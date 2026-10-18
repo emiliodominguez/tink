@@ -59,6 +59,8 @@ jobs:
       - run: yarn test:docs
       - run: yarn check:exports
       - run: yarn check:size
+      - run: yarn check:treeshaking
+      - run: yarn check:types
       - run: yarn docs
 
   test:
