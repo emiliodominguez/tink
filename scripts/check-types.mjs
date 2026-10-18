@@ -2,9 +2,11 @@
 // declarations stop compiling for a plain ES2022 consumer or when type-checking them gets expensive.
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
 
 const INSTANTIATION_BUDGET = 60_000;
-const tsc = createRequire(import.meta.url).resolve('typescript/bin/tsc');
+// The native TypeScript 7 compiler (`typescript` itself is the TypeScript 6 API package, for the tools that need one).
+const tsc = join(dirname(createRequire(import.meta.url).resolve('@typescript/native/package.json')), 'bin', 'tsc');
 let output;
 
 try {

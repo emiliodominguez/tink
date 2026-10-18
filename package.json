@@ -100,6 +100,7 @@
 		"@standard-schema/spec": "^1.1.0",
 		"@stryker-mutator/core": "^10",
 		"@stryker-mutator/jest-runner": "^10",
+		"@typescript/native": "npm:typescript@^7.0.2",
 		"@types/jest": "^30.0.0",
 		"@types/node": "^26.6.5",
 		"bezier-easing": "^3.2.0",
@@ -133,7 +134,7 @@
 		"remeda": "^2.52.0",
 		"ts-jest": "^29.4.14",
 		"typedoc": "^0.28.20",
-		"typescript": "^7.0.2",
+		"typescript": "npm:@typescript/typescript6@^6.0.2",
 		"typescript-eslint": "^8.71.2",
 		"ufo": "^1.6.4",
 		"zod": "^4.6.7"

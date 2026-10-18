@@ -403,7 +403,7 @@ describe('random', function () {
 			const real = globalThis.crypto;
 			const uuid = withCrypto(
 				{
-					getRandomValues: function (array: Uint8Array) {
+					getRandomValues: function (array: Uint8Array<ArrayBuffer>) {
 						return real.getRandomValues(array);
 					}
 				},
