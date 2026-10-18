@@ -258,7 +258,7 @@ describe('Decorators', function () {
 			expect(logSpy).toHaveBeenCalledWith('testLogMethod method returned:', 'test arg');
 		});
 
-		it('should log resolved promises and return the original promise', async function () {
+		it('should log resolved promises and return a promise settling the same way', async function () {
 			const result = test.testAsyncLogMethod(false);
 			expect(result).toBeInstanceOf(Promise);
 			await expect(result).resolves.toBe(1);
@@ -272,6 +272,38 @@ describe('Decorators', function () {
 			await expect(test.testAsyncLogMethod(true)).rejects.toThrow('async failure');
 			await Promise.resolve();
 			expect(logSpy).toHaveBeenCalledWith('testAsyncLogMethod method rejected:', new Error('async failure'));
+		});
+
+		it('should return a promise chained on the original, so that a rejection nobody handles still surfaces', async function () {
+			const { context } = fakeContext('method', 'load');
+			const error = new Error('load failed');
+			let original: Promise<never> | undefined;
+			const wrapped = decorators.log(function () {
+				original = Promise.reject(error);
+				return original;
+			}, context);
+			const returned = wrapped();
+			// The decorator attaches no handler that would mark the caller's rejection as handled: the caller gets its own promise.
+			expect(returned).not.toBe(original);
+			await expect(returned).rejects.toBe(error);
+			expect(logSpy).toHaveBeenCalledWith('load method rejected:', error);
+		});
+
+		it('should return other thenables untouched, without calling their then', function () {
+			const { context } = fakeContext('method', 'query');
+			let runs = 0;
+			const lazy = {
+				then: function (resolve: (value: string) => void) {
+					runs++;
+					resolve('rows');
+				}
+			};
+			const wrapped = decorators.log(function () {
+				return lazy;
+			}, context);
+			expect(wrapped()).toBe(lazy);
+			expect(runs).toBe(0);
+			expect(logSpy).toHaveBeenCalledWith('query method returned:', lazy);
 		});
 
 		it('should log and rethrow synchronous errors', function () {
@@ -878,6 +910,36 @@ describe('Decorators (round 2)', function () {
 			const { staticBound } = SubEdge;
 			expect(staticBound()).toBe('SubEdge');
 			expect(Edge.staticBound()).toBe('Edge');
+		});
+
+		it('should bind an inherited static method to the subclass even after the base class read it', function () {
+			class LaterEdge extends Edge {}
+
+			const { staticBound: baseBound } = Edge;
+			expect(baseBound()).toBe('Edge');
+			expect(Edge.staticBound).toBe(baseBound);
+			const { staticBound } = LaterEdge;
+			expect(staticBound()).toBe('LaterEdge');
+		});
+
+		it('should bind standard static methods lazily, so subclasses bind them to themselves', function () {
+			const { context, runInitializers } = fakeContext('method', 'who', { static: true });
+			/**
+			 * Returns the name of the class it is called on.
+			 */
+			function who(this: { name: string }): string {
+				return this.name;
+			}
+			class Base {}
+			Object.defineProperty(Base, 'who', { value: who, configurable: true, writable: true });
+			class Sub extends Base {}
+			decorators.bound(who, context);
+			runInitializers(Base);
+
+			const { who: baseWho } = Base as unknown as { who: () => string };
+			const { who: subWho } = Sub as unknown as { who: () => string };
+			expect(baseWho()).toBe('Base');
+			expect(subWho()).toBe('Sub');
 		});
 
 		it('should debounce static methods', function () {

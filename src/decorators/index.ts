@@ -40,6 +40,7 @@ interface StandardContext {
 	readonly kind: string;
 	readonly name: string | symbol;
 	readonly private?: boolean;
+	readonly static?: boolean;
 	addInitializer?(initializer: (this: unknown) => void): void;
 }
 
@@ -101,15 +102,6 @@ function isPrototypeObject(value: object): boolean {
 	const ctor = Object.prototype.hasOwnProperty.call(value, 'constructor') ? (value as { constructor: unknown }).constructor : undefined;
 
 	return typeof ctor === 'function' && ctor.prototype === value;
-}
-
-/**
- * Whether `value` is a thenable.
- * @param {unknown} value - Any value
- * @returns {boolean} `true` when `value` has a callable `then`
- */
-function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
-	return isObjectLike(value) && typeof (value as { then?: unknown }).then === 'function';
 }
 
 /**
@@ -312,21 +304,25 @@ function wrapLog(method: UnknownMethod, name: string): UnknownMethod {
 			throw error;
 		}
 
-		if (isPromiseLike(result)) {
-			result.then(
-				function (value) {
+		// A promise is logged through a promise chained on it, which is returned: handlers attached to the original instead would mark
+		// a rejection nobody handles as handled. Other thenables are left alone, since calling `then` can start their work (query builders).
+		if (result instanceof Promise) {
+			return result.then(
+				function (value: unknown): unknown {
 					// eslint-disable-next-line no-console
 					console.log(`${name} method resolved:`, value);
+					return value;
 				},
-				function (error: unknown) {
+				function (error: unknown): never {
 					// eslint-disable-next-line no-console
 					console.log(`${name} method rejected:`, error);
+					throw error;
 				}
 			);
-		} else {
-			// eslint-disable-next-line no-console
-			console.log(`${name} method returned:`, result);
 		}
+
+		// eslint-disable-next-line no-console
+		console.log(`${name} method returned:`, result);
 
 		return result;
 	};
@@ -334,9 +330,11 @@ function wrapLog(method: UnknownMethod, name: string): UnknownMethod {
 
 /**
  * Logs every call of the decorated method with `console.log`: `"<name> method called with arguments:" args`, then
- * `"<name> method returned:" result`. When the method returns a promise-like, `"<name> method resolved:" value` or
- * `"<name> method rejected:" error` is logged once it settles (the original promise is returned unchanged); a synchronous
- * exception is logged as `"<name> method threw:" error` and rethrown. `this` is preserved.
+ * `"<name> method returned:" result`. When the method returns a promise, `"<name> method resolved:" value` or
+ * `"<name> method rejected:" error` is logged once it settles, and a promise settling the same way is returned (so a rejection
+ * nobody handles still surfaces as an unhandled rejection). Other thenables are returned untouched and logged as returned, since
+ * calling their `then` could start their work. A synchronous exception is logged as `"<name> method threw:" error` and rethrown.
+ * `this` is preserved.
  * Security: arguments, results and errors are logged verbatim (nothing is redacted), so do not use it on methods that receive or return
  * secrets or personal data (passwords, tokens, ...) outside development.
  * Works with TypeScript/Babel legacy decorators and with TC39 standard decorators.
@@ -485,7 +483,8 @@ let wrapMemoizeDefault: MethodWrapper | undefined;
  *   it as a (non-enumerable, writable) own property of that instance. Accessing it through the prototype returns the unbound method,
  *   and `super.method` accesses from an overriding subclass bind without caching (so the override is not shadowed). On non-extensible
  *   (e.g. frozen) instances, a freshly bound method is returned on every access.
- * - Standard decorators: an initializer binds the method on each new instance (unless a subclass overrides it). Private methods are rejected.
+ * - Standard decorators: an initializer binds the method on each new instance (unless a subclass overrides it); static methods get the
+ *   lazy getter above, so a subclass inheriting one binds it to the subclass. Private methods are rejected.
  *   When combining decorators, put `@bound` first (outermost), so that it sees the final method.
  * @template T - The method type
  * @param {object | T} targetOrValue - Legacy: the prototype (or constructor); standard: the method
@@ -529,8 +528,10 @@ export function bound(targetOrValue: unknown, keyOrContext: unknown, descriptor?
 		context.addInitializer(function bindMethod(this: unknown): void {
 			const owner = this as Record<string | symbol, unknown>;
 
+			// A static method is bound lazily, like legacy ones: binding it to the class now would give subclasses the base class.
+			if (context.static) Object.defineProperty(owner, context.name, bindingAccessor(method, context.name, false));
 			// Skip when a subclass overrides the method: binding ours would shadow the override.
-			if (owner[context.name] === method) {
+			else if (owner[context.name] === method) {
 				Object.defineProperty(owner, context.name, { value: method.bind(owner), configurable: true, writable: true, enumerable: false });
 			}
 		});
@@ -544,7 +545,19 @@ export function bound(targetOrValue: unknown, keyOrContext: unknown, descriptor?
 		throw new TypeError(`@bound can only decorate methods (${String(key)} is not a method)`);
 	}
 
-	const method = descriptor.value as UnknownMethod;
+	return bindingAccessor(descriptor.value as UnknownMethod, key, descriptor.enumerable);
+}
+
+/**
+ * Creates the accessor of a `@bound` method: a lazy getter that binds the method to the object it is read from and caches it there.
+ * @param {UnknownMethod} method - The method
+ * @param {string | symbol} key - The property key
+ * @param {boolean | undefined} enumerable - Whether the accessor is enumerable
+ * @returns {PropertyDescriptor} The accessor descriptor
+ */
+function bindingAccessor(method: UnknownMethod, key: string | symbol, enumerable: boolean | undefined): PropertyDescriptor {
+	// Bound methods of the objects that hold the accessor themselves (a class, for a static method).
+	const owners = new WeakMap<object, UnknownMethod>();
 
 	/**
 	 * Lazily binds the method to the instance it is read from.
@@ -552,6 +565,17 @@ export function bound(targetOrValue: unknown, keyOrContext: unknown, descriptor?
 	 */
 	function get(this: unknown): UnknownMethod {
 		if (!isObjectLike(this) || isPrototypeObject(this)) return method;
+
+		// The object that holds this accessor (a class, for a static method) keeps it: an own copy would be inherited by subclasses,
+		// which must bind the method to themselves.
+		if (Object.getOwnPropertyDescriptor(this, key)?.get === get) {
+			let ownerBound = owners.get(this);
+			if (ownerBound === undefined) {
+				ownerBound = method.bind(this) as UnknownMethod;
+				owners.set(this, ownerBound);
+			}
+			return ownerBound;
+		}
 
 		const boundMethod = method.bind(this) as UnknownMethod;
 
@@ -565,7 +589,7 @@ export function bound(targetOrValue: unknown, keyOrContext: unknown, descriptor?
 
 	return {
 		configurable: true,
-		enumerable: descriptor.enumerable,
+		enumerable,
 		get,
 		set: function (this: unknown, value: unknown): void {
 			Object.defineProperty(this as object, key, { value, configurable: true, writable: true, enumerable: true });
