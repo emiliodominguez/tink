@@ -122,7 +122,7 @@ const sections = MODULES.map(function ([name, description]) {
 			return `| \`${row.name}\`${row.kind === 'class' ? ' _(class)_' : ''} | ${row.summary} |`;
 		})
 		.join('\n');
-	return `## ${name}\n\n${description}\n\n\`\`\`ts\nimport { … } from '@emiliodominguez/tink/${name}';\n\`\`\`\n\n| Export | Description |\n| --- | --- |\n${rows}\n`;
+	return `## ${name}\n\n${description}\n\n\`\`\`ts\nimport { … } from 'tinkjs/${name}';\n\`\`\`\n\n| Export | Description |\n| --- | --- |\n${rows}\n`;
 });
 
 const toc = MODULES.map(function ([name]) {
@@ -137,13 +137,13 @@ writeFileSync('docs/API.md', output);
 const REPO = 'https://github.com/emiliodominguez/js-helpers/blob/main';
 const PRINCIPLES = `Key facts for code generation:
 - ESM only, zero dependencies, Node >= 20.19 or any modern browser/runtime. TypeScript types ship in the package.
-- Import from module entry points: \`import { debounce } from '@emiliodominguez/tink/functions'\` (the root entry exposes namespaces: \`import { functions } from '@emiliodominguez/tink'\`).
+- Import from module entry points: \`import { debounce } from 'tinkjs/functions'\` (the root entry exposes namespaces: \`import { functions } from 'tinkjs'\`).
 - Helpers never mutate their inputs unless the name or docs say so (\`setInObjectByKeys\`, \`deleteFromObjectByKeys\`).
 - Invalid arguments throw \`TypeError\` (wrong type) or \`RangeError\` (invalid value) whose message names the function and the parameter (\`fn: param must be …, got …\`).
 - Randomised helpers take an optional \`random\` generator last; the default is \`Math.random\`. Pass \`secureRandom\` (random module) for tokens, OTPs and lotteries.
 - Type guards compose into validators: \`isShape\`, \`isArrayOf\`, \`isUnion\`, \`isOptional\`…; \`explain\` lists issues with paths, \`ensure\` throws a \`ValidationError\`, \`toStandardSchema\` adapts any guard for tRPC, TanStack Form, Hono and other Standard Schema consumers.`;
 
-const llms = `# tink (@emiliodominguez/tink)
+const llms = `# tink (tinkjs)
 
 > Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities (${MODULES.length} modules, ${[...EXPORTS.values()].reduce(function (total, rows) {
 	return total + rows.length;
@@ -154,7 +154,7 @@ ${PRINCIPLES}
 ## Modules
 
 ${MODULES.map(function ([name, description]) {
-	return `- [${name}](${REPO}/docs/API.md#${name}): ${description} Import from \`@emiliodominguez/tink/${name}\`.`;
+	return `- [${name}](${REPO}/docs/API.md#${name}): ${description} Import from \`tinkjs/${name}\`.`;
 }).join('\n')}
 
 ## Docs
@@ -166,12 +166,12 @@ ${MODULES.map(function ([name, description]) {
 - [Security policy](${REPO}/SECURITY.md)
 `;
 
-const full = `# @emiliodominguez/tink — full API index
+const full = `# tinkjs — full API index
 
 ${PRINCIPLES}
 
 ${MODULES.map(function ([name, description]) {
-	return `## ${name}\n\n${description}\nImport: \`import { … } from '@emiliodominguez/tink/${name}';\`\n\n${EXPORTS.get(name)
+	return `## ${name}\n\n${description}\nImport: \`import { … } from 'tinkjs/${name}';\`\n\n${EXPORTS.get(name)
 		.map(function (row) {
 			return `- \`${row.name}${row.signature}\`${row.summary ? ` — ${row.summary}` : ''}`;
 		})

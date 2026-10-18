@@ -1,16 +1,16 @@
 // Smoke-tests the BUILT package through its public `exports` map (unit tests run against `src`),
 // catching packaging or minification regressions. Run after `yarn build`.
 import assert from 'node:assert/strict';
-import * as root from '@emiliodominguez/tink';
-import { chunk } from '@emiliodominguez/tink/arrays';
-import { TimeoutError, AbortError, withTimeout, retry } from '@emiliodominguez/tink/async';
-import { addMonths, formatDate } from '@emiliodominguez/tink/date';
-import { memoize as memoizeMethod } from '@emiliodominguez/tink/decorators';
-import { debounce, curry } from '@emiliodominguez/tink/functions';
-import { isPlainObject } from '@emiliodominguez/tink/guards';
-import { round, sum } from '@emiliodominguez/tink/math';
-import { deepClone, deepMerge, isEqual } from '@emiliodominguez/tink/objects';
-import { toKebabCase, reverse } from '@emiliodominguez/tink/strings';
+import * as root from 'tinkjs';
+import { chunk } from 'tinkjs/arrays';
+import { TimeoutError, AbortError, withTimeout, retry } from 'tinkjs/async';
+import { addMonths, formatDate } from 'tinkjs/date';
+import { memoize as memoizeMethod } from 'tinkjs/decorators';
+import { debounce, curry } from 'tinkjs/functions';
+import { isPlainObject } from 'tinkjs/guards';
+import { round, sum } from 'tinkjs/math';
+import { deepClone, deepMerge, isEqual } from 'tinkjs/objects';
+import { toKebabCase, reverse } from 'tinkjs/strings';
 
 assert.deepEqual(Object.keys(root).sort(), [
 	'arrays',

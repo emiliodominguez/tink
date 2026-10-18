@@ -1,8 +1,8 @@
 # Changelog
 
-## 2.0.0
+## 1.0.0
 
-Full review and rewrite: every module is strictly typed, documented with complete JSDoc, and covered by example-based and property-based tests.
+First release as **tinkjs** (`npm install tinkjs`). tink is the successor of the `js-helpers` 1.x codebase, fully reviewed and rewritten: every module is strictly typed, documented with complete JSDoc, and covered by example-based and property-based tests. Notes for code coming from `js-helpers` 1.x are in [Upgrading from js-helpers 1.x](#upgrading-from-js-helpers-1x).
 
 ### Added
 
@@ -157,11 +157,9 @@ An adversarial review (prototype pollution, ReDoS, resource exhaustion, validato
         - the `end*` date functions threw on the last representable day.
 - **Published declarations are gated:** they must compile for a plain ES2022 consumer with `skipLibCheck` off, within a type-instantiation budget.
 
-### Changed (breaking)
+### Changed (breaking, from js-helpers 1.x)
 
-See [Migrating from 1.x](./README.md#migrating-from-1x).
-
-- The package is renamed to `@emiliodominguez/tink`.
+- The package is renamed to `tinkjs` and restarts at 1.0.0.
 - **Behaviour:**
     - `isError` decides same-realm objects with `instanceof`, so a plain object faking `Symbol.toStringTag` `'Error'` is no longer an error;
         - the `isDate`/`isRegExp`/`isMap`/`isSet`/`isWeakMap`/`isWeakSet` guards reject a genuine instance whose prototype was swapped to an unrelated object from the same realm (cross-realm instances still pass);
@@ -170,3 +168,51 @@ See [Migrating from 1.x](./README.md#migrating-from-1x).
                 - `countSubString` is case-sensitive;
                 - `hasProperty` only checks own properties;
                 - `round` rounds halves away from zero.
+
+### Upgrading from js-helpers 1.x
+
+Replace `js-helpers` imports with `tinkjs/<module>` deep imports, then review these behaviour changes:
+
+**arrays**
+
+- `first`/`last` are now typed `T | undefined`.
+- `contains` now finds `NaN`.
+
+**objects**
+
+- `clone` keeps arrays as arrays (it used to turn them into objects).
+- `hasProperty` only checks **own** properties. `hasProperty({}, 'toString')` is now `false`.
+- `getFromObjectByKeys` no longer throws on missing paths, and accepts an optional default value. Its second generic parameter is now the path, so let TypeScript infer it instead of writing `getFromObjectByKeys<T, R>(…)`.
+- The `is*` type checks moved to `guards` and are now real type predicates. They are still re-exported from `objects`.
+
+**strings**
+
+- `replace` and `countSubString` treat the search text literally. They no longer build a regex from it.
+- `countSubString` is now case-sensitive. Pass `{ ignoreCase: true }` for the old behaviour.
+- `toSnakeCase`/`toCamelCase` now split camelCase, acronyms and punctuation, not just single spaces.
+- `toNumber('')` returns `NaN`, not `0`.
+- `toBoolean` also accepts `'1'`, `'yes'`, `'y'` and `'on'`.
+
+**math**
+
+- `modulo` is now a true floored modulo: `modulo(-1, 3) === 2`. The old `%` behaviour is available as `remainder`.
+- `round` rounds halves away from zero, so `round(-2.5) === -3`.
+- `factorial`, `round`, `randomIntBetween` and similar functions throw `RangeError` on invalid input instead of overflowing the stack or returning `NaN`.
+
+**functions**
+
+- All wrappers preserve `this`.
+- `memoize` now caches falsy results.
+- `debounce`/`throttle` return the latest result and expose `cancel()`.
+
+**decorators**
+
+- `@memoize` keeps a separate cache per instance. Previously all instances shared one cache.
+- `@readonly` now works.
+
+**Imports**
+
+- The root entry exports namespaces (`import { strings } from …`). Use deep imports to get individual functions.
+- The package is ESM-only and requires Node 20.19+. CommonJS code on those versions can still `require()` it.
+- `guards` checks for built-ins (`isMap`, `isDate`, …) verify internal slots, so objects built with `Object.create(Map.prototype)`, and proxies of real instances, are no longer accepted.
+- `memoize` cache keys now tell `NaN`, `Infinity`, `-0` and `undefined` apart. Previously they collided.

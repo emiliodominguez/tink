@@ -27,7 +27,7 @@ import {
 	isShape,
 	isTruthy,
 	refine
-} from '@emiliodominguez/tink/guards';
+} from 'tinkjs/guards';
 import is from '@sindresorhus/is';
 import * as esToolkit from 'es-toolkit';
 import * as esToolkitCompat from 'es-toolkit/compat';

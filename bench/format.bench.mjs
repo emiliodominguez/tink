@@ -9,7 +9,7 @@ import {
 	formatRelativeTime,
 	formatUnit,
 	pluralRule
-} from '@emiliodominguez/tink/format';
+} from 'tinkjs/format';
 
 // Competitors: constructing the `Intl` formatter on every call (what a naive helper does), and reusing one formatter built ahead of
 // time (the theoretical best, which a helper taking options per call cannot reach: it must at least look its cached formatter up).

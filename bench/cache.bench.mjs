@@ -1,4 +1,4 @@
-import { createLRUCache, createPriorityQueue } from '@emiliodominguez/tink/cache';
+import { createLRUCache, createPriorityQueue } from 'tinkjs/cache';
 import { PriorityQueue } from 'p-queue';
 
 /**

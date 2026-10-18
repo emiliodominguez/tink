@@ -13,8 +13,8 @@ import {
 	isUrl,
 	isUuid,
 	parseJson
-} from '@emiliodominguez/tink/validate';
-import { isArrayOf, isInteger, isShape, isString } from '@emiliodominguez/tink/guards';
+} from 'tinkjs/validate';
+import { isArrayOf, isInteger, isShape, isString } from 'tinkjs/guards';
 import { z } from 'zod';
 
 // No validation library is installed: the competitors are the snippets people usually paste (a typical regex, `URL.canParse`, ...).

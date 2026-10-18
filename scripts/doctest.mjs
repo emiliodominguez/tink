@@ -6,7 +6,7 @@
 //   const x = expr; // => value  asserts the value bound to `x`
 //   expr; // throws RangeError   asserts that `expr` throws (or, with `await`, rejects) an error with that name
 //   // doctest: skip             as the first line: the block is not run
-// Any other comment is prose. All exports of the documented module are in scope; `import ... from '@emiliodominguez/tink/<module>'`
+// Any other comment is prose. All exports of the documented module are in scope; `import ... from 'tinkjs/<module>'`
 // lines are resolved against `src/` too. Each block runs on its own inside an async function, in strict mode.
 import { mkdtempSync, readdirSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -18,7 +18,7 @@ import ts from 'typescript';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SRC = join(ROOT, 'src');
-const PACKAGE = '@emiliodominguez/tink';
+const PACKAGE = 'tinkjs';
 const ROOT_ENTRY = '__root__';
 const BLOCK_TIMEOUT = 10_000;
 const SKIP_MARKER = /^\s*\/\/\s*doctest:\s*skip\b/;

@@ -35,7 +35,7 @@ import {
 	toPath,
 	toSnakeCaseKeys,
 	updateInObjectByKeys
-} from '@emiliodominguez/tink/objects';
+} from 'tinkjs/objects';
 import { defu } from 'defu';
 import * as toolkit from 'es-toolkit';
 import * as compat from 'es-toolkit/compat';

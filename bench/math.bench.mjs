@@ -21,7 +21,7 @@ import {
 	sum,
 	variance,
 	weightedAverage
-} from '@emiliodominguez/tink/math';
+} from 'tinkjs/math';
 
 // Deterministic pseudo-random data (no Math.random, so every run measures the same work).
 const large = Array.from({ length: 100_000 }, function (_, index) {

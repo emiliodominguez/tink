@@ -1,4 +1,4 @@
-import { contrastRatio, hslToRgb, lighten, mix, parseColor, parseHex, rgbToHsl, toCssRgb, toHex } from '@emiliodominguez/tink/color';
+import { contrastRatio, hslToRgb, lighten, mix, parseColor, parseHex, rgbToHsl, toCssRgb, toHex } from 'tinkjs/color';
 
 // No colour library is installed as a competitor: the `hand-written` implementations below are the straightforward
 // code one would write inline (no validation, no CSS Color 4 syntax, no alpha), i.e. a lower bound for the work.

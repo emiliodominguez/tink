@@ -432,7 +432,7 @@ function memoizeWrapper(options: MemoizeMethodOptions): MethodWrapper {
  * ```
  * @example
  * ```ts
- * import { createLRUCache } from '@emiliodominguez/tink/cache';
+ * import { createLRUCache } from 'tinkjs/cache';
  * class Users {
  *   loads = 0;
  *   @memoize({ createCache: function () { return createLRUCache({ max: 2 }); } })
@@ -588,7 +588,7 @@ export function bound(targetOrValue: unknown, keyOrContext: unknown, descriptor?
  * @throws {TypeError} when `wait` or `options.maxWait` is not a number, or when applied to something other than a method
  * @example
  * ```ts
- * import { sleep } from '@emiliodominguez/tink/async';
+ * import { sleep } from 'tinkjs/async';
  * class Search {
  *   queries: string[] = [];
  *   @debounced(20)
@@ -624,7 +624,7 @@ export function debounced(wait: number, options?: DebounceOptions): UniversalMet
  * @throws {TypeError} when `wait` is not a number, or when applied to something other than a method
  * @example
  * ```ts
- * import { sleep } from '@emiliodominguez/tink/async';
+ * import { sleep } from 'tinkjs/async';
  * class Tracker {
  *   positions: number[] = [];
  *   @throttled(20, { trailing: true })

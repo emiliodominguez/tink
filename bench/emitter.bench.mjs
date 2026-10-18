@@ -1,4 +1,4 @@
-import { createEmitter } from '@emiliodominguez/tink/emitter';
+import { createEmitter } from 'tinkjs/emitter';
 import mitt from 'mitt';
 
 /**

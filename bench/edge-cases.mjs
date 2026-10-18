@@ -3,13 +3,13 @@
 process.env.TZ = 'America/New_York'; // the DST rows need a zone with a fall-back hour; Node applies TZ changes at runtime
 
 const tink = {
-	arrays: await import('@emiliodominguez/tink/arrays'),
-	async: await import('@emiliodominguez/tink/async'),
-	date: await import('@emiliodominguez/tink/date'),
-	math: await import('@emiliodominguez/tink/math'),
-	objects: await import('@emiliodominguez/tink/objects'),
-	strings: await import('@emiliodominguez/tink/strings'),
-	url: await import('@emiliodominguez/tink/url')
+	arrays: await import('tinkjs/arrays'),
+	async: await import('tinkjs/async'),
+	date: await import('tinkjs/date'),
+	math: await import('tinkjs/math'),
+	objects: await import('tinkjs/objects'),
+	strings: await import('tinkjs/strings'),
+	url: await import('tinkjs/url')
 };
 const toolkit = await import('es-toolkit');
 const lodash = await import('lodash-es');
@@ -272,10 +272,9 @@ for (const { topic, library, pkg = library, call, theirs, ours } of CASES) {
 }
 
 if (markdown) {
-	console.log('| Case | Library | Call | Library returns | tink returns |\n| --- | --- | --- | --- | --- |');
-	for (const row of rows) {
-		console.log(`| ${row.slice(0, 3).join(' | ')} | \`${row[3]}\` | \`${row[4]}\` |`);
-	}
+	// The README table describes behaviours, not libraries: the plain output (without --markdown) names the library of each row.
+	console.log('| Case | Call | A popular implementation returns | tink returns |\n| --- | --- | --- | --- |');
+	for (const [topic, , call, theirs, ours] of rows) console.log(`| ${topic} | ${call} | \`${theirs}\` | \`${ours}\` |`);
 } else {
 	for (const [topic, library, call, theirs, ours] of rows) console.log(`${topic} · ${library} · ${call}\n    library: ${theirs}\n    tink:    ${ours}`);
 }

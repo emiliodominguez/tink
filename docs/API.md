@@ -11,7 +11,7 @@
 Collection helpers: set algebra, grouping, chunking, sorting, sampling.
 
 ```ts
-import { … } from '@emiliodominguez/tink/arrays';
+import { … } from 'tinkjs/arrays';
 ```
 
 | Export                     | Description                                                                                                                                                                                                                                                                 |
@@ -94,7 +94,7 @@ import { … } from '@emiliodominguez/tink/arrays';
 Shallow/deep cloning, merging, equality, path access and object reshaping.
 
 ```ts
-import { … } from '@emiliodominguez/tink/objects';
+import { … } from 'tinkjs/objects';
 ```
 
 | Export                   | Description                                                                                                                                                                                                                                                                                                                                                                                                                             |
@@ -156,7 +156,7 @@ import { … } from '@emiliodominguez/tink/objects';
 Runtime type predicates that narrow `unknown` values, composable into path-aware, Standard Schema-compatible validators.
 
 ```ts
-import { … } from '@emiliodominguez/tink/guards';
+import { … } from 'tinkjs/guards';
 ```
 
 | Export                      | Description                                                                                                                                                                                                                                              |
@@ -232,7 +232,7 @@ import { … } from '@emiliodominguez/tink/guards';
 Unicode-aware transformations, case conversion, escaping, templating and text metrics.
 
 ```ts
-import { … } from '@emiliodominguez/tink/strings';
+import { … } from 'tinkjs/strings';
 ```
 
 | Export                | Description                                                                                                                                                                                                                                                                                                              |
@@ -299,7 +299,7 @@ import { … } from '@emiliodominguez/tink/strings';
 Query-string building and parsing, URL joining and query merging, without URL object types.
 
 ```ts
-import { … } from '@emiliodominguez/tink/url';
+import { … } from 'tinkjs/url';
 ```
 
 | Export                   | Description                                                                                                                                                                                                                                                                                                                               |
@@ -329,7 +329,7 @@ import { … } from '@emiliodominguez/tink/url';
 Precise arithmetic, statistics, number theory and random numbers.
 
 ```ts
-import { … } from '@emiliodominguez/tink/math';
+import { … } from 'tinkjs/math';
 ```
 
 | Export               | Description                                                                                                                                                                                                                                                                                            |
@@ -385,7 +385,7 @@ import { … } from '@emiliodominguez/tink/math';
 Function composition, currying, memoization and rate limiting.
 
 ```ts
-import { … } from '@emiliodominguez/tink/functions';
+import { … } from 'tinkjs/functions';
 ```
 
 | Export              | Description                                                                                                                                                                                                                 |
@@ -422,7 +422,7 @@ import { … } from '@emiliodominguez/tink/functions';
 Promise utilities: retries, timeouts, polling, limiters, keyed Promise.all and async debounce.
 
 ```ts
-import { … } from '@emiliodominguez/tink/async';
+import { … } from 'tinkjs/async';
 ```
 
 | Export                      | Description                                                                                                                                                                                                                                                       |
@@ -456,7 +456,7 @@ import { … } from '@emiliodominguez/tink/async';
 Hex/RGB/HSL conversion, mixing, lightening and WCAG contrast checks.
 
 ```ts
-import { … } from '@emiliodominguez/tink/color';
+import { … } from 'tinkjs/color';
 ```
 
 | Export                 | Description                                                                                                                                                                                                                                                                                                   |
@@ -483,7 +483,7 @@ import { … } from '@emiliodominguez/tink/color';
 Fuzzy matching and ranking with highlight ranges, for command palettes and filter-as-you-type UIs.
 
 ```ts
-import { … } from '@emiliodominguez/tink/search';
+import { … } from 'tinkjs/search';
 ```
 
 | Export        | Description                                                                                                                                                                                             |
@@ -497,7 +497,7 @@ import { … } from '@emiliodominguez/tink/search';
 Animation easing curves, CSS-accurate cubic-bezier() and steps(), and an analytic spring.
 
 ```ts
-import { … } from '@emiliodominguez/tink/easing';
+import { … } from 'tinkjs/easing';
 ```
 
 | Export             | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -549,7 +549,7 @@ import { … } from '@emiliodominguez/tink/easing';
 Deterministic, cached Intl formatting: numbers, currency, percent, compact, units, lists, dates, ordinals.
 
 ```ts
-import { … } from '@emiliodominguez/tink/format';
+import { … } from 'tinkjs/format';
 ```
 
 | Export               | Description                                                                                                                                                                                                                        |
@@ -570,7 +570,7 @@ import { … } from '@emiliodominguez/tink/format';
 Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates.
 
 ```ts
-import { … } from '@emiliodominguez/tink/validate';
+import { … } from 'tinkjs/validate';
 ```
 
 | Export                | Description                                                                                                                                                                                                                                                                                                                                                                                                                 |
@@ -600,7 +600,7 @@ import { … } from '@emiliodominguez/tink/validate';
 DST-safe, non-mutating local-time date arithmetic, formatting and parsing.
 
 ```ts
-import { … } from '@emiliodominguez/tink/date';
+import { … } from 'tinkjs/date';
 ```
 
 | Export                  | Description                                                                                                                                                                                                                                                                                                                                                                                                                |
@@ -689,7 +689,7 @@ import { … } from '@emiliodominguez/tink/date';
 Lazy, generator-based pipelines over any (async) iterable, with exact pull counts and early-exit cleanup.
 
 ```ts
-import { … } from '@emiliodominguez/tink/iterables';
+import { … } from 'tinkjs/iterables';
 ```
 
 | Export          | Description                                                                                                                                                                                                                                               |
@@ -733,7 +733,7 @@ import { … } from '@emiliodominguez/tink/iterables';
 O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock; plugs into memoize.
 
 ```ts
-import { … } from '@emiliodominguez/tink/cache';
+import { … } from 'tinkjs/cache';
 ```
 
 | Export                | Description                                                                                                                                                                                                                                   |
@@ -746,7 +746,7 @@ import { … } from '@emiliodominguez/tink/cache';
 Typed event emitter with wildcard listeners, waitFor and error isolation.
 
 ```ts
-import { … } from '@emiliodominguez/tink/emitter';
+import { … } from 'tinkjs/emitter';
 ```
 
 | Export          | Description                                          |
@@ -758,7 +758,7 @@ import { … } from '@emiliodominguez/tink/emitter';
 Tiny state store compatible with React useSyncExternalStore, with derived selectors.
 
 ```ts
-import { … } from '@emiliodominguez/tink/store';
+import { … } from 'tinkjs/store';
 ```
 
 | Export        | Description                                                                                                                                                                                             |
@@ -770,7 +770,7 @@ import { … } from '@emiliodominguez/tink/store';
 Seeded deterministic PRNG plus cryptographically secure ids, UUIDs and bytes.
 
 ```ts
-import { … } from '@emiliodominguez/tink/random';
+import { … } from 'tinkjs/random';
 ```
 
 | Export           | Description                                                                                                                                                                                                                                      |
@@ -789,7 +789,7 @@ import { … } from '@emiliodominguez/tink/random';
 Class decorators for TypeScript (legacy and TC39 standard) and Babel.
 
 ```ts
-import { … } from '@emiliodominguez/tink/decorators';
+import { … } from 'tinkjs/decorators';
 ```
 
 | Export       | Description                                                                                                                                                                                                                                                                                                                  |

@@ -1,14 +1,14 @@
 // Compiled against the BUILT declarations by scripts/check-types.mjs: proves the published .d.ts files are valid for a
 // consumer with no DOM or Node types (skipLibCheck off), resolve through the exports map, and stay cheap to type-check.
-import { getFromObjectByKeys, setInObjectByKeys, deepMerge, merge, pick, omit } from '@emiliodominguez/tink/objects';
-import { curry, pipe, compose } from '@emiliodominguez/tink/functions';
-import type { NestedKeyOf, PathValue } from '@emiliodominguez/tink/utils';
-import { isShape, isString, isInteger, isOptional, isArrayOf, isUnion, isNullable, isTuple, toStandardSchema } from '@emiliodominguez/tink/guards';
-import type { Infer } from '@emiliodominguez/tink/guards';
+import { getFromObjectByKeys, setInObjectByKeys, deepMerge, merge, pick, omit } from 'tinkjs/objects';
+import { curry, pipe, compose } from 'tinkjs/functions';
+import type { NestedKeyOf, PathValue } from 'tinkjs/utils';
+import { isShape, isString, isInteger, isOptional, isArrayOf, isUnion, isNullable, isTuple, toStandardSchema } from 'tinkjs/guards';
+import type { Infer } from 'tinkjs/guards';
 import type { StandardSchemaV1 } from '@standard-schema/spec';
-import { toCamelCaseKeys } from '@emiliodominguez/tink/objects';
+import { toCamelCaseKeys } from 'tinkjs/objects';
 // The root entry pulls in every module's declarations.
-import * as everything from '@emiliodominguez/tink';
+import * as everything from 'tinkjs';
 
 interface Address {
 	street: string;

@@ -17,7 +17,7 @@ import {
 	withoutTrailingSlash,
 	withQuery,
 	withTrailingSlash
-} from '@emiliodominguez/tink/url';
+} from 'tinkjs/url';
 import * as ufo from 'ufo';
 
 // Competitors: what users naturally write with the platform's URLSearchParams / URL (no library in this category is installed).
