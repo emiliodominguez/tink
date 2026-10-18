@@ -1,0 +1,5 @@
+# Changes to the release pipeline, build scripts and package manifest need the maintainer's review.
+* @emiliodominguez
+/.github/ @emiliodominguez
+/scripts/ @emiliodominguez
+/package.json @emiliodominguez

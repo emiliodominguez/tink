@@ -30,6 +30,22 @@ Full review and rewrite: every module is strictly typed, documented with complet
     - enforces a size budget.
 - **Toolchain:** TypeScript 6, Jest 30, ESLint 10 (flat config), esbuild for the runtime build.
 
+- **Schema validation from guards** (`guards`): `isShape` (with `exact`), `isUnion`, `isTuple`, `isOptional`, `isNullable`, `withMessage` and the `Infer` type; `explain` returns every issue with its path, `ensure` throws a `ValidationError`, and `toStandardSchema` turns any guard into a [Standard Schema](https://standardschema.dev) v1 validator for tRPC, TanStack Form, Hono and the rest of the ecosystem. `isArrayOf`, `isRecordOf` and `isOneOf` report per-element issues too.
+- `random.secureRandom` (a 53-bit `crypto.getRandomValues` generator for every `random` parameter), `createLimiter({ maxPending })`, `diffSequences`/`longestCommonSubsequence` `{ maxEdits }`, `unflattenObject({ arrayLimit })`, `@memoize({ resolver, createCache })`.
+- **Docs:** [lodash migration guide](./docs/MIGRATING-FROM-LODASH.md) and the [import cost of every export](./docs/SIZES.md) (`yarn docs:sizes`); `llms.txt` and `llms-full.txt` for AI coding assistants, shipped in the package; [security policy](./SECURITY.md).
+- **Release pipeline:** npm trusted publishing (OIDC, no token) from a job that runs no project code, actions pinned to commit SHAs, least-privilege permissions, tags must point at `main`; Dependabot and CODEOWNERS.
+
+### Security
+
+An adversarial review (prototype pollution, ReDoS, resource exhaustion, validator bypasses, injection) found and fixed:
+
+- **objects:** `getFromObjectByKeys`, `getProperty`, `hasInObjectByKeys` and `pick` never resolve `__proto__`, `constructor`, `prototype` or members inherited from `Object.prototype` (`'viewer.constructor'` used to be truthy); `deleteFromObjectByKeys` and `setProperty(obj, '__proto__')` throw like the path setters; `unflattenObject`/`setInObjectByKeys` create objects instead of 4-billion-slot sparse arrays for huge indexes; stack-depth limits are documented.
+- **url:** `isAbsoluteUrl` normalises like browsers (`/\evil.com`, ` //evil.com`, `https:evil.com` are absolute; `javascript://` is not); `joinUrl` can no longer produce protocol-relative or scheme-injected results; `withQuery` replaces `key[]` parameters (no parameter pollution).
+- **validate:** `isUrl` rejects invisible/format characters, look-alike (NFKC-unstable) and percent-encoded hosts, ideographic dots, backslashes in the authority, empty labels and non-canonical numeric hosts; `isBase64` only accepts canonical encodings; `isCreditCardNumber` rejects all-zero numbers.
+- **strings:** `escapeHtml`/`unescapeHtml` always return strings (an array query value was returned unescaped); `escapeRegExp` follows TC39 `RegExp.escape` (safe inside classes and with the `v` flag); `mask` no longer reveals secrets shorter than the visible window; `toNumber` accepts exactly what `isNumericString` accepts.
+- **Denial of service:** `formatDate` tokenizes patterns in linear time (was quadratic); `fuzzyMatch` rejects impossible queries before allocating (was gigabytes); `isPrime` uses deterministic Miller–Rabin (311 ms → 0.1 ms worst case); `retry` always yields to the event loop (infinite retries of a throwing function froze the thread); `windowed`/`cartesianProduct` check output sizes before allocating; template, pattern and locale caches skip keys over 1 kB.
+- **Consistency:** math aggregates coerce numeric strings once (`sum(['1','2'])` was `'012'`); `weightedRandom` rejects non-number weights; `sleep`/`retry`/`pollUntil` validate signals up front; `memoize` keys distinguish dates from strings and key class instances, errors, functions and symbols by identity; `@memoize`/`@once` no longer share state across detached calls; error messages truncate quoted input; `assertNever` never serialises the whole value.
+
 ### Fixed
 
 **arrays**

@@ -10,7 +10,7 @@
 
 20 focused modules. Zero runtime dependencies. Import the helpers you need, with types and examples available in your editor.
 
-[Install](#install) · [Quick start](#usage) · [Modules](#modules) · [Examples](#examples) · [API reference](./docs/API.md) · [Contributing](./CONTRIBUTING.md)
+[Install](#install) · [Quick start](#usage) · [Modules](#modules) · [Examples](#examples) · [API reference](./docs/API.md) · [Migrating from lodash](./docs/MIGRATING-FROM-LODASH.md) · [Security](./SECURITY.md)
 
 ## Install
 
@@ -46,6 +46,19 @@ round(1.005, 2); // 1.01
 toSlug('Café Society!'); // 'cafe-society'
 ```
 
+Type guards compose into validators with path-aware errors, and plug into any library that speaks [Standard Schema](https://standardschema.dev) (tRPC, TanStack Form, React Hook Form, Hono…):
+
+```ts
+import { ensure, explain, isArrayOf, isInteger, isOptional, isShape, isString, toStandardSchema, type Infer } from '@emiliodominguez/js-helpers/guards';
+
+const isUser = isShape({ id: isInteger, name: isString, tags: isArrayOf(isString), email: isOptional(isString) });
+type User = Infer<typeof isUser>; // { id: number; name: string; tags: string[]; email?: string }
+
+explain(isUser, { id: 1, tags: ['a', 2] }); // [{ path: ['name'], message: 'Missing required property' }, { path: ['tags', 1], … }]
+const user = ensure(isUser, JSON.parse(body)); // typed User, or a ValidationError listing every issue
+const schema = toStandardSchema(isUser); // hand it to tRPC, TanStack Form, Hono…
+```
+
 <details>
 <summary>Prefer namespaced imports?</summary>
 
@@ -65,6 +78,8 @@ objects.isEqual(new Map([[1, { a: [1] }]]), new Map([[1, { a: [1] }]])); // true
 - **Types that follow your data.** Narrowing predicates, path-aware getters, tuple-typed `zip`, and typed `curry`, `compose` and `pipe`.
 - **Care with the edge cases.** Unicode-aware strings, DST-safe date arithmetic, compensated summation, circular-reference support and prototype-pollution checks.
 - **Small imports, complete docs.** Minified ESM modules with no runtime dependencies. Type declarations retain the JSDoc, so editor documentation stays useful.
+- **Safe on hostile input.** Path and merge helpers never read or write through `__proto__`, `constructor` or `Object.prototype`; every regex is linear-time; validators reject look-alike hosts and control characters; costs that grow with input size are documented. See the [security policy](./SECURITY.md).
+- **Validators for free.** Guards compose into Standard Schema validators with path-aware issues: no second schema library to ship.
 - **Behavior you can verify.** Example tests, [fast-check](https://fast-check.dev) properties and executable JSDoc examples. Inputs stay unchanged unless mutation is part of the named operation.
 
 ## Modules
@@ -86,7 +101,7 @@ Start with the task. Each module links to its full API reference.
 | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | [`arrays`](./docs/API.md#arrays)         | `chunk`, `groupBy`, `partition`, `sortBy` (stable), `windowed`, `binarySearch`, Myers `diffSequences`, `minBy`/`maxBy`, set algebra   |
 | [`objects`](./docs/API.md#objects)       | `deepClone`, `deepMerge`, `isEqual`, `diff`, `flattenObject`/`unflattenObject`, `pick`/`omit`, type-safe path get/set                 |
-| [`guards`](./docs/API.md#guards)         | 35+ narrowing predicates (`isPlainObject`, `isNonEmptyArray`, `isOneOf`, `isArrayOf`, …) and `assert`/`assertNever`                   |
+| [`guards`](./docs/API.md#guards)         | 35+ narrowing predicates, `isShape`/`isUnion`/`isTuple` schemas, `explain`/`ensure`, `toStandardSchema`, `assert`/`assertNever`       |
 | [`strings`](./docs/API.md#strings)       | every case style, `toSlug`, `dedent` tag, `wordWrap`, `levenshtein`, `mask`, `escapeHtml`, grapheme-aware `reverse`/`truncate`        |
 | [`math`](./docs/API.md#math)             | precise `sum`/`round`, `quantile`, `variance`, `clamp`/`lerp`/`mapRange`, `formatBytes`, `ordinal`, `gcd`/`lcm`, `isPrime`            |
 | [`functions`](./docs/API.md#functions)   | `debounce`/`throttle` with `cancel`/`flush`, `memoize`, `memoizeLast`, `curry`, `compose`/`pipe`, `once`, `attempt`                   |
@@ -102,7 +117,7 @@ Start with the task. Each module links to its full API reference.
 | [`cache`](./docs/API.md#cache)           | O(1) `createLRUCache` with TTL, eviction reasons and an injectable clock; drop-in cache for `memoize`                                 |
 | [`emitter`](./docs/API.md#emitter)       | typed `createEmitter` with wildcard listeners, `once`, `waitFor` (timeout/abort) and error isolation                                  |
 | [`store`](./docs/API.md#store)           | `createStore` for `useSyncExternalStore`, with equality-gated updates and cached `select()` stores                                    |
-| [`random`](./docs/API.md#random)         | seeded `createRandom` (cross-platform deterministic), secure `randomId`/`randomUUID`/`randomBytes`, `weightedRandom`                  |
+| [`random`](./docs/API.md#random)         | seeded `createRandom` (cross-platform deterministic), secure `secureRandom`/`randomId`/`randomUUID`/`randomBytes`, `weightedRandom`   |
 | [`decorators`](./docs/API.md#decorators) | `@memoize`/`@once` (per instance), `@bound`, `@debounced`, `@throttled`, `@retryable`, `@timeout`, `@readonly`, `@deprecated`         |
 
 </details>
@@ -276,7 +291,7 @@ class SearchBox {
 
 ## Size
 
-**About 39 kB gzipped for all modules combined.** Deep imports and tree-shaking reduce that to the helpers your application actually uses. The package has no runtime dependencies, and `yarn check:size` enforces its size budget.
+**About 43 kB gzipped for all 20 modules combined, and a median of under 500 B per helper.** Deep imports and tree-shaking reduce that to the helpers your application actually uses: [docs/SIZES.md](./docs/SIZES.md) lists the import cost of every export, and the [lodash migration guide](./docs/MIGRATING-FROM-LODASH.md) compares 112 equivalents side by side (243 kB for lodash vs 44 kB here, imported one at a time). The package has no runtime dependencies, and `yarn check:size` enforces its size budget.
 
 <details>
 <summary>See the size of each module</summary>
@@ -285,26 +300,26 @@ Sizes below are for the minified ESM build.
 
 | Module       | Minified | Gzipped |
 | ------------ | -------: | ------: |
-| `arrays`     |   9.4 kB |  3.6 kB |
-| `async`      |   6.7 kB |  2.6 kB |
-| `cache`      |   2.5 kB |  1.1 kB |
-| `color`      |   5.3 kB |  2.4 kB |
-| `date`       |  10.4 kB |  3.7 kB |
-| `decorators` |   4.5 kB |  1.5 kB |
+| `arrays`     |  10.3 kB |  3.9 kB |
+| `async`      |   6.7 kB |  2.7 kB |
+| `cache`      |   2.6 kB |  1.2 kB |
+| `color`      |   5.5 kB |  2.5 kB |
+| `date`       |  10.5 kB |  3.8 kB |
+| `decorators` |   4.7 kB |  1.6 kB |
 | `easing`     |   4.4 kB |  2.0 kB |
 | `emitter`    |   2.2 kB |  1.1 kB |
 | `format`     |   4.3 kB |  1.6 kB |
-| `functions`  |   5.6 kB |  2.3 kB |
-| `guards`     |   4.7 kB |  1.5 kB |
-| `iterables`  |   5.6 kB |  1.9 kB |
-| `math`       |   7.9 kB |  3.1 kB |
-| `objects`    |  11.9 kB |  4.0 kB |
-| `random`     |   5.4 kB |  2.4 kB |
+| `functions`  |   6.6 kB |  2.7 kB |
+| `guards`     |   8.6 kB |  2.8 kB |
+| `iterables`  |   5.7 kB |  1.9 kB |
+| `math`       |   8.4 kB |  3.3 kB |
+| `objects`    |  12.3 kB |  4.3 kB |
+| `random`     |   5.7 kB |  2.6 kB |
 | `search`     |   3.7 kB |  1.8 kB |
-| `store`      |   1.7 kB |  0.8 kB |
-| `strings`    |   9.1 kB |  3.8 kB |
-| `url`        |   2.9 kB |  1.4 kB |
-| `validate`   |   5.7 kB |  2.3 kB |
+| `store`      |   1.6 kB |  0.8 kB |
+| `strings`    |   9.5 kB |  4.0 kB |
+| `url`        |   3.3 kB |  1.6 kB |
+| `validate`   |   6.6 kB |  2.7 kB |
 
 </details>
 

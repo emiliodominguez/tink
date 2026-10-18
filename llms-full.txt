@@ -1,0 +1,555 @@
+# @emiliodominguez/js-helpers — full API index
+
+Key facts for code generation:
+- ESM only, zero dependencies, Node >= 20.19 or any modern browser/runtime. TypeScript types ship in the package.
+- Import from module entry points: `import { debounce } from '@emiliodominguez/js-helpers/functions'` (the root entry exposes namespaces: `import { functions } from '@emiliodominguez/js-helpers'`).
+- Helpers never mutate their inputs unless the name or docs say so (`setInObjectByKeys`, `deleteFromObjectByKeys`).
+- Invalid arguments throw `TypeError` (wrong type) or `RangeError` (invalid value) whose message names the function and the parameter (`fn: param must be …, got …`).
+- Randomised helpers take an optional `random` generator last; the default is `Math.random`. Pass `secureRandom` (random module) for tokens, OTPs and lotteries.
+- Type guards compose into validators: `isShape`, `isArrayOf`, `isUnion`, `isOptional`…; `explain` lists issues with paths, `ensure` throws a `ValidationError`, `toStandardSchema` adapts any guard for tRPC, TanStack Form, Hono and other Standard Schema consumers.
+
+## arrays
+
+Collection helpers: set algebra, grouping, chunking, sorting, sampling.
+Import: `import { … } from '@emiliodominguez/js-helpers/arrays';`
+
+- `contains<T>(array: ReadonlyArray<T>, value: T): boolean` — Check if an array contains a value, using SameValueZero equality (so `NaN` is found and `0` matches `-0`).
+- `first<T>(array: ReadonlyArray<T>): T | undefined` — Get the first item in an array.
+- `last<T>(array: ReadonlyArray<T>): T | undefined` — Get the last item in an array.
+- `flatten<T>(array: ReadonlyArray<T | ReadonlyArray<T>>): T[]` — Flatten an array by exactly one level, like `Array.prototype.flat()` (holes in sparse arrays are skipped).
+- `flattenDeep<T>(array: ReadonlyArray<T>): Array<FlatDeep<T>>` — Recursively flatten nested arrays of any depth, like `Array.prototype.flat(Infinity)` (holes are skipped).
+- `removeDuplicates<T>(iterable: Iterable<T>): T[]` — Remove duplicates from an iterable (SameValueZero equality), keeping the first occurrence of each value.
+- `union<T>(a: Iterable<T>, b: Iterable<T>): T[]` — Get the union of two iterables: every distinct value from `a`, then every distinct value of `b` not already in `a`.
+- `intersection<T>(a: Iterable<T>, b: Iterable<T>): T[]` — Get the intersection of two iterables: the distinct values of `a` that also appear in `b`.
+- `difference<T>(a: Iterable<T>, b: Iterable<T>): T[]` — Get the difference of two iterables: the distinct values of `a` that do not appear in `b`.
+- `symmetricDifference<T>(a: Iterable<T>, b: Iterable<T>): T[]` — Get the symmetric difference of two iterables: the distinct values that appear in exactly one of them.
+- `isSubset<T>(subset: Iterable<T>, superset: Iterable<T>): boolean` — Check whether every value of `subset` also appears in `superset` (SameValueZero equality).
+- `chunk<T>(array: ReadonlyArray<T>, size: number): T[][]` — Split an array into consecutive chunks of `size` items; only the last chunk may be shorter.
+- `compact<T>(array: ReadonlyArray<T>): Array<Exclude<T, Falsy>>` — Remove every falsy value (`false`, `null`, `undefined`, `0`, `-0`, `NaN`, `''`, `0n`) from an array.
+- `range(start: number, end?: number, step = 1): number[]` — Create an array of numbers progressing from `start` up to, but not including, `end`, with Python `range` semantics.
+- `zip<T extends Array<ReadonlyArray<unknown>>>(...arrays: T): Array<Zipped<T>>` — Combine arrays element-wise into tuples, truncating to the length of the shortest array.
+- `groupBy<T, K extends PropertyKey>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => K): Partial<Record<K, T[]>>` — Group the items of an array by the key returned by `keyFn`, preserving input order within each group.
+- `keyBy<T, K extends PropertyKey>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => K): Record<K, T>` — Index the items of an array by the key returned by `keyFn`; when several items share a key, the last one wins.
+- `countBy<T, K extends PropertyKey>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => K): Record<K, number>` — Count the items of an array per key returned by `keyFn`.
+- `partition<T, S extends T>(array: ReadonlyArray<T>, predicate: (item: T, index: number) => item is S): [S[], Exclude<T, S>[]]` — Split an array in two: the items matching a type-guard `predicate`, and the others.
+- `uniqueBy<T>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => unknown): T[]` — Remove items whose key (as returned by `keyFn`, compared with SameValueZero) was already seen, keeping the first occurrence.
+- `sortBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey, order: SortOrder = 'asc'): T[]` — Return a sorted copy of an array, ordered by the key `selector` returns for each item.
+- `shuffle<T>(array: ReadonlyArray<T>, random: RandomGenerator = Math.random): T[]` — Return a shuffled copy of an array using the Fisher–Yates algorithm (the input is not mutated).
+- `sample<T>(array: ReadonlyArray<T>, random: RandomGenerator = Math.random): T | undefined` — Pick a random item from an array.
+- `take<T>(array: ReadonlyArray<T>, n: number): T[]` — Return the first `n` items of an array (or all of them when it is shorter).
+- `drop<T>(array: ReadonlyArray<T>, n: number): T[]` — Return an array without its first `n` items.
+- `unzip<T extends ReadonlyArray<unknown>>(tuples: ReadonlyArray<T>): Unzipped<T> | []` — Split an array of tuples into one array per tuple position: the inverse of `zip`.
+- `windowed<T>(array: ReadonlyArray<T>, size: number, step = 1): T[][]` — Return the sliding windows of `size` consecutive items, starting every `step` items.
+- `pairwise<T>(array: ReadonlyArray<T>): Array<[T, T]>` — Return every pair of adjacent items: `[a[0], a[1]], [a[1], a[2]], ...` (empty for arrays with fewer than 2 items).
+- `minBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey): T | undefined` — Return the item with the SMALLEST key, using the same ordering rules as `sortBy` (numbers/bigints numerically and before strings, strings by UTF-16 code units, `Date`s by timestamp).
+- `maxBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey): T | undefined` — Return the item with the LARGEST key, using the same ordering rules as `sortBy` (numbers/bigints numerically and before strings, strings by UTF-16 code units, `Date`s by timestamp).
+- `sumBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => number): number` — Add up the numbers returned by `selector` for each item, using compensated (Neumaier) summation like `sum` from the math module (same algorithm, same result), so the rounding error does not grow with the number of items.
+- `move<T>(array: ReadonlyArray<T>, from: number, to: number): T[]` — Return a copy of an array with the item at `from` moved to position `to` (the input is not mutated).
+- `insertAt<T>(array: ReadonlyArray<T>, index: number, ...items: T[]): T[]` — Return a copy of an array with `items` inserted before position `index` (the input is not mutated).
+- `removeAt<T>(array: ReadonlyArray<T>, index: number, count = 1): T[]` — Return a copy of an array without the `count` items starting at `index` (the input is not mutated).
+- `sortedIndex<T extends number | string | bigint>(sortedArray: ReadonlyArray<T>, value: T): number` — Find, by binary search (O(log n)), the LOWEST index at which `value` can be inserted into `sortedArray` keeping it sorted (before any equal items).
+- `binarySearch<T extends number | string | bigint>(sortedArray: ReadonlyArray<T>, value: T): number` — Find the index of `value` in `sortedArray` by binary search (O(log n)); with duplicates, the LOWEST matching index is returned.
+- `cartesianProduct<T extends Array<ReadonlyArray<unknown>>>(...arrays: T): Array<Zipped<T>>` — Return the cartesian product of the given arrays: every tuple taking one item from each array, in lexicographic order (the LAST array varies fastest).
+- `intersperse<T, S>(array: ReadonlyArray<T>, separator: S): Array<T | S>` — Return a copy of an array with `separator` inserted between every two consecutive items.
+- `differenceBy<T, U = T>(a: Iterable<T>, b: Iterable<U>, keyFn: (item: T | U) => unknown): T[]` — Like `difference`, but items are compared by the key `keyFn` returns (SameValueZero): the items of `a` whose key is not the key of any item of `b`, keeping only the FIRST item of `a` per key.
+- `intersectionBy<T, U = T>(a: Iterable<T>, b: Iterable<U>, keyFn: (item: T | U) => unknown): T[]` — Like `intersection`, but items are compared by the key `keyFn` returns (SameValueZero): the items of `a` whose key is also the key of an item of `b`, keeping only the FIRST item of `a` per key.
+- `diffSequences<T>(a: Iterable<T>, b: Iterable<T>, equals: (x: T, y: T) => boolean = sameValueZero, options: DiffOptions = {}): Array<DiffOperation<T>>` — Computes a minimal edit script turning sequence `a` into sequence `b`: a list of `'equal'`, `'delete'` and `'insert'` operations (see `DiffOperation`) with the smallest possible number of deletions plus insertions.
+- `longestCommonSubsequence<T>(a: Iterable<T>, b: Iterable<T>, equals: (x: T, y: T) => boolean = sameValueZero, options: DiffOptions = {}): T[]` — Computes a longest common subsequence of `a` and `b`: the longest list of elements that appear in both, in the same relative order (not necessarily contiguously).
+
+## objects
+
+Shallow/deep cloning, merging, equality, path access and object reshaping.
+Import: `import { … } from '@emiliodominguez/js-helpers/objects';`
+
+- `merge<T extends object, S extends object[]>(target: T, ...sources: S): MergeAll<T, S>` — Shallowly merges one or more source objects into a NEW object, left to right (later keys win, like `{ ...target, ...a, ...b }`).
+- `clone<T>(value: T): T` — Creates a shallow copy of a value.
+- `hasProperty<T extends object, K extends PropertyKey>(object: T, property: K): object is T & Record<K, unknown>` — Determines whether an object has an OWN property with the given key (inherited properties such as `toString` do not count).
+- `getProperty<T, K extends keyof T>(object: T, property: K): T[K]` — Gets the value of a property of an object (own or inherited, e.g. a class getter, or a string's `length`).
+- `setProperty<T extends object, K extends PropertyKey, V>(object: T, property: K, value: V): void` — Sets the value of a property of an object.
+- `deleteProperty<T, K extends keyof T>(object: T, property: K): void` — Deletes a property from an object.
+- `getPropertyNames<T>(object: T): Array<keyof T>` — Gets the names of ALL own string-keyed properties of an object (`Object.getOwnPropertyNames`), including NON-enumerable ones (e.g. arrays include `'length'`).
+- `isEmpty<T>(value: T): boolean` — Determines whether a value is empty.
+- `pick<T extends object, K extends keyof T>(object: T, keys: ReadonlyArray<K>): Pick<T, K>` — Creates a new object with only the given keys.
+- `omit<T extends object, K extends keyof T>(object: T, keys: ReadonlyArray<K>): Omit<T, K>` — Creates a new object with every own enumerable (string and symbol) property except the given keys.
+- `mapValues<T extends object, R>(object: T, fn: (value: T[keyof T], key: keyof T, object: T) => R): { [K in keyof T]: R }` — Creates a new object with the same own enumerable (string and symbol) keys, whose values are the results of `fn`.
+- `mapKeys<T extends object, K extends PropertyKey>(object: T, fn: (value: T[keyof T], key: keyof T, object: T) => K): Record<K, T[keyof T]>` — Creates a new object with the same values, whose keys are the results of `fn`.
+- `invert<T extends Record<PropertyKey, PropertyKey>>(object: T): Invert<T>` — Creates a new object whose keys are the values of `object` and whose values are the (string) keys.
+- `getFromObjectByKeys<T extends object, P extends NestedKeyOf<T>>(target: T, keys: P): PathValue<T, P>` — Safely reads a nested value through a dot-separated path (array elements are addressed with numeric segments: `'list.0.id'`).
+- `setInObjectByKeys<T extends object>(target: T, path: string, value: unknown): T` — Sets a nested value through a dot-separated path.
+- `deepClone<T>(value: T): T` — Creates a deep copy of a value without using `structuredClone`.
+- `deepMerge<T extends object, S extends object[]>(target: T, ...sources: S): DeepMergeAll<T, S>` — Deeply merges plain objects into a NEW object, left to right (later sources win).
+- `isEqual(a: unknown, b: unknown): boolean` — Deep structural equality.
+- `deepFreeze<T>(object: T): DeepReadonly<T>` — Recursively freezes an object and every object reachable through its own (string and symbol) data properties, as well as `Map` keys/values and `Set` members.
+- `typedKeys<T extends object>(object: T): Array<StringKeyOf<T>>` — `Object.keys` with a precise return type: the OWN ENUMERABLE STRING keys of an object (symbol keys and inherited keys are excluded, numeric keys are returned as strings).
+- `typedEntries<T extends object>(object: T): Array<EntryOf<T>>` — `Object.entries` with a precise return type: `[key, value]` pairs for the OWN ENUMERABLE STRING keys of an object (symbol keys and inherited keys are excluded).
+- `typedFromEntries<E extends readonly [PropertyKey, unknown]>(entries: Iterable<E>): FromEntries<E>` — `Object.fromEntries` with a precise return type: builds a new object from `[key, value]` pairs (later duplicates win).
+- `pickBy<T extends object>(object: T, predicate: (value: T[keyof T], key: keyof T, object: T) => boolean): Partial<T>` — Creates a new object with the own enumerable (string and symbol) properties for which `predicate` returns true.
+- `omitBy<T extends object>(object: T, predicate: (value: T[keyof T], key: keyof T, object: T) => boolean): Partial<T>` — Creates a new object without the own enumerable (string and symbol) properties for which `predicate` returns true (the complement of `pickBy`).
+- `compactObject<T extends object>(object: T): CompactObject<T>` — Creates a SHALLOW copy of an object without the own properties whose value is `undefined`.
+- `flattenObject(object: object, options: FlattenOptions = {}): Record<string, unknown>` — Flattens nested plain objects and arrays into a single-level record mapping each LEAF path to its value.
+- `unflattenObject(record: Readonly<Record<string, unknown>>, options: UnflattenOptions = {}): Record<string, unknown>` — Rebuilds a nested object from a flat record of paths (the inverse of `flattenObject`).
+- `hasInObjectByKeys(target: object, path: string): boolean` — Checks whether a dot-separated path exists in an object: it is `true` exactly when `getFromObjectByKeys` resolves the path to a property (whose value may be `undefined`) rather than falling back to the default value.
+- `deleteFromObjectByKeys(target: object, path: string): boolean` — Deletes the property at a dot-separated path.
+- `diff(a: object, b: object): ObjectDiff` — Computes the structural differences between two trees of plain objects and arrays, as dot-separated paths (array elements use numeric segments: `'list.0'`).
+
+## guards
+
+Runtime type predicates that narrow `unknown` values, composable into path-aware, Standard Schema-compatible validators.
+Import: `import { … } from '@emiliodominguez/js-helpers/guards';`
+
+- `isObject(value: unknown): value is object` — Checks whether a value is a non-null object (`typeof value === 'object'`).
+- `isArray(value: unknown): value is unknown[]` — Checks whether a value is an array (works across realms, uses `Array.isArray`).
+- `isFunction(value: unknown): value is AnyFunction` — Checks whether a value is callable (functions, arrow functions, classes, async and generator functions).
+- `isString(value: unknown): value is string` — Checks whether a value is a primitive string (boxed `String` objects are not strings here).
+- `isNumber(value: unknown): value is number` — Checks whether a value is a primitive number.
+- `isBoolean(value: unknown): value is boolean` — Checks whether a value is a primitive boolean.
+- `isUndefined(value: unknown): value is undefined` — Checks whether a value is `undefined`.
+- `isNull(value: unknown): value is null` — Checks whether a value is `null`.
+- `isSymbol(value: unknown): value is symbol` — Checks whether a value is a symbol.
+- `isBigInt(value: unknown): value is bigint` — Checks whether a value is a bigint.
+- `isPromise(value: unknown): value is PromiseLike<unknown>` — Checks whether a value is promise-like: a native `Promise` OR any thenable (an object or function with a callable `then` property), which is what `await` accepts.
+- `isRegExp(value: unknown): value is RegExp` — Checks whether a value is a genuine `RegExp` (it has the internal regexp slots).
+- `isError(value: unknown): value is Error` — Checks whether a value is an `Error` (including subclasses such as `TypeError`).
+- `isDate(value: unknown): value is Date` — Checks whether a value is a `Date` instance.
+- `isMap(value: unknown): value is Map<unknown, unknown>` — Checks whether a value is a genuine `Map` (brand check: cross-realm and subclass instances pass; objects that merely inherit from `Map.prototype`, and proxies, fail).
+- `isSet(value: unknown): value is Set<unknown>` — Checks whether a value is a genuine `Set` (brand check: cross-realm and subclass instances pass; objects that merely inherit from `Set.prototype`, and proxies, fail).
+- `isWeakMap(value: unknown): value is WeakMap<object, unknown>` — Checks whether a value is a genuine `WeakMap` (brand check: cross-realm and subclass instances pass; objects that merely inherit from `WeakMap.prototype`, and proxies, fail).
+- `isWeakSet(value: unknown): value is WeakSet<object>` — Checks whether a value is a genuine `WeakSet` (brand check: cross-realm and subclass instances pass; objects that merely inherit from `WeakSet.prototype`, and proxies, fail).
+- `isNil(value: unknown): value is null | undefined` — Checks whether a value is `null` or `undefined`.
+- `isDefined<T>(value: T): value is NonNullable<T>` — Checks whether a value is neither `null` nor `undefined`, narrowing `T` to `NonNullable<T>`.
+- `isPlainObject(value: unknown): value is Record<PropertyKey, unknown>` — Checks whether a value is a plain object: an object whose prototype is exactly `Object.prototype` or `null` (object literals, `Object.create(null)`, `JSON.parse` output).
+- `isPrimitive(value: unknown): value is Primitive` — Checks whether a value is a primitive (`string`, `number`, `bigint`, `boolean`, `symbol`, `null` or `undefined`).
+- `isIterable(value: unknown): value is Iterable<unknown>` — Checks whether a value implements the iterable protocol (`value[Symbol.iterator]` is a function).
+- `isAsyncIterable(value: unknown): value is AsyncIterable<unknown>` — Checks whether a value implements the async iterable protocol (`value[Symbol.asyncIterator]` is a function).
+- `isFiniteNumber(value: unknown): value is number` — Checks whether a value is a finite number (excludes `NaN` and `±Infinity`).
+- `isInteger(value: unknown): value is number` — Checks whether a value is an integer number (finite, no fractional part).
+- `isNonEmptyString(value: unknown): value is string` — Checks whether a value is a primitive string with at least one UTF-16 code unit.
+- `isNonEmptyArray<T>(value: T[] | null | undefined): value is [T, ...T[]]` — Checks whether a (mutable) array has at least one element, narrowing it to a non-empty tuple `[T, ...T[]]` so that `value[0]` is typed `T` (not `T \| undefined` under `noUncheckedIndexedAccess`).
+- `isKeyOf<T extends object>(object: T, key: unknown): key is keyof T` — Checks whether `key` is an OWN property key of `object` (string, number or symbol; enumerable or not), narrowing `key` to `keyof T`.
+- `isOneOf<const T extends ReadonlyArray<unknown>>(values: T): (value: unknown) => value is T[number]` — Creates a guard that checks membership in a fixed list of values (compared with SameValueZero, like `Array#includes`, so `NaN` matches `NaN` and `0` matches `-0`), narrowing to the union of the list's element types.
+- `isInstanceOf<T>(constructor: abstract new (...args: never[]) => T): (value: unknown) => value is T` — Creates a guard that checks `value instanceof constructor` (so it honours `Symbol.hasInstance` and the prototype chain; it does not recognise instances from other realms).
+- `isArrayOf<T>(guard: Guard<T>): (value: unknown) => value is T[]` — Creates a guard that checks that a value is an array whose every element passes `guard`.
+- `isRecordOf<T>(guard: Guard<T>): (value: unknown) => value is Record<PropertyKey, T>` — Creates a guard that checks that a value is a plain object (see `isPlainObject`) whose own enumerable property values (string AND symbol keys) all pass `guard`.
+- `isTypedArray(value: unknown): value is TypedArray` — Checks whether a value is one of the eleven built-in typed arrays (`Uint8Array`, `Float64Array`, `BigInt64Array`…), including subclasses and instances from other realms.
+- `isArrayBuffer(value: unknown): value is ArrayBuffer` — Checks whether a value is a genuine `ArrayBuffer` (brand check: cross-realm instances and detached buffers pass; `SharedArrayBuffer`, typed arrays and objects that merely inherit from `ArrayBuffer.prototype` fail).
+- `AssertionErrornew (message = 'Assertion failed')` — Error thrown by `assert`, `assertDefined` and `assertNever`.
+- `assert(condition: unknown, message?: string): asserts condition` — Asserts that a condition is truthy; TypeScript then narrows `condition` (and anything derived from it) after the call.
+- `assertDefined<T>(value: T, message?: string): asserts value is NonNullable<T>` — Asserts that a value is neither `null` nor `undefined`, narrowing it to `NonNullable<T>` after the call.
+- `assertNever(value: never, message?: string): never` — Marks a code path that must be unreachable, typically the `default` branch of an exhaustive `switch`: the call only type-checks when `value` has been narrowed to `never`, so adding a new union member becomes a compile error.
+- `ValidationErrornew (issues: ReadonlyArray<SchemaIssue>)` — Error thrown by `ensure`: an `AssertionError` carrying every `SchemaIssue` found.
+- `isShape<S extends ShapeGuards>(shape: S, options?: IsShapeOptions): (value: unknown) => value is ShapeType<S>` — Creates a guard for objects with the given property guards: the TypeScript-only, zero-dependency equivalent of `z.object()`.
+- `isUnion<const G extends ReadonlyArray<Guard<unknown>>>(...guards: G): (value: unknown) => value is Infer<G[number]>` — Creates a guard that passes when ANY of `guards` passes, narrowing to the union of their types (`z.union()`).
+- `isOptional<T>(guard: Guard<T>): (value: unknown) => value is T | undefined` — Creates a guard that also accepts `undefined`; in an `isShape` the property becomes optional (`z.optional()`).
+- `isNullable<T>(guard: Guard<T>): (value: unknown) => value is T | null` — Creates a guard that also accepts `null` (`z.nullable()`).
+- `isTuple<const G extends ReadonlyArray<Guard<unknown>>>(...guards: G): (value: unknown) => value is { -readonly [K in keyof G]: Infer<G[K]> }` — Creates a guard for arrays of exactly `guards.length` elements, each checked by the guard at the same index (`z.tuple()`).
+- `withMessage<T>(guard: Guard<T>, message: string | ((value: unknown) => string)): (value: unknown) => value is T` — Wraps a guard so that `explain` (and `ensure`, `toStandardSchema`) reports `message` instead of the inner issues when it fails.
+- `explain(guard: Guard<unknown>, value: unknown): SchemaIssue[]` — Lists why `value` fails `guard`, with the path of every offending value; an empty array means it passes.
+- `ensure<T>(guard: Guard<T>, value: unknown): T` — Returns `value` typed as `T` when it passes `guard`, and throws a `ValidationError` listing every issue otherwise.
+- `toStandardSchema<T>(guard: Guard<T>): StandardSchemaV1<unknown, T>` — Turns any guard into a [Standard Schema](https://standardschema.dev) v1 validator, so the guards of this module plug straight into tRPC, TanStack Form, React Hook Form, Hono, Elysia and the rest of the ecosystem (issues carry paths, see `explain`).
+
+## strings
+
+Unicode-aware transformations, case conversion, escaping, templating and text metrics.
+Import: `import { … } from '@emiliodominguez/js-helpers/strings';`
+
+- `reverse(string: string): string` — Reverses a string by user-perceived characters (grapheme clusters), so emoji, surrogate pairs and combining marks are kept intact.
+- `capitalize(string: string): string` — Upper-cases the first user-perceived character (grapheme cluster) of a string and leaves the rest untouched.
+- `uncapitalize(string: string): string` — Lower-cases the first user-perceived character (grapheme cluster) of a string and leaves the rest untouched.
+- `substring(string: string, start: number, end: number): string` — Extracts a substring from a string based on start and end indices (UTF-16 code units, like `String.prototype.substring`).
+- `includes(string: string, subString: string): boolean` — Checks if a string contains a specified substring (case-sensitive).
+- `replace(string: string, searchValue: string, replaceValue: string): string` — Replaces all occurrences of a substring with a replacement string.
+- `truncate(string: string, length: number, suffix: string = '...'): string` — Truncates a string to `length` user-perceived characters (grapheme clusters) and appends a suffix when it was longer.
+- `repeat(string: string, times: number): string` — Repeats a string a specified number of times (wraps `String.prototype.repeat`).
+- `trim(string: string): string` — Removes whitespace (and line terminators) from both ends of a string.
+- `toTitleCase(string: string): string` — Converts a string to title case: in every whitespace-separated word the first letter is upper-cased and everything else is lower-cased.
+- `toSnakeCase(string: string): string` — Converts a string to snake_case.
+- `toKebabCase(string: string): string` — Converts a string to kebab-case, using the same word detection as `toSnakeCase`.
+- `toConstantCase(string: string): string` — Converts a string to CONSTANT_CASE (SCREAMING_SNAKE_CASE), using the same word detection as `toSnakeCase`.
+- `toCamelCase(string: string): string` — Converts a string to camelCase, using the same word detection as `toSnakeCase`.
+- `toPascalCase(string: string): string` — Converts a string to PascalCase, using the same word detection as `toSnakeCase`.
+- `removeDiacritics(string: string): string` — Removes diacritical marks (accents, umlauts, cedillas...) from a string: it is decomposed (NFD), the combining diacritical marks are stripped and the result is recomposed (NFC).
+- `toSlug(string: string): string` — Converts a string to a URL-friendly slug: compatibility-decomposed (NFKD), diacritics removed, a few common Latin letters transliterated (`ß` → `ss`, `æ` → `ae`, `ø` → `o`...), lower-cased, every run of characters outside `[a-z0-9]` replaced by a single `-`, and leading/trailing hyphens removed.
+- `toBoolean(string: string): boolean` — Converts a string to a boolean, which is handy for environment variables and query parameters.
+- `toNumber(string: string): number` — Converts a string holding a finite decimal number to that number, ignoring surrounding whitespace: the trimmed string must satisfy `isNumericString` from the validate module (optional sign, digits with an optional fraction, optional exponent), so the result is either a finite number or `NaN`, never `±Infinity`.
+- `startsWith(string: string, subString: string): boolean` — Checks if a string starts with a given substring (case-sensitive).
+- `endsWith(string: string, subString: string): boolean` — Checks if a string ends with a given substring (case-sensitive).
+- `countSubString(string: string, subString: string, options: CountSubStringOptions = {}): number` — Counts the non-overlapping, literal occurrences of a substring, scanning left to right (`countSubString('aaaa', 'aa')` is `2`).
+- `isEmpty(string: string): boolean` — Checks if a string is empty or contains only whitespace characters.
+- `getWords(string: string): string[]` — Extracts the words of a string.
+- `isPalindrome(string: string, options: IsPalindromeOptions = {}): boolean` — Checks if a string reads the same backwards (grapheme-aware, see `reverse`).
+- `escapeRegExp(string: string): string` — Escapes a string so that it matches itself literally in a regular expression, following the TC39 `RegExp.escape` algorithm (same output as the native `RegExp.escape` where it exists).
+- `escapeHtml(value: unknown): string` — Escapes the HTML-significant characters `&`, `<`, `>`, `"` and `'` so the string can be safely embedded in HTML text or quoted attributes (not in unquoted attributes, URLs, `<script>` or `<style>`).
+- `unescapeHtml(value: unknown): string` — Reverses `escapeHtml`: decodes `&lt;`, `&gt;`, `&quot;`, `&#39;`, `&#x27;`, `&apos;` and `&amp;`.
+- `normalizeWhitespace(string: string): string` — Trims a string and collapses every run of whitespace (spaces, tabs, line breaks, non-breaking spaces...) into a single space.
+- `interpolate(template: string, values: InterpolationValues): string` — Replaces `{key}` and `{nested.key}` placeholders (whitespace inside the braces is ignored) with values from an object.
+- `levenshtein(a: string, b: string): number` — Computes the Levenshtein edit distance between two strings: the minimum number of single-character insertions, deletions and substitutions turning `a` into `b`.
+- `similarity(a: string, b: string): number` — Computes a normalized similarity score from the `levenshtein` distance: `1 - distance / maxLength`, where lengths are counted in code points.
+- `dedent(string: string): string` — Removes the common leading indentation from a multi-line string, so it can be written indented in the source code.
+- `splitLines(string: string): string[]` — Splits a string into lines.
+- `wordWrap(string: string, width: number, options: WordWrapOptions = {}): string` — Wraps text to lines of at most `width` user-perceived characters (grapheme clusters) using a greedy algorithm: words are separated by whitespace and added to the current line while they fit, with a single space between them.
+- `mask(string: string, options: MaskOptions = {}): string` — Hides the middle of a string (card numbers, tokens, phone numbers...), replacing every user-perceived character (grapheme cluster) except the first `visibleStart` and the last `visibleEnd` ones with `char`.
+- `randomString(length: number, alphabet: string = ALPHANUMERIC, random: RandomGenerator = Math.random): string` — Generates a random string by drawing `length` characters uniformly and independently from `alphabet`.
+- `toSentenceCase(string: string): string` — Converts a string to Sentence case, using the same word detection as `toSnakeCase`: the words are lower-cased, joined with single spaces, and the first letter of the first word is upper-cased.
+- `pluralize(count: number, singular: string, plural: string = singular + 's'): string` — Picks the singular or plural form of a word for a count.
+- `formatCount(count: number, singular: string, plural: string = singular + 's'): string` — Formats a count followed by the matching singular or plural word (see `pluralize`); the number is stringified with `String()`.
+- `ensurePrefix(string: string, prefix: string): string` — Prepends `prefix` unless the string already starts with it.
+- `ensureSuffix(string: string, suffix: string): string` — Appends `suffix` unless the string already ends with it.
+- `stripPrefix(string: string, prefix: string): string` — Removes `prefix` from the start of the string once, if present.
+- `stripSuffix(string: string, suffix: string): string` — Removes `suffix` from the end of the string once, if present.
+
+## url
+
+Query-string building and parsing, URL joining and query merging, without URL object types.
+Import: `import { … } from '@emiliodominguez/js-helpers/url';`
+
+- `buildQueryString(params: QueryParams, options: BuildQueryStringOptions = {}): string` — Builds a query string (WITHOUT the leading `?`) from a record of parameters.
+- `parseQueryString(query: string): ParsedQuery` — Parses a query string into a record.
+- `withQuery(url: string, params: QueryParams, options: BuildQueryStringOptions = {}): string` — Adds parameters to a URL string that may already have a query and/or a `#fragment`.
+- `joinUrl(...parts: string[]): string` — Joins URL parts with exactly one `/` between them.
+- `getQueryParam(url: string, key: string): string | undefined` — Reads the first value of a query parameter from a URL string (see `parseQueryString` for the decoding rules).
+- `isAbsoluteUrl(string: string): boolean` — Checks whether a string is an absolute URL, i.e. one that names its own host (or file) instead of being resolved against the current page.
+
+## math
+
+Precise arithmetic, statistics, number theory and random numbers.
+Import: `import { … } from '@emiliodominguez/js-helpers/math';`
+
+- `sum(numbers: ReadonlyArray<number>): number` — Calculates the sum of an array of numbers using Neumaier (improved Kahan–Babuška) compensated summation, which keeps the rounding error independent of the number of elements and makes the result (practically) independent of their order.
+- `round(number: number, decimals = 0): number` — Rounds a number to a given number of decimal places, using its decimal representation so that values like `1.005` round as written (`round(1.005, 2) === 1.01`).
+- `average(numbers: ReadonlyArray<number>): number` — Calculates the arithmetic mean of an array of numbers (using the compensated `sum`, so numeric strings count as numbers).
+- `factorial(number: number): number` — Calculates the factorial of a non-negative integer, iteratively.
+- `max(numbers: ReadonlyArray<number>): number` — Finds the maximum value in an array of numbers, with the same semantics as `Math.max` (`-Infinity` for an empty array, `NaN` if any element is `NaN`, `0` preferred over `-0`), but without spreading the array, so it works on arrays of any length.
+- `min(numbers: ReadonlyArray<number>): number` — Finds the minimum value in an array of numbers, with the same semantics as `Math.min` (`Infinity` for an empty array, `NaN` if any element is `NaN`, `-0` preferred over `0`), but without spreading the array, so it works on arrays of any length.
+- `abs(number: number): number` — Finds the absolute value of a number.
+- `sqrt(number: number): number` — Finds the square root of a number.
+- `pow(base: number, exponent: number): number` — Raises a base to an exponent.
+- `log(number: number, base: number): number` — Returns the logarithm of a number in the given base.
+- `ceil(number: number): number` — Returns the smallest integer greater than or equal to a number.
+- `floor(number: number): number` — Returns the largest integer less than or equal to a number.
+- `modulo(dividend: number, divisor: number): number` — Mathematical (floored) modulo: the result always has the sign of the `divisor` (so for a positive divisor it lies in `[0, divisor)`), unlike the JavaScript `%` operator (see `remainder`).
+- `remainder(dividend: number, divisor: number): number` — Truncated remainder, identical to the JavaScript `%` operator: the result has the sign of the `dividend`.
+- `randomBetween(minimum: number, maximum: number, random: RandomGenerator = Math.random): number` — Generates a random floating-point number in the half-open range `[minimum, maximum)`.
+- `randomIntBetween(minimum: number, maximum: number, random: RandomGenerator = Math.random): number` — Returns a random integer between `minimum` and `maximum`, both inclusive.
+- `toRadians(degrees: number): number` — Converts degrees to radians.
+- `toDegrees(radians: number): number` — Converts radians to degrees.
+- `clamp(value: number, minimum: number, maximum: number): number` — Restricts a value to the inclusive range `[minimum, maximum]`.
+- `lerp(start: number, end: number, t: number): number` — Linear interpolation between `start` and `end`.
+- `inverseLerp(start: number, end: number, value: number): number` — Inverse of `lerp`: the factor `t` for which `lerp(start, end, t) === value`.
+- `mapRange(value: number, inMin: number, inMax: number, outMin: number, outMax: number): number` — Linearly maps a value from the range `[inMin, inMax]` to `[outMin, outMax]` (not clamped).
+- `inRange(value: number, start: number, end: number): boolean` — Checks whether a value lies in the half-open range `[start, end)`.
+- `product(numbers: ReadonlyArray<number>): number` — Multiplies all numbers of an array together.
+- `median(numbers: ReadonlyArray<number>): number` — Finds the median of an array of numbers (the mean of the two middle values for even lengths).
+- `mode(numbers: ReadonlyArray<number>): number[]` — Finds the most frequent value(s) of an array of numbers.
+- `variance(numbers: ReadonlyArray<number>, options: VarianceOptions = {}): number` — Computes the variance of an array of numbers using Welford's numerically stable online algorithm.
+- `standardDeviation(numbers: ReadonlyArray<number>, options: VarianceOptions = {}): number` — Computes the standard deviation (square root of `variance`) of an array of numbers.
+- `gcd(a: number, b: number): number` — Greatest common divisor of two integers (Euclid's algorithm).
+- `lcm(a: number, b: number): number` — Least common multiple of two integers.
+- `isPrime(number: number): boolean` — Checks whether a number is a prime.
+- `isEven(number: number): boolean` — Checks whether a number is an even integer.
+- `isOdd(number: number): boolean` — Checks whether a number is an odd integer.
+- `percentage(value: number, total: number): number` — Expresses `value` as a percentage of `total` (`value / total * 100`).
+- `quantile(numbers: ReadonlyArray<number>, q: number): number` — Computes the `q`-quantile of an array of numbers by linear interpolation between closest ranks (R type 7, the default of R, NumPy and Excel's `PERCENTILE.INC`): with the values sorted ascending, `h = (n - 1) * q` and the result interpolates between the values at ranks `floor(h)` and `ceil(h)`.
+- `percentile(numbers: ReadonlyArray<number>, p: number): number` — Computes the `p`-th percentile of an array of numbers: `quantile(numbers, p / 100)` (linear interpolation, same semantics as Excel's `PERCENTILE.INC`).
+- `cumulativeSum(numbers: Iterable<number>): number[]` — Computes the running totals of a sequence of numbers using the same compensated (Neumaier) summation as `sum`, so the last element is exactly `sum(numbers)` and rounding errors do not accumulate along the sequence.
+- `approximatelyEqual(a: number, b: number, options: ApproximatelyEqualOptions = {}): boolean` — Checks whether two numbers are close to each other, with the semantics of Python's `math.isclose`: `\|a - b\| <= max(relative * max(\|a\|, \|b\|), absolute)`.
+- `weightedAverage(values: ReadonlyArray<number>, weights: ReadonlyArray<number>): number` — Computes the weighted arithmetic mean `Σ(value × weight) / Σ(weight)`, using the compensated `sum`.
+- `normalize(numbers: ReadonlyArray<number>): number[]` — Min–max normalization: linearly rescales the numbers so the smallest becomes `0` and the largest `1`.
+- `formatBytes(bytes: number, options: FormatBytesOptions = {}): string` — Formats a byte count as a human-readable string, using SI units (`kB`, `MB`, …, powers of `1000`) by default, or IEC binary units (`KiB`, `MiB`, …, powers of `1024`) with `{ base: 1024 }`.
+- `ordinal(n: number): string` — Converts an integer to its English ordinal string (`1st`, `2nd`, `3rd`, `4th`, `11th`, `12th`, `13th`, `21st`, `112th`, …).
+- `nthRoot(value: number, n: number): number` — Computes the real `n`-th root of a number.
+- `roundToStep(value: number, step: number): number` — Rounds a number to the nearest multiple of `step` (e.g. snapping to quarters with `step = 0.25`).
+
+## functions
+
+Function composition, currying, memoization and rate limiting.
+Import: `import { … } from '@emiliodominguez/js-helpers/functions';`
+
+- `bind<T, A extends unknown[], R>(fn: (this: T, ...args: A) => R, thisArg: T): (...args: A) => R` — Creates a function that always invokes `fn` with `thisArg` as `this`, regardless of how it is called.
+- `partial<A extends unknown[], B extends unknown[], R>(fn: (...args: [...A, ...B]) => R, ...args: A): (...rest: B) => R` — Creates a function that invokes `fn` with `args` prepended to the arguments it receives.
+- `curry<A extends unknown[], R>(fn: (...args: A) => R, arity: number = fn.length): Curried<A, R>` — Curries `fn`: the returned function collects arguments (one or several at a time) until `arity` of them have been supplied, then invokes `fn` with all of them and the `this` of the final call.
+- `compose(): <T>(value: T) => T` — Composes functions from right to left: `compose(f, g, h)(...args)` is `f(g(h(...args)))`.
+- `pipe(): <T>(value: T) => T` — Composes functions from left to right: `pipe(f, g, h)(...args)` is `h(g(f(...args)))`.
+- `defaultMemoizeKey(...args: unknown[]): unknown` — The default cache-key resolver used by `memoize` (and the `memoize` decorator).
+- `memoize<F extends AnyFunction, C extends MemoizeCache<unknown, unknown> = Map<unknown, ReturnType<F>>>(fn: F, options: MemoizeOptions<F, C> = {}): Memoized<F, C>` — Creates a function that caches the results of `fn` by key (see `defaultMemoizeKey`).
+- `throttle<F extends AnyFunction>(fn: F, wait: number, options: ThrottleOptions = {}): Throttled<F>` — Creates a throttled function that invokes `fn` at most once per `wait` milliseconds.
+- `debounce<F extends AnyFunction>(fn: F, wait: number, options: DebounceOptions = {}): Debounced<F>` — Creates a debounced function that delays invoking `fn` until `wait` milliseconds have elapsed since the last call.
+- `once<F extends AnyFunction>(fn: F): F` — Creates a function that invokes `fn` only on its first call and returns that first result on every later call.
+- `before<F extends AnyFunction>(n: number, fn: F): (this: ThisParameterType<F>, ...args: Parameters<F>) => ReturnType<F> | undefined` — Creates a function that invokes `fn` only while it has been called fewer than `n` times; later calls return the last result.
+- `after<F extends AnyFunction>(n: number, fn: F): (this: ThisParameterType<F>, ...args: Parameters<F>) => ReturnType<F> | undefined` — Creates a function that invokes `fn` only once it has been called at least `n` times (from the `n`-th call on); earlier calls return `undefined`.
+- `negate<A extends unknown[], T = unknown>(predicate: (this: T, ...args: A) => unknown): (this: T, ...args: A) => boolean` — Creates a predicate that returns the boolean negation of `predicate`.
+- `identity<T>(value: T): T` — Returns its argument unchanged.
+- `noop(..._args: unknown[]): void` — Does nothing and returns `undefined`, whatever the arguments.
+- `attempt<A extends unknown[], R>(fn: (...args: A) => R, ...args: A): Result<R>` — Calls `fn(...args)` and captures its outcome as a `Result` tuple instead of throwing.
+- `times<R>(n: number, fn: (index: number) => R): R[]` — Calls `fn` `n` times with the indexes `0` to `n - 1` and collects the results in a new array.
+- `flip<A extends unknown[], R>(fn: (...args: A) => R): (...args: Reverse<A>) => R` — Creates a function that invokes `fn` with the arguments it receives in reverse order.
+- `unary<T, R>(fn: (arg: T) => R): (arg: T) => R` — Creates a function that invokes `fn` with only its first argument, ignoring the others.
+- `constant<T>(value: T): (..._args: unknown[]) => T` — Creates a function that ignores its arguments and always returns `value` (the same reference every time).
+- `shallowEqualArgs(next: ReadonlyArray<unknown>, previous: ReadonlyArray<unknown>): boolean` — Compares two argument lists element-wise with SameValueZero (`===`, except that `NaN` equals `NaN`).
+- `memoizeLast<F extends AnyFunction>(fn: F, isEqual: (next: Parameters<F>, previous: Parameters<F>) => boolean = shallowEqualArgs): MemoizedLast<F>` — Creates a function that remembers only its latest call: when called again with equal arguments (and the same `this`), it returns the cached result without invoking `fn`; otherwise it invokes `fn` and replaces the cache.
+
+## async
+
+Promise utilities: retries, timeouts, polling, limiters, keyed Promise.all and async debounce.
+Import: `import { … } from '@emiliodominguez/js-helpers/async';`
+
+- `AbortErrornew (message = 'The operation was aborted.')` — Error used to reject operations cancelled through an abort signal that carries no `reason`.
+- `TimeoutErrornew (message = 'The operation timed out.')` — Error used by `withTimeout` when the wrapped promise does not settle in time.
+- `createDeferred<T>(): Deferred<T>` — Creates a promise that can be resolved or rejected from the outside.
+- `sleep(ms: number, options: SleepOptions = {}): Promise<void>` — Resolves after `ms` milliseconds.
+- `withTimeout<T>(promise: PromiseLike<T> | T, ms: number, message?: string): Promise<T>` — Races `promise` against a timer: resolves/rejects like `promise` if it settles within `ms` milliseconds, otherwise rejects with a `TimeoutError`.
+- `retry<T>(fn: (attempt: number) => Promise<T> | T, options: RetryOptions = {}, random: RandomGenerator = Math.random): Promise<T>` — Calls `fn` until it succeeds, retrying up to `options.retries` times with exponential backoff: the delay before retry `k` (1-based) is `min(delay * factor^(k - 1), maxDelay)`, optionally randomised with full jitter.
+- `mapWithConcurrency<T, R>(items: Iterable<T>, mapper: (item: T, index: number) => Promise<R> | R, concurrency = Infinity): Promise<R[]>` — Maps `items` with an async `mapper`, running at most `concurrency` mappers at the same time, and resolves with the results in input order.
+- `attemptAsync<T>(fnOrPromise: PromiseLike<T> | (() => PromiseLike<T> | T)): Promise<Result<T>>` — Awaits a promise (or calls a possibly async function and awaits its result) and captures the outcome as a `Result` tuple.
+- `createLimiter(concurrency: number, options: LimiterOptions = {}): Limiter` — Creates a limiter that runs at most `concurrency` tasks at the same time, starting waiting tasks in FIFO order (like `p-limit`).
+- `pollUntil<T>(check: () => T | PromiseLike<T>, options: PollOptions = {}): Promise<Truthy<Awaited<T>>>` — Calls `check` immediately and then every `interval` ms (waiting for async checks to settle in between, so checks never overlap) until it returns (or resolves to) a truthy value, and resolves with that value.
+- `promiseAllObject<T extends object>(obj: T): Promise<{ -readonly [K in keyof T]: Awaited<T[K]> }>` — Like `Promise.all`, but for an object of promises (or values): resolves with an object with the same keys and the awaited values.
+- `promiseAllSettledObject<T extends object>(obj: T): Promise<{ -readonly [K in keyof T]: PromiseSettledResult<Awaited<T[K]>> }>` — Like `Promise.allSettled`, but for an object of promises (or values): resolves with an object with the same keys and a `PromiseSettledResult` for each value.
+- `debounceAsync<F extends (...args: never[]) => unknown>(fn: F, wait: number): DebouncedAsync<F>` — Creates a debounced version of a (possibly async) function: `fn` is invoked `wait` ms after the last call of a burst, with the latest `this` and arguments, and every call of the burst returns a promise that settles with the result of that single invocation.
+- `sequence<T>(tasks: Iterable<() => PromiseLike<T> | T>): Promise<T[]>` — Runs (possibly async) tasks one at a time, in iteration order, and resolves with their results in the same order.
+- `timeoutSignal(ms: number): PlatformAbortSignal` — Creates an `AbortSignal` that aborts with a `TimeoutError` after `ms` milliseconds — like the platform's `AbortSignal.timeout`, but with this library's `TimeoutError` as the reason (so `error instanceof TimeoutError` works across the async helpers).
+- `anySignal(signals: Iterable<AbortSignalLike | null | undefined>): PlatformAbortSignal` — Combines abort signals: returns a new `AbortSignal` that aborts as soon as any of the inputs aborts, with that input's `reason` (or an `AbortError` when it has none) — like the platform's `AbortSignal.any`, but accepting any `AbortSignalLike`.
+- `abortable<T>(promise: PromiseLike<T> | T, signal: AbortSignalLike | null | undefined): Promise<T>` — Settles like `promise`, unless `signal` aborts first, in which case it rejects with the signal's `reason` (or an `AbortError` when it has none).
+- `throwIfAborted(signal: AbortSignalLike | null | undefined): void` — Throws the signal's `reason` (or an `AbortError` when it has none) if `signal` is aborted; does nothing otherwise.
+
+## color
+
+Hex/RGB/HSL conversion, mixing, lightening and WCAG contrast checks.
+Import: `import { … } from '@emiliodominguez/js-helpers/color';`
+
+- `parseHex(hex: string): Rgba` — Parses a CSS hex colour.
+- `parseColor(input: string): Rgba` — Parses a CSS colour string (CSS Color 4) into an `Rgba` colour.
+- `toRgba(input: ColorInput): Rgba` — Normalizes any `ColorInput` to a fresh `Rgba` object: strings are parsed with `parseColor` (so every hex string gives the same result as `parseHex`); for objects, `r`, `g`, `b` are clamped to `[0, 255]` and rounded to integers, and `a` (default `1` when missing or `undefined`) is clamped to `[0, 1]`.
+- `toHex(color: ColorInput, options: ToHexOptions = {}): string` — Formats a colour as a lowercase CSS hex string.
+- `toCssRgb(color: ColorInput): string` — Formats a colour as a CSS `rgb()` string in the modern space-separated syntax: `'rgb(r g b)'`, or `'rgb(r g b / a)'` for translucent colours.
+- `toCssHsl(color: ColorInput): string` — Formats a colour as a CSS `hsl()` string in the modern space-separated syntax: `'hsl(h s% l%)'`, or `'hsl(h s% l% / a)'` for translucent colours.
+- `rgbToHsl(color: ColorInput): Hsl` — Converts an RGB colour to HSL using the standard (CSS Color 4) formulas.
+- `hslToRgb(hsl: Hsl): Rgb` — Converts an HSL colour to RGB using the standard (CSS Color 4) formulas, rounding channels to integers.
+- `mix(colorA: ColorInput, colorB: ColorInput, weight = 0.5): Rgba` — Mixes two colours by plain linear interpolation of their sRGB channels and alpha (no gamma-correct or premultiplied blending).
+- `lighten(color: ColorInput, amount: number): Rgba` — Makes a colour lighter by adding `amount` percentage points to its HSL lightness (the result is clamped at `100`, white).
+- `darken(color: ColorInput, amount: number): Rgba` — Makes a colour darker by subtracting `amount` percentage points from its HSL lightness (the result is clamped at `0`, black).
+- `withAlpha(color: ColorInput, alpha: number): Rgba` — Returns a copy of a colour with the given alpha.
+- `relativeLuminance(color: ColorInput): number` — Computes the WCAG 2.x relative luminance of a colour: `0.2126 R + 0.7152 G + 0.0722 B` over the linearized sRGB channels.
+- `contrastRatio(a: ColorInput, b: ColorInput): number` — Computes the WCAG 2.x contrast ratio `(L1 + 0.05) / (L2 + 0.05)` between two colours, where `L1` is the larger relative luminance.
+- `getReadableTextColor<L extends ColorInput = '#ffffff', D extends ColorInput = '#000000'>(background: ColorInput, options: ReadableTextColorOptions<L, D> = {}): L | D` — Picks whichever of two text colours has the higher WCAG contrast against a background (the dark one on ties).
+- `meetsContrast(foreground: ColorInput, background: ColorInput, options: MeetsContrastOptions = {}): boolean` — Checks whether a foreground/background pair meets a WCAG 2.x contrast requirement: AA needs `4.5:1` (`3:1` for large text), AAA needs `7:1` (`4.5:1` for large text).
+
+## search
+
+Fuzzy matching and ranking with highlight ranges, for command palettes and filter-as-you-type UIs.
+Import: `import { … } from '@emiliodominguez/js-helpers/search';`
+
+- `fuzzyMatch(query: string, target: string, options: FuzzyMatchOptions = {}): FuzzyMatch | undefined` — Fuzzy-matches `query` against `target` (as in command palettes and filter-as-you-type lists): the query matches when all of its characters appear in the target in order, not necessarily contiguously.
+- `fuzzySearch(items: Iterable<string>, query: string, options?: FuzzySearchOptions<string>): Array<FuzzySearchResult<string>>` — Fuzzy-filters and ranks `items` by how well they match `query` (see `fuzzyMatch` for the matching and scoring rules).
+- `highlight(text: string, ranges: Iterable<readonly [number, number]>): HighlightSegment[]` — Splits `text` into alternating matched / unmatched segments, e.g. to render the `ranges` of `fuzzyMatch` with `<mark>` elements in React (no `dangerouslySetInnerHTML` needed).
+
+## easing
+
+Animation easing curves, CSS-accurate cubic-bezier() and steps(), and an analytic spring.
+Import: `import { … } from '@emiliodominguez/js-helpers/easing';`
+
+- `easeOut(easing: EasingFunction): EasingFunction` — Turns an ease-in function into its ease-out counterpart by point reflection: `t => 1 - easing(1 - t)`.
+- `easeInOut(easing: EasingFunction): EasingFunction` — Builds a symmetric ease-in-out function from an ease-in function: the first half runs `easing` at double speed, the second half its reflection, so that `g(1 - t) === 1 - g(t)` and `g(0.5) === 0.5`.
+- `linear(t: number): number` — No easing: `t => t`.
+- `easeInQuad(t: number): number` — Quadratic ease-in: `t²`.
+- `easeInCubic(t: number): number` — Cubic ease-in: `t³` (computed with multiplications, like the other power easings: much faster than `**`).
+- `easeInQuart(t: number): number` — Quartic ease-in: `t⁴`.
+- `easeInQuint(t: number): number` — Quintic ease-in: `t⁵`.
+- `easeInSine(t: number): number` — Sinusoidal ease-in: `1 - cos(t·π/2)`.
+- `easeInExpo(t: number): number` — Exponential ease-in: `2^(10t - 10)`, pinned to `0` at `t = 0`.
+- `easeInCirc(t: number): number` — Circular ease-in: `1 - √(1 - t²)` (`NaN` for `\|t\| > 1`).
+- `easeInBack(t: number): number` — "Back" ease-in: pulls back slightly (about 10%) before moving forward: `t²·((c + 1)t - c)` with `c = 1.70158`.
+- `easeInElastic(t: number): number` — Elastic ease-in: a growing oscillation, `-2^(10t - 10)·sin((10t - 10.75)·2π/3)`, pinned to `0` and `1` at the ends.
+- `cubicBezier(x1: number, y1: number, x2: number, y2: number): EasingFunction` — Creates an easing function equivalent to CSS `cubic-bezier(x1, y1, x2, y2)`: the curve from `(0, 0)` to `(1, 1)` with control points `(x1, y1)` and `(x2, y2)`, evaluated by solving `x(s) = t` for the curve parameter `s` to ~1e-12 (Newton–Raphson, safeguarded by bisection, which always converges because `x` is monotonic when `x1, x2 ∈ [0, 1]`; for `t > 0.5` on the mirrored curve, so that both ends are equally precise), then returning `y(s)`.
+- `steps(count: number, position: StepPosition = 'jump-end'): EasingFunction` — Creates a step easing function equivalent to CSS `steps(count, position)`: the output jumps between `jumps + 1` evenly spaced levels `0, 1/jumps, ..., 1`, where `jumps` is `count` (`jump-start` / `jump-end`), `count - 1` (`jump-none`) or `count + 1` (`jump-both`).
+- `spring(options: SpringOptions = {}): Spring` — Solves a damped harmonic oscillator (mass `m` on a spring of stiffness `k` with damping `c`) released at position `0` with initial `velocity` towards a target at `1`, in closed form (under-, critically and over-damped cases), like the physics springs of SwiftUI, Framer Motion or React Spring.
+- `interpolate(from: number, to: number, t: number, easing: EasingFunction = linear): number` — Interpolates between two numbers with an easing function: `lerp(from, to, easing(t))`.
+
+## format
+
+Deterministic, cached Intl formatting: numbers, currency, percent, compact, units, lists, dates, ordinals.
+Import: `import { … } from '@emiliodominguez/js-helpers/format';`
+
+- `formatNumber(value: number | bigint, options: FormatNumberOptions = {}): string` — Formats a number with locale-aware grouping and decimal separators via `Intl.NumberFormat` (every non-style option passes through: `minimumFractionDigits`, `maximumFractionDigits`, `signDisplay`, `useGrouping`, `notation`, …).
+- `formatCurrency(value: number | bigint, currency: string, options: FormatCurrencyOptions = {}): string` — Formats an amount of money via `Intl.NumberFormat` with `style: 'currency'`.
+- `formatPercent(value: number, options: FormatPercentOptions = {}): string` — Formats a ratio as a percentage via `Intl.NumberFormat` with `style: 'percent'` (`0.256` is 25.6 %).
+- `formatCompact(value: number | bigint, options: FormatCompactOptions = {}): string` — Formats a number in compact notation (`1.2K`, `3.4M`, `1.2 thousand`) via `Intl.NumberFormat` with `notation: 'compact'`.
+- `formatUnit(value: number | bigint, unit: string, options: FormatUnitOptions = {}): string` — Formats a measurement via `Intl.NumberFormat` with `style: 'unit'`.
+- `formatList(items: Iterable<string>, options: FormatListOptions = {}): string` — Joins strings into a grammatical list via `Intl.ListFormat` (`'a, b, and c'`, `'a, b, or c'`).
+- `formatDateTime(date: DateInput, options: FormatDateTimeOptions = {}): string` — Formats an instant via `Intl.DateTimeFormat`.
+- `formatRelativeTime(value: number, unit: Intl.RelativeTimeFormatUnit, options: FormatRelativeTimeOptions = {}): string` — Formats an explicit amount of a unit relative to now (`'in 3 days'`, `'2 hours ago'`) via `Intl.RelativeTimeFormat`.
+- `formatOrdinal(n: number, options: FormatOrdinalOptions = {}): string` — Formats an integer as an ordinal (`'1st'`, `'22nd'`, `'1,001st'`), picking the suffix from its `Intl.PluralRules` ordinal category.
+- `pluralRule(count: number, options: PluralRuleOptions = {}): Intl.LDMLPluralRule` — Returns the `Intl.PluralRules` category of a count — the key to pick the right message variant (`'one'`, `'few'`, `'other'`…).
+
+## validate
+
+Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates.
+Import: `import { … } from '@emiliodominguez/js-helpers/validate';`
+
+- `isEmail(value: unknown): value is string` — Checks whether a value is an email address, using the WHATWG HTML "valid email address" grammar (the one browsers apply to `<input type="email">`) plus the usual length limits: at most 64 characters before the `@`, 254 characters in total and 63 characters per domain label.
+- `isUrl(value: unknown, options: IsUrlOptions = {}): value is string` — Checks whether a value is an absolute URL with an allowed scheme, parsing it with the WHATWG `URL` parser (`globalThis.URL`).
+- `isUuid(value: unknown, version?: UuidVersion): value is string` — Checks whether a value is a UUID as defined by RFC 9562 (which obsoletes RFC 4122), in the hyphenated 8-4-4-4-12 form, case-insensitively.
+- `isIPv4(value: unknown): value is string` — Checks whether a value is an IPv4 address in dotted-decimal form: exactly four decimal octets in `[0, 255]`.
+- `isIPv6(value: unknown): value is string` — Checks whether a value is an IPv6 address (RFC 4291 §2.2): eight groups of 1–4 hex digits, optionally compressed once with `::` (which stands for one or more zero groups), and optionally ending in an embedded IPv4 address (`::ffff:192.0.2.1`).
+- `isIP(value: unknown): value is string` — Checks whether a value is an IPv4 or an IPv6 address (see `isIPv4` and `isIPv6`).
+- `isHexColor(value: unknown, options?: IsHexColorOptions): value is string` — Checks whether a value is a CSS hex colour: `#rgb`, `#rrggbb` and, unless `alpha` is `false`, `#rgba` and `#rrggbbaa`, in any letter case.
+- `isSemver(value: unknown): value is string` — Checks whether a value is a semantic version, using the official regular expression from semver.org (SemVer 2.0.0): `MAJOR.MINOR.PATCH`, optional `-pre.release` identifiers and optional `+build.metadata`.
+- `parseSemver(value: unknown): SemVer | undefined` — Parses a semantic version into its parts.
+- `compareSemver(a: string, b: string): -1 | 0 | 1` — Compares two semantic versions by SemVer 2.0.0 precedence (semver.org §11): major, minor and patch numerically (exactly, at any size), then a version with a pre-release is lower than the same version without one, and pre-releases are compared identifier by identifier (numeric identifiers numerically and lower than alphanumeric ones, which compare in ASCII order; a shorter list of equal identifiers is lower).
+- `isIsoDateString(value: unknown): value is string` — Checks whether a value is an ISO 8601 / RFC 3339 calendar date in the `YYYY-MM-DD` form that is an actual date (`2023-02-29` and `2024-04-31` are rejected; leap years are handled).
+- `isIsoDateTimeString(value: unknown): value is string` — Checks whether a value is an RFC 3339 date-time: `YYYY-MM-DD`, `T`, `hh:mm:ss`, an optional fraction of a second, then `Z` or a `±hh:mm` offset (`T` and `Z` may be lowercase, as RFC 3339 allows).
+- `luhnCheck(digits: string): boolean` — Validates a string of digits with the Luhn (mod 10) checksum used by payment card numbers, IMEIs and similar identifiers.
+- `isCreditCardNumber(value: unknown): value is string` — Checks whether a value looks like a payment card number: 12 to 19 digits, not all zeros, optionally grouped with single spaces or dashes between digits, that pass the Luhn checksum (see `luhnCheck`).
+- `isJsonString(value: unknown): value is string` — Checks whether a value is a string that `JSON.parse` accepts (any JSON text, including `'1'`, `'"text"'` and `'null'`).
+- `isBase64(value: unknown, options: IsBase64Options = {}): value is string` — Checks whether a value is base64 (RFC 4648 §4) or, with `urlSafe`, base64url (§5) text.
+- `isSlug(value: unknown): value is string` — Checks whether a value is a URL slug: lowercase ASCII letters and digits in runs separated by single hyphens, with no leading or trailing hyphen.
+- `isNumericString(value: unknown): value is string` — Checks whether a value is a string holding a finite decimal number: an optional sign, digits with an optional fraction (`1`, `1.5`, `1.`, `.5`) and an optional exponent (`1e-7`, `2.5E+3`).
+
+## date
+
+DST-safe, non-mutating local-time date arithmetic, formatting and parsing.
+Import: `import { … } from '@emiliodominguez/js-helpers/date';`
+
+- `isValidDate(value: unknown): value is Date` — Checks whether a value is a `Date` instance holding a valid time (i.e. not `new Date(NaN)`).
+- `addDays(date: DateInput, amount: number): Date` — Adds a number of calendar days (local time).
+- `addWeeks(date: DateInput, amount: number): Date` — Adds a number of weeks (7 calendar days each, local time).
+- `addMonths(date: DateInput, amount: number): Date` — Adds a number of calendar months (local time).
+- `addYears(date: DateInput, amount: number): Date` — Adds a number of calendar years (local time).
+- `addHours(date: DateInput, amount: number): Date` — Adds an absolute number of hours (3 600 000 ms each); unlike `addDays`, this is not wall-clock based.
+- `addMinutes(date: DateInput, amount: number): Date` — Adds an absolute number of minutes.
+- `addSeconds(date: DateInput, amount: number): Date` — Adds an absolute number of seconds.
+- `addMilliseconds(date: DateInput, amount: number): Date` — Adds an absolute number of milliseconds.
+- `diffInDays(later: DateInput, earlier: DateInput): number` — Returns the signed number of calendar days between two dates (local time), ignoring the time of day: `diffInDays(Jan 2 00:01, Jan 1 23:59) === 1`.
+- `diffInHours(later: DateInput, earlier: DateInput): number` — Returns the signed number of whole hours between two dates, truncated toward zero (absolute time).
+- `diffInMinutes(later: DateInput, earlier: DateInput): number` — Returns the signed number of whole minutes between two dates, truncated toward zero (absolute time).
+- `diffInSeconds(later: DateInput, earlier: DateInput): number` — Returns the signed number of whole seconds between two dates, truncated toward zero (absolute time).
+- `diffInMonths(later: DateInput, earlier: DateInput): number` — Returns the signed number of COMPLETE calendar months between two dates (date-fns `differenceInMonths` semantics): for `later >= earlier` it is the largest `n` such that `addMonths(earlier, n) <= later` (time of day included, with end-of-month clamping, so Jan 31 → Feb 28 counts as one full month); for `later < earlier` it is `-diffInMonths(earlier, later)`.
+- `startOfDay(date: DateInput): Date` — Returns the start of the local day (00:00:00.000).
+- `endOfDay(date: DateInput): Date` — Returns the last millisecond of the local day (23:59:59.999).
+- `startOfMonth(date: DateInput): Date` — Returns the first day of the local month at 00:00:00.000.
+- `endOfMonth(date: DateInput): Date` — Returns the last day of the local month at 23:59:59.999.
+- `startOfWeek(date: DateInput, weekStartsOn: WeekdayIndex = 0): Date` — Returns the start (00:00:00.000, local) of the week containing `date`.
+- `endOfWeek(date: DateInput, weekStartsOn: WeekdayIndex = 0): Date` — Returns the end (23:59:59.999, local) of the week containing `date`.
+- `startOfYear(date: DateInput): Date` — Returns January 1st of the local year at 00:00:00.000.
+- `endOfYear(date: DateInput): Date` — Returns December 31st of the local year at 23:59:59.999.
+- `isSameDay(a: DateInput, b: DateInput): boolean` — Checks whether two dates fall on the same local calendar day.
+- `isSameMonth(a: DateInput, b: DateInput): boolean` — Checks whether two dates fall in the same local calendar month (of the same year).
+- `isSameYear(a: DateInput, b: DateInput): boolean` — Checks whether two dates fall in the same local calendar year.
+- `isLeapYear(yearOrDate: number | Date): boolean` — Checks whether a year (or the local year of a date) is a Gregorian leap year.
+- `daysInMonth(year: number, monthIndex: number): number` — Returns the number of days in a month.
+- `getDaysInMonth(date: DateInput): number` — Returns the number of days in the local month of a date.
+- `isWeekend(date: DateInput): boolean` — Checks whether a date falls on a Saturday or a Sunday (local time).
+- `isBefore(a: DateInput, b: DateInput): boolean` — Checks whether `a` is strictly before `b`.
+- `isAfter(a: DateInput, b: DateInput): boolean` — Checks whether `a` is strictly after `b`.
+- `isBetween(date: DateInput, start: DateInput, end: DateInput, inclusivity: BetweenInclusivity = '[]'): boolean` — Checks whether a date lies within a range.
+- `compareAsc(a: DateInput, b: DateInput): -1 | 0 | 1` — Ascending comparator, usable with `Array#sort`.
+- `compareDesc(a: DateInput, b: DateInput): -1 | 0 | 1` — Descending comparator, usable with `Array#sort`.
+- `minDate(dates: Iterable<DateInput>): Date | undefined` — Returns a copy of the earliest date.
+- `maxDate(dates: Iterable<DateInput>): Date | undefined` — Returns a copy of the latest date.
+- `formatDate(date: DateInput, pattern: string): string` — Formats a date (local time) with a token pattern.
+- `toISODateString(date: DateInput): string` — Returns the LOCAL calendar date as `'YYYY-MM-DD'`.
+- `parseISODate(value: string): Date | undefined` — Parses a strict `'YYYY-MM-DD'` string into a date at LOCAL midnight (unlike `new Date('YYYY-MM-DD')`, which is UTC).
+- `getRelativeTime(date: DateInput, baseDate: DateInput = new Date(), locale = 'en'): string` — Describes `date` relative to `baseDate` in words, e.g. `'in 3 days'`, `'2 hours ago'`, `'yesterday'`, `'now'`, using `Intl.RelativeTimeFormat` with `numeric: 'auto'`.
+- `eachDayOfInterval(start: DateInput, end: DateInput, options: EachDayOfIntervalOptions = {}): Date[]` — Returns every LOCAL calendar day from `start` to `end` (both inclusive), each at the start of the day (normally 00:00:00.000).
+- `getISOWeek(date: DateInput): number` — Returns the ISO 8601 week number (1-53) of the LOCAL calendar date.
+- `getISOWeekYear(date: DateInput): number` — Returns the ISO 8601 week-numbering year of the LOCAL calendar date: the calendar year of the Thursday of its ISO week.
+- `getQuarter(date: DateInput): Quarter` — Returns the calendar quarter (1-4) of the LOCAL date: `Math.floor(monthIndex / 3) + 1`.
+- `startOfQuarter(date: DateInput): Date` — Returns the first day of the local quarter at 00:00:00.000.
+- `endOfQuarter(date: DateInput): Date` — Returns the last day of the local quarter at 23:59:59.999.
+- `getAge(birthDate: DateInput, now: DateInput = new Date()): number` — Returns a person's age: the number of COMPLETED years between the LOCAL calendar days of `birthDate` and `now` (the time of day is ignored, so the age increases at the start of the birthday).
+- `addBusinessDays(date: DateInput, amount: number): Date` — Adds a number of business days (Monday-Friday, local time; no holidays), skipping Saturdays and Sundays.
+- `diffInBusinessDays(later: DateInput, earlier: DateInput): number` — Returns the signed number of business days (Monday-Friday, local calendar days; the time of day is ignored) between two dates: for `later >= earlier` it counts the weekdays AFTER `earlier`'s day up to and INCLUDING `later`'s day; for `later < earlier` it is `-diffInBusinessDays(earlier, later)`.
+- `isToday(date: DateInput, now: DateInput = new Date()): boolean` — Checks whether a date falls on the same LOCAL calendar day as `now`.
+- `isPast(date: DateInput, now: DateInput = new Date()): boolean` — Checks whether a date is strictly before `now` (absolute time).
+- `isFuture(date: DateInput, now: DateInput = new Date()): boolean` — Checks whether a date is strictly after `now` (absolute time).
+- `clampDate(date: DateInput, min: DateInput, max: DateInput): Date` — Clamps a date into the closed range `[min, max]`.
+- `formatDuration(ms: number, options: FormatDurationOptions = {}): string` — Formats a millisecond duration as a compact string such as `'1d 2h 3m'`.
+- `parseDuration(value: string): number` — Parses a duration string made of `<number><unit>` tokens (units `d`, `h`, `m`, `s`, `ms`, lowercase; whitespace between and inside tokens is optional; decimals such as `'1.5h'` or `'.5s'` are allowed) into milliseconds, e.g. `'1h 30m'` → `5_400_000`.
+
+## iterables
+
+Lazy, generator-based pipelines over any (async) iterable, with exact pull counts and early-exit cleanup.
+Import: `import { … } from '@emiliodominguez/js-helpers/iterables';`
+
+- `count(start = 0, step = 1): IterableIterator<number>` — Lazily count from `start` by `step`, forever: `start, start + step, start + 2 * step, ...`.
+- `repeatValue<T>(value: T, times = Infinity): IterableIterator<T>` — Lazily yield the same value `times` times (forever by default).
+- `cycle<T>(iterable: Iterable<T>): IterableIterator<T>` — Lazily repeat the items of an iterable forever.
+- `iterate<T>(seed: T, next: (value: T) => T): IterableIterator<T>` — Lazily unfold a sequence from a seed: `seed, next(seed), next(next(seed)), ...`, forever.
+- `map<T, U>(iterable: Iterable<T>, fn: (value: T, index: number) => U): IterableIterator<U>` — Lazily transform each item of an iterable (the lazy counterpart of `Array.prototype.map`).
+- `filter<T, S extends T>(iterable: Iterable<T>, predicate: (value: T, index: number) => value is S): IterableIterator<S>` — Lazily keep the items matching a type guard, narrowing the item type.
+- `flatMap<T, U>(iterable: Iterable<T>, fn: (value: T, index: number) => Iterable<U>): IterableIterator<U>` — Lazily map each item to an iterable and flatten the results one level.
+- `take<T>(iterable: Iterable<T>, n: number): IterableIterator<T>` — Lazily yield the first `n` items of an iterable (or all of them when it is shorter).
+- `drop<T>(iterable: Iterable<T>, n: number): IterableIterator<T>` — Lazily skip the first `n` items of an iterable and yield the rest.
+- `takeWhile<T>(iterable: Iterable<T>, predicate: (value: T, index: number) => boolean): IterableIterator<T>` — Lazily yield items while `predicate` holds, stopping (and closing the source) at the first item that fails it.
+- `dropWhile<T>(iterable: Iterable<T>, predicate: (value: T, index: number) => boolean): IterableIterator<T>` — Lazily skip items while `predicate` holds, then yield the first failing item and everything after it (`predicate` is no longer called once it has failed).
+- `chunk<T>(iterable: Iterable<T>, size: number): IterableIterator<T[]>` — Lazily split an iterable into consecutive chunks of `size` items; only the last chunk may be shorter.
+- `windowed<T>(iterable: Iterable<T>, size: number, step = 1): IterableIterator<T[]>` — Lazily yield the sliding windows of `size` consecutive items, starting every `step` items.
+- `zip<T extends Array<Iterable<unknown>>>(...iterables: T): IterableIterator<ZippedValues<T>>` — Lazily combine iterables item-wise into tuples, stopping at the end of the SHORTEST one (which may be infinite as long as another one is finite).
+- `enumerate<T>(iterable: Iterable<T>): IterableIterator<[number, T]>` — Lazily pair each item with its zero-based index.
+- `unique<T>(iterable: Iterable<T>, keyFn?: (value: T, index: number) => unknown): IterableIterator<T>` — Lazily drop items whose key (the item itself, or the result of `keyFn`) was already seen, keeping first occurrences.
+- `scan<T, A>(iterable: Iterable<T>, reducer: (accumulator: A, value: T, index: number) => A, initial: A): IterableIterator<A>` — Lazily yield the running accumulation of an iterable: the accumulator after each item (the initial value itself is NOT yielded, so the output has as many items as the input, and its last item is what `reduce` would return).
+- `concat<T>(...iterables: Array<Iterable<T>>): IterableIterator<T>` — Lazily yield the items of each iterable in turn.
+- `tap<T>(iterable: Iterable<T>, fn: (value: T, index: number) => void): IterableIterator<T>` — Lazily call `fn` on each item as it passes through, yielding the items unchanged (for logging or debugging).
+- `toArray<T>(iterable: Iterable<T>): T[]` — Collect the items of an iterable into a new array.
+- `reduce<T, A>(iterable: Iterable<T>, reducer: (accumulator: A, value: T, index: number) => A, initial: A): A` — Reduce the items of an iterable to a single value, starting from `initial`.
+- `first<T>(iterable: Iterable<T>): T | undefined` — Return the first item of an iterable, pulling only that item (the source is then closed).
+- `last<T>(iterable: Iterable<T>): T | undefined` — Return the last item of an iterable (consuming all of it; never returns for an infinite iterable).
+- `find<T, S extends T>(iterable: Iterable<T>, predicate: (value: T, index: number) => value is S): S | undefined` — Return the first item matching a type guard, narrowing its type; stops pulling (and closes the source) once found.
+- `some<T>(iterable: Iterable<T>, predicate: (value: T, index: number) => boolean): boolean` — Tell whether at least one item matches a predicate; stops at (and closes the source on) the first match.
+- `every<T>(iterable: Iterable<T>, predicate: (value: T, index: number) => boolean): boolean` — Tell whether every item matches a predicate; stops at (and closes the source on) the first mismatch.
+- `countItems<T>(iterable: Iterable<T>, predicate?: (value: T, index: number) => boolean): number` — Count the items of an iterable (consuming all of it), or only those matching `predicate` when given.
+- `mapAsync<T, U>(iterable: AwaitableIterable<T>, fn: (value: T, index: number) => U | PromiseLike<U>): AsyncIterableIterator<U>` — Lazily transform each item of an async (or sync) iterable with a possibly async function, one item at a time.
+- `filterAsync<T, S extends T>(iterable: AwaitableIterable<T>, predicate: (value: T, index: number) => value is S): AsyncIterableIterator<S>` — Lazily keep the items of an async (or sync) iterable matching a (sync) type guard, narrowing the item type.
+- `takeAsync<T>(iterable: AwaitableIterable<T>, n: number): AsyncIterableIterator<T>` — Lazily yield the first `n` items of an async (or sync) iterable; exactly `n` items are pulled, then the source is closed.
+- `chunkAsync<T>(iterable: AwaitableIterable<T>, size: number): AsyncIterableIterator<T[]>` — Lazily split an async (or sync) iterable into consecutive chunks of `size` items; only the last chunk may be shorter.
+- `toArrayAsync<T>(iterable: AwaitableIterable<T>): Promise<T[]>` — Collect the items of an async (or sync) iterable into a new array, awaiting each item in turn (like `Array.fromAsync`).
+
+## cache
+
+O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock; plugs into memoize.
+Import: `import { … } from '@emiliodominguez/js-helpers/cache';`
+
+- `createLRUCache<K = unknown, V = unknown>(options: LRUCacheOptions<K, V>): LRUCache<K, V>` — Creates a least-recently-used cache backed by a `Map` for lookups and a doubly linked list for recency, so `get`, `set`, `peek`, `has` and `delete` are O(1) (a hit only relinks two list nodes; it never re-inserts the key into the `Map`).
+
+## emitter
+
+Typed event emitter with wildcard listeners, waitFor and error isolation.
+Import: `import { … } from '@emiliodominguez/js-helpers/emitter';`
+
+- `createEmitter<Events extends EventMap>(): Emitter<Events>` — Creates a strictly typed, synchronous event emitter.
+
+## store
+
+Tiny state store compatible with React useSyncExternalStore, with derived selectors.
+Import: `import { … } from '@emiliodominguez/js-helpers/store';`
+
+- `createStore<S>(initialState: S, options: StoreOptions<S> = {}): Store<S>` — Creates a tiny synchronous state container, usable from React 18+ without any React dependency: `const state = useSyncExternalStore(store.subscribe, store.getState);` (methods can be passed unbound).
+
+## random
+
+Seeded deterministic PRNG plus cryptographically secure ids, UUIDs and bytes.
+Import: `import { … } from '@emiliodominguez/js-helpers/random';`
+
+- `createRandom(seed: number | string): SeededRandom` — Creates a deterministic, seedable pseudo-random generator (sfc32, seeded through the cyrb128 string hash).
+- `randomBytes(length: number): Uint8Array` — Generates cryptographically secure random bytes using `globalThis.crypto.getRandomValues`.
+- `randomUUID(): string` — Generates a random RFC 4122 / RFC 9562 version 4 UUID (e.g. `'3b241101-e2bb-4255-8caf-4136c566a962'`).
+- `randomId(size: number = 21, alphabet: string = URL_ALPHABET): string` — Generates a cryptographically secure random identifier (nanoid-style).
+- `secureRandom(): number` — A cryptographically secure `RandomGenerator`: returns a uniformly distributed float in `[0, 1)` with the full 53 bits of precision of a double (every multiple of `2 ** -53` is equally likely), drawn from `globalThis.crypto.getRandomValues`.
+- `weightedRandom<T>(items: ReadonlyArray<T>, weights: ReadonlyArray<number>, random: RandomGenerator = Math.random): T` — Picks a random item, with each item's chance proportional to its weight.
+- `randomGaussian(mean: number = 0, stdDev: number = 1, random: RandomGenerator = Math.random): number` — Draws a normally distributed (Gaussian) random number using the Box–Muller transform.
+- `randomBoolean(probability: number = 0.5, random: RandomGenerator = Math.random): boolean` — Returns `true` with the given probability.
+
+## decorators
+
+Class decorators for TypeScript (legacy and TC39 standard) and Babel.
+Import: `import { … } from '@emiliodominguez/js-helpers/decorators';`
+
+- `readonly(targetOrValue: object, keyOrContext: string | symbol, descriptor?: undefined): void` — Makes a class field write-once: the value assigned by the field initializer (or the first assignment) is kept, and the instance gets an enumerable, non-writable, non-configurable own property.
+- `log<T extends AnyFunction>(targetOrValue: object, keyOrContext: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>` — Logs every call of the decorated method with `console.log`: `"<name> method called with arguments:" args`, then `"<name> method returned:" result`.
+- `memoize<T extends AnyFunction>(targetOrValue: object, keyOrContext: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>` — Caches the results of the decorated method, separately for every instance (per class for static methods): instances never see each other's results, and caches are garbage-collected with their instance.
+- `bound<T extends AnyFunction>(targetOrValue: object, keyOrContext: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>` — Auto-binds the decorated method to its instance, so it can be passed around as a callback (`button.onclick = obj.method`).
+- `debounced(wait: number, options?: DebounceOptions): UniversalMethodDecorator` — Creates a method decorator that debounces the method with `debounce`, with separate timers for every instance.
+- `throttled(wait: number, options?: ThrottleOptions): UniversalMethodDecorator` — Creates a method decorator that throttles the method with `throttle`, with separate windows for every instance.
+- `deprecated(message?: string): UniversalMethodDecorator` — Creates a method decorator that emits a deprecation warning with `console.warn` the first time the method is called (once per decorated method, not once per call or per instance).
+- `once<T extends AnyFunction>(targetOrValue: object, keyOrContext: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>` — Makes the decorated method run at most once per instance (per class for static methods), like `once` from the functions module: later calls on the same instance return the first result (or rethrow the first error) without running the method again, and a re-entrant call made by the method itself returns `undefined`.
+- `retryable(options: RetryOptions = {}, random: RandomGenerator = Math.random): AsyncMethodDecorator` — Creates a decorator for async methods that retries failed calls with `retry` (exponential backoff, optional jitter, `shouldRetry`, `onRetry`, `signal`).
+- `timeout(ms: number, message?: string): AsyncMethodDecorator` — Creates a decorator for async methods that rejects with a `TimeoutError` when the returned promise does not settle within `ms` milliseconds (using `withTimeout`; the timer is always cleared, but the underlying operation is not cancelled).

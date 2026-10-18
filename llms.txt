@@ -1,0 +1,42 @@
+# @emiliodominguez/js-helpers
+
+> Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities (20 modules, 426 exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, fuzzy search, caches, emitters and stores. Property-tested and mutation-tested.
+
+Key facts for code generation:
+- ESM only, zero dependencies, Node >= 20.19 or any modern browser/runtime. TypeScript types ship in the package.
+- Import from module entry points: `import { debounce } from '@emiliodominguez/js-helpers/functions'` (the root entry exposes namespaces: `import { functions } from '@emiliodominguez/js-helpers'`).
+- Helpers never mutate their inputs unless the name or docs say so (`setInObjectByKeys`, `deleteFromObjectByKeys`).
+- Invalid arguments throw `TypeError` (wrong type) or `RangeError` (invalid value) whose message names the function and the parameter (`fn: param must be …, got …`).
+- Randomised helpers take an optional `random` generator last; the default is `Math.random`. Pass `secureRandom` (random module) for tokens, OTPs and lotteries.
+- Type guards compose into validators: `isShape`, `isArrayOf`, `isUnion`, `isOptional`…; `explain` lists issues with paths, `ensure` throws a `ValidationError`, `toStandardSchema` adapts any guard for tRPC, TanStack Form, Hono and other Standard Schema consumers.
+
+## Modules
+
+- [arrays](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#arrays): Collection helpers: set algebra, grouping, chunking, sorting, sampling. Import from `@emiliodominguez/js-helpers/arrays`.
+- [objects](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#objects): Shallow/deep cloning, merging, equality, path access and object reshaping. Import from `@emiliodominguez/js-helpers/objects`.
+- [guards](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#guards): Runtime type predicates that narrow `unknown` values, composable into path-aware, Standard Schema-compatible validators. Import from `@emiliodominguez/js-helpers/guards`.
+- [strings](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#strings): Unicode-aware transformations, case conversion, escaping, templating and text metrics. Import from `@emiliodominguez/js-helpers/strings`.
+- [url](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#url): Query-string building and parsing, URL joining and query merging, without URL object types. Import from `@emiliodominguez/js-helpers/url`.
+- [math](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#math): Precise arithmetic, statistics, number theory and random numbers. Import from `@emiliodominguez/js-helpers/math`.
+- [functions](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#functions): Function composition, currying, memoization and rate limiting. Import from `@emiliodominguez/js-helpers/functions`.
+- [async](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#async): Promise utilities: retries, timeouts, polling, limiters, keyed Promise.all and async debounce. Import from `@emiliodominguez/js-helpers/async`.
+- [color](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#color): Hex/RGB/HSL conversion, mixing, lightening and WCAG contrast checks. Import from `@emiliodominguez/js-helpers/color`.
+- [search](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#search): Fuzzy matching and ranking with highlight ranges, for command palettes and filter-as-you-type UIs. Import from `@emiliodominguez/js-helpers/search`.
+- [easing](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#easing): Animation easing curves, CSS-accurate cubic-bezier() and steps(), and an analytic spring. Import from `@emiliodominguez/js-helpers/easing`.
+- [format](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#format): Deterministic, cached Intl formatting: numbers, currency, percent, compact, units, lists, dates, ordinals. Import from `@emiliodominguez/js-helpers/format`.
+- [validate](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#validate): Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates. Import from `@emiliodominguez/js-helpers/validate`.
+- [date](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#date): DST-safe, non-mutating local-time date arithmetic, formatting and parsing. Import from `@emiliodominguez/js-helpers/date`.
+- [iterables](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#iterables): Lazy, generator-based pipelines over any (async) iterable, with exact pull counts and early-exit cleanup. Import from `@emiliodominguez/js-helpers/iterables`.
+- [cache](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#cache): O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock; plugs into memoize. Import from `@emiliodominguez/js-helpers/cache`.
+- [emitter](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#emitter): Typed event emitter with wildcard listeners, waitFor and error isolation. Import from `@emiliodominguez/js-helpers/emitter`.
+- [store](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#store): Tiny state store compatible with React useSyncExternalStore, with derived selectors. Import from `@emiliodominguez/js-helpers/store`.
+- [random](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#random): Seeded deterministic PRNG plus cryptographically secure ids, UUIDs and bytes. Import from `@emiliodominguez/js-helpers/random`.
+- [decorators](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#decorators): Class decorators for TypeScript (legacy and TC39 standard) and Babel. Import from `@emiliodominguez/js-helpers/decorators`.
+
+## Docs
+
+- [Full API index with signatures](llms-full.txt): every export with its signature and summary.
+- [API reference](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md)
+- [Migrating from lodash](https://github.com/emiliodominguez/js-helpers/blob/main/docs/MIGRATING-FROM-LODASH.md): lodash → js-helpers mapping with behavioural notes and sizes.
+- [Import cost of every helper](https://github.com/emiliodominguez/js-helpers/blob/main/docs/SIZES.md)
+- [Security policy](https://github.com/emiliodominguez/js-helpers/blob/main/SECURITY.md)
