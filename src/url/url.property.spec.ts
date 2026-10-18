@@ -468,6 +468,9 @@ describe('URL helpers (round 11 properties)', function () {
 		it('agree with the WHATWG URL parser on the resolved path, except for the collapsed slashes', function () {
 			fc.assert(
 				fc.property(path, suffix, function (middle, end) {
+					// Dot segments are resolved against the empty segments a double slash creates (`/a//..` is `/a/`), so collapsing first
+					// legitimately changes their target: cleanDoubleSlashes is a syntactic edit (documented), checked here without them.
+					fc.pre(!/(?:^|[/\\])\.{1,2}(?:[/\\?#]|$)/.test(`${middle}${end}`));
 					const input = `https://example.com/${middle}${end}`;
 					const original = new URL(input);
 					const cleaned = new URL(helpers.cleanDoubleSlashes(input));

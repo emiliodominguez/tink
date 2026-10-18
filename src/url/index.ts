@@ -625,13 +625,16 @@ export function withoutLeadingSlash(path: string): string {
 /**
  * Collapses every run of `/` in the path of a URL into a single `/`. The query and fragment are left untouched (`?next=https://a//b`
  * keeps its slashes), and so is the run of slashes after a scheme (`https://`, `file:///`) or at the start of a relative URL (so a
- * protocol-relative `//host` stays one).
+ * protocol-relative `//host` stays one). It is a purely syntactic edit: `.` and `..` segments are not resolved, and since a browser
+ * resolves `..` against the empty segment a double slash creates, `'/a//..'` (which resolves to `/a/`) becomes `'/a/..'` (which resolves to
+ * `/`). Resolve dot segments first (`new URL(url, base)`) when that matters.
  * @param {string} url - The URL or path
  * @returns {string} The URL without repeated slashes in its path
  * @example
  * cleanDoubleSlashes('https://example.com//a///b?u=http://x//y'); // => 'https://example.com/a/b?u=http://x//y'
  * cleanDoubleSlashes('file:///etc//hosts'); // => 'file:///etc/hosts'
  * cleanDoubleSlashes('//cdn.example.com//lib.js'); // => '//cdn.example.com/lib.js'
+ * cleanDoubleSlashes('/a//..'); // => '/a/..'
  */
 export function cleanDoubleSlashes(url: string): string {
 	const end = pathEnd(url);
