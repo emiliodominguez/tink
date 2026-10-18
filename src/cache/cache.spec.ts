@@ -130,6 +130,33 @@ describe('createLRUCache', function () {
 			expect(Object.is(evicted[0], 0)).toBe(true);
 		});
 
+		it('reports a key stored as +0 as +0 from every removal path, whatever key it is removed with', function () {
+			const clock = fakeClock();
+			const reported: Array<[string, string, string]> = [];
+			const cache = createLRUCache<number, string>({
+				max: 5,
+				ttl: 10,
+				now: clock.now,
+				onEvict: function (key, value, reason) {
+					reported.push([Object.is(key, -0) ? '-0' : String(key), value, reason]);
+				}
+			});
+			cache.set(0, 'a');
+			cache.delete(-0);
+			cache.set(0, 'b');
+			cache.set(-0, 'c');
+			clock.advance(20);
+			cache.get(-0);
+			cache.set(0, 'd');
+			cache.clear();
+			expect(reported).toEqual([
+				['0', 'a', 'deleted'],
+				['0', 'b', 'replaced'],
+				['0', 'c', 'expired'],
+				['0', 'd', 'cleared']
+			]);
+		});
+
 		it('delete returns whether a live entry was removed', function () {
 			const cache = createLRUCache<string, number>({ max: 2 });
 			cache.set('a', 1);
@@ -344,6 +371,18 @@ describe('createLRUCache', function () {
 			cache.set('a', 2);
 			expect(events).toEqual([['a', 1, 'expired']]);
 			expect(cache.get('a')).toBe(2);
+		});
+
+		it('setting the very same value over an expired entry reports nothing, since the value is still stored', function () {
+			const clock = fakeClock();
+			const { events, onEvict } = recorder<string, object>();
+			const resource = {};
+			const cache = createLRUCache<string, object>({ max: 1, ttl: 10, now: clock.now, onEvict });
+			cache.set('a', resource);
+			clock.advance(10);
+			cache.set('a', resource);
+			expect(events).toEqual([]);
+			expect(cache.get('a')).toBe(resource);
 		});
 
 		it('a capacity eviction of an expired LRU entry is reported as expired', function () {

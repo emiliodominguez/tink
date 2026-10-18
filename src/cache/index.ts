@@ -128,8 +128,9 @@ function assertTTL(caller: string, ttl: number): void {
  *   operation that looks the key up (`get`, `peek`, `has`, `set`, `delete`), by `prune()`, by `clear()`, or when they are the
  *   least-recently-used entry at a capacity eviction. Until then they count towards `size` and `max`. The clock is only read for entries
  *   that can expire, so a cache without TTLs never calls `now`.
- * - `onEvict(key, value, reason)` fires once per removed entry (see {@link LRUEvictionReason}), never for misses. Overwriting a live entry
- *   reports the old value as `'replaced'` unless it is the very same value (`Object.is`), so a resource is never disposed while still stored.
+ * - `onEvict(key, value, reason)` fires once per removed entry (see {@link LRUEvictionReason}), never for misses. Overwriting an entry
+ *   reports the old value as `'replaced'` (`'expired'` when it had expired) unless it is the very same value (`Object.is`), so a resource
+ *   is never disposed while still stored. A `-0` key is stored and reported as `0`, as by `Map`.
  *   It is called after the cache has been updated; an exception it throws propagates to the caller, but the cache stays consistent, and
  *   `clear`/`prune` still report every removed entry before rethrowing (an `AggregateError` when several calls threw).
  * - For a TTL-only cache use `max: Infinity` (see the second example).
@@ -262,13 +263,12 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 
 	/**
 	 * Removes an expired entry and reports it.
-	 * @param {K} key - The key it was looked up with (reported as is)
 	 * @param {Entry<K, V>} entry - The entry
 	 * @returns {undefined} Always `undefined`, so lookups can return the result
 	 */
-	function expire(key: K, entry: Entry<K, V>): undefined {
+	function expire(entry: Entry<K, V>): undefined {
 		remove(entry);
-		notify(key, entry.value, 'expired');
+		notify(entry.key, entry.value, 'expired');
 	}
 
 	/**
@@ -279,7 +279,7 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	function lookup(key: K): Entry<K, V> | undefined {
 		const entry = store.get(key);
 
-		return entry !== undefined && entry.expiresAt !== Infinity && now() >= entry.expiresAt ? expire(key, entry) : entry;
+		return entry !== undefined && entry.expiresAt !== Infinity && now() >= entry.expiresAt ? expire(entry) : entry;
 	}
 
 	/**
@@ -317,7 +317,7 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 			// Same as `lookup`, keeping the time for `updateAgeOnGet` (an entry that cannot expire has no TTL to restart).
 			if (entry.expiresAt !== Infinity) {
 				const time = now();
-				if (time >= entry.expiresAt) return expire(key, entry);
+				if (time >= entry.expiresAt) return expire(entry);
 				if (updateAgeOnGet) entry.expiresAt = time + entry.ttl;
 			}
 
@@ -356,8 +356,8 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 				unlink(entry);
 				pushNewest(entry);
 
-				if (expired) notify(key, previousValue, 'expired');
-				else if (!Object.is(previousValue, value)) notify(key, previousValue, 'replaced');
+				// Storing the very same value again removes nothing, even over an expired entry: it must not be disposed while stored.
+				if (!Object.is(previousValue, value)) notify(entry.key, previousValue, expired ? 'expired' : 'replaced');
 
 				return cache;
 			}
@@ -383,7 +383,7 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 			if (entry === undefined) return false;
 
 			remove(entry);
-			notify(key, entry.value, 'deleted');
+			notify(entry.key, entry.value, 'deleted');
 
 			return true;
 		},

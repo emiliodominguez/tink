@@ -69,8 +69,8 @@ function modelSet(model: Model, key: Key, value: Value, ttlOverride: number | un
 	const previous = index === -1 ? undefined : model.entries.splice(index, 1)[0];
 	model.entries.push({ key, value, ttl, expiresAt: model.time + ttl });
 	if (previous !== undefined) {
-		if (isExpired(model, previous)) model.events.push([key, previous.value, 'expired']);
-		else if (previous.value !== value) model.events.push([key, previous.value, 'replaced']);
+		// The very same value stays stored, so nothing is reported, expired or not.
+		if (previous.value !== value) model.events.push([key, previous.value, isExpired(model, previous) ? 'expired' : 'replaced']);
 	} else if (model.entries.length > model.config.max) {
 		const oldest = model.entries.shift() as ModelEntry;
 		model.events.push([oldest.key, oldest.value, isExpired(model, oldest) ? 'expired' : 'capacity']);
