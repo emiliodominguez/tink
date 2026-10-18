@@ -304,6 +304,16 @@ describe('Color helpers', function () {
 			expect(helpers.getReadableTextColor('#eee', { light: '#fff', dark: { r: 10, g: 10, b: 10 } })).toEqual({ r: 10, g: 10, b: 10 });
 		});
 
+		it('should type the result with the defaults unless both candidates are given', function () {
+			const both: '#eee' | '#333' = helpers.getReadableTextColor('#222', { light: '#eee', dark: '#333' });
+			const optional: helpers.ReadableTextColorOptions<'#eee', '#333'> = {};
+			// @ts-expect-error a missing candidate falls back to its default, which is neither '#eee' nor '#333'
+			const narrowed: '#eee' | '#333' = helpers.getReadableTextColor('#222', optional);
+			const widened: '#eee' | '#333' | '#ffffff' | '#000000' = helpers.getReadableTextColor('#222', optional);
+			const defaults: '#ffffff' | '#000000' = helpers.getReadableTextColor('#222');
+			expect([both, narrowed, widened, defaults]).toEqual(['#eee', '#ffffff', '#ffffff', '#ffffff']);
+		});
+
 		it('should prefer the dark candidate on ties', function () {
 			expect(helpers.getReadableTextColor('#777', { light: '#123', dark: '#123' })).toBe('#123');
 			expect(helpers.getReadableTextColor('#777', { light: '#000', dark: '#000000' })).toBe('#000000');

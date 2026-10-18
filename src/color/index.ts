@@ -716,7 +716,7 @@ export function contrastRatio(a: ColorInput, b: ColorInput): number {
  * @template D - Type of the dark option
  * @param {ColorInput} background - The background colour
  * @param {ReadableTextColorOptions<L, D>} [options={}] - `light` (default `'#ffffff'`) and `dark` (default `'#000000'`) candidates
- * @returns {L | D} The candidate with the better contrast
+ * @returns {L | D} The candidate with the better contrast (also typed as the defaults unless both candidates are given)
  * @throws {TypeError} when a colour is invalid (see {@link toRgba})
  * @throws {RangeError} when a channel is `NaN`
  * @example
@@ -724,12 +724,21 @@ export function contrastRatio(a: ColorInput, b: ColorInput): number {
  * getReadableTextColor('#fde68a'); // => '#000000'
  * getReadableTextColor('#222', { light: '#eee', dark: '#333' }); // => '#eee'
  */
+export function getReadableTextColor<L extends ColorInput, D extends ColorInput>(background: ColorInput, options: Required<ReadableTextColorOptions<L, D>>): L | D;
 export function getReadableTextColor<L extends ColorInput = '#ffffff', D extends ColorInput = '#000000'>(
 	background: ColorInput,
-	options: ReadableTextColorOptions<L, D> = {}
-): L | D {
-	const light = options.light ?? ('#ffffff' as L);
-	const dark = options.dark ?? ('#000000' as D);
+	options?: ReadableTextColorOptions<L, D>
+): L | D | '#ffffff' | '#000000';
+/**
+ * Implementation of {@link getReadableTextColor} (see the first overload for the full documentation). A missing candidate falls back to
+ * its default, so the result type includes the defaults unless both candidates are given.
+ * @param {ColorInput} background - The background colour
+ * @param {ReadableTextColorOptions<ColorInput, ColorInput>} [options={}] - The candidates
+ * @returns {ColorInput} The candidate with the better contrast
+ */
+export function getReadableTextColor(background: ColorInput, options: ReadableTextColorOptions<ColorInput, ColorInput> = {}): ColorInput {
+	const light = options.light ?? '#ffffff';
+	const dark = options.dark ?? '#000000';
 	return contrastRatio(background, dark) >= contrastRatio(background, light) ? dark : light;
 }
 
