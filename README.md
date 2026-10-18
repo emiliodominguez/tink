@@ -1,4 +1,4 @@
-![tink — Small utilities. Solid foundations.](./docs/assets/tink-logo.svg)
+![tinkit: Small utilities. Solid foundations. A smiling pastel building block next to the wordmark tinkit, an npm i tinkit command and four facts: ~600 typed helpers, 20 modules, 0 dependencies, tree-shakeable.](https://raw.githubusercontent.com/emiliodominguez/js-helpers/main/docs/assets/tinkit-banner.png)
 
 [![CI](https://img.shields.io/github/actions/workflow/status/emiliodominguez/js-helpers/tests.yml?branch=main&style=for-the-badge&label=CI&labelColor=161b22&logo=githubactions&logoColor=white)](https://github.com/emiliodominguez/js-helpers/actions/workflows/tests.yml)
 [![TypeScript: strict](https://img.shields.io/badge/TS-strict-3178c6?style=for-the-badge&labelColor=161b22&logo=typescript&logoColor=white)](./tsconfig.json)

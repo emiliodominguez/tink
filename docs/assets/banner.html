@@ -1,0 +1,191 @@
+<!doctype html>
+<!-- Source of tinkit-banner.png (1280 × 640 at 2× pixel density). Render: see docs/assets/README.md. -->
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<title>tinkit banner</title>
+		<style>
+			* {
+				box-sizing: border-box;
+				margin: 0;
+			}
+			html,
+			body {
+				width: 1280px;
+				height: 640px;
+				overflow: hidden;
+				background: #f6f4ff;
+			}
+			.canvas {
+				position: relative;
+				width: 1280px;
+				height: 640px;
+				overflow: hidden;
+				background:
+					radial-gradient(520px 380px at 12% 18%, rgba(138, 215, 255, 0.34), transparent 70%),
+					radial-gradient(560px 420px at 92% 96%, rgba(167, 139, 250, 0.3), transparent 70%),
+					radial-gradient(420px 300px at 70% 8%, rgba(255, 196, 222, 0.28), transparent 70%),
+					linear-gradient(160deg, #fdfcff 0%, #f3f0ff 100%);
+				font-family: 'Inter', sans-serif;
+				color: #0c1935;
+			}
+			.dots {
+				position: absolute;
+				inset: 0;
+				background-image: radial-gradient(rgba(12, 25, 53, 0.07) 1.2px, transparent 1.3px);
+				background-size: 26px 26px;
+				mask-image: linear-gradient(90deg, rgba(0, 0, 0, 0.9), rgba(0, 0, 0, 0.15) 55%, transparent 80%);
+			}
+			.art {
+				position: absolute;
+				left: 70px;
+				top: 92px;
+				width: 440px;
+				height: 460px;
+			}
+			.copy {
+				position: absolute;
+				left: 506px;
+				top: 0;
+				bottom: 0;
+				display: flex;
+				flex-direction: column;
+				justify-content: center;
+				gap: 0;
+			}
+			.wordmark {
+				font-family: 'Inter Display', 'Inter', sans-serif;
+				font-weight: 800;
+				font-size: 184px;
+				line-height: 1;
+				letter-spacing: -9px;
+				margin-left: -8px;
+			}
+			.wordmark .i {
+				position: relative;
+			}
+			.wordmark .i::after {
+				content: '';
+				position: absolute;
+				left: 50%;
+				top: 0.13em;
+				width: 0.19em;
+				height: 0.19em;
+				border-radius: 50%;
+				transform: translateX(-50%);
+				background: #bc67f7;
+			}
+			.wordmark .i.blue::after {
+				background: linear-gradient(135deg, #5aa8ff, #278dff);
+			}
+			.tagline {
+				margin-top: 14px;
+				font-size: 31px;
+				font-weight: 400;
+				color: #586179;
+				letter-spacing: -0.2px;
+			}
+			.install {
+				margin-top: 38px;
+				display: inline-flex;
+				align-items: center;
+				gap: 14px;
+				align-self: flex-start;
+				padding: 15px 24px 15px 20px;
+				border-radius: 16px;
+				background: #0c1935;
+				box-shadow: 0 10px 30px rgba(12, 25, 53, 0.18);
+				font-family: 'DejaVu Sans Mono', 'Liberation Mono', monospace;
+				font-size: 25px;
+				color: #e9e6ff;
+			}
+			.install .prompt {
+				color: #8ad7ff;
+			}
+			.install .name {
+				color: #d9b8ff;
+				font-weight: 700;
+			}
+			.facts {
+				margin-top: 26px;
+				display: flex;
+				gap: 9px;
+			}
+			.facts span {
+				padding: 7px 14px;
+				border-radius: 999px;
+				background: rgba(255, 255, 255, 0.78);
+				border: 1.5px solid rgba(12, 25, 53, 0.1);
+				font-size: 18px;
+				font-weight: 600;
+				color: #3a4561;
+			}
+		</style>
+	</head>
+	<body>
+		<div class="canvas">
+			<div class="dots"></div>
+
+			<svg class="art" viewBox="0 0 440 460" aria-hidden="true">
+				<defs>
+					<linearGradient id="left" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#8ad7ff" /><stop offset="1" stop-color="#a78bfa" /></linearGradient>
+					<linearGradient id="right" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#fff4f5" /><stop offset="1" stop-color="#ddd6fe" /></linearGradient>
+					<linearGradient id="mintLeft" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#9df0d0" /><stop offset="1" stop-color="#5fd1c4" /></linearGradient>
+					<linearGradient id="mintRight" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#f2fffa" /><stop offset="1" stop-color="#c9f3e6" /></linearGradient>
+					<linearGradient id="peachLeft" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#ffd2a8" /><stop offset="1" stop-color="#ff9fb8" /></linearGradient>
+					<linearGradient id="peachRight" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#fff8f1" /><stop offset="1" stop-color="#ffe0e6" /></linearGradient>
+					<linearGradient id="spark" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#dc5bff" /><stop offset="1" stop-color="#278dff" /></linearGradient>
+					<filter id="blur" x="-40%" y="-40%" width="180%" height="200%"><feGaussianBlur stdDeviation="14" /></filter>
+				</defs>
+
+				<!-- Ground shadows -->
+				<ellipse cx="205" cy="420" rx="150" ry="22" fill="#a78bfa" opacity=".22" filter="url(#blur)" />
+				<ellipse cx="64" cy="432" rx="52" ry="9" fill="#5fd1c4" opacity=".25" filter="url(#blur)" />
+
+
+				<!-- Small peach block, floating: about to click into place -->
+				<g transform="translate(26 56) scale(0.42) rotate(-8 92 101)" stroke="#0c1935" stroke-width="17" stroke-linejoin="round">
+					<path d="M0 53 92 0 184 53 92 106Z" fill="#fffaf6" />
+					<path d="M0 53 92 106 92 202 0 149Z" fill="url(#peachLeft)" />
+					<path d="M92 106 184 53 184 149 92 202Z" fill="url(#peachRight)" />
+				</g>
+				<path d="M96 168 q8 14 22 18" fill="none" stroke="#c9b8f5" stroke-width="5" stroke-linecap="round" stroke-dasharray="2 11" />
+
+				<!-- The tink block -->
+				<g transform="translate(62 96) scale(1.56)">
+					<g stroke="#0c1935" stroke-width="9" stroke-linejoin="round">
+						<path d="M0 53 92 0 184 53 92 106Z" fill="#fffafc" />
+						<path d="M0 53 92 106 92 202 0 149Z" fill="url(#left)" />
+						<path d="M92 106 184 53 184 149 92 202Z" fill="url(#right)" />
+					</g>
+					<g fill="#0c1935">
+						<ellipse cx="121" cy="133" rx="6.5" ry="11" />
+						<ellipse cx="159" cy="111" rx="6.5" ry="11" />
+					</g>
+					<path d="M130 156q13 15 26-5" fill="none" stroke="#0c1935" stroke-width="6.5" stroke-linecap="round" />
+					<ellipse cx="111" cy="152" rx="8" ry="4.5" fill="#ff9fc4" opacity=".55" transform="rotate(-28 111 152)" />
+					<ellipse cx="172" cy="130" rx="8" ry="4.5" fill="#ff9fc4" opacity=".55" transform="rotate(-28 172 130)" />
+				</g>
+
+				<!-- Small mint block (a spare part of the kit, in front) -->
+				<g transform="translate(20 330) scale(0.48)" stroke="#0c1935" stroke-width="15" stroke-linejoin="round">
+					<path d="M0 53 92 0 184 53 92 106Z" fill="#fbfffd" />
+					<path d="M0 53 92 106 92 202 0 149Z" fill="url(#mintLeft)" />
+					<path d="M92 106 184 53 184 149 92 202Z" fill="url(#mintRight)" />
+				</g>
+
+				<!-- Sparks -->
+				<path d="M294 82 304 56" stroke="url(#spark)" stroke-width="13" stroke-linecap="round" />
+				<path d="M326 104 350 86" stroke="#308fff" stroke-width="13" stroke-linecap="round" />
+				<path d="M334 140 362 138" stroke="#bc67f7" stroke-width="11" stroke-linecap="round" />
+			</svg>
+
+			<div class="copy">
+				<div class="wordmark">t<span class="i">ı</span>nk<span class="i blue">ı</span>t</div>
+				<div class="tagline">Small utilities. Solid foundations.</div>
+				<div class="install"><span class="prompt">$</span><span>npm i <span class="name">tinkit</span></span></div>
+				<div class="facts"><span>~600 typed helpers</span><span>20 modules</span><span>0 dependencies</span><span>tree-shakeable</span></div>
+			</div>
+		</div>
+	</body>
+</html>
