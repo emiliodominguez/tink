@@ -1527,6 +1527,184 @@ export function isNumberInRange(min: number, max: number): (value: unknown) => v
 }
 
 /**
+ * Creates a guard accepting integers between `min` and `max`, both inclusive (`z.number().int().min().max()`): ports, ages, page
+ * numbers. The bounds may be fractional or infinite (`isIntegerInRange(1, Infinity)` is "a positive integer"). {@link explain} reports
+ * the range.
+ * @param {number} min - The smallest accepted integer
+ * @param {number} max - The largest accepted integer
+ * @returns {(value: unknown) => boolean} A guard narrowing to `number`
+ * @throws {TypeError} when `min` or `max` is not a number
+ * @throws {RangeError} when `min` is `NaN`, or `max` is `NaN` or smaller than `min`
+ * @example
+ * const isPort = isIntegerInRange(1, 65535);
+ * isPort(8080); // => true
+ * isPort(80.5); // => false
+ * isPort(0); // => false
+ * explain(isPort, 70000); // => [{ message: 'Expected an integer between 1 and 65535 (got 70000)', path: [] }]
+ */
+export function isIntegerInRange(min: number, max: number): (value: unknown) => value is number {
+	assertNumber('isIntegerInRange', 'min', min, min === min, 'a number');
+	assertNumber('isIntegerInRange', 'max', max, max >= min, `a number >= min (${min})`);
+
+	return expecting(function isIntegerInBounds(value: unknown): value is number {
+		return Number.isInteger(value) && (value as number) >= min && (value as number) <= max;
+	}, `an integer between ${min} and ${max}`);
+}
+
+/**
+ * Creates a guard accepting strings whose length (in UTF-16 code units, like `String#length` and zod) is between `min` and `max`,
+ * both inclusive: `isStringOfLength(1, 50)` is `z.string().min(1).max(50)`. Pass `Infinity` as `max` for a minimum only, the same
+ * number twice for an exact length. {@link explain} reports the expected length and the actual one, never the string itself (it may
+ * be a password).
+ * @param {number} min - The smallest accepted length, an integer >= 0
+ * @param {number} max - The largest accepted length, an integer >= `min` or `Infinity`
+ * @returns {(value: unknown) => boolean} A guard narrowing to `string`
+ * @throws {TypeError} when `min` or `max` is not a number
+ * @throws {RangeError} when `min` is not an integer >= 0, or `max` is neither an integer >= `min` nor `Infinity`
+ * @example
+ * const isUsername = isStringOfLength(3, 20);
+ * isUsername('ada'); // => true
+ * isUsername('al'); // => false
+ * isStringOfLength(1, Infinity)(''); // => false
+ * explain(isUsername, 'al'); // => [{ message: 'Expected a string of 3 to 20 characters (got 2)', path: [] }]
+ * explain(isUsername, 42); // => [{ message: 'Expected a string of 3 to 20 characters (got number)', path: [] }]
+ */
+export function isStringOfLength(min: number, max: number): (value: unknown) => value is string {
+	assertNumber('isStringOfLength', 'min', min, Number.isInteger(min) && min >= 0, 'an integer >= 0');
+	assertNumber('isStringOfLength', 'max', max, (Number.isInteger(max) && max >= min) || max === Infinity, `an integer >= min (${min}) or Infinity`);
+
+	const expected = `Expected a string of ${min === max ? `exactly ${min}` : max === Infinity ? `at least ${min}` : `${min} to ${max}`} characters`;
+
+	return failing(
+		function isStringWithLength(value: unknown): value is string {
+			return typeof value === 'string' && value.length >= min && value.length <= max;
+		},
+		function (value: unknown): string {
+			return `${expected} (got ${typeof value === 'string' ? value.length : typeName(value)})`;
+		}
+	);
+}
+
+/**
+ * Creates a guard accepting strings that match `pattern` (`z.string().regex()`). The pattern is copied without its `g` and `y` flags,
+ * so the guard is stateless: `RegExp#test` with those flags advances `lastIndex`, which makes a shared global regex alternate between
+ * `true` and `false` on the same input. Linear-time matching is up to the pattern: avoid nested quantifiers on untrusted input.
+ * {@link explain} reports the pattern, never the string itself.
+ * @param {RegExp} pattern - The pattern the whole string must satisfy (anchor it with `^…$` to match the whole string)
+ * @returns {(value: unknown) => boolean} A guard narrowing to `string`
+ * @throws {TypeError} when `pattern` is not a regular expression
+ * @example
+ * const isHandle = isStringMatching(/^@[a-z0-9_]+$/);
+ * isHandle('@ada_l'); // => true
+ * isHandle('ada'); // => false
+ * const isWord = isStringMatching(/^\w+$/g);
+ * [isWord('abc'), isWord('abc')]; // => [true, true] // a plain `/^\w+$/g.test` alternates true, false
+ * explain(isHandle, 'ada'); // => [{ message: 'Expected a string matching /^@[a-z0-9_]+$/ (got string)', path: [] }]
+ */
+export function isStringMatching(pattern: RegExp): (value: unknown) => value is string {
+	if (!isRegExp(pattern)) throw new TypeError(`isStringMatching: \`pattern\` must be a RegExp, got ${typeName(pattern)}`);
+
+	const regex = new RegExp(pattern, pattern.flags.replace(/[gy]/g, ''));
+
+	return expecting(
+		function isMatchingString(value: unknown): value is string {
+			return typeof value === 'string' && regex.test(value);
+		},
+		`a string matching ${String(regex)}`
+	);
+}
+
+/**
+ * The type a {@link isDiscriminatedUnion} guard narrows to: for each variant, its guard's type with the discriminant set to the variant name.
+ * @template K - The discriminant key
+ * @template V - The variant guards, by discriminant value
+ */
+export type DiscriminatedUnionType<K extends string, V extends ShapeGuards> = {
+	[T in keyof V & string]: { [P in K]: T } & Infer<V[T]> extends infer O ? { [P in keyof O]: O[P] } : never;
+}[keyof V & string];
+
+/**
+ * Creates a guard for a discriminated (tagged) union (`z.discriminatedUnion()`): objects whose OWN string property `key` names one of
+ * the `variants`, and that pass that variant's guard. Each variant guard checks the rest of the object; the discriminant is checked
+ * once, and added to the narrowed type, so variants do not repeat it. Unlike {@link isUnion}, which tries every member in turn, the
+ * variant is looked up directly: checking stays fast with many variants, and {@link explain} reports the issues of the right variant
+ * (or the allowed tags, when the discriminant is wrong). Tags are strings; inherited keys (`toString`, `__proto__`) never match.
+ * @template K - The discriminant key
+ * @template V - The variant guards, by discriminant value
+ * @param {K} key - The discriminant property, e.g. `'type'` or `'kind'`
+ * @param {V} variants - A plain object mapping each discriminant value to the guard of its variant (at least one)
+ * @returns {(value: unknown) => boolean} A guard narrowing to {@link DiscriminatedUnionType}
+ * @throws {TypeError} when `key` is not a string, or `variants` is not a plain object of functions
+ * @throws {RangeError} when `variants` is empty
+ * @example
+ * const isShapeEvent = isDiscriminatedUnion('type', {
+ *   circle: isShape({ radius: isFiniteNumber }),
+ *   square: isShape({ side: isFiniteNumber })
+ * });
+ * isShapeEvent({ type: 'circle', radius: 2 }); // => true // narrows to { type: 'circle'; radius: number } | { type: 'square'; side: number }
+ * isShapeEvent({ type: 'square', radius: 2 }); // => false
+ * explain(isShapeEvent, { type: 'square', side: '2' }); // => [{ message: 'Invalid value (got string)', path: ['side'] }]
+ * explain(isShapeEvent, { type: 'hexagon' }); // => [{ message: 'Expected "circle" or "square" (got string)', path: ['type'] }]
+ */
+export function isDiscriminatedUnion<const K extends string, const V extends ShapeGuards>(key: K, variants: V): (value: unknown) => value is DiscriminatedUnionType<K, V> {
+	if (typeof key !== 'string') throw new TypeError(`isDiscriminatedUnion: \`key\` must be a string, got ${typeName(key)}`);
+	if (!isPlainObject(variants)) throw new TypeError(`isDiscriminatedUnion: \`variants\` must be a plain object, got ${typeName(variants)}`);
+
+	const tags = Object.keys(variants);
+
+	if (tags.length === 0) throw new RangeError('isDiscriminatedUnion: `variants` must have at least one variant, got 0');
+
+	const lookup = new Map<unknown, Guard<unknown>>();
+
+	for (const tag of tags) {
+		assertFunction('isDiscriminatedUnion', `variants.${tag}`, variants[tag]);
+		lookup.set(tag, variants[tag]);
+	}
+
+	const quoted = tags.map(function (tag: string): string {
+		return describe(tag);
+	});
+	const expected = `Expected ${quoted.length === 1 ? quoted[0] : `${quoted.slice(0, -1).join(', ')} or ${quoted[quoted.length - 1]}`}`;
+
+	/**
+	 * Returns the guard of the variant named by `value[key]`.
+	 * @param {object} value - A non-null object
+	 * @returns {Guard<unknown> | undefined} The variant guard, or `undefined` when the discriminant is missing or unknown
+	 */
+	function variantOf(value: object): Guard<unknown> | undefined {
+		return hasOwn.call(value, key) ? lookup.get((value as Record<string, unknown>)[key]) : undefined;
+	}
+
+	return explainable(
+		function isVariant(value: unknown): value is DiscriminatedUnionType<K, V> {
+			if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+
+			const guard = variantOf(value);
+
+			return guard !== undefined && guard(value);
+		},
+		function explainVariant(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
+			if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+				issues.push({ message: `Expected an object (got ${Array.isArray(value) ? 'array' : typeName(value)})`, path: path.slice() });
+
+				return false;
+			}
+
+			const guard = variantOf(value);
+
+			if (guard !== undefined) return collect(guard, value, path, issues);
+			issues.push(
+				hasOwn.call(value, key)
+					? { message: `${expected} (got ${typeName((value as Record<string, unknown>)[key])})`, path: [...path, key] }
+					: { message: 'Missing required property', path: [...path, key] }
+			);
+
+			return false;
+		}
+	);
+}
+
+/**
  * Creates a guard that passes when EVERY one of `guards` passes, narrowing to the intersection of their types (`z.intersection()`).
  * The guards run in order and stop at the first failure; {@link explain} reports the issues of every failing member (duplicates
  * removed). Shapes built with `{ exact: true }` reject each other's keys, so intersect non-exact shapes.
@@ -1812,10 +1990,10 @@ function compilePattern(pattern: unknown, ancestors: unknown[]): Guard<unknown> 
 
 /**
  * Lists why `value` fails `guard`, with the path of every offending value; an empty array means it passes. Guards built with
- * {@link isShape}, {@link isMatching}, {@link isArrayOf}, {@link isRecordOf}, {@link isTuple}, {@link isUnion}, {@link isIntersection},
- * {@link isOptional}, {@link isNullable}, {@link isLazy}, {@link refine}, {@link isOneOf}, {@link isLiteral}, {@link isNumberInRange} and
- * {@link withMessage}, and the JSON guards ({@link isJsonValue}…), report precise nested issues; any other guard is reported as one
- * issue at its path.
+ * {@link isShape}, {@link isMatching}, {@link isArrayOf}, {@link isRecordOf}, {@link isTuple}, {@link isUnion}, {@link isDiscriminatedUnion},
+ * {@link isIntersection}, {@link isOptional}, {@link isNullable}, {@link isLazy}, {@link refine}, {@link isOneOf}, {@link isLiteral},
+ * {@link isNumberInRange}, {@link isIntegerInRange}, {@link isStringOfLength}, {@link isStringMatching} and {@link withMessage}, and the
+ * JSON guards ({@link isJsonValue}…), report precise nested issues; any other guard is reported as one issue at its path.
  * @param {Guard<unknown>} guard - The guard to check against
  * @param {unknown} value - The value to check
  * @returns {SchemaIssue[]} The issues, in traversal order (empty when `value` passes)
