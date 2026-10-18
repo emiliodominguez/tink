@@ -31,6 +31,12 @@ const violations = [];
  */
 function inspect(node, source, file) {
 	if (ts.isFunctionLike(node) || ts.isClassLike(node)) return;
+	// `{ [key]: value }`: bundlers cannot prove that converting `key` to a property key is side-effect free, so they keep the object
+	// (and everything it references) even when nothing imports it.
+	if (ts.isComputedPropertyName(node)) {
+		const { line } = source.getLineAndCharacterOfPosition(node.getStart(source));
+		violations.push(`${file}:${line + 1}: top-level computed property key \`${node.getText(source).slice(0, 60)}\` cannot be tree-shaken`);
+	}
 	if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
 		const callee = node.expression.getText(source).replace(/\?\./g, '.');
 		if (!PURE_CALLEES.has(callee)) {
@@ -55,7 +61,7 @@ for (const entry of readdirSync('dist', { recursive: true })) {
 
 if (violations.length > 0) {
 	console.error(violations.join('\n'));
-	console.error('Module-level calls run on import and defeat tree-shaking: use literals, function declarations or lazy initialisation.');
+	console.error('Module-level calls and computed keys run on import and defeat tree-shaking: use literals with plain keys, function declarations or lazy initialisation.');
 	process.exit(1);
 }
 console.log('tree-shaking OK · no impure module-level code');
