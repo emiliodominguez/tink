@@ -53,6 +53,88 @@ describe('README examples', function () {
 		jest.useRealTimers();
 	});
 
+	it('should match the quick tour', async function () {
+		const isUser = root.guards.isShape({ id: root.guards.isInteger, email: root.guards.isString, roles: root.guards.isArrayOf(root.guards.isOneOf(['admin', 'editor'])) });
+
+		expect(root.guards.explain(isUser, { id: '7', roles: ['admin', 'root'] })).toEqual([
+			{ path: ['id'], message: 'Invalid value (got string)' },
+			{ path: ['email'], message: 'Missing required property' },
+			{ path: ['roles', 1], message: 'Expected one of 2 allowed values (got string)' }
+		]);
+		expect(root.validate.parseJson('{"id":7,"email":"a@b.co","roles":["admin"]}', isUser)).toEqual([undefined, { id: 7, email: 'a@b.co', roles: ['admin'] }]);
+		const [protoError, protoValue] = root.validate.parseJson('{"__proto__": {"isAdmin": true}}');
+		expect(protoError).toBeInstanceOf(SyntaxError);
+		expect((protoError as Error).message).toContain('JSON contains a forbidden "__proto__" key');
+		expect(protoValue).toBeUndefined();
+		expect(root.guards.toStandardSchema(isUser)['~standard'].validate({ id: 1, email: 'x', roles: [] })).toEqual({ value: { id: 1, email: 'x', roles: [] } });
+
+		expect(Object.keys(deepMerge({ theme: 'light' }, JSON.parse('{"__proto__": {"isAdmin": true}}')))).toEqual(['theme']);
+		expect(({} as Record<string, unknown>).isAdmin).toBeUndefined();
+		expect(getFromObjectByKeys({ viewer: { read: true } }, 'viewer.constructor' as never, false)).toBe(false);
+		expect(root.url.sanitizeUrl(' JAVASCRIPT:alert(1)')).toBe('about:blank');
+		expect(root.url.isAbsoluteUrl('/\\evil.com')).toBe(true);
+
+		expect(formatDate(root.date.addDuration(new Date(2024, 0, 31), { months: 1, days: 1 }), 'YYYY-MM-DD')).toBe('2024-03-01');
+		expect(root.date.intervalToDuration(new Date(2024, 0, 31), new Date(2024, 2, 1, 12))).toEqual({
+			years: 0,
+			months: 1,
+			days: 1,
+			hours: 12,
+			minutes: 0,
+			seconds: 0,
+			milliseconds: 0
+		});
+		expect(root.date.parseDate('2023-02-29', 'YYYY-MM-DD')).toBeUndefined();
+
+		expect(root.strings.reverse('a👍🏽b')).toBe('b👍🏽a');
+		expect(root.strings.padStart('🇦🇷', 3, '·')).toBe('··🇦🇷');
+		expect(root.objects.toCamelCaseKeys({ user_id: 1, created_at: '2024-01-01' })).toEqual({ userId: 1, createdAt: '2024-01-01' });
+
+		const people = [
+			{ name: 'b', age: 30 },
+			{ name: 'a', age: NaN },
+			{ name: 'c', age: 25 }
+		];
+		const ordered = root.arrays.orderBy(
+			people,
+			[
+				function (person: { name: string; age: number }): number {
+					return person.age;
+				},
+				function (person: { name: string; age: number }): string {
+					return person.name;
+				}
+			],
+			['desc', 'asc']
+		);
+		expect(
+			ordered.map(function (person) {
+				return person.name;
+			})
+		).toEqual(['b', 'c', 'a']);
+
+		type Shape = { kind: 'circle'; r: number } | { kind: 'square'; size: number };
+		const square: Shape = { kind: 'square', size: 3 };
+		expect(
+			root.functions.match(square as Shape, 'kind', {
+				circle: function (circle) {
+					return Math.PI * circle.r ** 2;
+				},
+				square: function (shape) {
+					return shape.size ** 2;
+				}
+			})
+		).toBe(9);
+
+		let calls = 0;
+		const getUser = root.async.memoizeAsync(async function (id: number) {
+			calls++;
+			return { id };
+		});
+		await Promise.all([getUser(1), getUser(1), getUser(1)]);
+		expect(calls).toBe(1);
+	});
+
 	it('should match the usage section', function () {
 		expect(chunk([1, 2, 3, 4, 5], 2)).toEqual([[1, 2], [3, 4], [5]]);
 		expect(toKebabCase('XMLHttpRequest')).toBe('xml-http-request');

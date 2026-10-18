@@ -74,6 +74,7 @@
 		"test:docs": "node scripts/doctest.mjs",
 		"test:mutation": "stryker run",
 		"bench": "node scripts/bench.mjs",
+		"compare": "node bench/edge-cases.mjs",
 		"test:dist": "node scripts/smoke-dist.mjs",
 		"check:exports": "attw --pack . --profile esm-only",
 		"check:size": "node scripts/check-size.mjs",

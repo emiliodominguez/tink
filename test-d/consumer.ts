@@ -6,6 +6,7 @@ import type { NestedKeyOf, PathValue } from '@emiliodominguez/tink/utils';
 import { isShape, isString, isInteger, isOptional, isArrayOf, isUnion, isNullable, isTuple, toStandardSchema } from '@emiliodominguez/tink/guards';
 import type { Infer } from '@emiliodominguez/tink/guards';
 import type { StandardSchemaV1 } from '@standard-schema/spec';
+import { toCamelCaseKeys } from '@emiliodominguez/tink/objects';
 // The root entry pulls in every module's declarations.
 import * as everything from '@emiliodominguez/tink';
 
@@ -85,4 +86,9 @@ type SpecOutput = StandardSchemaV1.InferOutput<typeof spec>;
 const output: SpecOutput = { id: 'a', email: 'x', tags: ['t'], manager: { id: 2 }, position: [1, 2] };
 // @ts-expect-error `id` must be a string or a number
 const wrong: Account = { id: true, tags: [], manager: null, position: [0, 0] };
-export { a, b, c, keys, v, m, dm, p, o, r, f, g, everything, spec, output, wrong };
+
+// README tour: key transforms keep their value types.
+const camel: { userId: number; createdAt: string } = toCamelCaseKeys({ user_id: 1, created_at: '2024-01-01' });
+// @ts-expect-error the snake_case key no longer exists
+camel.user_id;
+export { a, b, c, keys, v, m, dm, p, o, r, f, g, everything, spec, output, wrong, camel };
