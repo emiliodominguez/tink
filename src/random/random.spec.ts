@@ -606,6 +606,12 @@ describe('random', function () {
 	});
 
 	describe('weightedRandom', function () {
+		it('should reject numeric strings instead of concatenating them (e.g. weights read from a query string)', function () {
+			expect(function () {
+				helpers.weightedRandom(['a', 'b'], ['5', '3'] as never);
+			}).toThrow(new TypeError('weightedRandom: `weights[0]` must be a finite number >= 0, got string'));
+		});
+
 		it('should map the uniform draw onto cumulative weights', function () {
 			const items = ['a', 'b', 'c'];
 			const weights = [1, 2, 1];
@@ -780,6 +786,76 @@ describe('random', function () {
 			expect(function () {
 				helpers.randomBoolean(1.1);
 			}).toThrow(new RangeError('randomBoolean: `probability` must be a number in [0, 1], got 1.1'));
+		});
+	});
+	describe('secureRandom', function () {
+		it('should return 53-bit floats in [0, 1) built from two crypto words', function () {
+			// Every byte equal: the words are the same whatever the platform's endianness.
+			expect(
+				withCrypto(scriptedCrypto([new Array(1024).fill(0)]), function () {
+					return helpers.secureRandom();
+				})
+			).toBe(0);
+			expect(
+				withCrypto(scriptedCrypto([new Array(1024).fill(0xff)]), function () {
+					return helpers.secureRandom();
+				})
+			).toBe(1 - 2 ** -53);
+			expect(
+				withCrypto(scriptedCrypto([new Array(1024).fill(0x80)]), function () {
+					return helpers.secureRandom();
+				})
+			).toBe(((0x80808080 >>> 5) * 2 ** 26 + (0x80808080 >>> 6)) / 2 ** 53);
+		});
+
+		it('should serve 128 values per crypto call, and refill when the buffer is exhausted or the crypto object changes', function () {
+			const crypto = scriptedCrypto([new Array(1024).fill(1), new Array(1024).fill(2), new Array(1024).fill(3)]);
+			withCrypto(crypto, function () {
+				const first = helpers.secureRandom();
+				for (let i = 1; i < 128; i++) expect(helpers.secureRandom()).toBe(first);
+				expect(crypto.getRandomValues).toHaveBeenCalledTimes(1);
+				expect(helpers.secureRandom()).not.toBe(first);
+				expect(crypto.getRandomValues).toHaveBeenCalledTimes(2);
+			});
+			const other = scriptedCrypto([new Array(1024).fill(0)]);
+			expect(
+				withCrypto(other, function () {
+					return helpers.secureRandom();
+				})
+			).toBe(0);
+			expect(other.getRandomValues).toHaveBeenCalledTimes(1);
+		});
+
+		it('should use all 53 bits and be roughly uniform', function () {
+			const values = Array.from({ length: 4000 }, helpers.secureRandom);
+			for (const value of values) {
+				expect(value).toBeGreaterThanOrEqual(0);
+				expect(value).toBeLessThan(1);
+			}
+			expect(
+				values.some(function (value) {
+					return (value * 2 ** 53) % 2 === 1;
+				})
+			).toBe(true);
+			const mean =
+				values.reduce(function (total, value) {
+					return total + value;
+				}, 0) / values.length;
+			expect(Math.abs(mean - 0.5)).toBeLessThan(0.05);
+		});
+
+		it('should be usable wherever a RandomGenerator is accepted', function () {
+			expect(helpers.randomBoolean(1, helpers.secureRandom)).toBe(true);
+			expect(helpers.weightedRandom(['a', 'b'], [0, 1], helpers.secureRandom)).toBe('b');
+			expect(Number.isFinite(helpers.randomGaussian(0, 1, helpers.secureRandom))).toBe(true);
+		});
+
+		it('should throw when no cryptographically secure source is available, never falling back to Math.random', function () {
+			for (const value of [undefined, null, {}]) {
+				expect(function () {
+					withCrypto(value, helpers.secureRandom);
+				}).toThrow(new Error('secureRandom: no cryptographically secure random source is available (globalThis.crypto.getRandomValues is missing)'));
+			}
 		});
 	});
 });

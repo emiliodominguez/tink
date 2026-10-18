@@ -1,5 +1,6 @@
 import fc from 'fast-check';
 
+import { isNumericString } from '../validate/index.js';
 import * as helpers from '.';
 
 /**
@@ -240,6 +241,97 @@ describe('String helpers (properties)', function () {
 				})
 			);
 		});
+
+		/** Whether the runtime supports the `v` flag. */
+		const hasVFlag = (function (): boolean {
+			try {
+				return new RegExp('[a]', 'v').test('a');
+			} catch {
+				return false;
+			}
+		})();
+		const flags = hasVFlag ? ['', 'u', 'v'] : ['', 'u'];
+		const tricky = fc.string({
+			unit: fc.oneof(
+				fc.constantFrom(...'^$\\.*+?()[]{}|/,-=<>#&!%:;@~\'`"_ \t\n\v\f\r\u00a0\u2028\u2029\ufeff\u3000aZ09'.split('')),
+				fc.constantFrom('&&', '--', '!!', '\ud83d\ude00', 'é'),
+				fc.string({ unit: 'binary', maxLength: 2 })
+			)
+		});
+
+		it('matches the input exactly with the "", "u" and "v" (when supported) flags, lone surrogates included', function () {
+			fc.assert(
+				fc.property(fc.oneof(tricky, fc.string({ unit: 'binary' })), function (s) {
+					const escaped = helpers.escapeRegExp(s);
+					// Lone surrogates cannot be matched by u/v patterns as code units of a well-formed subject; they are still valid syntax.
+					const wellFormed = !/[\ud800-\udfff]/.test(s.replace(/[\ud800-\udbff][\udc00-\udfff]/g, ''));
+					for (const flag of flags) {
+						const regex = new RegExp(`^${escaped}$`, flag);
+						if (flag === '' || wellFormed) expect({ s, flag, test: regex.test(s) }).toEqual({ s, flag, test: true });
+					}
+				})
+			);
+		});
+
+		it('inside a character class, matches every character of the input and no other one', function () {
+			fc.assert(
+				fc.property(tricky, fc.constantFrom('q', 'Q', '3', 'é', ' '), function (s, other) {
+					fc.pre(s.length > 0);
+					const escaped = helpers.escapeRegExp(s);
+					for (const flag of flags) {
+						// Without u/v, a class holds code units; with them, code points.
+						const chars = flag === '' ? s.split('') : Array.from(s);
+						const regex = new RegExp(`^[${escaped}]$`, flag);
+						for (const char of chars) expect({ s, flag, char, test: regex.test(char) }).toEqual({ s, flag, char, test: true });
+						expect(regex.test(other)).toBe(chars.includes(other));
+					}
+				})
+			);
+		});
+
+		it('equals a direct transcription of the TC39 RegExp.escape algorithm (and the native one when available)', function () {
+			/**
+			 * RegExp.escape, transcribed from the proposal's spec text.
+			 * @param s - The string
+			 * @returns The escaped string
+			 */
+			function reference(s: string): string {
+				/**
+				 * Lower-case hex, zero-padded.
+				 * @param n - The number
+				 * @param width - The minimum width
+				 * @returns The hex digits
+				 */
+				function hex(n: number, width: number): string {
+					return n.toString(16).padStart(width, '0');
+				}
+				let result = '';
+				let first = true;
+				for (const c of s) {
+					const cp = c.codePointAt(0) as number;
+					if (first && /^[0-9A-Za-z]$/.test(c)) result += `\\x${hex(cp, 2)}`;
+					else if ('^$\\.*+?()[]{}|/'.includes(c)) result += `\\${c}`;
+					else if (c === '\t') result += '\\t';
+					else if (c === '\n') result += '\\n';
+					else if (c === '\v') result += '\\v';
+					else if (c === '\f') result += '\\f';
+					else if (c === '\r') result += '\\r';
+					else if (',-=<>#&!%:;@~\'`"'.includes(c) || /^\s$/.test(c) || (cp >= 0xd800 && cp <= 0xdfff)) {
+						result += cp <= 0xff ? `\\x${hex(cp, 2)}` : `\\u${hex(cp, 4)}`;
+					} else result += c;
+					first = false;
+				}
+				return result;
+			}
+			const native = (RegExp as any).escape as ((s: string) => string) | undefined;
+			fc.assert(
+				fc.property(fc.oneof(tricky, fc.string({ unit: 'binary' }), fc.string({ unit: 'grapheme' })), function (s) {
+					expect(helpers.escapeRegExp(s)).toBe(reference(s));
+					if (native !== undefined) expect(helpers.escapeRegExp(s)).toBe(native(s));
+				}),
+				{ numRuns: 1000 }
+			);
+		});
 	});
 
 	describe('escapeHtml / unescapeHtml', function () {
@@ -437,6 +529,18 @@ describe('String helpers (properties)', function () {
 				fc.property(fc.integer(), fc.stringMatching(/^\s*$/), function (n, pad) {
 					expect(helpers.toNumber(pad + String(n) + pad)).toBe(n);
 					expect(helpers.toNumber(pad)).toBeNaN();
+				})
+			);
+		});
+
+		it('toNumber returns a finite number exactly when isNumericString accepts the trimmed string, else NaN', function () {
+			const numberish = fc.string({ unit: fc.constantFrom('0', '1', '9', '.', 'e', 'E', '+', '-', 'x', 'b', 'o', '_', 'I', 'nfinity', ' ', '4', '00') });
+			fc.assert(
+				fc.property(fc.oneof(numberish, fc.double().map(String)), function (text) {
+					const value = helpers.toNumber(text);
+					if (isNumericString(text.trim())) expect(value).toBe(Number(text.trim()));
+					else expect(value).toBeNaN();
+					expect(Number.isNaN(value) || Number.isFinite(value)).toBe(true);
 				})
 			);
 		});
@@ -686,7 +790,7 @@ describe('String helpers (properties)', function () {
 	describe('mask', function () {
 		const maskable = fc.string({ unit: fc.constantFrom('a', '1', ' ', 'é', 'é', '👍🏽', '🇫🇷', '-') });
 
-		it('preserves the grapheme length and the visible parts', function () {
+		it('preserves the grapheme length and the visible parts, and always hides at least one grapheme of a non-empty string', function () {
 			fc.assert(
 				fc.property(maskable, fc.nat(5), fc.nat(5), fc.constantFrom('*', '•', '#'), function (s, visibleStart, visibleEnd, char) {
 					const masked = helpers.mask(s, { visibleStart, visibleEnd, char });
@@ -694,7 +798,7 @@ describe('String helpers (properties)', function () {
 					const output = graphemes(masked);
 					expect(output).toHaveLength(input.length);
 					if (input.length <= visibleStart + visibleEnd) {
-						expect(masked).toBe(s);
+						expect(masked).toBe(char.repeat(input.length));
 						return;
 					}
 					expect(output.slice(0, visibleStart)).toEqual(input.slice(0, visibleStart));

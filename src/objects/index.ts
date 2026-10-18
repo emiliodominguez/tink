@@ -19,7 +19,7 @@ import {
 	isWeakMap,
 	isWeakSet
 } from '../guards/index.js';
-import { assertFunction, describe } from '../utils/assert.js';
+import { assertFunction, assertInteger, describe } from '../utils/assert.js';
 import type { AnyFunction, DeepReadonly, NestedKeyOf, PathValue, Primitive, UnionToIntersection } from '../utils/index.js';
 
 // Backward compatibility: these type guards MOVED to the `guards` module (where they are real type predicates).
@@ -133,7 +133,7 @@ export type Invert<T> = { -readonly [K in keyof T as T[K] & PropertyKey]: K exte
 // Internal helpers
 // ---------------------------------------------------------------------------------------------------------------------
 
-/** Keys that must never be written through a user-controlled path or merged from a source (prototype pollution). */
+/** Keys that must never be written or deleted through a user-controlled path (prototype pollution). */
 const UNSAFE_KEYS: ReadonlySet<PropertyKey> = new Set<PropertyKey>(['__proto__', 'constructor', 'prototype']);
 
 /**
@@ -198,6 +198,49 @@ function defineValue(object: object, key: PropertyKey, value: unknown): void {
 function definePlain(object: object, key: PropertyKey, value: unknown): void {
 	if (key in Object.prototype) defineOwn(object, key, value);
 	else (object as Properties)[key] = value;
+}
+
+/**
+ * Whether reading `key` from `object` must NOT resolve, which is the read rule shared by {@link getFromObjectByKeys},
+ * {@link getProperty}, {@link hasInObjectByKeys} and {@link pick}: `__proto__`, `constructor` and `prototype` never resolve (not even
+ * as own data keys), and neither does a key that is not own and comes from `Object.prototype` (`toString`, `hasOwnProperty`... and
+ * anything a pollution added there). Own properties and properties inherited from any other prototype (class getters, `Array` and
+ * `String` methods, `Object.create(proto)` parents) are readable; so are primitives' own properties (a string's `length` and indices).
+ * @param {unknown} object - The (non-nullish) value the key is read from
+ * @param {PropertyKey} key - The key
+ * @returns {boolean} Whether the key must be treated as missing
+ */
+function isUnreadable(object: unknown, key: PropertyKey): boolean {
+	// Only the few keys `Object.prototype` has (`__proto__` and `constructor` among them) need more work: one lookup for the usual
+	// ones (the rest is kept out of line, so that this check stays small enough to be inlined into the readers).
+	return key === 'prototype' || (key in Object.prototype && isObjectPrototypeKey(object, key));
+}
+
+/**
+ * The slow part of {@link isUnreadable}, for a key that `Object.prototype` has: whether it is `__proto__` or `constructor`, or
+ * comes from `Object.prototype` when read from `object` (no object of the chain before it has the key as an own property).
+ * @param {unknown} object - The (non-nullish) value the key is read from
+ * @param {PropertyKey} key - A key of `Object.prototype`
+ * @returns {boolean} Whether the key must be treated as missing
+ */
+function isObjectPrototypeKey(object: unknown, key: PropertyKey): boolean {
+	if (key === '__proto__' || key === 'constructor') return true;
+	for (let current = object; current !== Object.prototype; current = Object.getPrototypeOf(current)) {
+		if (current === null || hasOwn(current as object, key)) return false;
+	}
+	return true;
+}
+
+/**
+ * Reads `key` from `object` following the rule of {@link isUnreadable}.
+ * @param {unknown} object - The (non-nullish) value to read from
+ * @param {PropertyKey} key - The key
+ * @returns {unknown} The value, or `undefined` when the key is missing or unreadable
+ */
+function readKey(object: unknown, key: PropertyKey): unknown {
+	const value = (object as Properties)[key];
+	// A missing key reads as `undefined` anyway, so the rule only needs to be checked for the other values.
+	return value === undefined || !isUnreadable(object, key) ? value : undefined;
 }
 
 /**
@@ -342,8 +385,9 @@ function isSimpleArray(array: ReadonlyArray<unknown>): boolean {
 
 /**
  * Shallowly merges one or more source objects into a NEW object, left to right (later keys win, like `{ ...target, ...a, ...b }`).
- * Inputs are never mutated. Own enumerable string and symbol keys are copied; a `'__proto__'` key becomes a plain own property
- * (no prototype change). `null`/`undefined` sources are ignored.
+ * Inputs are never mutated. Own enumerable string and symbol keys are copied as own data properties (defined, never assigned): a
+ * `'__proto__'` key becomes a plain own property (no prototype change), and `constructor`/`prototype` keys are copied like any other.
+ * `null`/`undefined` sources are ignored.
  * @template T - The target type
  * @template S - The tuple of source types
  * @param {T} target - The base object
@@ -368,6 +412,8 @@ export function merge<T extends object, S extends object[]>(target: T, ...source
  * - `Date`, `RegExp` (incl. `lastIndex`), `Map`, `Set`, `ArrayBuffer`, typed arrays/`DataView` and boxed primitives get a new instance with the same contents.
  * - Errors keep `message`, `stack` and other own (even non-enumerable) properties.
  * - `WeakMap`, `WeakSet` and promises cannot be copied and are returned by reference.
+ * - Keys are defined, never assigned: a `'__proto__'` key stays an own data property (no prototype change); `constructor` and
+ *   `prototype` keys are copied like any other own data key.
  * @template T - The type of the value
  * @param {T} value - The value to copy
  * @returns {T} The shallow copy
@@ -402,21 +448,29 @@ export function hasProperty<T extends object, K extends PropertyKey>(object: T, 
 }
 
 /**
- * Gets the value of a property of an object.
+ * Gets the value of a property of an object (own or inherited, e.g. a class getter, or a string's `length`).
+ * For safety, `__proto__`, `constructor` and `prototype` never resolve (not even as own keys), and neither do members of
+ * `Object.prototype` that the object does not have as own properties (`toString`, `hasOwnProperty`, keys added by prototype
+ * pollution...): they all read as `undefined`, so a user-controlled key cannot reach the prototype, `Object` or `Function`.
  * @template T - The object type
  * @template K - The key type
  * @param {T} object - The object to read from
  * @param {K} property - The property key
- * @returns {T[K]} The property value
+ * @returns {T[K]} The property value (`undefined` for a missing or blocked key)
+ * @throws {TypeError} when `object` is `null` or `undefined`
  * @example
  * getProperty({ a: 1 }, 'a'); // => 1
+ * getProperty('abc', 'length'); // => 3
+ * getProperty({} as { constructor?: unknown }, 'constructor'); // => undefined
  */
 export function getProperty<T, K extends keyof T>(object: T, property: K): T[K] {
-	return object[property];
+	return readKey(object, property) as T[K];
 }
 
 /**
  * Sets the value of a property of an object. MUTATES `object` (plain assignment, so setters run).
+ * The key `'__proto__'` is refused: assigning it would replace the object's prototype (e.g. with one carrying `isAdmin: true`).
+ * `constructor` and `prototype` are allowed: assigning them creates (or updates) a property of `object` itself.
  * @template T - The object type
  * @template K - The key type
  * @template V - The value type
@@ -424,12 +478,15 @@ export function getProperty<T, K extends keyof T>(object: T, property: K): T[K] 
  * @param {K} property - The property key
  * @param {V} value - The value to assign
  * @returns {void}
+ * @throws {RangeError} when `property` is `'__proto__'`
  * @example
  * const target = {};
  * setProperty(target, 'a', 1);
  * target; // => { a: 1 }
+ * setProperty({}, '__proto__', { isAdmin: true }); // throws RangeError
  */
 export function setProperty<T extends object, K extends PropertyKey, V>(object: T, property: K, value: V): void {
+	if (property === '__proto__') throw new RangeError('setProperty: `property` must not be the unsafe key "__proto__"');
 	(object as Record<K, V>)[property] = value;
 }
 
@@ -492,7 +549,8 @@ export function isEmpty<T>(value: T): boolean {
 
 /**
  * Creates a new object with only the given keys. A key is copied when it exists on the object (own OR inherited, e.g. class getters);
- * missing keys are skipped. The input is not mutated.
+ * missing keys are skipped. The input is not mutated. Keys are read with the rule of {@link getProperty}: `__proto__`, `constructor`,
+ * `prototype` and `Object.prototype` members the object does not own (`toString`...) are skipped too.
  * @template T - The object type
  * @template K - The picked keys
  * @param {T} object - The source object
@@ -500,13 +558,14 @@ export function isEmpty<T>(value: T): boolean {
  * @returns {Pick<T, K>} A new object with only those keys
  * @example
  * pick({ a: 1, b: 2, c: 3 }, ['a', 'c']); // => { a: 1, c: 3 }
+ * pick({ a: 1 } as { a: number; constructor?: unknown }, ['a', 'constructor']); // => { a: 1 }
  */
 export function pick<T extends object, K extends keyof T>(object: T, keys: ReadonlyArray<K>): Pick<T, K> {
 	const result = {} as Pick<T, K>;
 	for (const key of keys) {
 		const value = object[key];
 		// Only an `undefined` value can come from a missing key, so the `in` lookup is skipped for every other value.
-		if (value !== undefined || key in object) definePlain(result, key, value);
+		if ((value !== undefined || key in object) && !isUnreadable(object, key)) definePlain(result, key, value);
 	}
 	return result;
 }
@@ -612,14 +671,16 @@ const MAX_ARRAY_LENGTH = 2 ** 32 - 1;
 /** Canonical decimal form of a non-negative integer (no sign, no leading zeros). */
 const CANONICAL_INDEX = /^(?:0|[1-9]\d*)$/;
 
+/** Largest index for which the path setters create a missing container as an array (see {@link UnflattenOptions.arrayLimit}). */
+const ARRAY_LIMIT = 1000;
+
 /**
- * Whether a path segment is a canonical array index (`'0'`, `'12'`, but not `'01'`, `'-1'`, `'1.5'` or `'4294967295'`),
- * i.e. a key that an array stores as an element rather than as an extra property.
+ * The number a path segment stands for when it is in canonical decimal form (`'0'`, `'12'`, but not `'01'`, `'-1'` or `'1.5'`).
  * @param {string} segment - The path segment
- * @returns {boolean} Whether the segment is an array index
+ * @returns {number} The index, or `-1` when the segment is not a canonical non-negative integer
  */
-function isArrayIndex(segment: string): boolean {
-	return CANONICAL_INDEX.test(segment) && Number(segment) < MAX_ARRAY_LENGTH;
+function parseIndex(segment: string): number {
+	return CANONICAL_INDEX.test(segment) ? Number(segment) : -1;
 }
 
 /**
@@ -652,14 +713,26 @@ function parseWritablePath(caller: string, label: string, path: string, separato
  * @param {string} path - The original path, for error messages
  * @param {string} separator - The separator, for error messages
  * @param {string} caller - Name of the public function, for error messages
+ * @param {number} arrayLimit - Largest index for which a missing container is created as an array (at most `MAX_ARRAY_LENGTH - 1`);
+ * a larger canonical index creates a plain object instead
  * @param {WeakSet<object>} [owned] - Strict mode used by {@link unflattenObject}: the containers created so far. When given, every
  * created container is added to it, only those containers may be traversed, and an existing property is never overwritten
- * (any of these is a conflict between two keys)
+ * (any of these is a conflict between two keys). A created array about to receive an index above `arrayLimit` is replaced by a
+ * plain object with the same entries
  * @returns {void}
  * @throws {TypeError} when an existing intermediate value is a primitive
  * @throws {TypeError} in strict mode, when the path conflicts with a previously written one
  */
-function assignPath(target: object, segments: ReadonlyArray<string>, value: unknown, path: string, separator: string, caller: string, owned?: WeakSet<object>): void {
+function assignPath(
+	target: object,
+	segments: ReadonlyArray<string>,
+	value: unknown,
+	path: string,
+	separator: string,
+	caller: string,
+	arrayLimit: number,
+	owned?: WeakSet<object>
+): void {
 	let current = target as Record<string, unknown>;
 	const last = segments.length - 1;
 	// Whether `current` was created by this call: it then has no own property yet, so nothing needs to be looked up.
@@ -674,7 +747,8 @@ function assignPath(target: object, segments: ReadonlyArray<string>, value: unkn
 			throw new TypeError(`${caller}: cannot set "${path}": "${segments.slice(0, index + 1).join(separator)}" is already set by another key`);
 		}
 		if (next == null) {
-			const container: object = isArrayIndex(segments[index + 1]) ? [] : {};
+			const nextIndex = parseIndex(segments[index + 1]);
+			const container: object = nextIndex !== -1 && nextIndex <= arrayLimit ? [] : {};
 			// A fresh container has no own keys, so only an inherited key can intercept a plain assignment.
 			if (fresh && !(segment in current)) current[segment] = container;
 			else defineOwn(current, segment, container);
@@ -683,6 +757,13 @@ function assignPath(target: object, segments: ReadonlyArray<string>, value: unkn
 			next = container;
 		} else if (!isObject(next) && !isFunction(next)) {
 			throw new TypeError(`${caller}: cannot set "${path}": "${segments.slice(0, index + 1).join(separator)}" is a ${typeof next}, not an object`);
+		} else if (owned !== undefined && Number(segments[index + 1]) > arrayLimit && CANONICAL_INDEX.test(segments[index + 1]) && Array.isArray(next)) {
+			// An array created by an earlier key would grow past the limit: it becomes a plain object (its keys are path segments,
+			// never `__proto__`, so assigning them is safe), still owned. `current` owns `segment` as a data property: plain assignment.
+			// (The numeric comparison comes first: it is cheap, and false for the usual segments, names and small indices.)
+			next = Object.assign({}, next);
+			owned.add(next as object);
+			current[segment] = next;
 		}
 
 		current = next as Record<string, unknown>;
@@ -698,6 +779,10 @@ function assignPath(target: object, segments: ReadonlyArray<string>, value: unkn
  * Safely reads a nested value through a dot-separated path (array elements are addressed with numeric segments: `'list.0.id'`).
  * Never throws for missing intermediates: if any step is `null`/`undefined` the result is `undefined`.
  * When `defaultValue` is provided, it is returned whenever the resolved value is `undefined`.
+ * Each segment reads own and inherited properties (class getters, a string's `length`...), EXCEPT that, so that a user-controlled path
+ * cannot reach prototypes, `Object` or `Function` (e.g. a truthy `'viewer.constructor'` permission check), a `__proto__`,
+ * `constructor` or `prototype` segment never resolves (not even as an own key), and neither does an `Object.prototype` member the
+ * object does not own (`toString`, `hasOwnProperty`, keys added by prototype pollution...): the result is then `defaultValue`.
  * @template T - The object type
  * @template P - The path (inferred from the literal, checked against the object's shape)
  * @param {T} target - The object to read from
@@ -706,6 +791,8 @@ function assignPath(target: object, segments: ReadonlyArray<string>, value: unkn
  * @example
  * getFromObjectByKeys({ a: { b: [{ id: 1 }] } }, 'a.b.0.id'); // => 1
  * getFromObjectByKeys({ a: {} as { x?: { y: number } } }, 'a.x.y'); // => undefined
+ * getFromObjectByKeys({ name: 'Ada' }, 'name.length'); // => 3
+ * getFromObjectByKeys({ viewer: { read: true } } as Record<string, object>, 'viewer.constructor' as never, false); // => false
  */
 export function getFromObjectByKeys<T extends object, P extends NestedKeyOf<T>>(target: T, keys: P): PathValue<T, P>;
 /**
@@ -731,11 +818,11 @@ export function getFromObjectByKeys<T extends object, P extends NestedKeyOf<T>, 
 export function getFromObjectByKeys(target: object, keys: string, defaultValue?: unknown): unknown {
 	let current: unknown = target;
 	// A single segment (the most common path) is read directly, without splitting.
-	if (keys.indexOf('.') === -1) current = current == null ? undefined : (current as Record<string, unknown>)[keys];
+	if (keys.indexOf('.') === -1) current = current == null ? undefined : readKey(current, keys);
 	else {
 		for (const segment of keys.split('.')) {
 			if (current == null) return defaultValue;
-			current = (current as Record<string, unknown>)[segment];
+			current = readKey(current, segment);
 		}
 	}
 	return current === undefined ? defaultValue : current;
@@ -743,8 +830,9 @@ export function getFromObjectByKeys(target: object, keys: string, defaultValue?:
 
 /**
  * Sets a nested value through a dot-separated path. MUTATES `target` and returns it.
- * Missing (or `null`/`undefined`) intermediates are created: an array when the next segment is a canonical array index
- * (`'list.0'`, `'list.12'`; not `'01'`), a plain object otherwise.
+ * Missing (or `null`/`undefined`) intermediates are created: an array when the next segment is a canonical array index up to 1000
+ * (`'list.0'`, `'list.12'`; not `'01'`), a plain object otherwise (so `'list.4294967294'` cannot create a 4-billion-element sparse
+ * array). Writing any index into an EXISTING array is unchanged.
  * Only OWN properties are traversed: an inherited intermediate (such as `toString` from `Object.prototype`, or a getter defined on a class)
  * is shadowed by a new own container, so prototypes and built-ins are never modified. The final property is set by plain assignment.
  * @template T - The object type
@@ -757,9 +845,10 @@ export function getFromObjectByKeys(target: object, keys: string, defaultValue?:
  * @throws {TypeError} when an existing intermediate value is a primitive (it would have to be overwritten)
  * @example
  * setInObjectByKeys({}, 'a.list.0.id', 7); // => { a: { list: [{ id: 7 }] } }
+ * setInObjectByKeys({}, 'a.5000', 1); // => { a: { 5000: 1 } }
  */
 export function setInObjectByKeys<T extends object>(target: T, path: string, value: unknown): T {
-	assignPath(target, parseWritablePath('setInObjectByKeys', '`path`', path, '.'), value, path, '.', 'setInObjectByKeys');
+	assignPath(target, parseWritablePath('setInObjectByKeys', '`path`', path, '.'), value, path, '.', 'setInObjectByKeys', ARRAY_LIMIT);
 	return target;
 }
 
@@ -859,10 +948,15 @@ function copyChild(value: unknown, seen?: Map<object, unknown>): unknown {
  * - `WeakMap`, `WeakSet` and promises cannot be copied and are returned by reference.
  * - Shared and CIRCULAR references are preserved (the copy has the same reference graph).
  * - Extra own properties attached to built-ins (Date, Map, Set, RegExp, typed arrays) are not copied.
- * Very deeply nested inputs (thousands of levels) can exceed the call stack (`RangeError`).
+ * - Keys are defined, never assigned: a `'__proto__'` key stays an own data property (no prototype change); `constructor` and
+ *   `prototype` keys are copied like any other own data key.
+ *
+ * Recursion depth is bounded by the call stack (~thousands of levels): deeper input throws a `RangeError`
+ * (`Maximum call stack size exceeded`); validate the depth of untrusted input.
  * @template T - The type of the value
  * @param {T} value - The value to copy
  * @returns {T} An independent deep copy
+ * @throws {RangeError} when the nesting is deeper than the call stack allows
  * @example
  * const original = { a: [1, { b: 2 }], when: new Date(0) };
  * const copy = deepClone(original);
@@ -890,6 +984,8 @@ function deepMergeInto(result: object, source: object, ancestors: Set<object>): 
 		const sourceValue = (source as Properties)[key];
 
 		if (isPlainObject(sourceValue)) {
+			// Only an OWN value of `result` (always a fresh object built here) is merged into: never an inherited one such as
+			// `Object.prototype` through `__proto__`, or `Object` through `constructor`.
 			const current = hasOwn(result, key) ? (result as Properties)[key] : undefined;
 			const base = isPlainObject(current) ? current : Object.create(Object.getPrototypeOf(sourceValue));
 			definePlain(result, key, deepMergeInto(base, sourceValue, ancestors));
@@ -907,8 +1003,13 @@ function deepMergeInto(result: object, source: object, ancestors: Set<object>): 
  * - Only PLAIN objects are merged recursively (every merged plain object in the result is a fresh object).
  * - Arrays, dates, maps, class instances and all other values REPLACE the previous value and are assigned by reference.
  * - A key present in a source always wins, even when its value is `undefined`.
- * - Keys `__proto__`, `constructor` and `prototype` are ignored everywhere (prototype pollution guard).
+ * - Keys `__proto__`, `constructor` and `prototype` are DROPPED at every level: deepMerge is the classic sink for untrusted
+ *   input (user settings over defaults), so the result never carries a key that a later `Object.assign`, `for...in` copy or
+ *   path lookup could turn into a prototype change. (Faithful copies that keep such keys as own data: {@link clone},
+ *   {@link deepClone}, {@link merge}.) Only own values of the fresh result objects are ever merged into.
  * - `null`/`undefined` sources are skipped.
+ * - Recursion depth is bounded by the call stack (~thousands of levels): deeper input throws a `RangeError`
+ *   (`Maximum call stack size exceeded`); validate the depth of untrusted input.
  * @template T - The target type
  * @template S - The tuple of source types
  * @param {T} target - The base plain object
@@ -916,8 +1017,10 @@ function deepMergeInto(result: object, source: object, ancestors: Set<object>): 
  * @returns {DeepMergeAll<T, S>} A new, deeply merged object
  * @throws {TypeError} when the target or a source is not a plain object
  * @throws {TypeError} when an input contains a circular reference through plain objects
+ * @throws {RangeError} when the nesting is deeper than the call stack allows
  * @example
  * deepMerge({ a: { x: 1, y: 2 }, list: [1, 2] }, { a: { y: 3 }, list: [9] }); // => { a: { x: 1, y: 3 }, list: [9] }
+ * deepMerge({ theme: 'light' }, JSON.parse('{"__proto__": {"isAdmin": true}, "constructor": 1}')); // => { theme: 'light' }
  */
 export function deepMerge<T extends object, S extends object[]>(target: T, ...sources: S): DeepMergeAll<T, S> {
 	if (!isPlainObject(target)) throw new TypeError(`deepMerge: \`target\` must be a plain object, got ${describe(target)}`);
@@ -1109,9 +1212,13 @@ function equalWith(a: unknown, b: unknown, stack: ComparisonStack): boolean {
  * - Typed arrays (element-wise), `DataView`/`ArrayBuffer` (byte-wise), boxed primitives (by value), errors (`name` + `message` + own enumerable props).
  * - `WeakMap`, `WeakSet` and promises are only equal to themselves.
  * - Circular structures are supported (pairs already under comparison are assumed equal).
+ *
+ * Recursion depth is bounded by the call stack (~thousands of levels): deeper input throws a `RangeError`
+ * (`Maximum call stack size exceeded`); validate the depth of untrusted input.
  * @param {unknown} a - First value
  * @param {unknown} b - Second value
  * @returns {boolean} Whether the values are deeply equal
+ * @throws {RangeError} when the nesting is deeper than the call stack allows
  * @example
  * isEqual({ a: [1, { b: NaN }] }, { a: [1, { b: NaN }] }); // => true
  * isEqual(new Set([1, 2]), new Set([2, 1])); // => true
@@ -1307,6 +1414,18 @@ export interface FlattenOptions {
 }
 
 /**
+ * Options of {@link unflattenObject}.
+ */
+export interface UnflattenOptions extends FlattenOptions {
+	/**
+	 * Largest array index for which a missing container is created as an array (an integer `>= 0`, or `Infinity`). Defaults to `1000`.
+	 * A key with a larger index creates (or turns the array built so far into) a plain object instead, so that a short key such as
+	 * `'tags.4294967294'` cannot build a 4-billion-element sparse array.
+	 */
+	arrayLimit?: number;
+}
+
+/**
  * Validates and returns the separator of {@link FlattenOptions}.
  * @param {string} caller - Name of the public function, used in error messages
  * @param {FlattenOptions} options - The options
@@ -1361,18 +1480,22 @@ function flattenInto(source: object, keys: ReadonlyArray<string>, prefix: string
  * - Paths join own enumerable string keys with `separator`; array elements use numeric segments (`'list.0.id'`). Symbol keys and holes are skipped.
  * - Leaves are every value that is not a plain object or array (dates, maps, class instances... are leaves, stored by reference),
  *   plus EMPTY plain objects and arrays (so they survive {@link unflattenObject}).
- * - The result is a fresh object; a `'__proto__'` key is stored as a plain own property.
+ * - The result is a fresh object whose keys are defined, never assigned: a `'__proto__'` key (or path) is stored as a plain own
+ *   property, and `constructor`/`prototype` keys are flattened like any other own data key ({@link unflattenObject} rejects them).
  *
  * Round-trip caveats (`unflattenObject(flattenObject(x))` equals `x` only when none apply): keys containing the separator or empty keys,
  * numeric-looking keys of plain objects (they come back as arrays), sparse arrays, unsafe keys (`__proto__`...), a root array
  * (it comes back as an object), null-prototype objects (they come back with `Object.prototype`).
- * Very deeply nested inputs (thousands of levels) can exceed the call stack.
+ *
+ * Recursion depth is bounded by the call stack (~thousands of levels): deeper input throws a `RangeError`
+ * (`Maximum call stack size exceeded`); validate the depth of untrusted input.
  * @param {object} object - The plain object (or array) to flatten
  * @param {FlattenOptions} [options={}] - `separator` (default `'.'`)
  * @returns {Record<string, unknown>} A new flat record of leaf paths
  * @throws {TypeError} when `object` is not a plain object or an array, or contains a circular reference
  * @throws {TypeError} when `separator` is not a string
  * @throws {RangeError} when `separator` is empty
+ * @throws {RangeError} when the nesting is deeper than the call stack allows
  * @example
  * flattenObject({ a: { b: 1, c: [2, { d: 3 }] }, e: {} }); // => { 'a.b': 1, 'a.c.0': 2, 'a.c.1.d': 3, e: {} }
  * flattenObject({ a: { b: 1 } }, { separator: '/' }); // => { 'a/b': 1 }
@@ -1388,27 +1511,40 @@ export function flattenObject(object: object, options: FlattenOptions = {}): Rec
 /**
  * Rebuilds a nested object from a flat record of paths (the inverse of {@link flattenObject}). Keys are processed in `Object.keys` order;
  * each one is split on `separator` and its value written like {@link setInObjectByKeys} does: a missing container is created as an array
- * when the next segment is a canonical array index (`'0'`, `'12'`), as a plain object otherwise. The root is always a plain object.
+ * when the next segment is a canonical array index (`'0'`, `'12'`) no larger than `arrayLimit` (default 1000), as a plain object
+ * otherwise; an array built by earlier keys becomes a plain object (same entries) as soon as a key gives it an index above the limit.
+ * So input such as a parsed query string `tags.4294967294=x` cannot build a 4-billion-element sparse array. The root is always a plain object.
+ * The nesting depth of the result is the number of segments of the longest key: a key with thousands of segments builds an object
+ * that the recursive helpers ({@link deepClone}, {@link isEqual}, `JSON.stringify`...) cannot process, so bound the key length (or
+ * segment count) of untrusted input.
  * Keys that CONFLICT (one is a prefix path of another, such as `'a'` and `'a.b'`) throw a `TypeError` whatever their order, so values
  * are never written into a leaf value of the input: the input is not mutated (leaf values are reused by reference).
  * @param {Readonly<Record<string, unknown>>} record - The flat record
- * @param {FlattenOptions} [options={}] - `separator` (default `'.'`)
+ * @param {UnflattenOptions} [options={}] - `separator` (default `'.'`) and `arrayLimit` (default `1000`)
  * @returns {Record<string, unknown>} A new nested object
  * @throws {RangeError} when a segment is `__proto__`, `constructor` or `prototype` (prototype pollution guard)
  * @throws {RangeError} when a key has an empty segment (`''`, `'a..b'`)
  * @throws {TypeError} when two keys conflict (`{ a: 1, 'a.b': 2 }`)
  * @throws {TypeError} when `separator` is not a string
  * @throws {RangeError} when `separator` is empty
+ * @throws {TypeError} when `arrayLimit` is not a number
+ * @throws {RangeError} when `arrayLimit` is not an integer `>= 0` or `Infinity`
  * @example
  * unflattenObject({ 'a.b': 1, 'a.c.0': 2, 'a.c.1.d': 3 }); // => { a: { b: 1, c: [2, { d: 3 }] } }
  * unflattenObject({ 'a/b': 1 }, { separator: '/' }); // => { a: { b: 1 } }
+ * unflattenObject({ 'tags.0': 'a', 'tags.4294967294': 'b' }); // => { tags: { 0: 'a', 4294967294: 'b' } }
+ * unflattenObject({ 'a.0': 1, 'a.1': 2 }, { arrayLimit: 0 }); // => { a: { 0: 1, 1: 2 } }
  */
-export function unflattenObject(record: Readonly<Record<string, unknown>>, options: FlattenOptions = {}): Record<string, unknown> {
+export function unflattenObject(record: Readonly<Record<string, unknown>>, options: UnflattenOptions = {}): Record<string, unknown> {
 	const separator = readSeparator('unflattenObject', options);
+	const arrayLimit = options.arrayLimit ?? ARRAY_LIMIT;
+	assertInteger('unflattenObject', 'arrayLimit', arrayLimit, 0, true);
+	// Larger canonical integers are not array indices: they never create arrays.
+	const limit = Math.min(arrayLimit, MAX_ARRAY_LENGTH - 1);
 	const result: Record<string, unknown> = {};
 	const owned = new WeakSet<object>();
 	for (const key of Object.keys(record)) {
-		assignPath(result, parseWritablePath('unflattenObject', '`record` keys', key, separator), record[key], key, separator, 'unflattenObject', owned);
+		assignPath(result, parseWritablePath('unflattenObject', '`record` keys', key, separator), record[key], key, separator, 'unflattenObject', limit, owned);
 	}
 	return result;
 }
@@ -1418,55 +1554,58 @@ export function unflattenObject(record: Readonly<Record<string, unknown>>, optio
 // ---------------------------------------------------------------------------------------------------------------------
 
 /**
- * Walks the OWN properties along `segments`, stopping before the last one.
- * @param {unknown} target - The root value
- * @param {ReadonlyArray<string>} segments - The path segments
- * @returns {object | undefined} The object holding the last segment, or `undefined` when an intermediate is missing or a primitive
- */
-function resolveParent(target: unknown, segments: ReadonlyArray<string>): object | undefined {
-	let current = target;
-	for (let index = 0; index < segments.length - 1; index++) {
-		if (!(isObject(current) || isFunction(current)) || !hasOwn(current, segments[index])) return undefined;
-		current = (current as Properties)[segments[index]];
-	}
-	return isObject(current) || isFunction(current) ? current : undefined;
-}
-
-/**
- * Checks whether a dot-separated path exists in an object through OWN properties only (inherited properties such as `toString`
- * do not count). A property holding `undefined` exists. Primitives along the way have no properties, so `'name.length'` is `false`
- * for a string `name`. Array elements are addressed with numeric segments (`'list.0'`).
+ * Checks whether a dot-separated path exists in an object: it is `true` exactly when {@link getFromObjectByKeys} resolves the path
+ * to a property (whose value may be `undefined`) rather than falling back to the default value. Segments follow the same rule: own
+ * and inherited properties count (class getters, a string's `length` and indices, `Object.create(proto)` parents), but a
+ * `__proto__`, `constructor` or `prototype` segment never does, nor does an `Object.prototype` member the object does not own
+ * (`toString`, keys added by prototype pollution...). Array elements are addressed with numeric segments (`'list.0'`).
  * @param {object} target - The object to inspect
  * @param {string} path - The dot-separated path, e.g. `'a.b.0'`
- * @returns {boolean} Whether every segment of the path is an own property
+ * @returns {boolean} Whether every segment of the path resolves
  * @example
  * hasInObjectByKeys({ a: { b: [undefined] } }, 'a.b.0'); // => true
- * hasInObjectByKeys({ a: {} }, 'a.toString'); // => false // inherited
+ * hasInObjectByKeys({ a: {} }, 'a.toString'); // => false // an Object.prototype member
+ * hasInObjectByKeys({ a: {} }, 'a.constructor'); // => false
+ * hasInObjectByKeys({ name: 'Ada' }, 'name.length'); // => true
  */
 export function hasInObjectByKeys(target: object, path: string): boolean {
 	const segments = path.split('.');
-	const parent = resolveParent(target, segments);
-	return parent !== undefined && hasOwn(parent, segments[segments.length - 1]);
+	const last = segments.length - 1;
+	let current: unknown = target;
+	for (let index = 0; index < last && current != null; index++) current = readKey(current, segments[index]);
+	if (current == null) return false;
+	const key = segments[last];
+	// `in` needs an object: a primitive is boxed (its own properties, such as a string's indices, are then visible).
+	return key in Object(current) && !isUnreadable(current, key);
 }
 
 /**
  * Deletes the property at a dot-separated path. MUTATES `target`. Only OWN properties are followed and deleted
  * (an inherited property is never removed from a prototype). Deleting an array element leaves a hole (the length is unchanged).
+ * Like {@link setInObjectByKeys}, the path may not contain `__proto__`, `constructor` or `prototype` segments, so it cannot remove
+ * a method shared by every instance of a class (`'Service.prototype.run'`).
  * @param {object} target - The object to modify
  * @param {string} path - The dot-separated path, e.g. `'a.b.0'`
  * @returns {boolean} `true` when an own property was found and deleted; `false` when the path does not exist or the property is non-configurable
+ * @throws {RangeError} when the path has an empty segment (`''`, `'a..b'`, `'a.'`)
+ * @throws {RangeError} when a segment is `__proto__`, `constructor` or `prototype`
  * @example
  * const config = { a: { b: 1, c: 2 } };
  * deleteFromObjectByKeys(config, 'a.b'); // => true
  * config; // => { a: { c: 2 } }
  * deleteFromObjectByKeys(config, 'a.x'); // => false
+ * deleteFromObjectByKeys({ C: class {} }, 'C.prototype.m'); // throws RangeError
  */
 export function deleteFromObjectByKeys(target: object, path: string): boolean {
-	const segments = path.split('.');
-	const parent = resolveParent(target, segments);
-	const key = segments[segments.length - 1];
-	if (parent === undefined || !hasOwn(parent, key)) return false;
-	return Reflect.deleteProperty(parent, key);
+	const segments = parseWritablePath('deleteFromObjectByKeys', '`path`', path, '.');
+	const last = segments.length - 1;
+	let current: unknown = target;
+	for (let index = 0; index < last; index++) {
+		if (!(isObject(current) || isFunction(current)) || !hasOwn(current, segments[index])) return false;
+		current = (current as Properties)[segments[index]];
+	}
+	const key = segments[last];
+	return (isObject(current) || isFunction(current)) && hasOwn(current, key) && Reflect.deleteProperty(current, key);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1529,11 +1668,15 @@ function diffWalk(a: object, b: object, prefix: string, missing: string[], chang
  * - Identical references (including `a === b`) are equal by definition and are not walked.
  * - `removed` and `changed` are listed in the depth-first key order of `a`, `added` in that of `b`, so `diff(a, b).added`
  *   is exactly `diff(b, a).removed`. Keys containing `'.'` make paths ambiguous.
+ *
+ * Recursion depth is bounded by the call stack (~thousands of levels): deeper input throws a `RangeError`
+ * (`Maximum call stack size exceeded`); validate the depth of untrusted input.
  * @param {object} a - The old tree (a plain object or an array)
  * @param {object} b - The new tree (the same kind as `a`)
  * @returns {ObjectDiff} The `added`, `removed` and `changed` paths
  * @throws {TypeError} when `a` and `b` are not both plain objects or both arrays
  * @throws {TypeError} when a tree contains a circular reference
+ * @throws {RangeError} when the nesting is deeper than the call stack allows
  * @example
  * diff({ a: 1, b: { c: 2, d: [1] } }, { b: { c: 3, d: [1, 2] }, e: 0 }); // => { added: ['b.d.1', 'e'], removed: ['a'], changed: ['b.c'] }
  */

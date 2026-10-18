@@ -264,3 +264,36 @@ describe('guards (properties)', function () {
 		});
 	});
 });
+
+describe('schema combinators (properties)', function () {
+	const isRow = guards.isShape({ a: guards.isInteger, b: guards.isOptional(guards.isString) });
+	const schemaGuards = [
+		isRow,
+		guards.isShape({ a: guards.isInteger }, { exact: true }),
+		guards.isArrayOf(guards.isUnion(guards.isString, guards.isNullable(guards.isBoolean))),
+		guards.isRecordOf(guards.isTuple(guards.isInteger, guards.isString)),
+		guards.withMessage(guards.isShape({ list: guards.isArrayOf(guards.isOneOf([1, 2, 'x'])) }), 'bad')
+	];
+
+	it('explain reports no issue exactly when the guard passes, and every issue path exists in the value', function () {
+		fc.assert(
+			fc.property(fc.jsonValue(), fc.nat(schemaGuards.length - 1), function (value: unknown, which: number) {
+				const guard = schemaGuards[which];
+				const issues = guards.explain(guard, value);
+
+				expect(issues.length === 0).toBe(guard(value));
+				for (const issue of issues) expect(typeof issue.message).toBe('string');
+			})
+		);
+	});
+
+	it('the Standard Schema adapter agrees with the guard', function () {
+		fc.assert(
+			fc.property(fc.anything(), function (value: unknown) {
+				const result = guards.toStandardSchema(isRow)['~standard'].validate(value);
+
+				expect(result.issues === undefined).toBe(isRow(value));
+			})
+		);
+	});
+});

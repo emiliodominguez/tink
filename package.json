@@ -49,6 +49,8 @@
 	},
 	"files": [
 		"dist",
+		"llms.txt",
+		"llms-full.txt",
 		"README.md",
 		"LICENSE"
 	],
@@ -78,6 +80,7 @@
 		"check:types": "node scripts/check-types.mjs",
 		"docs": "typedoc",
 		"docs:api": "node scripts/generate-api-docs.mjs && prettier --write docs/API.md",
+		"docs:sizes": "node scripts/generate-size-docs.mjs && prettier --write docs/SIZES.md docs/MIGRATING-FROM-LODASH.md",
 		"validate": "yarn lint --max-warnings 0 && yarn format:check && yarn typecheck && yarn test:tz && yarn test:docs && yarn build && yarn test:dist && yarn check:size && yarn check:types && yarn check:exports",
 		"prepare": "husky",
 		"prepublishOnly": "yarn validate"
@@ -91,6 +94,7 @@
 	"devDependencies": {
 		"@arethetypeswrong/cli": "^0.18.5",
 		"@eslint/js": "^10.0.1",
+		"@standard-schema/spec": "^1.1.0",
 		"@stryker-mutator/core": "^10",
 		"@stryker-mutator/jest-runner": "^10",
 		"@types/jest": "^30.0.0",

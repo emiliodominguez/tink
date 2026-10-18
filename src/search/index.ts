@@ -103,7 +103,7 @@ const LOWER_CASE = 2;
 const UPPER_CASE = 4;
 /** Targets up to this many UTF-16 code units are aligned in scratch buffers reused across calls (larger ones get one-off buffers, so they are not retained). */
 const SHARED_LENGTH = 256;
-/** Largest back-pointer matrix (query code points × target code units) kept in the reused scratch buffers. */
+/** Largest back-pointer matrix (query code points × target code points) kept in the reused scratch buffers. */
 const SHARED_CELLS = 8192;
 
 /**
@@ -257,12 +257,13 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean): Fu
 	const length = target.length;
 
 	if (m === 0) return { score: 0, ranges: [] };
-	// Fast rejection (the common case while filtering), without allocating.
-	if (query.needles !== undefined && !contains(query.needles, target)) return undefined;
+	// Fast rejections (the common case while filtering), without allocating: a target has at most `length` code points.
+	if (m > length || (query.needles !== undefined && !contains(query.needles, target))) return undefined;
 
-	const cells = m * length;
-	const { codes, raw, offsets, rows, back } =
-		length <= SHARED_LENGTH && cells <= SHARED_CELLS ? (shared ??= allocate(SHARED_LENGTH, SHARED_CELLS)) : allocate(length, cells);
+	// The linear buffers first: the O(m·n) back-pointer matrix is only allocated once the subsequence check below has passed.
+	const small = length <= SHARED_LENGTH;
+	const workspace = small ? (shared ??= allocate(SHARED_LENGTH, SHARED_CELLS)) : allocate(length, 0);
+	const { codes, raw, offsets, rows } = workspace;
 	let n = 0;
 	// Greedy subsequence check (the alignment only exists if it passes), unless `contains` already did it.
 	let matched = query.needles === undefined ? 0 : m;
@@ -277,6 +278,8 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean): Fu
 	}
 	offsets[n] = length;
 	if (matched < m) return undefined;
+	const cells = m * n;
+	const back = small && cells <= SHARED_CELLS ? workspace.back : new Int32Array(cells);
 
 	let [row, previousRow] = rows;
 	for (let j = 0; j < n; j++) row[j] = codes[j] === q[0] ? MATCH + bonus(raw, j) + (raw[j] === query.raw[0] ? EXACT_CASE : 0) - Math.min(j, MAX_LEADING_PENALTY) : -Infinity;
@@ -348,12 +351,19 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean): Fu
  * match `'e'` + combining accent, characters whose lower case expands (`'İ'`) only match themselves, and ranges may split
  * multi-code-point graphemes (flags, ZWJ emoji). Normalize both strings (e.g. `.normalize('NFC')`) beforehand when that matters.
  *
- * An empty query matches every target with score `0` and no ranges. Time and memory are O(query length × target length).
+ * An empty query matches every target with score `0` and no ranges.
+ *
+ * Cost: a query longer than the target, or that is not a subsequence of it, is rejected in O(target length) time without
+ * allocating more than O(target length). A matching query costs O(query length × target length) time and a back-pointer matrix of
+ * 4 bytes per (query code point, target code point) pair — a 10 000-character query against a 100 000-character text is 4 GB.
+ * Cap the query length of untrusted input (search boxes: 64–256 characters is plenty, e.g. `query.slice(0, 128)`), and the
+ * target lengths if they are untrusted too.
  * @param {string} query - The characters to look for, in order
  * @param {string} target - The text to search in
  * @param {FuzzyMatchOptions} [options={}] - `caseSensitive` (default `false`)
  * @returns {FuzzyMatch | undefined} The score and matched ranges of the best alignment, or `undefined` when the query is not a subsequence of the target
  * @throws {TypeError} when `query` or `target` is not a string
+ * @throws {RangeError} when the back-pointer matrix of a matching query is too large to allocate (see the cost above)
  * @example
  * fuzzyMatch('fb', 'fooBar'); // => { score: 45, ranges: [[0, 1], [3, 4]] }
  * fuzzyMatch('bar', 'fooBar'); // => { score: 65, ranges: [[3, 6]] }
@@ -375,13 +385,17 @@ export function fuzzyMatch(query: string, target: string, options: FuzzyMatchOpt
  * Fuzzy-filters and ranks `items` by how well they match `query` (see {@link fuzzyMatch} for the matching and scoring rules).
  * Results are sorted by descending score; ties keep the original order of `items`. An empty query matches every item with score `0`,
  * so the full list (up to `limit`) is returned in its original order.
+ *
+ * Cost: up to O(query length × text length) time and memory per searched text (see {@link fuzzyMatch}); cap the length of
+ * untrusted queries.
  * @template T - The type of the searched items
  * @param {Iterable<T>} items - The items to search; strings unless `key` is given
  * @param {string} query - The characters to look for, in order
  * @param {FuzzySearchOptions<T>} [options={}] - `key` (text(s) of an item, best one wins), `limit`, `threshold` (minimum score), `caseSensitive`
  * @returns {Array<FuzzySearchResult<T>>} The matching items with their score, matched `key` text and its `ranges`, best first
  * @throws {TypeError} when `query` is not a string, `key` is not a function, or an item (without `key`) / a text returned by `key` is not a string
- * @throws {RangeError} when `limit` is not an integer >= 0 (or `Infinity`), or `threshold` is `NaN`
+ * @throws {RangeError} when `limit` is not an integer >= 0 (or `Infinity`), or `threshold` is `NaN`, or a matching query and text are too
+ * large for their back-pointer matrix (see {@link fuzzyMatch})
  * @example
  * fuzzySearch(['src/index.ts', 'README.md', 'src/search/index.ts'], 'sri').map(function (r) { return r.item; }); // => ['src/index.ts', 'src/search/index.ts']
  * @example

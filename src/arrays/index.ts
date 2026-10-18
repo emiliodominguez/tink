@@ -350,6 +350,9 @@ export function compact<T>(array: ReadonlyArray<T>): Array<Exclude<T, Falsy>> {
  * so fractional steps do not accumulate rounding errors (but are still subject to floating-point precision).
  * When `(end - start) / step` is an integer up to floating-point rounding (e.g. `range(0, 2.1, 0.3)`), the range has exactly
  * that many items, and no item ever reaches `end` (it is always exclusive, even when rounding errors would land on it).
+ * Only lengths above `2 ** 32 - 1` (the array limit) are rejected, far more than a heap can hold: callers must bound untrusted sizes
+ * (e.g. `range(Number(query.pages))`), since a result that does not fit in memory aborts the whole process with a fatal
+ * "heap out of memory" error rather than throwing.
  * @param {number} start - The first value, or the exclusive end when `end` is omitted
  * @param {number} [end] - The exclusive end of the range
  * @param {number} [step=1] - The increment between values (may be negative, never 0)
@@ -636,6 +639,7 @@ export function sortBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: nu
 
 /**
  * Return a shuffled copy of an array using the Fisher–Yates algorithm (the input is not mutated).
+ * Not cryptographically secure by default: pass `secureRandom` (random module) for tokens, OTPs, lotteries…
  * @template T
  * @param {ReadonlyArray<T>} array - The items to shuffle
  * @param {RandomGenerator} [random=Math.random] - Generator of floats in `[0, 1)`, injectable for deterministic results
@@ -658,6 +662,7 @@ export function shuffle<T>(array: ReadonlyArray<T>, random: RandomGenerator = Ma
 
 /**
  * Pick a random item from an array.
+ * Not cryptographically secure by default: pass `secureRandom` (random module) for tokens, OTPs, lotteries…
  * @template T
  * @param {ReadonlyArray<T>} array - The items to pick from
  * @param {RandomGenerator} [random=Math.random] - Generator of floats in `[0, 1)`, injectable for deterministic results
@@ -745,13 +750,15 @@ export function unzip<T extends ReadonlyArray<unknown>>(tuples: ReadonlyArray<T>
 /**
  * Return the sliding windows of `size` consecutive items, starting every `step` items. Only FULL windows are returned,
  * so an array shorter than `size` gives `[]`, and trailing items that do not fill a window are dropped.
- * The number of windows is `max(0, floor((length - size) / step) + 1)`.
+ * The number of windows is `max(0, floor((length - size) / step) + 1)`, and the result holds `size` times as many items in all, which
+ * must not exceed `2 ** 32 - 1`. That limit is far more than a heap can hold: callers must bound untrusted sizes, since a result
+ * that does not fit in memory aborts the whole process with a fatal "heap out of memory" error rather than throwing.
  * @template T
  * @param {ReadonlyArray<T>} array - The source array
  * @param {number} size - The length of each window (a positive integer)
  * @param {number} [step=1] - The distance between the starts of two consecutive windows (a positive integer)
  * @returns {T[][]} A new array of windows (each window is a fresh array)
- * @throws {RangeError} when `size` or `step` is not a positive integer
+ * @throws {RangeError} when `size` or `step` is not a positive integer, or the windows would hold more than `2 ** 32 - 1` items in all
  * @throws {TypeError} when `size` or `step` is not a number
  * @example
  * windowed([1, 2, 3, 4], 2); // => [[1, 2], [2, 3], [3, 4]]
@@ -761,6 +768,10 @@ export function unzip<T extends ReadonlyArray<unknown>>(tuples: ReadonlyArray<T>
 export function windowed<T>(array: ReadonlyArray<T>, size: number, step = 1): T[][] {
 	assertInteger('windowed', 'size', size, 1);
 	assertInteger('windowed', 'step', step, 1);
+	const windows = array.length < size ? 0 : Math.floor((array.length - size) / step) + 1;
+	if (windows * size > MAX_ARRAY_LENGTH) {
+		throw new RangeError(`windowed: the result would contain ${windows} windows of ${size} items, more than 2 ** 32 - 1 items in all`);
+	}
 	const result: T[][] = [];
 	for (let start = 0; start + size <= array.length; start += step) {
 		result.push(copyRange(array, start, start + size));
@@ -873,7 +884,8 @@ export function maxBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: num
 /**
  * Add up the numbers returned by `selector` for each item, using compensated (Neumaier) summation like `sum` from the math module (same algorithm, same result),
  * so the rounding error does not grow with the number of items.
- * `NaN`/`Infinity` keys propagate as in plain addition.
+ * `NaN`/`Infinity` keys propagate as in plain addition. Like the aggregates of the math module, each key is converted once with unary `+`,
+ * so numeric strings count as numbers instead of being concatenated.
  * @template T
  * @param {ReadonlyArray<T>} array - The items to add up
  * @param {(item: T, index: number) => number} selector - Returns the number contributed by an item
@@ -888,7 +900,7 @@ export function sumBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: num
 	let total = 0;
 	let compensation = 0;
 	for (let i = 0; i < array.length; i++) {
-		const value = selector(array[i], i);
+		const value = +selector(array[i], i);
 		const next = total + value;
 		compensation += Math.abs(total) >= Math.abs(value) ? total - next + value : value - next + total;
 		total = next;
@@ -1116,18 +1128,24 @@ export function binarySearch<T>(sortedArray: ReadonlyArray<T>, value: T, compare
 /**
  * Return the cartesian product of the given arrays: every tuple taking one item from each array, in lexicographic order
  * (the LAST array varies fastest). The result has `product of the lengths` tuples: it is empty when any array is empty,
- * and is `[[]]` (one empty tuple) when called without arrays.
+ * and is `[[]]` (one empty tuple) when called without arrays. The tuples must not hold more than `2 ** 32 - 1` items in all (checked
+ * before anything is allocated). That limit is far more than a heap can hold: callers must bound untrusted inputs (e.g. option lists
+ * of a product configurator), since a result that does not fit in memory aborts the whole process with a fatal "heap out of memory"
+ * error rather than throwing.
  * @template T - The tuple of input array types
  * @param {...ReadonlyArray<unknown>} arrays - The arrays to combine
  * @returns {Array<Zipped<T>>} A new array of fresh tuples
- * @throws {RangeError} when the result would have more items than an array can hold
+ * @throws {RangeError} when the tuples would hold more than `2 ** 32 - 1` items in all
  * @example
  * cartesianProduct([1, 2], ['a', 'b']); // => [[1, 'a'], [1, 'b'], [2, 'a'], [2, 'b']] // typed as [number, string][]
  */
 export function cartesianProduct<T extends Array<ReadonlyArray<unknown>>>(...arrays: T): Array<Zipped<T>> {
 	let total = 1;
 	for (const array of arrays) total *= array.length;
-	if (total > MAX_ARRAY_LENGTH) throw new RangeError(`cartesianProduct: the product would contain ${total} tuples, more than an array can hold`);
+	// Without arrays, the one (empty) tuple holds no item.
+	if (total * arrays.length > MAX_ARRAY_LENGTH) {
+		throw new RangeError(`cartesianProduct: the product would contain ${total} tuples of ${arrays.length} items, more than 2 ** 32 - 1 items in all`);
+	}
 	const result: Array<Zipped<T>> = [];
 	const positions = new Array<number>(arrays.length).fill(0);
 	for (let count = 0; count < total; count++) {
@@ -1256,6 +1274,18 @@ export type DiffOperation<T> =
 	{ type: 'equal'; value: T; indexA: number; indexB: number } | { type: 'delete'; value: T; indexA: number } | { type: 'insert'; value: T; indexB: number };
 
 /**
+ * Options accepted by {@link diffSequences} and {@link longestCommonSubsequence}.
+ */
+export interface DiffOptions {
+	/**
+	 * Largest number of edits (deletions plus insertions) accepted: when the sequences differ by more, a `RangeError` is thrown instead,
+	 * after O((N + M) · maxEdits) work. An integer >= 0 or `Infinity`.
+	 * @default Infinity
+	 */
+	maxEdits?: number;
+}
+
+/**
  * SameValueZero equality (like `===`, but `NaN` equals `NaN`), the default of {@link diffSequences}.
  * @param {unknown} x - First value
  * @param {unknown} y - Second value
@@ -1286,13 +1316,32 @@ function toList<T>(caller: string, name: string, value: Iterable<T>): ReadonlyAr
  * @param {Iterable<T>} a - The original sequence
  * @param {Iterable<T>} b - The target sequence
  * @param {(x: T, y: T) => boolean} equals - Element equality, called as `equals(itemOfA, itemOfB)`
+ * @param {DiffOptions} options - `maxEdits`
  * @returns {Array<DiffOperation<T>>} The edit script
- * @throws {TypeError} when `a` or `b` is not iterable, or `equals` is not a function
+ * @throws {TypeError} when `a` or `b` is not iterable, `equals` is not a function or `maxEdits` is not a number
+ * @throws {RangeError} when `maxEdits` is invalid or the sequences differ by more than `maxEdits` edits
  */
-function myersDiff<T>(caller: string, a: Iterable<T>, b: Iterable<T>, equals: (x: T, y: T) => boolean): Array<DiffOperation<T>> {
+function myersDiff<T>(caller: string, a: Iterable<T>, b: Iterable<T>, equals: (x: T, y: T) => boolean, options: DiffOptions): Array<DiffOperation<T>> {
 	const left = toList(caller, 'a', a);
 	const right = toList(caller, 'b', b);
 	assertFunction(caller, 'equals', equals);
+	const { maxEdits = Infinity } = options;
+	assertInteger(caller, 'maxEdits', maxEdits, 0, true);
+	// The searches for the middle snake of a sub-problem with D edits stop after ceil(D / 2) rounds, and every sub-problem has at most
+	// as many edits as the whole problem: a search that needs more rounds proves that more than `maxEdits` edits are needed.
+	const maxRounds = Math.ceil(maxEdits / 2);
+	let edits = 0;
+
+	/**
+	 * Counts edits about to be emitted, and enforces `maxEdits` exactly (every edit of the script is counted here).
+	 * @param {number} count - Number of new deletions or insertions
+	 * @returns {void}
+	 * @throws {RangeError} when more than `maxEdits` edits are needed
+	 */
+	function spend(count: number): void {
+		edits += count;
+		if (edits > maxEdits) throw new RangeError(`${caller}: the sequences differ by more than \`maxEdits\` (${maxEdits}) insertions and deletions`);
+	}
 
 	const script: Array<DiffOperation<T>> = [];
 	const deletions: number[] = [];
@@ -1343,6 +1392,8 @@ function myersDiff<T>(caller: string, a: Iterable<T>, b: Iterable<T>, equals: (x
 		backward[offset + 1] = 0;
 
 		for (let d = 0; ; d++) {
+			// Round `d` costs O(d) (plus the snakes): give up as soon as the budget is provably exceeded.
+			if (d > maxRounds) spend(Infinity);
 			for (let k = -d; k <= d; k += 2) {
 				let x = k === -d || (k !== d && forward[offset + k - 1] < forward[offset + k + 1]) ? forward[offset + k + 1] : forward[offset + k - 1] + 1;
 				let y = x - k;
@@ -1391,8 +1442,10 @@ function myersDiff<T>(caller: string, a: Iterable<T>, b: Iterable<T>, equals: (x
 		}
 
 		if (aLo === aEnd) {
+			spend(bEnd - bLo);
 			for (let j = bLo; j < bEnd; j++) insertions.push(j);
 		} else if (bLo === bEnd) {
+			spend(aEnd - aLo);
 			for (let i = aLo; i < aEnd; i++) deletions.push(i);
 		} else {
 			// Both ranges are non-empty and differ at both ends, so at least 2 edits are needed and each half needs strictly fewer.
@@ -1421,13 +1474,18 @@ function myersDiff<T>(caller: string, a: Iterable<T>, b: Iterable<T>, equals: (x
  * time is O((N + M)·D) where D is the size of the edit script (so near-identical inputs are fast, and completely different ones
  * cost O((N + M)²)), memory is O(N + M), and recursion depth is O(log D). Non-array iterables are copied first (strings are split
  * into code points).
+ *
+ * **Untrusted input:** two unrelated texts of 16,000 characters already take seconds of CPU. Cap the input sizes, or pass
+ * `{ maxEdits }`, which bounds the work to O((N + M) · maxEdits) and throws a `RangeError` when the sequences differ by more.
  * @template T - The element type
  * @param {Iterable<T>} a - The original sequence
  * @param {Iterable<T>} b - The target sequence
  * @param {(x: T, y: T) => boolean} [equals=SameValueZero] - Element equality, always called as `equals(itemOfA, itemOfB)`;
  * defaults to SameValueZero (`===`, except that `NaN` equals `NaN`). `'equal'` operations carry the element of `a`.
+ * @param {DiffOptions} [options={}] - `maxEdits` (default `Infinity`): the largest number of deletions plus insertions accepted
  * @returns {Array<DiffOperation<T>>} The edit script, in order
- * @throws {TypeError} when `a` or `b` is not iterable, or `equals` is not a function
+ * @throws {TypeError} when `a` or `b` is not iterable, `equals` is not a function, or `maxEdits` is not a number
+ * @throws {RangeError} when `maxEdits` is not an integer >= 0 or `Infinity`, or the sequences differ by more than `maxEdits` edits
  * @example
  * diffSequences([1, 2, 3], [1, 3, 4]); // => [{ type: 'equal', value: 1, indexA: 0, indexB: 0 }, { type: 'delete', value: 2, indexA: 1 }, { type: 'equal', value: 3, indexA: 2, indexB: 1 }, { type: 'insert', value: 4, indexB: 2 }]
  * diffSequences('cat', 'cut').map(function (op) { return op.type; }); // => ['equal', 'delete', 'insert', 'equal']
@@ -1435,30 +1493,36 @@ function myersDiff<T>(caller: string, a: Iterable<T>, b: Iterable<T>, equals: (x
  * const before = ['Alice', 'bob'];
  * const after = ['alice', 'Bob', 'Carol'];
  * diffSequences(before, after, function (x, y) { return x.toLowerCase() === y.toLowerCase(); }).map(function (op) { return op.type; }); // => ['equal', 'equal', 'insert']
+ * @example
+ * diffSequences('kitten', 'sitting', undefined, { maxEdits: 5 }).length; // => 9
+ * diffSequences('a'.repeat(10000), 'b'.repeat(10000), undefined, { maxEdits: 100 }); // throws RangeError
  */
-export function diffSequences<T>(a: Iterable<T>, b: Iterable<T>, equals: (x: T, y: T) => boolean = sameValueZero): Array<DiffOperation<T>> {
-	return myersDiff('diffSequences', a, b, equals);
+export function diffSequences<T>(a: Iterable<T>, b: Iterable<T>, equals: (x: T, y: T) => boolean = sameValueZero, options: DiffOptions = {}): Array<DiffOperation<T>> {
+	return myersDiff('diffSequences', a, b, equals, options);
 }
 
 /**
  * Computes a longest common subsequence of `a` and `b`: the longest list of elements that appear in both, in the same relative
  * order (not necessarily contiguously). It is the `'equal'` part of {@link diffSequences}, with the same complexity
  * (O((N + M)·D) time, O(N + M) memory). When several longest subsequences exist, which one is returned is unspecified but deterministic.
+ * **Untrusted input:** cap the input sizes or pass `{ maxEdits }`, as for {@link diffSequences}.
  * @template T - The element type
  * @param {Iterable<T>} a - The first sequence
  * @param {Iterable<T>} b - The second sequence
  * @param {(x: T, y: T) => boolean} [equals=SameValueZero] - Element equality, always called as `equals(itemOfA, itemOfB)`;
  * defaults to SameValueZero. The returned elements are taken from `a`.
+ * @param {DiffOptions} [options={}] - `maxEdits` (default `Infinity`): the largest number of deletions plus insertions accepted
  * @returns {T[]} The common subsequence, as a new array of elements of `a`
- * @throws {TypeError} when `a` or `b` is not iterable, or `equals` is not a function
+ * @throws {TypeError} when `a` or `b` is not iterable, `equals` is not a function, or `maxEdits` is not a number
+ * @throws {RangeError} when `maxEdits` is not an integer >= 0 or `Infinity`, or the sequences differ by more than `maxEdits` edits
  * @example
  * longestCommonSubsequence([1, 2, 3, 4, 5], [2, 4, 6, 5]); // => [2, 4, 5]
  * longestCommonSubsequence('ABCBDAB', 'BDCABA').length; // => 4
  * longestCommonSubsequence([NaN, 0], [-0, NaN]).length; // => 1
  */
-export function longestCommonSubsequence<T>(a: Iterable<T>, b: Iterable<T>, equals: (x: T, y: T) => boolean = sameValueZero): T[] {
+export function longestCommonSubsequence<T>(a: Iterable<T>, b: Iterable<T>, equals: (x: T, y: T) => boolean = sameValueZero, options: DiffOptions = {}): T[] {
 	const common: T[] = [];
-	for (const operation of myersDiff('longestCommonSubsequence', a, b, equals)) {
+	for (const operation of myersDiff('longestCommonSubsequence', a, b, equals, options)) {
 		if (operation.type === 'equal') common.push(operation.value);
 	}
 	return common;

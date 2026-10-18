@@ -65,8 +65,24 @@ type UrlConstructor = (new (input: string) => UrlRecord) & { readonly canParse?:
 /** WHATWG HTML "valid email address" grammar (the one behind `<input type=email>`). Each label is limited to 63 characters. */
 const EMAIL_PATTERN = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
 
-/** Any control character or white space, which the URL parser silently strips or percent-encodes. */
-const URL_FORBIDDEN_CHARACTER = /[\p{Cc}\s]/u;
+/**
+ * Any control character or white space (which the URL parser silently strips or percent-encodes), format character (`\p{Cf}`: soft hyphen,
+ * zero-width space, bidi controls...) or other default-ignorable code point (combining grapheme joiner, variation selectors...): IDNA
+ * deletes these from host names, and they are invisible elsewhere.
+ */
+const URL_FORBIDDEN_CHARACTER = /[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}\s]/u;
+
+/** The authority of a `scheme://` URL, read from the `//` the way RFC 3986 parsers do: up to the first `/`, `?` or `#`. */
+const AUTHORITY_PATTERN = /[^/?#]*/y;
+
+/** An empty label (a leading dot or two consecutive dots), `%` (the URL parser percent-decodes hosts), or a full stop that IDNA maps to `.`. */
+const INVALID_HOST_PATTERN = /^\.|\.\.|[%\u3002\uff0e\uff61]/;
+
+/** Any non-ASCII character. */
+const NON_ASCII_PATTERN = /[^\0-\x7f]/;
+
+/** A host whose last label (before an optional trailing dot) makes the WHATWG parser read it as an IPv4 address (decimal or `0x` hex). */
+const NUMERIC_HOST_PATTERN = /(?:^|\.)(?:[0-9]+|0x[0-9a-f]*)\.?$/i;
 
 /** Schemes the URL parser treats as "special": it accepts them without `//` (`http:example.com`) and with extra slashes. */
 const SPECIAL_SCHEMES: ReadonlySet<string> = new Set(['http', 'https', 'ws', 'wss', 'ftp', 'file']);
@@ -128,6 +144,10 @@ const NUMERIC_PATTERN = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]
  *
  * This is a pragmatic check, not RFC 5322: quoted local parts (`"a b"@x.com`), comments, IP-literal domains (`a@[127.0.0.1]`)
  * and non-ASCII addresses are rejected, while dotless domains (`user@localhost`) and dots anywhere in the local part are accepted.
+ *
+ * A valid address is not a safe string: the local part may contain shell, SQL, HTML-attribute and template metacharacters
+ * (`` ` ``, `|`, `'`, `$`, `{`, `}`, `&`, `=`, `#`, `%`...), e.g. `'{{7*7}}@x.com'` and ``"`id`@x.com"`` are valid. Escape or parameterize it
+ * for its destination (never interpolate it into a shell command, query or template).
  * @param {unknown} value - The value to check
  * @returns {boolean} `true` when `value` is a string holding a valid email address
  * @example
@@ -136,6 +156,7 @@ const NUMERIC_PATTERN = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]
  * isEmail('not an email'); // => false
  * isEmail('a@b@c.com'); // => false
  * isEmail(42); // => false
+ * isEmail("a'||'1'='1@x.com"); // => true
  */
 export function isEmail(value: unknown): value is string {
 	// The length check runs first, so the pattern never sees more than 254 characters.
@@ -160,7 +181,46 @@ function getUrlConstructor(): UrlConstructor {
  */
 function hasTld(hostname: string): boolean {
 	const labels = (hostname.endsWith('.') ? hostname.slice(0, -1) : hostname).split('.');
-	return labels.length > 1 && !labels.includes('') && TLD_PATTERN.test(labels[labels.length - 1]);
+	return labels.length > 1 && TLD_PATTERN.test(labels[labels.length - 1]);
+}
+
+/**
+ * Reads the host written in a URL authority, checking that the URL parser will use that host (up to letter case and IDNA encoding).
+ * @param {string} authority - The text between `//` and the first `/`, `?` or `#`
+ * @returns {string | undefined} The host name (after the last `@`, before the port; `''` for IP literals such as `[::1]`, which the parser
+ * validates, and for empty hosts), or `undefined` when the authority holds a backslash (a delimiter for the WHATWG parser, but not for
+ * RFC 3986 ones), or the host name has an empty label, a `%`, a character that NFKC normalization changes (fullwidth and circled letters,
+ * ...) or an ideographic full stop, or is numeric but not dotted-decimal IPv4 (`0x7f.1`, `2130706433`)
+ */
+function writtenHost(authority: string): string | undefined {
+	if (authority.includes('\\')) return undefined;
+
+	const start = authority.lastIndexOf('@') + 1;
+	if (authority[start] === '[') return '';
+	const portStart = authority.indexOf(':', start);
+	const host = authority.slice(start, portStart < 0 ? authority.length : portStart);
+	// Empty hosts are allowed by some schemes (`file:///path`); the parser rejects them for the others. One trailing dot is allowed.
+	if (INVALID_HOST_PATTERN.test(host) || (NUMERIC_HOST_PATTERN.test(host) && !isIPv4(host))) return undefined;
+
+	return NON_ASCII_PATTERN.test(host) && host.normalize('NFKC') !== host ? undefined : host;
+}
+
+/**
+ * Checks that every label of an internationalized host name stays one after IDNA processing: the ASCII labels are only lower-cased, and the
+ * others become punycode (`xn--`) labels, not ASCII ones (IDNA case folding maps `ẞ` to `ss`).
+ * @param {string} host - The host as written
+ * @param {string} hostname - The host as parsed
+ * @returns {boolean} `true` when the labels correspond one to one
+ */
+function isEncodingOf(host: string, hostname: string): boolean {
+	const written = host.split('.');
+	const parsed = hostname.split('.');
+	return (
+		written.length === parsed.length &&
+		written.every(function (label: string, index: number): boolean {
+			return NON_ASCII_PATTERN.test(label) ? parsed[index].startsWith('xn--') : parsed[index] === label.toLowerCase();
+		})
+	);
 }
 
 /**
@@ -169,6 +229,17 @@ function hasTld(hostname: string): boolean {
  * On top of what the parser accepts, the string must not contain white space or control characters (which the parser
  * silently strips), "special" schemes (`http`, `https`, `ws`, `wss`, `ftp`, `file`) must be followed by `//`
  * (`http:example.com` is rejected), and `http(s)` URLs must have a non-empty host.
+ *
+ * The host is also checked against the text, so that for an accepted URL the host a client connects to is the one a reader (or a
+ * string-based allow/deny list) sees: `new URL(value).hostname` is the written host, lower-cased, or its punycode form for
+ * internationalized names (`münchen.de`, `例え.jp`; each non-ASCII label must stay a punycode label, so `https://ẞa.com`, which IDNA case
+ * folding turns into `ssa.com`, is rejected). So the following are also rejected: invisible characters anywhere (format characters
+ * such as U+00AD soft hyphen, U+200B zero-width space or bidi controls, and other default-ignorable code points such as U+034F or
+ * variation selectors), a backslash in the authority (`http://evil.com\@good.com`, which parsers disagree on), and host names with
+ * a `%` (percent-decoded by the parser), an empty label (`https://a..b`, `https://.`; one trailing dot is allowed), characters that
+ * NFKC normalization changes (fullwidth `ｅ`, circled `ⓔ`, ...), ideographic full stops (`。`), or a numeric form other than
+ * dotted-decimal IPv4 (`http://0x7f.1`, `http://2130706433`, `http://127.1` all mean `127.0.0.1`).
+ * Credentials are allowed: in `https://good.com@evil.com` the host is `evil.com`, as for every parser.
  * @param {unknown} value - The value to check
  * @param {IsUrlOptions} [options={}] - `protocols` (default `['http', 'https']`): allowed schemes;
  * `requireTld` (default `false`): require a host ending in a top-level domain, which rejects `localhost`, IP addresses and host-less URLs
@@ -183,6 +254,8 @@ function hasTld(hostname: string): boolean {
  * isUrl('ftp://files.example.com', { protocols: ['ftp'] }); // => true
  * isUrl('example.com'); // => false
  * isUrl(' https://example.com'); // => false
+ * isUrl('https://ｅvil.com'); // => false
+ * isUrl('https://例え.jp'); // => true
  */
 export function isUrl(value: unknown, options: IsUrlOptions = {}): value is string {
 	const { protocols, requireTld = false } = options;
@@ -202,14 +275,21 @@ export function isUrl(value: unknown, options: IsUrlOptions = {}): value is stri
 				});
 	if (!allowed) return false;
 
-	if (SPECIAL_SCHEMES.has(scheme)) {
-		const rest = value.slice(schemeEnd + 1);
-		if (!rest.startsWith('//') || (scheme !== 'file' && (rest[2] === '/' || rest[2] === '\\'))) return false;
+	const hasAuthority = value.startsWith('//', schemeEnd + 1);
+	// The WHATWG parser reads `http:///host` as `http://host`; it also treats `\\` as `/`, so backslashes in the authority are rejected below.
+	if (SPECIAL_SCHEMES.has(scheme) && (!hasAuthority || (scheme !== 'file' && value[schemeEnd + 3] === '/'))) return false;
+	let host: string | undefined = '';
+	if (hasAuthority) {
+		AUTHORITY_PATTERN.lastIndex = schemeEnd + 3;
+		host = writtenHost((AUTHORITY_PATTERN.exec(value) as RegExpExecArray)[0]);
+		if (host === undefined) return false;
 	}
+	// Special schemes encode international host names with IDNA, whose result must be compared with the written host.
+	const international = SPECIAL_SCHEMES.has(scheme) && NON_ASCII_PATTERN.test(host);
 
 	// Runtimes with `URL.canParse` implement the WHATWG parser, which never yields an empty http(s) host: unless the host must be
 	// inspected, validate without building a URL object (about twice as fast).
-	if (!requireTld && typeof UrlParser.canParse === 'function') return UrlParser.canParse(value);
+	if (!requireTld && !international && typeof UrlParser.canParse === 'function') return UrlParser.canParse(value);
 
 	let url: UrlRecord;
 	try {
@@ -220,6 +300,7 @@ export function isUrl(value: unknown, options: IsUrlOptions = {}): value is stri
 
 	// A conforming parser never yields an empty http(s) host, but not every `globalThis.URL` implementation conforms.
 	if ((scheme === 'http' || scheme === 'https') && url.hostname === '') return false;
+	if (international && !isEncodingOf(host, url.hostname)) return false;
 
 	return !requireTld || hasTld(url.hostname);
 }
@@ -475,7 +556,11 @@ function compareIdentifiers(a: string, b: string): -1 | 0 | 1 {
  */
 function semverOrThrow(value: unknown): RegExpExecArray {
 	const match = matchSemver(value);
-	if (match === null) throw new TypeError(`compareSemver: ${typeof value === 'string' ? JSON.stringify(value) : typeof value} is not a valid semantic version`);
+	if (match === null) {
+		// At most 50 characters of the value are quoted, so that an attacker-sized input does not end up whole in logs.
+		const quoted = typeof value === 'string' ? JSON.stringify(value.length > 50 ? `${value.slice(0, 50)}…` : value) : typeof value;
+		throw new TypeError(`compareSemver: ${quoted} is not a valid semantic version`);
+	}
 	return match;
 }
 
@@ -600,7 +685,7 @@ export function luhnCheck(digits: string): boolean {
 }
 
 /**
- * Checks whether a value looks like a payment card number: 12 to 19 digits, optionally grouped with single spaces or dashes
+ * Checks whether a value looks like a payment card number: 12 to 19 digits, not all zeros, optionally grouped with single spaces or dashes
  * between digits, that pass the Luhn checksum (see {@link luhnCheck}). The issuer (IIN range) is not checked.
  * @param {unknown} value - The value to check
  * @returns {boolean} `true` when `value` is a string holding a plausible card number
@@ -609,11 +694,12 @@ export function luhnCheck(digits: string): boolean {
  * isCreditCardNumber('4111-1111-1111-1111'); // => true
  * isCreditCardNumber('4111111111111112'); // => false
  * isCreditCardNumber('4111  1111 1111 1111'); // => false
+ * isCreditCardNumber('0000 0000 0000 0000'); // => false
  */
 export function isCreditCardNumber(value: unknown): value is string {
 	if (typeof value !== 'string' || !CARD_PATTERN.test(value)) return false;
 	const digits = value.replace(/[ -]/g, '');
-	return digits.length >= 12 && digits.length <= 19 && luhnCheck(digits);
+	return digits.length >= 12 && digits.length <= 19 && /[1-9]/.test(digits) && luhnCheck(digits);
 }
 
 /**
@@ -640,6 +726,10 @@ export function isJsonString(value: unknown): value is string {
  * Checks whether a value is base64 (RFC 4648 §4) or, with `urlSafe`, base64url (§5) text. White space and line breaks are not allowed,
  * at most two `=` may end the string, and the length must be possible for encoded data (a remainder of 1 character modulo 4 never is).
  * When padded, the total length must be a multiple of 4. The empty string is valid (it encodes zero bytes).
+ *
+ * Only canonical encodings are accepted (RFC 4648 §3.5): the bits of the last character that encode no data must be zero, so every byte
+ * sequence has a single valid (padded or unpadded) spelling — `'YQ=='` is valid, `'YR=='`, which also decodes to `'a'`, is not. Strings
+ * that pass can therefore be compared as text (tokens, signatures, cache keys) without decoding them first.
  * @param {unknown} value - The value to check
  * @param {IsBase64Options} [options={}] - `urlSafe` (default `false`): use the `-` / `_` alphabet;
  * `padding` (default `'optional'`): whether `=` padding is `'optional'`, `'required'` or `'forbidden'`
@@ -653,6 +743,7 @@ export function isJsonString(value: unknown): value is string {
  * isBase64('a-_b', { urlSafe: true }); // => true
  * isBase64('a-_b'); // => false
  * isBase64('aGVsbG8==='); // => false
+ * isBase64('YR=='); // => false
  */
 export function isBase64(value: unknown, options: IsBase64Options = {}): value is string {
 	const { urlSafe = false, padding = 'optional' } = options;
@@ -661,11 +752,26 @@ export function isBase64(value: unknown, options: IsBase64Options = {}): value i
 	}
 	if (typeof value !== 'string' || !(urlSafe ? BASE64_URL_PATTERN : BASE64_PATTERN).test(value)) return false;
 
-	// The pattern only allows `=` at the end.
-	if (value.endsWith('=')) return padding !== 'forbidden' && value.length % 4 === 0;
+	// The pattern only allows `=` at the end. `end` is the length of the data characters; a final quantum of 2 (3) of them encodes one
+	// (two) bytes, leaving the 4 (2) low bits of its last character unused.
+	const end = value.length - (value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0);
+	const remainder = end % 4;
+	if (end < value.length ? padding === 'forbidden' || value.length % 4 !== 0 : remainder !== 0 && (remainder === 1 || padding === 'required')) return false;
 
-	const remainder = value.length % 4;
-	return remainder === 0 || (remainder !== 1 && padding !== 'required');
+	return remainder === 0 || (sextet(value.charCodeAt(end - 1)) & (remainder === 2 ? 15 : 3)) === 0;
+}
+
+/**
+ * Returns the 6-bit value of a base64 or base64url character.
+ * @param {number} code - The character code of an alphabet character
+ * @returns {number} `0`–`63`
+ */
+function sextet(code: number): number {
+	if (code >= 97) return code - 71;
+	if (code >= 65 && code <= 90) return code - 65;
+	if (code >= 48 && code <= 57) return code + 4;
+	// `+` / `-` is 62 and `/` / `_` is 63: both have their 2 low bits set, which is all the caller tests.
+	return 63;
 }
 
 /**

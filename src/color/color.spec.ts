@@ -348,6 +348,35 @@ describe('Color helpers', function () {
 			expect(helpers.parseColor('HSL(0.5TURN 100% 50%)')).toEqual({ r: 0, g: 255, b: 255, a: 1 });
 		});
 
+		it('security: only accepts CSS white space (space, tab, LF, CR, FF), around the string and between arguments', function () {
+			expect(helpers.parseColor('\t\r\f #FFF \n')).toEqual({ r: 255, g: 255, b: 255, a: 1 });
+			expect(helpers.parseColor('rgb(\f1\r2\n3\t/\t1)')).toEqual({ r: 1, g: 2, b: 3, a: 1 });
+			expect(helpers.parseColor('hsl(0,\n100%,\r50%)')).toEqual({ r: 255, g: 0, b: 0, a: 1 });
+			for (const space of ['\u00a0', '\u2028', '\u2029', '\u3000', '\ufeff', '\u1680', '\u2003', '\v']) {
+				for (const input of [
+					`rgb(1${space}2 3)`,
+					`rgb(1,${space}2,3)`,
+					`rgb(${space}1 2 3)`,
+					`rgb(1 2 3${space})`,
+					`${space}#fff`,
+					`#fff${space}`,
+					`transparent${space}`
+				]) {
+					expect(function () {
+						helpers.parseColor(input);
+					}).toThrow(TypeError);
+					expect(function () {
+						helpers.toRgba(input);
+					}).toThrow(TypeError);
+				}
+			}
+		});
+
+		it('accepts hex colours without `#` (documented), unlike isHexColor and CSS', function () {
+			expect(helpers.parseColor('add')).toEqual({ r: 170, g: 221, b: 221, a: 1 });
+			expect(helpers.parseColor('facade')).toEqual({ r: 250, g: 202, b: 222, a: 1 });
+		});
+
 		it('should parse the legacy comma syntax of rgb() and rgba()', function () {
 			expect(helpers.parseColor('rgb(255, 128, 0)')).toEqual({ r: 255, g: 128, b: 0, a: 1 });
 			expect(helpers.parseColor('rgba(255,128,0,0.25)')).toEqual({ r: 255, g: 128, b: 0, a: 0.25 });
@@ -547,6 +576,17 @@ describe('Color helpers', function () {
 			expect(function () {
 				helpers.parseHex('#zz');
 			}).toThrow(new TypeError('parseHex: `hex` must be a valid hex colour, got "#zz"'));
+			// Security: at most 50 characters of a rejected string are quoted.
+			const long = `#${'g'.repeat(10_000)}`;
+			expect(function () {
+				helpers.parseHex(long);
+			}).toThrow(new TypeError(`parseHex: \`hex\` must be a valid hex colour, got "${long.slice(0, 50)}…"`));
+			expect(function () {
+				helpers.parseColor(long);
+			}).toThrow(new TypeError(`parseColor: \`input\` must be a CSS colour (hex, rgb(), hsl() or 'transparent'), got "${long.slice(0, 50)}…"`));
+			expect(function () {
+				helpers.parseHex(long.slice(0, 50));
+			}).toThrow(new TypeError(`parseHex: \`hex\` must be a valid hex colour, got "${long.slice(0, 50)}"`));
 			expect(function () {
 				helpers.toRgba({ r: 0, g: 'x' as any, b: 0 });
 			}).toThrow(new TypeError('toRgba: `input.g` must be a number other than NaN, got string'));

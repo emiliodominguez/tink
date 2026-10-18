@@ -185,8 +185,8 @@ export function parseQueryString(query: string): ParsedQuery {
 	const result = Object.create(null) as ParsedQuery;
 
 	for (const [rawKey, value] of new URLSearchParams(search)) {
-		const isBracket = rawKey.endsWith('[]');
-		const key = isBracket ? rawKey.slice(0, -2) : rawKey;
+		const key = withoutBrackets(rawKey);
+		const isBracket = key !== rawKey;
 		const existing = result[key];
 
 		if (existing === undefined) result[key] = isBracket ? [value] : value;
@@ -195,6 +195,15 @@ export function parseQueryString(query: string): ParsedQuery {
 	}
 
 	return result;
+}
+
+/**
+ * Removes the `[]` suffix of a bracket key (`a[]` becomes `a`).
+ * @param {string} key - A decoded query-string key
+ * @returns {string} The key without its brackets
+ */
+function withoutBrackets(key: string): string {
+	return key.endsWith('[]') ? key.slice(0, -2) : key;
 }
 
 /**
@@ -216,8 +225,9 @@ function splitUrl(url: string): { base: string; query: string; hash: string } {
 /**
  * Adds parameters to a URL string that may already have a query and/or a `#fragment`.
  *
- * Existing pairs whose key (decoded, with `[]` removed) is not in `params` are kept verbatim, in place. Every key of `params` whose value is
- * not `undefined` replaces all existing occurrences of that key; its new pairs are appended at the end, serialized by {@link buildQueryString}
+ * Existing pairs whose key (decoded, with `[]` removed) is not in `params` (with `[]` removed) are kept verbatim, in place. Every key of
+ * `params` whose value is not `undefined` replaces all existing occurrences of that key, in both its plain and its bracket form (`a` and
+ * `a[]`), so a parameter can never be smuggled in twice; its new pairs are appended at the end, serialized by {@link buildQueryString}
  * with `options` (which apply to the appended pairs only). A `null` value therefore removes the key (with the default `skipNull: true`).
  * The fragment is preserved at the end; a dangling `?` is dropped when no pair remains.
  * @param {string} url - The URL (absolute or relative)
@@ -230,21 +240,23 @@ function splitUrl(url: string): { base: string; query: string; hash: string } {
  * withQuery('https://x.com/search?q=old&page=2#results', { q: 'new value', lang: 'en' }); // => 'https://x.com/search?page=2&q=new%20value&lang=en#results'
  * withQuery('/list?page=2&sort=asc', { page: null }); // => '/list?sort=asc'
  * withQuery('/list', {}); // => '/list'
+ * withQuery('/list?id[]=1&id=2', { 'id[]': [3] }); // => '/list?id%5B%5D=3'
  */
 export function withQuery(url: string, params: QueryParams, options: BuildQueryStringOptions = {}): string {
 	const { base, query, hash } = splitUrl(url);
-	const replaced = new Set(
-		Object.keys(params).filter(function (key: string): boolean {
-			return params[key] !== undefined;
-		})
-	);
+	// Keys are compared without their `[]` suffix on both sides, so `a` and `a[]` replace each other.
+	const replaced = new Set<string>();
+
+	for (const key of Object.keys(params)) {
+		if (params[key] !== undefined) replaced.add(withoutBrackets(key));
+	}
+
 	const pairs = query.split('&').filter(function (pair: string): boolean {
 		if (pair === '') return false;
 
 		const equalsIndex = pair.indexOf('=');
-		const key = decodeComponent(equalsIndex === -1 ? pair : pair.slice(0, equalsIndex));
 
-		return !replaced.has(key.endsWith('[]') ? key.slice(0, -2) : key);
+		return !replaced.has(withoutBrackets(decodeComponent(equalsIndex === -1 ? pair : pair.slice(0, equalsIndex))));
 	});
 	const added = buildQueryString(params, options);
 
@@ -257,10 +269,19 @@ export function withQuery(url: string, params: QueryParams, options: BuildQueryS
  * Joins URL parts with exactly one `/` between them.
  *
  * - Empty parts are ignored; runs of slashes inside or between parts collapse into one.
- * - The beginning of the first part is preserved: a scheme with its slashes (`https://`, `file:///`), a protocol-relative `//host`, or a leading `/`
- *   (also for a first part made only of slashes, or starting with three or more: there is no host to make it protocol-relative).
+ * - Like browsers, every `\` of the path counts as a `/` and ASCII tabs and line breaks are removed (before the query of the last part).
+ * - Only the FIRST argument can be a base. Its beginning is preserved: a scheme with its slashes (`https://`, `file:///`), a protocol-relative
+ *   `//host`, or a leading `/` (also for a first part made only of slashes, or starting with three or more: there is no host to make it
+ *   protocol-relative). When the first argument is empty, the result is a path: it may start with one `/`, never with `//` or a scheme.
+ * - The other parts can never add a host or a scheme: their leading slashes are dropped, and a result without a base whose first
+ *   segment holds a `:` (`https:`, `javascript:alert(1)`) is prefixed with `./`, as RFC 3986 requires for such relative paths.
  * - The result ends with `/` only when the last part (ignoring its query/fragment) does.
- * - The query (`?...`) and fragment (`#...`) of the last part are kept as they are; `?` and `#` in other parts are treated as path text.
+ * - The query (`?...`) and fragment (`#...`) of the last part are kept as they are.
+ *
+ * Security: apart from the above, parts are joined verbatim, NOT encoded. A `?` or `#` in an earlier part does not end the path for
+ * `joinUrl` (slashes after it are still collapsed), but it still starts the query or fragment of the resulting URL, and `.`/`..` segments
+ * are resolved by browsers and servers. Encode every untrusted segment with `encodeURIComponent` (which escapes `/`, `\`, `?` and `#`)
+ * and reject `.` and `..`.
  * @param {...string} parts - The URL parts
  * @returns {string} The joined URL (`''` when every part is empty)
  * @throws {TypeError} when a part is not a string
@@ -269,6 +290,9 @@ export function withQuery(url: string, params: QueryParams, options: BuildQueryS
  * joinUrl('/api', 'items/', '?page=2'); // => '/api/items?page=2'
  * joinUrl('a', 'b/'); // => 'a/b/'
  * joinUrl('//cdn.example.com', 'lib.js'); // => '//cdn.example.com/lib.js'
+ * joinUrl('/', '\\\\evil.example'); // => '/evil.example'
+ * joinUrl('', 'https://evil.example'); // => './https:/evil.example'
+ * joinUrl('/users', encodeURIComponent('a/../b?x')); // => '/users/a%2F..%2Fb%3Fx'
  */
 export function joinUrl(...parts: string[]): string {
 	// The non-empty parts, in a fresh array whose items are then replaced by their path text.
@@ -294,17 +318,32 @@ export function joinUrl(...parts: string[]): string {
 		paths[lastIndex] = last.slice(0, suffixIndex);
 	}
 
-	// A scheme with its slashes, else `//` before a host, else a single `/` (or nothing): the last alternative always matches.
-	const prefix = (/^[a-z][a-z\d+.-]*:\/*|^\/\/(?=[^/])|^\/?/i.exec(paths[0]) as RegExpExecArray)[0];
+	// What browsers ignore in a URL or read as a `/` (rare: tested first so that the common case does not allocate).
+	for (let index = 0; index < paths.length; index++) {
+		if (/[\\\t\n\r]/.test(paths[index])) paths[index] = paths[index].replace(/[\t\n\r]/g, '').replace(/\\/g, '/');
+	}
 
-	paths[0] = paths[0].slice(prefix.length);
+	return joinPaths(paths, parts[0] !== '') + suffix;
+}
 
+/**
+ * Joins the path parts of {@link joinUrl} (the last one without its query and fragment).
+ * @param {ReadonlyArray<string>} paths - The non-empty parts
+ * @param {boolean} base - Whether the first of them is the first argument, and so may hold a scheme or a protocol-relative host
+ * @returns {string} The joined path
+ */
+function joinPaths(paths: ReadonlyArray<string>, base: boolean): string {
+	const first = paths[0];
+	// The first argument is the base: a scheme with its slashes, else `//` before a host, else a single `/` (or nothing: the last
+	// alternative always matches). Any other first part only contributes a single leading `/`.
+	let prefix = base ? (/^[a-z][a-z\d+.-]*:\/*|^\/\/(?=[^/])|^\/?/i.exec(first) as RegExpExecArray)[0] : first[0] === '/' ? '/' : '';
 	// The non-empty slash-free segments, separated by exactly one `/`: each part without its leading and trailing slashes, and the runs
 	// of slashes inside a part (rare) collapsed afterwards.
 	let body = '';
 
-	for (const path of paths) {
-		let start = 0;
+	for (let index = 0; index < paths.length; index++) {
+		const path = paths[index];
+		let start = index === 0 ? prefix.length : 0;
 		let end = path.length;
 
 		while (path[start] === '/') start++;
@@ -317,7 +356,10 @@ export function joinUrl(...parts: string[]): string {
 
 	if (body.includes('//')) body = body.replace(/\/\/+/g, '/');
 
-	return prefix + body + (paths[lastIndex].endsWith('/') && body !== '' ? '/' : '') + suffix;
+	// A relative path whose first segment holds a `:` would be read as a scheme.
+	if (prefix === '' && /^[^/]*:/.test(body)) prefix = './';
+
+	return prefix + body + (paths[paths.length - 1].endsWith('/') && body !== '' ? '/' : '');
 }
 
 /**
@@ -334,23 +376,48 @@ export function joinUrl(...parts: string[]): string {
 export function getQueryParam(url: string, key: string): string | undefined {
 	// Stops at the first match instead of building the whole parsed record (whose keys have `[]` removed, see parseQueryString).
 	for (const [rawKey, value] of new URLSearchParams(splitUrl(url).query)) {
-		if ((rawKey.endsWith('[]') ? rawKey.slice(0, -2) : rawKey) === key) return value;
+		if (withoutBrackets(rawKey) === key) return value;
 	}
 
 	return undefined;
 }
 
 /**
- * Checks whether a string is an absolute URL: it starts with a scheme followed by `://` (`https://`, `ftp://`, `custom+app://`)
- * or is protocol-relative (`//host`). Schemes without `//` (`mailto:`, `data:`, `javascript:`) are not considered absolute here.
+ * The beginning of an absolute URL (see {@link isAbsoluteUrl}), once the characters browsers ignore have been removed.
+ */
+const ABSOLUTE_URL = /^(?:[\\/]{2}|(?:https?|wss?|ftp|file):|(?!(?:javascript|data|vbscript):)[a-z][a-z\d+.-]*:\/\/)/i;
+
+/**
+ * Checks whether a string is an absolute URL, i.e. one that names its own host (or file) instead of being resolved against the current
+ * page. The string is first normalised the way browsers (the WHATWG URL parser) do it: leading spaces and C0 control characters are
+ * ignored, tabs and line breaks are removed anywhere, and `\` counts as `/`. It is then absolute when it:
+ *
+ * - is protocol-relative: starts with two slashes (`//host`, `\\host`, `/\host`, `/\t/host`, `///host` ...);
+ * - starts with a special scheme (`http:`, `https:`, `ws:`, `wss:`, `ftp:`, `file:`), with or without slashes: browsers read `https:host`
+ *   and `https:/host` as `https://host` whenever the page's own scheme differs (so they are reported as absolute even though, on a page of
+ *   the same scheme, they resolve as paths);
+ * - or starts with another scheme followed by `//` (`custom+app://open`), except `javascript:`, `data:` and `vbscript:`, which never name
+ *   a host.
+ *
+ * Schemes without `//` (`mailto:`, `tel:`, `javascript:alert(1)`, `data:text/html,...`) are not absolute either.
+ *
+ * Security: `false` only means "no host of its own"; it does NOT mean "a safe same-origin path" (`javascript:alert(1)` is not absolute).
+ * To validate a redirect target such as a `?next=` parameter, resolve it and compare origins instead:
+ * `new URL(next, location.origin).origin === location.origin` (which also rejects `javascript:` and `data:` URLs).
  * @param {string} string - The string to check
  * @returns {boolean} Whether the string is an absolute URL
  * @example
  * isAbsoluteUrl('https://example.com'); // => true
  * isAbsoluteUrl('//cdn.example.com/lib.js'); // => true
+ * isAbsoluteUrl('/\\evil.example'); // => true // browsers read it as //evil.example
+ * isAbsoluteUrl(' https:evil.example'); // => true
  * isAbsoluteUrl('/relative/path'); // => false
  * isAbsoluteUrl('mailto:someone@example.com'); // => false
+ * isAbsoluteUrl('javascript://%0aalert(1)'); // => false
  */
 export function isAbsoluteUrl(string: string): boolean {
-	return /^(?:[a-z][a-z\d+.-]*:)?\/\//i.test(string);
+	// Most strings hold nothing that browsers ignore, so they are tested as they are first: a match never contains an ignored character,
+	// so removing them cannot undo it. Otherwise the leading spaces and C0 controls (`[^!-\uffff]`: below `!`), and the tabs and line
+	// breaks, are removed as browsers do, and the string is tested again.
+	return ABSOLUTE_URL.test(string) || (/^[^!-\uffff]|[\t\n\r]/.test(string) && ABSOLUTE_URL.test(string.replace(/^[^!-\uffff]+|[\t\n\r]/g, '')));
 }

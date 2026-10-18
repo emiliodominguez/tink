@@ -248,13 +248,16 @@ describe('Functions helpers (properties)', function () {
 		});
 
 		it('serialises argument lists like JSON.stringify with the documented markers (reference implementation)', function () {
-			const special = /^\\*(?:-?\d+n|NaN|-?Infinity|-0|undefined)$/;
+			const special = /^\\*(?:-?\d+n|NaN|-?Infinity|-0|undefined|#\d+|Date\((?:-?\d+|NaN)\))$/;
 			function referenceKey(args: unknown[]): string {
-				return JSON.stringify(args, function (this: unknown, _key: string, value: unknown): unknown {
+				return JSON.stringify(args, function (this: any, key: string): unknown {
+					const value = this[key];
 					if (typeof value === 'bigint') return `${value}n`;
 					if (typeof value === 'number') return Object.is(value, -0) ? '-0' : Number.isFinite(value) ? value : String(value);
 					if (typeof value === 'string') return special.test(value) ? `\\${value}` : value;
-					if (value === undefined && this === args) return 'undefined';
+					if (value === undefined) return 'undefined';
+					if (value instanceof Date) return `Date(${value.getTime()})`;
+					if (typeof value === 'symbol' || typeof value === 'function') return 'identity';
 					return value;
 				});
 			}
@@ -262,16 +265,91 @@ describe('Functions helpers (properties)', function () {
 				fc.double(),
 				fc.integer(),
 				fc.string({ unit: 'binary', maxLength: 4 }),
-				fc.constantFrom(NaN, -0, Infinity, -Infinity, null, undefined, true, false, 'NaN', '\\-0', '12n', '"', '\\', '\u2028', Symbol.iterator, add1),
+				fc.constantFrom(
+					NaN,
+					-0,
+					Infinity,
+					-Infinity,
+					null,
+					undefined,
+					true,
+					false,
+					'NaN',
+					'\\-0',
+					'12n',
+					'"',
+					'\\',
+					'\u2028',
+					Symbol.iterator,
+					add1,
+					'#1',
+					'Date(0)',
+					'\\Date(NaN)'
+				),
 				fc.bigInt(),
+				fc.date({ noInvalidDate: false }),
 				fc.array(fc.oneof(fc.integer(), fc.constantFrom(undefined, -0, 'NaN')), { maxLength: 2 }),
 				fc.dictionary(fc.string({ maxLength: 2 }), fc.oneof(fc.integer(), fc.constantFrom(undefined, NaN)), { maxKeys: 2 })
 			);
 
 			fc.assert(
 				fc.property(fc.array(value, { minLength: 2, maxLength: 4 }), function (args) {
-					expect(defaultMemoizeKey(...args)).toBe(referenceKey(args));
+					expect((defaultMemoizeKey(...args) as string).replace(/"#\d+"/g, '"identity"')).toBe(referenceKey(args));
 				})
+			);
+		});
+
+		it('never gives values of different kinds, or distinct non-plain values, the same key (security)', function () {
+			class Point {
+				constructor(readonly x: number) {}
+			}
+			const sharedSymbol = Symbol('shared');
+			const sharedInstance = new Point(1);
+			// Each arbitrary yields [kind, value]; values of the same kind are equal iff their `id` is equal.
+			const tagged = fc.oneof(
+				fc.integer({ min: -2, max: 2 }).map(function (n) {
+					return ['number', n, String(n)] as const;
+				}),
+				fc.constantFrom('', 'a', 'null', 'undefined', '#1', 'Date(0)', '1970-01-01T00:00:00.000Z', '[1]').map(function (text) {
+					return ['string', text, text] as const;
+				}),
+				fc.constantFrom(null, undefined, true).map(function (value) {
+					return ['atom', value, String(value)] as const;
+				}),
+				fc.integer({ min: 0, max: 2 }).map(function (time) {
+					return ['date', new Date(time), String(time)] as const;
+				}),
+				fc.constantFrom(0, 1).map(function (n) {
+					return ['plain', { n: n }, String(n)] as const;
+				}),
+				fc.constantFrom(0, 1).map(function (n) {
+					return ['array', [n], String(n)] as const;
+				}),
+				fc.constant(['symbol', sharedSymbol, 'shared'] as const),
+				fc.constant(['fresh symbol', Symbol('shared'), Math.random()] as const),
+				fc.constant(['instance', sharedInstance, 'shared'] as const),
+				fc.constant(['fresh instance', new Point(1), Math.random()] as const),
+				fc.constant(['error', new Error('x'), Math.random()] as const),
+				fc.constant(['map', new Map(), Math.random()] as const),
+				fc.constant(['function', add1, 'add1'] as const)
+			);
+
+			fc.assert(
+				fc.property(fc.array(tagged, { minLength: 1, maxLength: 3 }), fc.array(tagged, { minLength: 1, maxLength: 3 }), fc.boolean(), function (a, b, nest) {
+					const same =
+						a.length === b.length &&
+						a.every(function (entry, i) {
+							return entry[0] === b[i][0] && Object.is(entry[2], b[i][2]);
+						});
+					const argsA = a.map(function (entry) {
+						return nest ? { v: entry[1] } : entry[1];
+					});
+					const argsB = b.map(function (entry) {
+						return nest ? { v: entry[1] } : entry[1];
+					});
+					expect(Object.is(defaultMemoizeKey(...argsA), defaultMemoizeKey(...argsB))).toBe(same);
+				}),
+				{ numRuns: 1000 }
 			);
 		});
 	});

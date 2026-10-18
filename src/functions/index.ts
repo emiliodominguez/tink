@@ -1,4 +1,5 @@
 import { assertFunction, assertInteger, assertNumber, MAX_TIMEOUT } from '../utils/assert.js';
+import { isPlainObject } from '../guards/index.js';
 import type { AnyFunction } from '../utils/index.js';
 
 /**
@@ -23,9 +24,27 @@ function startTimer(callback: () => void, delay: number): TimerHandle {
 
 /**
  * Strings that the default memoize key serialiser uses as markers for values JSON cannot represent (bigints, `NaN`, `±Infinity`,
- * `-0`, top-level `undefined`), optionally preceded by backslashes. Real strings of this shape get one extra leading backslash.
+ * `-0`, `undefined`, dates and the identity of other objects), optionally preceded by backslashes. Real strings of this shape get one
+ * extra leading backslash.
  */
-const SPECIAL_KEY_TOKEN = /^\\*(?:-?\d+n|NaN|-?Infinity|-0|undefined)$/;
+const SPECIAL_KEY_TOKEN = /^\\*(?:-?\d+n|NaN|-?Infinity|-0|undefined|#\d+|Date\((?:-?\d+|NaN)\))$/;
+
+/**
+ * The identity numbers of the functions, symbols and non-plain objects met by the default memoize key (see {@link defaultMemoizeKey}).
+ * Weak, so they never keep a value alive. Symbols that cannot be weak keys (registered ones, or every symbol on engines older than
+ * ES2023) go to {@link SYMBOL_IDENTITIES} instead.
+ */
+const IDENTITIES = new WeakMap<object, number>();
+
+/**
+ * The identity numbers of the symbols that cannot be `WeakMap` keys (see {@link IDENTITIES}).
+ */
+const SYMBOL_IDENTITIES = new Map<unknown, number>();
+
+/**
+ * The last identity number handed out.
+ */
+let lastIdentity = 0;
 
 /**
  * Throws unless `value` is a finite number `>= 0` (a wait time in milliseconds; longer waits than `setTimeout` allows are split).
@@ -364,37 +383,56 @@ export type Memoized<F extends AnyFunction, C extends MemoizeCache<unknown, unkn
 };
 
 /**
- * The default cache-key resolver used by {@link memoize} (and the `memoize` decorator).
+ * The default cache-key resolver used by {@link memoize} (and the `memoize` decorator). Keys of distinct primitives, and of values of
+ * different kinds, never collide; plain data is compared by value and everything else by identity:
  *
- * - A single primitive argument (other than `-0`) is used as the key itself, so `1` and `'1'`, `undefined` and `null`, or `NaN` are all
- *   distinct keys.
- * - Anything else (zero or several arguments, an object, or `-0`) is serialised with `JSON.stringify(args)`. Values JSON cannot represent
- *   get distinct markers: bigints become `'<n>n'`, and `NaN`, `Infinity`, `-Infinity`, `-0` and top-level `undefined` arguments become
- *   those words; strings that look like such a marker are escaped with a leading backslash, so no two distinct primitives share a key.
+ * - A single argument that is a primitive (other than `-0`), a function, or an object other than a plain object, an array or a `Date`
+ *   is used as the key itself, so `1` and `'1'`, `undefined` and `null`, `NaN`, or two different class instances are all distinct keys.
+ * - Anything else (zero or several arguments, a plain object, an array, a `Date`, or `-0`) is serialised like `JSON.stringify(args)`,
+ *   except that every value JSON cannot represent gets a distinct marker string: bigints become `'<n>n'`; `NaN`, `Infinity`, `-Infinity`,
+ *   `-0` and `undefined` (also nested, so `[undefined]` differs from `[null]` and `{ a: undefined }` from `{}`) become those words; a `Date`
+ *   becomes `'Date(<time value>)'`; and functions, symbols and objects other than plain objects and arrays (class instances, errors,
+ *   `Map`, `Set`, `RegExp`, typed arrays, ...) become `'#<identity number>'`, the same number for the same value for the program's
+ *   lifetime (held weakly, except for symbols that cannot be `WeakMap` keys, such as `Symbol.for` ones). Strings shaped like a marker
+ *   are escaped with a leading backslash. `toJSON` methods are ignored.
  *
- * Limitations of the serialised form: functions, symbols and `undefined` nested inside arrays/objects collapse to `null` or are dropped,
- * `Map`/`Set` serialise as `{}`, objects are compared structurally (not by identity), key order matters, and circular structures throw.
- * Supply a custom `resolver` for such arguments.
+ * Limitations: plain objects and arrays are compared structurally by their own enumerable string keys (key order matters; symbol keys
+ * and non-enumerable properties are ignored; getters are invoked), holes in arrays count as `undefined`, and circular plain structures
+ * throw. Two class instances with the same fields are different keys. Supply a custom `resolver` for anything else.
  * @param {...unknown} args - The call arguments
  * @returns {unknown} The cache key
- * @throws {TypeError} when the arguments contain a circular structure
+ * @throws {TypeError} when the arguments contain a circular structure of plain objects or arrays
  * @example
  * defaultMemoizeKey(1); // => 1
  * defaultMemoizeKey('a', 2); // => '["a",2]'
  * defaultMemoizeKey(NaN, 2); // => '["NaN",2]'
+ * defaultMemoizeKey({ at: new Date(0) }); // => '[{"at":"Date(0)"}]'
+ * defaultMemoizeKey('Date(0)', [undefined]); // => '["\\\\Date(0)",["undefined"]]'
+ * const error = new Error('boom');
+ * defaultMemoizeKey(error) === error; // => true
  */
 export function defaultMemoizeKey(...args: unknown[]): unknown {
 	return memoizeKey(args);
 }
 
 /**
- * Whether a lone argument can be its own cache key: any primitive except `-0` (which `Map` would merge with `0`) and strings starting
- * with '[' (which could clash with a serialised argument list).
+ * Whether an object is compared by value by {@link defaultMemoizeKey}: an array, a `Date`, or a plain object (whose prototype is
+ * `Object.prototype` or `null`).
+ * @param {object} value - Any object
+ * @returns {boolean} `true` for plain data
+ */
+function isPlainData(value: object): boolean {
+	return isPlainObject(value) || Array.isArray(value) || value instanceof Date;
+}
+
+/**
+ * Whether a lone argument can be its own cache key: anything except `-0` (which `Map` would merge with `0`), strings starting with '['
+ * (which could clash with a serialised argument list) and plain data (compared by value).
  * @param {unknown} value - The argument
  * @returns {boolean} `true` when `value` is used as the key as is
  */
 function isDirectKey(value: unknown): boolean {
-	return (value === null || (typeof value !== 'object' && typeof value !== 'function')) && !(typeof value === 'string' && value[0] === '[') && !Object.is(value, -0);
+	return typeof value === 'object' ? value === null || !isPlainData(value) : typeof value === 'string' ? value[0] !== '[' : !Object.is(value, -0);
 }
 
 /**
@@ -406,7 +444,7 @@ function isDirectKey(value: unknown): boolean {
 function memoizeKey(args: unknown[]): unknown {
 	if (args.length === 1 && isDirectKey(args[0])) return args[0];
 
-	// Fast path: a list of strings and finite numbers is serialised by hand, exactly as `JSON.stringify` with the replacer below would
+	// Fast path: a list of strings and finite numbers is serialised by hand, exactly as serializeKey would
 	// (`String` formats finite numbers like JSON does). Any other argument falls back to the general serialiser.
 	let key = '[';
 
@@ -414,14 +452,9 @@ function memoizeKey(args: unknown[]): unknown {
 		const value = args[i];
 		let part: string;
 
-		if (typeof value === 'string') part = JSON.stringify(encodeKeyValue(value));
+		if (typeof value === 'string') part = JSON.stringify(escapeKeyString(value));
 		else if (Number.isFinite(value) && !Object.is(value, -0)) part = String(value);
-		else {
-			return JSON.stringify(args, function (this: unknown, _key: string, nested: unknown): unknown {
-				// Only top-level arguments are marked: nested `undefined` keeps JSON semantics (dropped from objects, `null` in arrays).
-				return nested === undefined ? (this === args ? 'undefined' : nested) : encodeKeyValue(nested);
-			});
-		}
+		else return serializeKey(args, []);
 
 		key += i === 0 ? part : `,${part}`;
 	}
@@ -430,22 +463,87 @@ function memoizeKey(args: unknown[]): unknown {
 }
 
 /**
- * Replaces the values JSON cannot represent with their key markers (see {@link defaultMemoizeKey}).
- * @param {unknown} value - A value met by the serialiser
- * @returns {unknown} The value to serialise instead
+ * Escapes a string that looks like a key marker (see {@link defaultMemoizeKey}).
+ * @param {string} value - A string argument or nested string
+ * @returns {string} The string to serialise
  */
-function encodeKeyValue(value: unknown): unknown {
-	switch (typeof value) {
-		case 'bigint':
-			return `${value}n`;
-		case 'number':
-			if (Object.is(value, -0)) return '-0';
-			return Number.isFinite(value) ? value : String(value);
-		case 'string':
-			return SPECIAL_KEY_TOKEN.test(value) ? `\\${value}` : value;
-		default:
-			return value;
+function escapeKeyString(value: string): string {
+	return SPECIAL_KEY_TOKEN.test(value) ? `\\${value}` : value;
+}
+
+/**
+ * The identity number of a function, symbol or non-plain object (see {@link defaultMemoizeKey}).
+ * @param {unknown} value - The value
+ * @returns {number} Its identity number
+ */
+function identityOf(value: unknown): number {
+	const weak = IDENTITIES as WeakMap<never, number>;
+	let id = weak.get(value as never) ?? SYMBOL_IDENTITIES.get(value);
+
+	if (id === undefined) {
+		id = ++lastIdentity;
+
+		try {
+			weak.set(value as never, id);
+		} catch {
+			// A symbol that cannot be held weakly (see IDENTITIES).
+			SYMBOL_IDENTITIES.set(value, id);
+		}
 	}
+
+	return id;
+}
+
+/**
+ * Serialises a value for {@link defaultMemoizeKey}: like `JSON.stringify` (without `toJSON`), but with a marker string for every value
+ * JSON cannot represent or would confuse.
+ * @param {unknown} value - The value
+ * @param {object[]} parents - The arrays and plain objects being serialised around `value`, to detect cycles
+ * @returns {string} The serialised value
+ * @throws {TypeError} when `value` contains a circular structure of plain objects or arrays
+ */
+function serializeKey(value: unknown, parents: object[]): string {
+	switch (typeof value) {
+		case 'string':
+			return JSON.stringify(escapeKeyString(value));
+		case 'number':
+			if (Object.is(value, -0)) return '"-0"';
+			return Number.isFinite(value) ? String(value) : `"${value}"`;
+		case 'boolean':
+			return String(value);
+		case 'bigint':
+			return `"${value}n"`;
+		case 'undefined':
+			return '"undefined"';
+		case 'object': {
+			if (value === null) return 'null';
+			if (value instanceof Date) return `"Date(${value.getTime()})"`;
+			if (!isPlainData(value)) break;
+			if (parents.includes(value)) throw new TypeError('defaultMemoizeKey: `args` must not contain circular structures');
+
+			parents.push(value);
+
+			let key = '';
+
+			if (Array.isArray(value)) {
+				for (let i = 0; i < value.length; i++) key += (i === 0 ? '' : ',') + serializeKey(value[i], parents);
+				key = `[${key}]`;
+			} else {
+				const names = Object.keys(value);
+
+				for (let i = 0; i < names.length; i++)
+					key += `${i === 0 ? '' : ','}${JSON.stringify(names[i])}:${serializeKey((value as Record<string, unknown>)[names[i]], parents)}`;
+				key = `{${key}}`;
+			}
+
+			parents.pop();
+
+			return key;
+		}
+	}
+
+	// Functions, symbols and non-plain objects.
+	return `"#${identityOf(value)}"`;
 }
 
 /**

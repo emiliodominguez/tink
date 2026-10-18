@@ -447,8 +447,15 @@ describe('String helpers', function () {
 			expect(helpers.toNumber('123.45')).toEqual(123.45);
 			expect(helpers.toNumber(' -7 ')).toEqual(-7);
 			expect(helpers.toNumber('1e3')).toEqual(1000);
-			expect(helpers.toNumber('0x1f')).toEqual(31);
-			expect(helpers.toNumber('Infinity')).toEqual(Infinity);
+			expect(helpers.toNumber('+.5')).toEqual(0.5);
+			expect(helpers.toNumber('5.')).toEqual(5);
+			expect(helpers.toNumber('\u00a012\n')).toEqual(12);
+		});
+
+		it('security: only converts finite decimal numbers, exactly like isNumericString validates them', function () {
+			for (const text of ['Infinity', '-Infinity', '+Infinity', '0x7fffffff', '0X1F', '0b1111', '0o777', '1e400', '-1e400', '1_000', 'NaN', '1 2', '١٢']) {
+				expect({ text, value: helpers.toNumber(text) }).toEqual({ text, value: NaN });
+			}
 		});
 
 		it('should return NaN for blank or non-numeric strings', function () {
@@ -603,13 +610,36 @@ describe('String helpers', function () {
 
 	describe('escapeRegExp', function () {
 		it('should escape every regex metacharacter', function () {
-			expect(helpers.escapeRegExp('.*+?^${}()|[]\\')).toEqual('\\.\\*\\+\\?\\^\\$\\{\\}\\(\\)\\|\\[\\]\\\\');
-			expect(helpers.escapeRegExp('1.5*(x)')).toEqual('1\\.5\\*\\(x\\)');
+			expect(helpers.escapeRegExp('.*+?^${}()|[]\\/')).toEqual('\\.\\*\\+\\?\\^\\$\\{\\}\\(\\)\\|\\[\\]\\\\\\/');
+			expect(helpers.escapeRegExp('1.5*(x)')).toEqual('\\x31\\.5\\*\\(x\\)');
 		});
 
-		it('should leave other characters untouched', function () {
+		it('should escape like TC39 RegExp.escape: punctuators, white space, line terminators, lone surrogates, a leading letter or digit', function () {
 			expect(helpers.escapeRegExp('')).toEqual('');
-			expect(helpers.escapeRegExp('abc-/ 😀')).toEqual('abc-/ 😀');
+			expect(helpers.escapeRegExp('_bc😀')).toEqual('_bc😀');
+			expect(helpers.escapeRegExp('abc')).toEqual('\\x61bc');
+			expect(helpers.escapeRegExp('Z9')).toEqual('\\x5a9');
+			expect(helpers.escapeRegExp(',-=<>#&!%:;@~\'`"')).toEqual('\\x2c\\x2d\\x3d\\x3c\\x3e\\x23\\x26\\x21\\x25\\x3a\\x3b\\x40\\x7e\\x27\\x60\\x22');
+			expect(helpers.escapeRegExp('\t\n\v\f\r \u00a0\u2028\u2029\ufeff\u3000')).toEqual('\\t\\n\\v\\f\\r\\x20\\xa0\\u2028\\u2029\\ufeff\\u3000');
+			expect(helpers.escapeRegExp('_\ud800_\udc00_\ud83d\ude00')).toEqual('_\\ud800_\\udc00_😀');
+			expect(helpers.escapeRegExp('\udc00\ud800')).toEqual('\\udc00\\ud800');
+		});
+
+		it('security: is safe inside character classes, with the v flag and after a backreference', function () {
+			const forbidden = new RegExp(`[${helpers.escapeRegExp('a-z')}]`);
+			expect(
+				['a', '-', 'z'].map(function (c) {
+					return forbidden.test(c);
+				})
+			).toEqual([true, true, true]);
+			expect(forbidden.test('m')).toBe(false);
+			for (const set of ['a&&b', 'a--b', 'a/b', '(a)', '[a]', '{}|\\', '!!##$$%%**++,,..::;;<<==>>??@@^^``~~']) {
+				const v = new RegExp(`^[${helpers.escapeRegExp(set)}]+$`, 'v');
+				expect({ set, all: v.test(set), other: v.test('q') }).toEqual({ set, all: true, other: false });
+			}
+			const backreference = new RegExp(`(a)\\1${helpers.escapeRegExp('0')}`);
+			expect(backreference.test('aa0')).toBe(true);
+			expect(new RegExp(`\\c${helpers.escapeRegExp('J')}`).test('\\cJ')).toBe(true);
 		});
 
 		it('should produce patterns that match literally, with and without the u flag', function () {
@@ -633,6 +663,28 @@ describe('String helpers', function () {
 			expect(helpers.escapeHtml('')).toEqual('');
 			expect(helpers.escapeHtml('plain text 😀')).toEqual('plain text 😀');
 		});
+
+		it('security: always returns an escaped string, converting other values with String()', function () {
+			// e.g. Express parses `?q[]=<script>` into an array
+			const query: any = ['<script>alert(1)</script>'];
+			expect(helpers.escapeHtml(query)).toBe('&lt;script&gt;alert(1)&lt;/script&gt;');
+			expect(`<p>${helpers.escapeHtml(query)}</p>`).not.toContain('<script>');
+			expect(helpers.escapeHtml(['<a>', '"b"'])).toBe('&lt;a&gt;,&quot;b&quot;');
+			expect(
+				helpers.escapeHtml({
+					toString: function () {
+						return '<i>';
+					}
+				})
+			).toBe('&lt;i&gt;');
+			expect(helpers.escapeHtml(null)).toBe('');
+			expect(helpers.escapeHtml(undefined)).toBe('');
+			expect(helpers.escapeHtml(42)).toBe('42');
+			expect(helpers.escapeHtml(false)).toBe('false');
+			expect(function () {
+				helpers.escapeHtml(Object.create(null));
+			}).toThrow(TypeError);
+		});
 	});
 
 	describe('unescapeHtml', function () {
@@ -651,6 +703,13 @@ describe('String helpers', function () {
 			expect(helpers.unescapeHtml('&nbsp; &copy; &lt &amp')).toEqual('&nbsp; &copy; &lt &amp');
 			expect(helpers.unescapeHtml('')).toEqual('');
 		});
+
+		it('always returns a string, converting other values with String()', function () {
+			expect(helpers.unescapeHtml(['&lt;b&gt;'] as any)).toBe('<b>');
+			expect(helpers.unescapeHtml(null)).toBe('');
+			expect(helpers.unescapeHtml(undefined)).toBe('');
+			expect(helpers.unescapeHtml(7)).toBe('7');
+		});
 	});
 
 	describe('normalizeWhitespace', function () {
@@ -667,6 +726,22 @@ describe('String helpers', function () {
 	});
 
 	describe('interpolate', function () {
+		it('security: does not cache templates longer than 1024 characters', function () {
+			const set = jest.spyOn(Map.prototype, 'set');
+			try {
+				const long = `{a}${'x'.repeat(1021)}!`;
+				expect(helpers.interpolate(long, { a: 1 })).toBe(`1${'x'.repeat(1021)}!`);
+				expect(helpers.interpolate(long.slice(0, -1), { a: 2 })).toBe(`2${'x'.repeat(1021)}`);
+				expect(
+					set.mock.calls.map(function (call: any[]) {
+						return call[0];
+					})
+				).toEqual([long.slice(0, -1)]);
+			} finally {
+				set.mockRestore();
+			}
+		});
+
 		it('should replace simple and nested placeholders', function () {
 			expect(helpers.interpolate('Hello {user.name}, you have {count} messages', { user: { name: 'Ada' }, count: 3 })).toEqual('Hello Ada, you have 3 messages');
 			expect(helpers.interpolate('{ name }!', { name: 'Bob' })).toEqual('Bob!');
@@ -927,11 +1002,15 @@ describe('String helpers', function () {
 			expect(helpers.mask('abc', { visibleEnd: 0, char: '👍🏽' })).toBe('👍🏽👍🏽👍🏽');
 		});
 
-		it('should return the string unchanged when nothing is left to hide', function () {
-			expect(helpers.mask('1234')).toBe('1234');
-			expect(helpers.mask('abc')).toBe('abc');
+		it('security: fails closed, masking everything when the visible parts would reveal the whole string', function () {
+			expect(helpers.mask('1234')).toBe('****');
+			expect(helpers.mask('123')).toBe('***');
+			expect(helpers.mask('1')).toBe('*');
 			expect(helpers.mask('')).toBe('');
-			expect(helpers.mask('abcd', { visibleStart: 2, visibleEnd: 2 })).toBe('abcd');
+			expect(helpers.mask('abcd', { visibleStart: 2, visibleEnd: 2 })).toBe('****');
+			expect(helpers.mask('abc', { visibleStart: 5, visibleEnd: 0, char: '•' })).toBe('•••');
+			expect(helpers.mask('👍🏽é', { visibleEnd: 2 })).toBe('**');
+			expect(helpers.mask('abcde', { visibleStart: 2, visibleEnd: 2 })).toBe('ab*de');
 		});
 
 		it('should be grapheme-aware', function () {
@@ -1081,6 +1160,12 @@ describe('String helpers', function () {
 			expect(function () {
 				helpers.mask('secret', { char: '**' });
 			}).toThrow(new RangeError('mask: `char` must be exactly one grapheme, got "**"'));
+			expect(function () {
+				helpers.mask('secret', { char: '*'.repeat(10_000) });
+			}).toThrow(new RangeError(`mask: \`char\` must be exactly one grapheme, got "${'*'.repeat(50)}…"`));
+			expect(function () {
+				helpers.mask('secret', { char: '*'.repeat(50) });
+			}).toThrow(new RangeError(`mask: \`char\` must be exactly one grapheme, got "${'*'.repeat(50)}"`));
 			expect(function () {
 				helpers.randomString(NaN);
 			}).toThrow(new RangeError('randomString: `length` must be an integer >= 0, got NaN'));

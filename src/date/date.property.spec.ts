@@ -563,4 +563,20 @@ describe('Date helpers (properties)', function () {
 			);
 		});
 	});
+
+	it('formatDate tokenizes exactly like the original single-regex tokenizer', function () {
+		const original = /\[([^\]]*)]|YYYY|YY|SSS|MM|M|DD|D|HH|H|hh|h|mm|m|ss|s|A|a/g;
+		const piece = fc.constantFrom('YYYY', 'YY', 'Y', 'SSS', 'S', 'MM', 'M', 'DD', 'D', 'HH', 'H', 'hh', 'h', 'mm', 'm', 'ss', 's', 'A', 'a', '[', ']', 'x', 'é', ' ', '-');
+		fc.assert(
+			fc.property(fc.array(piece, { maxLength: 30 }), fc.integer({ min: 0, max: 4_102_444_800_000 }), function (pieces, time) {
+				const pattern = pieces.join('');
+				const date = new Date(time);
+				const expected = pattern.replace(original, function (token: string, literal: string | undefined): string {
+					return literal ?? helpers.formatDate(date, token);
+				});
+				expect(helpers.formatDate(date, pattern)).toBe(expected);
+			}),
+			{ numRuns: 500 }
+		);
+	});
 });

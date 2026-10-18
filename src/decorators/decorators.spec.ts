@@ -1,5 +1,6 @@
 import * as decorators from '.';
 import { sleep } from '../async/index.js';
+import { createLRUCache, type LRUCache } from '../cache/index.js';
 
 class Test {
 	@decorators.readonly
@@ -345,12 +346,13 @@ describe('Decorators', function () {
 			expect(Test.staticSquare(3)).toBe(9);
 			expect(staticCalls).toBe(1);
 
+			// Without an instance there is nothing to attach a cache to: detached calls are not cached (previously they all shared one).
 			const detached = Test.staticSquare;
 			expect(detached.call(undefined, 4)).toBe(16);
 			expect(detached.call(undefined, 4)).toBe(16);
-			expect(staticCalls).toBe(2);
+			expect(staticCalls).toBe(3);
 			expect(detached.call(null as any, 4)).toBe(16);
-			expect(staticCalls).toBe(2); // a null `this` shares the state of other non-object receivers
+			expect(staticCalls).toBe(4);
 		});
 
 		it('should work as a standard decorator', function () {
@@ -914,6 +916,100 @@ describe('Decorators (round 2)', function () {
 					name === 'bound' ? new TypeError('@bound can only decorate public methods, not fields') : new TypeError(`@${name} can only decorate methods, not fields`)
 				);
 			});
+		});
+	});
+});
+
+describe('Decorators (security)', function () {
+	describe('memoize / once without an instance', function () {
+		it('@memoize should not share results between calls whose `this` is a primitive or missing', function () {
+			const spy = jest.fn(function (this: unknown, n: number) {
+				return `${String(this)}:${n}`;
+			});
+			const wrapped = decorators.memoize(spy, fakeContext('method', 'm').context);
+			expect(wrapped.call('abc' as any, 1)).toBe('abc:1');
+			expect(wrapped.call('xyz' as any, 1)).toBe('xyz:1');
+			expect(wrapped.call(undefined, 1)).toBe('undefined:1');
+			expect(wrapped.call(undefined, 1)).toBe('undefined:1');
+			expect(spy).toHaveBeenCalledTimes(4);
+		});
+
+		it('@once should not let one detached call decide the result of another', function () {
+			const spy = jest.fn(function (this: unknown) {
+				return String(this);
+			});
+			const wrapped = decorators.once(spy, fakeContext('method', 'm').context);
+			expect([wrapped.call('abc' as any), wrapped.call('xyz' as any), wrapped.call(undefined)]).toEqual(['abc', 'xyz', 'undefined']);
+			const a = {};
+			expect([wrapped.call(a), wrapped.call(a)]).toEqual(['[object Object]', '[object Object]']);
+			expect(spy).toHaveBeenCalledTimes(4);
+		});
+	});
+
+	describe('memoize options (bounded per-instance caches)', function () {
+		it('should create one cache per instance with createCache, and let an LRU bound it', function () {
+			const created: Array<LRUCache<unknown, unknown>> = [];
+			class Repo {
+				calls = 0;
+
+				@decorators.memoize({
+					createCache: function () {
+						const cache = createLRUCache<unknown, unknown>({ max: 2 });
+						created.push(cache);
+						return cache;
+					}
+				})
+				find(id: number): string {
+					this.calls++;
+					return `item ${id}`;
+				}
+			}
+
+			const repo = new Repo();
+			expect([repo.find(1), repo.find(2), repo.find(1), repo.find(3), repo.find(2)]).toEqual(['item 1', 'item 2', 'item 1', 'item 3', 'item 2']);
+			// 1, 2 computed; 1 cached; 3 evicts 2; 2 recomputed.
+			expect(repo.calls).toBe(4);
+			expect(created).toHaveLength(1);
+			expect(created[0].size).toBe(2);
+
+			const other = new Repo();
+			expect(other.find(1)).toBe('item 1');
+			expect(other.calls).toBe(1);
+			expect(created).toHaveLength(2);
+		});
+
+		it('should use the resolver, with the instance as `this`', function () {
+			const spy = jest.fn(function (user: { id: number; name: string }) {
+				return user.name;
+			});
+			const decorate = decorators.memoize({
+				resolver: function (this: { prefix: string }, user: { id: number }): string {
+					return `${this.prefix}${user.id}`;
+				}
+			});
+			const wrapped = decorate(spy, fakeContext('method', 'm').context);
+			const self = { prefix: 'u' };
+			expect(wrapped.call(self, { id: 1, name: 'a' })).toBe('a');
+			expect(wrapped.call(self, { id: 1, name: 'b' })).toBe('a');
+			expect(spy).toHaveBeenCalledTimes(1);
+
+			const legacy = decorate({}, 'm', { value: spy, writable: true, configurable: true, enumerable: false });
+			expect((legacy.value as any).call(self, { id: 2, name: 'c' })).toBe('c');
+		});
+
+		it('should validate the options when the decorator is created', function () {
+			expect(function () {
+				decorators.memoize(null as any);
+			}).toThrow(new TypeError('@memoize: `options` must be an object, got null'));
+			expect(function () {
+				decorators.memoize({ resolver: 1 as any });
+			}).toThrow(new TypeError('@memoize: `options.resolver` must be a function, got number'));
+			expect(function () {
+				decorators.memoize({ createCache: {} as any });
+			}).toThrow(new TypeError('@memoize: `options.createCache` must be a function, got object'));
+			expect(function () {
+				(decorators.memoize({}) as any)({}, 'getter', { get: function () {} });
+			}).toThrow(new TypeError('@memoize can only decorate methods (getter is not a method)'));
 		});
 	});
 });

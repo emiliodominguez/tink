@@ -15,7 +15,7 @@ export type SeededRandomState = readonly [number, number, number, number];
  * It is callable like `Math.random` (returns floats in `[0, 1)`), so it can be passed anywhere a {@link RandomGenerator}
  * is accepted, and it also exposes convenience methods that all draw from the same stream.
  *
- * **Not cryptographically secure** — use {@link randomBytes}, {@link randomId} or {@link randomUUID} for secrets.
+ * **Not cryptographically secure** — use {@link randomBytes}, {@link randomId}, {@link randomUUID} or {@link secureRandom} for secrets.
  */
 export interface SeededRandom {
 	/** Returns the next float in `[0, 1)` (32 bits of precision) and advances the stream. */
@@ -215,7 +215,7 @@ function fromState(seedState: SeededRandomState): SeededRandom {
  * Numeric seeds are hashed through `String(seed)`, so `createRandom(1)` and `createRandom('1')` are the same stream.
  *
  * **Not cryptographically secure**: the output is predictable from the seed or from a few observed values.
- * Use {@link randomBytes}, {@link randomId} or {@link randomUUID} for tokens, keys or anything security-sensitive.
+ * Use {@link randomBytes}, {@link randomId}, {@link randomUUID} or {@link secureRandom} for tokens, keys or anything security-sensitive.
  * @param {number | string} seed - A finite number or any string
  * @returns {SeededRandom} A callable generator returning floats in `[0, 1)` with `int`, `float`, `bool`, `pick`, `shuffle`, `fork`, `state` and `restore` methods
  * @throws {TypeError} when `seed` is neither a number nor a string
@@ -355,6 +355,53 @@ export function randomId(size: number = 21, alphabet: string = URL_ALPHABET): st
 	return pool.slice(poolOffset - size, poolOffset);
 }
 
+/** Number of 32-bit words {@link secureRandom} draws from the CSPRNG at once (two per value). */
+const SECURE_WORDS = 256;
+
+/**
+ * Random words drawn ahead of time by {@link secureRandom} from `secureSource` (allocated on first use), as bytes for
+ * `getRandomValues` and as 32-bit words; `secureWords[secureOffset]` is the next unused word.
+ */
+let secureBytes: Uint8Array | undefined;
+let secureWords: Uint32Array;
+let secureOffset = SECURE_WORDS;
+let secureSource: CryptoLike | undefined;
+
+/**
+ * A cryptographically secure {@link RandomGenerator}: returns a uniformly distributed float in `[0, 1)` with the full 53 bits of
+ * precision of a double (every multiple of `2 ** -53` is equally likely), drawn from `globalThis.crypto.getRandomValues`.
+ * Pass it to any helper that accepts a `random` argument (`shuffle`, `sample`, `randomIntBetween`, `weightedRandom`, …) when the
+ * outcome must not be predictable: tokens, one-time codes, lotteries, security-relevant sampling.
+ *
+ * Like {@link randomId}, words are drawn 256 at a time (one call serves 128 values) and handed out once each; the buffer is
+ * discarded whenever the `globalThis.crypto` object changes. It never falls back to `Math.random`.
+ * @returns {number} A random float `r` with `0 <= r < 1`
+ * @throws {Error} when no cryptographically secure random source is available
+ * @example
+ * secureRandom(); // e.g. 0.6170838526077869
+ * const r = secureRandom();
+ * r >= 0 && r < 1; // => true
+ * @example
+ * import { randomIntBetween } from '@emiliodominguez/js-helpers/math';
+ * randomIntBetween(100000, 999999, secureRandom); // e.g. 482913 (a 6-digit one-time code)
+ */
+export function secureRandom(): number {
+	const crypto = getCrypto('secureRandom');
+	if (secureOffset === SECURE_WORDS || crypto !== secureSource) {
+		if (secureBytes === undefined) {
+			secureBytes = new Uint8Array(SECURE_WORDS * 4);
+			secureWords = new Uint32Array(secureBytes.buffer);
+		}
+		crypto.getRandomValues(secureBytes);
+		secureSource = crypto;
+		secureOffset = 0;
+	}
+	// 27 + 26 random bits: an integer below 2 ** 53, scaled into [0, 1) exactly.
+	const value = (secureWords[secureOffset] >>> 5) * 67108864 + (secureWords[secureOffset + 1] >>> 6);
+	secureOffset += 2;
+	return value / 9007199254740992;
+}
+
 /** Largest batch of characters {@link randomId} generates ahead of time. */
 const MAX_POOL_SIZE = 32768;
 
@@ -464,13 +511,14 @@ function alphabetCharacters(alphabet: string): string[] {
 
 /**
  * Picks a random item, with each item's chance proportional to its weight.
- * Items with weight `0` are never returned.
+ * Items with weight `0` are never returned. Weights must be actual numbers: numeric strings are rejected rather than converted.
+ * Not cryptographically secure by default: pass {@link secureRandom} for tokens, OTPs, lotteries…
  * @template T
  * @param {ReadonlyArray<T>} items - The candidates
  * @param {ReadonlyArray<number>} weights - One finite, non-negative weight per item (they need not sum to 1)
  * @param {RandomGenerator} [random=Math.random] - Source of uniform numbers in `[0, 1)`, injectable for deterministic results
  * @returns {T} The chosen item
- * @throws {TypeError} when `random` is not a function, or a weight is a non-number that does not coerce to a valid weight
+ * @throws {TypeError} when `random` is not a function, or a weight is not a number
  * @throws {RangeError} when the arrays differ in length, a weight is negative, NaN or infinite, the total weight is zero or not finite, or `random()` returns a value outside `[0, 1)`
  * @example
  * weightedRandom(['common', 'rare'], [9, 1]); // 'common' ~90% of the time
@@ -485,7 +533,7 @@ export function weightedRandom<T>(items: ReadonlyArray<T>, weights: ReadonlyArra
 	let lastPositive = 0;
 	for (let i = 0; i < weights.length; i++) {
 		const weight = weights[i];
-		if (!(weight >= 0 && weight < Infinity)) assertNumber('weightedRandom', `weights[${i}]`, weight, false, 'a finite number >= 0');
+		if (!(typeof weight === 'number' && weight >= 0 && weight < Infinity)) assertNumber('weightedRandom', `weights[${i}]`, weight, false, 'a finite number >= 0');
 		total += weight;
 		if (weight > 0) lastPositive = i;
 	}
@@ -507,6 +555,7 @@ export function weightedRandom<T>(items: ReadonlyArray<T>, weights: ReadonlyArra
 /**
  * Draws a normally distributed (Gaussian) random number using the Box–Muller transform.
  * The first uniform sample is mapped to `(0, 1]` so `Math.log` never sees `0`.
+ * Not cryptographically secure by default: pass {@link secureRandom} for tokens, OTPs, lotteries…
  * @param {number} [mean=0] - Mean of the distribution (finite)
  * @param {number} [stdDev=1] - Standard deviation (finite, non-negative; `0` always returns `mean`)
  * @param {RandomGenerator} [random=Math.random] - Source of uniform numbers in `[0, 1)`, called twice per draw
@@ -528,6 +577,7 @@ export function randomGaussian(mean: number = 0, stdDev: number = 1, random: Ran
 /**
  * Returns `true` with the given probability.
  * `probability = 0` never returns `true` and `probability = 1` always does.
+ * Not cryptographically secure by default: pass {@link secureRandom} for tokens, OTPs, lotteries…
  * @param {number} [probability=0.5] - Chance of `true`, in `[0, 1]`
  * @param {RandomGenerator} [random=Math.random] - Source of uniform numbers in `[0, 1)`, injectable for deterministic results
  * @returns {boolean} A random boolean

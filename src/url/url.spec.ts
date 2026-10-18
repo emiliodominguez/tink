@@ -281,6 +281,115 @@ describe('URL helpers', function () {
 		});
 	});
 
+	describe('security', function () {
+		/**
+		 * Resolves `url` against `base` like a browser does (`location.href = url`, `<a href>`, a `Location` header).
+		 * @param {string} url - The URL
+		 * @param {string} [base='https://good.com'] - The base URL
+		 * @returns {string} The resolved URL
+		 */
+		function resolve(url: string, base: string = 'https://good.com'): string {
+			return new URL(url, base).href;
+		}
+
+		it('isAbsoluteUrl should see the browser-normalised forms of protocol-relative URLs (open redirect)', function () {
+			for (const url of [
+				'/\\evil.com',
+				'\\\\evil.com',
+				'\\/evil.com',
+				' //evil.com',
+				'\u0000\u001f //evil.com',
+				'/\t/evil.com',
+				'/\n/evil.com',
+				'\r//evil.com',
+				'///evil.com'
+			]) {
+				expect(resolve(url)).toBe('https://evil.com/');
+				expect(helpers.isAbsoluteUrl(url)).toBe(true);
+			}
+		});
+
+		it('isAbsoluteUrl should treat a special scheme as absolute even without // (browsers add them)', function () {
+			for (const url of ['https:\\\\evil.com', 'https:/evil.com', 'https:evil.com', 'HTTPS:evil.com', 'ht\ttps://evil.com', ' https://evil.com']) {
+				expect(resolve(url, 'http://good.com')).toBe('https://evil.com/');
+				expect(helpers.isAbsoluteUrl(url)).toBe(true);
+			}
+			expect(helpers.isAbsoluteUrl('http:x')).toBe(true);
+			expect(helpers.isAbsoluteUrl('wss:x')).toBe(true);
+			expect(helpers.isAbsoluteUrl('ftp:x')).toBe(true);
+			expect(helpers.isAbsoluteUrl('file:x')).toBe(true);
+		});
+
+		it('isAbsoluteUrl should never call javascript:, data: or vbscript: URLs absolute, even with //', function () {
+			for (const url of ['javascript://%0aalert(1)', 'JavaScript://x', 'java\tscript://x', ' javascript://x', 'data://text/html,x', 'vbscript://x']) {
+				expect(helpers.isAbsoluteUrl(url)).toBe(false);
+			}
+			// Other non-special schemes still need `//` (browsers do not add it, and `\` is not a slash for them).
+			expect(helpers.isAbsoluteUrl('custom:\\\\host')).toBe(false);
+			expect(helpers.isAbsoluteUrl('custom:/host')).toBe(false);
+			expect(helpers.isAbsoluteUrl('custom://host')).toBe(true);
+			expect(helpers.isAbsoluteUrl('javascripts://host')).toBe(true);
+			// Characters browsers do not strip keep the string relative.
+			expect(helpers.isAbsoluteUrl('\u00a0//evil.com')).toBe(false);
+			expect(helpers.isAbsoluteUrl('/%2F/evil.com')).toBe(false);
+			expect(helpers.isAbsoluteUrl('./\\evil.com')).toBe(false);
+			expect(helpers.isAbsoluteUrl(' \t')).toBe(false);
+		});
+
+		it('joinUrl should never let a part other than the first one start the result with // or a backslash', function () {
+			expect(helpers.joinUrl('/', '\\evil.com')).toBe('/evil.com');
+			expect(helpers.joinUrl('/', '/\\evil.com/x')).toBe('/evil.com/x');
+			expect(helpers.joinUrl('/', '\\\\evil.com')).toBe('/evil.com');
+			expect(helpers.joinUrl('/', '\t/evil.com')).toBe('/evil.com');
+			expect(helpers.joinUrl('/', '/\n/evil.com')).toBe('/evil.com');
+			expect(helpers.joinUrl('', '//evil.com')).toBe('/evil.com');
+			expect(helpers.joinUrl('', '\\\\evil.com')).toBe('/evil.com');
+			expect(helpers.joinUrl('', '', '//evil.com', 'x')).toBe('/evil.com/x');
+			for (const joined of [helpers.joinUrl('/', '\\evil.com'), helpers.joinUrl('', '//evil.com'), helpers.joinUrl('/', '\t/evil.com')]) {
+				expect(helpers.isAbsoluteUrl(joined)).toBe(false);
+				expect(resolve(joined)).toBe('https://good.com/evil.com');
+			}
+		});
+
+		it('joinUrl should never let a part other than the first one add a scheme', function () {
+			expect(helpers.joinUrl('', 'https://evil.com')).toBe('./https:/evil.com');
+			expect(helpers.joinUrl('', 'https:', 'evil.com')).toBe('./https:/evil.com');
+			expect(helpers.joinUrl('', ' https:', 'evil.com')).toBe('./ https:/evil.com');
+			expect(helpers.joinUrl('', 'javascript:alert(1)')).toBe('./javascript:alert(1)');
+			expect(resolve(helpers.joinUrl('', 'https://evil.com'), 'http://good.com/')).toBe('http://good.com/https:/evil.com');
+			// Without a scheme-shaped first segment, nothing is added.
+			expect(helpers.joinUrl('', 'a', 'b:c')).toBe('a/b:c');
+			expect(helpers.joinUrl('', '/https://evil.com')).toBe('/https:/evil.com');
+		});
+
+		it('joinUrl should still take a scheme or a protocol-relative host from the first part', function () {
+			expect(helpers.joinUrl('https:\\\\api.example.com\\v1', 'users')).toBe('https://api.example.com/v1/users');
+			expect(helpers.joinUrl('\\\\cdn.example.com', 'lib.js')).toBe('//cdn.example.com/lib.js');
+			expect(helpers.joinUrl('/\t/cdn.example.com', 'lib.js')).toBe('//cdn.example.com/lib.js');
+			expect(helpers.joinUrl('1a:b', 'c')).toBe('./1a:b/c');
+		});
+
+		it('joinUrl should keep backslashes and tabs of the query and fragment of the last part', function () {
+			expect(helpers.joinUrl('/a', 'b?x=\\\t#\\')).toBe('/a/b?x=\\\t#\\');
+		});
+
+		it('joinUrl joins the other parts verbatim: untrusted segments must be encoded by the caller', function () {
+			// Documented caveats: `?`, `#` and dot segments are not encoded...
+			expect(new URL(helpers.joinUrl('https://api.x.com/users', 'a?admin=1#', 'profile')).search).toBe('?admin=1');
+			expect(new URL(helpers.joinUrl('https://api.x.com/v1/users', '..', '..', 'admin')).pathname).toBe('/admin');
+			// ...but encodeURIComponent on each segment keeps them inside one path segment.
+			expect(new URL(helpers.joinUrl('https://api.x.com/users', encodeURIComponent('a?admin=1#'), 'profile')).search).toBe('');
+		});
+
+		it('withQuery should replace both key and key[] when params use the bracket form (parameter pollution)', function () {
+			expect(helpers.withQuery('/x?a[]=1', { 'a[]': '2' })).toBe('/x?a%5B%5D=2');
+			expect(helpers.withQuery('/x?a=1&a[]=2&b=3', { 'a[]': ['4', '5'] })).toBe('/x?b=3&a%5B%5D=4&a%5B%5D=5');
+			expect(helpers.withQuery('/x?a%5B%5D=1&b=2', { a: '3' })).toBe('/x?b=2&a=3');
+			expect(helpers.withQuery('/x?a[]=1&b=2', { 'a[]': null })).toBe('/x?b=2');
+			expect(helpers.parseQueryString(helpers.withQuery('/x?a[]=1', { 'a[]': '2' }).slice(2))).toEqual(Object.assign(Object.create(null), { a: ['2'] }));
+		});
+	});
+
 	describe('argument validation', function () {
 		it('uses the library-wide message format', function () {
 			expect(function () {

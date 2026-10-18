@@ -1293,7 +1293,7 @@ describe('Arrays helpers', function () {
 			const big = { length: 2 ** 20 } as unknown as number[];
 			expect(function () {
 				helpers.cartesianProduct(big, big);
-			}).toThrow(new RangeError('cartesianProduct: the product would contain 1099511627776 tuples, more than an array can hold'));
+			}).toThrow(new RangeError('cartesianProduct: the product would contain 1099511627776 tuples of 2 items, more than 2 ** 32 - 1 items in all'));
 		});
 	});
 
@@ -1712,6 +1712,94 @@ describe('Arrays helpers', function () {
 			expect(function () {
 				helpers.longestCommonSubsequence([], [], null as any);
 			}).toThrow(new TypeError('longestCommonSubsequence: `equals` must be a function, got null'));
+		});
+	});
+	describe('security', function () {
+		it('sumBy converts numeric strings with unary plus instead of concatenating them, like sum', function () {
+			const strings = new URLSearchParams('n=1&n=2&n=3').getAll('n');
+			expect(
+				helpers.sumBy(strings, function (value) {
+					return value as never as number;
+				})
+			).toBe(6);
+			expect(
+				helpers.sumBy(['1', 'x'], function (value) {
+					return value as never as number;
+				})
+			).toBe(NaN);
+		});
+
+		it('diffSequences and longestCommonSubsequence stop with a RangeError once more than `maxEdits` edits are needed', function () {
+			const a = 'a'.repeat(20_000);
+			const b = 'b'.repeat(20_000);
+			const start = performance.now();
+			expect(function () {
+				helpers.diffSequences(a, b, undefined, { maxEdits: 100 });
+			}).toThrow(new RangeError('diffSequences: the sequences differ by more than `maxEdits` (100) insertions and deletions'));
+			expect(function () {
+				helpers.longestCommonSubsequence(a, b, undefined, { maxEdits: 100 });
+			}).toThrow(new RangeError('longestCommonSubsequence: the sequences differ by more than `maxEdits` (100) insertions and deletions'));
+			// Without the budget, the same call costs about 40 000² / 2 comparisons (seconds).
+			expect(performance.now() - start).toBeLessThan(500);
+		});
+
+		it('`maxEdits` is exact: the edit distance itself is accepted, one less is rejected', function () {
+			const pairs: Array<[string, string]> = [
+				['kitten', 'sitting'],
+				['abc', 'abc'],
+				['', 'abcd'],
+				['abcd', ''],
+				['abcabba', 'cbabac'],
+				['ab', 'ba'],
+				['xaaaay', 'yaaaax']
+			];
+			for (const [a, b] of pairs) {
+				const distance = helpers.diffSequences(a, b).filter(function (operation) {
+					return operation.type !== 'equal';
+				}).length;
+				expect(helpers.diffSequences(a, b, undefined, { maxEdits: distance })).toStrictEqual(helpers.diffSequences(a, b));
+				expect(helpers.longestCommonSubsequence(a, b, undefined, { maxEdits: distance })).toStrictEqual(helpers.longestCommonSubsequence(a, b));
+				if (distance > 0) {
+					expect(function () {
+						helpers.diffSequences(a, b, undefined, { maxEdits: distance - 1 });
+					}).toThrow(RangeError);
+				}
+			}
+		});
+
+		it('validates `maxEdits`', function () {
+			expect(function () {
+				helpers.diffSequences([], [], undefined, { maxEdits: -1 });
+			}).toThrow(new RangeError('diffSequences: `maxEdits` must be an integer >= 0 or Infinity, got -1'));
+			expect(function () {
+				helpers.longestCommonSubsequence([], [], undefined, { maxEdits: '5' as any });
+			}).toThrow(new TypeError('longestCommonSubsequence: `maxEdits` must be an integer >= 0 or Infinity, got string'));
+			expect(helpers.diffSequences([1], [2], undefined, { maxEdits: Infinity })).toHaveLength(2);
+			expect(helpers.diffSequences([1], [2], undefined, {})).toHaveLength(2);
+		});
+
+		it('windowed rejects results with more than 2 ** 32 - 1 items in all before allocating them', function () {
+			const items = new Array(200_000).fill(0);
+			expect(function () {
+				helpers.windowed(items, 100_000);
+			}).toThrow(new RangeError('windowed: the result would contain 100001 windows of 100000 items, more than 2 ** 32 - 1 items in all'));
+			const huge = { length: 2 ** 32 - 1 } as unknown as number[];
+			expect(function () {
+				helpers.windowed(huge, 2, 1);
+			}).toThrow(new RangeError('windowed: the result would contain 4294967294 windows of 2 items, more than 2 ** 32 - 1 items in all'));
+			expect(helpers.windowed([1, 2, 3, 4, 5], 2, 2)).toStrictEqual([
+				[1, 2],
+				[3, 4]
+			]);
+		});
+
+		it('cartesianProduct rejects results with more than 2 ** 32 - 1 items in all before allocating them', function () {
+			const values = Array.from({ length: 200 }, function (_, index) {
+				return index;
+			});
+			expect(function () {
+				helpers.cartesianProduct(values, values, values, values);
+			}).toThrow(new RangeError('cartesianProduct: the product would contain 1600000000 tuples of 4 items, more than 2 ** 32 - 1 items in all'));
 		});
 	});
 });

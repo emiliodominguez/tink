@@ -1,6 +1,15 @@
 import { retry, withTimeout, type RetryOptions } from '../async/index.js';
-import { debounce, memoize as memoizeFunction, noop, once as onceFunction, throttle, type DebounceOptions, type ThrottleOptions } from '../functions/index.js';
-import { assertDelay } from '../utils/assert.js';
+import {
+	debounce,
+	memoize as memoizeFunction,
+	noop,
+	once as onceFunction,
+	throttle,
+	type DebounceOptions,
+	type MemoizeCache,
+	type ThrottleOptions
+} from '../functions/index.js';
+import { assertDelay, assertFunction, describe } from '../utils/assert.js';
 import type { AnyFunction, RandomGenerator } from '../utils/index.js';
 
 /**
@@ -60,7 +69,7 @@ export interface AsyncMethodDecorator {
 }
 
 /**
- * Key used for the per-instance state of methods called with a non-object `this` (e.g. detached calls in sloppy code).
+ * Key used by {@link debounced} and {@link throttled} for the state of calls whose `this` is not an object (detached calls).
  */
 const NO_INSTANCE: object = {};
 
@@ -104,24 +113,20 @@ function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
 }
 
 /**
- * The object used to key per-instance state for a call with the given `this`.
- * @param {unknown} thisArg - The `this` of the call
- * @returns {object} `thisArg` itself, or a shared sentinel for primitive/undefined `this`
- */
-function ownerOf(thisArg: unknown): object {
-	return isObjectLike(thisArg) ? thisArg : NO_INSTANCE;
-}
-
-/**
- * Creates a method that gives each instance (see {@link ownerOf}) its own wrapper of the original method, created on its first call.
+ * Creates a method that gives each instance (each object or function `this`) its own wrapper of the original method, created on its
+ * first call and garbage-collected with the instance. Calls whose `this` is not an object either call `detached` directly, without any
+ * state, or, when `detached` is omitted, all share one wrapper.
  * @param {() => UnknownMethod} wrap - Creates the wrapper for a new instance
+ * @param {UnknownMethod} [detached] - What calls without an instance run
  * @returns {UnknownMethod} The method dispatching to the instance's wrapper
  */
-function perInstance(wrap: () => UnknownMethod): UnknownMethod {
+function perInstance(wrap: () => UnknownMethod, detached?: UnknownMethod): UnknownMethod {
 	const wrappers = new WeakMap<object, UnknownMethod>();
 
 	return function perInstanceMethod(this: unknown, ...args: unknown[]): unknown {
-		const owner = ownerOf(this);
+		if (detached && !isObjectLike(this)) return detached.apply(this, args);
+
+		const owner = isObjectLike(this) ? this : NO_INSTANCE;
 		let wrapped = wrappers.get(owner);
 
 		if (wrapped === undefined) {
@@ -332,6 +337,8 @@ function wrapLog(method: UnknownMethod, name: string): UnknownMethod {
  * `"<name> method returned:" result`. When the method returns a promise-like, `"<name> method resolved:" value` or
  * `"<name> method rejected:" error` is logged once it settles (the original promise is returned unchanged); a synchronous
  * exception is logged as `"<name> method threw:" error` and rethrown. `this` is preserved.
+ * Security: arguments, results and errors are logged verbatim (nothing is redacted), so do not use it on methods that receive or return
+ * secrets or personal data (passwords, tokens, ...) outside development.
  * Works with TypeScript/Babel legacy decorators and with TC39 standard decorators.
  * @template T - The method type
  * @param {object | T} targetOrValue - Legacy: the prototype (or constructor); standard: the method
@@ -368,26 +375,50 @@ export function log(targetOrValue: unknown, keyOrContext: unknown, descriptor?: 
 // ---------------------------------------------------------------------------------------------------------------------
 
 /**
- * Wraps a method so that its results are cached per instance.
- * @param {UnknownMethod} method - The original method
- * @returns {UnknownMethod} The memoized method
+ * Options accepted by the {@link memoize} decorator factory (`@memoize({ ... })`).
  */
-function wrapMemoize(method: UnknownMethod): UnknownMethod {
-	return perInstance(function (): UnknownMethod {
-		return memoizeFunction(method);
-	});
+export interface MemoizeMethodOptions {
+	/** Computes the cache key from the call arguments, with the instance as `this`. Defaults to `defaultMemoizeKey` from the `functions` module. */
+	readonly resolver?: (...args: never[]) => unknown;
+	/**
+	 * Creates the cache of an instance, on its first call (one cache per instance, never shared). Defaults to a new, unbounded `Map`.
+	 * Return a bounded cache, such as `createLRUCache({ max: 100 })` from the `cache` module, to limit memory use.
+	 */
+	readonly createCache?: () => MemoizeCache<unknown, unknown>;
 }
 
 /**
- * Caches the results of the decorated method, separately for every instance (instances never see each other's results, and caches
- * are garbage-collected with their instance). Keys are computed with `defaultMemoizeKey` from the `functions` module (see its limitations).
+ * Creates the method wrapper of the {@link memoize} decorator.
+ * @param {MemoizeMethodOptions} options - The validated options
+ * @returns {MethodWrapper} The wrapper
+ */
+function memoizeWrapper(options: MemoizeMethodOptions): MethodWrapper {
+	const { resolver, createCache } = options;
+
+	return function (method: UnknownMethod): UnknownMethod {
+		return perInstance(function (): UnknownMethod {
+			// The resolver's public type only constrains what callers may pass; it is called with the method's arguments.
+			return memoizeFunction(method, { resolver: resolver as UnknownMethod | undefined, cache: createCache?.() });
+		}, method);
+	};
+}
+
+/**
+ * Caches the results of the decorated method, separately for every instance (per class for static methods): instances never see each
+ * other's results, and caches are garbage-collected with their instance. Calls without an instance (a detached call, whose `this` is
+ * `undefined`, or a primitive `this`) are not cached at all. Keys are computed with `defaultMemoizeKey` from the `functions` module (see
+ * its rules: plain data is compared by value, other objects by identity).
+ *
+ * Use it bare (`@memoize`, an unbounded `Map` per instance) or as a factory with {@link MemoizeMethodOptions}
+ * (`@memoize({ resolver, createCache })`) to choose the key or bound each instance's cache.
  * Works with TypeScript/Babel legacy decorators and with TC39 standard decorators.
  * @template T - The method type
- * @param {object | T} targetOrValue - Legacy: the prototype (or constructor); standard: the method
- * @param {string | symbol | ClassMethodDecoratorContext} keyOrContext - Legacy: the method name; standard: the decorator context
+ * @param {object | T | MemoizeMethodOptions} targetOrValue - Legacy: the prototype (or constructor); standard: the method; factory: the options
+ * @param {string | symbol | ClassMethodDecoratorContext} [keyOrContext] - Legacy: the method name; standard: the decorator context
  * @param {TypedPropertyDescriptor<T>} [descriptor] - Legacy: the method descriptor
- * @returns {TypedPropertyDescriptor<T> | T} Legacy: the new descriptor; standard: the wrapped method
- * @throws {TypeError} when applied to something other than a method
+ * @returns {TypedPropertyDescriptor<T> | T | UniversalMethodDecorator} Legacy: the new descriptor; standard: the wrapped method; factory: the decorator
+ * @throws {TypeError} when applied to something other than a method, or (factory) when `options` is not an object or `resolver` or
+ * `createCache` is not a function
  * @example
  * ```ts
  * class Calculator {
@@ -399,20 +430,49 @@ function wrapMemoize(method: UnknownMethod): UnknownMethod {
  * calculator.fibonacci(40); // => 102334155
  * calculator.calls; // => 41 // each n computed once
  * ```
+ * @example
+ * ```ts
+ * import { createLRUCache } from '@emiliodominguez/js-helpers/cache';
+ * class Users {
+ *   loads = 0;
+ *   @memoize({ createCache: function () { return createLRUCache({ max: 2 }); } })
+ *   load(id: number): string { this.loads++; return `user ${id}`; }
+ * }
+ * const users = new Users();
+ * users.load(1); users.load(2); users.load(3); // 1 is evicted
+ * users.load(1); // => 'user 1'
+ * users.loads; // => 4
+ * ```
  */
 export function memoize<T extends AnyFunction>(targetOrValue: object, keyOrContext: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>;
 export function memoize<T extends AnyFunction>(targetOrValue: T, keyOrContext: ClassMethodDecoratorContext): T;
+export function memoize(options: MemoizeMethodOptions): UniversalMethodDecorator;
 /**
  * Implementation of {@link memoize} (see the first overload for the full documentation).
- * @param {unknown} targetOrValue - Legacy: the prototype (or constructor); standard: the method
- * @param {unknown} keyOrContext - Legacy: the method name; standard: the decorator context
+ * @param {unknown} targetOrValue - Legacy: the prototype (or constructor); standard: the method; factory: the options
+ * @param {unknown} [keyOrContext] - Legacy: the method name; standard: the decorator context
  * @param {unknown} [descriptor] - Legacy: the method descriptor
- * @returns {unknown} Legacy: the new descriptor; standard: the wrapped method
- * @throws {TypeError} when applied to something other than a method
+ * @returns {unknown} Legacy: the new descriptor; standard: the wrapped method; factory: the decorator
+ * @throws {TypeError} when applied to something other than a method, or when the options are invalid
  */
-export function memoize(targetOrValue: unknown, keyOrContext: unknown, descriptor?: unknown): unknown {
-	return decorateMethod('memoize', wrapMemoize, targetOrValue, keyOrContext, descriptor);
+export function memoize(targetOrValue: unknown, keyOrContext?: unknown, descriptor?: unknown): unknown {
+	// Decorators always receive a key or a context: a lone argument is the options of the factory form.
+	if (keyOrContext !== undefined) return decorateMethod('memoize', wrapMemoizeDefault, targetOrValue, keyOrContext, descriptor);
+
+	if (typeof targetOrValue !== 'object' || targetOrValue === null) throw new TypeError(`@memoize: \`options\` must be an object, got ${describe(targetOrValue)}`);
+
+	const { resolver, createCache } = targetOrValue as MemoizeMethodOptions;
+
+	if (resolver !== undefined) assertFunction('@memoize', 'options.resolver', resolver);
+	if (createCache !== undefined) assertFunction('@memoize', 'options.createCache', createCache);
+
+	return createMethodDecorator('memoize', memoizeWrapper({ resolver, createCache }));
 }
+
+/**
+ * The method wrapper of the bare `@memoize` decorator.
+ */
+const wrapMemoizeDefault: MethodWrapper = memoizeWrapper({});
 
 // ---------------------------------------------------------------------------------------------------------------------
 // bound
@@ -518,7 +578,8 @@ export function bound(targetOrValue: unknown, keyOrContext: unknown, descriptor?
 // ---------------------------------------------------------------------------------------------------------------------
 
 /**
- * Creates a method decorator that debounces the method with {@link debounce}, with separate timers for every instance.
+ * Creates a method decorator that debounces the method with {@link debounce}, with separate timers for every instance. Calls without
+ * an instance (a detached call, whose `this` is `undefined`, or a primitive `this`) all share one timer per decorated method.
  * The decorated method returns the result of the latest invocation (or `undefined`), like a debounced function.
  * @param {number} wait - The quiet period in milliseconds
  * @param {DebounceOptions} [options] - `leading`, `trailing` and `maxWait`, as for {@link debounce}
@@ -552,7 +613,9 @@ export function debounced(wait: number, options?: DebounceOptions): UniversalMet
 }
 
 /**
- * Creates a method decorator that throttles the method with {@link throttle}, with separate windows for every instance.
+ * Creates a method decorator that throttles the method with {@link throttle}, with separate windows for every instance. Calls without
+ * an instance (a detached call, whose `this` is `undefined`, or a primitive `this`) all share one window per decorated method, and so
+ * may get the result of another such call.
  * The decorated method returns the result of the latest invocation (or `undefined`), like a throttled function.
  * @param {number} wait - The window length in milliseconds
  * @param {ThrottleOptions} [options] - `leading` and `trailing`, as for {@link throttle}
@@ -633,13 +696,15 @@ export function deprecated(message?: string): UniversalMethodDecorator {
 function wrapOnce(method: UnknownMethod): UnknownMethod {
 	return perInstance(function (): UnknownMethod {
 		return onceFunction(method);
-	});
+	}, method);
 }
 
 /**
  * Makes the decorated method run at most once per instance (per class for static methods), like `once` from the functions module:
  * later calls on the same instance return the first result (or rethrow the first error) without running the method again, and a
- * re-entrant call made by the method itself returns `undefined`. Each instance has its own state, garbage-collected with it.
+ * re-entrant call made by the method itself returns `undefined`. Each instance has its own state, garbage-collected with it. Calls
+ * without an instance (a detached call, whose `this` is `undefined`, or a primitive `this`) are not restricted: they always run the
+ * method, since there is no instance to remember the first result for (previously they all shared one state).
  * Works with TypeScript/Babel legacy decorators and with TC39 standard decorators.
  * @template T - The method type
  * @param {object | T} targetOrValue - Legacy: the prototype (or constructor); standard: the method

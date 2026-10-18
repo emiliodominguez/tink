@@ -85,12 +85,15 @@ function sortedCopy(numbers: ArrayLike<number>): ArrayLike<number> {
  *
  * If any intermediate sum is non-finite (an `Infinity` or `NaN` element, or overflow), the plain
  * floating-point result (`Infinity`, `-Infinity` or `NaN`) is returned.
+ * Like every aggregate of this module, each element is converted once with unary `+`, so numeric strings (from a query string,
+ * a form or a CSV file) count as numbers instead of being concatenated, values that do not convert give `NaN`, and BigInts throw a `TypeError`.
  * @param {ReadonlyArray<number>} numbers - The numbers to add up
  * @returns {number} The sum (`0` for an empty array)
  * @example
  * sum([1, 2, 3, 4]); // => 10
  * sum([0.1, 0.2, 0.3]); // => 0.6 // naive reduce gives 0.6000000000000001
  * sum([1e100, 1, -1e100]); // => 1 // naive reduce gives 0
+ * sum(['1', '2', '3'] as never); // => 6 // not '0123'
  */
 export function sum(numbers: ReadonlyArray<number>): number {
 	let total = 0;
@@ -99,7 +102,7 @@ export function sum(numbers: ReadonlyArray<number>): number {
 	// an integer pre-pass slowed mixed workloads down, and detecting exact additions inside the loop (`next - total === value`, both
 	// ways) costs as much as the compensation it would skip, so the plain loop of other libraries stays about 1.6 times faster.
 	for (let i = 0; i < numbers.length; i++) {
-		const value = numbers[i];
+		const value = +numbers[i];
 		const next = total + value;
 		compensation += Math.abs(total) >= Math.abs(value) ? total - next + value : value - next + total;
 		total = next;
@@ -152,7 +155,7 @@ export function round(number: number, decimals = 0): number {
 const POWERS_OF_TEN: ReadonlyArray<number> = [1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22];
 
 /**
- * Calculates the arithmetic mean of an array of numbers (using the compensated {@link sum}).
+ * Calculates the arithmetic mean of an array of numbers (using the compensated {@link sum}, so numeric strings count as numbers).
  * @param {ReadonlyArray<number>} numbers - The numbers to average
  * @returns {number} The mean, or `NaN` for an empty array
  * @example
@@ -187,6 +190,7 @@ export function factorial(number: number): number {
  * Finds the maximum value in an array of numbers, with the same semantics as `Math.max`
  * (`-Infinity` for an empty array, `NaN` if any element is `NaN`, `0` preferred over `-0`),
  * but without spreading the array, so it works on arrays of any length.
+ * Elements are converted once with unary `+`, like `Math.max` does (numeric strings compare as numbers, and the result is always a number).
  * @param {ReadonlyArray<number>} numbers - The numbers to search
  * @returns {number} The largest value
  * @example
@@ -195,8 +199,9 @@ export function factorial(number: number): number {
  */
 export function max(numbers: ReadonlyArray<number>): number {
 	let result = -Infinity;
-	for (const value of numbers) {
-		if (Number.isNaN(value)) return NaN;
+	for (const item of numbers) {
+		const value = +item;
+		if (value !== value) return NaN;
 		if (value > result || (value === 0 && Object.is(result, -0))) result = value;
 	}
 	return result;
@@ -206,6 +211,7 @@ export function max(numbers: ReadonlyArray<number>): number {
  * Finds the minimum value in an array of numbers, with the same semantics as `Math.min`
  * (`Infinity` for an empty array, `NaN` if any element is `NaN`, `-0` preferred over `0`),
  * but without spreading the array, so it works on arrays of any length.
+ * Elements are converted once with unary `+`, like `Math.min` does (numeric strings compare as numbers, and the result is always a number).
  * @param {ReadonlyArray<number>} numbers - The numbers to search
  * @returns {number} The smallest value
  * @example
@@ -214,8 +220,9 @@ export function max(numbers: ReadonlyArray<number>): number {
  */
 export function min(numbers: ReadonlyArray<number>): number {
 	let result = Infinity;
-	for (const value of numbers) {
-		if (Number.isNaN(value)) return NaN;
+	for (const item of numbers) {
+		const value = +item;
+		if (value !== value) return NaN;
 		if (value < result || (result === 0 && Object.is(value, -0))) result = value;
 	}
 	return result;
@@ -340,6 +347,7 @@ export function remainder(dividend: number, divisor: number): number {
 /**
  * Generates a random floating-point number in the half-open range `[minimum, maximum)`.
  * When `minimum === maximum`, `minimum` is returned.
+ * Not cryptographically secure by default: pass `secureRandom` (random module) for tokens, OTPs, lotteries…
  * @param {number} minimum - Inclusive lower bound
  * @param {number} maximum - Exclusive upper bound
  * @param {RandomGenerator} [random=Math.random] - Source of uniform numbers in `[0, 1)`
@@ -367,6 +375,9 @@ export function randomBetween(minimum: number, maximum: number, random: RandomGe
 /**
  * Returns a random integer between `minimum` and `maximum`, both inclusive.
  * Non-integer bounds are narrowed to the integers inside them (`ceil(minimum)` .. `floor(maximum)`).
+ * Ranges of more than `2 ** 32` integers combine two draws (21 + 32 bits), so that generators with only 32 bits of precision (such as
+ * `createRandom` streams) still reach every integer of ranges up to `2 ** 53`; smaller ranges use a single draw.
+ * Not cryptographically secure by default: pass `secureRandom` (random module) for tokens, OTPs, lotteries…
  * @param {number} minimum - Inclusive lower bound
  * @param {number} maximum - Inclusive upper bound
  * @param {RandomGenerator} [random=Math.random] - Source of uniform numbers in `[0, 1)`
@@ -383,7 +394,11 @@ export function randomIntBetween(minimum: number, maximum: number, random: Rando
 	const low = Math.ceil(minimum);
 	const high = Math.floor(maximum);
 	if (low > high) throw new RangeError(`randomIntBetween: no integer exists in [${minimum}, ${maximum}]`);
-	return Math.min(high, low + Math.floor(draw('randomIntBetween', random) * (high - low + 1))) + 0;
+	const span = high - low + 1;
+	let r = draw('randomIntBetween', random);
+	// A single 32-bit draw could only reach 2 ** 32 evenly spaced integers of a wider range.
+	if (span > 4294967296) r = (Math.floor(r * 2097152) * 4294967296 + Math.floor(draw('randomIntBetween', random) * 4294967296)) / 9007199254740992;
+	return Math.min(high, low + Math.floor(r * span)) + 0;
 }
 
 /**
@@ -494,7 +509,7 @@ export function inRange(value: number, start: number, end: number): boolean {
 }
 
 /**
- * Multiplies all numbers of an array together.
+ * Multiplies all numbers of an array together. Elements are converted once with unary `+` (numeric strings count as numbers).
  * @param {ReadonlyArray<number>} numbers - The numbers to multiply
  * @returns {number} The product (`1` for an empty array)
  * @example
@@ -503,13 +518,14 @@ export function inRange(value: number, start: number, end: number): boolean {
  */
 export function product(numbers: ReadonlyArray<number>): number {
 	let result = 1;
-	for (const value of numbers) result *= value;
+	for (const value of numbers) result *= +value;
 	return result;
 }
 
 /**
  * Finds the median of an array of numbers (the mean of the two middle values for even lengths).
  * The input is not mutated, and the result does not depend on its order (`-0` sorts before `0`).
+ * Elements are converted once with unary `+` (numeric strings count as numbers).
  * @param {ReadonlyArray<number>} numbers - The numbers
  * @returns {number} The median, or `NaN` if the array is empty or contains `NaN`
  * @example
@@ -533,7 +549,8 @@ export function median(numbers: ReadonlyArray<number>): number {
 
 /**
  * Finds the most frequent value(s) of an array of numbers.
- * Values are compared with SameValueZero (`0` and `-0` are the same value, `NaN` equals `NaN`).
+ * Elements are converted once with unary `+` (so `'1'` and `1` are the same value), then compared with SameValueZero
+ * (`0` and `-0` are the same value, `NaN` equals `NaN`).
  * @param {ReadonlyArray<number>} numbers - The numbers
  * @returns {number[]} Every value with the highest occurrence count, in ascending order (`NaN` last); `[]` for an empty array
  * @example
@@ -544,7 +561,8 @@ export function median(numbers: ReadonlyArray<number>): number {
 export function mode(numbers: ReadonlyArray<number>): number[] {
 	const counts = new Map<number, number>();
 	let highest = 0;
-	for (const value of numbers) {
+	for (const item of numbers) {
+		const value = +item;
 		const count = (counts.get(value) ?? 0) + 1;
 		counts.set(value, count);
 		highest = Math.max(highest, count);
@@ -559,7 +577,7 @@ export function mode(numbers: ReadonlyArray<number>): number[] {
 /**
  * Computes the variance of an array of numbers using Welford's numerically stable online algorithm.
  * By default the population variance (divide by `n`) is returned; pass `{ sample: true }` for the
- * sample variance (divide by `n - 1`).
+ * sample variance (divide by `n - 1`). Elements are converted once with unary `+` (numeric strings count as numbers).
  * @param {ReadonlyArray<number>} numbers - The numbers
  * @param {VarianceOptions} [options={}] - `sample`: compute the sample variance instead of the population one
  * @returns {number} The variance; `NaN` for an empty array, for a sample of fewer than 2 values, or if an element is not finite;
@@ -575,7 +593,8 @@ export function variance(numbers: ReadonlyArray<number>, options: VarianceOption
 	let mean = 0;
 	let squaredDistance = 0;
 	let allFinite = true;
-	for (const value of numbers) {
+	for (const item of numbers) {
+		const value = +item;
 		count++;
 		if (!Number.isFinite(value)) allFinite = false;
 		const delta = value - mean;
@@ -651,15 +670,66 @@ export function lcm(a: number, b: number): number {
 	return divisor === 0 ? 0 : Math.abs((a / divisor) * b);
 }
 
+/** Bases of the Miller–Rabin test run by {@link isPrime}: the first nine primes. */
+const PRIME_BASES: ReadonlyArray<bigint> = [2n, 3n, 5n, 7n, 11n, 13n, 17n, 19n, 23n];
+
 /**
- * Checks whether a number is a prime, using 6k ± 1 trial division.
- * Returns `false` for non-integers, negatives, `0` and `1`.
+ * `PRIME_BASE_LIMITS[i]` is the smallest strong pseudoprime to all the bases `PRIME_BASES[0..i]`: every odd number below it that
+ * passes those bases is prime (the first nine prime bases are deterministic below 3,825,123,056,546,413,051, beyond `2 ** 53`).
+ */
+const PRIME_BASE_LIMITS: ReadonlyArray<number> = [2047, 1373653, 25326001, 3215031751, 2152302898747, 3474749660383, 341550071728321, 341550071728321, Infinity];
+
+/**
+ * Deterministic Miller–Rabin primality test for odd integers `5 <= number < 2 ** 53` without small factors, in BigInt arithmetic
+ * (the squares of such numbers exceed `2 ** 53`). Runs only as many bases as {@link PRIME_BASE_LIMITS} requires for `number`.
+ * @param {number} number - An odd safe integer, at least 5
+ * @returns {boolean} Whether `number` is prime
+ * @example
+ * millerRabin(9007199254740881); // => true
+ */
+function millerRabin(number: number): boolean {
+	const n = BigInt(number);
+	const nMinusOne = n - 1n;
+	// n - 1 = odd * 2 ** twos
+	let odd = nMinusOne;
+	let twos = 0;
+	while ((odd & 1n) === 0n) {
+		odd >>= 1n;
+		twos++;
+	}
+	for (let i = 0; ; i++) {
+		// x = base ** odd mod n, by right-to-left binary exponentiation.
+		let x = 1n;
+		let power = PRIME_BASES[i];
+		for (let exponent = odd; ; power = (power * power) % n) {
+			if ((exponent & 1n) === 1n) x = (x * power) % n;
+			exponent >>= 1n;
+			if (exponent === 0n) break;
+		}
+		// A prime n gives x = 1, or reaches n - 1 within `twos - 1` further squarings.
+		if (x !== 1n) {
+			for (let squarings = 1; x !== nMinusOne; squarings++) {
+				if (squarings === twos) return false;
+				x = (x * x) % n;
+			}
+		}
+		if (number < PRIME_BASE_LIMITS[i]) return true;
+	}
+}
+
+/**
+ * Checks whether a number is a prime. Small numbers (below about `10 ** 6`) use 6k ± 1 trial division; larger ones are
+ * trial-divided by the numbers up to about 1000 and then go through a deterministic Miller–Rabin test (exact for every safe integer,
+ * with no probabilistic error), so the cost is bounded — a few tens of microseconds — whatever the input, even for attacker-chosen
+ * numbers close to `2 ** 53` (trial division up to `√n` would take a third of a second there).
+ * Returns `false` for non-integers, negatives, `0` and `1`, and for integers beyond `2 ** 53` (doubles that large are all even).
  * @param {number} number - The number to test
  * @returns {boolean} `true` if the number is prime
  * @example
  * isPrime(7); // => true
  * isPrime(9); // => false
  * isPrime(1); // => false
+ * isPrime(9007199254740881); // => true // the largest prime below 2 ** 53
  */
 export function isPrime(number: number): boolean {
 	if (!Number.isInteger(number) || number < 2) return false;
@@ -667,6 +737,8 @@ export function isPrime(number: number): boolean {
 	if (number % 2 === 0 || number % 3 === 0) return false;
 	for (let i = 5; i * i <= number; i += 6) {
 		if (number % i === 0 || number % (i + 2) === 0) return false;
+		// Past `1024 ** 2`, finishing the trial division would cost more than the Miller–Rabin test.
+		if (i > 1024) return millerRabin(number);
 	}
 	return true;
 }
@@ -782,6 +854,7 @@ function decimalPlaces(value: number): number {
  * (R type 7, the default of R, NumPy and Excel's `PERCENTILE.INC`): with the values sorted ascending,
  * `h = (n - 1) * q` and the result interpolates between the values at ranks `floor(h)` and `ceil(h)`.
  * The input is not mutated, and the result does not depend on its order (`-0` sorts before `0`).
+ * Elements are converted once with unary `+` (numeric strings count as numbers).
  * @param {ReadonlyArray<number>} numbers - The numbers
  * @param {number} q - The quantile to compute, in `[0, 1]` (`0` gives the minimum, `0.5` the median, `1` the maximum)
  * @returns {number} The quantile, or `NaN` if the array is empty or contains `NaN`
@@ -825,6 +898,7 @@ export function percentile(numbers: ReadonlyArray<number>, p: number): number {
 /**
  * Computes the running totals of a sequence of numbers using the same compensated (Neumaier) summation as {@link sum},
  * so the last element is exactly `sum(numbers)` and rounding errors do not accumulate along the sequence.
+ * Elements are converted once with unary `+` (numeric strings count as numbers).
  * @param {Iterable<number>} numbers - The numbers to accumulate
  * @returns {number[]} A new array of the same length whose `i`-th element is the sum of the first `i + 1` numbers
  * @example
@@ -836,7 +910,8 @@ export function cumulativeSum(numbers: Iterable<number>): number[] {
 	const result: number[] = [];
 	let total = 0;
 	let compensation = 0;
-	for (const value of numbers) {
+	for (const item of numbers) {
+		const value = +item;
 		const next = total + value;
 		compensation += Math.abs(total) >= Math.abs(value) ? total - next + value : value - next + total;
 		total = next;
@@ -876,6 +951,7 @@ export function approximatelyEqual(a: number, b: number, options: ApproximatelyE
 /**
  * Computes the weighted arithmetic mean `Σ(value × weight) / Σ(weight)`, using the compensated {@link sum}.
  * Weights are rescaled by the largest one first, so only their ratios matter and very large or tiny (subnormal) weights neither overflow nor underflow.
+ * Values and weights are converted with unary `+` (numeric strings count as numbers).
  * @param {ReadonlyArray<number>} values - The values to average
  * @param {ReadonlyArray<number>} weights - One finite, non-negative weight per value
  * @returns {number} The weighted mean, or `NaN` when the total weight is `0` (including empty arrays)
@@ -910,11 +986,11 @@ export function weightedAverage(values: ReadonlyArray<number>, weights: Readonly
 /**
  * Min–max normalization: linearly rescales the numbers so the smallest becomes `0` and the largest `1`.
  * Order is preserved (`a <= b` implies `normalize(a) <= normalize(b)`) and every result lies in `[0, 1]`.
- * When all numbers are equal, every result is `0`.
+ * When all numbers are equal, every result is `0`. Elements are converted with unary `+` (numeric strings count as numbers).
  * @param {ReadonlyArray<number>} numbers - The finite numbers to rescale
  * @returns {number[]} A new array of the same length with values in `[0, 1]`
- * @throws {RangeError} when an element is not finite (`NaN` or `±Infinity`)
- * @throws {TypeError} when an element is not a number
+ * @throws {RangeError} when an element is a number that is not finite (`NaN` or `±Infinity`)
+ * @throws {TypeError} when an element is a non-number that does not convert to a finite number
  * @example
  * normalize([10, 20, 15]); // => [0, 1, 0.5]
  * normalize([5, 5]); // => [0, 0]
@@ -922,7 +998,7 @@ export function weightedAverage(values: ReadonlyArray<number>, weights: Readonly
  */
 export function normalize(numbers: ReadonlyArray<number>): number[] {
 	for (let i = 0; i < numbers.length; i++) {
-		if (!Number.isFinite(numbers[i])) assertNumber('normalize', `numbers[${i}]`, numbers[i], false, 'a finite number');
+		if (!Number.isFinite(+numbers[i])) assertNumber('normalize', `numbers[${i}]`, numbers[i], false, 'a finite number');
 	}
 	const low = min(numbers);
 	const high = max(numbers);

@@ -419,7 +419,7 @@ describe('Async helpers', function () {
 			await expect(retry(jest.fn(), options)).rejects.toThrow(new RangeError(`retry: ${message}`));
 		});
 
-		it('should accept maxDelay = 0 and retry without any timer when the delay is 0', async function () {
+		it('should accept maxDelay = 0 and still yield to the event loop between attempts', async function () {
 			jest.useFakeTimers();
 
 			let calls = 0;
@@ -428,11 +428,48 @@ describe('Async helpers', function () {
 				if (calls < 3) throw new Error('again');
 				return 'done';
 			});
-			// No timer is involved: the retries complete without advancing the fake clock.
-			await expect(retry(fn, { delay: 0 })).resolves.toBe('done');
+			const zeroDelay = retry(fn, { delay: 0 });
+
+			await jest.runAllTimersAsync();
+			await expect(zeroDelay).resolves.toBe('done');
 			calls = 0;
-			await expect(retry(fn, { delay: 100, maxDelay: 0 })).resolves.toBe('done');
+
+			const zeroMax = retry(fn, { delay: 100, maxDelay: 0 });
+
+			await jest.runAllTimersAsync();
+			await expect(zeroMax).resolves.toBe('done');
 			expect(jest.getTimerCount()).toBe(0);
+		});
+
+		it('should not spin synchronously on a throwing fn with infinite retries, and should stay abortable', async function () {
+			const controller = new AbortController();
+			let calls = 0;
+			const pending = retry(
+				function (): never {
+					calls++;
+					throw new Error('sync');
+				},
+				{ retries: Infinity, signal: controller.signal }
+			);
+
+			// retry returned: the loop is not blocking the thread. A timer-driven abort is observed.
+			setTimeout(function () {
+				controller.abort(new Error('stop'));
+			}, 20);
+			await expect(pending).rejects.toThrow('stop');
+			expect(calls).toBeGreaterThan(1);
+		});
+
+		it('should reject a signal-like value without listener methods before starting timers', async function () {
+			await expect(retry(jest.fn(), { signal: { aborted: false } as never })).rejects.toThrow(
+				new TypeError('retry: `signal` must be an AbortSignal, null or undefined, got object')
+			);
+			await expect(sleep(10, { signal: { aborted: false } as never })).rejects.toThrow(
+				new TypeError('sleep: `signal` must be an AbortSignal, null or undefined, got object')
+			);
+			await expect(pollUntil(jest.fn(), { signal: { aborted: false } as never })).rejects.toThrow(
+				new TypeError('pollUntil: `signal` must be an AbortSignal, null or undefined, got object')
+			);
 		});
 
 		it('should reject with a TypeError when fn is not a function', async function () {
@@ -746,6 +783,96 @@ describe('Async helpers (round 2)', function () {
 			expect(function () {
 				createLimiter(concurrency);
 			}).toThrow(new RangeError(`createLimiter: \`concurrency\` must be an integer >= 1 or Infinity, got ${concurrency}`));
+		});
+
+		describe('security: maxPending bounds the queue', function () {
+			it('should reject calls with a RangeError, without queueing or running them, once `maxPending` tasks wait', async function () {
+				const limit = createLimiter(1, { maxPending: 1 });
+				const blocker = createDeferred<string>();
+				const running = limit(function () {
+					return blocker.promise;
+				});
+				const queued = limit(function () {
+					return 'queued';
+				});
+				const overflow = jest.fn();
+				const rejected = limit(overflow);
+				expect([limit.activeCount, limit.pendingCount]).toEqual([1, 1]);
+				await expect(rejected).rejects.toThrow(new RangeError('createLimiter: the queue is full (`maxPending` is 1)'));
+				expect(overflow).not.toHaveBeenCalled();
+				expect(limit.pendingCount).toBe(1);
+
+				blocker.resolve('running');
+				await expect(running).resolves.toBe('running');
+				await expect(queued).resolves.toBe('queued');
+				// Once the queue has room again, calls are accepted.
+				await expect(
+					limit(function () {
+						return 'later';
+					})
+				).resolves.toBe('later');
+			});
+
+			it('should never queue with `maxPending: 0`, but still run tasks while a slot is free', async function () {
+				const limit = createLimiter(2, { maxPending: 0 });
+				const blockers = [createDeferred<void>(), createDeferred<void>()];
+				const running = blockers.map(function (blocker) {
+					return limit(function () {
+						return blocker.promise;
+					});
+				});
+				await expect(limit(jest.fn())).rejects.toBeInstanceOf(RangeError);
+				expect([limit.activeCount, limit.pendingCount]).toEqual([2, 0]);
+				blockers[0].resolve();
+				blockers[1].resolve();
+				await Promise.all(running);
+			});
+
+			it('should free capacity when the queue is cleared', async function () {
+				const limit = createLimiter(1, { maxPending: 2, rejectOnClear: true });
+				const blocker = createDeferred<void>();
+				const running = limit(function () {
+					return blocker.promise;
+				});
+				const discarded = [limit(jest.fn()), limit(jest.fn())];
+				await expect(limit(jest.fn())).rejects.toBeInstanceOf(RangeError);
+				limit.clearQueue();
+				await expect(Promise.allSettled(discarded)).resolves.toHaveLength(2);
+				const accepted = limit(function () {
+					return 1;
+				});
+				expect(limit.pendingCount).toBe(1);
+				blocker.resolve();
+				await running;
+				await expect(accepted).resolves.toBe(1);
+			});
+
+			it('should keep the queue unbounded by default and with `maxPending: Infinity`', async function () {
+				for (const limit of [createLimiter(1), createLimiter(1, { maxPending: Infinity })]) {
+					const blocker = createDeferred<void>();
+					const all = [
+						limit(function () {
+							return blocker.promise;
+						})
+					];
+					for (let i = 0; i < 1000; i++) all.push(limit(jest.fn()));
+					expect(limit.pendingCount).toBe(1000);
+					blocker.resolve();
+					await Promise.all(all);
+				}
+			});
+
+			it.each([-1, 1.5, NaN])('should throw a RangeError for maxPending = %p', function (maxPending) {
+				expect(function () {
+					createLimiter(1, { maxPending });
+				}).toThrow(new RangeError(`createLimiter: \`maxPending\` must be an integer >= 0 or Infinity, got ${maxPending}`));
+			});
+
+			it('should throw a TypeError for a non-number maxPending', function () {
+				expect(function () {
+					createLimiter(1, { maxPending: '5' as any });
+				}).toThrow(new TypeError('createLimiter: `maxPending` must be an integer >= 0 or Infinity, got string'));
+			});
 		});
 	});
 

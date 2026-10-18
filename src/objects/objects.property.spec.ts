@@ -243,7 +243,8 @@ describe('objects (properties)', function () {
 
 	describe('pick / omit', function () {
 		it('pick ∪ omit reconstructs the object, and their keys are disjoint', function () {
-			const objectWithKeys = record.chain(function (object) {
+			const safeRecord = fc.dictionary(safeKey, anyValue, { maxKeys: 8, noNullPrototype: true });
+			const objectWithKeys = safeRecord.chain(function (object) {
 				return fc.tuple(fc.constant(object), fc.subarray(Object.keys(object)));
 			});
 			fc.assert(
@@ -253,6 +254,22 @@ describe('objects (properties)', function () {
 					const pickedKeys = Object.keys(picked);
 					for (const key of Object.keys(omitted)) expect(pickedKeys).not.toContain(key);
 					expect(helpers.isEqual(helpers.merge(picked, omitted), object)).toBe(true);
+				})
+			);
+		});
+	});
+
+	describe('pick (security)', function () {
+		it('never copies __proto__, constructor or prototype, nor an Object.prototype member the object does not own', function () {
+			const names = fc.constantFrom('a', 'constructor', '__proto__', 'prototype', 'toString', 'hasOwnProperty');
+			fc.assert(
+				fc.property(fc.dictionary(names, fc.jsonValue(), { noNullPrototype: true }), fc.array(names), function (object, keys) {
+					const picked = helpers.pick(object, keys as any[]);
+					const expected = keys.filter(function (key, index) {
+						return !UNSAFE.has(key) && Object.prototype.hasOwnProperty.call(object, key) && keys.indexOf(key) === index;
+					});
+					expect(Object.keys(picked).sort()).toStrictEqual(expected.sort());
+					expect(Object.getPrototypeOf(picked)).toBe(Object.prototype);
 				})
 			);
 		});
@@ -339,6 +356,44 @@ describe('objects (properties)', function () {
 					helpers.setInObjectByKeys(target, second, b);
 					expect(helpers.getFromObjectByKeys(target, first as any)).toBe(a);
 					expect(helpers.getFromObjectByKeys(target, second as any)).toBe(b);
+				})
+			);
+		});
+
+		it('hasInObjectByKeys agrees with getFromObjectByKeys, and unsafe or Object.prototype names never resolve', function () {
+			const names = fc.constantFrom('a', 'b', '0', '1', 'length', 'constructor', '__proto__', 'prototype', 'toString', 'valueOf', 'hasOwnProperty');
+			const tree = fc.dictionary(names, fc.jsonValue(), { maxKeys: 4, noNullPrototype: true });
+			const jsonish = fc.oneof(tree, fc.jsonValue(), fc.dictionary(names, tree, { maxKeys: 3, noNullPrototype: true }));
+			const anyPath = fc.array(names, { minLength: 1, maxLength: 4 }).map(function (segments) {
+				return segments.join('.');
+			});
+			const missing = Symbol('missing');
+			fc.assert(
+				fc.property(jsonish, anyPath, function (value, keys) {
+					const root = { root: value } as Record<string, unknown>;
+					const fullPath = `root.${keys}`;
+					const resolved = helpers.getFromObjectByKeys(root, fullPath as any, missing);
+					const has = helpers.hasInObjectByKeys(root, fullPath);
+					if (resolved !== missing) expect(has).toBe(true);
+					// JSON values hold no `undefined`, so a path that exists never falls back to the default.
+					else expect(has).toBe(false);
+					if (
+						keys.split('.').some(function (name) {
+							return UNSAFE.has(name);
+						})
+					)
+						expect(has).toBe(false);
+					if (resolved !== missing && resolved !== null && typeof resolved !== 'string' && typeof resolved !== 'number' && typeof resolved !== 'boolean') {
+						// Only JSON data (own values) or methods of Array/String/Number.prototype can be reached, never Object.prototype or its members.
+						expect(
+							resolved === Object.prototype ||
+								resolved === Object ||
+								resolved === Function ||
+								Object.values(Object.getOwnPropertyDescriptors(Object.prototype)).some(function (descriptor) {
+									return descriptor.value === resolved;
+								})
+						).toBe(false);
+					}
 				})
 			);
 		});
@@ -458,6 +513,37 @@ describe('objects (properties)', function () {
 						return !keys.includes(Number(key));
 					});
 					expect(Object.keys(omitted)).toStrictEqual(expected);
+				})
+			);
+		});
+
+		it('unflattenObject never creates an array longer than arrayLimit + 1', function () {
+			const index = fc.oneof(fc.nat(30), fc.integer({ min: 0, max: 2 ** 32 }));
+			const key = fc.array(fc.oneof(index.map(String), fc.constantFrom('a', 'b')), { minLength: 1, maxLength: 3 }).map(function (segments) {
+				return segments.join('.');
+			});
+			fc.assert(
+				fc.property(fc.uniqueArray(key, { maxLength: 6 }), fc.nat(20), function (keys, arrayLimit) {
+					let result: Record<string, unknown>;
+					try {
+						result = helpers.unflattenObject(
+							Object.fromEntries(
+								keys.map(function (k, i) {
+									return [k, i];
+								})
+							),
+							{ arrayLimit }
+						);
+					} catch (error) {
+						// Conflicting keys (`'a'` and `'a.b'`) are rejected; nothing else may throw.
+						expect(error).toBeInstanceOf(TypeError);
+						return;
+					}
+					for (const object of collectObjects(result)) if (Array.isArray(object)) expect(object.length).toBeLessThanOrEqual(arrayLimit + 1);
+					// Every key is still readable at its path.
+					keys.forEach(function (k, i) {
+						expect(helpers.getFromObjectByKeys(result, k as any)).toBe(i);
+					});
 				})
 			);
 		});

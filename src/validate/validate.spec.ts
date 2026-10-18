@@ -210,7 +210,7 @@ describe('isUrl', function () {
 		expect(helpers.isUrl('https://a..com', options)).toBe(false);
 		expect(helpers.isUrl('https://..com', options)).toBe(false);
 		expect(helpers.isUrl('https://example.com..', options)).toBe(false);
-		expect(helpers.isUrl('https://a..com')).toBe(true);
+		expect(helpers.isUrl('https://a..com')).toBe(false);
 	});
 
 	it('requireTld accepts the mixed-case host names of non-special schemes, which the URL parser does not lower-case', function () {
@@ -218,6 +218,70 @@ describe('isUrl', function () {
 		expect(helpers.isUrl('ssh://git@Host.Example.ORG:22/repo', options)).toBe(true);
 		expect(helpers.isUrl('redis://Cache.Example.Com', options)).toBe(true);
 		expect(helpers.isUrl('redis://Cache.EXAMPLE.C0M', options)).toBe(false);
+	});
+
+	describe('security: the fetched host is the written host', function () {
+		it.each([
+			['soft hyphen U+00AD', 'https://ev\u00adil.com/'],
+			['zero-width space U+200B', 'https://ev\u200bil.com/'],
+			['combining grapheme joiner U+034F', 'https://e\u034fvil.com/'],
+			['variation selector U+FE0F', 'https://e\ufe0fvil.com/'],
+			['word joiner U+2060', 'https://ex\u2060ample.com'],
+			['bidi override U+202E', 'https://example.com/\u202e'],
+			['fullwidth letter', 'https://\uff45vil.com/'],
+			['fullwidth host', 'https://\uff45\uff58\uff41\uff4d\uff50\uff4c\uff45.com'],
+			['circled letter', 'https://\u24d4vil.com/'],
+			['ideographic full stop', 'https://evil\u3002com/'],
+			['halfwidth ideographic full stop', 'https://evil\uff61com/'],
+			['fullwidth full stop', 'https://evil\uff0ecom/'],
+			['decomposed accent (NFKC composes it)', 'https://mu\u0308nchen.de'],
+			['percent-encoded host', 'https://%65vil.com/'],
+			['percent-encoded NUL', 'https://exa%00mple.com'],
+			['backslash before @', 'http://evil.com\\@good.com/'],
+			['backslash after //', 'https://\\evil.com'],
+			['backslash in a non-special authority', 'foo://evil.com\\@good.com'],
+			['empty host label', 'https://a..b'],
+			['dot-only host', 'https://.'],
+			['dots-only host', 'https://..'],
+			['leading dot', 'https://.example.com'],
+			['two trailing dots', 'https://example.com..'],
+			['hex IPv4', 'https://0x7f.1'],
+			['hex IPv4 label', 'https://0x7f.0.0.1'],
+			['integer IPv4', 'http://2130706433'],
+			['shorthand IPv4', 'http://127.1'],
+			['octal-looking IPv4', 'http://0177.0.0.1'],
+			['IPv4 with trailing dot', 'http://127.0.0.1.'],
+			['bare 0x', 'http://a.0x']
+		])('rejects %s', function (_label, url) {
+			expect(helpers.isUrl(url, { protocols: ['http', 'https', 'foo'] })).toBe(false);
+		});
+
+		it.each([
+			'https://münchen.de',
+			'https://MÜNCHEN.de/x',
+			'https://例え.jp',
+			'https://xn--mnchen-3ya.de',
+			'https://user:p%40ss@example.com:8080/a%20b?q=%41#%42',
+			'https://example.com./',
+			'http://127.0.0.1:8080',
+			'http://[::ffff:127.0.0.1]/',
+			'https://0x.example.com',
+			'https://1.example.com',
+			'https://example.com/\\path',
+			'https://example.com/?q=\u00e9'
+		])('accepts %s', function (url) {
+			expect(helpers.isUrl(url)).toBe(true);
+		});
+
+		it('checks hosts behind credentials and before the port, and the authority of non-special schemes', function () {
+			expect(helpers.isUrl('https://good.com@ev\u00adil.com')).toBe(false);
+			expect(helpers.isUrl('https://good.com@%65vil.com')).toBe(false);
+			expect(helpers.isUrl('https://a..b:443')).toBe(false);
+			expect(helpers.isUrl('ssh://git@a..b/x', { protocols: ['ssh'] })).toBe(false);
+			expect(helpers.isUrl('ssh://git@host/x', { protocols: ['ssh'] })).toBe(true);
+			expect(helpers.isUrl('file:///etc/hosts', { protocols: ['file'] })).toBe(true);
+			expect(helpers.isUrl('mailto:a@%65vil.com', { protocols: ['mailto'] })).toBe(true);
+		});
 	});
 
 	it('throws a TypeError when protocols is not an array', function () {
@@ -677,6 +741,13 @@ describe('compareSemver', function () {
 		expect(function () {
 			helpers.compareSemver('1.0', '1.0.0');
 		}).toThrow(new TypeError('compareSemver: "1.0" is not a valid semantic version'));
+		// Security: at most 50 characters of a rejected string are quoted.
+		expect(function () {
+			helpers.compareSemver('1.0.0', 'x'.repeat(10_000));
+		}).toThrow(new TypeError(`compareSemver: "${'x'.repeat(50)}…" is not a valid semantic version`));
+		expect(function () {
+			helpers.compareSemver('1.0.0', 'x'.repeat(50));
+		}).toThrow(new TypeError(`compareSemver: "${'x'.repeat(50)}" is not a valid semantic version`));
 		expect(function () {
 			helpers.compareSemver('1.0.0', 'v1.0.0');
 		}).toThrow(TypeError);
@@ -791,7 +862,7 @@ describe('isCreditCardNumber', function () {
 		'4222222222222', // 13-digit Visa
 		'6304000000000000', // Maestro
 		'6799990100000000019', // 19 digits
-		'000000000000' // 12 digits
+		'000000000034' // 12 digits, leading zeros
 	])('accepts %s', function (card) {
 		expect(helpers.isCreditCardNumber(card)).toBe(true);
 	});
@@ -807,7 +878,11 @@ describe('isCreditCardNumber', function () {
 		'4111.1111.1111.1111',
 		'00000000000', // 11 digits
 		'00000000000000000000', // 20 digits
-		'abcd'
+		'abcd',
+		// Luhn-valid, but all zeros (security: placeholder numbers must not pass)
+		'000000000000',
+		'0000 0000 0000',
+		'0000-0000-0000-0000-000'
 	])('rejects %s', function (card) {
 		expect(helpers.isCreditCardNumber(card)).toBe(false);
 	});
@@ -850,6 +925,18 @@ describe('isBase64', function () {
 		expect(helpers.isBase64('-_8=', { urlSafe: true })).toBe(true);
 		expect(helpers.isBase64('+/+/', { urlSafe: true })).toBe(false);
 		expect(helpers.isBase64('-_-_')).toBe(false);
+	});
+
+	it('security: only accepts canonical encodings (unused bits of the last character are zero)', function () {
+		// 'YQ==', 'YR==', 'YS==' and 'YT==' all decode to 'a': only the first is canonical.
+		for (const text of ['YR==', 'YS==', 'YT==', 'YR', 'Zh==', 'Zm9=', 'Zm+', 'Zm/', 'Zm-', 'Zm_', 'Z/==', 'Z_']) {
+			expect({ text, valid: helpers.isBase64(text) || helpers.isBase64(text, { urlSafe: true }) }).toEqual({ text, valid: false });
+		}
+		for (const text of ['YQ==', 'YQ', 'YWI=', 'YWI', 'Zm8', 'Zw==', 'ZA', 'Zm0', 'Zm4=']) expect(helpers.isBase64(text)).toBe(true);
+		expect(helpers.isBase64('-_8', { urlSafe: true })).toBe(true);
+		expect(helpers.isBase64('-_9', { urlSafe: true })).toBe(false);
+		expect(helpers.isBase64('-w', { urlSafe: true })).toBe(true);
+		expect(helpers.isBase64('-x', { urlSafe: true })).toBe(false);
 	});
 
 	it('throws a RangeError for an unknown padding mode', function () {

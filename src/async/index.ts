@@ -136,6 +136,8 @@ export function sleep(ms: number, options: SleepOptions = {}): Promise<void> {
 
 		const { signal } = options;
 
+		assertOptionalSignal('sleep', 'signal', signal);
+
 		if (signal?.aborted) {
 			reject(abortReason(signal));
 			return;
@@ -199,6 +201,8 @@ export function withTimeout<T>(promise: PromiseLike<T> | T, ms: number, message?
  * Calls `fn` until it succeeds, retrying up to `options.retries` times with exponential backoff:
  * the delay before retry `k` (1-based) is `min(delay * factor^(k - 1), maxDelay)`, optionally randomised with full jitter.
  * Resolves with the first successful result; rejects with the last error once retries are exhausted or `shouldRetry` returns `false`.
+ * Every retry waits for at least one timer tick (`setTimeout(0)` for a zero delay), so even `retries: Infinity` with a synchronously
+ * throwing `fn` never blocks the thread and stays abortable through `signal`.
  * @template T - The resolved value type
  * @param {(attempt: number) => Promise<T> | T} fn - The operation; receives the 1-based attempt number
  * @param {RetryOptions} [options] - `retries` (3), `delay` (0), `factor` (2), `maxDelay` (Infinity), `jitter` (false), `shouldRetry`, `onRetry`, `signal`
@@ -225,6 +229,7 @@ export async function retry<T>(fn: (attempt: number) => Promise<T> | T, options:
 	if (shouldRetry !== undefined) assertFunction('retry', 'shouldRetry', shouldRetry);
 	if (onRetry !== undefined) assertFunction('retry', 'onRetry', onRetry);
 	if (jitter) assertFunction('retry', 'random', random);
+	assertOptionalSignal('retry', 'signal', signal);
 
 	for (let attempt = 1; ; attempt++) {
 		if (signal?.aborted) throw abortReason(signal);
@@ -242,7 +247,9 @@ export async function retry<T>(fn: (attempt: number) => Promise<T> | T, options:
 			const base = Math.min(delay * factor ** (attempt - 1), maxDelay, MAX_TIMEOUT);
 			const wait = jitter ? draw('retry', random) * base : base;
 
-			if (wait > 0) await sleep(wait, { signal });
+			// Always yield to the event loop, even for a zero delay: a synchronously throwing `fn` with `retries: Infinity` would otherwise
+			// spin forever without ever returning control, and an abort fired by a timer or by I/O could never be observed.
+			await sleep(wait, { signal });
 		}
 	}
 }
@@ -344,6 +351,13 @@ export async function attemptAsync<T>(fnOrPromise: PromiseLike<T> | (() => Promi
 export interface LimiterOptions {
 	/** When `true`, {@link Limiter.clearQueue} rejects the promises of the discarded tasks with an {@link AbortError}. Defaults to `false` (they never settle). */
 	rejectOnClear?: boolean;
+	/**
+	 * Largest number of tasks allowed to wait for a slot (an integer >= 0, or `Infinity`). Once that many wait, further calls reject
+	 * with a `RangeError` straight away, without queueing or running their task. Set it whenever tasks are created from untrusted or
+	 * unbounded input (e.g. one per incoming request): an unbounded queue grows until the process runs out of memory.
+	 * @default Infinity
+	 */
+	maxPending?: number;
 }
 
 /**
@@ -354,6 +368,7 @@ export interface Limiter {
 	 * Runs `fn(...args)` as soon as fewer than `concurrency` tasks are active (immediately and synchronously when a slot is free),
 	 * and settles like its result. Synchronous throws become rejections.
 	 * @throws {TypeError} (as a rejection) when `fn` is not a function
+	 * @throws {RangeError} (as a rejection) when no slot is free and `maxPending` tasks are already waiting
 	 */
 	<A extends unknown[], T>(fn: (...args: A) => PromiseLike<T> | T, ...args: A): Promise<T>;
 	/** Number of tasks currently running. */
@@ -376,11 +391,13 @@ interface LimiterTask {
 
 /**
  * Creates a limiter that runs at most `concurrency` tasks at the same time, starting waiting tasks in FIFO order (like `p-limit`).
+ * The queue of waiting tasks is unbounded by default: pass `maxPending` to bound it (calls beyond it reject with a `RangeError`)
+ * whenever the number of calls is not under your control.
  * @param {number} concurrency - Maximum number of tasks running at once (an integer >= 1, or `Infinity`)
- * @param {LimiterOptions} [options] - `rejectOnClear` (default `false`)
+ * @param {LimiterOptions} [options] - `rejectOnClear` (default `false`) and `maxPending` (default `Infinity`)
  * @returns {Limiter} The `limit(fn, ...args)` function, with `activeCount`, `pendingCount` and `clearQueue()`
- * @throws {TypeError} when `concurrency` is not a number
- * @throws {RangeError} when `concurrency` is not an integer >= 1 or `Infinity`
+ * @throws {TypeError} when `concurrency` or `maxPending` is not a number
+ * @throws {RangeError} when `concurrency` is not an integer >= 1 or `Infinity`, or `maxPending` is not an integer >= 0 or `Infinity`
  * @example
  * const limit = createLimiter(2);
  * async function double(n: number): Promise<number> { await sleep(5); return n * 2; }
@@ -388,11 +405,18 @@ interface LimiterTask {
  * limit.activeCount; // => 2
  * limit.pendingCount; // => 1
  * await results; // => [2, 4, 6]
+ * @example
+ * const limit = createLimiter(1, { maxPending: 1 });
+ * const running = limit(sleep, 5);
+ * const queued = limit(sleep, 5);
+ * await limit(sleep, 5); // throws RangeError // the queue is full
+ * await Promise.all([running, queued]);
  */
 export function createLimiter(concurrency: number, options: LimiterOptions = {}): Limiter {
 	assertInteger('createLimiter', 'concurrency', concurrency, 1, true);
 
-	const rejectOnClear = options.rejectOnClear ?? false;
+	const { rejectOnClear = false, maxPending = Infinity } = options;
+	assertInteger('createLimiter', 'maxPending', maxPending, 0, true);
 	// The waiting tasks form a linked FIFO queue (O(1) enqueue and dequeue, no array to compact).
 	let first: LimiterTask | undefined;
 	let last: LimiterTask | undefined;
@@ -445,6 +469,10 @@ export function createLimiter(concurrency: number, options: LimiterOptions = {})
 
 			if (active < concurrency) {
 				run();
+				return;
+			}
+			if (pending >= maxPending) {
+				reject(new RangeError(`createLimiter: the queue is full (\`maxPending\` is ${maxPending})`));
 				return;
 			}
 
@@ -534,6 +562,7 @@ export function pollUntil<T>(check: () => T | PromiseLike<T>, options: PollOptio
 		assertFunction('pollUntil', 'check', check);
 		assertDelay('pollUntil', 'interval', interval);
 		assertDelay('pollUntil', 'timeout', timeout, true);
+		assertOptionalSignal('pollUntil', 'signal', signal);
 
 		if (signal?.aborted) {
 			reject(abortReason(signal));

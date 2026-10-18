@@ -352,4 +352,30 @@ describe('Search helpers', function () {
 			).toBe('sidx');
 		});
 	});
+
+	describe('security', function () {
+		const target = 'x'.repeat(20_000);
+
+		it('rejects a query longer than the target without allocating (even when non-ASCII disables the indexOf pre-filter)', function () {
+			expect(helpers.fuzzyMatch(`é${'y'.repeat(1_000_000)}`, target)).toBeUndefined();
+			expect(helpers.fuzzyMatch('ab', 'a')).toBeUndefined();
+			expect(helpers.fuzzyMatch('😀😀', '😀')).toBeUndefined();
+			expect(helpers.fuzzyMatch('😀', '😀')).toEqual({ score: 25, ranges: [[0, 2]] });
+			expect(helpers.fuzzySearch(['x'.repeat(5_000), 'abc'], `é${'y'.repeat(40_000)}`)).toEqual([]);
+		});
+
+		it('runs the subsequence check before allocating the O(query × target) matrix', function () {
+			const before = process.memoryUsage().arrayBuffers;
+			// 5001 × 20000 cells would be a 400 MB matrix.
+			expect(helpers.fuzzyMatch(`é${'y'.repeat(5_000)}`, target)).toBeUndefined();
+			expect(helpers.fuzzyMatch(`x${'é'.repeat(5_000)}`, target)).toBeUndefined();
+			expect(process.memoryUsage().arrayBuffers - before).toBeLessThan(10_000_000);
+		});
+
+		it('sizes the matrix by target code points and still aligns long non-ASCII matches', function () {
+			const long = `${'é'.repeat(300)}😀`;
+			expect(helpers.fuzzyMatch('é😀', long)?.ranges).toEqual([[299, 302]]);
+			expect(helpers.fuzzyMatch('éé', 'é'.repeat(40))?.ranges).toEqual([[0, 2]]);
+		});
+	});
 });

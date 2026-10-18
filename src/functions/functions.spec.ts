@@ -520,12 +520,12 @@ describe('Functions helpers', function () {
 			expect(helpers.defaultMemoizeKey({ a: 1 })).toBe('[{"a":1}]');
 			expect(helpers.defaultMemoizeKey('[x')).toBe('["[x"]');
 			expect(helpers.defaultMemoizeKey(1n, 2)).toBe('["1n",2]');
-			// A function is not a primitive: like nested functions, it serialises as null (supply a resolver for such arguments).
-			expect(helpers.defaultMemoizeKey(helpers.noop)).toBe('[null]');
+			// A lone function is its own key (identity), like a lone class instance.
+			expect(helpers.defaultMemoizeKey(helpers.noop)).toBe(helpers.noop);
 			// Only whole strings shaped like a marker are escaped.
 			expect(helpers.defaultMemoizeKey('aNaN', 'NaNa', '1n2', 1)).toBe('["aNaN","NaNa","1n2",1]');
-			// Top-level `undefined` arguments get a marker even next to objects; nested ones keep JSON semantics.
-			expect(helpers.defaultMemoizeKey(undefined, { a: 1, b: undefined })).toBe('["undefined",{"a":1}]');
+			// `undefined` gets a marker at every level, so `{ b: undefined }` differs from `{}`.
+			expect(helpers.defaultMemoizeKey(undefined, { a: 1, b: undefined })).toBe('["undefined",{"a":1,"b":"undefined"}]');
 		});
 
 		it('should throw a TypeError on circular structures', function () {
@@ -1261,8 +1261,10 @@ describe('Functions helpers (round 2)', function () {
 			expect(helpers.defaultMemoizeKey('plain', 1.5)).toBe('["plain",1.5]');
 		});
 
-		it('should keep JSON semantics for nested undefined values', function () {
-			expect(helpers.defaultMemoizeKey({ a: undefined, b: 1 }, [undefined])).toBe('[{"b":1},[null]]');
+		it('should mark nested undefined values too (holes count as undefined)', function () {
+			expect(helpers.defaultMemoizeKey({ a: undefined, b: 1 }, [undefined])).toBe('[{"a":"undefined","b":1},["undefined"]]');
+			// eslint-disable-next-line no-sparse-arrays -- a hole on purpose
+			expect(helpers.defaultMemoizeKey([1, , 2])).toBe('[[1,"undefined",2]]');
 			expect(helpers.defaultMemoizeKey({ a: -0, b: NaN })).toBe('[{"a":"-0","b":"NaN"}]');
 		});
 	});
@@ -1620,5 +1622,104 @@ describe('Functions helpers (round 8 fast paths)', function () {
 		expect(function () {
 			helpers.pipe(inc, double, 'x' as unknown as typeof inc);
 		}).toThrow(new TypeError('pipe: `fns[2]` must be a function, got string'));
+	});
+});
+
+describe('Functions helpers (security)', function () {
+	describe('defaultMemoizeKey collisions', function () {
+		it('should not confuse a Date with its ISO string, nor two Dates with each other', function () {
+			const iso = new Date(0).toISOString();
+			expect(helpers.defaultMemoizeKey(new Date(0), 1)).not.toBe(helpers.defaultMemoizeKey(iso, 1));
+			expect(helpers.defaultMemoizeKey(new Date(0))).not.toBe(helpers.defaultMemoizeKey(iso));
+			expect(helpers.defaultMemoizeKey({ at: new Date(0) })).not.toBe(helpers.defaultMemoizeKey({ at: iso }));
+			expect(helpers.defaultMemoizeKey(new Date(0))).not.toBe(helpers.defaultMemoizeKey(new Date(1)));
+			// Dates are compared by time value, not identity.
+			expect(helpers.defaultMemoizeKey(new Date(5), 'x')).toBe(helpers.defaultMemoizeKey(new Date(5), 'x'));
+			expect(helpers.defaultMemoizeKey(new Date(5))).toBe('["Date(5)"]');
+			expect(helpers.defaultMemoizeKey(new Date(NaN))).toBe('["Date(NaN)"]');
+			expect(helpers.defaultMemoizeKey('Date(5)')).toBe('Date(5)');
+			expect(helpers.defaultMemoizeKey('Date(5)', 1)).toBe('["\\\\Date(5)",1]');
+		});
+
+		it('should not confuse errors, class instances with private state, maps or sets', function () {
+			class User {
+				readonly #id: number;
+				constructor(id: number) {
+					this.#id = id;
+				}
+				get id(): number {
+					return this.#id;
+				}
+			}
+			const message = helpers.memoize(function (error: Error): string {
+				return error.message;
+			});
+			expect([message(new Error('a')), message(new Error('b'))]).toEqual(['a', 'b']);
+			const id = helpers.memoize(function (user: User, n: number): number {
+				return user.id + n;
+			});
+			expect([id(new User(1), 0), id(new User(2), 0)]).toEqual([1, 2]);
+			const size = helpers.memoize(function (map: Map<number, number>): number {
+				return map.size;
+			});
+			expect([size(new Map()), size(new Map([[1, 1]]))]).toEqual([0, 1]);
+			expect(helpers.defaultMemoizeKey({ s: new Set([1]) })).not.toBe(helpers.defaultMemoizeKey({ s: new Set([2]) }));
+		});
+
+		it('should key functions, symbols and non-plain objects by identity', function () {
+			const user = new (class Box {
+				value = 1;
+			})();
+			const error = new Error('x');
+			const sym = Symbol('x');
+			// A lone one is its own key.
+			expect(helpers.defaultMemoizeKey(user)).toBe(user);
+			expect(helpers.defaultMemoizeKey(error)).toBe(error);
+			expect(helpers.defaultMemoizeKey(helpers.noop)).toBe(helpers.noop);
+			expect(helpers.defaultMemoizeKey(sym)).toBe(sym);
+			// In a list, they get a stable identity marker.
+			expect(helpers.defaultMemoizeKey(user, 1)).toBe(helpers.defaultMemoizeKey(user, 1));
+			expect(helpers.defaultMemoizeKey(user, 1)).toMatch(/^\["#\d+",1\]$/);
+			expect(helpers.defaultMemoizeKey(user, 1)).not.toBe(helpers.defaultMemoizeKey(new (class Box {})(), 1));
+			expect(helpers.defaultMemoizeKey([helpers.noop])).not.toBe(helpers.defaultMemoizeKey([helpers.identity]));
+			expect(helpers.defaultMemoizeKey(Symbol.for('a'), 1)).toBe(helpers.defaultMemoizeKey(Symbol.for('a'), 1));
+			expect(helpers.defaultMemoizeKey(Symbol.for('a'), 1)).not.toBe(helpers.defaultMemoizeKey(Symbol.for('b'), 1));
+			expect(helpers.defaultMemoizeKey(Symbol('a'), 1)).not.toBe(helpers.defaultMemoizeKey(Symbol('a'), 1));
+			// Strings shaped like an identity marker are escaped.
+			const marker = JSON.parse(helpers.defaultMemoizeKey(user, 1) as string)[0] as string;
+			expect(helpers.defaultMemoizeKey(marker, 1)).not.toBe(helpers.defaultMemoizeKey(user, 1));
+			expect(helpers.defaultMemoizeKey('#12', 1)).toBe('["\\\\#12",1]');
+		});
+
+		it('should not confuse symbols, functions, undefined and null (previously all null)', function () {
+			const keys = [
+				helpers.defaultMemoizeKey(Symbol('x'), 1),
+				helpers.defaultMemoizeKey(null, 1),
+				helpers.defaultMemoizeKey(undefined, 1),
+				helpers.defaultMemoizeKey(helpers.noop, 1),
+				helpers.defaultMemoizeKey([null]),
+				helpers.defaultMemoizeKey([undefined]),
+				helpers.defaultMemoizeKey([helpers.noop]),
+				helpers.defaultMemoizeKey({ a: undefined }),
+				helpers.defaultMemoizeKey({}),
+				helpers.defaultMemoizeKey({ a: helpers.noop }),
+				helpers.defaultMemoizeKey({ a: null })
+			];
+			expect(new Set(keys).size).toBe(keys.length);
+		});
+
+		it('should keep value-based keys for plain objects and arrays (also with a null prototype), ignoring toJSON', function () {
+			expect(helpers.defaultMemoizeKey({ a: [1, { b: 2 }] })).toBe(helpers.defaultMemoizeKey({ a: [1, { b: 2 }] }));
+			expect(helpers.defaultMemoizeKey(Object.assign(Object.create(null), { a: 1 }))).toBe('[{"a":1}]');
+			expect(helpers.defaultMemoizeKey({ toJSON: helpers.constant(1) }, 2)).not.toBe(helpers.defaultMemoizeKey(1, 2));
+			expect(helpers.defaultMemoizeKey({ toJSON: helpers.constant(1) })).toMatch(/^\[\{"toJSON":"#\d+"\}\]$/);
+		});
+
+		it('should not throw on cycles through non-plain objects', function () {
+			class Node {
+				self: Node = this;
+			}
+			expect(helpers.defaultMemoizeKey({ node: new Node() })).toMatch(/^\[\{"node":"#\d+"\}\]$/);
+		});
 	});
 });

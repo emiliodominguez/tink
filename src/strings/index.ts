@@ -1,5 +1,6 @@
 import { assertInteger, describe, draw } from '../utils/assert.js';
 import type { RandomGenerator } from '../utils/index.js';
+import { isNumericString } from '../validate/index.js';
 
 /**
  * Options accepted by {@link countSubString}.
@@ -568,19 +569,26 @@ export function toBoolean(string: string): boolean {
 }
 
 /**
- * Converts a string to a number with `Number()` semantics, except that blank strings (empty or whitespace only) give `NaN` instead of `0`.
+ * Converts a string holding a finite decimal number to that number, ignoring surrounding whitespace: the trimmed string must satisfy
+ * `isNumericString` from the validate module (optional sign, digits with an optional fraction, optional exponent), so the result is
+ * either a finite number or `NaN`, never `±Infinity`.
+ *
+ * Unlike `Number()`, blank strings give `NaN` (not `0`), and so do hex, octal and binary literals (`'0x1f'`), `'Infinity'`, numeric
+ * separators and values that overflow (`'1e400'`): validation with `isNumericString` and conversion with `toNumber` always agree.
  * @param {string} string - The string to be converted to a number
- * @returns {number} The converted number, or `NaN` when the string is blank or not numeric
+ * @returns {number} The converted (finite) number, or `NaN` when the trimmed string is not a finite decimal number
  * @example
  * toNumber(' 42 '); // => 42
- * toNumber('0x1f'); // => 31
+ * toNumber('-1.5e3'); // => -1500
+ * toNumber('0x1f'); // => NaN
+ * toNumber('Infinity'); // => NaN
  * toNumber(''); // => NaN
  * toNumber('12px'); // => NaN
  */
 export function toNumber(string: string): number {
 	const trimmed = string.trim();
 
-	return trimmed === '' ? NaN : Number(trimmed);
+	return isNumericString(trimmed) ? Number(trimmed) : NaN;
 }
 
 /**
@@ -681,16 +689,61 @@ export function isPalindrome(string: string, options: IsPalindromeOptions = {}):
 }
 
 /**
- * Escapes every character that has a special meaning in a regular expression (`. * + ? ^ $ { } ( ) | [ ] \`), so the result
- * matches the input literally. The output is valid with and without the `u` flag.
+ * The characters {@link escapeRegExp} escapes (as TC39 `RegExp.escape` does): a leading ASCII letter or digit, the syntax characters
+ * and `/`, the other ASCII punctuators, white space, line terminators and lone surrogates. Without the `u` flag, so surrogates are seen
+ * as code units.
+ */
+const REGEXP_ESCAPED = /^[0-9A-Za-z]|[$^\\.*+?()[\]{}|/,\-=<>#&!%:;@~'`"\s]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+
+/** Escape sequences computed by {@link escapeRegExpChar}, by character (at most the ~2 200 code units {@link REGEXP_ESCAPED} matches). */
+const regExpEscapes: Record<string, string> = {};
+
+/**
+ * Escapes one character matched by {@link REGEXP_ESCAPED}: `\` before a syntax character or `/`, a control escape (`\t`, `\n`, `\v`,
+ * `\f`, `\r`), else `\xHH` (code units up to `0xff`) or `\uHHHH`.
+ * @param {string} char - The character (one UTF-16 code unit)
+ * @returns {string} Its escape sequence
+ */
+function escapeRegExpChar(char: string): string {
+	let escape = regExpEscapes[char];
+
+	if (escape === undefined) {
+		const control = '\t\n\v\f\r'.indexOf(char);
+		const code = char.charCodeAt(0);
+
+		escape = '^$\\.*+?()[]{}|/'.includes(char)
+			? `\\${char}`
+			: control >= 0
+				? `\\${'tnvfr'[control]}`
+				: code < 256
+					? `\\x${code.toString(16).padStart(2, '0')}`
+					: `\\u${code.toString(16).padStart(4, '0')}`;
+		regExpEscapes[char] = escape;
+	}
+
+	return escape;
+}
+
+/**
+ * Escapes a string so that it matches itself literally in a regular expression, following the TC39 `RegExp.escape` algorithm (same
+ * output as the native `RegExp.escape` where it exists):
+ * - the syntax characters `^ $ \ . * + ? ( ) [ ] { } |` and `/` get a backslash;
+ * - the other ASCII punctuators `` , - = < > # & ! % : ; @ ~ ' ` " ``, white space, line terminators and lone surrogates become `\xHH`,
+ *   `\uHHHH` or a control escape (`\t`, `\n`...);
+ * - a leading ASCII letter or digit becomes `\xHH`, so it cannot extend a preceding escape (`\1` + `0` is not `\10`, `\c` + `J` ...).
+ *
+ * The result is valid with and without the `u` and `v` flags, both outside and inside a character class (`[...]`, where `-`, `&&`
+ * and `--` would otherwise form ranges or set operations), and in a regex literal (`/` is escaped).
  * @param {string} string - The string to escape
  * @returns {string} The escaped string
  * @example
- * escapeRegExp('1.5*(x)'); // => '1\\.5\\*\\(x\\)'
+ * escapeRegExp('1.5*(x)'); // => '\\x31\\.5\\*\\(x\\)'
+ * escapeRegExp('a-z'); // => '\\x61\\x2dz'
  * new RegExp(escapeRegExp('a.b')).test('axb'); // => false
+ * new RegExp('[' + escapeRegExp('a-z') + ']').test('m'); // => false
  */
 export function escapeRegExp(string: string): string {
-	return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	return string.replace(REGEXP_ESCAPED, escapeRegExpChar);
 }
 
 /**
@@ -699,13 +752,31 @@ export function escapeRegExp(string: string): string {
 const HTML_ESCAPES: Readonly<Record<string, string>> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
 /**
- * Escapes the HTML-significant characters `&`, `<`, `>`, `"` and `'` so the string can be safely embedded in HTML text or quoted attributes.
- * @param {string} string - The string to escape
+ * Converts a value to the string that {@link escapeHtml} and {@link unescapeHtml} process.
+ * @param {unknown} value - The value
+ * @returns {string} `value` itself for strings, `''` for `null` and `undefined`, else `String(value)`
+ */
+function toText(value: unknown): string {
+	return typeof value === 'string' ? value : value == null ? '' : String(value);
+}
+
+/**
+ * Escapes the HTML-significant characters `&`, `<`, `>`, `"` and `'` so the string can be safely embedded in HTML text or quoted attributes
+ * (not in unquoted attributes, URLs, `<script>` or `<style>`).
+ *
+ * The result is always a string: other values are converted with `String()` first (`null` and `undefined` become `''`), so that, for
+ * example, a query parameter parsed as an array (`?q[]=<script>` gives `['<script>']`) is escaped too, instead of being returned as is
+ * and stringified unescaped by a template.
+ * @param {unknown} value - The string to escape (other values are converted to strings)
  * @returns {string} The escaped string
+ * @throws {TypeError} when `value` cannot be converted to a string (e.g. an object with a throwing or missing `toString`)
  * @example
  * escapeHtml('<a href="x">Tom & Jerry\'s</a>'); // => '&lt;a href=&quot;x&quot;&gt;Tom &amp; Jerry&#39;s&lt;/a&gt;'
+ * escapeHtml(['<script>']); // => '&lt;script&gt;'
+ * escapeHtml(undefined); // => ''
  */
-export function escapeHtml(string: string): string {
+export function escapeHtml(value: unknown): string {
+	const string = toText(value);
 	// Testing first saves the (slower) replace call on text without special characters, the common case.
 	return /[&<>"']/.test(string)
 		? string.replace(/[&<>"']/g, function (char: string): string {
@@ -723,13 +794,17 @@ const HTML_UNESCAPES: Readonly<Record<string, string | undefined>> = { '&amp;': 
 /**
  * Reverses {@link escapeHtml}: decodes `&lt;`, `&gt;`, `&quot;`, `&#39;`, `&#x27;`, `&apos;` and `&amp;`. Decoding happens in a single pass,
  * so `&amp;` is effectively decoded last and `'&amp;lt;'` becomes `'&lt;'` (never `'<'`). Other entities are left untouched.
- * @param {string} string - The string to unescape
+ * Like {@link escapeHtml}, it always returns a string: other values are converted with `String()` (`null` and `undefined` become `''`).
+ * @param {unknown} value - The string to unescape (other values are converted to strings)
  * @returns {string} The unescaped string
+ * @throws {TypeError} when `value` cannot be converted to a string
  * @example
  * unescapeHtml('&lt;b&gt;Tom &amp; Jerry&#39;s&lt;/b&gt;'); // => "<b>Tom & Jerry's</b>"
  * unescapeHtml('&amp;lt;'); // => '&lt;'
+ * unescapeHtml(null); // => ''
  */
-export function unescapeHtml(string: string): string {
+export function unescapeHtml(value: unknown): string {
+	const string = toText(value);
 	if (!string.includes('&')) return string;
 
 	return string.replace(/&(?:amp|lt|gt|quot|apos|#39|#[xX]27);/g, function (entity: string): string {
@@ -776,15 +851,21 @@ function resolvePath(source: unknown, path: string): unknown {
 const PLACEHOLDER = /\{([^{}]+)\}/;
 
 /**
- * The templates {@link interpolate} parsed recently, at most 16 (templates are usually constants, applied to many value objects),
- * each split into the text parts at even indices (first and last included, possibly empty) and the raw paths between braces at odd ones.
+ * The templates {@link interpolate} parsed recently, at most 16 of at most {@link MAX_CACHED_TEMPLATE_LENGTH} characters (templates are
+ * usually constants, applied to many value objects), each split into the text parts at even indices (first and last included, possibly
+ * empty) and the raw paths between braces at odd ones.
  */
 const parsedTemplates = new Map<string, string[]>();
+
+/** Longer templates are not cached, so the cache cannot retain attacker-sized strings (it is bounded by entries, not bytes). */
+const MAX_CACHED_TEMPLATE_LENGTH = 1024;
 
 /**
  * Replaces `{key}` and `{nested.key}` placeholders (whitespace inside the braces is ignored) with values from an object.
  * Values are stringified with `String()`. Placeholders whose path does not exist (or resolves to `undefined`) are left untouched.
  * Only own properties are read, so `{constructor}` or `{__proto__}` never leak prototype members. There is no escaping syntax for braces.
+ * Values are inserted as is (escape them, e.g. with {@link escapeHtml}, for HTML). The 16 most recent templates of at most 1024
+ * characters are kept parsed.
  * @param {string} template - The template containing placeholders
  * @param {InterpolationValues} values - The values to insert; nested objects and arrays are addressed with dots (`{items.0}`)
  * @returns {string} The interpolated string
@@ -796,10 +877,12 @@ export function interpolate(template: string, values: InterpolationValues): stri
 	let parts = parsedTemplates.get(template);
 
 	if (parts === undefined) {
-		// Simple eviction keeps the cache bounded: start afresh once it is full.
-		if (parsedTemplates.size === 16) parsedTemplates.clear();
 		parts = template.split(PLACEHOLDER);
-		parsedTemplates.set(template, parts);
+		if (template.length <= MAX_CACHED_TEMPLATE_LENGTH) {
+			// Simple eviction keeps the cache bounded: start afresh once it is full.
+			if (parsedTemplates.size === 16) parsedTemplates.clear();
+			parsedTemplates.set(template, parts);
+		}
 	}
 
 	let result = parts[0];
@@ -873,7 +956,8 @@ function editDistance(a: ReadonlyArray<string>, b: ReadonlyArray<string>): numbe
  * Computes the Levenshtein edit distance between two strings: the minimum number of single-character insertions, deletions and substitutions
  * turning `a` into `b`. Characters are Unicode code points, so an astral character (emoji, surrogate pair) counts as one.
  * The common prefix and suffix are skipped and the dynamic-programming table keeps a single row sized after the shorter string,
- * so the extra memory is O(min(n, m)) and the time O(n × m).
+ * so the extra memory is O(min(n, m)) and the time O(n × m): cap the length of untrusted inputs (two 100 000-character strings take
+ * 10¹⁰ steps).
  * @param {string} a - The first string
  * @param {string} b - The second string
  * @returns {number} The edit distance (a non-negative integer, `0` iff the strings are equal)
@@ -1139,8 +1223,9 @@ export interface MaskOptions {
 /**
  * Hides the middle of a string (card numbers, tokens, phone numbers...), replacing every user-perceived character (grapheme cluster)
  * except the first `visibleStart` and the last `visibleEnd` ones with `char`. The grapheme length is preserved.
- * When the visible parts cover the whole string (it has at most `visibleStart + visibleEnd` graphemes), nothing is hidden and
- * the string is returned unchanged — pick the visible counts accordingly for short secrets.
+ * It fails closed: when the visible parts would cover the whole string (it has at most `visibleStart + visibleEnd` graphemes, e.g.
+ * `mask('1234')` with the default 4 visible graphemes), nothing could be hidden, so every grapheme is masked instead. Otherwise at least
+ * one grapheme is hidden, which may still reveal most of a short secret (`mask('12345')` is `'*2345'`): pick the visible counts accordingly.
  * @param {string} string - The string to mask
  * @param {MaskOptions} [options={}] - `visibleStart` (default `0`), `visibleEnd` (default `4`) and `char` (default `'*'`)
  * @returns {string} The masked string
@@ -1150,6 +1235,7 @@ export interface MaskOptions {
  * mask('4111111111111111'); // => '************1111'
  * mask('john.doe@mail.com', { visibleStart: 2, visibleEnd: 9, char: '•' }); // => 'jo••••••@mail.com'
  * mask('👍🏽👍🏽👍🏽👍🏽👍🏽', { visibleEnd: 1 }); // => '****👍🏽'
+ * mask('1234'); // => '****'
  */
 export function mask(string: string, options: MaskOptions = {}): string {
 	const { visibleStart = 0, visibleEnd = 4, char = '*' } = options;
@@ -1157,12 +1243,13 @@ export function mask(string: string, options: MaskOptions = {}): string {
 	assertInteger('mask', 'visibleStart', visibleStart);
 	assertInteger('mask', 'visibleEnd', visibleEnd);
 
-	if (graphemeLength(char) !== 1) throw new RangeError(`mask: \`char\` must be exactly one grapheme, got ${JSON.stringify(char)}`);
+	if (graphemeLength(char) !== 1)
+		throw new RangeError(`mask: \`char\` must be exactly one grapheme, got ${JSON.stringify(char.length > 50 ? `${char.slice(0, 50)}…` : char)}`);
 
 	const graphemes = splitGraphemes(string);
 	const hidden = graphemes.length - visibleStart - visibleEnd;
 
-	if (hidden <= 0) return string;
+	if (hidden <= 0) return char.repeat(graphemes.length);
 
 	return graphemes.slice(0, visibleStart).join('') + char.repeat(hidden) + graphemes.slice(visibleStart + hidden).join('');
 }

@@ -251,6 +251,23 @@ describe('isBase64 (properties)', function () {
 	});
 });
 
+describe('isBase64 canonical encodings (properties)', function () {
+	it('accepts a padded string exactly when it is the btoa encoding of what atob decodes it to', function () {
+		fc.assert(
+			fc.property(fc.string({ unit: fc.constantFrom('A', 'B', 'Q', 'R', 'g', 'h', 'w', 'z', '0', '8', '9', '+', '/', '='), maxLength: 12 }), function (text) {
+				let canonical: boolean;
+				try {
+					canonical = btoa(atob(text)) === text;
+				} catch {
+					canonical = false;
+				}
+				expect(helpers.isBase64(text, { padding: 'required' })).toBe(canonical);
+			}),
+			{ numRuns: 3000 }
+		);
+	});
+});
+
 describe('isNumericString (properties)', function () {
 	it('accepts String(n) for every finite double', function () {
 		fc.assert(
@@ -332,6 +349,71 @@ describe('isEmail (properties)', function () {
 				fc.pre(email.length <= 254 && email.indexOf('@') <= 64);
 				expect(helpers.isEmail(email)).toBe(true);
 			})
+		);
+	});
+});
+
+describe('isUrl (properties)', function () {
+	/** Host characters: plain ones and the invisible, compatibility, full-stop, escape and delimiter characters that the URL parser rewrites. */
+	const hostChar = fc.constantFrom(
+		...['a', 'b', 'e', 'x', 'K', '0', '1', '7', 'f', '-', '.', '.', '.', ':', '@', '%', '6', '5', '\\', '/', '[', ']'],
+		...['ü', 'Ü', '例', 'é', 'ß', 'ẞ', 'İ', 'ς', 'ſ', 'K', '­', '​', '͏', '️', '⁠', '̈', 'ｅ', 'ⓔ', '。', '｡', '．', '⒈']
+	);
+	const urlArb = fc
+		.record({
+			scheme: fc.constantFrom('http', 'https', 'HTTPS'),
+			user: fc.option(fc.constantFrom('user', 'u:p', 'good.com'), { nil: undefined }),
+			host: fc.array(hostChar, { minLength: 1, maxLength: 12 }).map(function (chars) {
+				return chars.join('');
+			}),
+			port: fc.option(fc.constantFrom('80', '8080'), { nil: undefined }),
+			path: fc.constantFrom('', '/', '/x?y#z', '?q', '#f')
+		})
+		.map(function (v) {
+			return `${v.scheme}://${v.user === undefined ? '' : v.user + '@'}${v.host}${v.port === undefined ? '' : ':' + v.port}${v.path}`;
+		});
+
+	/**
+	 * The host as a reader (or an RFC 3986 parser, regex of its appendix B) sees it: the authority after the last `@`, before the port.
+	 * @param url - The URL text
+	 * @returns The host text
+	 */
+	function writtenHost(url: string): string {
+		const authority = (/^[^:/?#]+:\/\/([^/?#]*)/.exec(url) as RegExpExecArray)[1];
+		const host = authority.slice(authority.lastIndexOf('@') + 1);
+		return host.startsWith('[') ? host.slice(0, host.indexOf(']') + 1) : host.split(':')[0];
+	}
+
+	it('the parsed hostname is the written host, lower-cased, with non-ASCII labels in punycode', function () {
+		fc.assert(
+			fc.property(urlArb, function (url) {
+				fc.pre(helpers.isUrl(url));
+				const host = writtenHost(url);
+				const hostname = new URL(url).hostname;
+				const written = host.split('.');
+				const parsed = hostname.split('.');
+				expect(parsed.length).toBe(written.length);
+				written.forEach(function (label: string, index: number) {
+					// eslint-disable-next-line no-control-regex
+					if (/^[\x00-\x7f]*$/.test(label)) expect(parsed[index]).toBe(label.toLowerCase());
+					else {
+						expect(parsed[index].startsWith('xn--')).toBe(true);
+						expect(parsed[index]).toBe(new URL(`http://${label}`).hostname);
+					}
+				});
+			}),
+			{ numRuns: 3000 }
+		);
+	});
+
+	it('the parsed hostname equals new URL("http://" + host).hostname for accepted URLs', function () {
+		fc.assert(
+			fc.property(urlArb, function (url) {
+				fc.pre(helpers.isUrl(url));
+				const host = writtenHost(url);
+				expect([host.toLowerCase(), new URL(`http://${host}`).hostname]).toContain(new URL(url).hostname);
+			}),
+			{ numRuns: 1000 }
 		);
 	});
 });

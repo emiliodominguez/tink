@@ -821,18 +821,20 @@ describe('Objects helpers', function () {
 			expect(source.b.z).toBe(3);
 		});
 
-		it('ignores __proto__, constructor and prototype keys (no prototype pollution)', function () {
+		it('drops __proto__, constructor and prototype keys at every level without polluting', function () {
 			const malicious = JSON.parse(
 				'{"__proto__":{"polluted":1},"constructor":{"prototype":{"polluted":2}},"prototype":{"polluted":3},"safe":{"__proto__":{"polluted":4}}}'
 			);
-			const result: any = helpers.deepMerge({}, malicious);
+			const result: any = helpers.deepMerge({}, malicious, malicious);
 			expect(({} as any).polluted).toBeUndefined();
-			expect((Object.prototype as any).polluted).toBeUndefined();
-			expect(result.polluted).toBeUndefined();
+			expect((Object as any).prototype.polluted).toBeUndefined();
 			expect(Object.keys(result)).toStrictEqual(['safe']);
-			expect(Object.prototype.hasOwnProperty.call(result, '__proto__')).toBe(false);
+			expect(Object.keys(result.safe)).toStrictEqual([]);
+			expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
 			expect(Object.getPrototypeOf(result.safe)).toBe(Object.prototype);
-			expect(result.safe.polluted).toBeUndefined();
+			expect(result.constructor).toBe(Object);
+			// An own `__proto__` key of the target is dropped too.
+			expect(Object.keys(helpers.deepMerge(JSON.parse('{"__proto__":{"a":1},"b":2}')))).toStrictEqual(['b']);
 		});
 
 		it('merges symbol keys and null-prototype objects, skips nullish sources', function () {
@@ -1224,12 +1226,16 @@ describe('Objects helpers', function () {
 			const target: Record<string, any> = {};
 			helpers.setInObjectByKeys(target, 'a.01', 1);
 			helpers.setInObjectByKeys(target, 'b.4294967295', 2);
-			helpers.setInObjectByKeys(target, 'c.4294967294', 3);
+			helpers.setInObjectByKeys(target, 'c.1000', 3);
 			helpers.setInObjectByKeys(target, 'd.0', 4);
 			expect(Array.isArray(target.a)).toBe(false);
 			expect(target.a).toStrictEqual({ '01': 1 });
 			expect(Array.isArray(target.b)).toBe(false);
 			expect(Array.isArray(target.c)).toBe(true);
+			// Only up to the array limit (security: see the `security` tests); unflattenObject's limit can go up to the largest index.
+			expect(Array.isArray(helpers.unflattenObject({ 'c.4294967294': 3 }, { arrayLimit: Infinity }).c)).toBe(true);
+			expect(Array.isArray(helpers.unflattenObject({ 'c.4294967295': 3 }, { arrayLimit: Infinity }).c)).toBe(false);
+			expect(helpers.unflattenObject({ 'c.0': 1, 'c.4294967295': 3 }, { arrayLimit: Infinity })).toStrictEqual({ c: { 0: 1, 4294967295: 3 } });
 			expect(target.d).toStrictEqual([4]);
 			expect(JSON.parse(JSON.stringify(target.a))).toStrictEqual({ '01': 1 });
 		});
@@ -1461,7 +1467,7 @@ describe('Objects helpers', function () {
 	});
 
 	describe('hasInObjectByKeys / deleteFromObjectByKeys', function () {
-		it('hasInObjectByKeys follows own properties only', function () {
+		it('hasInObjectByKeys follows own and inherited properties, except Object.prototype members (behaviour change: own only)', function () {
 			const target = { a: { b: [undefined], s: 'text', n: null }, fn: Object.assign(function () {}, { x: 1 }) };
 			expect(helpers.hasInObjectByKeys(target, 'a')).toBe(true);
 			expect(helpers.hasInObjectByKeys(target, 'a.b.0')).toBe(true);
@@ -1470,10 +1476,10 @@ describe('Objects helpers', function () {
 			expect(helpers.hasInObjectByKeys({ fn: Object.assign(function () {}, { inner: { z: 1 } }) }, 'fn.inner.z')).toBe(true);
 			expect(helpers.hasInObjectByKeys(target, 'a.b.1')).toBe(false);
 			expect(helpers.hasInObjectByKeys(target, 'a.toString')).toBe(false);
-			expect(helpers.hasInObjectByKeys(target, 'a.s.length')).toBe(false);
+			expect(helpers.hasInObjectByKeys(target, 'a.s.length')).toBe(true);
 			expect(helpers.hasInObjectByKeys(target, 'a.n.x')).toBe(false);
 			expect(helpers.hasInObjectByKeys(target, 'missing.x.y')).toBe(false);
-			expect(helpers.hasInObjectByKeys(Object.create({ a: { b: 1 } }), 'a.b')).toBe(false);
+			expect(helpers.hasInObjectByKeys(Object.create({ a: { b: 1 } }), 'a.b')).toBe(true);
 		});
 
 		it('deleteFromObjectByKeys deletes own properties and reports success', function () {
@@ -1498,6 +1504,15 @@ describe('Objects helpers', function () {
 			const locked = Object.defineProperty({}, 'fixed', { value: 1, configurable: false });
 			expect(helpers.deleteFromObjectByKeys(locked, 'fixed')).toBe(false);
 			expect(helpers.deleteFromObjectByKeys([1, 2], 'length')).toBe(false);
+		});
+
+		it('deleteFromObjectByKeys follows own properties of functions', function () {
+			const target = { fn: Object.assign(function () {}, { inner: { z: 1 }, x: 2 }) };
+			expect(helpers.deleteFromObjectByKeys(target, 'fn.inner.z')).toBe(true);
+			expect(helpers.deleteFromObjectByKeys(target, 'fn.x')).toBe(true);
+			expect(helpers.deleteFromObjectByKeys(target, 'fn.name.x')).toBe(false);
+			expect(target.fn.inner).toStrictEqual({});
+			expect('x' in target.fn).toBe(false);
 		});
 	});
 
@@ -1797,12 +1812,246 @@ describe('Objects helpers', function () {
 			expect(helpers.diff(loop, loop)).toStrictEqual({ added: [], removed: [], changed: [] });
 		});
 
-		it('hasInObjectByKeys does not see properties of primitives', function () {
-			expect(helpers.hasInObjectByKeys({ name: 'abc' }, 'name.length')).toBe(false);
-			expect(helpers.hasInObjectByKeys({ name: 'abc' }, 'name.0')).toBe(false);
+		it('hasInObjectByKeys sees the own properties of primitives, like getFromObjectByKeys (behaviour change)', function () {
+			expect(helpers.hasInObjectByKeys({ name: 'abc' }, 'name.length')).toBe(true);
+			expect(helpers.hasInObjectByKeys({ name: 'abc' }, 'name.0')).toBe(true);
+			expect(helpers.hasInObjectByKeys({ name: 'abc' }, 'name.3')).toBe(false);
+			expect(helpers.hasInObjectByKeys({ n: 1 }, 'n.toFixed')).toBe(true);
 			expect(helpers.deleteFromObjectByKeys({ name: 'abc' }, 'name.0')).toBe(false);
 			expect(helpers.hasInObjectByKeys({ a: null }, 'a.b.c')).toBe(false);
 			expect(helpers.hasInObjectByKeys({ a: undefined }, 'a.b.c')).toBe(false);
+		});
+	});
+
+	describe('security', function () {
+		class Person {
+			first = 'Ada';
+			last = 'Lovelace';
+			/**
+			 * An inherited getter.
+			 * @returns {string} The full name
+			 */
+			get fullName(): string {
+				return `${this.first} ${this.last}`;
+			}
+		}
+
+		it('getFromObjectByKeys never resolves __proto__/constructor/prototype nor Object.prototype members', function () {
+			const permissions = { viewer: { read: true } } as any;
+			expect(helpers.getFromObjectByKeys(permissions, 'viewer.constructor')).toBeUndefined();
+			expect(helpers.getFromObjectByKeys(permissions, 'viewer.constructor', false)).toBe(false);
+			expect(helpers.getFromObjectByKeys({} as any, 'constructor.constructor')).toBeUndefined();
+			expect(helpers.getFromObjectByKeys({} as any, '__proto__')).toBeUndefined();
+			expect(helpers.getFromObjectByKeys({} as any, 'toString', 'x')).toBe('x');
+			expect(helpers.getFromObjectByKeys({ a: {} } as any, 'a.hasOwnProperty', 'x')).toBe('x');
+			expect(helpers.getFromObjectByKeys({ fn: function () {} } as any, 'fn.prototype')).toBeUndefined();
+			expect(helpers.getFromObjectByKeys({ list: [1] } as any, 'list.constructor')).toBeUndefined();
+			// Even own data keys with those names never resolve.
+			expect(helpers.getFromObjectByKeys(JSON.parse('{"__proto__":{"x":1},"constructor":2,"prototype":3}'), '__proto__.x')).toBeUndefined();
+			expect(helpers.getFromObjectByKeys(JSON.parse('{"constructor":2}'), 'constructor', 0)).toBe(0);
+			expect(helpers.getFromObjectByKeys(JSON.parse('{"prototype":3}'), 'prototype', 0)).toBe(0);
+		});
+
+		it('getFromObjectByKeys keeps own shadows of Object.prototype names, other inherited properties and primitive properties', function () {
+			expect(helpers.getFromObjectByKeys({ toString: 'own' } as any, 'toString')).toBe('own');
+			expect(helpers.getFromObjectByKeys({ user: new Person() } as any, 'user.fullName')).toBe('Ada Lovelace');
+			expect(helpers.getFromObjectByKeys({ a: Object.create({ inherited: 1 }) } as any, 'a.inherited')).toBe(1);
+			expect(helpers.getFromObjectByKeys({ name: 'abc' } as any, 'name.length')).toBe(3);
+			expect(helpers.getFromObjectByKeys({ name: 'abc' } as any, 'name.1')).toBe('b');
+			expect(helpers.getFromObjectByKeys({ list: [1, 2] } as any, 'list.length')).toBe(2);
+			// A method a class (or a built-in prototype other than Object.prototype) defines is not an Object.prototype member.
+			class Custom {
+				/**
+				 * Overrides `Object.prototype.toString`.
+				 * @returns {string} A label
+				 */
+				toString(): string {
+					return 'custom';
+				}
+			}
+			expect((helpers.getFromObjectByKeys({ c: new Custom() } as any, 'c.toString') as () => string).call(new Custom())).toBe('custom');
+			expect(helpers.getFromObjectByKeys({ list: [] } as any, 'list.toString')).toBe(Array.prototype.toString);
+			expect(helpers.getFromObjectByKeys({ name: 'abc' } as any, 'name.toString')).toBe(String.prototype.toString);
+			expect(helpers.getFromObjectByKeys({ n: 1 } as any, 'n.hasOwnProperty')).toBeUndefined();
+			expect(helpers.getFromObjectByKeys({ bare: Object.create(null) } as any, 'bare.toString', 'x')).toBe('x');
+		});
+
+		it('getFromObjectByKeys does not see properties added to Object.prototype (pollution gadgets)', function () {
+			(Object.prototype as any).isAdmin = true;
+			try {
+				expect(helpers.getFromObjectByKeys({ user: {} } as any, 'user.isAdmin', false)).toBe(false);
+				expect(helpers.hasInObjectByKeys({ user: {} }, 'user.isAdmin')).toBe(false);
+				expect(helpers.getProperty({} as any, 'isAdmin')).toBeUndefined();
+				expect(helpers.pick({} as any, ['isAdmin'])).toStrictEqual({});
+				expect(helpers.getFromObjectByKeys({ user: { isAdmin: false } } as any, 'user.isAdmin')).toBe(false);
+				// A property an intermediate prototype defines (even with the same value) still resolves.
+				expect(helpers.getFromObjectByKeys({ user: Object.create({ isAdmin: true }) } as any, 'user.isAdmin')).toBe(true);
+			} finally {
+				delete (Object.prototype as any).isAdmin;
+			}
+		});
+
+		it('getProperty applies the same rule', function () {
+			expect(helpers.getProperty({} as any, 'constructor')).toBeUndefined();
+			expect(helpers.getProperty({} as any, '__proto__')).toBeUndefined();
+			expect(helpers.getProperty({} as any, 'toString')).toBeUndefined();
+			expect(helpers.getProperty(function () {} as any, 'prototype')).toBeUndefined();
+			expect(helpers.getProperty(new Person(), 'fullName')).toBe('Ada Lovelace');
+			expect(helpers.getProperty('abc', 'length')).toBe(3);
+			expect(helpers.getProperty({ toString: 1 } as any, 'toString')).toBe(1);
+			const sym = Symbol('s');
+			expect(helpers.getProperty({ [sym]: 1 }, sym)).toBe(1);
+		});
+
+		it('hasInObjectByKeys agrees with getFromObjectByKeys', function () {
+			const target: any = { viewer: { read: true, none: undefined }, user: new Person(), name: 'abc', fn: function () {}, a: Object.create({ inherited: 1 }) };
+			const paths = [
+				'viewer.constructor',
+				'constructor.constructor',
+				'__proto__',
+				'toString',
+				'viewer.read',
+				'viewer.none',
+				'viewer.missing',
+				'user.fullName',
+				'user.first',
+				'name.length',
+				'name.1',
+				'name.9',
+				'name.toString',
+				'name.hasOwnProperty',
+				'fn.prototype',
+				'fn.name',
+				'a.inherited',
+				'viewer.none.x'
+			];
+			const missing = Symbol('missing');
+			for (const path of paths) {
+				// `true` exactly when the path resolves: to a defined value (not the default), or to a property holding `undefined`.
+				const value = helpers.getFromObjectByKeys(target, path as any, missing);
+				expect([path, helpers.hasInObjectByKeys(target, path)]).toStrictEqual([path, value !== missing || path === 'viewer.none']);
+			}
+			expect(
+				paths.map(function (path) {
+					return helpers.hasInObjectByKeys(target, path);
+				})
+			).toStrictEqual([false, false, false, false, true, true, false, true, true, true, true, false, true, false, false, true, true, false]);
+		});
+
+		it('pick skips __proto__, constructor, prototype and Object.prototype members', function () {
+			const picked = helpers.pick(JSON.parse('{"__proto__":{"isAdmin":true},"a":1}'), ['__proto__', 'a'] as any[]);
+			expect(Object.prototype.hasOwnProperty.call(picked, '__proto__')).toBe(false);
+			expect(picked).toStrictEqual({ a: 1 });
+			expect(Object.keys(helpers.pick({} as any, ['constructor', 'toString', '__proto__']))).toStrictEqual([]);
+			expect(helpers.pick({ toString: 'own' } as any, ['toString'])).toStrictEqual({ toString: 'own' });
+			expect(helpers.pick(function named() {} as any, ['prototype', 'name'])).toStrictEqual({ name: 'named' });
+		});
+
+		it('deleteFromObjectByKeys rejects __proto__/constructor/prototype and empty segments', function () {
+			class Service {
+				/**
+				 * A method every instance shares.
+				 * @returns {number} 1
+				 */
+				run(): number {
+					return 1;
+				}
+			}
+			expect(function () {
+				helpers.deleteFromObjectByKeys({ C: Service }, 'C.prototype.run');
+			}).toThrow(new RangeError('deleteFromObjectByKeys: `path` must not contain the unsafe segment "prototype", got "C.prototype.run"'));
+			expect(typeof Service.prototype.run).toBe('function');
+			for (const path of ['__proto__.toString', 'a.constructor', 'constructor']) {
+				expect(function () {
+					helpers.deleteFromObjectByKeys({ a: {} }, path);
+				}).toThrow(RangeError);
+			}
+			expect(function () {
+				helpers.deleteFromObjectByKeys({ a: {} }, 'a..b');
+			}).toThrow(new RangeError('deleteFromObjectByKeys: `path` must not contain empty segments, got "a..b"'));
+			expect(typeof Object.prototype.toString).toBe('function');
+		});
+
+		it('hasInObjectByKeys returns false for unsafe segments', function () {
+			class C {}
+			expect(helpers.hasInObjectByKeys({ C }, 'C.prototype.constructor')).toBe(false);
+			expect(helpers.hasInObjectByKeys({ C }, 'C.prototype')).toBe(false);
+			expect(helpers.hasInObjectByKeys({}, 'constructor')).toBe(false);
+			expect(helpers.hasInObjectByKeys(JSON.parse('{"__proto__":1}'), '__proto__')).toBe(false);
+		});
+
+		it('unflattenObject does not build huge sparse arrays (arrayLimit, default 1000)', function () {
+			const start = Date.now();
+			const result: any = helpers.unflattenObject({ 'tags.4294967294': 'x' });
+			expect(Array.isArray(result.tags)).toBe(false);
+			expect(result.tags).toStrictEqual({ 4294967294: 'x' });
+			expect(helpers.unflattenObject({ 'a.1000': 1 })).toStrictEqual({ a: Object.assign(new Array(1000), { 1000: 1 }) });
+			expect(helpers.unflattenObject({ 'a.1001': 1 })).toStrictEqual({ a: { 1001: 1 } });
+			// An array created by an earlier key becomes a plain object (with the same entries) when a later key goes above the limit.
+			const converted: any = helpers.unflattenObject({ 'tags.0': 'a', 'tags.1.name': 'b', 'tags.5000': 'c', 'tags.2': 'd' });
+			expect(converted).toStrictEqual({ tags: { 0: 'a', 1: { name: 'b' }, 2: 'd', 5000: 'c' } });
+			expect(Object.getPrototypeOf(converted.tags)).toBe(Object.prototype);
+			expect(helpers.unflattenObject({ 'a.0.x': 1, 'a.9999.y': 2, 'a.0.z': 3 })).toStrictEqual({ a: { 0: { x: 1, z: 3 }, 9999: { y: 2 } } });
+			// Conflicts are still detected after the conversion.
+			expect(function () {
+				helpers.unflattenObject({ 'a.0': 1, 'a.2000': 2, 'a.2000.b': 3 });
+			}).toThrow(TypeError);
+			expect(Date.now() - start).toBeLessThan(1000);
+		});
+
+		it('unflattenObject arrayLimit option', function () {
+			expect(helpers.unflattenObject({ 'a.0': 1, 'a.1': 2 }, { arrayLimit: 0 })).toStrictEqual({ a: { 0: 1, 1: 2 } });
+			expect(helpers.unflattenObject({ 'a.0': 1 }, { arrayLimit: 0 })).toStrictEqual({ a: [1] });
+			expect(helpers.unflattenObject({ 'a.20': 1 }, { arrayLimit: 20 })).toStrictEqual({ a: Object.assign(new Array(20), { 20: 1 }) });
+			expect(helpers.unflattenObject({ 'a.21': 1 }, { arrayLimit: 20 })).toStrictEqual({ a: { 21: 1 } });
+			expect(helpers.unflattenObject({ 'a.5000': 1 }, { arrayLimit: Infinity }).a).toHaveLength(5001);
+			for (const bad of [-1, 1.5, NaN, -Infinity]) {
+				expect(function () {
+					helpers.unflattenObject({}, { arrayLimit: bad });
+				}).toThrow(new RangeError(`unflattenObject: \`arrayLimit\` must be an integer >= 0 or Infinity, got ${bad}`));
+			}
+			expect(function () {
+				helpers.unflattenObject({}, { arrayLimit: '5' as any });
+			}).toThrow(new TypeError('unflattenObject: `arrayLimit` must be an integer >= 0 or Infinity, got string'));
+		});
+
+		it('setInObjectByKeys creates a plain object instead of a huge array, but writes into existing arrays', function () {
+			const target: any = helpers.setInObjectByKeys({}, 'a.4294967294', 1);
+			expect(target).toStrictEqual({ a: { 4294967294: 1 } });
+			expect(helpers.setInObjectByKeys({}, 'a.1001.b', 1)).toStrictEqual({ a: { 1001: { b: 1 } } });
+			expect(Array.isArray((helpers.setInObjectByKeys({}, 'a.1000', 1) as any).a)).toBe(true);
+			const existing: any = { list: [] };
+			helpers.setInObjectByKeys(existing, 'list.5000', 1);
+			expect(existing.list).toHaveLength(5001);
+		});
+
+		it('setProperty refuses __proto__ (prototype replacement)', function () {
+			const session: any = {};
+			expect(function () {
+				helpers.setProperty(session, '__proto__', { isAdmin: true });
+			}).toThrow(new RangeError('setProperty: `property` must not be the unsafe key "__proto__"'));
+			expect(session.isAdmin).toBeUndefined();
+			expect(Object.getPrototypeOf(session)).toBe(Object.prototype);
+			const other: any = {};
+			helpers.setProperty(other, 'constructor', 1);
+			expect(Object.getOwnPropertyDescriptor(other, 'constructor')?.value).toBe(1);
+		});
+
+		it('copies keep __proto__, constructor and prototype as own data keys, while deepMerge drops them', function () {
+			const input = JSON.parse('{"__proto__":{"isAdmin":true},"constructor":{"prototype":{"polluted":1}},"prototype":3,"safe":{"__proto__":{"x":4}}}');
+			for (const result of [helpers.merge({}, input), helpers.clone(input), helpers.deepClone(input)] as any[]) {
+				expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+				expect(result.isAdmin).toBeUndefined();
+				expect(Object.keys(result)).toStrictEqual(['__proto__', 'constructor', 'prototype', 'safe']);
+				expect(Object.getOwnPropertyDescriptor(result, '__proto__')?.value).toStrictEqual(JSON.parse('{"isAdmin":true}'));
+				expect(Object.getPrototypeOf(result.safe)).toBe(Object.prototype);
+				expect(result.safe.x).toBeUndefined();
+				expect(helpers.isEqual(result, input)).toBe(true);
+			}
+			expect(Object.keys(helpers.deepMerge({}, input))).toStrictEqual(['safe']);
+			expect(Object.keys(helpers.flattenObject(input))).toStrictEqual(['__proto__.isAdmin', 'constructor.prototype.polluted', 'prototype', 'safe.__proto__.x']);
+			expect(({} as any).isAdmin).toBeUndefined();
+			expect(({} as any).polluted).toBeUndefined();
 		});
 	});
 });

@@ -110,13 +110,24 @@ const DURATION_TOKEN_REGEX = /(\d+(?:\.\d+)?|\.\d+)\s*(ms|d|h|m|s)/g;
  */
 const MAX_CACHE_ENTRIES = 64;
 
+/**
+ * Keys longer than this are never cached, so the caches cannot retain attacker-sized patterns or locales (their size is
+ * bounded by entries, not bytes).
+ */
+const MAX_CACHED_KEY_LENGTH = 1024;
+
 const ISO_DATE_REGEX = /^(\d{4})-(\d{2})-(\d{2})$/;
 
 /**
- * Single tokenizing regex used by {@link formatDate}. Alternatives are ordered longest-first so that e.g. `YYYY`
- * wins over `YY` and `MM` over `M`. A `[...]` group captures literal text.
+ * The tokens of {@link formatDate}, ordered longest-first so that e.g. `YYYY` wins over `YY` and `MM` over `M`.
  */
-const FORMAT_TOKEN_REGEX = /\[([^\]]*)]|YYYY|YY|SSS|MM|M|DD|D|HH|H|hh|h|mm|m|ss|s|A|a/g;
+const TOKEN_REGEX = /YYYY|YY|SSS|MM|M|DD|D|HH|H|hh|h|mm|m|ss|s|A|a/g;
+
+/**
+ * {@link TOKEN_REGEX} plus a `[...]` group capturing literal text. Only run on text that ends with `]` (see
+ * {@link compilePattern}): there, every `[` has a closing `]` and each match consumes all it scans, so tokenizing is linear.
+ */
+const FORMAT_TOKEN_REGEX = new RegExp(`\\[([^\\]]*)]|${TOKEN_REGEX.source}`, 'g');
 
 /**
  * Left-pads the absolute value of an integer with zeros, keeping a leading minus sign for negatives.
@@ -1069,7 +1080,12 @@ export function maxDate(dates: Iterable<DateInput>): Date | undefined {
  * | `SSS` | millisecond `000-999` | `A` / `a` | `AM`/`PM` / `am`/`pm` |
  *
  * Text inside `[square brackets]` is output literally (without the brackets). Any other character is copied as is;
- * note that a bare `a`, `s`, `m`, `h`, `D`… IS a token, so wrap words in brackets: `'[at] HH:mm'`.
+ * note that a bare `a`, `s`, `m`, `h`, `D`… IS a token, so wrap words in brackets: `'[at] HH:mm'`. A `[` without a closing `]`
+ * is copied as is.
+ *
+ * Tokenizing takes time linear in the pattern length, so untrusted patterns cannot stall the event loop (the output is still
+ * proportional to the pattern: cap its length if it comes from users). Compiled patterns of at most 1024 characters are cached
+ * (64 at most); longer ones are re-tokenized on every call.
  * @param {DateInput} date - The date to format
  * @param {string} pattern - The format pattern
  * @returns {string} The formatted date
@@ -1090,23 +1106,25 @@ export function formatDate(date: DateInput, pattern: string): string {
 
 /**
  * Returns `cache.get(key)`, computing and storing `create(key)` first when missing. The cache is cleared when it reaches
- * {@link MAX_CACHE_ENTRIES} entries, so its size stays bounded whatever the keys.
- * @template K - Type of the keys
+ * {@link MAX_CACHE_ENTRIES} entries, and keys longer than {@link MAX_CACHED_KEY_LENGTH} are not stored, so its size stays
+ * bounded whatever the keys.
  * @template V - Type of the cached values
- * @param {Map<K, V>} cache - The cache
- * @param {K} key - The key
- * @param {(key: K) => V} create - Computes the value of a missing key
+ * @param {Map<string, V>} cache - The cache
+ * @param {string} key - The key
+ * @param {(key: string) => V} create - Computes the value of a missing key
  * @returns {V} The cached value
  * @example
  * cached(new Map(), 'YYYY', compilePattern).length; // => 3
  */
-function cached<K, V>(cache: Map<K, V>, key: K, create: (key: K) => V): V {
+function cached<V>(cache: Map<string, V>, key: string, create: (key: string) => V): V {
 	let value = cache.get(key);
 
 	if (value === undefined) {
 		value = create(key);
-		if (cache.size >= MAX_CACHE_ENTRIES) cache.clear();
-		cache.set(key, value);
+		if (key.length <= MAX_CACHED_KEY_LENGTH) {
+			if (cache.size >= MAX_CACHE_ENTRIES) cache.clear();
+			cache.set(key, value);
+		}
 	}
 
 	return value;
@@ -1127,15 +1145,34 @@ const compiledPatterns = new Map<string, ReadonlyArray<string | ((date: Date) =>
  */
 function compilePattern(pattern: string): ReadonlyArray<string | ((date: Date) => string)> {
 	const parts: Array<string | ((date: Date) => string)> = [];
-	let end = 0;
-
-	for (const match of pattern.matchAll(FORMAT_TOKEN_REGEX)) {
-		parts.push(pattern.slice(end, match.index), match[1] ?? FORMATTERS[match[0]]);
-		end = match.index + match[0].length;
-	}
+	// Every `[` after the last `]` is unclosed, so that tail cannot hold a `[...]` group: it is tokenized without that alternative,
+	// which would otherwise rescan to the end of the pattern from each `[` (quadratic time on `'['.repeat(n)`).
+	const head = pattern.lastIndexOf(']') + 1;
+	const end = tokenize(parts, pattern, head, pattern.length, TOKEN_REGEX, tokenize(parts, pattern, 0, head, FORMAT_TOKEN_REGEX, 0));
 	parts.push(pattern.slice(end));
 
 	return parts;
+}
+
+/**
+ * Appends to `parts` the tokens of `pattern.slice(start, stop)` found by `regex`, each preceded by the literal text since `end`.
+ * @param {Array<string | ((date: Date) => string)>} parts - The compiled pattern so far
+ * @param {string} pattern - The whole pattern
+ * @param {number} start - Start of the tokenized slice
+ * @param {number} stop - End of the tokenized slice
+ * @param {RegExp} regex - {@link FORMAT_TOKEN_REGEX} or {@link TOKEN_REGEX}
+ * @param {number} end - End of the text already in `parts`
+ * @returns {number} End of the text in `parts` after the last token
+ * @example
+ * tokenize([], 'D [D]', 0, 5, FORMAT_TOKEN_REGEX, 0); // => 5
+ */
+function tokenize(parts: Array<string | ((date: Date) => string)>, pattern: string, start: number, stop: number, regex: RegExp, end: number): number {
+	for (const match of pattern.slice(start, stop).matchAll(regex)) {
+		parts.push(pattern.slice(end, start + match.index), match[1] ?? FORMATTERS[match[0]]);
+		end = start + match.index + match[0].length;
+	}
+
+	return end;
 }
 
 /**
@@ -1203,7 +1240,8 @@ function relativeTimeFormat(locale: string): Intl.RelativeTimeFormat {
  * weeks while less than one complete month has elapsed (see {@link diffInMonths}), months below 12 months, else years.
  * @param {DateInput} date - The date to describe
  * @param {DateInput} [baseDate=new Date()] - The reference date ("now")
- * @param {string} [locale='en'] - A BCP 47 locale passed to `Intl.RelativeTimeFormat`
+ * @param {string} [locale='en'] - A BCP 47 locale passed to `Intl.RelativeTimeFormat` (formatters are cached per locale, for the 64 most recent
+ * locales of at most 1024 characters)
  * @returns {string} The relative time phrase
  * @throws {TypeError} when a date argument is neither a `Date` nor a number
  * @throws {RangeError} when either date is invalid or the locale is malformed
@@ -1239,6 +1277,8 @@ export function getRelativeTime(date: DateInput, baseDate: DateInput = new Date(
 /**
  * Returns every LOCAL calendar day from `start` to `end` (both inclusive), each at the start of the day (normally
  * 00:00:00.000). Only the calendar days of `start` and `end` matter for which days are included.
+ * The result holds one date per `step` days of the interval, so bound intervals that come from untrusted input (the range of valid
+ * dates spans about 200 million days).
  * @param {DateInput} start - The first day of the interval
  * @param {DateInput} end - The last day of the interval (must not be before `start`)
  * @param {EachDayOfIntervalOptions} [options={}] - `step`: the number of days between consecutive results (default `1`)

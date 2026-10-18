@@ -1444,4 +1444,110 @@ describe('Math helpers', function () {
 			for (const [fn, error] of cases) expect(fn).toThrow(error);
 		});
 	});
+
+	describe('security', function () {
+		it('isPrime answers for the largest primes below 2 ** 53 in well under a millisecond (no trial division up to sqrt(n))', function () {
+			const largePrimes = [9_007_199_254_740_881, 9_007_199_254_740_847, 4_503_599_627_370_449, 1_099_511_627_689, 4_294_967_291];
+			const start = performance.now();
+			for (let i = 0; i < 20; i++) for (const prime of largePrimes) expect(helpers.isPrime(prime)).toBe(true);
+			// Trial division needs about 300 ms for EACH of the first two numbers.
+			expect(performance.now() - start).toBeLessThan(250);
+		});
+
+		it('isPrime rejects the strong pseudoprimes to the first prime bases and Carmichael numbers', function () {
+			const composites = [
+				2047, // strong pseudoprime to base 2
+				1_373_653, // bases 2, 3
+				25_326_001, // bases 2, 3, 5
+				3_215_031_751, // bases 2, 3, 5, 7
+				2_152_302_898_747, // bases 2 .. 11
+				3_474_749_660_383, // bases 2 .. 13
+				341_550_071_728_321, // bases 2 .. 17 (and 19)
+				561,
+				41_041,
+				825_265,
+				321_197_185,
+				5_394_826_801,
+				232_250_619_601,
+				9_746_347_772_161, // Carmichael numbers
+				94_906_249 * 94_906_247, // the product of the two largest primes below sqrt(2 ** 53)
+				67_108_859 * 134_217_689, // the product of two primes close to 2 ** 26 and 2 ** 27
+				9_007_199_254_740_991 // 2 ** 53 - 1 = 6361 * 69431 * 20394401
+			];
+			for (const composite of composites) expect(helpers.isPrime(composite)).toBe(false);
+		});
+
+		it('aggregates convert numeric strings with unary plus instead of concatenating them', function () {
+			const strings = new URLSearchParams('n=1&n=2&n=3').getAll('n') as never as number[];
+			expect(helpers.sum(strings)).toBe(6);
+			expect(helpers.average(strings)).toBe(2);
+			expect(helpers.median(strings)).toBe(2);
+			expect(helpers.product(strings)).toBe(6);
+			expect(helpers.cumulativeSum(strings)).toEqual([1, 3, 6]);
+			expect(helpers.variance(strings)).toBeCloseTo(2 / 3, 15);
+			expect(helpers.standardDeviation(['2', '4', '4', '4', '5', '5', '7', '9'] as never as number[])).toBe(2);
+			expect(helpers.max(['10', '9'] as never as number[])).toBe(10);
+			expect(helpers.min(['10', '9'] as never as number[])).toBe(9);
+			expect(helpers.mode(['1', 1, '2'] as never as number[])).toEqual([1]);
+			expect(helpers.quantile(strings, 0.5)).toBe(2);
+			expect(helpers.percentile(strings, 100)).toBe(3);
+			expect(helpers.weightedAverage(['10', '20'] as never as number[], ['1', '3'] as never as number[])).toBe(17.5);
+			expect(helpers.normalize(['10', '20', '15'] as never as number[])).toEqual([0, 1, 0.5]);
+			// Values that do not convert give NaN, as in plain arithmetic.
+			expect(helpers.sum(['1', 'x'] as never as number[])).toBe(NaN);
+			expect(helpers.max(['x', 1] as never as number[])).toBe(NaN);
+			expect(helpers.min([1, 'x'] as never as number[])).toBe(NaN);
+			expect(function () {
+				helpers.normalize(['1', 'x'] as never as number[]);
+			}).toThrow(new TypeError('normalize: `numbers[1]` must be a finite number, got string'));
+			expect(function () {
+				helpers.sum([1n] as never as number[]);
+			}).toThrow(TypeError);
+		});
+
+		it('aggregates convert each element exactly once', function () {
+			let calls = 0;
+			const two = {
+				valueOf: function (): number {
+					calls++;
+					return 2;
+				}
+			} as never as number;
+			for (const aggregate of [
+				helpers.sum,
+				helpers.average,
+				helpers.product,
+				helpers.max,
+				helpers.min,
+				helpers.variance,
+				helpers.cumulativeSum,
+				helpers.median,
+				helpers.mode
+			]) {
+				calls = 0;
+				aggregate([two, two, two]);
+				expect(calls).toBe(3);
+			}
+		});
+
+		it('randomIntBetween reaches every residue of ranges wider than 2 ** 32 with a 32-bit generator', function () {
+			let state = 1;
+			function lcg32(): number {
+				state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+				return state / 2 ** 32;
+			}
+			const lowBits = new Set<number>();
+			for (let i = 0; i < 6000; i++) lowBits.add(helpers.randomIntBetween(0, 2 ** 40, lcg32) % 256);
+			expect(lowBits.size).toBe(256);
+			// Two draws make up the 53 bits: the high 21 bits from the first one, the low 32 bits from the second one.
+			const draws = [0.5, 0.25];
+			expect(
+				helpers.randomIntBetween(0, 2 ** 53 - 1, function () {
+					return draws.shift() as number;
+				})
+			).toBe(2 ** 52 + 2 ** 30);
+			expect(helpers.randomIntBetween(0, 2 ** 53 - 1, constant(ALMOST_ONE))).toBe(2 ** 53 - 1);
+			expect(helpers.randomIntBetween(-(2 ** 33), 2 ** 33, constant(0))).toBe(-(2 ** 33));
+		});
+	});
 });

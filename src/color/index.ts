@@ -96,13 +96,19 @@ export interface MeetsContrastOptions {
  */
 const COMPONENT = String.raw`([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(%|deg|grad|rad|turn)?`;
 
+/** CSS white space (CSS Syntax 3): space, tab and line feed, carriage return or form feed — not JavaScript's `\s` (no-break space, U+2028...). */
+const SPACE = String.raw`[ \t\n\r\f]`;
+
 /** Legacy syntax `name(a, b, c[, d])`: the function name, then a number and a unit per argument. */
-const LEGACY_FUNCTION_PATTERN = new RegExp(String.raw`^(rgba?|hsla?)\(\s*${COMPONENT}\s*,\s*${COMPONENT}\s*,\s*${COMPONENT}(?:\s*,\s*${COMPONENT})?\s*\)$`, 'i');
+const LEGACY_FUNCTION_PATTERN = new RegExp(
+	String.raw`^(rgba?|hsla?)\(${SPACE}*${COMPONENT}${SPACE}*,${SPACE}*${COMPONENT}${SPACE}*,${SPACE}*${COMPONENT}(?:${SPACE}*,${SPACE}*${COMPONENT})?${SPACE}*\)$`,
+	'i'
+);
 
 /** Modern syntax `name(a b c[ / d])`, where any argument may be `none`: the function name, then a number, a unit and `none` per argument. */
 const MODERN_COMPONENT = `(?:${COMPONENT}|(none))`;
 const MODERN_FUNCTION_PATTERN = new RegExp(
-	String.raw`^(rgba?|hsla?)\(\s*${MODERN_COMPONENT}\s+${MODERN_COMPONENT}\s+${MODERN_COMPONENT}(?:\s*\/\s*${MODERN_COMPONENT})?\s*\)$`,
+	String.raw`^(rgba?|hsla?)\(${SPACE}*${MODERN_COMPONENT}${SPACE}+${MODERN_COMPONENT}${SPACE}+${MODERN_COMPONENT}(?:${SPACE}*\/${SPACE}*${MODERN_COMPONENT})?${SPACE}*\)$`,
 	'i'
 );
 
@@ -174,7 +180,7 @@ function linearChannel(value: number): number {
 export function parseHex(hex: string): Rgba {
 	if (typeof hex !== 'string') throw new TypeError(`parseHex: \`hex\` must be a string, got ${describe(hex)}`);
 	const color = parseHexDigits(hex);
-	if (color === undefined) throw new TypeError(`parseHex: \`hex\` must be a valid hex colour, got ${JSON.stringify(hex)}`);
+	if (color === undefined) throw new TypeError(`parseHex: \`hex\` must be a valid hex colour, got ${quote(hex)}`);
 	return color;
 }
 
@@ -275,6 +281,30 @@ function parseCssFunction(text: string): Rgba | undefined {
 }
 
 /**
+ * Quotes a rejected string for an error message, keeping at most its first 50 characters (so that an attacker-sized input does not
+ * end up whole in logs).
+ * @param {string} text - The string
+ * @returns {string} Its JSON representation, truncated with `…`
+ * @example
+ * quote('#ggg'); // => '"#ggg"'
+ */
+function quote(text: string): string {
+	return JSON.stringify(text.length > 50 ? `${text.slice(0, 50)}…` : text);
+}
+
+/**
+ * Tells whether a UTF-16 code unit is CSS white space (see {@link SPACE}).
+ * @param {number} code - The code unit
+ * @returns {boolean} `true` for space, tab, line feed, form feed and carriage return
+ * @example
+ * isSpace(0x20); // => true
+ * isSpace(0xa0); // => false
+ */
+function isSpace(code: number): boolean {
+	return code === 32 || (code >= 9 && code <= 13 && code !== 11);
+}
+
+/**
  * Parses a CSS colour string for `caller`.
  * @param {string} caller - Name of the public function, used in the error message
  * @param {string} name - Name of the validated parameter
@@ -285,10 +315,15 @@ function parseCssFunction(text: string): Rgba | undefined {
  * parseCssColor('toRgba', 'input', 'transparent'); // => { r: 0, g: 0, b: 0, a: 0 }
  */
 function parseCssColor(caller: string, name: string, input: string): Rgba {
-	const text = input.trim();
+	// Strip CSS white space only (`String.prototype.trim` also strips no-break spaces, line separators, BOMs...).
+	let start = 0;
+	let end = input.length;
+	while (start < end && isSpace(input.charCodeAt(start))) start++;
+	while (end > start && isSpace(input.charCodeAt(end - 1))) end--;
+	const text = input.slice(start, end);
 	const color = parseHexDigits(text) ?? (text.length === 11 && text.toLowerCase() === 'transparent' ? { r: 0, g: 0, b: 0, a: 0 } : parseCssFunction(text));
 	if (color === undefined) {
-		throw new TypeError(`${caller}: \`${name}\` must be a CSS colour (hex, rgb(), hsl() or 'transparent'), got ${JSON.stringify(input)}`);
+		throw new TypeError(`${caller}: \`${name}\` must be a CSS colour (hex, rgb(), hsl() or 'transparent'), got ${quote(input)}`);
 	}
 	return color;
 }
@@ -302,7 +337,13 @@ function parseCssColor(caller: string, name: string, input: string): Rgba {
  *   percentages or plain numbers, `none` means `0`); the hue is a number (degrees) or an angle in `deg`, `grad`, `rad` or `turn`;
  * - `transparent` (transparent black).
  *
- * Function names, units and keywords are case-insensitive, and whitespace around the string and the arguments is ignored.
+ * Function names, units and keywords are case-insensitive, and white space around the string and the arguments is ignored. Only CSS
+ * white space counts (space, tab, line feed, carriage return, form feed): like browsers, other Unicode spaces (U+00A0 no-break space,
+ * U+2028 line separator, U+3000...) make the string invalid.
+ *
+ * Unlike CSS, hex colours may omit the `#` (as with {@link parseHex}), so bare words made of hex digits are colours: `'add'`, `'bad'`,
+ * `'beef'` and `'facade'` parse, while CSS (and `isHexColor` from the validate module) require the `#`. Check with `isHexColor`, or
+ * require the `#` yourself, when the string must be valid CSS (e.g. before writing it into a stylesheet).
  * The alpha is a number or a percentage. Out-of-range values are clamped as in CSS: channels to `[0, 255]`, saturation and
  * lightness to `[0%, 100%]`, alpha to `[0, 1]`; the hue wraps around. Channels are then rounded to integers (alpha is not rounded).
  * Numbers too large for a double (e.g. `1e999`) are rejected.
@@ -320,6 +361,8 @@ function parseCssColor(caller: string, name: string, input: string): Rgba {
  * parseColor('transparent'); // => { r: 0, g: 0, b: 0, a: 0 }
  * parseColor('rgb(300 -20 0)'); // => { r: 255, g: 0, b: 0, a: 1 }
  * parseColor('red'); // throws TypeError
+ * parseColor('rgb(1\u00a02 3)'); // throws TypeError
+ * parseColor('facade'); // => { r: 250, g: 202, b: 222, a: 1 }
  */
 export function parseColor(input: string): Rgba {
 	if (typeof input !== 'string') throw new TypeError(`parseColor: \`input\` must be a string, got ${describe(input)}`);

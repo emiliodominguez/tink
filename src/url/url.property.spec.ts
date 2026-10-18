@@ -150,9 +150,8 @@ describe('URL helpers (properties)', function () {
 				fc.property(fc.constantFrom('', '/', '//', 'https://', 'http://host', '//host'), fc.array(part, { maxLength: 5 }), function (start, parts) {
 					const joined = helpers.joinUrl(start, ...parts);
 					const all = [start, ...parts];
-					const first = all.find(Boolean) ?? '';
-					// The only legitimate '//' is the scheme's or a protocol-relative '//host' at the very start.
-					const prefix = first.includes('://') ? first.slice(0, first.indexOf('://') + 3) : /^\/\/[^/]/.test(first) ? '//' : '';
+					// The only legitimate '//' is the scheme's or a protocol-relative '//host' at the very start of the FIRST argument.
+					const prefix = start.includes('://') ? start.slice(0, start.indexOf('://') + 3) : /^\/\/[^/]/.test(start) ? '//' : '';
 					expect(joined.startsWith(prefix)).toBe(true);
 					expect(joined.slice(prefix.length)).not.toContain('//');
 					const segments = all
@@ -201,6 +200,104 @@ describe('URL helpers (properties)', function () {
 					const joined = helpers.joinUrl(...parts);
 					expect(helpers.joinUrl(joined)).toBe(joined);
 				})
+			);
+		});
+	});
+
+	describe('security (cross-checked against the WHATWG URL parser)', function () {
+		const token = fc.constantFrom(
+			'/',
+			'/',
+			'\\',
+			'\\',
+			' ',
+			'\t',
+			'\n',
+			'\r',
+			'\u0000',
+			'\u001f',
+			':',
+			'a',
+			'.',
+			'@',
+			'%2F',
+			'javascript',
+			'data',
+			'https',
+			'http',
+			'ftp',
+			'file',
+			'wss',
+			'x',
+			'evil.com'
+		);
+		const url = fc.array(token, { maxLength: 8 }).map(function (tokens) {
+			return tokens.join('');
+		});
+		const special = new Set(['http:', 'https:', 'ws:', 'wss:', 'ftp:', 'file:']);
+		const bases = ['https://example.com/app/', 'http://example.com/app/'];
+
+		/**
+		 * Resolves `input` like a browser, or returns `undefined` when browsers reject it.
+		 * @param {string} input - The URL
+		 * @param {string} base - The base URL
+		 * @returns {URL | undefined} The resolved URL
+		 */
+		function resolve(input: string, base: string): URL | undefined {
+			try {
+				return new URL(input, base);
+			} catch {
+				return undefined;
+			}
+		}
+
+		it('isAbsoluteUrl is true whenever a browser would leave the origin for an http(s)/ws/ftp/file URL', function () {
+			fc.assert(
+				fc.property(url, function (input) {
+					for (const base of bases) {
+						const resolved = resolve(input, base);
+						if (resolved !== undefined && special.has(resolved.protocol) && resolved.origin !== new URL(base).origin) {
+							expect(helpers.isAbsoluteUrl(input)).toBe(true);
+						}
+					}
+				}),
+				{ numRuns: 2000 }
+			);
+		});
+
+		it('isAbsoluteUrl is false for javascript:/data: URLs and for every input a browser keeps on the same origin path-wise', function () {
+			fc.assert(
+				fc.property(url, function (input) {
+					const resolved = resolve(input, bases[0]);
+					if (resolved !== undefined && (resolved.protocol === 'javascript:' || resolved.protocol === 'data:')) expect(helpers.isAbsoluteUrl(input)).toBe(false);
+					// Without any ':' the only way out is a protocol-relative form, which browsers resolve to another host.
+					if (!input.includes(':') && resolved !== undefined && resolved.host === 'example.com') expect(helpers.isAbsoluteUrl(input)).toBe(false);
+				}),
+				{ numRuns: 2000 }
+			);
+		});
+
+		it('joinUrl results stay on the origin unless the first argument is itself absolute', function () {
+			fc.assert(
+				fc.property(fc.constantFrom('', '/', '/app', 'app', '/app/'), fc.array(url, { maxLength: 4 }), function (first, rest) {
+					const joined = helpers.joinUrl(first, ...rest);
+					expect(helpers.isAbsoluteUrl(joined)).toBe(false);
+					for (const base of bases) {
+						const resolved = resolve(joined, base);
+						if (resolved !== undefined) expect(resolved.origin).toBe(new URL(base).origin);
+					}
+				}),
+				{ numRuns: 2000 }
+			);
+		});
+
+		it('joinUrl keeps the host of an absolute first argument', function () {
+			fc.assert(
+				fc.property(fc.constantFrom('https://example.com', '//example.com', 'https://example.com/v1/'), fc.array(url, { maxLength: 4 }), function (first, rest) {
+					const resolved = resolve(helpers.joinUrl(first, ...rest), bases[0]);
+					if (resolved !== undefined) expect(resolved.host).toBe('example.com');
+				}),
+				{ numRuns: 1000 }
 			);
 		});
 	});

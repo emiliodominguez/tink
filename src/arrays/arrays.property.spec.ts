@@ -669,6 +669,24 @@ describe('arrays (property-based)', function () {
 		});
 	});
 	describe('diffSequences / longestCommonSubsequence', function () {
+		it('`maxEdits` accepts exactly the scripts with at most that many edits, and does not change the script', function () {
+			fc.assert(
+				fc.property(diffInput, diffInput, fc.nat({ max: 40 }), function (a, b, maxEdits) {
+					const script = helpers.diffSequences(a, b);
+					const edits = script.filter(function (operation) {
+						return operation.type !== 'equal';
+					}).length;
+					if (edits <= maxEdits) {
+						expect(helpers.diffSequences(a, b, undefined, { maxEdits })).toStrictEqual(script);
+					} else {
+						expect(function () {
+							helpers.diffSequences(a, b, undefined, { maxEdits });
+						}).toThrow(RangeError);
+					}
+				})
+			);
+		});
+
 		it('the script should rebuild a (equal + delete) and b (equal + insert), with consistent indices', function () {
 			fc.assert(
 				fc.property(diffInput, diffInput, function (a, b) {

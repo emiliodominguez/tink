@@ -163,6 +163,47 @@ describe('Async helpers (properties)', function () {
 				})
 			);
 		});
+
+		it('with `maxPending`, accepts exactly `concurrency + maxPending` simultaneous calls and rejects the others untouched', async function () {
+			await fc.assert(
+				fc.asyncProperty(
+					fc.integer({ min: 1, max: 4 }),
+					fc.integer({ min: 0, max: 4 }),
+					fc.integer({ min: 0, max: 15 }),
+					async function (concurrency, maxPending, calls) {
+						const limit = createLimiter(concurrency, { maxPending });
+						const blocker = createDeferred<void>();
+						const ran: number[] = [];
+						const outcomes = await Promise.allSettled(
+							Array.from({ length: calls }, function (_, i) {
+								const promise = limit(async function () {
+									ran.push(i);
+									await blocker.promise;
+									return i;
+								});
+								if (i === calls - 1) blocker.resolve();
+								return promise;
+							})
+						);
+						const accepted = Math.min(calls, concurrency + maxPending);
+						expect(
+							outcomes.map(function (outcome) {
+								return outcome.status === 'fulfilled' ? outcome.value : (outcome.reason as Error).name;
+							})
+						).toEqual(
+							Array.from({ length: calls }, function (_, i) {
+								return i < accepted ? i : 'RangeError';
+							})
+						);
+						expect(ran).toEqual(
+							Array.from({ length: accepted }, function (_, i) {
+								return i;
+							})
+						);
+					}
+				)
+			);
+		});
 	});
 
 	describe('promiseAllObject', function () {

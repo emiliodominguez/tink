@@ -3,6 +3,9 @@
 import { getFromObjectByKeys, setInObjectByKeys, deepMerge, merge, pick, omit } from '@emiliodominguez/js-helpers/objects';
 import { curry, pipe, compose } from '@emiliodominguez/js-helpers/functions';
 import type { NestedKeyOf, PathValue } from '@emiliodominguez/js-helpers/utils';
+import { isShape, isString, isInteger, isOptional, isArrayOf, isUnion, isNullable, isTuple, toStandardSchema } from '@emiliodominguez/js-helpers/guards';
+import type { Infer } from '@emiliodominguez/js-helpers/guards';
+import type { StandardSchemaV1 } from '@standard-schema/spec';
 // The root entry pulls in every module's declarations.
 import * as everything from '@emiliodominguez/js-helpers';
 
@@ -65,4 +68,21 @@ const g = compose(String, function (x: number) {
 	return x * 2;
 });
 setInObjectByKeys(org, 'owner.name', 'Ada');
-export { a, b, c, keys, v, m, dm, p, o, r, f, g, everything };
+
+// Guards double as Standard Schema validators: assignable to the official spec type, with the inferred output.
+const isAccount = isShape({
+	id: isUnion(isString, isInteger),
+	email: isOptional(isString),
+	tags: isArrayOf(isString),
+	manager: isNullable(isShape({ id: isInteger })),
+	position: isTuple(isInteger, isInteger)
+});
+type Account = Infer<typeof isAccount>;
+const account: Account = { id: 1, tags: [], manager: null, position: [0, 0] };
+account.tags.push('mutable');
+const spec: StandardSchemaV1<unknown, Account> = toStandardSchema(isAccount);
+type SpecOutput = StandardSchemaV1.InferOutput<typeof spec>;
+const output: SpecOutput = { id: 'a', email: 'x', tags: ['t'], manager: { id: 2 }, position: [1, 2] };
+// @ts-expect-error `id` must be a string or a number
+const wrong: Account = { id: true, tags: [], manager: null, position: [0, 0] };
+export { a, b, c, keys, v, m, dm, p, o, r, f, g, everything, spec, output, wrong };

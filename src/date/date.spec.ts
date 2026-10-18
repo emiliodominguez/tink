@@ -1597,4 +1597,42 @@ describe('Date helpers', function () {
 			}).toThrow(new TypeError(`parseDuration: \`value\` must be a valid duration, got "${fifty}…"`));
 		});
 	});
+
+	describe('security', function () {
+		it('tokenizes patterns full of unclosed brackets in linear time', function () {
+			const pattern = '['.repeat(200_000);
+			const start = performance.now();
+			expect(helpers.formatDate(0, pattern)).toBe(pattern);
+			expect(helpers.formatDate(new Date(2024, 0, 5), `YYYY [x] ${pattern}D`)).toBe(`2024 x ${pattern}5`);
+			expect(helpers.formatDate(new Date(2024, 0, 5), `]${pattern}`)).toBe(`]${pattern}`);
+			// The quadratic tokenizer took several seconds on 80k characters.
+			expect(performance.now() - start).toBeLessThan(1000);
+		});
+
+		it('keeps the meaning of brackets: the first `]` closes a group, unclosed `[` are literal', function () {
+			const date = new Date(2024, 0, 5, 14, 7);
+			expect(helpers.formatDate(date, '[[D]] D')).toBe('[D] 5');
+			expect(helpers.formatDate(date, '[D [D] D')).toBe('D [D 5');
+			expect(helpers.formatDate(date, 'D] [D')).toBe('5] [5');
+			expect(helpers.formatDate(date, ']]')).toBe(']]');
+		});
+
+		it('does not cache patterns or locales longer than 1024 characters', function () {
+			const set = jest.spyOn(Map.prototype, 'set');
+			try {
+				const date = new Date(2024, 0, 5);
+				const long = `${'['.repeat(1024)}D`;
+				const longLocale = `en-x-${'abcdefgh-'.repeat(113)}abc`;
+				expect(helpers.formatDate(date, long)).toBe(`${'['.repeat(1024)}5`);
+				expect(helpers.formatDate(date, long.slice(1))).toBe(`${'['.repeat(1023)}5`);
+				expect(helpers.getRelativeTime(date, date, longLocale)).toBe('now');
+				const keys = set.mock.calls.map(function (call: any[]) {
+					return call[0];
+				});
+				expect(keys).toEqual([long.slice(1)]);
+			} finally {
+				set.mockRestore();
+			}
+		});
+	});
 });

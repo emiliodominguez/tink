@@ -885,7 +885,7 @@ describe('guards', function () {
 			expect(area({ kind: 'square', size: 2 })).toBe(2);
 			expect(function () {
 				area({ kind: 'triangle' } as any);
-			}).toThrow(new guards.AssertionError('Unexpected value: {"kind":"triangle"}'));
+			}).toThrow(new guards.AssertionError('Unexpected value: [object Object]'));
 			expect(function () {
 				guards.assertNever('x' as never, 'custom');
 			}).toThrow(new guards.AssertionError('custom'));
@@ -903,7 +903,7 @@ describe('guards', function () {
 				[Symbol('s'), 'Unexpected value: Symbol(s)'],
 				[undefined, 'Unexpected value: undefined'],
 				[null, 'Unexpected value: null'],
-				[Object.create(null), 'Unexpected value: {}'],
+				[Object.create(null), 'Unexpected value: [object Object]'],
 				[circular, 'Unexpected value: [object Object]'],
 				[
 					{
@@ -913,7 +913,9 @@ describe('guards', function () {
 					},
 					'Unexpected value: [object Object]'
 				],
-				[[1, 'a'], 'Unexpected value: [1,"a"]']
+				[[1, 'a'], 'Unexpected value: [object Array]'],
+				[new Date(0), 'Unexpected value: [object Date]'],
+				['line\nbreak', 'Unexpected value: "line\\nbreak"']
 			];
 
 			cases.forEach(function ([value, message]) {
@@ -924,6 +926,52 @@ describe('guards', function () {
 			expect(function () {
 				guards.assertNever(noop as never);
 			}).toThrow(new guards.AssertionError(`Unexpected value: ${String(noop)}`));
+		});
+
+		describe('security: assertNever keeps payloads out of its message', function () {
+			function messageOf(value: unknown): string {
+				try {
+					guards.assertNever(value as never);
+				} catch (error) {
+					return (error as Error).message;
+				}
+				throw new Error('assertNever did not throw');
+			}
+
+			it('does not copy object contents (secrets of a request body) into the message', function () {
+				const body = JSON.parse('{"kind":"triangle","password":"hunter2","card":"4111111111111111"}');
+				const message = messageOf(body);
+				expect(message).toBe('Unexpected value: [object Object]');
+				expect(message).not.toContain('hunter2');
+			});
+
+			it('caps the description at 100 characters, whatever the size of the value', function () {
+				expect(messageOf({ kind: 'x', pad: 'A'.repeat(20_000_000) })).toBe('Unexpected value: [object Object]');
+				const longString = messageOf('A'.repeat(20_000_000));
+				expect(longString).toBe(`Unexpected value: "${'A'.repeat(98)}…`);
+				expect(longString.length).toBe('Unexpected value: '.length + 100);
+				expect(messageOf(10n ** 200n)).toBe(`Unexpected value: 1${'0'.repeat(98)}…`);
+				expect(messageOf(Symbol('s'.repeat(500))).length).toBe('Unexpected value: '.length + 100);
+				// A cut never leaves half of a surrogate pair behind.
+				expect(messageOf(Symbol(`${'s'.repeat(91)}😀😀`))).toBe(`Unexpected value: Symbol(${'s'.repeat(91)}…`);
+			});
+
+			it('never runs toJSON, and survives values whose inspection throws', function () {
+				const toJSON = jest.fn(function () {
+					return 'attacker-controlled message text';
+				});
+				expect(messageOf({ toJSON })).toBe('Unexpected value: [object Object]');
+				expect(toJSON).not.toHaveBeenCalled();
+				const { proxy, revoke } = Proxy.revocable({}, {});
+				revoke();
+				expect(messageOf(proxy)).toBe('Unexpected value: object');
+				const hostile = Object.defineProperty({}, Symbol.toStringTag, {
+					get: function () {
+						throw new Error('boom');
+					}
+				});
+				expect(messageOf(hostile)).toBe('Unexpected value: object');
+			});
 		});
 	});
 });

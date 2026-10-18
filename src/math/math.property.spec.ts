@@ -15,6 +15,17 @@ function naiveIsPrime(n: number): boolean {
 	return true;
 }
 
+/** The previous `isPrime`: 6k ± 1 trial division up to √n (slow near 2 ** 53, exact everywhere). */
+function trialDivisionIsPrime(n: number): boolean {
+	if (!Number.isInteger(n) || n < 2) return false;
+	if (n < 4) return true;
+	if (n % 2 === 0 || n % 3 === 0) return false;
+	for (let i = 5; i * i <= n; i += 6) {
+		if (n % i === 0 || n % (i + 2) === 0) return false;
+	}
+	return true;
+}
+
 describe('Math helpers (property-based)', function () {
 	describe('sum', function () {
 		it('should equal the naive reduce on integer arrays', function () {
@@ -396,6 +407,36 @@ describe('Math helpers (property-based)', function () {
 			for (let n = 0; n < 2000; n++) {
 				expect(helpers.isPrime(n)).toBe(naiveIsPrime(n));
 			}
+		});
+
+		it('should agree with 6k ± 1 trial division on random integers below 2 ** 42', function () {
+			fc.assert(
+				fc.property(fc.bigInt({ min: 0n, max: 2n ** 42n }), function (big) {
+					const n = Number(big);
+					expect(helpers.isPrime(n)).toBe(trialDivisionIsPrime(n));
+				}),
+				{ numRuns: 2000 }
+			);
+		});
+
+		it('should agree with 6k ± 1 trial division on odd integers just past the trial-division cut-off', function () {
+			fc.assert(
+				fc.property(fc.integer({ min: 1_050_000 / 2, max: 2 ** 29 }), function (half) {
+					const n = 2 * half + 1;
+					expect(helpers.isPrime(n)).toBe(trialDivisionIsPrime(n));
+				}),
+				{ numRuns: 2000 }
+			);
+		});
+
+		it('should never call a product of two integers >= 2 a prime, up to 2 ** 53', function () {
+			const factor = fc.integer({ min: 2, max: 94_906_265 });
+			fc.assert(
+				fc.property(factor, factor, function (a, b) {
+					expect(helpers.isPrime(a * b)).toBe(false);
+				}),
+				{ numRuns: 2000 }
+			);
 		});
 	});
 
