@@ -313,3 +313,310 @@ describe('URL helpers (properties)', function () {
 		});
 	});
 });
+
+/** Characters that matter to URL parsing: scheme characters, slashes, separators, ignored and control characters. */
+const urlish = fc.string({
+	unit: fc.constantFrom(
+		'a',
+		'j',
+		'S',
+		'h',
+		't',
+		'p',
+		's',
+		'1',
+		'+',
+		'.',
+		'-',
+		':',
+		'/',
+		'\\',
+		'?',
+		'#',
+		'%',
+		'&',
+		';',
+		' ',
+		'\t',
+		'\n',
+		'\r',
+		'\x00',
+		'\x01',
+		'\x1f',
+		'é',
+		'@'
+	),
+	maxLength: 16
+});
+const scheme = fc.stringMatching(/^[a-zA-Z][a-zA-Z0-9+.-]{0,5}$/);
+/** URL-like strings that start with a scheme (possibly disguised with ignored characters). */
+const schemeUrl = fc.tuple(fc.constantFrom('', ' ', '\x01', '\t', ' \x00'), scheme, fc.constantFrom('', '\t', '\n'), urlish).map(function ([prefix, name, noise, rest]) {
+	return `${prefix}${name.slice(0, 1)}${noise}${name.slice(1)}:${rest}`;
+});
+const anyUrl = fc.oneof(urlish, schemeUrl);
+const pathSegment = fc.stringMatching(/^[a-z0-9.%-]{0,4}$/);
+const path = fc.array(fc.oneof(pathSegment, fc.constant('')), { maxLength: 5 }).map(function (segments) {
+	return segments.join('/');
+});
+const suffix = fc.tuple(fc.option(fc.stringMatching(/^[a-z/=&?]{0,6}$/)), fc.option(fc.stringMatching(/^[a-z/?#]{0,6}$/))).map(function ([query, hash]) {
+	return (query === null ? '' : `?${query}`) + (hash === null ? '' : `#${hash}`);
+});
+const prefix = fc.constantFrom('', '/', '//host', 'https://example.com', 'file://', 'mailto:');
+
+/** Splits a URL string into its path and the rest (query and fragment). */
+function splitPath(url: string): [string, string] {
+	const index = url.search(/[?#]/);
+	return index === -1 ? [url, ''] : [url.slice(0, index), url.slice(index)];
+}
+
+describe('URL helpers (round 11 properties)', function () {
+	describe('isSafeUrl', function () {
+		it('reads the same scheme as the WHATWG URL parser', function () {
+			fc.assert(
+				fc.property(anyUrl, function (url) {
+					const parsed = URL.parse(url);
+					if (parsed === null) return;
+					expect(helpers.isSafeUrl(url, { protocols: [parsed.protocol], allowRelative: false })).toBe(true);
+					expect(helpers.isSafeUrl(url, { protocols: ['zz-not-it:'], allowRelative: true })).toBe(false);
+				})
+			);
+		});
+
+		it('only accepts URLs that browsers resolve to an allowed scheme (or that do not parse at all)', function () {
+			fc.assert(
+				fc.property(anyUrl, fc.boolean(), function (url, allowRelative) {
+					const resolved = URL.parse(url, 'https://base.example/dir/');
+					const safe = helpers.isSafeUrl(url, { protocols: ['http:', 'mailto:'], allowRelative });
+					if (resolved === null) return;
+					const absolute = URL.canParse(url);
+					if (safe) expect(absolute ? ['http:', 'mailto:'] : ['https:']).toContain(resolved.protocol);
+					else if (absolute) expect(['http:', 'mailto:']).not.toContain(resolved.protocol);
+					else expect(allowRelative).toBe(false);
+				})
+			);
+		});
+
+		it('never accepts a javascript: URL, however it is disguised', function () {
+			fc.assert(
+				fc.property(
+					fc.constantFrom('', ' ', '\x01', '\t\n'),
+					fc.array(fc.constantFrom('', '\t', '\n', '\r'), { minLength: 10, maxLength: 10 }),
+					fc.boolean(),
+					urlish,
+					function (lead, noise, upper, rest) {
+						const name = 'javascript'.split('').map(function (letter, index) {
+							return (upper && index % 2 === 0 ? letter.toUpperCase() : letter) + noise[index];
+						});
+						const url = `${lead}${name.join('')}:${rest}`;
+						expect(URL.parse(url)?.protocol).toBe('javascript:');
+						expect(helpers.isSafeUrl(url)).toBe(false);
+						expect(helpers.sanitizeUrl(url)).toBe('about:blank');
+					}
+				)
+			);
+		});
+	});
+
+	describe('slash helpers', function () {
+		const url = fc.tuple(prefix, path, suffix).map(function ([start, middle, end]) {
+			return start + middle + end;
+		});
+
+		it('only change the path, and are idempotent', function () {
+			fc.assert(
+				fc.property(fc.oneof(url, urlish), function (input) {
+					const [, rest] = splitPath(input);
+					for (const fn of [helpers.withTrailingSlash, helpers.withoutTrailingSlash, helpers.cleanDoubleSlashes]) {
+						const result = fn(input);
+						expect(splitPath(result)[1]).toBe(rest);
+						expect(fn(result)).toBe(result);
+					}
+					expect(helpers.withLeadingSlash(helpers.withLeadingSlash(input))).toBe(helpers.withLeadingSlash(input));
+					expect(helpers.withoutLeadingSlash(helpers.withoutLeadingSlash(input))).toBe(helpers.withoutLeadingSlash(input));
+				})
+			);
+		});
+
+		it('add or remove only slashes', function () {
+			fc.assert(
+				fc.property(url, function (input) {
+					const bare = input.replace(/\//g, '');
+					expect(helpers.withTrailingSlash(input).replace(/\//g, '')).toBe(bare);
+					expect(helpers.withoutTrailingSlash(input).replace(/\//g, '')).toBe(bare);
+					expect(helpers.cleanDoubleSlashes(input).replace(/\//g, '')).toBe(bare);
+					expect(helpers.withLeadingSlash(input).replace(/\//g, '')).toBe(bare);
+				})
+			);
+		});
+
+		it('produce the documented shapes', function () {
+			fc.assert(
+				fc.property(url, function (input) {
+					expect(splitPath(helpers.withTrailingSlash(input))[0].endsWith('/')).toBe(true);
+					expect(helpers.withLeadingSlash(input)).toMatch(/^\/(?![/\\])/);
+					expect(helpers.withoutLeadingSlash(input)).not.toMatch(/^\//);
+					const keep = /^(?:[a-z][a-z\d+.-]*:)?\/*/i.exec(input)![0];
+					const cleaned = splitPath(helpers.cleanDoubleSlashes(input))[0];
+					expect(cleaned.startsWith(keep)).toBe(true);
+					expect(cleaned.slice(keep.length)).not.toContain('//');
+					const trimmed = splitPath(helpers.withoutTrailingSlash(input))[0];
+					expect(trimmed === '' || !trimmed.endsWith('/') || trimmed === keep).toBe(true);
+				})
+			);
+		});
+
+		it('agree with the WHATWG URL parser on the resolved path, except for the collapsed slashes', function () {
+			fc.assert(
+				fc.property(path, suffix, function (middle, end) {
+					const input = `https://example.com/${middle}${end}`;
+					const original = new URL(input);
+					const cleaned = new URL(helpers.cleanDoubleSlashes(input));
+					expect(cleaned.search).toBe(original.search);
+					expect(cleaned.hash).toBe(original.hash);
+					expect(cleaned.host).toBe(original.host);
+					expect(cleaned.pathname).toBe(original.pathname.replace(/\/\/+/g, '/'));
+				})
+			);
+		});
+	});
+
+	describe('withBase / withoutBase', function () {
+		const base = fc.array(fc.stringMatching(/^[a-z]{1,3}$/), { minLength: 1, maxLength: 3 }).map(function (segments) {
+			return '/' + segments.join('/');
+		});
+		const relative = fc.tuple(fc.constantFrom('/', ''), path, suffix).map(function ([start, middle, end]) {
+			return start + middle + end;
+		});
+
+		it('round-trip a path that starts with / and is not already under the base', function () {
+			fc.assert(
+				fc.property(base, fc.constantFrom('', '/', '//'), path, suffix, function (root, trailing, middle, end) {
+					const input = `/${middle.replace(/^\/+/, '')}${end}`;
+					const [pathname] = splitPath(input);
+					fc.pre(pathname !== root && !pathname.startsWith(root + '/'));
+					const mounted = helpers.withBase(input, root + trailing);
+					expect(mounted.startsWith(root + '/') || mounted === root).toBe(true);
+					expect(helpers.withoutBase(mounted, root + trailing)).toBe(input);
+					expect(helpers.withBase(mounted, root)).toBe(mounted);
+				})
+			);
+		});
+
+		it('never produce a protocol-relative URL from a relative input', function () {
+			fc.assert(
+				fc.property(base, fc.oneof(relative, urlish), function (root, input) {
+					const mounted = helpers.withBase(input, root);
+					const unmounted = helpers.withoutBase(input, root);
+					if (mounted !== input) expect(mounted).not.toMatch(/^[/\\]{2}/);
+					if (unmounted !== input) expect(unmounted).toMatch(/^\/(?![/\\\t\n\r])/);
+				})
+			);
+		});
+
+		it('is segment-aware', function () {
+			fc.assert(
+				fc.property(base, fc.stringMatching(/^[a-z]{1,3}$/), function (root, extra) {
+					expect(helpers.withoutBase(root + extra, root)).toBe(root + extra);
+					expect(helpers.withBase(root + extra, root)).toBe(`${root}/${root.slice(1)}${extra}`);
+				})
+			);
+		});
+	});
+
+	describe('safeDecodeURIComponent', function () {
+		it('equals decodeURIComponent whenever that does not throw, and never throws', function () {
+			fc.assert(
+				fc.property(fc.string({ unit: fc.constantFrom('%', '2', '5', 'E', '9', 'C', '3', 'A', 'F', '8', '0', 'B', 'x', '+') }), function (text) {
+					let expected: string | undefined;
+					try {
+						expected = decodeURIComponent(text);
+					} catch {
+						expected = undefined;
+					}
+					const decoded = helpers.safeDecodeURIComponent(text);
+					if (expected !== undefined) expect(decoded).toBe(expected);
+				})
+			);
+		});
+
+		it('inverts encodeURIComponent, also when surrounded by malformed escapes', function () {
+			fc.assert(
+				fc.property(wellFormedValue, fc.constantFrom('', '%', '%E0%A4', '%ZZ', '%C3'), function (text, junk) {
+					expect(helpers.safeDecodeURIComponent(encodeURIComponent(text))).toBe(text);
+					// Junk at the end of a run cannot swallow the valid escapes before it.
+					expect(helpers.safeDecodeURIComponent(encodeURIComponent(text) + junk)).toBe(text + junk);
+				})
+			);
+		});
+
+		it('matches a reference that decodes the longest valid UTF-8 escape sequence at each position', function () {
+			function reference(text: string): string {
+				let out = '';
+				for (let index = 0; index < text.length;) {
+					let taken = false;
+					for (let bytes = 1; bytes <= 4 && !taken; bytes++) {
+						const candidate = text.slice(index, index + 3 * bytes);
+						if (!new RegExp(`^(?:%[0-9a-fA-F]{2}){${bytes}}$`).test(candidate)) break;
+						try {
+							out += decodeURIComponent(candidate);
+							index += candidate.length;
+							taken = true;
+						} catch {
+							// Try a longer sequence.
+						}
+					}
+					if (!taken) out += text[index++];
+				}
+				return out;
+			}
+
+			fc.assert(
+				fc.property(
+					fc.string({ unit: fc.constantFrom('%', '%C3', '%A9', '%E0', '%A4', '%F0', '%9F', '%91', '%8D', '%80', '%FF', '%2', '%25', 'x', '9') }),
+					function (text) {
+						expect(helpers.safeDecodeURIComponent(text)).toBe(reference(text));
+					}
+				)
+			);
+		});
+	});
+
+	describe('withFragment / withoutFragment / withoutQuery', function () {
+		const base = fc.tuple(prefix, path, suffix).map(function ([start, middle, end]) {
+			return start + middle + end;
+		});
+
+		it('round-trips the fragment text', function () {
+			fc.assert(
+				fc.property(base, value, function (url, fragment) {
+					const result = helpers.withFragment(url, fragment);
+					const text = fragment.startsWith('#') ? fragment.slice(1) : fragment;
+					expect(result.startsWith(helpers.withoutFragment(url))).toBe(true);
+					if (text === '') {
+						expect(result).toBe(helpers.withoutFragment(url));
+					} else {
+						const hash = result.slice(helpers.withoutFragment(url).length);
+						expect(hash.indexOf('#', 1)).toBe(-1);
+						expect(helpers.safeDecodeURIComponent(hash.slice(1))).toBe(text.replace(/\p{Cs}/gu, '�'));
+						const parsed = URL.parse(result, 'https://x.example/');
+						if (parsed !== null) expect(parsed.hash).toBe(hash);
+					}
+				})
+			);
+		});
+
+		it('removes the fragment and the query independently', function () {
+			fc.assert(
+				fc.property(base, function (url) {
+					const parsed = URL.parse(url, 'https://x.example/');
+					fc.pre(parsed !== null && !url.startsWith('mailto:') && !url.startsWith('file:') && !url.startsWith('//'));
+					expect(new URL(helpers.withoutFragment(url), 'https://x.example/').hash).toBe('');
+					expect(new URL(helpers.withoutFragment(url), 'https://x.example/').search).toBe(parsed!.search);
+					expect(new URL(helpers.withoutQuery(url), 'https://x.example/').search).toBe('');
+					expect(new URL(helpers.withoutQuery(url), 'https://x.example/').hash).toBe(parsed!.hash);
+					expect(helpers.withoutQuery(helpers.withoutFragment(url))).toBe(helpers.withoutFragment(helpers.withoutQuery(url)));
+				})
+			);
+		});
+	});
+});

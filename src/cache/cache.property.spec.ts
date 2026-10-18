@@ -1,6 +1,6 @@
 import fc from 'fast-check';
 import { memoize } from '../functions/index.js';
-import { createLRUCache, type LRUCache, type LRUEvictionReason } from '.';
+import { createLRUCache, createPriorityQueue, type LRUCache, type LRUEvictionReason } from '.';
 
 type Key = number;
 type Value = number;
@@ -261,6 +261,58 @@ describe('createLRUCache (properties)', function () {
 				expect(calls).toBeLessThanOrEqual(inputs.length);
 				if (new Set(inputs).size <= max) expect(calls).toBe(new Set(inputs).size);
 			})
+		);
+	});
+});
+
+describe('createPriorityQueue (properties)', function () {
+	type Item = { priority: number; id: number };
+
+	function byPriority(a: Item, b: Item): number {
+		return a.priority - b.priority;
+	}
+
+	it('pops exactly like a stable sort of the pushed values, under any interleaving of push/pop/delete', function () {
+		fc.assert(
+			fc.property(
+				fc.array(
+					fc.oneof(
+						fc.record({ op: fc.constant('push' as const), priority: fc.integer({ min: 0, max: 4 }) }),
+						fc.record({ op: fc.constantFrom('pop' as const, 'delete' as const), at: fc.nat() })
+					),
+					{
+						maxLength: 80
+					}
+				),
+				function (ops) {
+					const queue = createPriorityQueue(byPriority);
+					// Reference model: the queued items in insertion order; the next one out is the first with the smallest priority.
+					let model: Item[] = [];
+					let id = 0;
+					for (const step of ops) {
+						if (step.op === 'push') {
+							const item = { priority: step.priority, id: id++ };
+							model.push(item);
+							expect(queue.push(item)).toBe(model.length);
+						} else if (step.op === 'pop') {
+							const expected = model.slice().sort(byPriority)[0];
+							model = model.filter(function (item) {
+								return item !== expected;
+							});
+							expect(queue.pop()).toBe(expected);
+						} else if (model.length > 0) {
+							const victim = model[step.at % model.length];
+							model = model.filter(function (item) {
+								return item !== victim;
+							});
+							expect(queue.delete(victim)).toBe(true);
+						}
+						expect(queue.size).toBe(model.length);
+						expect(queue.peek()).toBe(model.slice().sort(byPriority)[0]);
+						expect([...queue]).toEqual(model.slice().sort(byPriority));
+					}
+				}
+			)
 		);
 	});
 });

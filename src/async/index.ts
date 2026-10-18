@@ -1,6 +1,7 @@
-import { debounce, noop, type Result } from '../functions/index.js';
+import { createLRUCache, createPriorityQueue } from '../cache/index.js';
+import { debounce, defaultMemoizeKey, noop, type MemoizeCache, type Result } from '../functions/index.js';
 import { assertDelay, assertFunction, assertInteger, assertNumber, describe, draw, MAX_TIMEOUT } from '../utils/assert.js';
-import type { AbortSignalLike, RandomGenerator } from '../utils/index.js';
+import type { AbortSignalLike, AnyFunction, RandomGenerator } from '../utils/index.js';
 
 export type { Result } from '../functions/index.js';
 
@@ -93,6 +94,21 @@ export interface RetryOptions {
  */
 function abortReason(signal: AbortSignalLike): unknown {
 	return signal.reason ?? new AbortError();
+}
+
+/**
+ * Calls `fn` with `thisArg` and `args` and returns its outcome as a promise: a synchronous throw becomes a rejection.
+ * @param {Function} fn - The function to call
+ * @param {unknown} thisArg - The `this` value
+ * @param {ArrayLike<unknown>} args - The arguments
+ * @returns {Promise<unknown>} A promise settling like the call
+ */
+function invoke(fn: (...args: never[]) => unknown, thisArg: unknown, args: ArrayLike<unknown>): Promise<unknown> {
+	try {
+		return Promise.resolve((fn as (this: unknown, ...args: unknown[]) => unknown).apply(thisArg, args as unknown[]));
+	} catch (error) {
+		return Promise.reject(error);
+	}
 }
 
 /**
@@ -255,68 +271,303 @@ export async function retry<T>(fn: (attempt: number) => Promise<T> | T, options:
 }
 
 /**
+ * Options accepted by {@link mapWithConcurrency}, {@link mapSettledWithConcurrency} and {@link filterWithConcurrency}.
+ */
+export interface ConcurrencyOptions {
+	/** Maximum number of callbacks in flight (an integer >= 1, or `Infinity`). Defaults to `Infinity`. */
+	concurrency?: number;
+	/**
+	 * Aborting it stops starting new items and rejects straight away with the signal's `reason` (or an {@link AbortError}); callbacks
+	 * already running are not interrupted (their outcome is ignored), but they receive the signal as their third argument.
+	 */
+	signal?: AbortSignalLike | null;
+	/**
+	 * `true` (the default): reject with the first error and start no further items. `false`: process every item, then reject with an
+	 * `AggregateError` holding every error (in the order they occurred) if any callback failed.
+	 */
+	stopOnError?: boolean;
+}
+
+/**
+ * A callback run by the `*WithConcurrency` helpers: receives the item, its index and the caller's abort signal.
+ * @template T - The item type
+ * @template R - The result type
+ */
+export type ConcurrentCallback<T, R> = (item: T, index: number, signal: AbortSignalLike | undefined) => PromiseLike<R> | R;
+
+/**
+ * Runs `callback` on every element of `list` with bounded concurrency (see {@link ConcurrencyOptions}).
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {string} name - Name of the callback parameter, used in error messages
+ * @param {Iterable<unknown>} items - The items (consumed eagerly)
+ * @param {ConcurrentCallback<unknown, unknown>} callback - The callback
+ * @param {number | ConcurrencyOptions | undefined} options - The concurrency, or the options
+ * @returns {Promise<unknown[]>} The results, in input order
+ */
+function runConcurrently(
+	caller: string,
+	name: string,
+	items: Iterable<unknown>,
+	callback: ConcurrentCallback<unknown, unknown>,
+	options: number | ConcurrencyOptions | undefined
+): Promise<unknown[]> {
+	const { concurrency = Infinity, signal, stopOnError = true } = typeof options === 'object' && options !== null ? options : { concurrency: options };
+	let list: unknown[];
+
+	// Argument errors, an aborted signal and (on the fast path) synchronous throws become rejections.
+	try {
+		assertInteger(caller, 'concurrency', concurrency, 1, true);
+		assertFunction(caller, name, callback);
+		assertOptionalSignal(caller, 'signal', signal);
+		if (signal?.aborted) throw abortReason(signal);
+
+		list = Array.from(items);
+
+		// Every item can start at once and nothing can stop the run early except a failure: map them directly (same behaviour as below,
+		// much cheaper than tracking slots).
+		if (concurrency >= list.length && signal == null && stopOnError) {
+			const started: unknown[] = [];
+
+			for (let index = 0; index < list.length; index++) {
+				try {
+					started.push(callback(list[index], index, undefined));
+				} catch (error) {
+					// The items already started keep running; their outcome is ignored (and their rejections are handled).
+					Promise.all(started).catch(noop);
+					throw error;
+				}
+			}
+
+			return Promise.all(started);
+		}
+	} catch (error) {
+		return Promise.reject(error);
+	}
+
+	return new Promise<unknown[]>(function (resolve, reject) {
+		const results: unknown[] = [];
+		const errors: unknown[] = [];
+		const mapperSignal = signal ?? undefined;
+		let next = 0;
+		let running = 0;
+		let done = false;
+
+		/**
+		 * Settles the returned promise once and removes the abort listener.
+		 * @param {(value: never) => void} settle - `resolve` or `reject`
+		 * @param {unknown} value - The value or reason
+		 * @returns {void}
+		 */
+		function finish(settle: (value: never) => void, value: unknown): void {
+			if (done) return;
+			done = true;
+			signal?.removeEventListener('abort', onAbort);
+			settle(value as never);
+		}
+
+		/**
+		 * Abort listener.
+		 * @returns {void}
+		 */
+		function onAbort(): void {
+			finish(reject, abortReason(signal as AbortSignalLike));
+		}
+
+		/**
+		 * Records a failed callback: rejects at once with `stopOnError`, otherwise collects the error.
+		 * @param {unknown} error - The error
+		 * @returns {void}
+		 */
+		function failed(error: unknown): void {
+			if (stopOnError) finish(reject, error);
+			else errors.push(error);
+		}
+
+		/**
+		 * Starts items while slots are free, and settles once every item has completed.
+		 * @returns {void}
+		 */
+		function launch(): void {
+			while (!done && running < concurrency && next < list.length) {
+				const index = next++;
+				let outcome: unknown;
+
+				try {
+					outcome = callback(list[index], index, mapperSignal);
+				} catch (error) {
+					// A synchronous throw is handled before the next item starts (so `stopOnError` starts nothing more).
+					failed(error);
+					continue;
+				}
+
+				running++;
+				Promise.resolve(outcome).then(
+					function (value) {
+						results[index] = value;
+						release();
+					},
+					function (error: unknown) {
+						failed(error);
+						release();
+					}
+				);
+			}
+
+			if (running === 0 && next >= list.length) {
+				if (errors.length > 0) finish(reject, new AggregateError(errors, `${caller}: ${errors.length} of ${list.length} items failed`));
+				else finish(resolve, results);
+			}
+		}
+
+		/**
+		 * Frees the slot of a completed callback.
+		 * @returns {void}
+		 */
+		function release(): void {
+			running--;
+			launch();
+		}
+
+		signal?.addEventListener('abort', onAbort);
+		launch();
+	});
+}
+
+/**
  * Maps `items` with an async `mapper`, running at most `concurrency` mappers at the same time, and resolves with the results in input
- * order. Rejects with the first error; once an error occurred no new items are started (mappers already running are not cancelled).
+ * order. The third argument is either the concurrency or a {@link ConcurrencyOptions} object:
+ * - `stopOnError` (default `true`) rejects with the first error and starts no further items (mappers already running are not
+ *   cancelled; their outcome is ignored and their rejections are handled). With `false`, every item is processed and the promise then
+ *   rejects with an `AggregateError` of all the errors if any mapper failed.
+ * - `signal` stops starting new items and rejects at once with the signal's `reason`; it is also passed to every mapper as its third
+ *   argument, so mappers can cancel their own work (e.g. `fetch(url, { signal })`). The abort listener is removed on settle.
  * @template T - The item type
  * @template R - The mapped value type
  * @param {Iterable<T>} items - The items to map (consumed eagerly)
- * @param {(item: T, index: number) => Promise<R> | R} mapper - The (possibly async) mapping function
- * @param {number} [concurrency=Infinity] - Maximum number of mappers in flight (an integer >= 1, or `Infinity`)
+ * @param {ConcurrentCallback<T, R>} mapper - The (possibly async) mapping function, called with `(item, index, signal)`
+ * @param {number | ConcurrencyOptions} [options=Infinity] - The maximum number of mappers in flight, or `{ concurrency, signal, stopOnError }`
  * @returns {Promise<R[]>} The mapped values, in input order
- * @throws {TypeError} (as a rejection) when `mapper` is not a function, or `concurrency` is not a number
+ * @throws {TypeError} (as a rejection) when `mapper` is not a function, `concurrency` is not a number, or `signal` is not a signal
  * @throws {RangeError} (as a rejection) when `concurrency` is not an integer >= 1 or `Infinity`
- * @throws {unknown} (as a rejection) the first error thrown or rejected by `mapper`
+ * @throws {AggregateError} (as a rejection) with `stopOnError: false`, when at least one mapper failed
+ * @throws {unknown} (as a rejection) the first error thrown or rejected by `mapper`, or the abort reason of `signal`
  * @example
  * async function size(name: string): Promise<number> { await sleep(5); return name.length; }
  * await mapWithConcurrency(['a', 'bb', 'ccc'], size, 2); // => [1, 2, 3] // in input order, at most 2 running at once
+ * @example
+ * const controller = new AbortController();
+ * async function load(id: number, index: number, signal?: AbortSignalLike): Promise<number> { await sleep(20, { signal }); return id; }
+ * const pages = mapWithConcurrency([1, 2, 3], load, { concurrency: 2, signal: controller.signal });
+ * controller.abort(new AbortError('navigated away'));
+ * await pages; // throws AbortError
  */
-export async function mapWithConcurrency<T, R>(items: Iterable<T>, mapper: (item: T, index: number) => Promise<R> | R, concurrency = Infinity): Promise<R[]> {
-	assertInteger('mapWithConcurrency', 'concurrency', concurrency, 1, true);
-	assertFunction('mapWithConcurrency', 'mapper', mapper);
+export function mapWithConcurrency<T, R>(items: Iterable<T>, mapper: ConcurrentCallback<T, R>, options?: number | ConcurrencyOptions): Promise<R[]> {
+	return runConcurrently('mapWithConcurrency', 'mapper', items, mapper as ConcurrentCallback<unknown, unknown>, options) as Promise<R[]>;
+}
 
+/**
+ * Turns a fulfilled value into a `PromiseFulfilledResult`.
+ * @param {unknown} value - The value
+ * @returns {PromiseFulfilledResult<unknown>} The settled result
+ */
+function fulfilled(value: unknown): PromiseFulfilledResult<unknown> {
+	return { status: 'fulfilled', value };
+}
+
+/**
+ * Turns a rejection reason into a `PromiseRejectedResult`.
+ * @param {unknown} reason - The reason
+ * @returns {PromiseRejectedResult} The settled result
+ */
+function rejected(reason: unknown): PromiseRejectedResult {
+	return { status: 'rejected', reason };
+}
+
+/**
+ * Like {@link mapWithConcurrency}, but never rejects because of a mapper: resolves with a `PromiseSettledResult` per item, in input
+ * order (like `Promise.allSettled`). It still rejects for invalid arguments, and with the signal's `reason` when `signal` aborts
+ * (no new items start; `stopOnError` has no effect).
+ * @template T - The item type
+ * @template R - The mapped value type
+ * @param {Iterable<T>} items - The items to map (consumed eagerly)
+ * @param {ConcurrentCallback<T, R>} mapper - The (possibly async) mapping function, called with `(item, index, signal)`
+ * @param {number | ConcurrencyOptions} [options=Infinity] - The maximum number of mappers in flight, or `{ concurrency, signal }`
+ * @returns {Promise<Array<PromiseSettledResult<Awaited<R>>>>} The outcome of every item, in input order
+ * @throws {TypeError} (as a rejection) when `mapper` is not a function, `concurrency` is not a number, or `signal` is not a signal
+ * @throws {RangeError} (as a rejection) when `concurrency` is not an integer >= 1 or `Infinity`
+ * @throws {unknown} (as a rejection) the abort reason of `signal`
+ * @example
+ * async function parse(text: string): Promise<number> { const n = Number(text); if (Number.isNaN(n)) throw new Error(`bad: ${text}`); return n; }
+ * const results = await mapSettledWithConcurrency(['1', 'x'], parse, 2);
+ * results[0]; // => { status: 'fulfilled', value: 1 }
+ * results[1]; // => { status: 'rejected', reason: new Error('bad: x') }
+ */
+export async function mapSettledWithConcurrency<T, R>(
+	items: Iterable<T>,
+	mapper: ConcurrentCallback<T, R>,
+	options?: number | ConcurrencyOptions
+): Promise<Array<PromiseSettledResult<Awaited<R>>>> {
+	assertFunction('mapSettledWithConcurrency', 'mapper', mapper);
+
+	return runConcurrently(
+		'mapSettledWithConcurrency',
+		'mapper',
+		items,
+		function (item, index, signal) {
+			return invoke(mapper, undefined, [item, index, signal]).then(fulfilled, rejected);
+		},
+		options
+	) as Promise<Array<PromiseSettledResult<Awaited<R>>>>;
+}
+
+/**
+ * Filters `items` with an async `predicate`, running at most `concurrency` predicates at the same time, and resolves with the items
+ * whose predicate returned (or resolved to) a truthy value, in input order. Accepts the same options as {@link mapWithConcurrency}
+ * (`concurrency`, `signal`, `stopOnError`), with the same error and abort semantics.
+ * @template T - The item type
+ * @param {Iterable<T>} items - The items to filter (consumed eagerly)
+ * @param {ConcurrentCallback<T, unknown>} predicate - The (possibly async) predicate, called with `(item, index, signal)`
+ * @param {number | ConcurrencyOptions} [options=Infinity] - The maximum number of predicates in flight, or `{ concurrency, signal, stopOnError }`
+ * @returns {Promise<T[]>} The kept items, in input order
+ * @throws {TypeError} (as a rejection) when `predicate` is not a function, `concurrency` is not a number, or `signal` is not a signal
+ * @throws {RangeError} (as a rejection) when `concurrency` is not an integer >= 1 or `Infinity`
+ * @throws {AggregateError} (as a rejection) with `stopOnError: false`, when at least one predicate failed
+ * @throws {unknown} (as a rejection) the first error thrown or rejected by `predicate`, or the abort reason of `signal`
+ * @example
+ * async function isOnline(host: string): Promise<boolean> { await sleep(5); return host !== 'down.example'; }
+ * await filterWithConcurrency(['a.example', 'down.example', 'b.example'], isOnline, { concurrency: 2 }); // => ['a.example', 'b.example']
+ */
+export function filterWithConcurrency<T, S extends T>(
+	items: Iterable<T>,
+	predicate: (item: T, index: number, signal: AbortSignalLike | undefined) => item is S,
+	options?: number | ConcurrencyOptions
+): Promise<S[]>;
+/**
+ * Filters `items` with an async `predicate`, with bounded concurrency (see the first overload).
+ * @template T - The item type
+ * @param {Iterable<T>} items - The items to filter (consumed eagerly)
+ * @param {ConcurrentCallback<T, unknown>} predicate - The (possibly async) predicate, called with `(item, index, signal)`
+ * @param {number | ConcurrencyOptions} [options=Infinity] - The maximum number of predicates in flight, or `{ concurrency, signal, stopOnError }`
+ * @returns {Promise<T[]>} The kept items, in input order
+ * @example
+ * await filterWithConcurrency([1, 2, 3, 4], async function (n) { return n % 2 === 0; }); // => [2, 4]
+ */
+export function filterWithConcurrency<T>(items: Iterable<T>, predicate: ConcurrentCallback<T, unknown>, options?: number | ConcurrencyOptions): Promise<T[]>;
+/**
+ * Filters `items` with an async `predicate`, with bounded concurrency (see the first overload).
+ * @template T - The item type
+ * @param {Iterable<T>} items - The items to filter (consumed eagerly)
+ * @param {ConcurrentCallback<T, unknown>} predicate - The (possibly async) predicate
+ * @param {number | ConcurrencyOptions} [options=Infinity] - The concurrency, or the options
+ * @returns {Promise<T[]>} The kept items, in input order
+ */
+export async function filterWithConcurrency<T>(items: Iterable<T>, predicate: ConcurrentCallback<T, unknown>, options?: number | ConcurrencyOptions): Promise<T[]> {
 	const list = Array.from(items);
+	const keep = await runConcurrently('filterWithConcurrency', 'predicate', list, predicate as ConcurrentCallback<unknown, unknown>, options);
 
-	// Every item can start at once: map them directly instead of running one worker per item (same behaviour, much cheaper).
-	if (concurrency >= list.length) {
-		const started: Array<Promise<R> | R> = [];
-
-		for (let index = 0; index < list.length; index++) {
-			try {
-				started.push(mapper(list[index], index));
-			} catch (error) {
-				// The items already started keep running, as with workers; their outcome is ignored (and rejections are handled).
-				Promise.all(started).catch(noop);
-				throw error;
-			}
-		}
-
-		return Promise.all(started);
-	}
-
-	const results: R[] = [];
-	let next = 0;
-	let failed = false;
-
-	/**
-	 * Repeatedly takes the next unprocessed item until none is left or a mapper failed.
-	 * @returns {Promise<void>} Resolves when this worker is done
-	 */
-	async function worker(): Promise<void> {
-		while (!failed && next < list.length) {
-			const index = next++;
-
-			try {
-				results[index] = await mapper(list[index], index);
-			} catch (error) {
-				failed = true;
-				throw error;
-			}
-		}
-	}
-
-	await Promise.all(Array.from({ length: Math.min(concurrency, list.length) }, worker));
-
-	return results;
+	return list.filter(function (_, index) {
+		return keep[index];
+	});
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -453,18 +704,12 @@ export function createLimiter(concurrency: number, options: LimiterOptions = {})
 			function run(): void {
 				active++;
 
-				let outcome: Promise<unknown>;
-
-				try {
-					outcome = Promise.resolve(fn(...args));
-				} catch (error) {
-					outcome = Promise.reject(error);
-				}
-
-				outcome.then(resolve, reject).then(function () {
-					active--;
-					startNext();
-				});
+				invoke(fn, undefined, args)
+					.then(resolve, reject)
+					.then(function () {
+						active--;
+						startNext();
+					});
 			}
 
 			if (active < concurrency) {
@@ -511,6 +756,488 @@ export function createLimiter(concurrency: number, options: LimiterOptions = {})
 	});
 
 	return limit as unknown as Limiter;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// createQueue / createRateLimiter
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Options accepted by {@link createQueue}.
+ */
+export interface QueueOptions {
+	/** Maximum number of tasks running at once (an integer >= 1, or `Infinity`). Defaults to `Infinity`. */
+	concurrency?: number;
+	/**
+	 * Aborting it removes every waiting task and rejects its promise with the signal's `reason` (or an {@link AbortError}), and so does
+	 * every later `add`. Running tasks are not interrupted: they receive the signal and settle on their own.
+	 */
+	signal?: AbortSignalLike | null;
+}
+
+/**
+ * Options accepted by {@link Queue.add}.
+ */
+export interface QueueAddOptions {
+	/** Tasks with a higher priority start first; tasks of equal priority start in the order they were added. Defaults to `0`. */
+	priority?: number;
+	/**
+	 * Aborting it before the task starts removes the task from the queue (it never runs) and rejects its promise with the signal's
+	 * `reason`. Once started, the task receives it (combined with the queue's signal, when both are set).
+	 */
+	signal?: AbortSignalLike | null;
+}
+
+/**
+ * A priority task queue as returned by {@link createQueue}.
+ */
+export interface Queue {
+	/**
+	 * Adds a task and returns a promise that settles like it. The task is called with an abort signal (see {@link QueueAddOptions.signal})
+	 * when it starts: immediately and synchronously if a slot is free, nothing is waiting and the queue is not paused. Synchronous throws
+	 * become rejections.
+	 * @throws {TypeError} (as a rejection) when `task` is not a function, `priority` is not a number, or `signal` is not a signal
+	 * @throws {RangeError} (as a rejection) when `priority` is `NaN`
+	 */
+	add<T>(task: (signal: AbortSignalLike | undefined) => PromiseLike<T> | T, options?: QueueAddOptions): Promise<T>;
+	/** Number of tasks waiting to start. */
+	readonly size: number;
+	/** Number of tasks running. */
+	readonly pending: number;
+	/** Whether the queue is paused. */
+	readonly isPaused: boolean;
+	/** Stops starting tasks (running tasks continue) until `resume()` is called. */
+	pause(): void;
+	/** Starts waiting tasks again, up to the concurrency. */
+	resume(): void;
+	/** Removes every waiting task, rejecting its promise with an {@link AbortError} (running tasks are not affected). */
+	clear(): void;
+	/** Resolves as soon as no task is waiting (immediately if none is). Each call returns a new promise, so it can be awaited again later. */
+	onEmpty(): Promise<void>;
+	/** Resolves as soon as no task is waiting or running (immediately if none is). Each call returns a new promise. */
+	onIdle(): Promise<void>;
+}
+
+/**
+ * A waiting {@link Queue} task.
+ */
+interface QueueTask {
+	readonly priority: number;
+	readonly run: () => void;
+	readonly reject: (reason: unknown) => void;
+	readonly signal: AbortSignalLike | null | undefined;
+	readonly onAbort: () => void;
+}
+
+/**
+ * Orders queue tasks by decreasing priority (ties keep insertion order: the priority queue is stable).
+ * @param {QueueTask} a - A task
+ * @param {QueueTask} b - Another task
+ * @returns {number} A negative number when `a` starts first
+ */
+function byPriority(a: QueueTask, b: QueueTask): number {
+	return b.priority - a.priority;
+}
+
+/**
+ * Calls and empties a list of waiting resolvers.
+ * @param {Array<() => void>} waiters - The resolvers
+ * @returns {Array<() => void>} A new, empty list
+ */
+function wake(waiters: Array<() => void>): Array<() => void> {
+	for (const resolve of waiters) resolve();
+
+	return [];
+}
+
+/**
+ * Creates a task queue that runs at most `concurrency` tasks at the same time, starting the waiting task with the highest `priority`
+ * first and tasks of equal priority in FIFO order (a stable binary heap, so `add` and every start are O(log n)). It has no timers.
+ *
+ * Cancellation is precise: a task whose own `signal` aborts while it waits is removed from the queue (it never runs) and its promise
+ * rejects with the signal's `reason`; aborting the queue's `signal` does the same for every waiting task and rejects every later `add`.
+ * Running tasks are never interrupted, but they receive the signal(s) to cancel their own work. Listeners are removed as soon as a task
+ * starts or leaves the queue.
+ * @param {QueueOptions} [options] - `concurrency` (default `Infinity`) and `signal`
+ * @returns {Queue} The queue
+ * @throws {TypeError} when `concurrency` is not a number or `signal` is not a signal
+ * @throws {RangeError} when `concurrency` is not an integer >= 1 or `Infinity`
+ * @example
+ * const queue = createQueue({ concurrency: 1 });
+ * const order: string[] = [];
+ * async function job(name: string): Promise<string> { await sleep(5); order.push(name); return name; }
+ * queue.add(function () { return job('first'); }); // starts at once
+ * queue.add(function () { return job('low'); });
+ * queue.add(function () { return job('urgent'); }, { priority: 10 });
+ * queue.size; // => 2
+ * queue.pending; // => 1
+ * await queue.onIdle();
+ * order; // => ['first', 'urgent', 'low']
+ * @example
+ * const queue = createQueue({ concurrency: 1 });
+ * const controller = new AbortController();
+ * queue.add(function () { return sleep(10); });
+ * const waiting = queue.add(function () { return 'never runs'; }, { signal: controller.signal });
+ * controller.abort(new AbortError('not needed any more'));
+ * await waiting; // throws AbortError
+ * queue.size; // => 0
+ */
+export function createQueue(options: QueueOptions = {}): Queue {
+	const { concurrency = Infinity, signal: queueSignal } = options;
+
+	assertInteger('createQueue', 'concurrency', concurrency, 1, true);
+	assertOptionalSignal('createQueue', 'signal', queueSignal);
+
+	const waiting = createPriorityQueue(byPriority);
+	let running = 0;
+	let paused = false;
+	let emptyWaiters: Array<() => void> = [];
+	let idleWaiters: Array<() => void> = [];
+
+	/**
+	 * Resolves the `onEmpty` / `onIdle` promises whose condition now holds.
+	 * @returns {void}
+	 */
+	function notify(): void {
+		if (waiting.size > 0) return;
+		emptyWaiters = wake(emptyWaiters);
+		if (running === 0) idleWaiters = wake(idleWaiters);
+	}
+
+	/**
+	 * Starts waiting tasks while slots are free and the queue is not paused.
+	 * @returns {void}
+	 */
+	function startNext(): void {
+		while (!paused && running < concurrency && waiting.size > 0) (waiting.pop() as QueueTask).run();
+		notify();
+	}
+
+	/**
+	 * Removes every waiting task and rejects its promise.
+	 * @param {unknown} reason - The rejection reason
+	 * @returns {void}
+	 */
+	function drop(reason: unknown): void {
+		for (let task = waiting.pop(); task !== undefined; task = waiting.pop()) {
+			task.signal?.removeEventListener('abort', task.onAbort);
+			task.reject(reason);
+		}
+		notify();
+	}
+
+	queueSignal?.addEventListener(
+		'abort',
+		function () {
+			drop(abortReason(queueSignal));
+		},
+		{ once: true }
+	);
+
+	return {
+		add<T>(task: (signal: AbortSignalLike | undefined) => PromiseLike<T> | T, addOptions: QueueAddOptions = {}): Promise<T> {
+			return new Promise<T>(function (resolve, reject) {
+				const { priority = 0, signal } = addOptions;
+
+				assertFunction('Queue.add', 'task', task);
+				assertNumber('Queue.add', 'priority', priority, priority === priority, 'a number');
+				assertOptionalSignal('Queue.add', 'signal', signal);
+				if (queueSignal?.aborted) throw abortReason(queueSignal);
+				if (signal?.aborted) throw abortReason(signal);
+
+				/**
+				 * Starts the task in a slot and frees the slot once it settles.
+				 * @returns {void}
+				 */
+				function run(): void {
+					signal?.removeEventListener('abort', onAbort);
+
+					// The task sees both signals; the combined one is detached from them once the task settles.
+					const [taskSignal, release] = signal && queueSignal ? combineSignals('createQueue', [signal, queueSignal]) : [signal ?? queueSignal ?? undefined, noop];
+					running++;
+					(invoke(task, undefined, [taskSignal]) as Promise<T>).then(resolve, reject).then(function () {
+						release();
+						running--;
+						startNext();
+					});
+				}
+
+				/**
+				 * Abort listener of a waiting task: removes it from the queue and rejects its promise.
+				 * @returns {void}
+				 */
+				function onAbort(): void {
+					waiting.delete(entry);
+					reject(abortReason(signal as AbortSignalLike));
+					notify();
+				}
+
+				const entry: QueueTask = { priority, run, reject, signal, onAbort };
+
+				if (!paused && running < concurrency && waiting.size === 0) {
+					run();
+				} else {
+					waiting.push(entry);
+					signal?.addEventListener('abort', onAbort, { once: true });
+				}
+			});
+		},
+		get size(): number {
+			return waiting.size;
+		},
+		get pending(): number {
+			return running;
+		},
+		get isPaused(): boolean {
+			return paused;
+		},
+		pause(): void {
+			paused = true;
+		},
+		resume(): void {
+			paused = false;
+			startNext();
+		},
+		clear(): void {
+			drop(new AbortError('The task was removed from the queue.'));
+		},
+		onEmpty(): Promise<void> {
+			return new Promise<void>(function (resolve) {
+				if (waiting.size === 0) resolve();
+				else emptyWaiters.push(resolve);
+			});
+		},
+		onIdle(): Promise<void> {
+			return new Promise<void>(function (resolve) {
+				if (waiting.size === 0 && running === 0) resolve();
+				else idleWaiters.push(resolve);
+			});
+		}
+	};
+}
+
+/**
+ * Options accepted by {@link createRateLimiter}.
+ */
+export interface RateLimiterOptions {
+	/** Maximum number of calls that may start within any window of `interval` milliseconds (an integer >= 1). */
+	limit: number;
+	/** Length of the sliding window in milliseconds (`0` to `2^31 - 1`). */
+	interval: number;
+	/**
+	 * Aborting it rejects every waiting call (and every later one) with the signal's `reason` (or an {@link AbortError}) and clears the
+	 * timer. Calls already started are not affected.
+	 */
+	signal?: AbortSignalLike | null;
+}
+
+/**
+ * A rate limiter as returned by {@link createRateLimiter}.
+ */
+export interface RateLimiter {
+	/**
+	 * Calls `fn(...args)` as soon as the rate limit allows it (immediately and synchronously when it does and no call is waiting), and
+	 * settles like its result. Calls start in FIFO order and are never dropped. Synchronous throws become rejections.
+	 * @throws {TypeError} (as a rejection) when `fn` is not a function
+	 */
+	schedule<A extends unknown[], T>(fn: (...args: A) => PromiseLike<T> | T, ...args: A): Promise<T>;
+	/**
+	 * Returns a rate-limited version of `fn`: every call goes through {@link RateLimiter.schedule} (with `this` forwarded) and returns a promise.
+	 * @throws {TypeError} when `fn` is not a function
+	 */
+	wrap<A extends unknown[], T, This = unknown>(fn: (this: This, ...args: A) => PromiseLike<T> | T): (this: This, ...args: A) => Promise<Awaited<T>>;
+	/** Number of calls waiting for the rate limit. */
+	readonly pendingCount: number;
+	/** Removes every waiting call, rejecting its promise with an {@link AbortError}, and clears the timer. */
+	clearQueue(): void;
+}
+
+/**
+ * A waiting rate-limited call.
+ */
+interface RateLimitedCall {
+	readonly start: () => void;
+	readonly reject: (reason: unknown) => void;
+	/** The call queued after this one. */
+	next?: RateLimitedCall;
+}
+
+/**
+ * Creates a rate limiter that starts at most `limit` calls within any window of `interval` milliseconds. Calls beyond the limit are
+ * queued (never dropped, unlike `throttle`) and start in FIFO order as soon as the window allows.
+ *
+ * The window slides (it is "strict"): a call may start only once the call `limit` starts before it started at least `interval` ms ago.
+ * Fixed windows, the default of several libraries, let `2 × limit` calls through around a window boundary. Only the start times of the
+ * last `limit` calls are kept, and at most one timer exists, only while calls are waiting: an idle limiter holds no timer, so it never
+ * keeps a process alive. `limit` caps how often calls start, not how many run at once (combine with {@link createLimiter} for that).
+ * @param {RateLimiterOptions} options - `limit`, `interval` and an optional `signal`
+ * @returns {RateLimiter} The limiter, with `schedule`, `wrap`, `pendingCount` and `clearQueue`
+ * @throws {TypeError} when `options` is not an object, `limit` or `interval` is not a number, or `signal` is not a signal
+ * @throws {RangeError} when `limit` is not an integer >= 1, or `interval` is not between `0` and `2^31 - 1`
+ * @example
+ * const limiter = createRateLimiter({ limit: 2, interval: 50 });
+ * const started: number[] = [];
+ * const begin = Date.now();
+ * function call(id: number): number { started.push(Date.now() - begin); return id; }
+ * await Promise.all([1, 2, 3].map(function (id) { return limiter.schedule(call, id); })); // => [1, 2, 3]
+ * started[1] < 50; // => true // the first two start at once
+ * started[2] >= 49; // => true // the third waits for the window to slide
+ * @example
+ * // doctest: skip
+ * const search = createRateLimiter({ limit: 5, interval: 1000 }).wrap(function (query: string) { return fetch(`/api?q=${query}`); });
+ */
+export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
+	if (typeof options !== 'object' || options === null) throw new TypeError(`createRateLimiter: \`options\` must be an object, got ${describe(options)}`);
+
+	const { limit, interval, signal } = options;
+
+	assertInteger('createRateLimiter', 'limit', limit, 1);
+	assertDelay('createRateLimiter', 'interval', interval);
+	assertOptionalSignal('createRateLimiter', 'signal', signal);
+
+	// The start times of the last `limit` calls, as a ring buffer whose oldest entry is at `cursor` once it is full.
+	const starts: number[] = [];
+	let cursor = 0;
+	// The waiting calls form a linked FIFO queue.
+	let first: RateLimitedCall | undefined;
+	let last: RateLimitedCall | undefined;
+	let pending = 0;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let draining = false;
+
+	/**
+	 * Records a start now if the window allows one.
+	 * @returns {number} `0` or less when a start was recorded, otherwise how many milliseconds to wait for the window to allow one
+	 */
+	function admit(): number {
+		const now = Date.now();
+		const full = starts.length === limit;
+
+		// A start "in the future" means the clock went back: count it as starting now, so the wait never exceeds `interval`.
+		if (full && starts[cursor] > now) starts[cursor] = now;
+
+		// The oldest of the last `limit` starts must be `interval` ms old.
+		const wait = full ? starts[cursor] + interval - now : 0;
+
+		if (wait <= 0) {
+			if (full) {
+				starts[cursor] = now;
+				cursor = (cursor + 1) % limit;
+			} else {
+				starts.push(now);
+			}
+		}
+
+		return wait;
+	}
+
+	/**
+	 * Starts waiting calls while the window allows it, then arms a timer for the next one (if any is still waiting).
+	 * @returns {void}
+	 */
+	function drain(): void {
+		timer = undefined;
+		draining = true;
+
+		while (first !== undefined) {
+			const wait = admit();
+
+			if (wait > 0) {
+				timer = setTimeout(drain, wait);
+				break;
+			}
+
+			const call = first;
+
+			first = call.next;
+			pending--;
+			call.start();
+		}
+
+		draining = false;
+	}
+
+	/**
+	 * Clears the timer and rejects every waiting call.
+	 * @param {unknown} reason - The rejection reason
+	 * @returns {void}
+	 */
+	function drop(reason: unknown): void {
+		clearTimeout(timer);
+		timer = undefined;
+
+		let call = first;
+
+		first = undefined;
+		pending = 0;
+		for (; call !== undefined; call = call.next) call.reject(reason);
+	}
+
+	signal?.addEventListener(
+		'abort',
+		function () {
+			drop(abortReason(signal));
+		},
+		{ once: true }
+	);
+
+	/**
+	 * Queues a call (see {@link RateLimiter.schedule}).
+	 * @param {(...args: unknown[]) => unknown} fn - The function to call
+	 * @param {...unknown} args - Its arguments
+	 * @returns {Promise<unknown>} Settles like the call
+	 */
+	function schedule(fn: (...args: unknown[]) => unknown, ...args: unknown[]): Promise<unknown> {
+		return new Promise<unknown>(function (resolve, reject) {
+			assertFunction('RateLimiter.schedule', 'fn', fn);
+			if (signal?.aborted) throw abortReason(signal);
+
+			/**
+			 * Calls `fn` and settles like it.
+			 * @returns {void}
+			 */
+			function start(): void {
+				try {
+					resolve(fn(...args));
+				} catch (error) {
+					reject(error);
+				}
+			}
+
+			// Nothing waits and the window allows it: start now (no timer exists while nothing waits).
+			if (first === undefined && admit() <= 0) {
+				start();
+				return;
+			}
+
+			const call: RateLimitedCall = { start, reject };
+
+			// `last` is stale once the queue has drained, so it is only followed while `first` is set.
+			if (first === undefined) first = call;
+			else (last as RateLimitedCall).next = call;
+			last = call;
+			pending++;
+			// A call scheduled from a starting call is picked up by the running drain loop.
+			if (timer === undefined && !draining) drain();
+		});
+	}
+
+	return {
+		schedule: schedule as RateLimiter['schedule'],
+		wrap<A extends unknown[], T, This = unknown>(fn: (this: This, ...args: A) => PromiseLike<T> | T): (this: This, ...args: A) => Promise<Awaited<T>> {
+			assertFunction('RateLimiter.wrap', 'fn', fn);
+
+			return function rateLimited(this: This, ...args: A): Promise<Awaited<T>> {
+				return schedule(Reflect.apply as (...args: unknown[]) => unknown, fn, this, args) as Promise<Awaited<T>>;
+			};
+		},
+		get pendingCount(): number {
+			return pending;
+		},
+		clearQueue(): void {
+			drop(new AbortError('The call was removed from the rate limiter queue.'));
+		}
+	};
 }
 
 /**
@@ -608,15 +1335,7 @@ export function pollUntil<T>(check: () => T | PromiseLike<T>, options: PollOptio
 		function poll(): void {
 			pollTimer = undefined;
 
-			let outcome: Promise<Awaited<T>>;
-
-			try {
-				outcome = Promise.resolve(check()) as Promise<Awaited<T>>;
-			} catch (error) {
-				outcome = Promise.reject(error);
-			}
-
-			outcome.then(
+			(invoke(check, undefined, []) as Promise<Awaited<T>>).then(
 				function (value) {
 					if (settled) return;
 					if (value) {
@@ -804,6 +1523,154 @@ export function debounceAsync<F extends (...args: never[]) => unknown>(fn: F, wa
 }
 
 /**
+ * Options accepted by {@link memoizeAsync}.
+ * @template F - The memoized function type
+ */
+export interface MemoizeAsyncOptions<F extends AnyFunction> {
+	/** Computes the cache key from the call arguments (`this` is forwarded). Defaults to `defaultMemoizeKey` (from the functions module). */
+	resolver?: (this: ThisParameterType<F>, ...args: Parameters<F>) => unknown;
+	/**
+	 * Where resolved values are stored. Defaults to a new `Map`, or, with `ttl`, to an unbounded `createLRUCache` (from the cache module).
+	 * Pass `createLRUCache({ max })` to bound it. With `ttl`, the cache's `set` is called with `{ ttl }` as its third argument.
+	 */
+	cache?: MemoizeCache<unknown, Awaited<ReturnType<F>>>;
+	/** Time-to-live of every resolved value in milliseconds (`> 0`, or `Infinity`). Defaults to no expiry. */
+	ttl?: number;
+}
+
+/**
+ * An async function memoized with {@link memoizeAsync}.
+ * @template F - The original function type
+ */
+export interface MemoizedAsync<F extends AnyFunction> {
+	(this: ThisParameterType<F>, ...args: Parameters<F>): Promise<Awaited<ReturnType<F>>>;
+	/** The cache of resolved values, keyed by the resolver's result. */
+	readonly cache: MemoizeCache<unknown, Awaited<ReturnType<F>>>;
+	/** Forgets every resolved value and every call in flight (a call in flight still settles its callers, but its value is not cached). */
+	clear(): void;
+	/** Forgets the resolved value and the call in flight for these arguments; returns whether there was one. */
+	delete(...args: Parameters<F>): boolean;
+	/**
+	 * Calls the memoized function (with `this` undefined) but stops waiting when `signal` aborts: this caller's promise rejects with the
+	 * signal's `reason`, while the shared call keeps running for the other callers and still fills the cache. An already-aborted signal
+	 * rejects without calling anything.
+	 */
+	withSignal(signal: AbortSignalLike | null | undefined, ...args: Parameters<F>): Promise<Awaited<ReturnType<F>>>;
+}
+
+/**
+ * Memoizes an async (or promise-returning) function, correctly:
+ * - Single flight: concurrent calls with the same key share one in-flight call instead of starting one each.
+ * - Only resolved values are cached. A rejection (or a synchronous throw) is passed to the callers of that call and then forgotten, so
+ *   the next call retries; `memoize` or `once` on an async function would cache the rejected promise forever.
+ * - `ttl` expires resolved values; `cache` can be any `Map`-like store, such as `createLRUCache` to bound memory.
+ * - `withSignal(signal, ...args)` lets one caller stop waiting without cancelling the work shared with the others.
+ * - `clear()` / `delete(...args)` invalidate: a call in flight at that moment does not write its (possibly stale) value to the cache.
+ * @template F - The type of the function to memoize
+ * @param {F} fn - The function to memoize
+ * @param {MemoizeAsyncOptions<F>} [options] - `resolver` (key function), `cache` and `ttl`
+ * @returns {MemoizedAsync<F>} The memoized function, with `cache`, `clear()`, `delete(...args)` and `withSignal(signal, ...args)`
+ * @throws {TypeError} when `fn` or `resolver` is not a function, or `ttl` is not a number
+ * @throws {RangeError} when `ttl` is not a number > 0
+ * @example
+ * let requests = 0;
+ * async function fetchUser(id: number): Promise<{ id: number }> { requests++; await sleep(5); return { id }; }
+ * const getUser = memoizeAsync(fetchUser, { ttl: 60_000 });
+ * const [a, b] = await Promise.all([getUser(1), getUser(1)]);
+ * a === b; // => true
+ * await getUser(1); // => { id: 1 } // cached
+ * requests; // => 1
+ * @example
+ * let attempts = 0;
+ * const flaky = memoizeAsync(async function (): Promise<string> { attempts++; if (attempts === 1) throw new Error('offline'); return 'ok'; });
+ * await flaky(); // throws Error
+ * await flaky(); // => 'ok' // the rejection was not cached
+ */
+export function memoizeAsync<F extends AnyFunction>(fn: F, options: MemoizeAsyncOptions<F> = {}): MemoizedAsync<F> {
+	const { resolver = defaultMemoizeKey, ttl } = options;
+
+	assertFunction('memoizeAsync', 'fn', fn);
+	assertFunction('memoizeAsync', 'resolver', resolver);
+	if (ttl !== undefined) assertNumber('memoizeAsync', 'ttl', ttl, ttl > 0, 'a number > 0 or Infinity');
+
+	const cache = (options.cache ?? (ttl === undefined ? new Map() : createLRUCache({ max: Infinity, ttl }))) as MemoizeCache<unknown, unknown>;
+	const setOptions = ttl === undefined ? undefined : { ttl };
+	const inflight = new Map<unknown, Promise<unknown>>();
+	const call = fn as unknown as (this: unknown, ...args: unknown[]) => unknown;
+	const key = resolver as unknown as (this: unknown, ...args: unknown[]) => unknown;
+
+	/**
+	 * The memoized wrapper.
+	 * @param {...unknown} args - The call arguments
+	 * @returns {Promise<unknown>} The cached value, the shared call in flight, or a new call
+	 */
+	function memoized(this: unknown, ...args: unknown[]): Promise<unknown> {
+		let id: unknown;
+
+		try {
+			id = key.apply(this, args);
+		} catch (error) {
+			return Promise.reject(error);
+		}
+
+		// Read once, then `has` only for a cached `undefined` (an expiring cache could drop the entry between the two).
+		const cached = cache.get(id);
+		if (cached !== undefined || cache.has(id)) return Promise.resolve(cached);
+
+		let shared = inflight.get(id);
+
+		if (shared === undefined) {
+			const started = invoke(call, this, args);
+
+			// Only the call still registered for this key (not cleared or deleted meanwhile) may write to the cache.
+			started.then(
+				function (value) {
+					if (inflight.get(id) !== started) return;
+					inflight.delete(id);
+					(cache.set as (key: unknown, value: unknown, options?: { ttl: number }) => unknown)(id, value, setOptions);
+				},
+				function () {
+					if (inflight.get(id) === started) inflight.delete(id);
+				}
+			);
+			inflight.set(id, started);
+			shared = started;
+		}
+
+		return shared;
+	}
+
+	Object.defineProperties(memoized, {
+		cache: { value: cache, enumerable: true },
+		clear: {
+			value: function clear(): void {
+				inflight.clear();
+				cache.clear();
+			}
+		},
+		delete: {
+			value: function (...args: unknown[]): boolean {
+				const id = key(...args);
+				const removed = inflight.delete(id);
+
+				return cache.delete(id) || removed;
+			}
+		},
+		withSignal: {
+			value: function withSignal(signal: AbortSignalLike | null | undefined, ...args: unknown[]): Promise<unknown> {
+				return new Promise<unknown>(function (resolve) {
+					assertOptionalSignal('memoizeAsync', 'signal', signal);
+					if (signal?.aborted) throw abortReason(signal);
+					resolve(abortable(memoized(...args), signal));
+				});
+			}
+		}
+	});
+
+	return memoized as unknown as MemoizedAsync<F>;
+}
+
+/**
  * Runs (possibly async) tasks one at a time, in iteration order, and resolves with their results in the same order. Each task is
  * only pulled from the iterable (and started) after the previous one has settled, so lazy iterables and generators are supported.
  * Rejects with the first error, without starting the remaining tasks.
@@ -949,29 +1816,48 @@ export function anySignal(signals: Iterable<AbortSignalLike | null | undefined>)
 		index++;
 	}
 
-	const controller = createAbortController('anySignal');
+	return combineSignals('anySignal', inputs)[0] as PlatformAbortSignal;
+}
+
+/**
+ * Creates a signal that aborts as soon as any of `inputs` aborts (see {@link anySignal}), together with a function that detaches it
+ * from the inputs (removing every listener) once it is no longer needed.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {AbortSignalLike[]} inputs - The signals to combine
+ * @returns {[AbortSignalLike, () => void]} The combined signal and its `release` function
+ * @throws {Error} when the environment has no `AbortController`
+ */
+function combineSignals(caller: string, inputs: AbortSignalLike[]): [AbortSignalLike, () => void] {
+	const controller = createAbortController(caller);
 	const aborted = inputs.find(function (input) {
 		return input.aborted;
 	});
+	const listeners = inputs.map(function (input) {
+		return function onAbort(): void {
+			release();
+			controller.abort(abortReason(input));
+		};
+	});
+
+	/**
+	 * Removes every listener (the first abort does it, so none runs twice).
+	 * @returns {void}
+	 */
+	function release(): void {
+		inputs.forEach(function (input, i) {
+			input.removeEventListener('abort', listeners[i]);
+		});
+	}
 
 	if (aborted !== undefined) {
 		controller.abort(abortReason(aborted));
 	} else {
-		const listeners = inputs.map(function (input) {
-			return function onAbort(): void {
-				inputs.forEach(function (other, i) {
-					other.removeEventListener('abort', listeners[i]);
-				});
-				controller.abort(abortReason(input));
-			};
-		});
 		inputs.forEach(function (input, i) {
-			// The first abort removes every listener, so none runs twice.
 			input.addEventListener('abort', listeners[i]);
 		});
 	}
 
-	return controller.signal as PlatformAbortSignal;
+	return [controller.signal, release];
 }
 
 /**

@@ -1,5 +1,7 @@
 import {
 	after,
+	allPass,
+	anyPass,
 	attempt,
 	before,
 	compose,
@@ -9,12 +11,14 @@ import {
 	defaultMemoizeKey,
 	flip,
 	identity,
+	match,
 	memoize,
 	memoizeLast,
 	negate,
 	noop,
 	once,
 	partial,
+	partialRight,
 	pipe,
 	throttle,
 	times,
@@ -24,6 +28,7 @@ import { memoize as memoizeDecorator } from '@emiliodominguez/tink/decorators';
 import * as esToolkit from 'es-toolkit';
 import * as esCompat from 'es-toolkit/compat';
 import * as lodash from 'lodash-es';
+import * as remeda from 'remeda';
 
 /**
  * A cheap function to wrap, so the benchmarks measure the wrapper rather than the work.
@@ -113,6 +118,63 @@ function wordLength(word) {
 
 // memoize: ours keys a single primitive by itself (like es-toolkit/lodash) and serialises everything else by value (es-toolkit and
 // lodash key objects by identity and ignore every argument but the first), so the object/multi-arg cases are not like for like.
+/**
+ * @param {number} n - A number
+ * @returns {boolean} Whether `n` is positive
+ */
+function isPositive(n) {
+	return n > 0;
+}
+/**
+ * @param {number} n - A number
+ * @returns {boolean} Whether `n` is a multiple of 3
+ */
+function isMultipleOf3(n) {
+	return n % 3 === 0;
+}
+const evenPositive3 = allPass(isEven, isPositive, isMultipleOf3);
+const remedaAll = remeda.allPass([isEven, isPositive, isMultipleOf3]);
+const lodashAll = lodash.overEvery([isEven, isPositive, isMultipleOf3]);
+const evenOrPositive3 = anyPass(isEven, isPositive, isMultipleOf3);
+const remedaAny = remeda.anyPass([isEven, isPositive, isMultipleOf3]);
+const lodashAny = lodash.overSome([isEven, isPositive, isMultipleOf3]);
+const signed = keys.map(function (n) {
+	return n - 50;
+});
+const rightAdd3 = partialRight(add3, 2, 3);
+const esRightAdd3 = esToolkit.partialRight(add3, 2, 3);
+const lodashRightAdd3 = lodash.partialRight(add3, 2, 3);
+const shapes = keys.map(function (n) {
+	return n % 3 === 0 ? { kind: 'circle', radius: n } : n % 3 === 1 ? { kind: 'square', size: n } : { kind: 'rect', width: n, height: 2 };
+});
+const shapeHandlers = {
+	circle: function (shape) {
+		return 3 * shape.radius * shape.radius;
+	},
+	square: function (shape) {
+		return shape.size * shape.size;
+	},
+	rect: function (shape) {
+		return shape.width * shape.height;
+	}
+};
+/**
+ * The hand-written equivalent of `match(shape, 'kind', shapeHandlers)`.
+ * @param {{ kind: string }} shape - A shape
+ * @returns {number} Its area
+ */
+function areaSwitch(shape) {
+	switch (shape.kind) {
+		case 'circle':
+			return 3 * shape.radius * shape.radius;
+		case 'square':
+			return shape.size * shape.size;
+		case 'rect':
+			return shape.width * shape.height;
+		default:
+			throw new Error('unreachable');
+	}
+}
 const memoAdd = memoize(add);
 const esMemoAdd = esToolkit.memoize(add);
 const lodashMemoAdd = lodash.memoize(add);
@@ -693,6 +755,67 @@ export default [
 				}
 				return total;
 			}
+		}
+	},
+	{
+		name: 'partialRight (2 bound args, x100)',
+		fn: function () {
+			let total = 0;
+			for (let i = 0; i < 100; i++) total += rightAdd3(keys[i]);
+			return total;
+		},
+		competitors: {
+			'es-toolkit': function () {
+				let total = 0;
+				for (let i = 0; i < 100; i++) total += esRightAdd3(keys[i]);
+				return total;
+			},
+			lodash: function () {
+				let total = 0;
+				for (let i = 0; i < 100; i++) total += lodashRightAdd3(keys[i]);
+				return total;
+			}
+		}
+	},
+	{
+		name: 'allPass (3 predicates, filter 100)',
+		fn: function () {
+			return signed.filter(evenPositive3);
+		},
+		competitors: {
+			remeda: function () {
+				return signed.filter(remedaAll);
+			},
+			'lodash overEvery': function () {
+				return signed.filter(lodashAll);
+			}
+		}
+	},
+	{
+		name: 'anyPass (3 predicates, filter 100)',
+		fn: function () {
+			return signed.filter(evenOrPositive3);
+		},
+		competitors: {
+			remeda: function () {
+				return signed.filter(remedaAny);
+			},
+			'lodash overSome': function () {
+				return signed.filter(lodashAny);
+			}
+		}
+	},
+	{
+		name: 'match (3 tags, x100)',
+		fn: function () {
+			let total = 0;
+			for (let i = 0; i < 100; i++) total += match(shapes[i], 'kind', shapeHandlers);
+			return total;
+		},
+		baseline: function () {
+			let total = 0;
+			for (let i = 0; i < 100; i++) total += areaSwitch(shapes[i]);
+			return total;
 		}
 	}
 ];

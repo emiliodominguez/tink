@@ -1,4 +1,5 @@
 import { isIterable } from '../guards/index.js';
+import { median } from '../math/index.js';
 import { assertFunction, assertInteger, assertNumber, describe, draw } from '../utils/assert.js';
 import type { RandomGenerator } from '../utils/index.js';
 
@@ -23,7 +24,8 @@ export type FlatDeep<T> = T extends ReadonlyArray<infer U> ? FlatDeep<U> : T;
 export type Zipped<T extends ReadonlyArray<ReadonlyArray<unknown>>> = { -readonly [K in keyof T]: T[K] extends ReadonlyArray<infer U> ? U : never };
 
 /**
- * Values accepted as sort keys by {@link sortBy}.
+ * Values accepted as sort keys by {@link sortBy}. Selectors may also return `null` or `undefined` (a missing key): such keys,
+ * like `NaN` and invalid `Date`s, rank after every other key in both directions.
  */
 export type SortKey = number | string | bigint | Date;
 
@@ -565,12 +567,22 @@ export function uniqueBy<T>(array: ReadonlyArray<T>, keyFn: (item: T, index: num
 }
 
 /**
- * Converts a sort key to a primitive that can be compared with `<`.
- * @param {SortKey} key - The key returned by a `sortBy` selector
- * @returns {number | string | bigint} The key itself, or the timestamp of a `Date`
+ * Converts a sort key to a primitive that can be compared with `<`. Missing keys (`null`, `undefined`) become `NaN`, so that every
+ * unorderable key (`NaN`, invalid `Date`, nullish) is a single kind of value the callers rank last.
+ * @param {SortKey | null | undefined} key - The key returned by a `sortBy` selector
+ * @returns {number | string | bigint} The key itself, the timestamp of a `Date`, or `NaN` for a missing key
  */
-function toComparable(key: SortKey): number | string | bigint {
-	return key instanceof Date ? key.getTime() : key;
+function toComparable(key: SortKey | null | undefined): number | string | bigint {
+	return key instanceof Date ? key.getTime() : (key ?? NaN);
+}
+
+/**
+ * Converts a key returned by a selector with {@link toComparable}, skipping the conversion for numbers (the common case).
+ * @param {SortKey | null | undefined} key - The selected key
+ * @returns {number | string | bigint} The comparable key (`NaN` when unorderable)
+ */
+function rank(key: SortKey | null | undefined): number | string | bigint {
+	return typeof key === 'number' ? key : toComparable(key);
 }
 
 /**
@@ -587,6 +599,54 @@ function compareKeys(a: number | string | bigint, b: number | string | bigint): 
 }
 
 /**
+ * The total order shared by the ranking helpers: comparable keys in the given direction, and `NaN` (unorderable) keys after
+ * all of them in BOTH directions, equal to each other.
+ * @param {number | string | bigint} a - The first comparable key
+ * @param {number | string | bigint} b - The second comparable key
+ * @param {number} direction - `1` for ascending, `-1` for descending
+ * @returns {number} A negative number, zero or a positive number
+ */
+function compareRanked(a: number | string | bigint, b: number | string | bigint, direction: number): number {
+	if (a !== a) return b !== b ? 0 : 1;
+	return b !== b ? -1 : direction * compareKeys(a, b);
+}
+
+/**
+ * Validates a sort direction.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {string} name - Name of the validated parameter
+ * @param {unknown} order - The direction to validate
+ * @param {number} [index] - Position of `order` in the `name` array, if it is an item of one
+ * @returns {number} `1` for `'asc'`, `-1` for `'desc'`
+ * @throws {RangeError} when `order` is neither `'asc'` nor `'desc'`
+ */
+function toDirection(caller: string, name: string, order: unknown, index?: number): number {
+	if (order === 'asc' || order === 'desc') return order === 'asc' ? 1 : -1;
+	throw new RangeError(`${caller}: \`${index === undefined ? name : `${name}[${index}]`}\` must be 'asc' or 'desc', got ${String(order)}`);
+}
+
+/**
+ * Sorts an array of indices in place, stably. Short arrays (the fixed cost of `Array.prototype.sort` with a comparator dominates
+ * for them) are insertion-sorted, up to twice as fast.
+ * @param {number[]} indices - The indices to sort
+ * @param {Comparator<number>} compare - Compares two indices
+ * @returns {void}
+ */
+function stableSort(indices: number[], compare: Comparator<number>): void {
+	if (indices.length > 12) {
+		indices.sort(compare);
+		return;
+	}
+	for (let i = 1; i < indices.length; i++) {
+		const index = indices[i];
+		let j = i;
+		// Strictly greater: an equal item stays after the earlier ones, which keeps the sort stable.
+		for (; j > 0 && compare(indices[j - 1], index) > 0; j--) indices[j] = indices[j - 1];
+		indices[j] = index;
+	}
+}
+
+/**
  * Return a sorted copy of an array, ordered by the key `selector` returns for each item. The sort is stable
  * (items with equal keys keep their relative order, in both directions) and the selector is called once per item.
  *
@@ -594,10 +654,12 @@ function compareKeys(a: number | string | bigint, b: number | string | bigint): 
  * - numbers and bigints compare numerically (and may be mixed); `Date`s compare by timestamp;
  * - strings compare by UTF-16 code units with plain `<` (not `localeCompare`), so `'B' < 'a'`;
  * - numeric keys sort before string keys when both kinds are mixed;
- * - `NaN` keys and invalid `Date`s always go last, whatever the order.
+ * - `NaN` keys, invalid `Date`s and missing (`null`/`undefined`) keys always go last, whatever the order, in input order.
+ *
+ * Use {@link orderBy} to sort by several keys.
  * @template T
  * @param {ReadonlyArray<T>} array - The items to sort (not mutated)
- * @param {(item: T, index: number) => SortKey} selector - Returns the sort key of an item
+ * @param {(item: T, index: number) => SortKey | null | undefined} selector - Returns the sort key of an item
  * @param {SortOrder} [order='asc'] - `'asc'` for ascending or `'desc'` for descending keys
  * @returns {T[]} A new sorted array
  * @throws {TypeError} when `selector` is not a function
@@ -605,10 +667,11 @@ function compareKeys(a: number | string | bigint, b: number | string | bigint): 
  * @example
  * sortBy([{ n: 'b' }, { n: 'a' }], function (o) { return o.n; }); // => [{ n: 'a' }, { n: 'b' }]
  * sortBy([1, 3, 2], function (n) { return n; }, 'desc'); // => [3, 2, 1]
+ * sortBy([{ n: 2 }, {}, { n: 1 }], function (o: { n?: number }) { return o.n; }); // => [{ n: 1 }, { n: 2 }, {}]
  */
-export function sortBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey, order: SortOrder = 'asc'): T[] {
+export function sortBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey | null | undefined, order: SortOrder = 'asc'): T[] {
 	assertFunction('sortBy', 'selector', selector);
-	if (order !== 'asc' && order !== 'desc') throw new RangeError(`sortBy: \`order\` must be 'asc' or 'desc', got ${String(order)}`);
+	toDirection('sortBy', 'order', order);
 	const length = array.length;
 	const keys: Array<number | string | bigint> = [];
 	// Indices of the items to sort, then of the items with a NaN key (they keep their input order, after all the others).
@@ -621,8 +684,9 @@ export function sortBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: nu
 		keys.push(key);
 		(key !== key ? unordered : sorted).push(i);
 	}
-	// `sort` is stable and `sorted` is in input order, so items with equal keys keep their relative order.
-	sorted.sort(
+	// The sort is stable and `sorted` is in input order, so items with equal keys keep their relative order.
+	stableSort(
+		sorted,
 		order === 'asc'
 			? function (x: number, y: number): number {
 					return compareKeys(keys[x], keys[y]);
@@ -653,9 +717,9 @@ export function shuffle<T>(array: ReadonlyArray<T>, random: RandomGenerator = Ma
 	const result = Array.from(array);
 	for (let i = result.length - 1; i > 0; i--) {
 		const j = Math.floor(draw('shuffle', random) * (i + 1));
-		const swap = result[i];
+		const held = result[i];
 		result[i] = result[j];
-		result[j] = swap;
+		result[j] = held;
 	}
 	return result;
 }
@@ -798,14 +862,14 @@ export function pairwise<T>(array: ReadonlyArray<T>): Array<[T, T]> {
  * Shared worker of {@link minBy} and {@link maxBy}: the first item whose key is extreme in the given direction.
  * @template T
  * @param {ReadonlyArray<T>} array - The items to inspect
- * @param {(item: T, index: number) => SortKey} selector - Returns the key of an item
+ * @param {(item: T, index: number) => SortKey | null | undefined} selector - Returns the key of an item
  * @param {number} direction - `-1` to find the smallest key, `1` to find the largest
  * @returns {T | undefined} The first item with the extreme key, or `undefined` when there is no non-NaN key
  */
-function extremeBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey, direction: number): T | undefined {
+function extremeBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey | null | undefined, direction: number): T | undefined {
 	let best: T | undefined;
 	let bestKey: number | string | bigint = NaN;
-	let selected: SortKey = NaN;
+	let selected: SortKey | null | undefined = NaN;
 	let i = 0;
 	// Fast path while the keys are numbers (the common case): find the first non-NaN key...
 	for (; i < array.length; i++) {
@@ -845,11 +909,11 @@ function extremeBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number
 /**
  * Return the item with the SMALLEST key, using the same ordering rules as {@link sortBy}
  * (numbers/bigints numerically and before strings, strings by UTF-16 code units, `Date`s by timestamp).
- * On ties the FIRST such item wins. Items whose key is `NaN` (or an invalid `Date`) are ignored.
+ * On ties the FIRST such item wins. Items whose key is `NaN`, an invalid `Date`, `null` or `undefined` are ignored.
  * The selector is called exactly once per item.
  * @template T
  * @param {ReadonlyArray<T>} array - The items to inspect
- * @param {(item: T, index: number) => SortKey} selector - Returns the key of an item
+ * @param {(item: T, index: number) => SortKey | null | undefined} selector - Returns the key of an item
  * @returns {T | undefined} The first item with the smallest key, or `undefined` when the array is empty or every key is `NaN`
  * @throws {TypeError} when `selector` is not a function
  * @example
@@ -857,7 +921,7 @@ function extremeBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number
  * minBy(items, function (o) { return o.n; }) === items[1]; // => true // ties keep the first
  * minBy([NaN, 2], function (n) { return n; }); // => 2
  */
-export function minBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey): T | undefined {
+export function minBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey | null | undefined): T | undefined {
 	assertFunction('minBy', 'selector', selector);
 	return extremeBy(array, selector, -1);
 }
@@ -865,18 +929,18 @@ export function minBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: num
 /**
  * Return the item with the LARGEST key, using the same ordering rules as {@link sortBy}
  * (numbers/bigints numerically and before strings, strings by UTF-16 code units, `Date`s by timestamp).
- * On ties the FIRST such item wins. Items whose key is `NaN` (or an invalid `Date`) are ignored.
+ * On ties the FIRST such item wins. Items whose key is `NaN`, an invalid `Date`, `null` or `undefined` are ignored.
  * The selector is called exactly once per item.
  * @template T
  * @param {ReadonlyArray<T>} array - The items to inspect
- * @param {(item: T, index: number) => SortKey} selector - Returns the key of an item
+ * @param {(item: T, index: number) => SortKey | null | undefined} selector - Returns the key of an item
  * @returns {T | undefined} The first item with the largest key, or `undefined` when the array is empty or every key is `NaN`
  * @throws {TypeError} when `selector` is not a function
  * @example
  * maxBy([{ n: 3 }, { n: 7 }], function (o) { return o.n; }); // => { n: 7 }
  * maxBy(['b', 'a', 'B'], function (s) { return s; }); // => 'b'
  */
-export function maxBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey): T | undefined {
+export function maxBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey | null | undefined): T | undefined {
 	assertFunction('maxBy', 'selector', selector);
 	return extremeBy(array, selector, 1);
 }
@@ -896,6 +960,20 @@ export function maxBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: num
  */
 export function sumBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => number): number {
 	assertFunction('sumBy', 'selector', selector);
+	return scaledSum(array, selector, 1);
+}
+
+/**
+ * Neumaier sum of the selected numbers divided by `divisor`, the division being applied to the running total and to the compensation
+ * separately: this is the compensated sum itself for `divisor = 1`, and makes the mean of {@link averageBy} more accurate than dividing
+ * the rounded sum (`0.1`, `0.2`, `0.3` average to `0.2`, not `0.19999999999999998`).
+ * @template T
+ * @param {ReadonlyArray<T>} array - The items to add up
+ * @param {(item: T, index: number) => number} selector - Returns the number contributed by an item
+ * @param {number} divisor - What the sum is divided by
+ * @returns {number} The scaled sum
+ */
+function scaledSum<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => number, divisor: number): number {
 	// Neumaier summation inlined (same algorithm and result as `sum`), so no intermediate array of keys is allocated.
 	let total = 0;
 	let compensation = 0;
@@ -905,7 +983,7 @@ export function sumBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: num
 		compensation += Math.abs(total) >= Math.abs(value) ? total - next + value : value - next + total;
 		total = next;
 	}
-	return Number.isFinite(total) ? total + compensation : total;
+	return Number.isFinite(total) ? total / divisor + compensation / divisor : total / divisor;
 }
 
 /**
@@ -1014,17 +1092,18 @@ function naturalCompare(a: unknown, b: unknown): number {
 }
 
 /**
- * Binary search for the lowest index at which `value` could be inserted while keeping `sortedArray` sorted.
+ * Binary search for the lowest (or highest) index at which `value` could be inserted while keeping `sortedArray` sorted.
  * @template T
  * @param {string} caller - Name of the public function, used in the error message
  * @param {ReadonlyArray<T>} sortedArray - An array sorted according to `compare`
  * @param {T} value - The value to locate
  * @param {Comparator<T> | undefined} compare - The comparator (`undefined` for the natural `<` order)
- * @returns {[number, Comparator<T>]} The lower-bound index and the comparator actually used
+ * @param {boolean} [upper=false] - Whether to return the upper bound (after the items comparing equal) instead of the lower one
+ * @returns {[number, Comparator<T>]} The bound and the comparator actually used
  * @throws {TypeError} when `compare` is given but is not a function
  * @throws {RangeError} when `value` is `NaN` and no comparator is given
  */
-function lowerBound<T>(caller: string, sortedArray: ReadonlyArray<T>, value: T, compare: Comparator<T> | undefined): [number, Comparator<T>] {
+function searchBound<T>(caller: string, sortedArray: ReadonlyArray<T>, value: T, compare: Comparator<T> | undefined, upper = false): [number, Comparator<T>] {
 	if (compare === undefined) {
 		if (Number.isNaN(value)) throw new RangeError(`${caller}: \`value\` must not be NaN when no comparator is given, got NaN`);
 	} else assertFunction(caller, 'compare', compare);
@@ -1033,7 +1112,8 @@ function lowerBound<T>(caller: string, sortedArray: ReadonlyArray<T>, value: T, 
 	let high = sortedArray.length;
 	while (low < high) {
 		const middle = (low + high) >>> 1;
-		if (order(sortedArray[middle], value) < 0) low = middle + 1;
+		const comparison = order(sortedArray[middle], value);
+		if (comparison < 0 || (upper && comparison === 0)) low = middle + 1;
 		else high = middle;
 	}
 	return [low, order];
@@ -1079,7 +1159,7 @@ export function sortedIndex<T>(sortedArray: ReadonlyArray<T>, value: T, compare:
  * sortedIndex([1, 3], 2); // => 1
  */
 export function sortedIndex<T>(sortedArray: ReadonlyArray<T>, value: T, compare?: Comparator<T>): number {
-	return lowerBound('sortedIndex', sortedArray, value, compare)[0];
+	return searchBound('sortedIndex', sortedArray, value, compare)[0];
 }
 
 /**
@@ -1121,7 +1201,7 @@ export function binarySearch<T>(sortedArray: ReadonlyArray<T>, value: T, compare
  * binarySearch([1, 3], 3); // => 1
  */
 export function binarySearch<T>(sortedArray: ReadonlyArray<T>, value: T, compare?: Comparator<T>): number {
-	const [index, order] = lowerBound('binarySearch', sortedArray, value, compare);
+	const [index, order] = searchBound('binarySearch', sortedArray, value, compare);
 	return index < sortedArray.length && order(sortedArray[index], value) === 0 ? index : -1;
 }
 
@@ -1526,4 +1606,1024 @@ export function longestCommonSubsequence<T>(a: Iterable<T>, b: Iterable<T>, equa
 		if (operation.type === 'equal') common.push(operation.value);
 	}
 	return common;
+}
+
+/**
+ * Like {@link union}, but items are compared by the key `keyFn` returns (SameValueZero): every item of `a`, then of `b`, whose key
+ * was not seen before, so only the FIRST item per key is kept. `unionBy(a, b, identity)` equals `union(a, b)`.
+ * `keyFn` is called once per item of both iterables.
+ * @template T - The item type of `a`
+ * @template U - The item type of `b`
+ * @param {Iterable<T>} a - The first items
+ * @param {Iterable<U>} b - The second items
+ * @param {(item: T | U) => unknown} keyFn - Returns the identity key of an item of either iterable
+ * @returns {Array<T | U>} One item per distinct key, in first-appearance order
+ * @throws {TypeError} when `keyFn` is not a function
+ * @example
+ * unionBy([{ id: 1 }, { id: 2 }], [{ id: 2 }, { id: 3 }], function (o) { return o.id; }); // => [{ id: 1 }, { id: 2 }, { id: 3 }]
+ * unionBy([1.2, 2.5], [2.1, 3.4], Math.floor); // => [1.2, 2.5, 3.4]
+ */
+export function unionBy<T, U = T>(a: Iterable<T>, b: Iterable<U>, keyFn: (item: T | U) => unknown): Array<T | U> {
+	assertFunction('unionBy', 'keyFn', keyFn);
+	const seen = new Set<unknown>();
+	const result: Array<T | U> = [];
+	for (const items of [a, b] as Array<Iterable<T | U>>) {
+		for (const item of items) {
+			const key = keyFn(item);
+			if (!seen.has(key)) {
+				seen.add(key);
+				result.push(item);
+			}
+		}
+	}
+	return result;
+}
+
+/**
+ * Appends to `result` the items whose key is not in `excluded`, adding each appended key to `excluded` (so one item per key).
+ * @template T
+ * @param {ReadonlyArray<T>} items - The items
+ * @param {unknown[]} keys - The key of each item
+ * @param {Set<unknown>} excluded - Keys to skip; grows with every appended item
+ * @param {T[]} result - The array appended to
+ * @returns {T[]} `result`
+ */
+function keepNew<T>(items: ReadonlyArray<T>, keys: unknown[], excluded: Set<unknown>, result: T[]): T[] {
+	for (let i = 0; i < items.length; i++) {
+		if (!excluded.has(keys[i])) {
+			excluded.add(keys[i]);
+			result.push(items[i]);
+		}
+	}
+	return result;
+}
+
+/**
+ * Like {@link symmetricDifference}, but items are compared by the key `keyFn` returns (SameValueZero): the items of `a` whose key
+ * is not the key of any item of `b`, followed by the items of `b` whose key is not the key of any item of `a`, keeping only the
+ * FIRST item per key. `keyFn` is called once per item of both iterables.
+ * @template T - The item type of `a`
+ * @template U - The item type of `b`
+ * @param {Iterable<T>} a - The first items
+ * @param {Iterable<U>} b - The second items
+ * @param {(item: T | U) => unknown} keyFn - Returns the identity key of an item of either iterable
+ * @returns {Array<T | U>} The items whose key appears in exactly one of the iterables, in first-appearance order
+ * @throws {TypeError} when `keyFn` is not a function
+ * @example
+ * symmetricDifferenceBy([{ id: 1 }, { id: 2 }], [{ id: 2 }, { id: 3 }], function (o) { return o.id; }); // => [{ id: 1 }, { id: 3 }]
+ */
+export function symmetricDifferenceBy<T, U = T>(a: Iterable<T>, b: Iterable<U>, keyFn: (item: T | U) => unknown): Array<T | U> {
+	assertFunction('symmetricDifferenceBy', 'keyFn', keyFn);
+	const left = Array.from(a);
+	const right = Array.from(b);
+	const leftKeys = keyList(left, keyFn);
+	const rightKeys = keyList(right, keyFn);
+	// Emitted keys join the set of the side they are tested against, which keeps one item per key without another Set.
+	const result = keepNew<T | U>(left, leftKeys, new Set(rightKeys), []);
+	return keepNew(right, rightKeys, new Set(leftKeys), result);
+}
+
+/**
+ * Appends to `result` the items not `equals` to an item already in it.
+ * @template T
+ * @param {Iterable<T>} items - The candidates
+ * @param {(x: T, y: T) => boolean} equals - The equality (`x` is the candidate, `y` an item already kept)
+ * @param {T[]} result - The array appended to
+ * @returns {T[]} `result`
+ */
+function keepDistinct<T>(items: Iterable<T>, equals: (x: T, y: T) => boolean, result: T[]): T[] {
+	// The scans are inlined in the comparator-based helpers: a shared scanning function is not inlined by V8, which halves their speed.
+	for (const item of items) {
+		let i = 0;
+		while (i < result.length && !equals(item, result[i])) i++;
+		if (i === result.length) result.push(item);
+	}
+	return result;
+}
+
+/**
+ * Remove the items `equals` to an earlier item, keeping the first occurrence: {@link removeDuplicates} with a custom equality, for
+ * values that have no identity key (e.g. points within a tolerance). It compares every pair, in O(n²): when a key exists, prefer
+ * {@link uniqueBy}, which is O(n).
+ * @template T
+ * @param {Iterable<T>} iterable - The items to deduplicate
+ * @param {(x: T, y: T) => boolean} equals - Whether two items are duplicates (`x` is the candidate, `y` an item already kept)
+ * @returns {T[]} A new array of distinct items, in first-appearance order
+ * @throws {TypeError} when `equals` is not a function
+ * @example
+ * uniqueWith([1, 1.05, 2, 1.9], function (x, y) { return Math.abs(x - y) < 0.2; }); // => [1, 2]
+ */
+export function uniqueWith<T>(iterable: Iterable<T>, equals: (x: T, y: T) => boolean): T[] {
+	assertFunction('uniqueWith', 'equals', equals);
+	return keepDistinct(iterable, equals, []);
+}
+
+/**
+ * {@link union} with a custom equality: every item of `a`, then of `b`, not `equals` to an item already kept (first occurrence
+ * wins). O(n²) in the total number of items: when a key exists, prefer {@link unionBy}, which is linear.
+ * @template T - The item type of `a`
+ * @template U - The item type of `b`
+ * @param {Iterable<T>} a - The first items
+ * @param {Iterable<U>} b - The second items
+ * @param {(x: T | U, y: T | U) => boolean} equals - Whether two items are the same (`x` is the candidate, `y` an item already kept)
+ * @returns {Array<T | U>} The distinct items of both iterables, in first-appearance order
+ * @throws {TypeError} when `equals` is not a function
+ * @example
+ * unionWith([{ x: 1, y: 2 }], [{ x: 1, y: 2 }, { x: 3, y: 4 }], function (p, q) { return p.x === q.x && p.y === q.y; }); // => [{ x: 1, y: 2 }, { x: 3, y: 4 }]
+ */
+export function unionWith<T, U = T>(a: Iterable<T>, b: Iterable<U>, equals: (x: T | U, y: T | U) => boolean): Array<T | U> {
+	assertFunction('unionWith', 'equals', equals);
+	return keepDistinct<T | U>(b, equals, keepDistinct<T | U>(a, equals, []));
+}
+
+/**
+ * {@link difference} with a custom equality: the items of `a` not `equals` to any item of `b`, keeping only the first of several
+ * items of `a` that are `equals` to each other. O(n·m): when a key exists, prefer {@link differenceBy}, which is linear.
+ * @template T - The item type of `a`
+ * @template U - The item type of `b`
+ * @param {Iterable<T>} a - The items to take from (defines the output order)
+ * @param {Iterable<U>} b - The items to exclude
+ * @param {(x: T, y: T | U) => boolean} equals - Whether two items are the same (`x` is always an item of `a`; `y` is an item of `b`, or an item of `a` already kept)
+ * @returns {T[]} The distinct items of `a` with no equal in `b`, in first-appearance order
+ * @throws {TypeError} when `equals` is not a function
+ * @example
+ * differenceWith([{ x: 1 }, { x: 2 }], [{ x: 2 }], function (p, q) { return p.x === q.x; }); // => [{ x: 1 }]
+ */
+export function differenceWith<T, U = T>(a: Iterable<T>, b: Iterable<U>, equals: (x: T, y: T | U) => boolean): T[] {
+	assertFunction('differenceWith', 'equals', equals);
+	// Kept items join the exclusion list, which removes later duplicates of them in the same pass.
+	const excluded: Array<T | U> = Array.isArray(b) ? b.slice() : Array.from(b);
+	const result: T[] = [];
+	for (const item of a) {
+		let i = 0;
+		while (i < excluded.length && !equals(item, excluded[i])) i++;
+		if (i === excluded.length) {
+			excluded.push(item);
+			result.push(item);
+		}
+	}
+	return result;
+}
+
+/**
+ * {@link intersection} with a custom equality: the items of `a` `equals` to some item of `b`, keeping only the first of several
+ * items of `a` that are `equals` to each other. O(n·m): when a key exists, prefer {@link intersectionBy}, which is linear.
+ * @template T - The item type of `a`
+ * @template U - The item type of `b`
+ * @param {Iterable<T>} a - The items to take from (defines the output order)
+ * @param {Iterable<U>} b - The items to match
+ * @param {(x: T, y: T | U) => boolean} equals - Whether two items are the same (`x` is always an item of `a`; `y` is an item of `b`, or an item of `a` already kept)
+ * @returns {T[]} The distinct items of `a` with an equal in `b`, in first-appearance order
+ * @throws {TypeError} when `equals` is not a function
+ * @example
+ * intersectionWith([{ x: 1 }, { x: 2 }], [{ x: 2 }], function (p, q) { return p.x === q.x; }); // => [{ x: 2 }]
+ */
+export function intersectionWith<T, U = T>(a: Iterable<T>, b: Iterable<U>, equals: (x: T, y: T | U) => boolean): T[] {
+	assertFunction('intersectionWith', 'equals', equals);
+	const candidates: ReadonlyArray<U> = Array.isArray(b) ? b : Array.from(b);
+	const result: T[] = [];
+	for (const item of a) {
+		let i = 0;
+		while (i < candidates.length && !equals(item, candidates[i])) i++;
+		if (i === candidates.length) continue;
+		let j = 0;
+		while (j < result.length && !equals(item, result[j])) j++;
+		if (j === result.length) result.push(item);
+	}
+	return result;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Ordering and ranking
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Return a sorted copy of an array, ordered by several keys: by the first selector's key, then items with equal first keys by the
+ * second selector's key, and so on, each key in its own direction. The sort is stable (items with equal keys in all selectors keep
+ * their input order) and each selector is called exactly once per item, not once per comparison.
+ *
+ * Every key follows the ordering rules of {@link sortBy}, which make the order TOTAL and deterministic: numbers/bigints numerically
+ * and before strings, strings by UTF-16 code units, `Date`s by timestamp, and `NaN`, invalid `Date`s, `null` and `undefined` keys
+ * after every other key in BOTH directions (equal to each other, so the next selector decides between them).
+ * @template T
+ * @param {ReadonlyArray<T>} array - The items to sort (not mutated)
+ * @param {ReadonlyArray<(item: T, index: number) => SortKey | null | undefined>} selectors - Return the keys of an item, most significant first (none: a plain copy)
+ * @param {SortOrder | ReadonlyArray<SortOrder>} [orders='asc'] - One direction for all keys, or one per selector (missing trailing ones are `'asc'`)
+ * @returns {T[]} A new sorted array
+ * @throws {TypeError} when `selectors` is not an array of functions, or `orders` is neither a direction nor an array
+ * @throws {RangeError} when a direction is neither `'asc'` nor `'desc'`, or there are more directions than selectors
+ * @example
+ * const users = [{ name: 'bo', age: 30 }, { name: 'al', age: 25 }, { name: 'cy', age: 30 }];
+ * orderBy(users, [function (u) { return u.age; }, function (u) { return u.name; }], ['desc', 'asc']); // => [{ name: 'bo', age: 30 }, { name: 'cy', age: 30 }, { name: 'al', age: 25 }]
+ * orderBy([3, NaN, 1], [function (n) { return n; }]); // => [1, 3, NaN]
+ */
+export function orderBy<T>(
+	array: ReadonlyArray<T>,
+	selectors: ReadonlyArray<(item: T, index: number) => SortKey | null | undefined>,
+	orders: SortOrder | ReadonlyArray<SortOrder> = 'asc'
+): T[] {
+	if (!Array.isArray(selectors)) throw new TypeError(`orderBy: \`selectors\` must be an array of functions, got ${describe(selectors)}`);
+	const single = typeof orders === 'string';
+	if (!single && !Array.isArray(orders)) throw new TypeError(`orderBy: \`orders\` must be 'asc', 'desc' or an array of them, got ${describe(orders)}`);
+	const count = selectors.length;
+	if (!single && orders.length > count) throw new RangeError(`orderBy: \`orders\` must not be longer than \`selectors\` (${count}), got ${orders.length} directions`);
+	const shared = single ? toDirection('orderBy', 'orders', orders) : 0;
+	const directions: number[] = [];
+	for (let k = 0; k < count; k++) {
+		// The parameter names are only formatted on failure.
+		if (typeof selectors[k] !== 'function') assertFunction('orderBy', `selectors[${k}]`, selectors[k]);
+		directions.push(single ? shared : toDirection('orderBy', 'orders', orders[k] ?? 'asc', k));
+	}
+	if (count === 1) return sortBy(array, selectors[0], directions[0] === 1 ? 'asc' : 'desc');
+	const length = array.length;
+	// Decorate: the keys of item `i` are `keys[i * count]` to `keys[i * count + count - 1]`.
+	const keys: Array<number | string | bigint> = [];
+	const indices: number[] = [];
+	for (let i = 0; i < length; i++) {
+		for (let k = 0; k < count; k++) keys.push(rank(selectors[k](array[i], i)));
+		indices.push(i);
+	}
+	// The sort is stable and `indices` is in input order, so items with equal keys keep their relative order.
+	stableSort(indices, function (x: number, y: number): number {
+		for (let k = 0; k < count; k++) {
+			const comparison = compareRanked(keys[x * count + k], keys[y * count + k], directions[k]);
+			if (comparison !== 0) return comparison;
+		}
+		return 0;
+	});
+	const result = new Array<T>(length);
+	for (let i = 0; i < length; i++) result[i] = array[indices[i]];
+	return result;
+}
+
+/**
+ * Restores the heap property of `heap[from..size)` from position `position` down: the root holds the WORST ranked entry.
+ * Entries are item indices, ranked by their key (`compareRanked`) then by index (later is worse), a strict total order.
+ * @param {number[]} heap - Item indices
+ * @param {Array<number | string | bigint>} keys - The comparable key of each heap slot (parallel to `heap`)
+ * @param {number} size - The number of entries in the heap
+ * @param {number} position - The slot to sift down
+ * @param {number} dir - `1` for ascending, `-1` for descending
+ * @returns {void}
+ */
+function siftDown(heap: number[], keys: Array<number | string | bigint>, size: number, position: number, dir: number): void {
+	for (;;) {
+		let worst = position;
+		for (let child = 2 * position + 1; child <= 2 * position + 2 && child < size; child++) {
+			const comparison = compareRanked(keys[child], keys[worst], dir);
+			if (comparison > 0 || (comparison === 0 && heap[child] > heap[worst])) worst = child;
+		}
+		if (worst === position) return;
+		const index = heap[position];
+		const key = keys[position];
+		heap[position] = heap[worst];
+		keys[position] = keys[worst];
+		heap[worst] = index;
+		keys[worst] = key;
+		position = worst;
+	}
+}
+
+/**
+ * Selects the `size` best-ranked items in O(n log size) with a bounded heap.
+ * @template T
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {ReadonlyArray<T>} array - The items
+ * @param {number} size - How many items to keep (an integer in `[0, length]`)
+ * @param {(item: T, index: number) => SortKey | null | undefined} selector - Returns the key of an item
+ * @param {SortOrder} order - The direction
+ * @returns {[number[], Array<number | string | bigint>, number]} The heap of item indices (worst at the root), their keys, and the direction
+ * @throws {TypeError} when `selector` is not a function
+ * @throws {RangeError} when `order` is neither `'asc'` nor `'desc'`
+ */
+function selectBest<T>(
+	caller: string,
+	array: ReadonlyArray<T>,
+	size: number,
+	selector: (item: T, index: number) => SortKey | null | undefined,
+	order: SortOrder
+): [number[], Array<number | string | bigint>, number] {
+	assertFunction(caller, 'selector', selector);
+	const dir = toDirection(caller, 'order', order);
+	const heap: number[] = [];
+	const keys: Array<number | string | bigint> = [];
+	if (size === 0) return [heap, keys, dir];
+	for (let i = 0; i < size; i++) {
+		heap.push(i);
+		keys.push(rank(selector(array[i], i)));
+	}
+	for (let position = (size >> 1) - 1; position >= 0; position--) siftDown(heap, keys, size, position, dir);
+	for (let i = size; i < array.length; i++) {
+		const key = rank(selector(array[i], i));
+		// A later item replaces the root only when STRICTLY better ranked, so ties keep the earlier item (stability).
+		if (compareRanked(key, keys[0], dir) < 0) {
+			heap[0] = i;
+			keys[0] = key;
+			siftDown(heap, keys, size, 0, dir);
+		}
+	}
+	return [heap, keys, dir];
+}
+
+/**
+ * Return the `n` first items of `sortBy(array, selector, order)` without sorting the whole array: a bounded heap selects them in
+ * O(length · log n), then only they are sorted. Same ordering rules as {@link sortBy} (stable on ties, `NaN`/invalid `Date`/nullish
+ * keys last in both directions), so the result always equals `sortBy(array, selector, order).slice(0, n)`.
+ * The selector is called exactly once per item. Use `'desc'` for the `n` largest ("top N").
+ * @template T
+ * @param {ReadonlyArray<T>} array - The items to rank (not mutated)
+ * @param {number} n - How many items to return (a non-negative integer; all of them when larger than the array)
+ * @param {(item: T, index: number) => SortKey | null | undefined} selector - Returns the ranking key of an item
+ * @param {SortOrder} [order='asc'] - `'asc'` for the smallest keys first, `'desc'` for the largest first
+ * @returns {T[]} A new array of at most `n` items, in rank order
+ * @throws {TypeError} when `n` is not a number or `selector` is not a function
+ * @throws {RangeError} when `n` is not a non-negative integer, or `order` is neither `'asc'` nor `'desc'`
+ * @example
+ * const scores = [{ id: 'a', score: 7 }, { id: 'b', score: 9 }, { id: 'c', score: 8 }];
+ * takeFirstBy(scores, 2, function (s) { return s.score; }, 'desc'); // => [{ id: 'b', score: 9 }, { id: 'c', score: 8 }]
+ * takeFirstBy([5, NaN, 1, 3], 3, function (n) { return n; }); // => [1, 3, 5]
+ */
+export function takeFirstBy<T>(array: ReadonlyArray<T>, n: number, selector: (item: T, index: number) => SortKey | null | undefined, order: SortOrder = 'asc'): T[] {
+	assertInteger('takeFirstBy', 'n', n, 0);
+	if (n >= array.length) {
+		// Every item is taken: a plain sort is cheaper than the heap.
+		assertFunction('takeFirstBy', 'selector', selector);
+		toDirection('takeFirstBy', 'order', order);
+		return sortBy(array, selector, order);
+	}
+	const [heap, keys, dir] = selectBest('takeFirstBy', array, n, selector, order);
+	const slots = range(heap.length);
+	stableSort(slots, function (x: number, y: number): number {
+		return compareRanked(keys[x], keys[y], dir) || heap[x] - heap[y];
+	});
+	return slots.map(function (slot: number): T {
+		return array[heap[slot]];
+	});
+}
+
+/**
+ * Return the item at position `index` of `sortBy(array, selector, order)` without sorting the whole array (a bounded heap of
+ * `position + 1` items, O(length · log position)): `0` is the first ranked item, `1` the second... Negative indices count from the end
+ * like `Array.prototype.at` (`-1` is the last ranked item). Same ordering rules as {@link sortBy}: stable on ties, and `NaN`/invalid
+ * `Date`/nullish keys ranked last in both directions. The selector is called exactly once per item.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The items to rank (not mutated)
+ * @param {number} index - The rank to return, an integer (negative counts from the end)
+ * @param {(item: T, index: number) => SortKey | null | undefined} selector - Returns the ranking key of an item
+ * @param {SortOrder} [order='asc'] - `'asc'` to rank the smallest keys first, `'desc'` the largest first
+ * @returns {T | undefined} The item at that rank, or `undefined` when `index` is out of range
+ * @throws {TypeError} when `index` is not a number or `selector` is not a function
+ * @throws {RangeError} when `index` is not an integer, or `order` is neither `'asc'` nor `'desc'`
+ * @example
+ * nthBy([40, 10, 30, 20], 1, function (n) { return n; }); // => 20
+ * nthBy([40, 10, 30, 20], 0, function (n) { return n; }, 'desc'); // => 40
+ * nthBy([40, 10, 30, 20], -1, function (n) { return n; }); // => 40
+ * nthBy([1, 2], 5, function (n) { return n; }); // => undefined
+ */
+export function nthBy<T>(array: ReadonlyArray<T>, index: number, selector: (item: T, index: number) => SortKey | null | undefined, order: SortOrder = 'asc'): T | undefined {
+	assertNumber('nthBy', 'index', index, Number.isInteger(index), 'an integer');
+	const position = index < 0 ? array.length + index : index;
+	// Out-of-range positions still validate `selector` and `order`, through a selection of no item.
+	const [heap] = selectBest('nthBy', array, position >= 0 && position < array.length ? position + 1 : 0, selector, order);
+	// The root of the heap of the `position + 1` best items is the worst of them: the item at `position`.
+	return heap.length === 0 ? undefined : array[heap[0]];
+}
+
+/**
+ * Shared worker of {@link sortedIndexBy} and {@link sortedLastIndexBy}.
+ * @template T
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {ReadonlyArray<T>} sortedArray - Items sorted as `sortBy(sortedArray, selector, order)` would
+ * @param {T} value - The item to locate
+ * @param {(item: T) => SortKey | null | undefined} selector - Returns the sort key of an item
+ * @param {SortOrder} order - The direction the array is sorted in
+ * @param {boolean} upper - Whether to return the upper bound
+ * @returns {number} An index in `[0, length]`
+ * @throws {TypeError} when `selector` is not a function
+ * @throws {RangeError} when `order` is neither `'asc'` nor `'desc'`
+ */
+function sortedIndexByKey<T>(
+	caller: string,
+	sortedArray: ReadonlyArray<T>,
+	value: T,
+	selector: (item: T) => SortKey | null | undefined,
+	order: SortOrder,
+	upper: boolean
+): number {
+	assertFunction(caller, 'selector', selector);
+	const dir = toDirection(caller, 'order', order);
+	const target = rank(selector(value));
+	let low = 0;
+	let high = sortedArray.length;
+	while (low < high) {
+		const middle = (low + high) >>> 1;
+		const comparison = compareRanked(rank(selector(sortedArray[middle])), target, dir);
+		if (comparison < 0 || (upper && comparison === 0)) low = middle + 1;
+		else high = middle;
+	}
+	return low;
+}
+
+/**
+ * Find, by binary search (O(log n) selector calls), the LOWEST index at which `value` can be inserted into `sortedArray` keeping it
+ * sorted by the key `selector` returns (before any items with an equal key). Keys are compared with the ordering rules of
+ * {@link sortBy}, so any array sorted by `sortBy(items, selector, order)` qualifies, including its trailing `NaN`/invalid
+ * `Date`/nullish keys (an unorderable `value` key is located among them). For another order, use {@link sortedIndex} with a comparator.
+ * @template T
+ * @param {ReadonlyArray<T>} sortedArray - Items sorted as `sortBy(sortedArray, selector, order)` would
+ * @param {T} value - The item to locate (its key is computed once)
+ * @param {(item: T) => SortKey | null | undefined} selector - Returns the sort key of an item
+ * @param {SortOrder} [order='asc'] - The direction the array is sorted in
+ * @returns {number} An index in `[0, length]`
+ * @throws {TypeError} when `selector` is not a function
+ * @throws {RangeError} when `order` is neither `'asc'` nor `'desc'`
+ * @example
+ * const byAge = [{ age: 20 }, { age: 30 }, { age: 30 }, { age: 40 }];
+ * sortedIndexBy(byAge, { age: 30 }, function (p) { return p.age; }); // => 1
+ * sortedIndexBy([3, 2, 1], 2, function (n) { return n; }, 'desc'); // => 1
+ */
+export function sortedIndexBy<T>(sortedArray: ReadonlyArray<T>, value: T, selector: (item: T) => SortKey | null | undefined, order: SortOrder = 'asc'): number {
+	return sortedIndexByKey('sortedIndexBy', sortedArray, value, selector, order, false);
+}
+
+/**
+ * Like {@link sortedIndexBy}, but returns the HIGHEST insertion index (after any items with an equal key), which keeps insertion
+ * order among equal keys when used to insert.
+ * @template T
+ * @param {ReadonlyArray<T>} sortedArray - Items sorted as `sortBy(sortedArray, selector, order)` would
+ * @param {T} value - The item to locate (its key is computed once)
+ * @param {(item: T) => SortKey | null | undefined} selector - Returns the sort key of an item
+ * @param {SortOrder} [order='asc'] - The direction the array is sorted in
+ * @returns {number} An index in `[0, length]`
+ * @throws {TypeError} when `selector` is not a function
+ * @throws {RangeError} when `order` is neither `'asc'` nor `'desc'`
+ * @example
+ * sortedLastIndexBy([{ age: 20 }, { age: 30 }, { age: 30 }, { age: 40 }], { age: 30 }, function (p) { return p.age; }); // => 3
+ */
+export function sortedLastIndexBy<T>(sortedArray: ReadonlyArray<T>, value: T, selector: (item: T) => SortKey | null | undefined, order: SortOrder = 'asc'): number {
+	return sortedIndexByKey('sortedLastIndexBy', sortedArray, value, selector, order, true);
+}
+
+/**
+ * Find, by binary search (O(log n)), the HIGHEST index at which `value` can be inserted into `sortedArray` keeping it sorted (after
+ * any equal items): the upper-bound counterpart of {@link sortedIndex}. Without a comparator, numbers, strings or bigints are
+ * ordered with `<`; the array must already be sorted in that order (and contain no `NaN`), otherwise the result is unspecified.
+ * @template T - A number, string or bigint type
+ * @param {ReadonlyArray<T>} sortedArray - An array sorted in ascending `<` order
+ * @param {T} value - The value to locate
+ * @returns {number} An index in `[0, length]`
+ * @throws {RangeError} when `value` is `NaN`
+ * @example
+ * sortedLastIndex([10, 20, 20, 30], 20); // => 3
+ * sortedLastIndex([10, 20, 30], 5); // => 0
+ */
+export function sortedLastIndex<T extends number | string | bigint>(sortedArray: ReadonlyArray<T>, value: T): number;
+/**
+ * Find, by binary search (O(log n)), the HIGHEST index at which `value` can be inserted into `sortedArray` keeping it sorted
+ * according to `compare` (after any items comparing equal). The array must already be sorted by `compare`.
+ * @template T
+ * @param {ReadonlyArray<T>} sortedArray - An array sorted according to `compare`
+ * @param {T} value - The value to locate
+ * @param {Comparator<T>} compare - The comparator the array is sorted by
+ * @returns {number} An index in `[0, length]`
+ * @throws {TypeError} when `compare` is given but is not a function
+ * @example
+ * sortedLastIndex([{ n: 1 }, { n: 3 }, { n: 3 }], { n: 3 }, function (a, b) { return a.n - b.n; }); // => 3
+ */
+export function sortedLastIndex<T>(sortedArray: ReadonlyArray<T>, value: T, compare: Comparator<T>): number;
+/**
+ * Implementation of {@link sortedLastIndex}.
+ * @template T
+ * @param {ReadonlyArray<T>} sortedArray - A sorted array
+ * @param {T} value - The value to locate
+ * @param {Comparator<T>} [compare] - The comparator the array is sorted by
+ * @returns {number} The highest insertion index
+ * @throws {RangeError} when `value` is `NaN` and no comparator is given
+ * @throws {TypeError} when `compare` is given but is not a function
+ * @example
+ * sortedLastIndex([1, 3, 3], 3); // => 3
+ */
+export function sortedLastIndex<T>(sortedArray: ReadonlyArray<T>, value: T, compare?: Comparator<T>): number {
+	return searchBound('sortedLastIndex', sortedArray, value, compare, true)[0];
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Slicing, splitting and reordering
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Return the last `n` items of an array (or all of them when it is shorter). Unlike `array.slice(-n)`, `n = 0` gives `[]`.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The source array
+ * @param {number} n - How many items to take (a non-negative integer)
+ * @returns {T[]} A new array with at most `n` items
+ * @throws {RangeError} when `n` is negative or not an integer
+ * @throws {TypeError} when `n` is not a number
+ * @example
+ * takeLast([1, 2, 3], 2); // => [2, 3]
+ * takeLast([1, 2, 3], 0); // => []
+ */
+export function takeLast<T>(array: ReadonlyArray<T>, n: number): T[] {
+	assertInteger('takeLast', 'n', n, 0);
+	return copyRange(array, Math.max(array.length - n, 0), array.length);
+}
+
+/**
+ * Return an array without its last `n` items.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The source array
+ * @param {number} n - How many items to drop (a non-negative integer)
+ * @returns {T[]} A new array with the remaining items
+ * @throws {RangeError} when `n` is negative or not an integer
+ * @throws {TypeError} when `n` is not a number
+ * @example
+ * dropLast([1, 2, 3], 2); // => [1]
+ * dropLast([1, 2, 3], 0); // => [1, 2, 3]
+ */
+export function dropLast<T>(array: ReadonlyArray<T>, n: number): T[] {
+	assertInteger('dropLast', 'n', n, 0);
+	return copyRange(array, 0, Math.max(array.length - n, 0));
+}
+
+/**
+ * The index just after the last item, scanning from the end, for which `predicate` returns false (`0` when it holds for all).
+ * @template T
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {ReadonlyArray<T>} array - The items
+ * @param {(item: T, index: number) => boolean} predicate - The condition
+ * @returns {number} The start of the longest suffix whose items all match
+ * @throws {TypeError} when `predicate` is not a function
+ */
+function suffixStart<T>(caller: string, array: ReadonlyArray<T>, predicate: (item: T, index: number) => boolean): number {
+	assertFunction(caller, 'predicate', predicate);
+	let start = array.length;
+	while (start > 0 && predicate(array[start - 1], start - 1)) start--;
+	return start;
+}
+
+/**
+ * Return the longest suffix of an array whose items all match `predicate`, scanning from the end and stopping at the first item
+ * that does not match. The predicate receives each item with its index in the input.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The source array
+ * @param {(item: T, index: number) => boolean} predicate - The condition the kept items meet
+ * @returns {T[]} A new array with the matching trailing items, in input order
+ * @throws {TypeError} when `predicate` is not a function
+ * @example
+ * takeLastWhile([1, 5, 2, 3], function (n) { return n < 4; }); // => [2, 3]
+ */
+export function takeLastWhile<T>(array: ReadonlyArray<T>, predicate: (item: T, index: number) => boolean): T[] {
+	return copyRange(array, suffixStart('takeLastWhile', array, predicate), array.length);
+}
+
+/**
+ * Return an array without its longest suffix whose items all match `predicate` (scanning from the end, stopping at the first item
+ * that does not match). The predicate receives each item with its index in the input.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The source array
+ * @param {(item: T, index: number) => boolean} predicate - The condition the dropped items meet
+ * @returns {T[]} A new array with the remaining items
+ * @throws {TypeError} when `predicate` is not a function
+ * @example
+ * dropLastWhile(['a', 'b', '', ''], function (s) { return s === ''; }); // => ['a', 'b']
+ */
+export function dropLastWhile<T>(array: ReadonlyArray<T>, predicate: (item: T, index: number) => boolean): T[] {
+	return copyRange(array, 0, suffixStart('dropLastWhile', array, predicate));
+}
+
+/**
+ * Split an array into runs of ADJACENT items with the same key (compared with SameValueZero, so `NaN` keys group together), like
+ * Python's `itertools.groupby`: unlike {@link groupBy}, a key that comes back after another one starts a new run.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The source array
+ * @param {(item: T, index: number) => unknown} keyFn - Returns the key of an item (called once per item)
+ * @returns {T[][]} The runs, in input order (each a fresh, non-empty array); `[]` for an empty array
+ * @throws {TypeError} when `keyFn` is not a function
+ * @example
+ * chunkBy([1, 3, 2, 4, 5], function (n) { return n % 2; }); // => [[1, 3], [2, 4], [5]]
+ * chunkBy(['a', 'b', 'a'], function (s) { return s; }); // => [['a'], ['b'], ['a']]
+ */
+export function chunkBy<T>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => unknown): T[][] {
+	assertFunction('chunkBy', 'keyFn', keyFn);
+	const result: T[][] = [];
+	let run: T[] = [];
+	let previous: unknown;
+	for (let i = 0; i < array.length; i++) {
+		const key = keyFn(array[i], i);
+		// SameValueZero, inlined.
+		if (i > 0 && (key === previous || (key !== key && previous !== previous))) run.push(array[i]);
+		else {
+			run = [array[i]];
+			result.push(run);
+		}
+		previous = key;
+	}
+	return result;
+}
+
+/**
+ * Split an array in two at the first item matching `predicate`: the items before it, and the rest (starting with that item).
+ * When no item matches, the second part is empty.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The source array
+ * @param {(item: T, index: number) => boolean} predicate - The condition that starts the second part
+ * @returns {[T[], T[]]} `[before, fromMatch]`, two new arrays
+ * @throws {TypeError} when `predicate` is not a function
+ * @example
+ * splitWhen([1, 2, 3, 2], function (n) { return n > 2; }); // => [[1, 2], [3, 2]]
+ * splitWhen([1, 2], function (n) { return n > 5; }); // => [[1, 2], []]
+ */
+export function splitWhen<T>(array: ReadonlyArray<T>, predicate: (item: T, index: number) => boolean): [T[], T[]] {
+	assertFunction('splitWhen', 'predicate', predicate);
+	let index = 0;
+	while (index < array.length && !predicate(array[index], index)) index++;
+	return [copyRange(array, 0, index), copyRange(array, index, array.length)];
+}
+
+/**
+ * Return a copy of an array with the items at positions `i` and `j` exchanged (the input is not mutated). Negative indices count
+ * from the end, like `Array.prototype.at`. Holes of sparse arrays become `undefined`.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The source array
+ * @param {number} i - Index of the first item, in `[-length, length - 1]`
+ * @param {number} j - Index of the second item, in `[-length, length - 1]`
+ * @returns {T[]} A new array, a permutation of the input
+ * @throws {RangeError} when `i` or `j` is not an integer or is out of range (any index is out of range for an empty array)
+ * @throws {TypeError} when `i` or `j` is not a number
+ * @example
+ * swap(['a', 'b', 'c'], 0, 2); // => ['c', 'b', 'a']
+ * swap(['a', 'b', 'c'], 0, -2); // => ['b', 'a', 'c']
+ */
+export function swap<T>(array: ReadonlyArray<T>, i: number, j: number): T[] {
+	const left = resolveIndex('swap', 'i', i, array.length, false);
+	const right = resolveIndex('swap', 'j', j, array.length, false);
+	const result = Array.from(array);
+	result[left] = array[right];
+	result[right] = array[left];
+	return result;
+}
+
+/**
+ * Return a copy of an array rotated by `k` positions (the input is not mutated): a positive `k` moves every item `k` places towards
+ * the END, the last items wrapping around to the front (like Python's `deque.rotate`); a negative `k` rotates towards the start.
+ * `k` may exceed the length (it is taken modulo the length). Holes of sparse arrays become `undefined`.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The source array
+ * @param {number} k - The number of positions, an integer (any sign or magnitude)
+ * @returns {T[]} A new array, a permutation of the input
+ * @throws {RangeError} when `k` is not an integer
+ * @throws {TypeError} when `k` is not a number
+ * @example
+ * rotate([1, 2, 3, 4], 1); // => [4, 1, 2, 3]
+ * rotate([1, 2, 3, 4], -1); // => [2, 3, 4, 1]
+ * rotate([1, 2, 3], 7); // => [3, 1, 2]
+ */
+export function rotate<T>(array: ReadonlyArray<T>, k: number): T[] {
+	assertNumber('rotate', 'k', k, Number.isInteger(k), 'an integer');
+	const length = array.length;
+	const result = new Array<T>(length);
+	// The item at `i` moves to `i + k` (mod length): position `i` of the result takes the item at `i - shift`.
+	const shift = ((k % length) + length) % length;
+	for (let i = 0; i < length; i++) result[i] = array[i < shift ? i - shift + length : i - shift];
+	return result;
+}
+
+/**
+ * Return a copy of an array where `item` is removed if present, or appended otherwise: the state change of a checkbox list or tag
+ * picker. Presence is decided by SameValueZero (so `NaN` is found), or by comparing the keys `keyFn` returns. Every matching item
+ * is removed (a list with duplicates loses all of them).
+ * @template T
+ * @param {ReadonlyArray<T>} array - The current items (not mutated)
+ * @param {T} item - The item to toggle
+ * @param {(item: T) => unknown} [keyFn] - Returns the identity key of an item (compared with SameValueZero)
+ * @returns {T[]} A new array without the matching items, or with `item` appended when none matched
+ * @throws {TypeError} when `keyFn` is given but is not a function
+ * @example
+ * toggle(['a', 'b'], 'b'); // => ['a']
+ * toggle(['a', 'b'], 'c'); // => ['a', 'b', 'c']
+ * toggle([{ id: 1 }, { id: 2 }], { id: 1 }, function (o) { return o.id; }); // => [{ id: 2 }]
+ */
+export function toggle<T>(array: ReadonlyArray<T>, item: T, keyFn?: (item: T) => unknown): T[] {
+	if (keyFn !== undefined) assertFunction('toggle', 'keyFn', keyFn);
+	const target = keyFn === undefined ? item : keyFn(item);
+	const result: T[] = [];
+	for (let i = 0; i < array.length; i++) {
+		const value = array[i];
+		if (!sameValueZero(keyFn === undefined ? value : keyFn(value), target)) result.push(value);
+	}
+	if (result.length === array.length) result.push(item);
+	return result;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Building
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Normalize a value that may be a single item, an array of items, or nothing, into a fresh array (lodash's `castArray`):
+ * - an array is COPIED (shallowly), so the result can be mutated without touching the input (lodash returns the same array);
+ * - `null` and `undefined` mean "nothing" and give `[]` (lodash gives `[undefined]` for `castArray(undefined)` but `[]` for
+ *   `castArray()`); to keep a nullish item, wrap it yourself: `[value]`;
+ * - anything else, including strings, `Set`s and other iterables, is wrapped as ONE item (use `Array.from` to spread an iterable).
+ * @template T
+ * @param {T | ReadonlyArray<T> | null | undefined} value - An item, an array of items, or nothing
+ * @returns {T[]} A new array
+ * @example
+ * toArray(1); // => [1]
+ * toArray([1, 2]); // => [1, 2]
+ * toArray(null); // => []
+ * toArray('ab'); // => ['ab']
+ */
+export function toArray<T>(value: T | ReadonlyArray<T> | null | undefined): T[] {
+	if (value === null || value === undefined) return [];
+	return Array.isArray(value) ? copyRange(value as ReadonlyArray<T>, 0, value.length) : [value as T];
+}
+
+/**
+ * Build an object from a list of keys and a list of values: `{ [keys[i]]: values[i] }`, like `Object.fromEntries(zip(keys, values))`.
+ * Keys are DEFINED as own data properties, never assigned: a `'__proto__'` key becomes an ordinary own property instead of
+ * replacing the prototype (as it does in es-toolkit and radash), and no inherited setter or read-only property interferes.
+ * The result is a plain object (`Object.prototype`). When a key repeats, the last value wins (its position stays the first one's).
+ * @template K - The key type
+ * @template V - The value type
+ * @param {ReadonlyArray<K>} keys - The property keys (strings, numbers or symbols)
+ * @param {ReadonlyArray<V>} values - The values, one per key
+ * @returns {Record<K, V>} A new object
+ * @throws {RangeError} when the arrays have different lengths (no key or value is silently dropped)
+ * @example
+ * zipObject(['a', 'b'], [1, 2]); // => { a: 1, b: 2 }
+ * Object.keys(zipObject(['__proto__'], [1])); // => ['__proto__']
+ * zipObject(['a', 'b'], [1]); // throws RangeError
+ */
+export function zipObject<const K extends PropertyKey, V>(keys: ReadonlyArray<K>, values: ReadonlyArray<V>): Record<K, V> {
+	if (keys.length !== values.length) throw new RangeError(`zipObject: \`values\` must have as many items as \`keys\` (${keys.length}), got ${values.length}`);
+	// Assigning to a null-prototype object is defining (nothing is inherited, not even the `__proto__` accessor), and is several
+	// times faster than `Object.defineProperty`; the usual prototype is attached afterwards.
+	const result = nullObject() as Record<K, V>;
+	for (let i = 0; i < keys.length; i++) result[keys[i]] = values[i];
+	return Object.setPrototypeOf(result, Object.prototype) as Record<K, V>;
+}
+
+/**
+ * Combine arrays element-wise with `fn`: `fn(a[i], b[i], ...)` for every index, truncating to the length of the SHORTEST array like
+ * {@link zip} (lodash pads the shorter arrays with `undefined` instead, which `fn`'s parameter types would not reveal). The
+ * arguments of `fn` are typed from the arrays, one per array.
+ * @template T - The tuple of input array types
+ * @template R - The result type of `fn`
+ * @param {(...values: Zipped<T>) => R} fn - Combines the items at one index
+ * @param {...ReadonlyArray<unknown>} arrays - The arrays to combine
+ * @returns {R[]} A new array of `fn` results; empty when called without arrays
+ * @throws {TypeError} when `fn` is not a function
+ * @example
+ * zipWith(function (a, b) { return a + b; }, [1, 2, 3], [10, 20]); // => [11, 22]
+ * zipWith(function (name, age) { return `${name} (${age})`; }, ['al', 'bo'], [30, 25]); // => ['al (30)', 'bo (25)']
+ */
+export function zipWith<T extends Array<ReadonlyArray<unknown>>, R>(fn: (...values: Zipped<T>) => R, ...arrays: T): R[] {
+	assertFunction('zipWith', 'fn', fn);
+	const call = fn as (...values: unknown[]) => R;
+	let length = arrays.length === 0 ? 0 : arrays[0].length;
+	for (let k = 1; k < arrays.length; k++) length = Math.min(length, arrays[k].length);
+	const result = new Array<R>(length);
+	if (arrays.length === 2) {
+		// Two arrays (the usual case) skip the argument list.
+		const [left, right] = arrays;
+		for (let i = 0; i < length; i++) result[i] = call(left[i], right[i]);
+		return result;
+	}
+	const values = new Array<unknown>(arrays.length);
+	for (let i = 0; i < length; i++) {
+		for (let k = 0; k < arrays.length; k++) values[k] = arrays[k][i];
+		result[i] = call(...values);
+	}
+	return result;
+}
+
+/**
+ * Return `n` distinct random items of an array (sampling WITHOUT replacement: positions are distinct, so equal values may repeat only
+ * if the input repeats them). The result is in random order: a uniformly random arrangement of a uniformly random subset, so
+ * `sampleSize(array, array.length)` is a shuffle. When `n` exceeds the length, every item is returned (like {@link take}).
+ * Partial Fisher–Yates, on a copy when `n` is a large part of the array, otherwise over a virtual copy (O(n) time and memory
+ * whatever the array length); both make exactly `min(n, length)` calls to `random` and give the same result for the same draws.
+ * Not cryptographically secure by default: pass `secureRandom` (random module) for raffles, lotteries, audits...
+ * @template T
+ * @param {ReadonlyArray<T>} array - The items to pick from (not mutated)
+ * @param {number} n - How many items to pick (a non-negative integer)
+ * @param {RandomGenerator} [random=Math.random] - Generator of floats in `[0, 1)`, injectable for deterministic results
+ * @returns {T[]} A new array of `min(n, length)` items
+ * @throws {RangeError} when `n` is not a non-negative integer, or `random()` returns a value outside `[0, 1)`
+ * @throws {TypeError} when `n` is not a number or `random` is not a function
+ * @example
+ * sampleSize([1, 2, 3, 4, 5], 2); // e.g. [4, 1]
+ * sampleSize([1, 2, 3], 3, function () { return 0; }); // => [1, 2, 3]
+ * sampleSize([1, 2], 5).length; // => 2
+ */
+export function sampleSize<T>(array: ReadonlyArray<T>, n: number, random: RandomGenerator = Math.random): T[] {
+	assertInteger('sampleSize', 'n', n, 0);
+	const length = array.length;
+	const count = Math.min(n, length);
+	const result = new Array<T>(count);
+	if (length <= 64 * count) {
+		// The sample is a large part of the array: shuffling the front of a real copy is cheaper than tracking the swaps.
+		const pool = copyRange(array, 0, length);
+		for (let i = 0; i < count; i++) {
+			const j = i + Math.floor(draw('sampleSize', random) * (length - i));
+			result[i] = pool[j];
+			pool[j] = pool[i];
+		}
+		return result;
+	}
+	// A few items of a long array: only the swaps of a virtual copy are recorded, as position -> index of the input item now there.
+	const moved = new Map<number, number>();
+	for (let i = 0; i < count; i++) {
+		const j = i + Math.floor(draw('sampleSize', random) * (length - i));
+		result[i] = array[moved.get(j) ?? j];
+		moved.set(j, moved.get(i) ?? i);
+	}
+	return result;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Aggregates
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Return the mean of the numbers `selector` returns for each item, added up with compensated summation like {@link sumBy} (so
+ * `0.1`, `0.2`, `0.3` average to exactly `0.2`). Each key is converted once with unary `+`; `NaN` keys propagate.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The items
+ * @param {(item: T, index: number) => number} selector - Returns the number of an item
+ * @returns {number} The mean, or `NaN` for an empty array (like `average` from the math module)
+ * @throws {TypeError} when `selector` is not a function
+ * @example
+ * averageBy([{ n: 0.1 }, { n: 0.2 }, { n: 0.3 }], function (o) { return o.n; }); // => 0.2
+ * averageBy([], function (n: number) { return n; }); // => NaN
+ */
+export function averageBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => number): number {
+	assertFunction('averageBy', 'selector', selector);
+	return scaledSum(array, selector, array.length);
+}
+
+/**
+ * Return the median of the numbers `selector` returns for each item (the mean of the two middle values for an even count), with
+ * the semantics of `median` from the math module: keys are converted once with unary `+`, and the result does not depend on the
+ * item order.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The items
+ * @param {(item: T, index: number) => number} selector - Returns the number of an item
+ * @returns {number} The median, or `NaN` when the array is empty or a key is `NaN`
+ * @throws {TypeError} when `selector` is not a function
+ * @example
+ * medianBy([{ age: 30 }, { age: 20 }, { age: 50 }], function (p) { return p.age; }); // => 30
+ * medianBy([4, 1, 3, 2], function (n) { return n; }); // => 2.5
+ */
+export function medianBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => number): number {
+	assertFunction('medianBy', 'selector', selector);
+	const values = new Array<number>(array.length);
+	for (let i = 0; i < array.length; i++) values[i] = selector(array[i], i);
+	return median(values);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Combinatorics
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Throws when a combinatorial result would not fit in arrays: more than `2 ** 32 - 1` tuples, or items in all.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {number} count - The number of tuples
+ * @param {number} items - The number of items in all the tuples
+ * @returns {void}
+ * @throws {RangeError} when either number exceeds `2 ** 32 - 1`
+ */
+function assertResultSize(caller: string, count: number, items: number): void {
+	if (count > MAX_ARRAY_LENGTH || items > MAX_ARRAY_LENGTH) {
+		throw new RangeError(`${caller}: the result would contain ${count} tuples holding ${items} items, more than 2 ** 32 - 1`);
+	}
+}
+
+/**
+ * Picks the items at the given positions.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The items
+ * @param {number[]} positions - The positions to pick
+ * @returns {T[]} A new tuple
+ */
+function pick<T>(array: ReadonlyArray<T>, positions: number[]): T[] {
+	const tuple = new Array<T>(positions.length);
+	for (let i = 0; i < positions.length; i++) tuple[i] = array[positions[i]];
+	return tuple;
+}
+
+/**
+ * Return every combination of `k` items of an array (subsets of `k` POSITIONS, items in input order), in lexicographic order of
+ * positions, like Python's `itertools.combinations`. There are `C(length, k)` of them: `[[]]` for `k = 0`, `[]` when `k > length`.
+ * Positions are distinct, not values: duplicate inputs give duplicate-looking combinations (deduplicate the input first if needed).
+ * The size is checked before anything is allocated: more than `2 ** 32 - 1` tuples or items in all throws, and since a result
+ * that does not fit in memory aborts the process instead of throwing, callers must still bound untrusted sizes.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The items to choose from
+ * @param {number} k - The size of each combination (a non-negative integer)
+ * @returns {T[][]} A new array of fresh tuples
+ * @throws {TypeError} when `k` is not a number
+ * @throws {RangeError} when `k` is not a non-negative integer, or the result would exceed `2 ** 32 - 1` tuples or items
+ * @example
+ * combinations(['a', 'b', 'c'], 2); // => [['a', 'b'], ['a', 'c'], ['b', 'c']]
+ * combinations([1, 2], 3); // => []
+ */
+export function combinations<T>(array: ReadonlyArray<T>, k: number): T[][] {
+	assertInteger('combinations', 'k', k, 0);
+	const length = array.length;
+	if (k > length) return [];
+	// C(length, k), computed incrementally (each step is an exact integer) and stopped as soon as it is too large.
+	let count = 1;
+	for (let i = 0; i < k && count <= MAX_ARRAY_LENGTH; i++) count = (count * (length - i)) / (i + 1);
+	assertResultSize('combinations', count, count * k);
+	const result: T[][] = [];
+	// Filled with `push`, so that V8 keeps the array packed (`range` returns a holey one, which is slower to read).
+	const positions: number[] = [];
+	for (let i = 0; i < k; i++) positions.push(i);
+	for (;;) {
+		result.push(pick(array, positions));
+		// Advance the rightmost position that can still move, then reset the following ones right after it.
+		let i = k - 1;
+		while (i >= 0 && positions[i] === length - k + i) i--;
+		if (i < 0) return result;
+		positions[i]++;
+		for (let j = i + 1; j < k; j++) positions[j] = positions[j - 1] + 1;
+	}
+}
+
+/**
+ * Return every arrangement of `k` items of an array (ordered selections of `k` distinct POSITIONS), in lexicographic order of
+ * positions, like Python's `itertools.permutations`. There are `length! / (length - k)!` of them: `[[]]` for `k = 0`, `[]` when
+ * `k > length`. Positions are distinct, not values: duplicate inputs give duplicate-looking permutations.
+ * The size is checked before anything is allocated: more than `2 ** 32 - 1` tuples or items in all throws, and since a result
+ * that does not fit in memory aborts the process instead of throwing, callers must still bound untrusted sizes.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The items to arrange
+ * @param {number} [k=array.length] - The size of each permutation (a non-negative integer)
+ * @returns {T[][]} A new array of fresh tuples
+ * @throws {TypeError} when `k` is not a number
+ * @throws {RangeError} when `k` is not a non-negative integer, or the result would exceed `2 ** 32 - 1` tuples or items
+ * @example
+ * permutations([1, 2, 3]); // => [[1, 2, 3], [1, 3, 2], [2, 1, 3], [2, 3, 1], [3, 1, 2], [3, 2, 1]]
+ * permutations(['a', 'b', 'c'], 2); // => [['a', 'b'], ['a', 'c'], ['b', 'a'], ['b', 'c'], ['c', 'a'], ['c', 'b']]
+ */
+export function permutations<T>(array: ReadonlyArray<T>, k = array.length): T[][] {
+	assertInteger('permutations', 'k', k, 0);
+	const length = array.length;
+	if (k > length) return [];
+	let count = 1;
+	for (let i = 0; i < k && count <= MAX_ARRAY_LENGTH; i++) count *= length - i;
+	assertResultSize('permutations', count, count * k);
+	const result: T[][] = [];
+	// Depth-first search over the positions: `positions` is the current prefix, `next` the first position to try after it.
+	const positions: number[] = [];
+	const used = new Array<boolean>(length).fill(false);
+	let next = 0;
+	for (;;) {
+		if (positions.length === k) {
+			result.push(pick(array, positions));
+			next = length;
+		}
+		while (next < length && used[next]) next++;
+		if (next < length) {
+			used[next] = true;
+			positions.push(next);
+			next = 0;
+		} else {
+			if (positions.length === 0) return result;
+			const position = positions.pop() as number;
+			used[position] = false;
+			next = position + 1;
+		}
+	}
+}
+
+/**
+ * Return every subset of an array (`2 ** length` of them, items in input order), in binary-counting order: item `i` is in subset
+ * `m` when bit `i` of `m` is set, so `[]` comes first and the whole array last. Positions are distinct, not values.
+ * The size is checked before anything is allocated (more than `2 ** 32 - 1` subsets or items in all throws, i.e. inputs longer
+ * than 28 items); since a result that does not fit in memory aborts the process instead of throwing, keep inputs short.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The items
+ * @returns {T[][]} A new array of fresh subsets
+ * @throws {RangeError} when the result would exceed `2 ** 32 - 1` subsets or items
+ * @example
+ * powerSet(['a', 'b', 'c']); // => [[], ['a'], ['b'], ['a', 'b'], ['c'], ['a', 'c'], ['b', 'c'], ['a', 'b', 'c']]
+ */
+export function powerSet<T>(array: ReadonlyArray<T>): T[][] {
+	const length = array.length;
+	// Every item is in half of the subsets.
+	assertResultSize('powerSet', 2 ** length, length * 2 ** (length - 1));
+	const result: T[][] = [[]];
+	for (let i = 0; i < length; i++) {
+		const size = result.length;
+		for (let j = 0; j < size; j++) {
+			const subset = result[j].slice();
+			subset.push(array[i]);
+			result.push(subset);
+		}
+	}
+	return result;
 }

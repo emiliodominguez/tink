@@ -1803,3 +1803,901 @@ describe('Arrays helpers', function () {
 		});
 	});
 });
+
+describe('Arrays helpers (ordering, slicing, set algebra, combinatorics)', function () {
+	/** Identity selector for numbers. */
+	function self(n: number): number {
+		return n;
+	}
+
+	/** Record key used by the set-algebra tests. */
+	function byId(item: { id: number }): number {
+		return item.id;
+	}
+
+	/** SameValueZero, for the comparator-based helpers. */
+	function same(x: unknown, y: unknown): boolean {
+		return x === y || (x !== x && y !== y);
+	}
+
+	describe('orderBy', function () {
+		const users = [
+			{ name: 'cy', age: 30 },
+			{ name: 'al', age: 25 },
+			{ name: 'bo', age: 30 },
+			{ name: 'al', age: 40 }
+		];
+
+		/** Name selector. */
+		function name(user: { name: string }): string {
+			return user.name;
+		}
+
+		/** Age selector. */
+		function age(user: { age: number }): number {
+			return user.age;
+		}
+
+		it('sorts by several keys, each in its own direction', function () {
+			expect(helpers.orderBy(users, [age, name], ['desc', 'asc'])).toStrictEqual([users[3], users[2], users[0], users[1]]);
+			expect(helpers.orderBy(users, [name, age], ['asc', 'desc'])).toStrictEqual([users[3], users[1], users[2], users[0]]);
+		});
+
+		it('applies a single direction to every key, and defaults missing trailing directions to ascending', function () {
+			expect(helpers.orderBy(users, [name, age], 'desc')).toStrictEqual([users[0], users[2], users[3], users[1]]);
+			expect(helpers.orderBy(users, [name, age], ['desc'])).toStrictEqual([users[0], users[2], users[1], users[3]]);
+			expect(helpers.orderBy(users, [name, age])).toStrictEqual([users[1], users[3], users[2], users[0]]);
+		});
+
+		it('is stable and never mutates the input', function () {
+			const items = [
+				{ k: 1, id: 'a' },
+				{ k: 0, id: 'b' },
+				{ k: 1, id: 'c' },
+				{ k: 0, id: 'd' }
+			];
+			const copy = items.slice();
+			const sorted = helpers.orderBy(
+				items,
+				[
+					function (item) {
+						return item.k;
+					},
+					function () {
+						return 0;
+					}
+				],
+				'desc'
+			);
+			expect(
+				sorted.map(function (item) {
+					return item.id;
+				})
+			).toStrictEqual(['a', 'c', 'b', 'd']);
+			expect(items).toStrictEqual(copy);
+		});
+
+		it('ranks NaN, invalid dates, null and undefined keys last in both directions, leaving the next key to decide', function () {
+			const items = [
+				{ k: 2 as number | null | undefined, t: 1 },
+				{ k: NaN, t: 3 },
+				{ k: undefined, t: 1 },
+				{ k: 1, t: 0 },
+				{ k: null, t: 2 }
+			];
+			/** First key. */
+			function k(item: { k: number | null | undefined }): number | null | undefined {
+				return item.k;
+			}
+			/** Second key. */
+			function t(item: { t: number }): number {
+				return item.t;
+			}
+			expect(helpers.orderBy(items, [k, t])).toStrictEqual([items[3], items[0], items[2], items[4], items[1]]);
+			expect(helpers.orderBy(items, [k, t], ['desc', 'desc'])).toStrictEqual([items[0], items[3], items[1], items[4], items[2]]);
+			const dates = [new Date(Number.NaN), new Date(5), new Date(1)];
+			expect(
+				helpers.orderBy(dates, [
+					function (d) {
+						return d;
+					},
+					function () {
+						return 0;
+					}
+				])
+			).toStrictEqual([dates[2], dates[1], dates[0]]);
+		});
+
+		it('gives a correct order where es-toolkit (NaN) and remeda (undefined) do not', function () {
+			expect(helpers.orderBy([2, NaN, 1], [self, self])).toStrictEqual([1, 2, NaN]);
+			expect(helpers.orderBy([2, undefined, 1], [self as (n: number | undefined) => number, self as (n: number | undefined) => number])).toStrictEqual([
+				1,
+				2,
+				undefined
+			]);
+		});
+
+		it('orders mixed key kinds like sortBy (numbers and bigints before strings)', function () {
+			const keys: Array<number | bigint | string> = ['b', 3n, 1, 'a', 2];
+			/** Identity over mixed keys. */
+			function mixed(key: number | bigint | string): number | bigint | string {
+				return key;
+			}
+			expect(helpers.orderBy(keys, [mixed, mixed])).toStrictEqual([1, 2, 3n, 'a', 'b']);
+		});
+
+		it('calls each selector exactly once per item, with the item and its index', function () {
+			const first = jest.fn(function (n: number) {
+				return n % 2;
+			});
+			const second = jest.fn(self);
+			const input = [5, 4, 3, 2, 1, 0, 9, 8, 7, 6];
+			expect(helpers.orderBy(input, [first, second])).toStrictEqual([0, 2, 4, 6, 8, 1, 3, 5, 7, 9]);
+			expect(first).toHaveBeenCalledTimes(input.length);
+			expect(second).toHaveBeenCalledTimes(input.length);
+			expect(first).toHaveBeenNthCalledWith(3, 3, 2);
+		});
+
+		it('with one selector equals sortBy, and with none returns a copy', function () {
+			expect(helpers.orderBy([3, 1, 2], [self], ['desc'])).toStrictEqual([3, 2, 1]);
+			expect(helpers.orderBy([3, 1, 2], [self])).toStrictEqual([1, 2, 3]);
+			const input = [3, 1, 2];
+			const copy = helpers.orderBy(input, []);
+			expect(copy).toStrictEqual(input);
+			expect(copy).not.toBe(input);
+			expect(helpers.orderBy([], [self, self])).toStrictEqual([]);
+		});
+
+		it('rejects invalid selectors and directions', function () {
+			expect(function () {
+				helpers.orderBy([1], self as any);
+			}).toThrow(new TypeError('orderBy: `selectors` must be an array of functions, got function'));
+			expect(function () {
+				helpers.orderBy([1], [self, 1 as any]);
+			}).toThrow(new TypeError('orderBy: `selectors[1]` must be a function, got number'));
+			expect(function () {
+				helpers.orderBy([1], [self], 'up' as any);
+			}).toThrow(new RangeError("orderBy: `orders` must be 'asc' or 'desc', got up"));
+			expect(function () {
+				helpers.orderBy([1], [], 'up' as any);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.orderBy([1], [self, self], ['asc', 'down' as any]);
+			}).toThrow(new RangeError("orderBy: `orders[1]` must be 'asc' or 'desc', got down"));
+			expect(function () {
+				helpers.orderBy([1], [self], ['asc', 'asc']);
+			}).toThrow(new RangeError('orderBy: `orders` must not be longer than `selectors` (1), got 2 directions'));
+			expect(function () {
+				helpers.orderBy([1], [self], 1 as any);
+			}).toThrow(new TypeError("orderBy: `orders` must be 'asc', 'desc' or an array of them, got number"));
+		});
+	});
+
+	describe('nullish sort keys in sortBy, minBy and maxBy', function () {
+		const items = [{ n: 2 }, {}, { n: null }, { n: 1 }];
+
+		/** Optional key. */
+		function n(item: { n?: number | null }): number | null | undefined {
+			return item.n;
+		}
+
+		it('sortBy puts null and undefined keys last, in input order, in both directions', function () {
+			expect(helpers.sortBy(items, n)).toStrictEqual([items[3], items[0], items[1], items[2]]);
+			expect(helpers.sortBy(items, n, 'desc')).toStrictEqual([items[0], items[3], items[1], items[2]]);
+		});
+
+		it('minBy and maxBy ignore null and undefined keys', function () {
+			expect(helpers.minBy(items, n)).toBe(items[3]);
+			expect(helpers.maxBy(items, n)).toBe(items[0]);
+			expect(helpers.minBy([{}, { n: 'b' }, { n: 'a' }] as Array<{ n?: string }>, n as any)).toStrictEqual({ n: 'a' });
+			expect(helpers.maxBy([{}, { n: null }], n)).toBeUndefined();
+		});
+	});
+
+	describe('takeFirstBy and nthBy', function () {
+		const scores = [
+			{ id: 'a', score: 7 },
+			{ id: 'b', score: 9 },
+			{ id: 'c', score: 8 },
+			{ id: 'd', score: 9 },
+			{ id: 'e', score: 7 }
+		];
+
+		/** Score selector. */
+		function score(entry: { score: number }): number {
+			return entry.score;
+		}
+
+		it('takeFirstBy returns the n best ranked items in rank order, ties in input order', function () {
+			expect(helpers.takeFirstBy(scores, 3, score, 'desc')).toStrictEqual([scores[1], scores[3], scores[2]]);
+			expect(helpers.takeFirstBy(scores, 2, score)).toStrictEqual([scores[0], scores[4]]);
+			expect(helpers.takeFirstBy(scores, 10, score)).toStrictEqual(helpers.sortBy(scores, score));
+			expect(helpers.takeFirstBy([5, 4, 3, 2, 1, 0, 6, 7, 8, 9], 4, self)).toStrictEqual([0, 1, 2, 3]);
+		});
+
+		it('takeFirstBy ranks NaN and nullish keys last', function () {
+			expect(helpers.takeFirstBy([NaN, 5, 1, 3], 3, self)).toStrictEqual([1, 3, 5]);
+			expect(helpers.takeFirstBy([NaN, 5, 1], 3, self, 'desc')).toStrictEqual([5, 1, NaN]);
+			expect(helpers.takeFirstBy([NaN, 2, undefined, 1], 4, self as (n: number | undefined) => number | undefined)).toStrictEqual([1, 2, NaN, undefined]);
+		});
+
+		it('takeFirstBy calls the selector once per item, and not at all for n = 0', function () {
+			const selector = jest.fn(self);
+			expect(helpers.takeFirstBy([3, 1, 2, 5, 4], 2, selector)).toStrictEqual([1, 2]);
+			expect(selector).toHaveBeenCalledTimes(5);
+			expect(selector).toHaveBeenNthCalledWith(4, 5, 3);
+			selector.mockClear();
+			expect(helpers.takeFirstBy([3, 1], 0, selector)).toStrictEqual([]);
+			expect(selector).not.toHaveBeenCalled();
+			expect(helpers.takeFirstBy([], 3, self)).toStrictEqual([]);
+		});
+
+		it('takeFirstBy validates its arguments', function () {
+			expect(function () {
+				helpers.takeFirstBy([1], -1, self);
+			}).toThrow(new RangeError('takeFirstBy: `n` must be an integer >= 0, got -1'));
+			expect(function () {
+				helpers.takeFirstBy([1], 1.5, self);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.takeFirstBy([1], '1' as any, self);
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.takeFirstBy([1], 0, null as any);
+			}).toThrow(new TypeError('takeFirstBy: `selector` must be a function, got null'));
+			expect(function () {
+				helpers.takeFirstBy([1], 0, self, 'up' as any);
+			}).toThrow(new RangeError("takeFirstBy: `order` must be 'asc' or 'desc', got up"));
+		});
+
+		it('nthBy returns the item at a rank, counting from the end for negative indices', function () {
+			const values = [40, 10, 30, 20];
+			expect(helpers.nthBy(values, 0, self)).toBe(10);
+			expect(helpers.nthBy(values, 2, self)).toBe(30);
+			expect(helpers.nthBy(values, 3, self)).toBe(40);
+			expect(helpers.nthBy(values, -1, self)).toBe(40);
+			expect(helpers.nthBy(values, -4, self)).toBe(10);
+			expect(helpers.nthBy(values, 1, self, 'desc')).toBe(30);
+			expect(helpers.nthBy(scores, 1, score, 'desc')).toBe(scores[3]);
+			expect(helpers.nthBy([NaN, 1], -1, self, 'desc')).toBeNaN();
+		});
+
+		it('nthBy returns undefined out of range, but still validates the selector and order', function () {
+			expect(helpers.nthBy([1, 2], 2, self)).toBeUndefined();
+			expect(helpers.nthBy([1, 2], -3, self)).toBeUndefined();
+			expect(helpers.nthBy([], 0, self)).toBeUndefined();
+			expect(function () {
+				helpers.nthBy([1], 5, 'x' as any);
+			}).toThrow(new TypeError('nthBy: `selector` must be a function, got string'));
+			expect(function () {
+				helpers.nthBy([1], 5, self, 'down' as any);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.nthBy([1], 0.5, self);
+			}).toThrow(new RangeError('nthBy: `index` must be an integer, got 0.5'));
+			expect(function () {
+				helpers.nthBy([1], '0' as any, self);
+			}).toThrow(new TypeError('nthBy: `index` must be an integer, got string'));
+		});
+	});
+
+	describe('sortedLastIndex, sortedIndexBy and sortedLastIndexBy', function () {
+		it('sortedLastIndex returns the upper bound', function () {
+			expect(helpers.sortedLastIndex([10, 20, 20, 30], 20)).toBe(3);
+			expect(helpers.sortedLastIndex([10, 20, 30], 5)).toBe(0);
+			expect(helpers.sortedLastIndex([10, 20, 30], 99)).toBe(3);
+			expect(helpers.sortedLastIndex([], 1)).toBe(0);
+			expect(helpers.sortedLastIndex(['a', 'b', 'b'], 'b')).toBe(3);
+			expect(
+				helpers.sortedLastIndex([{ n: 1 }, { n: 3 }, { n: 3 }, { n: 4 }], { n: 3 }, function (a, b) {
+					return a.n - b.n;
+				})
+			).toBe(3);
+		});
+
+		it('sortedLastIndex validates like sortedIndex', function () {
+			expect(function () {
+				helpers.sortedLastIndex([1, 2], NaN);
+			}).toThrow(new RangeError('sortedLastIndex: `value` must not be NaN when no comparator is given, got NaN'));
+			expect(function () {
+				helpers.sortedLastIndex([1, 2], 1, 'x' as any);
+			}).toThrow(new TypeError('sortedLastIndex: `compare` must be a function, got string'));
+		});
+
+		const people = [{ age: 20 }, { age: 30 }, { age: 30 }, { age: 40 }];
+
+		/** Age selector. */
+		function age(person: { age: number }): number {
+			return person.age;
+		}
+
+		it('locate a value by its key, before or after the equal keys', function () {
+			expect(helpers.sortedIndexBy(people, { age: 30 }, age)).toBe(1);
+			expect(helpers.sortedLastIndexBy(people, { age: 30 }, age)).toBe(3);
+			expect(helpers.sortedIndexBy(people, { age: 10 }, age)).toBe(0);
+			expect(helpers.sortedLastIndexBy(people, { age: 50 }, age)).toBe(4);
+			expect(helpers.sortedIndexBy([3, 2, 2, 1], 2, self, 'desc')).toBe(1);
+			expect(helpers.sortedLastIndexBy([3, 2, 2, 1], 2, self, 'desc')).toBe(3);
+		});
+
+		it('work on arrays sorted by sortBy, including their trailing NaN and nullish keys', function () {
+			const sorted = helpers.sortBy([NaN, 3, undefined, 1, 2], self as (n: number | undefined) => number | undefined, 'desc');
+			expect(sorted).toStrictEqual([3, 2, 1, NaN, undefined]);
+			const select = self as (n: number | undefined) => number | undefined;
+			expect(helpers.sortedIndexBy(sorted, 2, select, 'desc')).toBe(1);
+			expect(helpers.sortedIndexBy(sorted, 0, select, 'desc')).toBe(3);
+			expect(helpers.sortedIndexBy(sorted, NaN, select, 'desc')).toBe(3);
+			expect(helpers.sortedLastIndexBy(sorted, undefined, select, 'desc')).toBe(5);
+		});
+
+		it('call the selector once for the value and once per probe', function () {
+			const selector = jest.fn(self);
+			helpers.sortedIndexBy([1, 2, 3, 4, 5, 6, 7], 4, selector);
+			expect(selector.mock.calls.length).toBeLessThanOrEqual(1 + 3);
+			expect(selector).toHaveBeenNthCalledWith(1, 4);
+		});
+
+		it('validate the selector and order', function () {
+			expect(function () {
+				helpers.sortedIndexBy([1], 1, 1 as any);
+			}).toThrow(new TypeError('sortedIndexBy: `selector` must be a function, got number'));
+			expect(function () {
+				helpers.sortedLastIndexBy([1], 1, self, 'x' as any);
+			}).toThrow(new RangeError("sortedLastIndexBy: `order` must be 'asc' or 'desc', got x"));
+		});
+	});
+
+	describe('takeLast, dropLast, takeLastWhile and dropLastWhile', function () {
+		it('takeLast returns the last n items (none for n = 0, unlike slice(-0))', function () {
+			expect(helpers.takeLast([1, 2, 3], 2)).toStrictEqual([2, 3]);
+			expect(helpers.takeLast([1, 2, 3], 0)).toStrictEqual([]);
+			expect(helpers.takeLast([1, 2, 3], 5)).toStrictEqual([1, 2, 3]);
+			expect(helpers.takeLast([], 1)).toStrictEqual([]);
+		});
+
+		it('dropLast removes the last n items', function () {
+			expect(helpers.dropLast([1, 2, 3], 2)).toStrictEqual([1]);
+			expect(helpers.dropLast([1, 2, 3], 0)).toStrictEqual([1, 2, 3]);
+			expect(helpers.dropLast([1, 2, 3], 5)).toStrictEqual([]);
+			const input = [1, 2];
+			expect(helpers.dropLast(input, 0)).not.toBe(input);
+		});
+
+		it('takeLast and dropLast validate n like take and drop (no silent flooring)', function () {
+			expect(function () {
+				helpers.takeLast([1, 2, 3], 1.5);
+			}).toThrow(new RangeError('takeLast: `n` must be an integer >= 0, got 1.5'));
+			expect(function () {
+				helpers.dropLast([1, 2, 3], -1);
+			}).toThrow(new RangeError('dropLast: `n` must be an integer >= 0, got -1'));
+			expect(function () {
+				helpers.takeLast([1], '1' as any);
+			}).toThrow(TypeError);
+		});
+
+		it('takeLastWhile and dropLastWhile split off the longest matching suffix', function () {
+			/** Small numbers. */
+			function small(n: number): boolean {
+				return n < 4;
+			}
+			expect(helpers.takeLastWhile([1, 5, 2, 3], small)).toStrictEqual([2, 3]);
+			expect(helpers.dropLastWhile([1, 5, 2, 3], small)).toStrictEqual([1, 5]);
+			expect(helpers.takeLastWhile([1, 2], small)).toStrictEqual([1, 2]);
+			expect(helpers.dropLastWhile([1, 2], small)).toStrictEqual([]);
+			expect(helpers.takeLastWhile([1, 9], small)).toStrictEqual([]);
+			expect(helpers.dropLastWhile([1, 9], small)).toStrictEqual([1, 9]);
+			expect(helpers.takeLastWhile([], small)).toStrictEqual([]);
+		});
+
+		it('takeLastWhile passes the input index and stops at the first mismatch from the end', function () {
+			const predicate = jest.fn(function (n: number) {
+				return n > 1;
+			});
+			expect(helpers.takeLastWhile([5, 1, 3, 4], predicate)).toStrictEqual([3, 4]);
+			expect(predicate.mock.calls).toStrictEqual([
+				[4, 3],
+				[3, 2],
+				[1, 1]
+			]);
+		});
+
+		it('takeLastWhile and dropLastWhile require a function', function () {
+			expect(function () {
+				helpers.takeLastWhile([1], null as any);
+			}).toThrow(new TypeError('takeLastWhile: `predicate` must be a function, got null'));
+			expect(function () {
+				helpers.dropLastWhile([1], 1 as any);
+			}).toThrow(new TypeError('dropLastWhile: `predicate` must be a function, got number'));
+		});
+	});
+
+	describe('zipObject', function () {
+		it('pairs keys with values', function () {
+			const symbol = Symbol('s');
+			expect(helpers.zipObject(['a', 'b'], [1, 2])).toStrictEqual({ a: 1, b: 2 });
+			const mixed = helpers.zipObject([1, symbol], ['x', 'y']);
+			expect(mixed[1]).toBe('x');
+			expect(mixed[symbol]).toBe('y');
+			expect(helpers.zipObject([], [])).toStrictEqual({});
+		});
+
+		it('returns a plain object, and the last value wins for a repeated key', function () {
+			const result = helpers.zipObject(['a', 'b', 'a'], [1, 2, 3]);
+			expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+			expect(Object.entries(result)).toStrictEqual([
+				['a', 3],
+				['b', 2]
+			]);
+		});
+
+		it('defines hostile keys as own data properties without touching any prototype', function () {
+			const hostile = JSON.parse('{"__proto__":{"x":1},"constructor":{"prototype":{"x":1}}}') as Record<string, unknown>;
+			const keys = Object.keys(hostile);
+			const result = helpers.zipObject(
+				keys,
+				keys.map(function (key) {
+					return hostile[key];
+				})
+			);
+			expect(Object.keys(result)).toStrictEqual(['__proto__', 'constructor']);
+			expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+			expect(Object.getOwnPropertyDescriptor(result, '__proto__')).toStrictEqual({ value: { x: 1 }, writable: true, enumerable: true, configurable: true });
+			expect(result.constructor).toStrictEqual({ prototype: { x: 1 } });
+			expect((result as any).x).toBeUndefined();
+			expect(({} as any).x).toBeUndefined();
+			expect((Object.prototype as any).x).toBeUndefined();
+			const named = helpers.zipObject(['toString', 'hasOwnProperty'], [1, 2]);
+			expect(Object.keys(named)).toStrictEqual(['toString', 'hasOwnProperty']);
+		});
+
+		it('rejects arrays of different lengths instead of dropping keys or values', function () {
+			expect(function () {
+				helpers.zipObject(['a', 'b'], [1]);
+			}).toThrow(new RangeError('zipObject: `values` must have as many items as `keys` (2), got 1'));
+			expect(function () {
+				helpers.zipObject(['a'], [1, 2]);
+			}).toThrow(RangeError);
+		});
+
+		it('types the result from literal keys', function () {
+			const typed: { a: number; b: number } = helpers.zipObject(['a', 'b'], [1, 2]);
+			expect(typed.a + typed.b).toBe(3);
+		});
+	});
+
+	describe('sampleSize', function () {
+		it('returns n distinct items driven by the injected generator', function () {
+			expect(helpers.sampleSize([1, 2, 3], 3, sequence(0))).toStrictEqual([1, 2, 3]);
+			expect(helpers.sampleSize([1, 2, 3, 4], 2, sequence(0.99))).toStrictEqual([4, 1]);
+			// Draws 0.5 then 0: position 2 swaps with 0, then position 1 is picked.
+			expect(helpers.sampleSize(['a', 'b', 'c', 'd'], 2, sequence(0.5, 0))).toStrictEqual(['c', 'b']);
+			expect(helpers.sampleSize(['a', 'b', 'c', 'd'], 3, sequence(0.99, 0.99, 0))).toStrictEqual(['d', 'a', 'c']);
+			expect(helpers.sampleSize(['a', 'b', 'c', 'd'], 4, sequence(0, 0.9, 0))).toStrictEqual(['a', 'd', 'c', 'b']);
+		});
+
+		it('clamps n to the length and calls random exactly min(n, length) times', function () {
+			const random = jest.fn(sequence(0.3));
+			expect(helpers.sampleSize([1, 2], 5, random)).toHaveLength(2);
+			expect(random).toHaveBeenCalledTimes(2);
+			random.mockClear();
+			expect(helpers.sampleSize([1, 2], 0, random)).toStrictEqual([]);
+			expect(helpers.sampleSize([], 3, random)).toStrictEqual([]);
+			expect(random).not.toHaveBeenCalled();
+		});
+
+		it('never repeats a position, whatever the array length', function () {
+			const values = Array.from({ length: 1000 }, function (_, index) {
+				return index;
+			});
+			const picked = helpers.sampleSize(values, 600);
+			expect(new Set(picked).size).toBe(600);
+			expect(
+				helpers.sampleSize(values, 1000).sort(function (a, b) {
+					return a - b;
+				})
+			).toStrictEqual(values);
+		});
+
+		it('is roughly uniform', function () {
+			const counts = [0, 0, 0, 0];
+			for (let i = 0; i < 4000; i++) for (const value of helpers.sampleSize([0, 1, 2, 3], 2)) counts[value]++;
+			for (const count of counts) expect(Math.abs(count - 2000)).toBeLessThan(250);
+		});
+
+		it('validates n and the generator', function () {
+			expect(function () {
+				helpers.sampleSize([1], -1);
+			}).toThrow(new RangeError('sampleSize: `n` must be an integer >= 0, got -1'));
+			expect(function () {
+				helpers.sampleSize([1], 1.5);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.sampleSize([1], 1, sequence(1));
+			}).toThrow(new RangeError('sampleSize: `random()` must return a number in [0, 1), got 1'));
+			expect(function () {
+				helpers.sampleSize([1], 1, 'x' as any);
+			}).toThrow(new TypeError('sampleSize: `random` must be a function, got string'));
+		});
+	});
+
+	describe('toArray', function () {
+		it('wraps single values, copies arrays and maps nullish values to []', function () {
+			expect(helpers.toArray(1)).toStrictEqual([1]);
+			expect(helpers.toArray(null)).toStrictEqual([]);
+			expect(helpers.toArray(undefined)).toStrictEqual([]);
+			expect(helpers.toArray('ab')).toStrictEqual(['ab']);
+			const set = new Set([1]);
+			expect(helpers.toArray(set)).toStrictEqual([set]);
+			expect(helpers.toArray(0)).toStrictEqual([0]);
+			expect(helpers.toArray(false)).toStrictEqual([false]);
+		});
+
+		it('returns a fresh, typed copy of an array', function () {
+			const input: ReadonlyArray<number> = [1, 2];
+			const copy: number[] = helpers.toArray(input);
+			expect(copy).toStrictEqual([1, 2]);
+			expect(copy).not.toBe(input);
+			const single: string[] = helpers.toArray<string>('a' as string | undefined);
+			expect(single).toStrictEqual(['a']);
+		});
+	});
+
+	describe('chunkBy and splitWhen', function () {
+		it('chunkBy groups adjacent items with the same key', function () {
+			expect(
+				helpers.chunkBy([1, 3, 2, 4, 5], function (n) {
+					return n % 2;
+				})
+			).toStrictEqual([[1, 3], [2, 4], [5]]);
+			expect(
+				helpers.chunkBy(['a', 'b', 'a'], function (s) {
+					return s;
+				})
+			).toStrictEqual([['a'], ['b'], ['a']]);
+			expect(helpers.chunkBy([], self)).toStrictEqual([]);
+		});
+
+		it('chunkBy compares keys with SameValueZero (NaN keys group, unlike es-toolkit)', function () {
+			expect(helpers.chunkBy([NaN, NaN, 1], self)).toStrictEqual([[NaN, NaN], [1]]);
+			expect(helpers.chunkBy([0, -0, 1], self)).toStrictEqual([[0, -0], [1]]);
+			expect(
+				helpers.chunkBy([undefined, undefined, 1], function (v) {
+					return v;
+				})
+			).toStrictEqual([[undefined, undefined], [1]]);
+		});
+
+		it('chunkBy passes the index and validates keyFn', function () {
+			const keyFn = jest.fn(function (_: string, index: number) {
+				return index < 2;
+			});
+			expect(helpers.chunkBy(['a', 'b', 'c'], keyFn)).toStrictEqual([['a', 'b'], ['c']]);
+			expect(keyFn).toHaveBeenNthCalledWith(3, 'c', 2);
+			expect(function () {
+				helpers.chunkBy([1], null as any);
+			}).toThrow(new TypeError('chunkBy: `keyFn` must be a function, got null'));
+		});
+
+		it('splitWhen splits before the first matching item', function () {
+			/** Large numbers. */
+			function large(n: number): boolean {
+				return n > 2;
+			}
+			expect(helpers.splitWhen([1, 2, 3, 2], large)).toStrictEqual([
+				[1, 2],
+				[3, 2]
+			]);
+			expect(helpers.splitWhen([3, 1], large)).toStrictEqual([[], [3, 1]]);
+			expect(helpers.splitWhen([1, 2], large)).toStrictEqual([[1, 2], []]);
+			expect(helpers.splitWhen([], large)).toStrictEqual([[], []]);
+		});
+
+		it('splitWhen passes the index, stops at the first match and validates the predicate', function () {
+			const predicate = jest.fn(function (_: string, index: number) {
+				return index === 1;
+			});
+			expect(helpers.splitWhen(['a', 'b', 'c'], predicate)).toStrictEqual([['a'], ['b', 'c']]);
+			expect(predicate).toHaveBeenCalledTimes(2);
+			expect(function () {
+				helpers.splitWhen([1], 1 as any);
+			}).toThrow(new TypeError('splitWhen: `predicate` must be a function, got number'));
+		});
+	});
+
+	describe('unionBy, symmetricDifferenceBy and the comparator-based set operations', function () {
+		it('unionBy keeps the first item per key, a before b', function () {
+			expect(helpers.unionBy([{ id: 1 }, { id: 2, v: 'a' }], [{ id: 2, v: 'b' }, { id: 3 }], byId)).toStrictEqual([{ id: 1 }, { id: 2, v: 'a' }, { id: 3 }]);
+			expect(helpers.unionBy([1.2, 2.5, 1.9], [2.1, 3.4], Math.floor)).toStrictEqual([1.2, 2.5, 3.4]);
+			expect(helpers.unionBy([NaN], [NaN, 1], self)).toStrictEqual([NaN, 1]);
+			expect(helpers.unionBy(once(1, 1), once(2), self)).toStrictEqual([1, 2]);
+		});
+
+		it('unionBy calls keyFn with the item only', function () {
+			const keyFn = jest.fn(self);
+			helpers.unionBy([1], [2], keyFn);
+			expect(keyFn.mock.calls).toStrictEqual([[1], [2]]);
+		});
+
+		it('symmetricDifferenceBy keeps the items whose key is in exactly one input', function () {
+			expect(helpers.symmetricDifferenceBy([{ id: 1 }, { id: 2 }], [{ id: 2 }, { id: 3 }], byId)).toStrictEqual([{ id: 1 }, { id: 3 }]);
+			expect(helpers.symmetricDifferenceBy([1.1, 1.5, 2.2], [2.9, 3.1, 3.2], Math.floor)).toStrictEqual([1.1, 3.1]);
+			expect(helpers.symmetricDifferenceBy(once(1, 2), once(2, 3), self)).toStrictEqual([1, 3]);
+			const keyFn = jest.fn(self);
+			helpers.symmetricDifferenceBy([1, 2], [3], keyFn);
+			expect(keyFn).toHaveBeenCalledTimes(3);
+		});
+
+		it('uniqueWith keeps the first of equal items', function () {
+			const near = jest.fn(function (x: number, y: number) {
+				return Math.abs(x - y) < 0.2;
+			});
+			expect(helpers.uniqueWith([1, 1.05, 2, 1.9], near)).toStrictEqual([1, 2]);
+			expect(near).toHaveBeenNthCalledWith(1, 1.05, 1);
+			expect(helpers.uniqueWith(once(NaN, NaN, 0, -0), same)).toStrictEqual([NaN, 0]);
+		});
+
+		it('unionWith keeps the distinct items of a then b', function () {
+			/** Point equality. */
+			function samePoint(p: { x: number }, q: { x: number }): boolean {
+				return p.x === q.x;
+			}
+			expect(helpers.unionWith([{ x: 1 }, { x: 1 }], [{ x: 1 }, { x: 2 }], samePoint)).toStrictEqual([{ x: 1 }, { x: 2 }]);
+			expect(helpers.unionWith(once(1), once(2, 1), same)).toStrictEqual([1, 2]);
+		});
+
+		it('differenceWith keeps the distinct items of a without an equal in b', function () {
+			const equals = jest.fn(function (p: { x: number }, q: { x: number }) {
+				return p.x === q.x;
+			});
+			expect(helpers.differenceWith([{ x: 1 }, { x: 2 }, { x: 1 }], [{ x: 2 }], equals)).toStrictEqual([{ x: 1 }]);
+			expect(equals.mock.calls[0]).toStrictEqual([{ x: 1 }, { x: 2 }]);
+			expect(helpers.differenceWith(once(1, 2, 3), once(2), same)).toStrictEqual([1, 3]);
+		});
+
+		it('intersectionWith keeps the distinct items of a with an equal in b', function () {
+			const equals = jest.fn(function (p: { x: number }, q: { x: number }) {
+				return p.x === q.x;
+			});
+			expect(helpers.intersectionWith([{ x: 1 }, { x: 2 }, { x: 2 }], [{ x: 2 }, { x: 3 }], equals)).toStrictEqual([{ x: 2 }]);
+			expect(equals.mock.calls[0]).toStrictEqual([{ x: 1 }, { x: 2 }]);
+			expect(helpers.intersectionWith(once(1, 2, 3), once(3, 2), same)).toStrictEqual([2, 3]);
+		});
+
+		it('all validate their function argument', function () {
+			expect(function () {
+				helpers.unionBy([], [], null as any);
+			}).toThrow(new TypeError('unionBy: `keyFn` must be a function, got null'));
+			expect(function () {
+				helpers.symmetricDifferenceBy([], [], null as any);
+			}).toThrow(new TypeError('symmetricDifferenceBy: `keyFn` must be a function, got null'));
+			expect(function () {
+				helpers.uniqueWith([], 1 as any);
+			}).toThrow(new TypeError('uniqueWith: `equals` must be a function, got number'));
+			expect(function () {
+				helpers.unionWith([], [], 1 as any);
+			}).toThrow(new TypeError('unionWith: `equals` must be a function, got number'));
+			expect(function () {
+				helpers.differenceWith([], [], 1 as any);
+			}).toThrow(new TypeError('differenceWith: `equals` must be a function, got number'));
+			expect(function () {
+				helpers.intersectionWith([], [], 1 as any);
+			}).toThrow(new TypeError('intersectionWith: `equals` must be a function, got number'));
+		});
+	});
+
+	describe('toggle', function () {
+		it('removes a present item or appends a missing one, without mutating', function () {
+			const input = ['a', 'b'];
+			expect(helpers.toggle(input, 'b')).toStrictEqual(['a']);
+			expect(helpers.toggle(input, 'c')).toStrictEqual(['a', 'b', 'c']);
+			expect(input).toStrictEqual(['a', 'b']);
+			expect(helpers.toggle([], 1)).toStrictEqual([1]);
+		});
+
+		it('uses SameValueZero and removes every match', function () {
+			expect(helpers.toggle([NaN, 1], NaN)).toStrictEqual([1]);
+			expect(helpers.toggle([0, 1], -0)).toStrictEqual([1]);
+			expect(helpers.toggle([1, 2, 1], 1)).toStrictEqual([2]);
+		});
+
+		it('compares keys when given a keyFn', function () {
+			const keyFn = jest.fn(byId);
+			expect(helpers.toggle([{ id: 1 }, { id: 2 }], { id: 1 }, keyFn)).toStrictEqual([{ id: 2 }]);
+			expect(keyFn).toHaveBeenCalledTimes(3);
+			expect(helpers.toggle([{ id: 1 }], { id: 3 }, byId)).toStrictEqual([{ id: 1 }, { id: 3 }]);
+			expect(function () {
+				helpers.toggle([1], 1, 1 as any);
+			}).toThrow(new TypeError('toggle: `keyFn` must be a function, got number'));
+		});
+	});
+
+	describe('averageBy and medianBy', function () {
+		/** Value selector. */
+		function value(item: { n: number }): number {
+			return item.n;
+		}
+
+		it('averageBy uses compensated summation', function () {
+			expect(helpers.averageBy([{ n: 0.1 }, { n: 0.2 }, { n: 0.3 }], value)).toBe(0.2);
+			expect(helpers.averageBy([1, 2, 3, 4], self)).toBe(2.5);
+			expect(helpers.averageBy([1e308, 1e308], self)).toBe(Infinity);
+			expect(helpers.averageBy([1, NaN], self)).toBeNaN();
+			expect(helpers.averageBy(['1', '2'] as any[], self)).toBe(1.5);
+		});
+
+		it('averageBy is NaN for an empty array, and sumBy is unchanged', function () {
+			expect(helpers.averageBy([], self)).toBeNaN();
+			expect(helpers.sumBy([], self)).toBe(0);
+			expect(helpers.sumBy([0.1, 0.2, 0.3], self)).toBe(0.6);
+		});
+
+		it('medianBy matches math.median', function () {
+			expect(helpers.medianBy([{ n: 30 }, { n: 20 }, { n: 50 }], value)).toBe(30);
+			expect(helpers.medianBy([4, 1, 3, 2], self)).toBe(2.5);
+			expect(helpers.medianBy([], self)).toBeNaN();
+			expect(helpers.medianBy([1, NaN, 2], self)).toBeNaN();
+			const selector = jest.fn(self);
+			helpers.medianBy([5, 6], selector);
+			expect(selector).toHaveBeenNthCalledWith(2, 6, 1);
+		});
+
+		it('both validate the selector', function () {
+			expect(function () {
+				helpers.averageBy([1], null as any);
+			}).toThrow(new TypeError('averageBy: `selector` must be a function, got null'));
+			expect(function () {
+				helpers.medianBy([1], null as any);
+			}).toThrow(new TypeError('medianBy: `selector` must be a function, got null'));
+		});
+	});
+
+	describe('combinations, permutations and powerSet', function () {
+		it('combinations lists the k-subsets of positions in lexicographic order', function () {
+			expect(helpers.combinations(['a', 'b', 'c'], 2)).toStrictEqual([
+				['a', 'b'],
+				['a', 'c'],
+				['b', 'c']
+			]);
+			expect(helpers.combinations([1, 2, 3, 4], 3)).toStrictEqual([
+				[1, 2, 3],
+				[1, 2, 4],
+				[1, 3, 4],
+				[2, 3, 4]
+			]);
+			expect(helpers.combinations([1, 2], 0)).toStrictEqual([[]]);
+			expect(helpers.combinations([1, 2], 2)).toStrictEqual([[1, 2]]);
+			expect(helpers.combinations([1, 2], 3)).toStrictEqual([]);
+			expect(helpers.combinations([], 0)).toStrictEqual([[]]);
+			expect(helpers.combinations([1, 1], 1)).toStrictEqual([[1], [1]]);
+		});
+
+		it('permutations lists the arrangements of positions in lexicographic order', function () {
+			expect(helpers.permutations([1, 2, 3])).toStrictEqual([
+				[1, 2, 3],
+				[1, 3, 2],
+				[2, 1, 3],
+				[2, 3, 1],
+				[3, 1, 2],
+				[3, 2, 1]
+			]);
+			expect(helpers.permutations(['a', 'b', 'c'], 1)).toStrictEqual([['a'], ['b'], ['c']]);
+			expect(helpers.permutations([1, 2], 0)).toStrictEqual([[]]);
+			expect(helpers.permutations([], 0)).toStrictEqual([[]]);
+			expect(helpers.permutations([])).toStrictEqual([[]]);
+			expect(helpers.permutations([1, 2], 3)).toStrictEqual([]);
+		});
+
+		it('powerSet lists every subset in binary-counting order', function () {
+			expect(helpers.powerSet(['a', 'b', 'c'])).toStrictEqual([[], ['a'], ['b'], ['a', 'b'], ['c'], ['a', 'c'], ['b', 'c'], ['a', 'b', 'c']]);
+			expect(helpers.powerSet([])).toStrictEqual([[]]);
+		});
+
+		it('reject results larger than arrays can hold before allocating them', function () {
+			expect(function () {
+				helpers.combinations(new Array(100_000), 3);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.combinations(new Array(66_000), 2);
+			}).toThrow(new RangeError('combinations: the result would contain 2177967000 tuples holding 4355934000 items, more than 2 ** 32 - 1'));
+			expect(function () {
+				helpers.permutations(new Array(20));
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.permutations(new Array(70_000), 2);
+			}).toThrow(new RangeError('permutations: the result would contain 4899930000 tuples holding 9799860000 items, more than 2 ** 32 - 1'));
+			expect(function () {
+				helpers.powerSet(new Array(29));
+			}).toThrow(new RangeError('powerSet: the result would contain 536870912 tuples holding 7784628224 items, more than 2 ** 32 - 1'));
+		});
+
+		it('validate k', function () {
+			expect(function () {
+				helpers.combinations([1], -1);
+			}).toThrow(new RangeError('combinations: `k` must be an integer >= 0, got -1'));
+			expect(function () {
+				helpers.permutations([1], 1.5);
+			}).toThrow(new RangeError('permutations: `k` must be an integer >= 0, got 1.5'));
+			expect(function () {
+				helpers.combinations([1], '1' as any);
+			}).toThrow(TypeError);
+		});
+	});
+
+	describe('zipWith', function () {
+		it('combines arrays element-wise, truncating to the shortest (unlike lodash, which pads)', function () {
+			expect(
+				helpers.zipWith(
+					function (a, b) {
+						return a + b;
+					},
+					[1, 2, 3],
+					[10, 20]
+				)
+			).toStrictEqual([11, 22]);
+			const labels: string[] = helpers.zipWith(
+				function (name, age, active) {
+					return `${name}:${age}:${active}`;
+				},
+				['al', 'bo'],
+				[30, 25],
+				[true, false]
+			);
+			expect(labels).toStrictEqual(['al:30:true', 'bo:25:false']);
+			expect(helpers.zipWith(self, [1, 2])).toStrictEqual([1, 2]);
+			expect(helpers.zipWith(self, [], [1])).toStrictEqual([]);
+		});
+
+		it('returns [] without arrays and validates fn', function () {
+			const fn = jest.fn();
+			expect(helpers.zipWith(fn)).toStrictEqual([]);
+			expect(fn).not.toHaveBeenCalled();
+			expect(function () {
+				helpers.zipWith(null as any, [1]);
+			}).toThrow(new TypeError('zipWith: `fn` must be a function, got null'));
+		});
+	});
+
+	describe('swap and rotate', function () {
+		it('swap exchanges two items of a copy, with negative indices', function () {
+			const input = ['a', 'b', 'c'];
+			expect(helpers.swap(input, 0, 2)).toStrictEqual(['c', 'b', 'a']);
+			expect(helpers.swap(input, 0, -2)).toStrictEqual(['b', 'a', 'c']);
+			expect(helpers.swap(input, 1, 1)).toStrictEqual(['a', 'b', 'c']);
+			expect(input).toStrictEqual(['a', 'b', 'c']);
+		});
+
+		it('swap rejects out-of-range indices', function () {
+			expect(function () {
+				helpers.swap([1, 2], 0, 2);
+			}).toThrow(new RangeError('swap: `j` must be an integer in [-2, 1], got 2'));
+			expect(function () {
+				helpers.swap([1, 2], -3, 0);
+			}).toThrow(new RangeError('swap: `i` must be an integer in [-2, 1], got -3'));
+			expect(function () {
+				helpers.swap([], 0, 0);
+			}).toThrow(new RangeError('swap: `i` must be a valid index, but the array is empty, got 0'));
+		});
+
+		it('rotate moves items towards the end for positive k, towards the start for negative k', function () {
+			expect(helpers.rotate([1, 2, 3, 4], 1)).toStrictEqual([4, 1, 2, 3]);
+			expect(helpers.rotate([1, 2, 3, 4], -1)).toStrictEqual([2, 3, 4, 1]);
+			expect(helpers.rotate([1, 2, 3], 7)).toStrictEqual([3, 1, 2]);
+			expect(helpers.rotate([1, 2, 3], -7)).toStrictEqual([2, 3, 1]);
+			expect(helpers.rotate([1, 2, 3], 3)).toStrictEqual([1, 2, 3]);
+			expect(helpers.rotate([1, 2, 3], 0)).toStrictEqual([1, 2, 3]);
+			expect(helpers.rotate([], 5)).toStrictEqual([]);
+		});
+
+		it('rotate requires an integer k', function () {
+			expect(function () {
+				helpers.rotate([1], 1.5);
+			}).toThrow(new RangeError('rotate: `k` must be an integer, got 1.5'));
+			expect(function () {
+				helpers.rotate([1], Infinity);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.rotate([1], '1' as any);
+			}).toThrow(new TypeError('rotate: `k` must be an integer, got string'));
+		});
+	});
+});

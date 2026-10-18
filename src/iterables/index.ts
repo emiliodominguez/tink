@@ -1,5 +1,7 @@
+import { AbortError } from '../async/index.js';
 import { isAsyncIterable, isIterable } from '../guards/index.js';
 import { assertFunction, assertInteger, assertNumber, describe } from '../utils/assert.js';
+import type { AbortSignalLike } from '../utils/index.js';
 
 /**
  * The tuple of item types produced by {@link zip} for a tuple of input iterables.
@@ -1125,6 +1127,233 @@ export function chunkAsync<T>(iterable: AwaitableIterable<T>, size: number): Asy
 	assertAwaitableIterable('chunkAsync', iterable);
 	assertInteger('chunkAsync', 'size', size, 1);
 	return chunkedAsync(iterable, size);
+}
+
+/**
+ * Options accepted by {@link mapConcurrent}.
+ */
+export interface MapConcurrentOptions {
+	/**
+	 * Maximum number of items pulled from the source but not yet consumed: mapping in flight, or mapped and waiting to be read (an
+	 * integer >= 1, or `Infinity` to disable backpressure).
+	 */
+	concurrency: number;
+	/** `true` (the default): yield results in source order. `false`: yield each result as soon as it is ready. */
+	ordered?: boolean;
+	/**
+	 * Aborting it stops pulling from the source, which is closed, and makes the iterator throw the signal's `reason` (or an `AbortError`)
+	 * at its next read. It is also passed to `fn` as its third argument.
+	 */
+	signal?: AbortSignalLike | null;
+}
+
+/**
+ * An item pulled by {@link mapConcurrent}: pending until its mapping settles, then its outcome.
+ */
+interface MappedSlot {
+	settled: boolean;
+	ok: boolean;
+	result: unknown;
+}
+
+/**
+ * The async generator behind {@link mapConcurrent} (the arguments are already validated).
+ * @param {AwaitableIterable<unknown>} iterable - The source items
+ * @param {(value: unknown, index: number, signal: AbortSignalLike | undefined) => unknown} fn - Maps an item
+ * @param {number} concurrency - The read-ahead limit
+ * @param {boolean} ordered - Whether results keep source order
+ * @param {AbortSignalLike | undefined} signal - The abort signal
+ * @returns {AsyncGenerator<unknown, void, undefined>} An async generator of the mapped items
+ */
+async function* mappedConcurrently(
+	iterable: AwaitableIterable<unknown>,
+	fn: (value: unknown, index: number, signal: AbortSignalLike | undefined) => unknown,
+	concurrency: number,
+	ordered: boolean,
+	signal: AbortSignalLike | undefined
+): AsyncGenerator<unknown, void, undefined> {
+	// Sync iterables always get the wrapper, which closes them on early exit and awaits their items.
+	const source = (isAsyncIterable(iterable) ? iterable : awaitedItems(iterable))[Symbol.asyncIterator]();
+	// Pulled items not yet yielded: in source order when `ordered`, otherwise in the order they settled.
+	const slots: MappedSlot[] = [];
+	let buffered = 0;
+	let index = 0;
+	let pulling = false;
+	let exhausted = false;
+	let stopped = false;
+	let sourceError: { error: unknown } | undefined;
+	let wakeUp: (() => void) | undefined;
+
+	/**
+	 * Wakes the consumer loop up, if it is waiting.
+	 * @returns {void}
+	 */
+	function notify(): void {
+		const resume = wakeUp;
+
+		wakeUp = undefined;
+		resume?.();
+	}
+
+	/**
+	 * Records the outcome of a mapping and wakes the consumer up.
+	 * @param {MappedSlot} slot - The item's slot
+	 * @param {boolean} ok - Whether the mapping succeeded
+	 * @param {unknown} result - The mapped value or the error
+	 * @returns {void}
+	 */
+	function settle(slot: MappedSlot, ok: boolean, result: unknown): void {
+		slot.settled = true;
+		slot.ok = ok;
+		slot.result = result;
+		if (!ordered) slots.push(slot);
+		notify();
+	}
+
+	/**
+	 * Pulls the next item, unless the read-ahead limit is reached, a pull is already pending, or the source is done.
+	 * @returns {void}
+	 */
+	function fill(): void {
+		if (pulling || exhausted || stopped || buffered >= concurrency) return;
+		pulling = true;
+		source.next().then(
+			function (step) {
+				pulling = false;
+				if (step.done) {
+					exhausted = true;
+				} else if (!stopped) {
+					const slot: MappedSlot = { settled: false, ok: false, result: undefined };
+					let outcome: unknown;
+
+					buffered++;
+					if (ordered) slots.push(slot);
+					try {
+						outcome = fn(step.value, index++, signal);
+					} catch (error) {
+						outcome = Promise.reject(error);
+					}
+					Promise.resolve(outcome).then(
+						function (value) {
+							settle(slot, true, value);
+						},
+						function (error: unknown) {
+							settle(slot, false, error);
+						}
+					);
+					fill();
+				}
+				notify();
+			},
+			function (error: unknown) {
+				pulling = false;
+				exhausted = true;
+				sourceError = { error };
+				notify();
+			}
+		);
+	}
+
+	/**
+	 * Abort listener: stops pulling and wakes the consumer up, which then throws the reason.
+	 * @returns {void}
+	 */
+	function onAbort(): void {
+		stopped = true;
+		notify();
+	}
+
+	signal?.addEventListener('abort', onAbort);
+
+	try {
+		for (;;) {
+			if (signal?.aborted) throw abortReason(signal);
+			fill();
+
+			const slot = slots[0];
+
+			if (slot?.settled) {
+				slots.shift();
+				buffered--;
+				fill();
+				if (!slot.ok) throw slot.result;
+				yield slot.result;
+			} else if (exhausted && buffered === 0) {
+				if (sourceError) throw sourceError.error;
+				return;
+			} else {
+				await new Promise<void>(function (resolve) {
+					wakeUp = resolve;
+				});
+			}
+		}
+	} finally {
+		stopped = true;
+		signal?.removeEventListener('abort', onAbort);
+		// Close the source unless it finished or failed on its own (a pending pull is answered first, then the source closes).
+		if (!exhausted) await source.return?.();
+	}
+}
+
+/**
+ * Lazily maps an async (or sync) iterable with a possibly async `fn`, running up to `concurrency` mappings at the same time: the
+ * streaming counterpart of `mapWithConcurrency` (from the async module), for sources too large or too slow to collect first.
+ *
+ * - Backpressure: at most `concurrency` items are pulled ahead of the consumer (mapping, or mapped and waiting to be read), and the
+ *   source is pulled one item at a time, so a slow consumer slows the source down instead of buffering it.
+ * - Order: results come in source order by default; with `ordered: false` each comes as soon as it is ready.
+ * - Errors: an error of `fn` is thrown when its result would have been yielded (in order) or as soon as it happens (unordered); an error
+ *   of the source is thrown after the items pulled before it. The source is then closed and nothing more is pulled.
+ * - Early exit (`break`, `return()`, an error) stops pulling and calls the source's `return()`. Mappings already running are not
+ *   interrupted (their results are dropped, and their rejections handled), so pass `signal` to `fn` to cancel them.
+ * - `signal`: aborting stops pulling and makes the iterator throw the signal's `reason` at its next read, closing the source.
+ * @template T - The source item type
+ * @template U - The mapped item type
+ * @param {AwaitableIterable<T>} iterable - The source items
+ * @param {(value: T, index: number, signal: AbortSignalLike | undefined) => U | PromiseLike<U>} fn - Maps an item (with its index and the signal)
+ * @param {number | MapConcurrentOptions} options - The concurrency, or `{ concurrency, ordered, signal }`
+ * @returns {AsyncIterableIterator<U>} An async iterator of the mapped items
+ * @throws {TypeError} when `iterable` is neither async iterable nor iterable, `fn` is not a function, `concurrency` is not a number, or `signal` is not a signal
+ * @throws {RangeError} when `concurrency` is not an integer >= 1 or `Infinity`
+ * @example
+ * async function double(n: number): Promise<number> { await new Promise(function (resolve) { setTimeout(resolve, 10 - n); }); return n * 2; }
+ * await toArrayAsync(mapConcurrent([1, 2, 3, 4], double, 2)); // => [2, 4, 6, 8]
+ * @example
+ * // Unordered, stopping early: the source is closed and nothing more is pulled
+ * for await (const size of mapConcurrent(count(1), async function (n) { return n * 10; }, { concurrency: 4, ordered: false })) {
+ *   if (size >= 30) break;
+ * }
+ */
+export function mapConcurrent<T, U>(
+	iterable: AwaitableIterable<T>,
+	fn: (value: T, index: number, signal: AbortSignalLike | undefined) => U | PromiseLike<U>,
+	options: number | MapConcurrentOptions
+): AsyncIterableIterator<U> {
+	const { concurrency, ordered = true, signal } = typeof options === 'object' && options !== null ? options : { concurrency: options };
+
+	assertAwaitableIterable('mapConcurrent', iterable);
+	assertFunction('mapConcurrent', 'fn', fn);
+	assertInteger('mapConcurrent', 'concurrency', concurrency, 1, true);
+	if (signal != null && (typeof signal !== 'object' || typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function')) {
+		throw new TypeError(`mapConcurrent: \`signal\` must be an AbortSignal, null or undefined, got ${describe(signal)}`);
+	}
+
+	return mappedConcurrently(
+		iterable,
+		fn as (value: unknown, index: number, signal: AbortSignalLike | undefined) => unknown,
+		concurrency,
+		ordered,
+		signal ?? undefined
+	) as AsyncIterableIterator<U>;
+}
+
+/**
+ * The reason a signal was aborted with, or a fresh `AbortError` when it has none.
+ * @param {AbortSignalLike} signal - An aborted signal
+ * @returns {unknown} The rejection reason
+ */
+function abortReason(signal: AbortSignalLike): unknown {
+	return signal.reason ?? new AbortError();
 }
 
 /**

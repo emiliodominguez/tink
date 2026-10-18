@@ -123,8 +123,18 @@ export function easeOut(easing: EasingFunction): EasingFunction {
 export function easeInOut(easing: EasingFunction): EasingFunction {
 	assertFunction('easeInOut', 'easing', easing);
 	return function (t) {
-		return t < 0.5 ? easing(2 * t) / 2 : 1 - easing(2 - 2 * t) / 2;
+		return inOut(easing, t);
 	};
+}
+
+/**
+ * Evaluates the ease-in-out built from `easing` at `t` (see {@link easeInOut}).
+ * @param {EasingFunction} easing - The ease-in function
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
+ */
+function inOut(easing: EasingFunction, t: number): number {
+	return t < 0.5 ? easing(2 * t) / 2 : 1 - easing(2 - 2 * t) / 2;
 }
 
 /**
@@ -150,16 +160,24 @@ export function easeInQuad(t: number): number {
 }
 /**
  * Quadratic ease-out.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeOutQuad(0.5); // => 0.75
  */
-export const easeOutQuad: EasingFunction = /* @__PURE__ */ easeOut(easeInQuad);
+export function easeOutQuad(t: number): number {
+	return 1 - easeInQuad(1 - t);
+}
 /**
  * Quadratic ease-in-out.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeInOutQuad(0.25); // => 0.125
  */
-export const easeInOutQuad: EasingFunction = /* @__PURE__ */ easeInOut(easeInQuad);
+export function easeInOutQuad(t: number): number {
+	return inOut(easeInQuad, t);
+}
 
 /**
  * Cubic ease-in: `t³` (computed with multiplications, like the other power easings: much faster than `**`).
@@ -173,16 +191,24 @@ export function easeInCubic(t: number): number {
 }
 /**
  * Cubic ease-out.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeOutCubic(0.5); // => 0.875
  */
-export const easeOutCubic: EasingFunction = /* @__PURE__ */ easeOut(easeInCubic);
+export function easeOutCubic(t: number): number {
+	return 1 - easeInCubic(1 - t);
+}
 /**
  * Cubic ease-in-out.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeInOutCubic(0.25); // => 0.0625
  */
-export const easeInOutCubic: EasingFunction = /* @__PURE__ */ easeInOut(easeInCubic);
+export function easeInOutCubic(t: number): number {
+	return inOut(easeInCubic, t);
+}
 
 /**
  * Quartic ease-in: `t⁴`.
@@ -197,16 +223,24 @@ export function easeInQuart(t: number): number {
 }
 /**
  * Quartic ease-out.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeOutQuart(0.5); // => 0.9375
  */
-export const easeOutQuart: EasingFunction = /* @__PURE__ */ easeOut(easeInQuart);
+export function easeOutQuart(t: number): number {
+	return 1 - easeInQuart(1 - t);
+}
 /**
  * Quartic ease-in-out.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeInOutQuart(0.25); // => 0.03125
  */
-export const easeInOutQuart: EasingFunction = /* @__PURE__ */ easeInOut(easeInQuart);
+export function easeInOutQuart(t: number): number {
+	return inOut(easeInQuart, t);
+}
 
 /**
  * Quintic ease-in: `t⁵`.
@@ -221,16 +255,24 @@ export function easeInQuint(t: number): number {
 }
 /**
  * Quintic ease-out.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeOutQuint(0.5); // => 0.96875
  */
-export const easeOutQuint: EasingFunction = /* @__PURE__ */ easeOut(easeInQuint);
+export function easeOutQuint(t: number): number {
+	return 1 - easeInQuint(1 - t);
+}
 /**
  * Quintic ease-in-out.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeInOutQuint(0.25); // => 0.015625
  */
-export const easeInOutQuint: EasingFunction = /* @__PURE__ */ easeInOut(easeInQuint);
+export function easeInOutQuint(t: number): number {
+	return inOut(easeInQuint, t);
+}
 
 /**
  * Sinusoidal ease-in: `1 - cos(t·π/2)`.
@@ -246,16 +288,24 @@ export function easeInSine(t: number): number {
 }
 /**
  * Sinusoidal ease-out (`sin(t·π/2)`).
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * Math.abs(easeOutSine(0.5) - Math.SQRT1_2) < 1e-15; // => true
  */
-export const easeOutSine: EasingFunction = /* @__PURE__ */ easeOut(easeInSine);
+export function easeOutSine(t: number): number {
+	return 1 - easeInSine(1 - t);
+}
 /**
  * Sinusoidal ease-in-out (`(1 - cos(t·π)) / 2`).
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeInOutSine(0.5); // => 0.5
  */
-export const easeInOutSine: EasingFunction = /* @__PURE__ */ easeInOut(easeInSine);
+export function easeInOutSine(t: number): number {
+	return inOut(easeInSine, t);
+}
 
 /**
  * Exponential ease-in: `2^(10t - 10)`, pinned to `0` at `t = 0`.
@@ -270,16 +320,24 @@ export function easeInExpo(t: number): number {
 }
 /**
  * Exponential ease-out.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeOutExpo(0.5); // => 0.96875
  */
-export const easeOutExpo: EasingFunction = /* @__PURE__ */ easeOut(easeInExpo);
+export function easeOutExpo(t: number): number {
+	return 1 - easeInExpo(1 - t);
+}
 /**
  * Exponential ease-in-out.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeInOutExpo(0.25); // => 0.015625
  */
-export const easeInOutExpo: EasingFunction = /* @__PURE__ */ easeInOut(easeInExpo);
+export function easeInOutExpo(t: number): number {
+	return inOut(easeInExpo, t);
+}
 
 /**
  * Circular ease-in: `1 - √(1 - t²)` (`NaN` for `|t| > 1`).
@@ -294,16 +352,24 @@ export function easeInCirc(t: number): number {
 }
 /**
  * Circular ease-out (`√(1 - (1 - t)²)`).
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * Math.abs(easeOutCirc(0.4) - 0.8) < 1e-15; // => true
  */
-export const easeOutCirc: EasingFunction = /* @__PURE__ */ easeOut(easeInCirc);
+export function easeOutCirc(t: number): number {
+	return 1 - easeInCirc(1 - t);
+}
 /**
  * Circular ease-in-out.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * Math.abs(easeInOutCirc(0.3) - 0.1) < 1e-15; // => true
  */
-export const easeInOutCirc: EasingFunction = /* @__PURE__ */ easeInOut(easeInCirc);
+export function easeInOutCirc(t: number): number {
+	return inOut(easeInCirc, t);
+}
 
 /**
  * "Back" ease-in: pulls back slightly (about 10%) before moving forward: `t²·((c + 1)t - c)` with `c = 1.70158`.
@@ -318,16 +384,24 @@ export function easeInBack(t: number): number {
 }
 /**
  * "Back" ease-out: overshoots the target slightly before settling.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeOutBack(0.5) > 1; // => true
  */
-export const easeOutBack: EasingFunction = /* @__PURE__ */ easeOut(easeInBack);
+export function easeOutBack(t: number): number {
+	return 1 - easeInBack(1 - t);
+}
 /**
  * "Back" ease-in-out.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeInOutBack(0.5); // => 0.5
  */
-export const easeInOutBack: EasingFunction = /* @__PURE__ */ easeInOut(easeInBack);
+export function easeInOutBack(t: number): number {
+	return inOut(easeInBack, t);
+}
 
 /**
  * Elastic ease-in: a growing oscillation, `-2^(10t - 10)·sin((10t - 10.75)·2π/3)`, pinned to `0` and `1` at the ends.
@@ -346,36 +420,56 @@ export function easeInElastic(t: number): number {
 }
 /**
  * Elastic ease-out: overshoots and oscillates around the target.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeOutElastic(1); // => 1
  */
-export const easeOutElastic: EasingFunction = /* @__PURE__ */ easeOut(easeInElastic);
+export function easeOutElastic(t: number): number {
+	return 1 - easeInElastic(1 - t);
+}
 /**
  * Elastic ease-in-out.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeInOutElastic(0.5); // => 0.5
  */
-export const easeInOutElastic: EasingFunction = /* @__PURE__ */ easeInOut(easeInElastic);
+export function easeInOutElastic(t: number): number {
+	return inOut(easeInElastic, t);
+}
 
 /**
  * Bounce ease-out: falls to the target and bounces three times (base curve of the bounce family).
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeOutBounce(1); // => 1
  * easeOutBounce(0.5); // => 0.765625
  */
-export const easeOutBounce: EasingFunction = bounce;
+export function easeOutBounce(t: number): number {
+	return bounce(t);
+}
 /**
  * Bounce ease-in (reflection of {@link easeOutBounce}).
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeInBounce(0.5); // => 0.234375
  */
-export const easeInBounce: EasingFunction = /* @__PURE__ */ easeOut(bounce);
+export function easeInBounce(t: number): number {
+	return 1 - bounce(1 - t);
+}
 /**
  * Bounce ease-in-out.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * easeInOutBounce(0.5); // => 0.5
  */
-export const easeInOutBounce: EasingFunction = /* @__PURE__ */ easeInOut(easeInBounce);
+export function easeInOutBounce(t: number): number {
+	return inOut(easeInBounce, t);
+}
 
 /**
  * Solves `x(s) = t` for `s` in `[0, 1]`, where `x(s) = ((a·s + b)·s + c)·s` is increasing with `x(0) = 0` and `x(1) = 1`.
@@ -456,30 +550,50 @@ export function cubicBezier(x1: number, y1: number, x2: number, y2: number): Eas
 	};
 }
 
+let cssEaseCurve: EasingFunction | undefined;
 /**
  * CSS `ease`: `cubic-bezier(0.25, 0.1, 0.25, 1)` (the default `transition-timing-function`).
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * Math.abs(cssEase(0.5) - 0.8024033877399112) < 1e-9; // => true
  */
-export const cssEase: EasingFunction = /* @__PURE__ */ cubicBezier(0.25, 0.1, 0.25, 1);
+export function cssEase(t: number): number {
+	return (cssEaseCurve ??= cubicBezier(0.25, 0.1, 0.25, 1))(t);
+}
+let cssEaseInCurve: EasingFunction | undefined;
 /**
  * CSS `ease-in`: `cubic-bezier(0.42, 0, 1, 1)`.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * cssEaseIn(1); // => 1
  */
-export const cssEaseIn: EasingFunction = /* @__PURE__ */ cubicBezier(0.42, 0, 1, 1);
+export function cssEaseIn(t: number): number {
+	return (cssEaseInCurve ??= cubicBezier(0.42, 0, 1, 1))(t);
+}
+let cssEaseOutCurve: EasingFunction | undefined;
 /**
  * CSS `ease-out`: `cubic-bezier(0, 0, 0.58, 1)`.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * cssEaseOut(0); // => 0
  */
-export const cssEaseOut: EasingFunction = /* @__PURE__ */ cubicBezier(0, 0, 0.58, 1);
+export function cssEaseOut(t: number): number {
+	return (cssEaseOutCurve ??= cubicBezier(0, 0, 0.58, 1))(t);
+}
+let cssEaseInOutCurve: EasingFunction | undefined;
 /**
  * CSS `ease-in-out`: `cubic-bezier(0.42, 0, 0.58, 1)`.
+ * @param {number} t - Progress
+ * @returns {number} Eased progress
  * @example
  * Math.abs(cssEaseInOut(0.5) - 0.5) < 1e-12; // => true
  */
-export const cssEaseInOut: EasingFunction = /* @__PURE__ */ cubicBezier(0.42, 0, 0.58, 1);
+export function cssEaseInOut(t: number): number {
+	return (cssEaseInOutCurve ??= cubicBezier(0.42, 0, 0.58, 1))(t);
+}
 
 /**
  * Creates a step easing function equivalent to CSS `steps(count, position)`: the output jumps between `jumps + 1` evenly spaced

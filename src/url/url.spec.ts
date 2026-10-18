@@ -407,3 +407,227 @@ describe('URL helpers', function () {
 		});
 	});
 });
+
+describe('URL helpers (round 11)', function () {
+	describe('isSafeUrl / sanitizeUrl', function () {
+		it('should allow the default schemes, in any case', function () {
+			for (const url of ['https://example.com', 'http://x', 'HTTPS://X', 'mailto:a@b.c', 'tel:+123', 'Https:host']) expect(helpers.isSafeUrl(url)).toBe(true);
+		});
+
+		it('should reject other schemes, however they are disguised', function () {
+			const unsafe = [
+				'javascript:alert(1)',
+				'JaVaScRiPt:alert(1)',
+				' java\tscript:alert(1)',
+				'\x01javascript:x',
+				'\x00 \x1fjavascript:x',
+				'java\nscript:x',
+				'jav\r\nascript:x',
+				'\tjavascript:x',
+				'data:text/html,<script>alert(1)</script>',
+				'vbscript:msgbox',
+				'file:///etc/passwd',
+				'blob:https://x/uuid',
+				'custom+app://open',
+				'c:/windows'
+			];
+			for (const url of unsafe) expect(helpers.isSafeUrl(url)).toBe(false);
+		});
+
+		it('should treat strings without a scheme as relative', function () {
+			for (const url of [
+				'/path',
+				'page.html',
+				'?q=1',
+				'#top',
+				'',
+				'//cdn.example.com/x.js',
+				'javascript',
+				'java script:x',
+				'\x01java\x01script:x',
+				'javascript&colon;x',
+				'1http:x'
+			]) {
+				expect(helpers.isSafeUrl(url)).toBe(true);
+				expect(helpers.isSafeUrl(url, { allowRelative: false })).toBe(false);
+			}
+		});
+
+		it('should use a custom allowlist', function () {
+			expect(helpers.isSafeUrl('ftp://files.example.com', { protocols: ['https:', 'FTP:'] })).toBe(true);
+			expect(helpers.isSafeUrl('https://x', { protocols: ['ftp:'] })).toBe(false);
+			expect(helpers.isSafeUrl('/x', { protocols: [] })).toBe(true);
+			expect(helpers.isSafeUrl('https://x', { protocols: [] })).toBe(false);
+			expect(helpers.isSafeUrl('web+app:x', { protocols: ['web+app:'] })).toBe(true);
+		});
+
+		it('should treat non-strings as unsafe', function () {
+			expect(helpers.isSafeUrl(undefined as any)).toBe(false);
+			expect(
+				helpers.isSafeUrl({
+					toString: function () {
+						return 'https://x';
+					}
+				} as any)
+			).toBe(false);
+			expect(helpers.sanitizeUrl(42 as any)).toBe('about:blank');
+		});
+
+		it('should validate the allowlist', function () {
+			expect(function () {
+				helpers.isSafeUrl('https://x', { protocols: 'https:' as any });
+			}).toThrow(new TypeError('isSafeUrl: `options.protocols` must be an array of strings, got string'));
+			expect(function () {
+				helpers.isSafeUrl('https://x', { protocols: ['https:', 1] as any });
+			}).toThrow(new TypeError('isSafeUrl: `options.protocols` must be an array of strings, got number in it'));
+			for (const entry of ['https', 'https://', ':', '1a:', '']) {
+				expect(function () {
+					helpers.isSafeUrl('/x', { protocols: [entry] });
+				}).toThrow(new RangeError(`isSafeUrl: \`options.protocols\` entries must be schemes ending with ':' (such as 'https:'), got ${JSON.stringify(entry)}`));
+			}
+		});
+
+		it('should sanitize with a fallback', function () {
+			expect(helpers.sanitizeUrl('https://example.com')).toBe('https://example.com');
+			expect(helpers.sanitizeUrl(' https://example.com ')).toBe(' https://example.com ');
+			expect(helpers.sanitizeUrl('javascript:alert(1)')).toBe('about:blank');
+			expect(helpers.sanitizeUrl('javascript:alert(1)', '#')).toBe('#');
+			expect(helpers.sanitizeUrl('vbscript:x', null)).toBeNull();
+			expect(helpers.sanitizeUrl('/x', '#', { allowRelative: false })).toBe('#');
+			expect(helpers.sanitizeUrl('ftp://x', '#', { protocols: ['ftp:'] })).toBe('ftp://x');
+		});
+	});
+
+	describe('slash helpers', function () {
+		it('withTrailingSlash should respect the query and fragment', function () {
+			expect(helpers.withTrailingSlash('/a?x=1')).toBe('/a/?x=1');
+			expect(helpers.withTrailingSlash('/a/?x=1')).toBe('/a/?x=1');
+			expect(helpers.withTrailingSlash('/a#b/c')).toBe('/a/#b/c');
+			expect(helpers.withTrailingSlash('')).toBe('/');
+			expect(helpers.withTrailingSlash('?q')).toBe('/?q');
+			expect(helpers.withTrailingSlash('https://x.com')).toBe('https://x.com/');
+		});
+
+		it('withoutTrailingSlash should keep roots and scheme slashes', function () {
+			expect(helpers.withoutTrailingSlash('/a/')).toBe('/a');
+			expect(helpers.withoutTrailingSlash('/a///?x=/#/')).toBe('/a?x=/#/');
+			expect(helpers.withoutTrailingSlash('/')).toBe('/');
+			expect(helpers.withoutTrailingSlash('/?x')).toBe('/?x');
+			expect(helpers.withoutTrailingSlash('')).toBe('');
+			expect(helpers.withoutTrailingSlash('a//')).toBe('a');
+			expect(helpers.withoutTrailingSlash('https://x.com/')).toBe('https://x.com');
+			expect(helpers.withoutTrailingSlash('https://')).toBe('https://');
+			expect(helpers.withoutTrailingSlash('file:///')).toBe('file:///');
+			expect(helpers.withoutTrailingSlash('//host/')).toBe('//host');
+		});
+
+		it('withLeadingSlash should give exactly one leading slash', function () {
+			expect(helpers.withLeadingSlash('a')).toBe('/a');
+			expect(helpers.withLeadingSlash('/a')).toBe('/a');
+			expect(helpers.withLeadingSlash('')).toBe('/');
+			expect(helpers.withLeadingSlash('//evil.example')).toBe('/evil.example');
+			expect(helpers.withLeadingSlash('/\\evil.example')).toBe('/evil.example');
+			expect(helpers.withLeadingSlash('/\t/evil.example')).toBe('/evil.example');
+			expect(helpers.withLeadingSlash('#x')).toBe('/#x');
+		});
+
+		it('withoutLeadingSlash should remove the leading slashes', function () {
+			expect(helpers.withoutLeadingSlash('/a/b/')).toBe('a/b/');
+			expect(helpers.withoutLeadingSlash('///a')).toBe('a');
+			expect(helpers.withoutLeadingSlash('a')).toBe('a');
+			expect(helpers.withoutLeadingSlash('\\\\a')).toBe('a');
+		});
+
+		it('cleanDoubleSlashes should only touch the path', function () {
+			expect(helpers.cleanDoubleSlashes('https://example.com//a///b?u=http://x//y#//z')).toBe('https://example.com/a/b?u=http://x//y#//z');
+			expect(helpers.cleanDoubleSlashes('file:///etc//hosts')).toBe('file:///etc/hosts');
+			expect(helpers.cleanDoubleSlashes('//cdn.example.com//lib.js')).toBe('//cdn.example.com/lib.js');
+			expect(helpers.cleanDoubleSlashes('/a//b//')).toBe('/a/b/');
+			expect(helpers.cleanDoubleSlashes('a//b')).toBe('a/b');
+			expect(helpers.cleanDoubleSlashes('')).toBe('');
+		});
+	});
+
+	describe('withBase / withoutBase', function () {
+		it('should mount a path under a base, segment by segment', function () {
+			expect(helpers.withBase('/users?page=2#top', '/app')).toBe('/app/users?page=2#top');
+			expect(helpers.withBase('users', '/app/')).toBe('/app/users');
+			expect(helpers.withBase('/', '/app')).toBe('/app/');
+			expect(helpers.withBase('', '/app')).toBe('/app');
+			expect(helpers.withBase('?q', '/app')).toBe('/app?q');
+			expect(helpers.withBase('/app', '/app')).toBe('/app');
+			expect(helpers.withBase('/app/users', '/app/')).toBe('/app/users');
+			expect(helpers.withBase('/app?x', '/app')).toBe('/app?x');
+			expect(helpers.withBase('/application', '/app')).toBe('/app/application');
+			expect(helpers.withBase('//evil.example', '/app')).toBe('/app/evil.example');
+			expect(helpers.withBase('/v1', 'https://api.example.com/')).toBe('https://api.example.com/v1');
+		});
+
+		it('should leave URLs with a scheme and empty bases alone', function () {
+			expect(helpers.withBase('https://x.com/a', '/app')).toBe('https://x.com/a');
+			expect(helpers.withBase('javascript:alert(1)', '/app')).toBe('javascript:alert(1)');
+			expect(helpers.withBase('users', '/')).toBe('users');
+			expect(helpers.withBase('users', '')).toBe('users');
+		});
+
+		it('should unmount a base path, segment by segment', function () {
+			expect(helpers.withoutBase('/app/users?page=2#top', '/app')).toBe('/users?page=2#top');
+			expect(helpers.withoutBase('/app', '/app/')).toBe('/');
+			expect(helpers.withoutBase('/app?x', '/app')).toBe('/?x');
+			expect(helpers.withoutBase('/app/', '/app')).toBe('/');
+			expect(helpers.withoutBase('/application', '/app')).toBe('/application');
+			expect(helpers.withoutBase('/other', '/app')).toBe('/other');
+			expect(helpers.withoutBase('/app//evil.example', '/app')).toBe('/evil.example');
+			expect(helpers.withoutBase('/users', '/')).toBe('/users');
+			expect(helpers.withoutBase('https://example.com/docs/intro', 'https://example.com/docs')).toBe('/intro');
+		});
+	});
+
+	describe('safeDecodeURIComponent', function () {
+		it('should decode like decodeURIComponent when it can', function () {
+			expect(helpers.safeDecodeURIComponent('caf%C3%A9%20au%20lait')).toBe('café au lait');
+			expect(helpers.safeDecodeURIComponent('%F0%9F%91%8D')).toBe('👍');
+			expect(helpers.safeDecodeURIComponent('plain')).toBe('plain');
+			expect(helpers.safeDecodeURIComponent('a+b%2B')).toBe('a+b+');
+			expect(helpers.safeDecodeURIComponent('')).toBe('');
+		});
+
+		it('should keep malformed escapes and decode the valid ones', function () {
+			expect(helpers.safeDecodeURIComponent('%E0%A4%A')).toBe('%E0%A4%A');
+			expect(helpers.safeDecodeURIComponent('100%25%20off%')).toBe('100% off%');
+			expect(helpers.safeDecodeURIComponent('%ZZ%41')).toBe('%ZZA');
+			expect(helpers.safeDecodeURIComponent('Jos%E9%20Garc%C3%ADa')).toBe('Jos%E9 García');
+			expect(helpers.safeDecodeURIComponent('%E0%A4%41')).toBe('%E0%A4A');
+			expect(helpers.safeDecodeURIComponent('%80%C3%A9%C3')).toBe('%80é%C3');
+			expect(helpers.safeDecodeURIComponent('%ED%A0%80')).toBe('%ED%A0%80');
+			expect(helpers.safeDecodeURIComponent('%F8%88%80%80%80')).toBe('%F8%88%80%80%80');
+			expect(helpers.safeDecodeURIComponent('%C0%AF')).toBe('%C0%AF');
+		});
+	});
+
+	describe('withFragment / withoutFragment / withoutQuery', function () {
+		it('should set, replace and remove the fragment', function () {
+			expect(helpers.withFragment('/docs?v=2#old', 'install')).toBe('/docs?v=2#install');
+			expect(helpers.withFragment('/docs', '#install')).toBe('/docs#install');
+			expect(helpers.withFragment('/docs', '##x')).toBe('/docs#%23x');
+			expect(helpers.withFragment('/a#b', '')).toBe('/a');
+			expect(helpers.withFragment('/a#b', '#')).toBe('/a');
+			expect(helpers.withFragment('/app', '/users/42?tab=info&x=1')).toBe('/app#/users/42?tab=info&x=1');
+			expect(helpers.withFragment('/a', 'section 2 #b 100%')).toBe('/a#section%202%20%23b%20100%25');
+			expect(helpers.withFragment('/a', 'é\ud800')).toBe('/a#%C3%A9%EF%BF%BD');
+		});
+
+		it('should remove the fragment', function () {
+			expect(helpers.withoutFragment('/docs?v=2#install')).toBe('/docs?v=2');
+			expect(helpers.withoutFragment('/docs')).toBe('/docs');
+			expect(helpers.withoutFragment('#a#b')).toBe('');
+		});
+
+		it('should remove the query and keep the fragment', function () {
+			expect(helpers.withoutQuery('/search?q=a#results')).toBe('/search#results');
+			expect(helpers.withoutQuery('/page#section?not-a-query')).toBe('/page#section?not-a-query');
+			expect(helpers.withoutQuery('/page')).toBe('/page');
+			expect(helpers.withoutQuery('?a?b')).toBe('');
+		});
+	});
+});

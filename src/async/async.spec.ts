@@ -5,8 +5,13 @@ import {
 	attemptAsync,
 	createDeferred,
 	createLimiter,
+	createQueue,
+	createRateLimiter,
 	debounceAsync,
+	filterWithConcurrency,
+	mapSettledWithConcurrency,
 	mapWithConcurrency,
+	memoizeAsync,
 	pollUntil,
 	promiseAllObject,
 	promiseAllSettledObject,
@@ -18,6 +23,7 @@ import {
 	timeoutSignal,
 	withTimeout
 } from '.';
+import { createLRUCache } from '../cache/index.js';
 import type { AbortSignalLike } from '../utils/index.js';
 
 /**
@@ -1527,6 +1533,1028 @@ describe('Async helpers (round 2)', function () {
 			expect(function () {
 				throwIfAborted({ aborted: true } as any);
 			}).toThrow(new TypeError('throwIfAborted: `signal` must be an AbortSignal, null or undefined, got object'));
+		});
+	});
+});
+
+/**
+ * Fails the test if an unhandled rejection happens while `fn` runs (and for one macrotask after it).
+ */
+async function withoutUnhandledRejections(fn: () => Promise<void>): Promise<void> {
+	const unhandled = jest.fn();
+	process.on('unhandledRejection', unhandled);
+	try {
+		await fn();
+		await new Promise(setImmediate);
+	} finally {
+		process.off('unhandledRejection', unhandled);
+	}
+	expect(unhandled).not.toHaveBeenCalled();
+}
+
+/** Flushes pending promise reactions (several hops). */
+async function flush(): Promise<void> {
+	for (let i = 0; i < 10; i++) await Promise.resolve();
+}
+
+describe('Async helpers (round 11)', function () {
+	afterEach(function () {
+		jest.clearAllTimers();
+		jest.useRealTimers();
+	});
+
+	describe('mapWithConcurrency (options)', function () {
+		it('accepts an options object and passes the signal to the mapper', async function () {
+			const signal = new CountingSignal();
+			const seen: unknown[] = [];
+			const result = await mapWithConcurrency(
+				[1, 2, 3],
+				async function (n, index, received) {
+					seen.push(received);
+					await Promise.resolve();
+					return n * 10 + index;
+				},
+				{ concurrency: 2, signal }
+			);
+			expect(result).toEqual([10, 21, 32]);
+			expect(seen).toEqual([signal, signal, signal]);
+			expect(signal.listenerCount).toBe(0);
+		});
+
+		it('defaults to unbounded concurrency with an empty options object, and passes undefined without a signal', async function () {
+			const deferreds = [createDeferred<number>(), createDeferred<number>(), createDeferred<number>()];
+			const signals: unknown[] = [];
+			const promise = mapWithConcurrency(
+				deferreds,
+				function (deferred, _index, signal) {
+					signals.push(signal);
+					return deferred.promise;
+				},
+				{ signal: null }
+			);
+			expect(signals).toEqual([undefined, undefined, undefined]);
+			deferreds.forEach(function (deferred, i) {
+				deferred.resolve(i);
+			});
+			await expect(promise).resolves.toEqual([0, 1, 2]);
+		});
+
+		it('rejects at once with the abort reason, starts nothing more and removes its listener', async function () {
+			await withoutUnhandledRejections(async function () {
+				const signal = new CountingSignal();
+				const started: number[] = [];
+				const running: Array<ReturnType<typeof createDeferred<number>>> = [];
+				const promise = mapWithConcurrency(
+					[0, 1, 2, 3],
+					function (n) {
+						started.push(n);
+						const deferred = createDeferred<number>();
+						running.push(deferred);
+						return deferred.promise;
+					},
+					{ concurrency: 2, signal }
+				);
+				expect(signal.listenerCount).toBe(1);
+				signal.abort('stop');
+				await expect(promise).rejects.toBe('stop');
+				expect(signal.listenerCount).toBe(0);
+				running[0].reject(new Error('late failure'));
+				running[1].resolve(1);
+				await flush();
+				expect(started).toEqual([0, 1]);
+			});
+		});
+
+		it('rejects with an AbortError when the signal has no reason, and does not call the mapper for an aborted signal', async function () {
+			const mapper = jest.fn();
+			const signal = new CountingSignal();
+			signal.abort();
+			await expect(mapWithConcurrency([1], mapper, { signal })).rejects.toBeInstanceOf(AbortError);
+			expect(mapper).not.toHaveBeenCalled();
+			expect(signal.listenerCount).toBe(0);
+		});
+
+		it('removes the listener after a failure', async function () {
+			const signal = new CountingSignal();
+			await expect(
+				mapWithConcurrency(
+					[1, 2],
+					async function () {
+						throw new Error('boom');
+					},
+					{ signal }
+				)
+			).rejects.toThrow('boom');
+			expect(signal.listenerCount).toBe(0);
+		});
+
+		it('with stopOnError: false, processes every item and rejects with an AggregateError of all errors', async function () {
+			await withoutUnhandledRejections(async function () {
+				const started: number[] = [];
+				const promise = mapWithConcurrency(
+					[0, 1, 2, 3, 4],
+					function (n) {
+						started.push(n);
+						if (n === 1) throw new Error('sync 1');
+						if (n === 3) return Promise.reject(new Error('async 3'));
+						return Promise.resolve(n);
+					},
+					{ concurrency: 2, stopOnError: false }
+				);
+				const error = await promise.then(
+					function () {
+						throw new Error('expected a rejection');
+					},
+					function (reason: unknown) {
+						return reason as AggregateError;
+					}
+				);
+				expect(error).toBeInstanceOf(AggregateError);
+				expect(error.message).toBe('mapWithConcurrency: 2 of 5 items failed');
+				expect(
+					error.errors.map(function (e: Error) {
+						return e.message;
+					})
+				).toEqual(['sync 1', 'async 3']);
+				expect(started).toEqual([0, 1, 2, 3, 4]);
+			});
+		});
+
+		it('with stopOnError: false, resolves when nothing failed', async function () {
+			await expect(
+				mapWithConcurrency(
+					[1, 2],
+					function (n) {
+						return n + 1;
+					},
+					{ stopOnError: false, concurrency: 1 }
+				)
+			).resolves.toEqual([2, 3]);
+		});
+
+		it('rejects with a TypeError for an invalid signal or options', async function () {
+			await expect(mapWithConcurrency([1], jest.fn(), { signal: {} as any })).rejects.toThrow(
+				new TypeError('mapWithConcurrency: `signal` must be an AbortSignal, null or undefined, got object')
+			);
+			await expect(mapWithConcurrency([1], jest.fn(), null as any)).rejects.toThrow(
+				new TypeError('mapWithConcurrency: `concurrency` must be an integer >= 1 or Infinity, got null')
+			);
+			await expect(mapWithConcurrency([1], jest.fn(), { concurrency: 0 })).rejects.toThrow(RangeError);
+		});
+	});
+
+	describe('mapSettledWithConcurrency', function () {
+		it('resolves with every outcome in input order, catching sync throws', async function () {
+			const results = await mapSettledWithConcurrency(
+				[1, 2, 3, 4],
+				function (n) {
+					if (n === 2) throw new Error('sync');
+					if (n === 3) return Promise.reject(new Error('async'));
+					return sleep(5 - n).then(function () {
+						return n * 2;
+					});
+				},
+				2
+			);
+			expect(results).toEqual([
+				{ status: 'fulfilled', value: 2 },
+				{ status: 'rejected', reason: new Error('sync') },
+				{ status: 'rejected', reason: new Error('async') },
+				{ status: 'fulfilled', value: 8 }
+			]);
+		});
+
+		it('respects the concurrency and passes the signal', async function () {
+			let inFlight = 0;
+			let maxInFlight = 0;
+			const signal = new CountingSignal();
+			const results = await mapSettledWithConcurrency(
+				[1, 2, 3, 4, 5],
+				async function (n, _index, received) {
+					expect(received).toBe(signal);
+					inFlight++;
+					maxInFlight = Math.max(maxInFlight, inFlight);
+					await sleep(1);
+					inFlight--;
+					return n;
+				},
+				{ concurrency: 2, signal, stopOnError: true }
+			);
+			expect(maxInFlight).toBe(2);
+			expect(results).toHaveLength(5);
+		});
+
+		it('rejects with the abort reason', async function () {
+			const signal = new CountingSignal();
+			const promise = mapSettledWithConcurrency(
+				[1, 2],
+				function () {
+					return new Promise(function () {});
+				},
+				{ signal }
+			);
+			signal.abort('cancelled');
+			await expect(promise).rejects.toBe('cancelled');
+		});
+
+		it('rejects with a TypeError when mapper is not a function', async function () {
+			await expect(mapSettledWithConcurrency([1], 'x' as any)).rejects.toThrow(new TypeError('mapSettledWithConcurrency: `mapper` must be a function, got string'));
+			await expect(mapSettledWithConcurrency([1], jest.fn(), -1)).rejects.toThrow(RangeError);
+		});
+	});
+
+	describe('filterWithConcurrency', function () {
+		it('keeps the items whose (async) predicate is truthy, in input order', async function () {
+			const result = await filterWithConcurrency(
+				[5, 1, 4, 2, 3],
+				async function (n) {
+					await sleep(n);
+					return n % 2 === 1 ? 'yes' : 0;
+				},
+				{ concurrency: 2 }
+			);
+			expect(result).toEqual([5, 1, 3]);
+		});
+
+		it('narrows with a type guard and accepts a positional concurrency', async function () {
+			const values: Array<string | number> = ['a', 1, 'b'];
+			const strings = await filterWithConcurrency(
+				values,
+				function (value): value is string {
+					return typeof value === 'string';
+				},
+				1
+			);
+			const check: string[] = strings;
+			expect(check).toEqual(['a', 'b']);
+		});
+
+		it('rejects with the first error, or the abort reason', async function () {
+			await expect(
+				filterWithConcurrency([1, 2], function (n) {
+					if (n === 2) throw new Error('bad');
+					return true;
+				})
+			).rejects.toThrow('bad');
+			const signal = new CountingSignal();
+			const promise = filterWithConcurrency(
+				[1],
+				function () {
+					return new Promise<boolean>(function () {});
+				},
+				{ signal }
+			);
+			signal.abort('gone');
+			await expect(promise).rejects.toBe('gone');
+			expect(signal.listenerCount).toBe(0);
+		});
+
+		it('rejects with a TypeError naming the predicate', async function () {
+			await expect(filterWithConcurrency([1], undefined as any)).rejects.toThrow(new TypeError('filterWithConcurrency: `predicate` must be a function, got undefined'));
+		});
+	});
+
+	describe('createQueue', function () {
+		it('runs tasks immediately while slots are free, and queues the rest', async function () {
+			const queue = createQueue({ concurrency: 2 });
+			const deferreds = [createDeferred<string>(), createDeferred<string>(), createDeferred<string>()];
+			const started: number[] = [];
+			const promises = deferreds.map(function (deferred, i) {
+				return queue.add(function () {
+					started.push(i);
+					return deferred.promise;
+				});
+			});
+			expect(started).toEqual([0, 1]);
+			expect(queue.pending).toBe(2);
+			expect(queue.size).toBe(1);
+			deferreds[0].resolve('a');
+			await flush();
+			expect(started).toEqual([0, 1, 2]);
+			deferreds[1].resolve('b');
+			deferreds[2].resolve('c');
+			await expect(Promise.all(promises)).resolves.toEqual(['a', 'b', 'c']);
+			await queue.onIdle();
+			expect(queue.pending).toBe(0);
+		});
+
+		it('starts higher priorities first and keeps FIFO order among equal priorities', async function () {
+			const queue = createQueue({ concurrency: 1 });
+			const order: string[] = [];
+			function job(name: string): () => void {
+				return function () {
+					order.push(name);
+				};
+			}
+			queue.pause();
+			expect(queue.isPaused).toBe(true);
+			queue.add(job('low-1'), { priority: -1 });
+			queue.add(job('normal-1'));
+			queue.add(job('high-1'), { priority: 5 });
+			queue.add(job('normal-2'), { priority: 0 });
+			queue.add(job('high-2'), { priority: 5 });
+			queue.add(job('low-2'), { priority: -1 });
+			queue.add(job('top'), { priority: Infinity });
+			expect(queue.size).toBe(7);
+			queue.resume();
+			expect(queue.isPaused).toBe(false);
+			await queue.onIdle();
+			expect(order).toEqual(['top', 'high-1', 'high-2', 'normal-1', 'normal-2', 'low-1', 'low-2']);
+		});
+
+		it('defaults to unbounded concurrency', function () {
+			const queue = createQueue();
+			for (let i = 0; i < 5; i++)
+				queue.add(function () {
+					return new Promise(function () {});
+				});
+			expect(queue.pending).toBe(5);
+			expect(queue.size).toBe(0);
+		});
+
+		it('does not let a task added from a running task jump ahead of waiting tasks', async function () {
+			const queue = createQueue({ concurrency: 2 });
+			const order: string[] = [];
+			const gate = createDeferred<void>();
+			queue.add(function () {
+				return gate.promise;
+			});
+			queue.pause();
+			queue.add(
+				function () {
+					order.push('waiting-high');
+				},
+				{ priority: 1 }
+			);
+			queue.resume();
+			// The first slot is still busy; the second ran 'waiting-high' synchronously. Now fill both slots and queue more.
+			const blocker = createDeferred<void>();
+			queue.add(function () {
+				queue.add(function () {
+					order.push('nested');
+				});
+				return blocker.promise;
+			});
+			queue.add(
+				function () {
+					order.push('queued');
+				},
+				{ priority: 2 }
+			);
+			expect(order).toEqual(['waiting-high']);
+			gate.resolve();
+			await flush();
+			blocker.resolve();
+			await queue.onIdle();
+			expect(order).toEqual(['waiting-high', 'queued', 'nested']);
+		});
+
+		it('turns synchronous throws into rejections and keeps going', async function () {
+			const queue = createQueue({ concurrency: 1 });
+			const failing = queue.add(function () {
+				throw new Error('sync');
+			});
+			const next = queue.add(function () {
+				return 'next';
+			});
+			await expect(failing).rejects.toThrow('sync');
+			await expect(next).resolves.toBe('next');
+		});
+
+		it('onEmpty and onIdle resolve at once when idle, and can be awaited again', async function () {
+			const queue = createQueue({ concurrency: 1 });
+			await expect(queue.onEmpty()).resolves.toBeUndefined();
+			await expect(queue.onIdle()).resolves.toBeUndefined();
+			const first = createDeferred<void>();
+			const second = createDeferred<void>();
+			queue.add(function () {
+				return first.promise;
+			});
+			queue.add(function () {
+				return second.promise;
+			});
+			let empty = false;
+			let idle = false;
+			queue.onEmpty().then(function () {
+				empty = true;
+			});
+			queue.onIdle().then(function () {
+				idle = true;
+			});
+			first.resolve();
+			await flush();
+			expect(empty).toBe(true);
+			expect(idle).toBe(false);
+			second.resolve();
+			await flush();
+			expect(idle).toBe(true);
+			// Re-armed
+			const third = createDeferred<void>();
+			queue.add(function () {
+				return third.promise;
+			});
+			let idleAgain = false;
+			queue.onIdle().then(function () {
+				idleAgain = true;
+			});
+			await flush();
+			expect(idleAgain).toBe(false);
+			third.resolve();
+			await flush();
+			expect(idleAgain).toBe(true);
+		});
+
+		it('clear() rejects the waiting tasks with an AbortError and leaves running ones alone', async function () {
+			const queue = createQueue({ concurrency: 1 });
+			const running = createDeferred<string>();
+			const first = queue.add(function () {
+				return running.promise;
+			});
+			const signal = new CountingSignal();
+			const task = jest.fn();
+			const waiting = queue.add(task, { signal });
+			expect(signal.listenerCount).toBe(1);
+			let empty = false;
+			queue.onEmpty().then(function () {
+				empty = true;
+			});
+			queue.clear();
+			await expect(waiting).rejects.toThrow(new AbortError('The task was removed from the queue.'));
+			expect(empty).toBe(true);
+			expect(signal.listenerCount).toBe(0);
+			expect(queue.size).toBe(0);
+			running.resolve('done');
+			await expect(first).resolves.toBe('done');
+			expect(task).not.toHaveBeenCalled();
+		});
+
+		it('removes a waiting task whose signal aborts: it never runs and its listener is gone', async function () {
+			const queue = createQueue({ concurrency: 1 });
+			const gate = createDeferred<void>();
+			queue.add(function () {
+				return gate.promise;
+			});
+			const signal = new CountingSignal();
+			const task = jest.fn();
+			const other = jest.fn(function () {
+				return 'other';
+			});
+			const aborted = queue.add(task, { signal, priority: 9 });
+			const kept = queue.add(other);
+			let empty = false;
+			queue.onEmpty().then(function () {
+				empty = true;
+			});
+			signal.abort('not needed');
+			await expect(aborted).rejects.toBe('not needed');
+			expect(signal.listenerCount).toBe(0);
+			expect(queue.size).toBe(1);
+			expect(empty).toBe(false);
+			gate.resolve();
+			await expect(kept).resolves.toBe('other');
+			expect(task).not.toHaveBeenCalled();
+			expect(empty).toBe(true);
+		});
+
+		it('resolves onIdle when the last waiting task of a paused queue is aborted', async function () {
+			const queue = createQueue();
+			queue.pause();
+			const signal = new CountingSignal();
+			const task = queue.add(jest.fn(), { signal });
+			let idle = false;
+			queue.onIdle().then(function () {
+				idle = true;
+			});
+			signal.abort();
+			await expect(task).rejects.toBeInstanceOf(AbortError);
+			await flush();
+			expect(idle).toBe(true);
+		});
+
+		it('rejects at once (without running) for an already-aborted task signal', async function () {
+			const queue = createQueue();
+			const signal = new CountingSignal();
+			signal.abort('early');
+			const task = jest.fn();
+			await expect(queue.add(task, { signal })).rejects.toBe('early');
+			expect(task).not.toHaveBeenCalled();
+			expect(signal.listenerCount).toBe(0);
+		});
+
+		it('passes the task signal, the queue signal, or both combined to the task', async function () {
+			const queueSignal = new CountingSignal();
+			const queue = createQueue({ signal: queueSignal });
+			const taskSignal = new CountingSignal();
+			const received: Array<AbortSignalLike | undefined> = [];
+			function record(signal: AbortSignalLike | undefined): void {
+				received.push(signal);
+			}
+			await queue.add(record);
+			expect(received[0]).toBe(queueSignal);
+			const plain = createQueue();
+			await plain.add(record);
+			expect(received[1]).toBeUndefined();
+			await plain.add(record, { signal: taskSignal });
+			expect(received[2]).toBe(taskSignal);
+			// Both: a combined signal, detached once the task settles.
+			const gate = createDeferred<void>();
+			const both = queue.add(
+				function (signal) {
+					record(signal);
+					return gate.promise;
+				},
+				{ signal: taskSignal }
+			);
+			const combined = received[3] as AbortSignalLike;
+			expect(combined).not.toBe(taskSignal);
+			expect(combined).not.toBe(queueSignal);
+			expect(taskSignal.listenerCount).toBe(1);
+			expect(queueSignal.listenerCount).toBe(2);
+			queueSignal.abort('shutdown');
+			expect(combined.aborted).toBe(true);
+			expect(combined.reason).toBe('shutdown');
+			gate.resolve();
+			await both;
+			await flush();
+			expect(taskSignal.listenerCount).toBe(0);
+		});
+
+		it('detaches the combined signal after the task settles even when nothing aborted', async function () {
+			const queueSignal = new CountingSignal();
+			const taskSignal = new CountingSignal();
+			const queue = createQueue({ signal: queueSignal });
+			await queue.add(jest.fn(), { signal: taskSignal });
+			await flush();
+			expect(taskSignal.listenerCount).toBe(0);
+			expect(queueSignal.listenerCount).toBe(1); // the queue's own listener
+		});
+
+		it('aborting the queue signal rejects waiting tasks and later adds, but lets running tasks finish', async function () {
+			await withoutUnhandledRejections(async function () {
+				const controller = new AbortController();
+				const queue = createQueue({ concurrency: 1, signal: controller.signal });
+				const gate = createDeferred<string>();
+				const running = queue.add(function () {
+					return gate.promise;
+				});
+				const taskSignal = new CountingSignal();
+				const waiting = queue.add(jest.fn(), { signal: taskSignal });
+				const reason = new AbortError('queue closed');
+				controller.abort(reason);
+				await expect(waiting).rejects.toBe(reason);
+				expect(taskSignal.listenerCount).toBe(0);
+				await expect(queue.add(jest.fn())).rejects.toBe(reason);
+				gate.resolve('finished');
+				await expect(running).resolves.toBe('finished');
+				await queue.onIdle();
+			});
+		});
+
+		it('rejects every add when created with an aborted signal', async function () {
+			const signal = new CountingSignal();
+			signal.abort();
+			const queue = createQueue({ signal });
+			await expect(queue.add(jest.fn())).rejects.toBeInstanceOf(AbortError);
+		});
+
+		it('validates its arguments', async function () {
+			expect(function () {
+				createQueue({ concurrency: 0 });
+			}).toThrow(new RangeError('createQueue: `concurrency` must be an integer >= 1 or Infinity, got 0'));
+			expect(function () {
+				createQueue({ signal: 1 as any });
+			}).toThrow(new TypeError('createQueue: `signal` must be an AbortSignal, null or undefined, got number'));
+			const queue = createQueue();
+			await expect(queue.add(null as any)).rejects.toThrow(new TypeError('Queue.add: `task` must be a function, got null'));
+			await expect(queue.add(jest.fn(), { priority: NaN })).rejects.toThrow(new RangeError('Queue.add: `priority` must be a number, got NaN'));
+			await expect(queue.add(jest.fn(), { priority: '1' as any })).rejects.toThrow(new TypeError('Queue.add: `priority` must be a number, got string'));
+			await expect(queue.add(jest.fn(), { signal: 'x' as any })).rejects.toThrow(TypeError);
+		});
+	});
+
+	describe('createRateLimiter', function () {
+		it('starts at most `limit` calls per sliding window, in FIFO order, without dropping any', async function () {
+			jest.useFakeTimers({ now: 0 });
+			const limiter = createRateLimiter({ limit: 2, interval: 100 });
+			const starts: Array<[number, number]> = [];
+			function call(id: number): number {
+				starts.push([id, Date.now()]);
+				return id;
+			}
+			const results = Promise.all(
+				[1, 2, 3, 4, 5].map(function (id) {
+					return limiter.schedule(call, id);
+				})
+			);
+			expect(starts).toEqual([
+				[1, 0],
+				[2, 0]
+			]);
+			expect(limiter.pendingCount).toBe(3);
+			expect(jest.getTimerCount()).toBe(1);
+			await jest.advanceTimersByTimeAsync(250);
+			expect(starts).toEqual([
+				[1, 0],
+				[2, 0],
+				[3, 100],
+				[4, 100],
+				[5, 200]
+			]);
+			await expect(results).resolves.toEqual([1, 2, 3, 4, 5]);
+			expect(limiter.pendingCount).toBe(0);
+			expect(jest.getTimerCount()).toBe(0);
+		});
+
+		it('uses a sliding window: no 2x burst across a window boundary', async function () {
+			jest.useFakeTimers({ now: 0 });
+			const limiter = createRateLimiter({ limit: 2, interval: 100 });
+			const starts: number[] = [];
+			function call(): void {
+				starts.push(Date.now());
+			}
+			limiter.schedule(call);
+			await jest.advanceTimersByTimeAsync(90);
+			limiter.schedule(call);
+			await jest.advanceTimersByTimeAsync(10);
+			// t = 100: the start at 0 left the window, the one at 90 has not.
+			limiter.schedule(call);
+			limiter.schedule(call);
+			expect(starts).toEqual([0, 90, 100]);
+			await jest.advanceTimersByTimeAsync(89);
+			expect(starts).toEqual([0, 90, 100]);
+			await jest.advanceTimersByTimeAsync(1);
+			expect(starts).toEqual([0, 90, 100, 190]);
+			expect(jest.getTimerCount()).toBe(0);
+		});
+
+		it('holds no timer while idle and starts immediately when allowed', function () {
+			jest.useFakeTimers({ now: 0 });
+			const limiter = createRateLimiter({ limit: 1, interval: 1000 });
+			const fn = jest.fn();
+			limiter.schedule(fn);
+			expect(fn).toHaveBeenCalledTimes(1);
+			expect(jest.getTimerCount()).toBe(0);
+		});
+
+		it('picks up calls scheduled from a starting call without arming a second timer', async function () {
+			jest.useFakeTimers({ now: 0 });
+			const limiter = createRateLimiter({ limit: 2, interval: 100 });
+			const order: string[] = [];
+			limiter.schedule(function () {
+				order.push('a');
+				limiter.schedule(function () {
+					order.push('nested');
+				});
+				limiter.schedule(function () {
+					order.push('nested-2');
+				});
+			});
+			expect(order).toEqual(['a', 'nested']);
+			expect(jest.getTimerCount()).toBe(1);
+			await jest.advanceTimersByTimeAsync(100);
+			expect(order).toEqual(['a', 'nested', 'nested-2']);
+			expect(jest.getTimerCount()).toBe(0);
+		});
+
+		it('settles like the call: values, promises, sync throws and rejections', async function () {
+			const limiter = createRateLimiter({ limit: 10, interval: 10 });
+			await expect(
+				limiter.schedule(
+					function (a: number, b: number) {
+						return a + b;
+					},
+					1,
+					2
+				)
+			).resolves.toBe(3);
+			await expect(
+				limiter.schedule(function () {
+					return Promise.resolve('async');
+				})
+			).resolves.toBe('async');
+			await expect(
+				limiter.schedule(function () {
+					throw new Error('sync');
+				})
+			).rejects.toThrow('sync');
+			await expect(
+				limiter.schedule(function () {
+					return Promise.reject(new Error('async'));
+				})
+			).rejects.toThrow('async');
+		});
+
+		it('wrap returns a rate-limited function that forwards this and arguments', async function () {
+			jest.useFakeTimers({ now: 0 });
+			const limiter = createRateLimiter({ limit: 1, interval: 50 });
+			const counter = {
+				base: 10,
+				add: limiter.wrap(function (this: { base: number }, n: number): number {
+					return this.base + n;
+				})
+			};
+			const first = counter.add(1);
+			const second = counter.add(2);
+			await expect(first).resolves.toBe(11);
+			await jest.advanceTimersByTimeAsync(50);
+			await expect(second).resolves.toBe(12);
+			expect(function () {
+				limiter.wrap(5 as any);
+			}).toThrow(new TypeError('RateLimiter.wrap: `fn` must be a function, got number'));
+		});
+
+		it('caps the wait at one interval when the clock goes backwards', async function () {
+			jest.useFakeTimers({ now: 10_000 });
+			const limiter = createRateLimiter({ limit: 1, interval: 100 });
+			const starts: number[] = [];
+			function call(): void {
+				starts.push(Date.now());
+			}
+			limiter.schedule(call);
+			jest.setSystemTime(0);
+			limiter.schedule(call);
+			await jest.advanceTimersByTimeAsync(99);
+			expect(starts).toEqual([10_000]);
+			await jest.advanceTimersByTimeAsync(1);
+			expect(starts).toEqual([10_000, 100]);
+		});
+
+		it('aborting rejects the waiting calls with the reason, clears the timer and rejects later calls', async function () {
+			jest.useFakeTimers({ now: 0 });
+			const signal = new CountingSignal();
+			const limiter = createRateLimiter({ limit: 1, interval: 1000, signal });
+			const first = limiter.schedule(function () {
+				return 'first';
+			});
+			const fn = jest.fn();
+			const waiting = limiter.schedule(fn);
+			expect(jest.getTimerCount()).toBe(1);
+			signal.abort('stop');
+			await expect(waiting).rejects.toBe('stop');
+			await expect(first).resolves.toBe('first');
+			expect(jest.getTimerCount()).toBe(0);
+			expect(limiter.pendingCount).toBe(0);
+			expect(signal.listenerCount).toBe(0);
+			await expect(limiter.schedule(fn)).rejects.toBe('stop');
+			expect(fn).not.toHaveBeenCalled();
+		});
+
+		it('clearQueue rejects the waiting calls with an AbortError and clears the timer', async function () {
+			jest.useFakeTimers({ now: 0 });
+			const limiter = createRateLimiter({ limit: 1, interval: 1000 });
+			limiter.schedule(jest.fn());
+			const waiting = limiter.schedule(jest.fn());
+			const alsoWaiting = limiter.schedule(jest.fn());
+			limiter.clearQueue();
+			await expect(waiting).rejects.toThrow(new AbortError('The call was removed from the rate limiter queue.'));
+			await expect(alsoWaiting).rejects.toBeInstanceOf(AbortError);
+			expect(jest.getTimerCount()).toBe(0);
+			// Still usable afterwards: the window still counts the first call.
+			const fn = jest.fn();
+			limiter.schedule(fn);
+			expect(fn).not.toHaveBeenCalled();
+			await jest.advanceTimersByTimeAsync(1000);
+			expect(fn).toHaveBeenCalledTimes(1);
+		});
+
+		it('accepts an interval of 0 (no limiting)', function () {
+			const limiter = createRateLimiter({ limit: 1, interval: 0 });
+			const fn = jest.fn();
+			limiter.schedule(fn);
+			limiter.schedule(fn);
+			expect(fn).toHaveBeenCalledTimes(2);
+		});
+
+		it('validates its arguments', async function () {
+			expect(function () {
+				createRateLimiter(undefined as any);
+			}).toThrow(new TypeError('createRateLimiter: `options` must be an object, got undefined'));
+			expect(function () {
+				createRateLimiter({ limit: 0, interval: 10 });
+			}).toThrow(new RangeError('createRateLimiter: `limit` must be an integer >= 1, got 0'));
+			expect(function () {
+				createRateLimiter({ limit: Infinity, interval: 10 });
+			}).toThrow(RangeError);
+			expect(function () {
+				createRateLimiter({ limit: 1, interval: -1 });
+			}).toThrow(new RangeError('createRateLimiter: `interval` must be a number between 0 and 2147483647, got -1'));
+			expect(function () {
+				createRateLimiter({ limit: 1, interval: 10, signal: {} as any });
+			}).toThrow(TypeError);
+			await expect(createRateLimiter({ limit: 1, interval: 1 }).schedule(null as any)).rejects.toThrow(
+				new TypeError('RateLimiter.schedule: `fn` must be a function, got null')
+			);
+		});
+	});
+
+	describe('memoizeAsync', function () {
+		it('shares one in-flight call between concurrent callers and caches the value', async function () {
+			const fn = jest.fn(async function (id: number) {
+				await Promise.resolve();
+				return { id };
+			});
+			const memo = memoizeAsync(fn);
+			const a = memo(1);
+			const b = memo(1);
+			expect(a).toBe(b);
+			const [first, second] = await Promise.all([a, b]);
+			expect(first).toBe(second);
+			expect(memo.cache.get(1)).toBe(first);
+			await expect(memo(1)).resolves.toBe(first);
+			await memo(2);
+			expect(fn).toHaveBeenCalledTimes(2);
+		});
+
+		it('never caches rejections or synchronous throws', async function () {
+			await withoutUnhandledRejections(async function () {
+				let calls = 0;
+				const memo = memoizeAsync(function (n: number): Promise<number> | number {
+					calls++;
+					if (calls === 1) return Promise.reject(new Error('first'));
+					if (calls === 2) throw new Error('second');
+					return n;
+				});
+				const a = memo(1);
+				const b = memo(1);
+				await expect(a).rejects.toThrow('first');
+				await expect(b).rejects.toThrow('first');
+				await expect(memo(1)).rejects.toThrow('second');
+				expect(memo.cache.has(1)).toBe(false);
+				await expect(memo(1)).resolves.toBe(1);
+				expect(calls).toBe(3);
+			});
+		});
+
+		it('caches undefined results', async function () {
+			const fn = jest.fn(async function () {
+				return undefined;
+			});
+			const memo = memoizeAsync(fn);
+			await memo();
+			await expect(memo()).resolves.toBeUndefined();
+			expect(fn).toHaveBeenCalledTimes(1);
+		});
+
+		it('expires values after ttl (backed by an LRU cache)', async function () {
+			jest.useFakeTimers({ now: 0 });
+			const fn = jest.fn(async function (key: string) {
+				return `${key}@${Date.now()}`;
+			});
+			const memo = memoizeAsync(fn, { ttl: 1000 });
+			await expect(memo('a')).resolves.toBe('a@0');
+			jest.setSystemTime(999);
+			await expect(memo('a')).resolves.toBe('a@0');
+			jest.setSystemTime(1000);
+			await expect(memo('a')).resolves.toBe('a@1000');
+			expect(fn).toHaveBeenCalledTimes(2);
+		});
+
+		it('uses a custom cache, passing the ttl to its set', async function () {
+			jest.useFakeTimers({ now: 0 });
+			const cache = createLRUCache<unknown, number>({ max: 2 });
+			const set = jest.spyOn(cache, 'set');
+			const memo = memoizeAsync(
+				async function (n: number) {
+					return n * 2;
+				},
+				{ cache, ttl: 50 }
+			);
+			await memo(1);
+			await memo(2);
+			await memo(3);
+			expect(memo.cache).toBe(cache);
+			expect(cache.size).toBe(2);
+			expect(set).toHaveBeenCalledWith(3, 6, { ttl: 50 });
+			jest.setSystemTime(50);
+			expect(cache.has(3)).toBe(false);
+			const map = new Map<unknown, number>();
+			const plain = memoizeAsync(
+				async function (n: number) {
+					return n;
+				},
+				{ cache: map }
+			);
+			await plain(7);
+			expect(map.get(7)).toBe(7);
+		});
+
+		it('uses the resolver (with this) for keys, and rejects when it throws', async function () {
+			const memo = memoizeAsync(
+				async function (this: { scope: string }, user: { id: number; name: string }) {
+					return `${this.scope}:${user.name}`;
+				},
+				{
+					resolver: function (this: { scope: string }, user) {
+						return `${this.scope}/${user.id}`;
+					}
+				}
+			);
+			const context = { scope: 'admin', memo };
+			await expect(context.memo({ id: 1, name: 'Ada' })).resolves.toBe('admin:Ada');
+			await expect(context.memo({ id: 1, name: 'changed' })).resolves.toBe('admin:Ada');
+			expect([...(memo.cache as Map<unknown, unknown>)].length).toBe(1);
+			const failing = memoizeAsync(jest.fn(), {
+				resolver: function () {
+					throw new Error('bad key');
+				}
+			});
+			await expect(failing()).rejects.toThrow('bad key');
+		});
+
+		it('clear() and delete() forget values and calls in flight (a cleared call does not write to the cache)', async function () {
+			const gate = createDeferred<string>();
+			const fn = jest.fn(function (key: string): Promise<string> | string {
+				return key === 'slow' ? gate.promise : key;
+			});
+			const memo = memoizeAsync(fn);
+			const slow = memo('slow');
+			memo.clear();
+			gate.resolve('stale');
+			await expect(slow).resolves.toBe('stale');
+			expect(memo.cache.has('slow')).toBe(false);
+			await memo('fast');
+			expect(memo.delete('fast')).toBe(true);
+			expect(memo.delete('fast')).toBe(false);
+			const again = createDeferred<string>();
+			fn.mockImplementationOnce(function () {
+				return again.promise;
+			});
+			const inflight = memo('x');
+			expect(memo.delete('x')).toBe(true);
+			expect(memo('x')).not.toBe(inflight);
+			again.reject(new Error('ignored'));
+			await expect(inflight).rejects.toThrow('ignored');
+			await flush();
+			expect(memo.cache.get('x')).toBe('x');
+		});
+
+		it('withSignal stops one caller waiting without cancelling the shared call', async function () {
+			const gate = createDeferred<string>();
+			const fn = jest.fn(function () {
+				return gate.promise;
+			});
+			const memo = memoizeAsync(fn);
+			const signal = new CountingSignal();
+			const impatient = memo.withSignal(signal);
+			const patient = memo();
+			signal.abort('gave up');
+			await expect(impatient).rejects.toBe('gave up');
+			expect(signal.listenerCount).toBe(0);
+			gate.resolve('value');
+			await expect(patient).resolves.toBe('value');
+			await expect(memo.withSignal(null)).resolves.toBe('value');
+			await expect(memo()).resolves.toBe('value');
+			expect(fn).toHaveBeenCalledTimes(1);
+		});
+
+		it('withSignal with an aborted signal rejects without calling the function, and validates the signal', async function () {
+			const fn = jest.fn(async function (n: number) {
+				return n;
+			});
+			const memo = memoizeAsync(fn);
+			const signal = new CountingSignal();
+			signal.abort();
+			await expect(memo.withSignal(signal, 1)).rejects.toBeInstanceOf(AbortError);
+			await expect(memo.withSignal({} as any, 1)).rejects.toThrow(new TypeError('memoizeAsync: `signal` must be an AbortSignal, null or undefined, got object'));
+			expect(fn).not.toHaveBeenCalled();
+			await expect(memo.withSignal(new CountingSignal(), 2)).resolves.toBe(2);
+		});
+
+		it('types the memoized function after the original', async function () {
+			const memo = memoizeAsync(async function (a: number, b: string): Promise<string> {
+				return `${a}${b}`;
+			});
+			const value: string = await memo(1, 'x');
+			expect(value).toBe('1x');
+			// @ts-expect-error wrong argument type
+			await memo('1', 'x');
+		});
+
+		it('validates its arguments', function () {
+			expect(function () {
+				memoizeAsync(null as any);
+			}).toThrow(new TypeError('memoizeAsync: `fn` must be a function, got null'));
+			expect(function () {
+				memoizeAsync(jest.fn(), { resolver: 1 as any });
+			}).toThrow(new TypeError('memoizeAsync: `resolver` must be a function, got number'));
+			expect(function () {
+				memoizeAsync(jest.fn(), { ttl: 0 });
+			}).toThrow(new RangeError('memoizeAsync: `ttl` must be a number > 0 or Infinity, got 0'));
+			expect(function () {
+				memoizeAsync(jest.fn(), { ttl: '5' as any });
+			}).toThrow(TypeError);
+		});
+	});
+
+	describe('anySignal (shared combinator)', function () {
+		it('still aborts with the first aborted input and detaches the others', function () {
+			const a = new CountingSignal();
+			const b = new CountingSignal();
+			const combined = anySignal([a, b]);
+			expect(a.listenerCount).toBe(1);
+			b.abort('b');
+			expect(combined.reason).toBe('b');
+			expect(a.listenerCount).toBe(0);
 		});
 	});
 });

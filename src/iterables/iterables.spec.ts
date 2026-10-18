@@ -1781,3 +1781,277 @@ describe('iterables', function () {
 		});
 	});
 });
+
+describe('mapConcurrent', function () {
+	/** An infinite async source counting the items it produced, and whether it was closed. */
+	function counter() {
+		const stats = { produced: 0, closed: 0 };
+		const iterable = (async function* () {
+			try {
+				for (let i = 0; ; i++) {
+					stats.produced++;
+					yield i;
+				}
+			} finally {
+				stats.closed++;
+			}
+		})();
+		return { iterable, stats };
+	}
+
+	function deferred<T>() {
+		let resolve!: (value: T) => void;
+		let reject!: (reason: unknown) => void;
+		const promise = new Promise<T>(function (res, rej) {
+			resolve = res;
+			reject = rej;
+		});
+		return { promise, resolve, reject };
+	}
+
+	async function ticks(n = 20): Promise<void> {
+		for (let i = 0; i < n; i++) await Promise.resolve();
+	}
+
+	class FakeSignal {
+		aborted = false;
+		reason: unknown = undefined;
+		readonly listeners = new Set<() => void>();
+		addEventListener(_type: 'abort', listener: () => void): void {
+			this.listeners.add(listener);
+		}
+		removeEventListener(_type: 'abort', listener: () => void): void {
+			this.listeners.delete(listener);
+		}
+		abort(reason?: unknown): void {
+			this.aborted = true;
+			this.reason = reason;
+			for (const listener of [...this.listeners]) listener();
+		}
+	}
+
+	it('maps in source order with at most `concurrency` mappings in flight', async function () {
+		let inFlight = 0;
+		let maxInFlight = 0;
+		const result = await helpers.toArrayAsync(
+			helpers.mapConcurrent(
+				[5, 1, 4, 2, 3, 0],
+				async function (n, index) {
+					inFlight++;
+					maxInFlight = Math.max(maxInFlight, inFlight);
+					await ticks(n * 3);
+					inFlight--;
+					return `${index}:${n}`;
+				},
+				{ concurrency: 3 }
+			)
+		);
+		expect(result).toEqual(['0:5', '1:1', '2:4', '3:2', '4:3', '5:0']);
+		expect(maxInFlight).toBe(3);
+	});
+
+	it('yields results as they complete with ordered: false', async function () {
+		const result = await helpers.toArrayAsync(
+			helpers.mapConcurrent(
+				[30, 10, 20],
+				async function (n) {
+					await ticks(n);
+					return n;
+				},
+				{ concurrency: 3, ordered: false }
+			)
+		);
+		expect(result).toEqual([10, 20, 30]);
+	});
+
+	it('applies backpressure: never more than `concurrency` items pulled ahead of the consumer', async function () {
+		const { iterable, stats } = counter();
+		const iterator = helpers.mapConcurrent(iterable, double, 2);
+		expect(stats.produced).toBe(0);
+		await expect(iterator.next()).resolves.toEqual({ done: false, value: 0 });
+		await ticks();
+		// One item consumed, two buffered.
+		expect(stats.produced).toBe(3);
+		await iterator.next();
+		await ticks();
+		expect(stats.produced).toBe(4);
+		await iterator.return!();
+		expect(stats.closed).toBe(1);
+	});
+
+	it('closes the source and pulls nothing more on early exit', async function () {
+		const { iterable, stats } = counter();
+		const unhandled = jest.fn();
+		process.on('unhandledRejection', unhandled);
+		try {
+			const seen: number[] = [];
+			for await (const value of helpers.mapConcurrent(
+				iterable,
+				async function (n) {
+					if (n === 5) throw new Error('dropped in flight');
+					return n;
+				},
+				{ concurrency: 4, ordered: false }
+			)) {
+				seen.push(value);
+				if (value === 2) break;
+			}
+			const produced = stats.produced;
+			await ticks();
+			await new Promise(setImmediate);
+			expect(seen).toContain(2);
+			expect(stats.closed).toBe(1);
+			expect(stats.produced).toBe(produced);
+			expect(unhandled).not.toHaveBeenCalled();
+		} finally {
+			process.off('unhandledRejection', unhandled);
+		}
+	});
+
+	it('throws a mapping error at its position (ordered) and closes the source', async function () {
+		const { iterable, stats } = counter();
+		const seen: number[] = [];
+		await expect(
+			(async function () {
+				for await (const value of helpers.mapConcurrent(
+					iterable,
+					function (n) {
+						if (n === 3) throw new Error('three');
+						return n;
+					},
+					3
+				)) {
+					seen.push(value);
+				}
+			})()
+		).rejects.toThrow('three');
+		expect(seen).toEqual([0, 1, 2]);
+		expect(stats.closed).toBe(1);
+	});
+
+	it('throws a source error after the items pulled before it, without closing the failed source', async function () {
+		const returned = jest.fn();
+		let i = 0;
+		const source: AsyncIterable<number> = {
+			[Symbol.asyncIterator]() {
+				return {
+					next: function () {
+						i++;
+						return i <= 2 ? Promise.resolve({ done: false, value: i }) : Promise.reject(new Error('source failed'));
+					},
+					return: function () {
+						returned();
+						return Promise.resolve({ done: true as const, value: undefined });
+					}
+				};
+			}
+		};
+		const seen: number[] = [];
+		await expect(
+			(async function () {
+				for await (const value of helpers.mapConcurrent(
+					source,
+					async function (n) {
+						await ticks(5);
+						return n * 10;
+					},
+					{ concurrency: 4, ordered: false }
+				))
+					seen.push(value);
+			})()
+		).rejects.toThrow('source failed');
+		expect(seen).toEqual([10, 20]);
+		expect(returned).not.toHaveBeenCalled();
+	});
+
+	it('accepts sync iterables of values and promises, closing them on early exit', async function () {
+		const { iterable, stats } = spy([1, Promise.resolve(2), 3, 4]);
+		const iterator = helpers.mapConcurrent(iterable, double, Infinity);
+		await expect(iterator.next()).resolves.toEqual({ done: false, value: 2 });
+		await expect(iterator.next()).resolves.toEqual({ done: false, value: 4 });
+		await iterator.return!();
+		expect(stats.closed).toBe(1);
+		await expect(helpers.toArrayAsync(helpers.mapConcurrent([], double, 1))).resolves.toEqual([]);
+	});
+
+	it('passes the index and the signal to fn', async function () {
+		const signal = new FakeSignal();
+		const calls: unknown[][] = [];
+		await helpers.toArrayAsync(
+			helpers.mapConcurrent(
+				['a', 'b'],
+				function (value, index, received) {
+					calls.push([value, index, received]);
+					return value;
+				},
+				{ concurrency: 1, signal }
+			)
+		);
+		expect(calls).toEqual([
+			['a', 0, signal],
+			['b', 1, signal]
+		]);
+		expect(signal.listeners.size).toBe(0);
+	});
+
+	it('aborting rejects the pending read with the reason, stops pulling and closes the source', async function () {
+		const { iterable, stats } = counter();
+		const signal = new FakeSignal();
+		const gate = deferred<number>();
+		const iterator = helpers.mapConcurrent(
+			iterable,
+			function () {
+				return gate.promise;
+			},
+			{ concurrency: 2, signal }
+		);
+		const pending = iterator.next();
+		await ticks();
+		const produced = stats.produced;
+		signal.abort('cancelled');
+		await expect(pending).rejects.toBe('cancelled');
+		expect(stats.closed).toBe(1);
+		expect(signal.listeners.size).toBe(0);
+		gate.resolve(1);
+		await ticks();
+		expect(stats.produced).toBe(produced);
+		await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
+	});
+
+	it('throws at the next read when aborted between reads, and does not start for an aborted signal', async function () {
+		const signal = new FakeSignal();
+		const iterator = helpers.mapConcurrent([1, 2, 3], double, { concurrency: 1, signal });
+		await expect(iterator.next()).resolves.toEqual({ done: false, value: 2 });
+		signal.abort();
+		await expect(iterator.next()).rejects.toThrow('The operation was aborted.');
+		const fn = jest.fn();
+		const aborted = new FakeSignal();
+		aborted.abort('early');
+		const { iterable, stats } = counter();
+		await expect(helpers.mapConcurrent(iterable, fn, { concurrency: 1, signal: aborted }).next()).rejects.toBe('early');
+		expect(fn).not.toHaveBeenCalled();
+		expect(stats.produced).toBe(0);
+	});
+
+	it('validates its arguments eagerly', function () {
+		expect(function () {
+			helpers.mapConcurrent(5 as any, double, 1);
+		}).toThrow(new TypeError('mapConcurrent: `iterable` must be iterable, got number'));
+		expect(function () {
+			helpers.mapConcurrent([1], 'x' as any, 1);
+		}).toThrow(new TypeError('mapConcurrent: `fn` must be a function, got string'));
+		expect(function () {
+			helpers.mapConcurrent([1], double, 0);
+		}).toThrow(new RangeError('mapConcurrent: `concurrency` must be an integer >= 1 or Infinity, got 0'));
+		expect(function () {
+			helpers.mapConcurrent([1], double, {} as any);
+		}).toThrow(new TypeError('mapConcurrent: `concurrency` must be an integer >= 1 or Infinity, got undefined'));
+		expect(function () {
+			helpers.mapConcurrent([1], double, { concurrency: 1, signal: { addEventListener() {} } as any });
+		}).toThrow(new TypeError('mapConcurrent: `signal` must be an AbortSignal, null or undefined, got object'));
+		expect(function () {
+			helpers.mapConcurrent([1], double, { concurrency: 1, signal: 'x' as any });
+		}).toThrow(new TypeError('mapConcurrent: `signal` must be an AbortSignal, null or undefined, got string'));
+		expect(helpers.mapConcurrent([1], double, { concurrency: 1, signal: null })).toBeDefined();
+	});
+});

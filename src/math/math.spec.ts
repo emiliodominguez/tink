@@ -93,6 +93,10 @@ describe('Math helpers', function () {
 		it('should be the identity when the number already has fewer decimals than requested', function () {
 			expect(helpers.round(1.5, 400)).toBe(1.5);
 			expect(helpers.round(-1.5, 400)).toBe(-1.5);
+			// Shifting 17 significant digits by 20 places and back used to change the last one (…148 → …146).
+			expect(helpers.round(1.1773748397827148, 20)).toBe(1.1773748397827148);
+			expect(helpers.round(-1.1773748397827148, 17)).toBe(-1.1773748397827148);
+			expect(helpers.round(123.5, 1)).toBe(123.5);
 		});
 
 		it('should support negative decimals', function () {
@@ -289,6 +293,41 @@ describe('Math helpers', function () {
 		it('should return the smallest integer greater than or equal to a number', function () {
 			expect(helpers.ceil(3.14)).toBe(4);
 			expect(helpers.ceil(-2.9)).toBe(-2);
+			expect(Object.is(helpers.ceil(-0.5), -0)).toBe(true);
+			expect(helpers.ceil(NaN)).toBeNaN();
+		});
+
+		it('should round up at a decimal precision, as the number is written', function () {
+			expect(helpers.ceil(1.1, 2)).toBe(1.1); // naive: 1.11
+			expect(helpers.ceil(0.29, 2)).toBe(0.29);
+			expect(helpers.ceil(4.006, 2)).toBe(4.01);
+			expect(helpers.ceil(-4.006, 2)).toBe(-4);
+			expect(helpers.ceil(1.234, 1)).toBe(1.3);
+			expect(helpers.ceil(0.1 + 0.2, 1)).toBe(0.4);
+			expect(helpers.ceil(0.1 + 0.2, 16)).toBe(0.3000000000000001);
+			expect(helpers.ceil(6040, -2)).toBe(6100);
+			expect(helpers.ceil(6000, -2)).toBe(6000);
+			expect(helpers.ceil(1e-7, 2)).toBe(0.01);
+			expect(helpers.ceil(5, 2)).toBe(5);
+			expect(Object.is(helpers.ceil(-0.001, 2), -0)).toBe(true);
+			expect(Object.is(helpers.ceil(-0, 3), -0)).toBe(true);
+			expect(helpers.ceil(1.5, 400)).toBe(1.5);
+			expect(helpers.ceil(5, -400)).toBe(Infinity);
+			expect(Object.is(helpers.ceil(-5, -400), -0)).toBe(true);
+			expect(helpers.ceil(1.1773748397827148, 20)).toBe(1.1773748397827148);
+			expect(helpers.floor(1.1773748397827148, 17)).toBe(1.1773748397827148);
+			expect(helpers.ceil(Infinity, 2)).toBe(Infinity);
+			expect(helpers.ceil(NaN, 2)).toBeNaN();
+			expect(helpers.ceil(1e300, 5)).toBe(1e300);
+		});
+
+		it('should validate decimals', function () {
+			expect(function () {
+				helpers.ceil(1, 1.5);
+			}).toThrow(new RangeError('ceil: `decimals` must be an integer, got 1.5'));
+			expect(function () {
+				helpers.ceil(1, '2' as any);
+			}).toThrow(new TypeError('ceil: `decimals` must be an integer, got string'));
 		});
 	});
 
@@ -296,6 +335,25 @@ describe('Math helpers', function () {
 		it('should return the largest integer less than or equal to a number', function () {
 			expect(helpers.floor(3.14)).toBe(3);
 			expect(helpers.floor(-2.9)).toBe(-3);
+			expect(Object.is(helpers.floor(-0), -0)).toBe(true);
+		});
+
+		it('should round down at a decimal precision, as the number is written', function () {
+			expect(helpers.floor(4.35, 2)).toBe(4.35); // naive: 4.34
+			expect(helpers.floor(1.239, 2)).toBe(1.23);
+			expect(helpers.floor(-1.231, 2)).toBe(-1.24);
+			expect(helpers.floor(0.57, 2)).toBe(0.57);
+			expect(helpers.floor(4060, -2)).toBe(4000);
+			expect(helpers.floor(-4060, -2)).toBe(-4100);
+			expect(helpers.floor(5, -400)).toBe(0);
+			expect(helpers.floor(-5, -400)).toBe(-Infinity);
+			expect(helpers.floor(-Infinity, 1)).toBe(-Infinity);
+		});
+
+		it('should validate decimals', function () {
+			expect(function () {
+				helpers.floor(1, NaN);
+			}).toThrow(new RangeError('floor: `decimals` must be an integer, got NaN'));
 		});
 	});
 
@@ -1068,6 +1126,101 @@ describe('Math helpers', function () {
 			expect(function () {
 				helpers.normalize([1, Infinity]);
 			}).toThrow(RangeError);
+		});
+	});
+
+	describe('parseBytes', function () {
+		it('should parse SI, IEC and bare byte counts', function () {
+			expect(helpers.parseBytes('1.5 kB')).toBe(1500);
+			expect(helpers.parseBytes('1.5 KB')).toBe(1500);
+			expect(helpers.parseBytes('1.1 kB')).toBe(1100); // not 1100.0000000000002
+			expect(helpers.parseBytes('1 MiB')).toBe(1_048_576);
+			expect(helpers.parseBytes('1KiB')).toBe(1024); // bytes.parse gives 1
+			expect(helpers.parseBytes('-2 KiB')).toBe(-2048);
+			expect(helpers.parseBytes('512')).toBe(512);
+			expect(helpers.parseBytes('512 B')).toBe(512);
+			expect(helpers.parseBytes('0.5 B')).toBe(0.5);
+			expect(helpers.parseBytes('.5kB')).toBe(500);
+			expect(helpers.parseBytes('1e3')).toBe(1000); // bytes.parse gives 1
+			expect(helpers.parseBytes('1E3 B')).toBe(1000);
+			expect(helpers.parseBytes('1e+16 YB')).toBe(1e40);
+			expect(helpers.parseBytes('  2   GiB  ')).toBe(2 ** 31);
+			expect(helpers.parseBytes('1 EB')).toBe(1e18);
+			expect(helpers.parseBytes('1 EiB')).toBe(2 ** 60);
+			expect(helpers.parseBytes('3 YiB')).toBe(3 * 2 ** 80);
+			const si = ['B', 'kB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
+			const iec = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB'];
+			for (let k = 0; k < si.length; k++) {
+				expect(helpers.parseBytes(`7 ${si[k]}`)).toBe(Number(`7e${3 * k}`));
+				expect(helpers.parseBytes(`7 ${si[k]}`, { base: 1024 })).toBe(7 * 1024 ** k);
+				expect(helpers.parseBytes(`7 ${iec[k]}`)).toBe(7 * 1024 ** k);
+				expect(helpers.parseBytes(`7 ${iec[k]}`, { base: 1000 })).toBe(7 * 1024 ** k);
+			}
+		});
+
+		it('should reject garbage instead of half-parsing it', function () {
+			const rejected = [
+				'1 Mb',
+				'1 mb',
+				'1 kb',
+				'12 apples',
+				'1 KiBs',
+				'1 kiB',
+				'1 K',
+				'',
+				' ',
+				'1.',
+				'1..5 B',
+				'+1 B',
+				'1,5 MB',
+				'1 024 B',
+				'MB',
+				'- 1 B',
+				'1e B',
+				'0x10',
+				'Infinity',
+				'NaN B',
+				'1e400 B',
+				'1e300 YB'
+			];
+			for (const value of rejected) {
+				expect(function () {
+					helpers.parseBytes(value);
+				}).toThrow(RangeError);
+			}
+			expect(function () {
+				helpers.parseBytes('1 Mb');
+			}).toThrow(new RangeError(`parseBytes: \`value\` must be a finite byte size such as '1.5 MB' or '2 KiB', got "1 Mb"`));
+			expect(function () {
+				helpers.parseBytes(`${'9'.repeat(60)} apples`);
+			}).toThrow(new RangeError(`parseBytes: \`value\` must be a finite byte size such as '1.5 MB' or '2 KiB', got "${'9'.repeat(50)}…"`));
+			expect(function () {
+				helpers.parseBytes(1024 as any);
+			}).toThrow(new TypeError('parseBytes: `value` must be a string, got number'));
+			expect(function () {
+				helpers.parseBytes('1 kB', { base: 1000.5 as any });
+			}).toThrow(new RangeError('parseBytes: `base` must be 1000 or 1024, got 1000.5'));
+		});
+
+		it('should parse in linear time', function () {
+			const start = performance.now();
+			for (const value of [`1${' '.repeat(100_000)}x`, `1${'e'.repeat(100_000)}1`, `${'1'.repeat(100_000)}.`, `1 ${'B'.repeat(100_000)} 1`]) {
+				expect(function () {
+					helpers.parseBytes(value);
+				}).toThrow(RangeError);
+			}
+			expect(performance.now() - start).toBeLessThan(1000);
+		});
+
+		it('should invert formatBytes', function () {
+			for (const bytes of [0, 1, 999, 1000, 1500, 999_999, 1_234_567, 3e9, 1e24, 1e40, -2048, 0.5]) {
+				for (const base of [1000, 1024] as const) {
+					const text = helpers.formatBytes(bytes, { base, decimals: 2 });
+					expect(helpers.formatBytes(helpers.parseBytes(text, { base }), { base, decimals: 2 })).toBe(text);
+				}
+			}
+			expect(helpers.parseBytes(helpers.formatBytes(1_234_567, { decimals: 6 }))).toBe(1_234_567);
+			expect(helpers.parseBytes(helpers.formatBytes(1_234_567, { base: 1024, decimals: 20 }), { base: 1024 })).toBe(1_234_567);
 		});
 	});
 

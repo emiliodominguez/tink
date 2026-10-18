@@ -1,5 +1,26 @@
+import * as util from 'util';
 import * as vm from 'vm';
 import * as helpers from '.';
+
+/**
+ * The real `process`: Jest gives tests a copy whose `env` does not reach the engine's time zone, so a function created by the
+ * outer realm's `Function` constructor fetches it.
+ */
+const realProcess = new (util.inspect.constructor as FunctionConstructor)('return process')() as { env: Record<string, string | undefined> };
+
+/**
+ * Runs `fn` with the engine's local time zone set to `timeZone`, then restores it.
+ */
+function withTimeZone(timeZone: string, fn: () => void): void {
+	const previous = realProcess.env.TZ;
+	realProcess.env.TZ = timeZone;
+	try {
+		fn();
+	} finally {
+		if (previous === undefined) delete realProcess.env.TZ;
+		else realProcess.env.TZ = previous;
+	}
+}
 
 /**
  * Returns the local calendar/time components of a date, for TZ-agnostic assertions.
@@ -1633,6 +1654,609 @@ describe('Date helpers', function () {
 			} finally {
 				set.mockRestore();
 			}
+		});
+	});
+
+	describe('round 11: addDuration / subDuration / intervalToDuration', function () {
+		it('applies the largest units first, with end-of-month clamping', function () {
+			expect(parts(helpers.addDuration(new Date(2024, 0, 31, 9), { months: 1, days: 1, hours: 2 }))).toEqual([2024, 2, 1, 11, 0, 0, 0]);
+			expect(ymd(helpers.addDuration(new Date(2023, 0, 31), { months: 1 }))).toEqual([2023, 1, 28]);
+			expect(ymd(helpers.addDuration(new Date(2024, 1, 29), { years: 1, weeks: 1 }))).toEqual([2025, 2, 7]);
+			expect(ymd(helpers.addDuration(new Date(2024, 1, 29), { years: -4 }))).toEqual([2020, 1, 29]);
+			expect(parts(helpers.addDuration(new Date(2024, 0, 1), { minutes: 90, seconds: 1.5, milliseconds: 2 }))).toEqual([2024, 0, 1, 1, 30, 1, 502]);
+			expect(parts(helpers.addDuration(new Date(2024, 0, 1, 12), { hours: -0.5 }))).toEqual([2024, 0, 1, 11, 30, 0, 0]);
+		});
+
+		it('returns a copy for an empty duration and never mutates the input', function () {
+			const date = new Date(2024, 0, 31);
+			const result = helpers.addDuration(date, {});
+			expect(result).not.toBe(date);
+			expect(result.getTime()).toBe(date.getTime());
+			expect(helpers.addDuration(date.getTime(), { days: 0, hours: 0 }).getTime()).toBe(date.getTime());
+			helpers.addDuration(date, { months: 1, hours: 1 });
+			expect(ymd(date)).toEqual([2024, 0, 31]);
+			expect(helpers.addDuration(0, { years: undefined, hours: 1 }).getTime()).toBe(3_600_000);
+		});
+
+		it('subDuration negates every field', function () {
+			expect(parts(helpers.subDuration(new Date(2024, 2, 31, 12), { months: 1, hours: 12 }))).toEqual([2024, 1, 29, 0, 0, 0, 0]);
+			expect(ymd(helpers.subDuration(new Date(2024, 0, 10), { weeks: 1, days: 2 }))).toEqual([2024, 0, 1]);
+			expect(ymd(helpers.subDuration(new Date(2024, 0, 10), { days: -2 }))).toEqual([2024, 0, 12]);
+		});
+
+		it('validates the duration', function () {
+			expect(function () {
+				helpers.addDuration(new Date(), null as any);
+			}).toThrow(new TypeError('addDuration: `duration` must be an object, got null'));
+			expect(function () {
+				helpers.subDuration(new Date(), 5 as any);
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.addDuration(new Date(), { day: 1 } as any);
+			}).toThrow(new RangeError('addDuration: `duration` must only have the fields years, months, weeks, days, hours, minutes, seconds, milliseconds, got "day"'));
+			expect(function () {
+				helpers.addDuration(new Date(), JSON.parse('{"__proto__":{"days":1}}'));
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.addDuration(new Date(), { days: 1.5 });
+			}).toThrow(new RangeError('addDuration: `duration.days` must be an integer, got 1.5'));
+			expect(function () {
+				helpers.subDuration(new Date(), { years: '1' as any });
+			}).toThrow(new TypeError('subDuration: `duration.years` must be an integer, got string'));
+			expect(function () {
+				helpers.addDuration(new Date(), { hours: Infinity });
+			}).toThrow(new RangeError('addDuration: `duration.hours` must be a finite number, got Infinity'));
+			expect(function () {
+				helpers.addDuration(INVALID, { days: 1 });
+			}).toThrow(new RangeError('Invalid date'));
+			expect(function () {
+				helpers.addDuration(new Date(), { years: 300_000 });
+			}).toThrow(new RangeError('Resulting date is out of range'));
+			expect(function () {
+				helpers.addDuration(8.64e15, { hours: 1 });
+			}).toThrow(new RangeError('Resulting date is out of range'));
+		});
+
+		it('intervalToDuration breaks an interval into calendar components', function () {
+			const zero = { years: 0, months: 0, days: 0, hours: 0, minutes: 0, seconds: 0, milliseconds: 0 };
+			expect(helpers.intervalToDuration(new Date(2024, 0, 31, 9), new Date(2025, 2, 1, 11, 30, 5, 7))).toEqual({
+				years: 1,
+				months: 1,
+				days: 1,
+				hours: 2,
+				minutes: 30,
+				seconds: 5,
+				milliseconds: 7
+			});
+			expect(helpers.intervalToDuration(new Date(2023, 0, 31), new Date(2023, 1, 28))).toEqual({ ...zero, months: 1 });
+			expect(helpers.intervalToDuration(new Date(2024, 0, 31), new Date(2024, 1, 28))).toEqual({ ...zero, days: 28 });
+			expect(helpers.intervalToDuration(new Date(2024, 0, 15, 12), new Date(2024, 1, 15, 11))).toEqual({ ...zero, days: 30, hours: 23 });
+			expect(helpers.intervalToDuration(5, 5)).toEqual(zero);
+		});
+
+		it('intervalToDuration walks backwards from start when end is earlier', function () {
+			const zero = { years: 0, months: 0, days: 0, hours: 0, minutes: 0, seconds: 0, milliseconds: 0 };
+			expect(helpers.intervalToDuration(new Date(2024, 0, 2), new Date(2024, 0, 1, 12))).toEqual({ ...zero, hours: -12 });
+			expect(helpers.intervalToDuration(new Date(2023, 2, 31, 10), new Date(2023, 1, 28, 12))).toEqual({ ...zero, days: -30, hours: -22 });
+			expect(helpers.intervalToDuration(new Date(2024, 2, 31, 10), new Date(2024, 1, 28, 12))).toEqual({ ...zero, months: -1, hours: -22 });
+			expect(helpers.intervalToDuration(new Date(2025, 2, 31), new Date(2024, 1, 29))).toEqual({ ...zero, years: -1, months: -1 });
+			const start = new Date(2024, 2, 31, 10);
+			const end = new Date(2023, 1, 28, 12);
+			expect(helpers.addDuration(start, helpers.intervalToDuration(start, end)).getTime()).toBe(end.getTime());
+		});
+	});
+
+	describe('round 11: toISOStringLocal', function () {
+		it('equals toISOString() when the offset is zero', function () {
+			withTimeZone('UTC', function () {
+				const date = new Date(Date.UTC(2026, 9, 18, 9, 30, 15, 7));
+				expect(helpers.toISOStringLocal(date)).toBe('2026-10-18T09:30:15.007Z');
+				expect(helpers.toISOStringLocal(date.getTime(), { milliseconds: false })).toBe('2026-10-18T09:30:15Z');
+				expect(helpers.toISOStringLocal(Date.UTC(-1, 0, 1) - 1)).toBe('-000002-12-31T23:59:59.999Z');
+				expect(helpers.toISOStringLocal(new Date(Date.UTC(10000, 0, 1)))).toBe('+010000-01-01T00:00:00.000Z');
+				expect(helpers.toISOStringLocal(8.64e15)).toBe('+275760-09-13T00:00:00.000Z');
+			});
+		});
+
+		it('writes half-hour and 45-minute offsets with the right sign', function () {
+			const instant = Date.UTC(2026, 0, 18, 7, 30);
+			const expected: Array<[string, string]> = [
+				['Asia/Kolkata', '2026-01-18T13:00:00.000+05:30'],
+				['Asia/Kathmandu', '2026-01-18T13:15:00.000+05:45'],
+				['America/St_Johns', '2026-01-18T04:00:00.000-03:30'],
+				['Australia/Lord_Howe', '2026-01-18T18:30:00.000+11:00'],
+				['Pacific/Chatham', '2026-01-18T21:15:00.000+13:45'],
+				['America/New_York', '2026-01-18T02:30:00.000-05:00']
+			];
+			for (const [zone, iso] of expected) {
+				withTimeZone(zone, function () {
+					expect(helpers.toISOStringLocal(instant)).toBe(iso);
+					expect(new Date(iso).getTime()).toBe(instant);
+				});
+			}
+			withTimeZone('Australia/Lord_Howe', function () {
+				expect(helpers.toISOStringLocal(Date.UTC(2026, 5, 18, 7, 30))).toBe('2026-06-18T18:00:00.000+10:30');
+			});
+		});
+
+		it('keeps the instant for negative years and historical offsets with seconds', function () {
+			withTimeZone('America/New_York', function () {
+				const ancient = new Date(Date.UTC(-1, 0, 1, 12));
+				const iso = helpers.toISOStringLocal(ancient);
+				expect(iso).toBe('-000001-01-01T07:04:00.000-04:56');
+				expect(new Date(iso).getTime()).toBe(ancient.getTime());
+			});
+			withTimeZone('Europe/Paris', function () {
+				// Paris mean time was UTC+00:09:21: shown at +00:09, 21 seconds earlier than the wall clock.
+				const date = new Date(1900, 0, 1);
+				expect(helpers.toISOStringLocal(date)).toBe('1899-12-31T23:59:39.000+00:09');
+				expect(helpers.toISOStringLocal(date, { milliseconds: false })).toBe('1899-12-31T23:59:39+00:09');
+				expect(new Date(helpers.toISOStringLocal(date)).getTime()).toBe(date.getTime());
+			});
+		});
+
+		it('works up to the limits of the Date range', function () {
+			withTimeZone('Asia/Tokyo', function () {
+				expect(helpers.toISOStringLocal(8.64e15)).toBe('+275760-09-13T09:00:00.000+09:00');
+				expect(new Date(helpers.toISOStringLocal(8.64e15)).getTime()).toBe(8.64e15);
+			});
+			withTimeZone('America/New_York', function () {
+				// Local mean time (-04:56:02) at the earliest date: the instant at -04:56 is before the range.
+				expect(function () {
+					helpers.toISOStringLocal(-8.64e15);
+				}).toThrow(new RangeError('Resulting date is out of range'));
+			});
+			expect(function () {
+				helpers.toISOStringLocal(INVALID);
+			}).toThrow(new RangeError('Invalid date'));
+		});
+	});
+
+	describe('round 11: diffInWeeks / diffInYears / diffInCalendarMonths / diffInCalendarYears', function () {
+		it('counts complete weeks, time of day included', function () {
+			expect(helpers.diffInWeeks(new Date(2024, 0, 15), new Date(2024, 0, 1))).toBe(2);
+			expect(helpers.diffInWeeks(new Date(2024, 0, 15, 8), new Date(2024, 0, 1, 9))).toBe(1);
+			expect(helpers.diffInWeeks(new Date(2024, 0, 1), new Date(2024, 0, 15))).toBe(-2);
+			expect(helpers.diffInWeeks(new Date(2024, 0, 1, 9), new Date(2024, 0, 15, 8))).toBe(-1);
+			expect(helpers.diffInWeeks(new Date(2024, 0, 7), new Date(2024, 0, 1))).toBe(0);
+			expect(Object.is(helpers.diffInWeeks(new Date(2024, 0, 1), new Date(2024, 0, 3)), 0)).toBe(true);
+		});
+
+		it('counts complete years with the Feb 29 → Feb 28 policy of addYears', function () {
+			expect(helpers.diffInYears(new Date(2024, 5, 15), new Date(2020, 5, 16))).toBe(3);
+			expect(helpers.diffInYears(new Date(2024, 5, 16), new Date(2020, 5, 16))).toBe(4);
+			expect(helpers.diffInYears(new Date(2025, 1, 28), new Date(2024, 1, 29))).toBe(1);
+			expect(helpers.diffInYears(new Date(2025, 1, 27, 23), new Date(2024, 1, 29))).toBe(0);
+			expect(helpers.diffInYears(new Date(2020, 0, 1), new Date(2024, 0, 1))).toBe(-4);
+			expect(helpers.diffInYears(new Date(2024, 11, 31), new Date(2024, 0, 1))).toBe(0);
+		});
+
+		it('counts calendar months and years, ignoring the rest', function () {
+			expect(helpers.diffInCalendarMonths(new Date(2024, 0, 1), new Date(2023, 11, 31, 23))).toBe(1);
+			expect(helpers.diffInCalendarMonths(new Date(2024, 2, 31), new Date(2024, 2, 1))).toBe(0);
+			expect(helpers.diffInCalendarMonths(new Date(2023, 0, 1), new Date(2024, 11, 31))).toBe(-23);
+			expect(helpers.diffInCalendarYears(new Date(2024, 0, 1), new Date(2023, 11, 31))).toBe(1);
+			expect(helpers.diffInCalendarYears(0, 0)).toBe(0);
+		});
+	});
+
+	describe('round 11: startOfHour / endOfHour / startOfMinute / endOfMinute', function () {
+		it('truncates to the wall-clock hour and minute', function () {
+			const date = new Date(2024, 4, 10, 15, 42, 7, 9);
+			expect(parts(helpers.startOfHour(date))).toEqual([2024, 4, 10, 15, 0, 0, 0]);
+			expect(parts(helpers.endOfHour(date))).toEqual([2024, 4, 10, 15, 59, 59, 999]);
+			expect(parts(helpers.startOfMinute(date))).toEqual([2024, 4, 10, 15, 42, 0, 0]);
+			expect(parts(helpers.endOfMinute(date))).toEqual([2024, 4, 10, 15, 42, 59, 999]);
+			expect(parts(helpers.endOfHour(new Date(2024, 4, 10, 15)))).toEqual([2024, 4, 10, 15, 59, 59, 999]);
+			expect(parts(helpers.endOfMinute(new Date(2024, 11, 31, 23, 59, 30)))).toEqual([2024, 11, 31, 23, 59, 59, 999]);
+			expect(helpers.startOfMinute(date)).not.toBe(date);
+		});
+
+		it('keeps each occurrence of the repeated hour when clocks are set back (New York)', function () {
+			withTimeZone('America/New_York', function () {
+				const second = new Date('2024-11-03T06:30:00Z'); // 01:30 EST, the second 01:30
+				expect(helpers.startOfHour(second).toISOString()).toBe('2024-11-03T06:00:00.000Z'); // 01:00 EST
+				expect(helpers.endOfHour(second).toISOString()).toBe('2024-11-03T06:59:59.999Z');
+				const first = new Date('2024-11-03T05:30:00Z'); // 01:30 EDT
+				expect(helpers.startOfHour(first).toISOString()).toBe('2024-11-03T05:00:00.000Z');
+				expect(helpers.endOfHour(first).toISOString()).toBe('2024-11-03T05:59:59.999Z');
+				expect(helpers.startOfHour(new Date('2024-03-10T07:30:00Z')).toISOString()).toBe('2024-03-10T07:00:00.000Z'); // 03:00 EDT
+			});
+		});
+
+		it('stays on the wall-clock hour when the clock moves by 30 minutes (Lord Howe Island)', function () {
+			withTimeZone('Australia/Lord_Howe', function () {
+				// 2024-04-07 02:00 (+11:00) → 01:30 (+10:30): 01:45 (+10:30) is in the repeated half hour.
+				const repeated = new Date('2024-04-06T15:15:00Z');
+				expect(helpers.startOfHour(repeated).toISOString()).toBe('2024-04-06T14:00:00.000Z'); // 01:00 (+11:00)
+				expect(parts(helpers.startOfHour(repeated))).toEqual([2024, 3, 7, 1, 0, 0, 0]);
+				expect(parts(helpers.endOfHour(repeated))).toEqual([2024, 3, 7, 1, 59, 59, 999]);
+				// 2024-10-06 02:00 (+10:30) → 02:30 (+11:00): the hour 02 starts at 02:30.
+				const afterGap = new Date('2024-10-05T15:45:00Z'); // 02:45 (+11:00)
+				expect(parts(helpers.startOfHour(afterGap))).toEqual([2024, 9, 6, 2, 30, 0, 0]);
+				expect(helpers.startOfHour(afterGap).toISOString()).toBe('2024-10-05T15:30:00.000Z');
+			});
+		});
+
+		it('throws when the boundary is out of range', function () {
+			withTimeZone('UTC', function () {
+				expect(helpers.startOfHour(-8.64e15).getTime()).toBe(-8.64e15);
+				expect(function () {
+					helpers.endOfHour(8.64e15);
+				}).toThrow(new RangeError('Resulting date is out of range'));
+				expect(function () {
+					helpers.endOfMinute(8.64e15);
+				}).toThrow(RangeError);
+			});
+			withTimeZone('America/New_York', function () {
+				expect(function () {
+					helpers.startOfMinute(-8.64e15);
+				}).toThrow(new RangeError('Resulting date is out of range'));
+			});
+		});
+	});
+
+	describe('round 11: roundToNearestMinutes', function () {
+		it('rounds to a wall-clock grid in the three modes', function () {
+			expect(parts(helpers.roundToNearestMinutes(new Date(2024, 0, 1, 9, 7, 30), 5))).toEqual([2024, 0, 1, 9, 10, 0, 0]);
+			expect(parts(helpers.roundToNearestMinutes(new Date(2024, 0, 1, 9, 7, 29, 999), 5))).toEqual([2024, 0, 1, 9, 5, 0, 0]);
+			expect(parts(helpers.roundToNearestMinutes(new Date(2024, 0, 1, 9, 7), 15, 'floor'))).toEqual([2024, 0, 1, 9, 0, 0, 0]);
+			expect(parts(helpers.roundToNearestMinutes(new Date(2024, 0, 1, 9, 50), 15, 'ceil'))).toEqual([2024, 0, 1, 10, 0, 0, 0]);
+			expect(parts(helpers.roundToNearestMinutes(new Date(2024, 0, 1, 9, 45), 15, 'ceil'))).toEqual([2024, 0, 1, 9, 45, 0, 0]);
+			expect(parts(helpers.roundToNearestMinutes(new Date(2024, 0, 1, 9, 29, 59)))).toEqual([2024, 0, 1, 9, 30, 0, 0]);
+			expect(parts(helpers.roundToNearestMinutes(new Date(2024, 11, 31, 23, 30), 60))).toEqual([2025, 0, 1, 0, 0, 0, 0]);
+			expect(parts(helpers.roundToNearestMinutes(new Date(2024, 0, 1, 9, 0, 0, 1), 1, 'ceil'))).toEqual([2024, 0, 1, 9, 1, 0, 0]);
+		});
+
+		it('rounds to the nearest instant across a DST change', function () {
+			withTimeZone('America/New_York', function () {
+				// 01:30 EDT is as far from 01:00 EDT as from 01:00 EST, 30 minutes later: the tie goes up.
+				expect(helpers.roundToNearestMinutes(new Date('2024-11-03T05:30:00Z'), 60).toISOString()).toBe('2024-11-03T06:00:00.000Z');
+			});
+			withTimeZone('Australia/Lord_Howe', function () {
+				// 01:45 (+11:00) rounded up to the hour: 02:00 comes after the repeated half hour, at +10:30.
+				expect(helpers.roundToNearestMinutes(new Date('2024-04-06T14:45:00Z'), 60, 'ceil').toISOString()).toBe('2024-04-06T15:30:00.000Z');
+				expect(helpers.roundToNearestMinutes(new Date('2024-04-06T14:45:00Z'), 30, 'ceil').toISOString()).toBe('2024-04-06T15:00:00.000Z');
+			});
+		});
+
+		it('validates step and mode', function () {
+			for (const step of [0, 7, 45, 120, 1.5, -5, NaN]) {
+				expect(function () {
+					helpers.roundToNearestMinutes(0, step);
+				}).toThrow(new RangeError(`roundToNearestMinutes: \`step\` must be a divisor of 60, got ${step}`));
+			}
+			expect(function () {
+				helpers.roundToNearestMinutes(0, '5' as any);
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.roundToNearestMinutes(0, 5, 'up' as any);
+			}).toThrow(new RangeError('roundToNearestMinutes: `mode` must be one of round, floor, ceil, got up'));
+			expect(function () {
+				helpers.roundToNearestMinutes(INVALID);
+			}).toThrow(new RangeError('Invalid date'));
+		});
+	});
+
+	describe('round 11: eachOfInterval', function () {
+		it('enumerates every unit from the start of the first one', function () {
+			expect(helpers.eachOfInterval(new Date(2024, 0, 31), new Date(2024, 3, 15), 'month').map(ymd)).toEqual([
+				[2024, 0, 1],
+				[2024, 1, 1],
+				[2024, 2, 1],
+				[2024, 3, 1]
+			]);
+			expect(helpers.eachOfInterval(new Date(2023, 10, 5), new Date(2024, 6, 1), 'quarter').map(ymd)).toEqual([
+				[2023, 9, 1],
+				[2024, 0, 1],
+				[2024, 3, 1],
+				[2024, 6, 1]
+			]);
+			expect(helpers.eachOfInterval(new Date(2020, 5, 1), new Date(2024, 5, 1), 'year', 2).map(ymd)).toEqual([
+				[2020, 0, 1],
+				[2022, 0, 1],
+				[2024, 0, 1]
+			]);
+			expect(helpers.eachOfInterval(new Date(2024, 0, 3), new Date(2024, 0, 20), 'week', 1, 1).map(ymd)).toEqual([
+				[2024, 0, 1],
+				[2024, 0, 8],
+				[2024, 0, 15]
+			]);
+			expect(helpers.eachOfInterval(new Date(2024, 0, 3), new Date(2024, 0, 20), 'week').map(ymd)).toEqual([
+				[2023, 11, 31],
+				[2024, 0, 7],
+				[2024, 0, 14]
+			]);
+			expect(helpers.eachOfInterval(new Date(2024, 0, 30, 18), new Date(2024, 1, 2, 9), 'day', 2).map(parts)).toEqual([
+				[2024, 0, 30, 0, 0, 0, 0],
+				[2024, 1, 1, 0, 0, 0, 0]
+			]);
+			expect(helpers.eachOfInterval(new Date(2024, 0, 1, 9, 30), new Date(2024, 0, 1, 12), 'hour').map(parts)).toEqual([
+				[2024, 0, 1, 9, 0, 0, 0],
+				[2024, 0, 1, 10, 0, 0, 0],
+				[2024, 0, 1, 11, 0, 0, 0],
+				[2024, 0, 1, 12, 0, 0, 0]
+			]);
+			expect(helpers.eachOfInterval(new Date(2024, 0, 1, 9, 58, 30), new Date(2024, 0, 1, 10, 1), 'minute', 2).map(parts)).toEqual([
+				[2024, 0, 1, 9, 58, 0, 0],
+				[2024, 0, 1, 10, 0, 0, 0]
+			]);
+			expect(helpers.eachOfInterval(5, 5, 'minute')).toEqual([helpers.startOfMinute(5)]);
+		});
+
+		it('agrees with eachDayOfInterval for days', function () {
+			const start = new Date(2024, 1, 25, 13);
+			const end = new Date(2024, 2, 5, 2);
+			expect(helpers.eachOfInterval(start, end, 'day', 3)).toEqual(helpers.eachDayOfInterval(start, end, { step: 3 }));
+		});
+
+		it('steps hours on the timeline and snaps them to the wall clock', function () {
+			withTimeZone('America/New_York', function () {
+				const fallBack = helpers.eachOfInterval(new Date(2024, 10, 3), new Date(2024, 10, 3, 3), 'hour');
+				expect(fallBack.map(Number)).toEqual(
+					[4, 5, 6, 7, 8].map(function (hour: number) {
+						return Date.UTC(2024, 10, 3, hour);
+					})
+				);
+				expect(
+					helpers.eachOfInterval(new Date(2024, 2, 10), new Date(2024, 2, 10, 4), 'hour').map(function (date: Date) {
+						return date.getHours();
+					})
+				).toEqual([0, 1, 3, 4]);
+			});
+			withTimeZone('Australia/Lord_Howe', function () {
+				/**
+				 * Formats the wall-clock time.
+				 */
+				function hours(date: Date): string {
+					return helpers.formatDate(date, 'HH:mm');
+				}
+				// Clocks set back from 02:00 to 01:30: whole hours only, each once.
+				expect(helpers.eachOfInterval(new Date('2024-04-06T13:00:00Z'), new Date('2024-04-06T17:00:00Z'), 'hour').map(hours)).toEqual([
+					'00:00',
+					'01:00',
+					'02:00',
+					'03:00'
+				]);
+				// Clocks moved forward from 02:00 to 02:30: the hour 02 starts at 02:30.
+				expect(helpers.eachOfInterval(new Date('2024-10-05T13:30:00Z'), new Date('2024-10-05T17:00:00Z'), 'hour').map(hours)).toEqual([
+					'00:00',
+					'01:00',
+					'02:30',
+					'03:00',
+					'04:00'
+				]);
+			});
+		});
+
+		it('validates its arguments and refuses huge results', function () {
+			expect(function () {
+				helpers.eachOfInterval(0, 1, 'decade' as any);
+			}).toThrow(new RangeError('eachOfInterval: `unit` must be one of year, quarter, month, week, day, hour, minute, got decade'));
+			expect(function () {
+				helpers.eachOfInterval(0, 1, 'day', 0);
+			}).toThrow(new RangeError('eachOfInterval: `step` must be a safe integer >= 1, got 0'));
+			expect(function () {
+				helpers.eachOfInterval(0, 1, 'week', 1, 7 as any);
+			}).toThrow(new RangeError('eachOfInterval: `weekStartsOn` must be an integer between 0 and 6, got 7'));
+			expect(function () {
+				helpers.eachOfInterval(1, 0, 'day');
+			}).toThrow(new RangeError('eachOfInterval: `start` must not be after `end`'));
+			expect(function () {
+				helpers.eachOfInterval(0, 3 * 365 * 86_400_000, 'minute');
+			}).toThrow(new RangeError('eachOfInterval: the interval holds 1576801 dates, more than 1000000'));
+			expect(function () {
+				helpers.eachOfInterval(-8.64e15, 8.64e15, 'day');
+			}).toThrow(RangeError);
+			expect(helpers.eachOfInterval(Date.UTC(-200_000, 6, 1), Date.UTC(200_000, 6, 1), 'year', 1000)).toHaveLength(401);
+			withTimeZone('UTC', function () {
+				expect(function () {
+					helpers.eachOfInterval(-8.64e15, 8.64e15, 'year', 1000);
+				}).toThrow(new RangeError('Resulting date is out of range'));
+				expect(helpers.eachOfInterval(8.64e15 - 3_600_000, 8.64e15, 'hour').map(Number)).toEqual([8.64e15 - 3_600_000, 8.64e15]);
+			});
+		});
+	});
+
+	describe('round 11: nextWeekday / previousWeekday', function () {
+		it('finds the weekday strictly after or before, keeping the time of day', function () {
+			const wednesday = new Date(2024, 4, 15, 9, 30);
+			expect(parts(helpers.nextWeekday(wednesday, 5))).toEqual([2024, 4, 17, 9, 30, 0, 0]);
+			expect(ymd(helpers.nextWeekday(wednesday, 3))).toEqual([2024, 4, 22]);
+			expect(ymd(helpers.nextWeekday(wednesday, 2))).toEqual([2024, 4, 21]);
+			expect(parts(helpers.previousWeekday(wednesday, 1))).toEqual([2024, 4, 13, 9, 30, 0, 0]);
+			expect(ymd(helpers.previousWeekday(wednesday, 3))).toEqual([2024, 4, 8]);
+			expect(ymd(helpers.previousWeekday(wednesday, 4))).toEqual([2024, 4, 9]);
+			expect(ymd(helpers.previousWeekday(new Date(2024, 0, 1), 6))).toEqual([2023, 11, 30]);
+		});
+
+		it('validates the weekday', function () {
+			expect(function () {
+				helpers.nextWeekday(0, 7 as any);
+			}).toThrow(new RangeError('nextWeekday: `weekday` must be an integer between 0 and 6, got 7'));
+			expect(function () {
+				helpers.previousWeekday(0, '1' as any);
+			}).toThrow(new TypeError('previousWeekday: `weekday` must be an integer between 0 and 6, got string'));
+		});
+	});
+
+	describe('round 11: intervalsOverlap', function () {
+		/**
+		 * A date on 2024-01-01 at `hour`.
+		 */
+		function at(hour: number): Date {
+			return new Date(2024, 0, 1, hour);
+		}
+
+		it('treats intervals as half-open by default', function () {
+			expect(helpers.intervalsOverlap({ start: at(9), end: at(12) }, { start: at(12), end: at(17) })).toBe(false);
+			expect(helpers.intervalsOverlap({ start: at(9), end: at(12) }, { start: at(11), end: at(13) })).toBe(true);
+			expect(helpers.intervalsOverlap({ start: at(11), end: at(13) }, { start: at(9), end: at(12) })).toBe(true);
+			expect(helpers.intervalsOverlap({ start: at(9), end: at(17) }, { start: at(11), end: at(12) })).toBe(true);
+			expect(helpers.intervalsOverlap({ start: at(9), end: at(10) }, { start: at(11), end: at(12) })).toBe(false);
+			// An empty interval is an empty set.
+			expect(helpers.intervalsOverlap({ start: at(10), end: at(10) }, { start: at(9), end: at(12) })).toBe(false);
+			expect(helpers.intervalsOverlap({ start: 5, end: 5 }, { start: 5, end: 5 })).toBe(false);
+		});
+
+		it('treats intervals as closed with `inclusive`', function () {
+			const options = { inclusive: true };
+			expect(helpers.intervalsOverlap({ start: at(9), end: at(12) }, { start: at(12), end: at(17) }, options)).toBe(true);
+			expect(helpers.intervalsOverlap({ start: at(10), end: at(10) }, { start: at(9), end: at(12) }, options)).toBe(true);
+			expect(helpers.intervalsOverlap({ start: 5, end: 5 }, { start: 5, end: 5 }, options)).toBe(true);
+			expect(helpers.intervalsOverlap({ start: at(9), end: at(10) }, { start: at(11), end: at(12) }, options)).toBe(false);
+			expect(helpers.intervalsOverlap({ start: at(13), end: at(14) }, { start: at(11), end: at(12) }, options)).toBe(false);
+		});
+
+		it('validates the intervals', function () {
+			expect(function () {
+				helpers.intervalsOverlap({ start: at(12), end: at(9) }, { start: at(9), end: at(12) });
+			}).toThrow(new RangeError('intervalsOverlap: `a.start` must not be after `a.end`'));
+			expect(function () {
+				helpers.intervalsOverlap({ start: at(9), end: at(12) }, { start: 2, end: 1 });
+			}).toThrow(new RangeError('intervalsOverlap: `b.start` must not be after `b.end`'));
+			expect(function () {
+				helpers.intervalsOverlap(null as any, { start: 1, end: 2 });
+			}).toThrow(new TypeError('intervalsOverlap: `a` must be an interval object, got null'));
+			expect(function () {
+				helpers.intervalsOverlap({ start: 1, end: 2 }, 'x' as any);
+			}).toThrow(new TypeError('intervalsOverlap: `b` must be an interval object, got string'));
+			expect(function () {
+				helpers.intervalsOverlap({ start: INVALID, end: 2 }, { start: 1, end: 2 });
+			}).toThrow(new RangeError('Invalid date'));
+			expect(function () {
+				helpers.intervalsOverlap({ start: '1' as any, end: 2 }, { start: 1, end: 2 });
+			}).toThrow(TypeError);
+		});
+	});
+
+	describe('round 11: parseDate', function () {
+		it('parses every formatDate token', function () {
+			expect(helpers.parseDate('2024-01-05 14:07:09.003', 'YYYY-MM-DD HH:mm:ss.SSS')).toEqual(new Date(2024, 0, 5, 14, 7, 9, 3));
+			expect(helpers.parseDate('5/1/24 2:07 PM', 'D/M/YY h:mm A')).toEqual(new Date(2024, 0, 5, 14, 7));
+			expect(helpers.parseDate('12:05 am', 'hh:mm a')).toEqual(new Date(2000, 0, 1, 0, 5));
+			expect(helpers.parseDate('12:05 pm', 'hh:mm a')).toEqual(new Date(2000, 0, 1, 12, 5));
+			expect(helpers.parseDate('9:5:7', 'H:m:s')).toEqual(new Date(2000, 0, 1, 9, 5, 7));
+			expect(helpers.parseDate('23:59:59', 'H:m:s')).toEqual(new Date(2000, 0, 1, 23, 59, 59));
+			expect(helpers.parseDate('20240229', 'YYYYMMDD')).toEqual(new Date(2024, 1, 29));
+			expect(helpers.parseDate('20240229235959999', 'YYYYMMDDHHmmssSSS')).toEqual(new Date(2024, 1, 29, 23, 59, 59, 999));
+			expect(helpers.parseDate("on 05 [x] o'clock", "[on] DD [[x]] [o'clock]")).toEqual(new Date(2000, 0, 5));
+			expect(helpers.parseDate('PM', 'A')).toEqual(new Date(2000, 0, 1, 12));
+			expect(helpers.parseDate('', '')).toEqual(new Date(2000, 0, 1));
+			expect(helpers.parseDate('02-29', 'MM-DD')).toEqual(new Date(2000, 1, 29));
+			expect(helpers.parseDate('3 PM', 'h A')).toEqual(new Date(2000, 0, 1, 15));
+			expect(helpers.parseDate('15 PM', 'H A')).toEqual(new Date(2000, 0, 1, 15));
+		});
+
+		it('reads years of any size and sign', function () {
+			const ancient = new Date(2000, 0, 1);
+			ancient.setFullYear(-1, 5, 15);
+			expect(helpers.parseDate('-0001-06-15', 'YYYY-MM-DD')).toEqual(ancient);
+			const yearZero = new Date(2000, 0, 1);
+			yearZero.setFullYear(0);
+			expect(helpers.parseDate('0000', 'YYYY')).toEqual(yearZero);
+			expect(helpers.parseDate('123456-01', 'YYYY-MM')?.getFullYear()).toBe(123456);
+			expect(helpers.parseDate('12345 AD', 'YYYY [AD]')?.getFullYear()).toBe(12345);
+			expect(helpers.parseDate('2024 AM', 'YYYYA')).toBeUndefined();
+			expect(helpers.parseDate('2024AM', 'YYYYA')).toEqual(new Date(2024, 0, 1));
+			expect(helpers.parseDate('999999999-01', 'YYYY-MM')).toBeUndefined();
+			expect(helpers.parseDate(`${'9'.repeat(400)}`, 'YYYY')).toBeUndefined();
+		});
+
+		it('rejects input that formatDate would not produce', function () {
+			const rejected: Array<[string, string]> = [
+				['2023-02-29', 'YYYY-MM-DD'],
+				['2024-13-01', 'YYYY-MM-DD'],
+				['2024-00-10', 'YYYY-MM-DD'],
+				['2024-01-32', 'YYYY-MM-DD'],
+				['2024-1-5', 'YYYY-MM-DD'],
+				['2024-01-05 ', 'YYYY-MM-DD'],
+				['2024-01-0', 'YYYY-MM-DD'],
+				['2024/01/05', 'YYYY-MM-DD'],
+				['24:00', 'HH:mm'],
+				['12:60', 'HH:mm'],
+				['05', 'D'],
+				['5', 'DD'],
+				['00:00 AM', 'hh:mm A'],
+				['13:00 PM', 'hh:mm A'],
+				['10:00 pm', 'hh:mm A'],
+				['10:00 XM', 'hh:mm A'],
+				['10:00 P', 'hh:mm A'],
+				['14:00 AM', 'HH:mm A'],
+				['-', 'YYYY'],
+				['-024', 'YYYY'],
+				['024', 'YYYY'],
+				['2024', 'YY'],
+				['abc', 'YYYY'],
+				['', 'YYYY'],
+				['at', '[on]'],
+				['2024 25', 'YYYY YY']
+			];
+			for (const [value, pattern] of rejected) expect([value, pattern, helpers.parseDate(value, pattern)]).toEqual([value, pattern, undefined]);
+			expect(helpers.parseDate('2099 99', 'YYYY YY')).toEqual(new Date(2099, 0, 1));
+			expect(helpers.parseDate('1999 99', 'YYYY YY')).toEqual(new Date(1999, 0, 1));
+			expect(helpers.parseDate(20240105 as any, 'YYYYMMDD')).toBeUndefined();
+			expect(helpers.parseDate(null as any, 'YYYY')).toBeUndefined();
+		});
+
+		it('rejects local times skipped by a DST change and takes the first of a repeated time', function () {
+			withTimeZone('America/New_York', function () {
+				expect(helpers.parseDate('2024-03-10 02:30', 'YYYY-MM-DD HH:mm')).toBeUndefined();
+				expect(helpers.parseDate('2024-11-03 01:30', 'YYYY-MM-DD HH:mm')?.toISOString()).toBe('2024-11-03T05:30:00.000Z');
+			});
+		});
+
+		it('throws on a non-string pattern', function () {
+			expect(function () {
+				helpers.parseDate('2024', 5 as any);
+			}).toThrow(new TypeError('parseDate: `pattern` must be a string, got number'));
+		});
+
+		it('parses in linear time', function () {
+			const start = performance.now();
+			expect(helpers.parseDate('1'.repeat(200_000), 'D'.repeat(100_000))).toBeUndefined();
+			expect(helpers.parseDate('1'.repeat(200_000), 'YYYY')).toBeUndefined();
+			expect(helpers.parseDate(`${'['.repeat(100_000)}5`, `${'['.repeat(100_000)}D`)).toEqual(new Date(2000, 0, 5));
+			expect(performance.now() - start).toBeLessThan(2000);
+		});
+	});
+
+	describe('round 11: getDayOfYear / isTomorrow / isYesterday / isSameWeek / isSameQuarter', function () {
+		it('getDayOfYear', function () {
+			expect(helpers.getDayOfYear(new Date(2024, 0, 1, 23))).toBe(1);
+			expect(helpers.getDayOfYear(new Date(2024, 2, 1))).toBe(61);
+			expect(helpers.getDayOfYear(new Date(2023, 2, 1))).toBe(60);
+			expect(helpers.getDayOfYear(new Date(2024, 11, 31))).toBe(366);
+			expect(helpers.getDayOfYear(new Date(2023, 11, 31, 23, 59))).toBe(365);
+		});
+
+		it('isTomorrow / isYesterday compare local calendar days', function () {
+			const now = new Date(2024, 0, 1, 8);
+			expect(helpers.isTomorrow(new Date(2024, 0, 2, 23, 59), now)).toBe(true);
+			expect(helpers.isTomorrow(new Date(2024, 0, 3), now)).toBe(false);
+			expect(helpers.isTomorrow(new Date(2024, 0, 1, 23), now)).toBe(false);
+			expect(helpers.isYesterday(new Date(2023, 11, 31, 0, 1), now)).toBe(true);
+			expect(helpers.isYesterday(new Date(2024, 0, 1), now)).toBe(false);
+			expect(helpers.isTomorrow(Date.now() + 86_400_000 * 3)).toBe(false);
+			expect(helpers.isYesterday(helpers.addDays(new Date(), -1))).toBe(true);
+			expect(helpers.isTomorrow(helpers.addDays(new Date(), 1))).toBe(true);
+		});
+
+		it('isSameWeek honours weekStartsOn', function () {
+			expect(helpers.isSameWeek(new Date(2024, 4, 12), new Date(2024, 4, 18, 23))).toBe(true);
+			expect(helpers.isSameWeek(new Date(2024, 4, 12), new Date(2024, 4, 18), 1)).toBe(false);
+			expect(helpers.isSameWeek(new Date(2024, 4, 13), new Date(2024, 4, 19), 1)).toBe(true);
+			expect(helpers.isSameWeek(new Date(2024, 11, 30), new Date(2025, 0, 4))).toBe(true);
+			expect(helpers.isSameWeek(new Date(2024, 4, 12), new Date(2024, 4, 11))).toBe(false);
+			expect(function () {
+				helpers.isSameWeek(0, 0, -1 as any);
+			}).toThrow(new RangeError('isSameWeek: `weekStartsOn` must be an integer between 0 and 6, got -1'));
+		});
+
+		it('isSameQuarter', function () {
+			expect(helpers.isSameQuarter(new Date(2024, 0, 1), new Date(2024, 2, 31))).toBe(true);
+			expect(helpers.isSameQuarter(new Date(2024, 2, 31), new Date(2024, 3, 1))).toBe(false);
+			expect(helpers.isSameQuarter(new Date(2024, 0, 1), new Date(2023, 0, 1))).toBe(false);
 		});
 	});
 });

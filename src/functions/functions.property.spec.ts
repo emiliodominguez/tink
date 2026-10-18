@@ -1,5 +1,23 @@
 import fc from 'fast-check';
-import { attempt, compose, curry, debounce, defaultMemoizeKey, flip, memoize, memoizeLast, negate, once, partial, pipe, times } from '.';
+import {
+	allPass,
+	anyPass,
+	attempt,
+	compose,
+	curry,
+	debounce,
+	defaultMemoizeKey,
+	flip,
+	match,
+	memoize,
+	memoizeLast,
+	negate,
+	once,
+	partial,
+	partialRight,
+	pipe,
+	times
+} from '.';
 
 type IntFn = (x: number) => number;
 
@@ -436,5 +454,65 @@ describe('Functions helpers (properties)', function () {
 				})
 			);
 		});
+	});
+});
+
+describe('round 11 helpers (properties)', function () {
+	function collect(...args: unknown[]): unknown[] {
+		return args;
+	}
+
+	it('partialRight(fn, ...tail)(...head) calls fn(...head, ...tail), and partial/partialRight compose to the full call', function () {
+		fc.assert(
+			fc.property(fc.array(fc.anything(), { maxLength: 5 }), fc.array(fc.anything(), { maxLength: 5 }), function (head, tail) {
+				const bound = partialRight(collect as (...args: unknown[]) => unknown[], ...tail) as (...args: unknown[]) => unknown[];
+				expect(bound(...head)).toEqual([...head, ...tail]);
+				const both = partial(partialRight(collect as (...args: unknown[]) => unknown[], ...tail) as (...args: unknown[]) => unknown[], ...head);
+				expect(both()).toEqual([...head, ...tail]);
+			})
+		);
+	});
+
+	it('allPass/anyPass agree with every/some, and allPass(...ps) === !anyPass(...ps.map(negate))', function () {
+		fc.assert(
+			fc.property(fc.array(fc.integer({ min: 1, max: 6 }), { maxLength: 6 }), fc.integer({ min: -50, max: 50 }), function (divisors, value) {
+				const predicates = divisors.map(function (d) {
+					return function (n: number): boolean {
+						return n % d === 0;
+					};
+				});
+				const expectedAll = predicates.every(function (p) {
+					return p(value);
+				});
+				const expectedAny = predicates.some(function (p) {
+					return p(value);
+				});
+				expect(allPass(...predicates)(value)).toBe(expectedAll);
+				expect(anyPass(...predicates)(value)).toBe(expectedAny);
+				expect(allPass(...predicates)(value)).toBe(!anyPass(...predicates.map(negate))(value));
+			})
+		);
+	});
+
+	it('match calls exactly the handler named by the tag', function () {
+		type Tagged = { tag: 'a'; n: number } | { tag: 'b'; n: number } | { tag: 'c'; n: number };
+		fc.assert(
+			fc.property(fc.constantFrom<'a' | 'b' | 'c'>('a', 'b', 'c'), fc.integer(), function (tag, n) {
+				const value = { tag, n } as Tagged;
+				const result = match(value, 'tag', {
+					a: function (v) {
+						return ['a', v] as const;
+					},
+					b: function (v) {
+						return ['b', v] as const;
+					},
+					c: function (v) {
+						return ['c', v] as const;
+					}
+				});
+				expect(result[0]).toBe(tag);
+				expect(result[1]).toBe(value);
+			})
+		);
 	});
 });

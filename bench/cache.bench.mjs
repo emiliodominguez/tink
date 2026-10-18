@@ -1,4 +1,5 @@
-import { createLRUCache } from '@emiliodominguez/tink/cache';
+import { createLRUCache, createPriorityQueue } from '@emiliodominguez/tink/cache';
+import { PriorityQueue } from 'p-queue';
 
 /**
  * A minimal LRU cache (Map re-insertion for recency, no TTL, no callbacks, no validation): the theoretical best for this API.
@@ -202,5 +203,44 @@ export default [
 			for (const entry of map) count += entry[1];
 			return count;
 		}
-	}
+	},
+	...[100, 10_000].map(function (n) {
+		const priorities = Array.from({ length: n }, function (_, index) {
+			return (index * 7919) % 97;
+		});
+		/**
+		 * Max-priority order.
+		 * @param {{ priority: number }} a - A task
+		 * @param {{ priority: number }} b - Another task
+		 * @returns {number} Negative when `a` comes first
+		 */
+		function byPriority(a, b) {
+			return b.priority - a.priority;
+		}
+		const tasks = priorities.map(function (priority) {
+			return { priority };
+		});
+		return {
+			name: `createPriorityQueue: push ${n} + pop all`,
+			fn: function () {
+				const queue = createPriorityQueue(byPriority);
+				for (let i = 0; i < n; i++) queue.push(tasks[i]);
+				let last;
+				while (queue.size > 0) last = queue.pop();
+				return last;
+			},
+			competitors: {
+				'p-queue PriorityQueue': function () {
+					const queue = new PriorityQueue();
+					for (let i = 0; i < n; i++) queue.enqueue(tasks[i], { priority: priorities[i] });
+					let last;
+					while (queue.size > 0) last = queue.dequeue();
+					return last;
+				},
+				'stable sort (array)': function () {
+					return tasks.slice().sort(byPriority);
+				}
+			}
+		};
+	})
 ];

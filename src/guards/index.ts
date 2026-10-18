@@ -1,5 +1,5 @@
-import { assertFunction, describe as typeName } from '../utils/assert.js';
-import type { AnyFunction, Primitive } from '../utils/index.js';
+import { assertFunction, assertNumber, describe as typeName } from '../utils/assert.js';
+import type { AnyFunction, Primitive, UnionToIntersection } from '../utils/index.js';
 
 /**
  * Returns the internal `[object Tag]` string of a value (as produced by `Object.prototype.toString`).
@@ -341,6 +341,69 @@ export function isDefined<T>(value: T): value is NonNullable<T> {
 }
 
 /**
+ * The values with a falsy static type. `NaN` is falsy too but has no literal type: see {@link FalsyPart}.
+ */
+export type Falsy = false | 0 | 0n | '' | null | undefined;
+
+/**
+ * The part of `T` that can be falsy, used by {@link isFalsy}: the {@link Falsy} members of `T`, plus `number` for a wide `number` (`0`,
+ * `-0` and `NaN` are all falsy, and only `0` has a literal type), `''` for a wide `string` and `0n` for a wide `bigint`.
+ * @template T - The type to narrow
+ */
+export type FalsyPart<T> =
+	NonNullable<unknown> extends T
+		? T & (Falsy | number)
+		: T extends Falsy
+			? T
+			: T extends number
+				? number extends T
+					? T
+					: never
+				: T extends string
+					? string extends T
+						? T & ''
+						: never
+					: T extends bigint
+						? bigint extends T
+							? T & 0n
+							: never
+						: never;
+
+/**
+ * Checks whether a value is truthy, narrowing it to `Exclude<T, Falsy>`: unlike `array.filter(Boolean)`, `array.filter(isTruthy)`
+ * narrows the element type. Falsy values are `false`, `0`, `-0`, `0n`, `''`, `null`, `undefined` and `NaN`.
+ *
+ * As with every type predicate, the `false` branch removes whole non-literal types: after `if (!isTruthy(count))` a `count: number`
+ * is narrowed to `never`, so test {@link isFalsy} for that branch instead.
+ * @template T - The type of the value
+ * @param {T} value - The value to check
+ * @returns {boolean} Whether the value is truthy
+ * @example
+ * [1, 0, 'a', '', null, undefined, NaN, 0n, false].filter(isTruthy); // => [1, 'a']
+ * const names: (string | undefined)[] = ['ada', undefined];
+ * names.filter(isTruthy); // => ['ada'] // typed string[]
+ */
+export function isTruthy<T>(value: T): value is Exclude<T, Falsy> {
+	return !!value;
+}
+
+/**
+ * Checks whether a value is falsy (`false`, `0`, `-0`, `0n`, `''`, `null`, `undefined` or `NaN`), narrowing it to
+ * {@link FalsyPart}: `string | undefined` becomes `'' | undefined`, and a wide `number` stays `number` (it may be `NaN`).
+ * @template T - The type of the value
+ * @param {T} value - The value to check
+ * @returns {boolean} Whether the value is falsy
+ * @example
+ * isFalsy(NaN); // => true
+ * isFalsy('0'); // => false
+ * isFalsy([]); // => false
+ * [0, 1, '', 'a', null].filter(isFalsy); // => [0, '', null]
+ */
+export function isFalsy<T>(value: T): value is FalsyPart<T> {
+	return !value;
+}
+
+/**
  * Checks whether a value is a plain object: an object whose prototype is exactly `Object.prototype` or `null`
  * (object literals, `Object.create(null)`, `JSON.parse` output). Arrays, class instances, dates, maps, etc. are not plain.
  * Plain objects coming from another realm have a different `Object.prototype` and are therefore NOT considered plain.
@@ -423,6 +486,78 @@ export function isFiniteNumber(value: unknown): value is number {
  */
 export function isInteger(value: unknown): value is number {
 	return Number.isInteger(value);
+}
+
+/**
+ * Checks whether a value is a finite number greater than zero. `NaN`, `±Infinity`, `0` and `-0` are rejected. Like every guard,
+ * it composes with {@link isShape}; wrap it in {@link withMessage} for a custom issue message.
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether the value is a positive finite number
+ * @example
+ * isPositiveNumber(0.5); // => true
+ * isPositiveNumber(0); // => false
+ * isPositiveNumber(-0); // => false
+ * isPositiveNumber(Infinity); // => false
+ */
+export function isPositiveNumber(value: unknown): value is number {
+	return Number.isFinite(value) && (value as number) > 0;
+}
+
+/**
+ * Checks whether a value is a finite number greater than or equal to zero. `-0` counts as zero (it compares equal to `0` and
+ * `JSON.stringify` writes it as `0`); `NaN` and `±Infinity` are rejected.
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether the value is a non-negative finite number
+ * @example
+ * isNonNegativeNumber(0); // => true
+ * isNonNegativeNumber(-0); // => true
+ * isNonNegativeNumber(-0.1); // => false
+ * isNonNegativeNumber(Infinity); // => false
+ */
+export function isNonNegativeNumber(value: unknown): value is number {
+	return Number.isFinite(value) && (value as number) >= 0;
+}
+
+/**
+ * Checks whether a value is an integer greater than zero (`1`, `2`, …; `1e21` too: use {@link isSafeInteger} to bound it).
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether the value is a positive integer
+ * @example
+ * isPositiveInteger(3); // => true
+ * isPositiveInteger(0); // => false
+ * isPositiveInteger(1.5); // => false
+ * isPositiveInteger(3n); // => false
+ */
+export function isPositiveInteger(value: unknown): value is number {
+	return Number.isInteger(value) && (value as number) > 0;
+}
+
+/**
+ * Checks whether a value is an integer greater than or equal to zero (an index or a count). `-0` counts as zero.
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether the value is a non-negative integer
+ * @example
+ * isNonNegativeInteger(0); // => true
+ * isNonNegativeInteger(-0); // => true
+ * isNonNegativeInteger(-1); // => false
+ * isNonNegativeInteger(0.5); // => false
+ */
+export function isNonNegativeInteger(value: unknown): value is number {
+	return Number.isInteger(value) && (value as number) >= 0;
+}
+
+/**
+ * Checks whether a value is a safe integer: an integer in `[-(2^53 - 1), 2^53 - 1]`, the range where every integer is exactly
+ * representable (so `n + 1 !== n`).
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether the value is a safe integer
+ * @example
+ * isSafeInteger(2 ** 53 - 1); // => true
+ * isSafeInteger(2 ** 53); // => false
+ * isSafeInteger(1.5); // => false
+ */
+export function isSafeInteger(value: unknown): value is number {
+	return Number.isSafeInteger(value);
 }
 
 /**
@@ -957,6 +1092,8 @@ function collect(guard: Guard<unknown>, value: unknown, path: PropertyKey[], iss
 	const explainer = explainers.get(guard);
 
 	if (explainer !== undefined) return explainer(value, path, issues);
+	// The JSON guards are plain function declarations (a top-level factory call would defeat tree-shaking), so they are not in the registry.
+	if (guard === isJsonValue || guard === isJsonObject || guard === isJsonArray) return explainJson(guard, value, path, issues);
 	if (guard(value)) return true;
 
 	issues.push({ message: `Invalid value (got ${typeName(value)})`, path: path.slice() });
@@ -1047,31 +1184,46 @@ export function isShape<S extends ShapeGuards>(shape: S, options?: IsShapeOption
 
 		return guard;
 	});
-	const exact = options?.exact === true;
-	const known = new Set<string>(keys);
 
+	return shapeGuard(keys, guards, undefined, options?.exact === true ? new Set<PropertyKey>(keys) : undefined) as (value: unknown) => value is ShapeType<S>;
+}
+
+/**
+ * Builds the guard behind {@link isShape} and the object patterns of {@link isMatching}.
+ * @param {ReadonlyArray<PropertyKey>} keys - The checked keys
+ * @param {ReadonlyArray<Guard<unknown>>} guards - The guard of each key
+ * @param {ReadonlyArray<boolean> | undefined} required - Per key, whether it must be an own property (otherwise a missing key is checked as `undefined`)
+ * @param {ReadonlySet<PropertyKey> | undefined} known - For exact shapes, the allowed own enumerable string keys
+ * @returns {Guard<unknown>} The guard
+ */
+function shapeGuard(
+	keys: ReadonlyArray<PropertyKey>,
+	guards: ReadonlyArray<Guard<unknown>>,
+	required: ReadonlyArray<boolean> | undefined,
+	known: ReadonlySet<PropertyKey> | undefined
+): Guard<unknown> {
 	/**
-	 * Whether `value` has a key the shape does not know.
-	 * @param {object} value - The object to inspect
-	 * @returns {boolean} `true` when an unknown own enumerable string key exists
+	 * Whether a missing key fails the check.
+	 * @param {number} index - The key's index
+	 * @returns {boolean} `true` when the key is required, or its guard rejects `undefined`
 	 */
-	function hasUnknownKey(value: object): boolean {
-		for (const key in value) if (hasOwn.call(value, key) && !known.has(key)) return true;
-
-		return false;
+	function missingFails(index: number): boolean {
+		return (required !== undefined && required[index]) || !guards[index](undefined);
 	}
 
 	return explainable(
-		function isShaped(value: unknown): value is ShapeType<S> {
+		function isShaped(value: unknown): value is object {
 			if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
 
 			for (let index = 0; index < keys.length; index++) {
 				const key = keys[index];
 
-				if (!guards[index](hasOwn.call(value, key) ? (value as Record<string, unknown>)[key] : undefined)) return false;
+				if (hasOwn.call(value, key) ? !guards[index]((value as Record<PropertyKey, unknown>)[key]) : missingFails(index)) return false;
 			}
 
-			return !exact || !hasUnknownKey(value);
+			if (known !== undefined) for (const key in value) if (hasOwn.call(value, key) && !known.has(key)) return false;
+
+			return true;
 		},
 		function explainShape(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
 			if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -1086,14 +1238,14 @@ export function isShape<S extends ShapeGuards>(shape: S, options?: IsShapeOption
 				const key = keys[index];
 
 				if (hasOwn.call(value, key)) {
-					passed = collectChild(guards[index], (value as Record<string, unknown>)[key], key, path, issues) && passed;
-				} else if (!guards[index](undefined)) {
+					passed = collectChild(guards[index], (value as Record<PropertyKey, unknown>)[key], key, path, issues) && passed;
+				} else if (missingFails(index)) {
 					issues.push({ message: 'Missing required property', path: [...path, key] });
 					passed = false;
 				}
 			}
 
-			if (exact) {
+			if (known !== undefined) {
 				for (const key in value) {
 					if (hasOwn.call(value, key) && !known.has(key)) {
 						issues.push({ message: 'Unknown property', path: [...path, key] });
@@ -1258,14 +1410,227 @@ export function withMessage<T>(guard: Guard<T>, message: string | ((value: unkno
 		throw new TypeError(`withMessage: \`message\` must be a string or a function, got ${typeName(message)}`);
 	}
 
-	return explainable(
+	return failing(
 		function isLabelled(value: unknown): value is T {
 			return guard(value);
 		},
-		function explainLabelled(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
-			if (guard(value)) return true;
+		function (value: unknown): string {
+			return typeof message === 'string' ? message : String(message(value));
+		}
+	);
+}
 
-			issues.push({ message: typeof message === 'string' ? message : String(message(value)), path: path.slice() });
+/**
+ * Registers an explainer that reports one issue, built by `message`, when `guard` fails.
+ * @template G - The guard type
+ * @param {G} guard - A guard created by the caller (it must not be shared, since a guard has one explainer)
+ * @param {(value: unknown) => string} message - Builds the message from the rejected value
+ * @returns {G} The guard itself
+ */
+function failing<G extends Guard<unknown>>(guard: G, message: (value: unknown) => string): G {
+	return explainable(guard, function explainFailure(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
+		if (guard(value)) return true;
+
+		issues.push({ message: message(value), path: path.slice() });
+
+		return false;
+	});
+}
+
+/**
+ * Registers an explainer reporting `Expected <expected> (got <value>)` when `guard` fails (numbers are shown, other values by type).
+ * @template G - The guard type
+ * @param {G} guard - A guard created by the caller
+ * @param {string} expected - What the guard accepts
+ * @returns {G} The guard itself
+ */
+function expecting<G extends Guard<unknown>>(guard: G, expected: string): G {
+	return failing(guard, function (value: unknown): string {
+		return `Expected ${expected} (got ${typeof value === 'number' ? value : typeName(value)})`;
+	});
+}
+
+/**
+ * SameValueZero equality (`Array#includes` semantics): `NaN` equals `NaN` and `0` equals `-0`.
+ * @param {unknown} a - A value
+ * @param {unknown} b - Another value
+ * @returns {boolean} Whether they are equal
+ */
+function sameValueZero(a: unknown, b: unknown): boolean {
+	return a === b || (a !== a && b !== b);
+}
+
+/**
+ * Builds a guard accepting exactly `expected` (SameValueZero).
+ * @template T - The literal type
+ * @param {T} expected - The accepted value
+ * @returns {Guard<T>} The guard
+ */
+function literal<T>(expected: T): Guard<T> {
+	return expecting(function isLiteralValue(value: unknown): value is T {
+		return sameValueZero(value, expected);
+	}, describe(expected));
+}
+
+/**
+ * Creates a guard accepting exactly one primitive value (`z.literal()`), compared with SameValueZero: `isLiteral(NaN)` accepts `NaN`
+ * and `isLiteral(0)` accepts `-0`. {@link explain} reports `Expected <value>`. For a set of values use {@link isOneOf}; for objects,
+ * {@link isMatching}.
+ * @template T - The literal type
+ * @param {T} value - The accepted primitive
+ * @returns {(value: unknown) => boolean} A guard narrowing to `T`
+ * @throws {TypeError} when `value` is an object or a function
+ * @example
+ * const isAdmin = isLiteral('admin');
+ * isAdmin('admin'); // => true
+ * isAdmin('Admin'); // => false
+ * explain(isShape({ role: isAdmin }), { role: 'user' }); // => [{ message: 'Expected "admin" (got string)', path: ['role'] }]
+ */
+export function isLiteral<const T extends Primitive>(value: T): (value: unknown) => value is T {
+	if (!isPrimitive(value)) throw new TypeError(`isLiteral: \`value\` must be a primitive, got ${typeName(value)}`);
+
+	return literal(value);
+}
+
+/**
+ * Creates a guard accepting finite numbers between `min` and `max`, both inclusive. `NaN` and `±Infinity` are always rejected, even
+ * with infinite bounds (`isNumberInRange(0, Infinity)` is "finite and non-negative"). {@link explain} reports the range.
+ * @param {number} min - The smallest accepted number
+ * @param {number} max - The largest accepted number
+ * @returns {(value: unknown) => boolean} A guard narrowing to `number`
+ * @throws {TypeError} when `min` or `max` is not a number
+ * @throws {RangeError} when `min` is `NaN`, or `max` is `NaN` or smaller than `min`
+ * @example
+ * const isPercent = isNumberInRange(0, 100);
+ * isPercent(42.5); // => true
+ * isPercent(101); // => false
+ * explain(isPercent, -1); // => [{ message: 'Expected a number between 0 and 100 (got -1)', path: [] }]
+ * isNumberInRange(10, 0); // throws RangeError
+ */
+export function isNumberInRange(min: number, max: number): (value: unknown) => value is number {
+	assertNumber('isNumberInRange', 'min', min, min === min, 'a number');
+	assertNumber('isNumberInRange', 'max', max, max >= min, `a number >= min (${min})`);
+
+	return expecting(function isInRange(value: unknown): value is number {
+		return Number.isFinite(value) && (value as number) >= min && (value as number) <= max;
+	}, `a number between ${min} and ${max}`);
+}
+
+/**
+ * Creates a guard that passes when EVERY one of `guards` passes, narrowing to the intersection of their types (`z.intersection()`).
+ * The guards run in order and stop at the first failure; {@link explain} reports the issues of every failing member (duplicates
+ * removed). Shapes built with `{ exact: true }` reject each other's keys, so intersect non-exact shapes.
+ * @template G - The member guards
+ * @param {...G} guards - The member guards (at least one)
+ * @returns {(value: unknown) => boolean} A guard narrowing to the intersection of the members' types
+ * @throws {TypeError} when a member is not a function
+ * @throws {RangeError} when no guard is given
+ * @example
+ * const isNamed = isShape({ name: isString });
+ * const isAged = isShape({ age: isInteger });
+ * const isPerson = isIntersection(isNamed, isAged); // { name: string } & { age: number }
+ * isPerson({ name: 'Ada', age: 36 }); // => true
+ * isPerson({ name: 'Ada' }); // => false
+ * explain(isPerson, 1); // => [{ message: 'Expected an object (got number)', path: [] }]
+ */
+export function isIntersection<const G extends ReadonlyArray<Guard<unknown>>>(...guards: G): (value: unknown) => value is UnionToIntersection<Infer<G[number]>> {
+	if (guards.length === 0) throw new RangeError('isIntersection: expected at least one guard, got 0');
+	assertGuards('isIntersection', guards);
+
+	const members = guards.slice();
+
+	return explainable(
+		function isIntersectionMember(value: unknown): value is UnionToIntersection<Infer<G[number]>> {
+			for (let index = 0; index < members.length; index++) if (!members[index](value)) return false;
+
+			return true;
+		},
+		function explainIntersection(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
+			const seen = new Set<string>();
+			let passed = true;
+
+			for (let index = 0; index < members.length; index++) {
+				const found: SchemaIssue[] = [];
+
+				if (collect(members[index], value, path, found)) continue;
+				passed = false;
+				for (const issue of found) {
+					const id = `${issue.path.map(String).join('\0')}\u0001${issue.message}`;
+
+					if (!seen.has(id)) {
+						seen.add(id);
+						issues.push(issue);
+					}
+				}
+			}
+
+			return passed;
+		}
+	);
+}
+
+/**
+ * Creates a guard that passes when `guard` passes AND `predicate` accepts the (narrowed) value (`.refine()` in zod). A type-guard
+ * predicate narrows further. {@link explain} reports the issues of `guard` when it fails, else one issue with `message`: this is how
+ * `isEmail`, `isUuid` and other validators get custom messages and paths.
+ * @template T - The type checked by `guard`
+ * @template U - The type narrowed by `predicate`
+ * @param {Guard<T>} guard - The base guard
+ * @param {(value: T) => value is U} predicate - The extra check, only called with values that passed `guard`
+ * @param {string | ((value: T) => string)} [message='Invalid value (got <type>)'] - The issue message, or a function building it
+ * @returns {(value: unknown) => boolean} A guard narrowing to `U`
+ * @throws {TypeError} when `guard` or `predicate` is not a function, or `message` is neither a string, a function nor `undefined`
+ * @example
+ * const isEven = refine(isInteger, function (n) { return n % 2 === 0; }, 'Expected an even number');
+ * isEven(4); // => true
+ * isEven(3); // => false
+ * explain(isShape({ n: isEven }), { n: 3 }); // => [{ message: 'Expected an even number', path: ['n'] }]
+ * explain(isShape({ n: isEven }), { n: 'x' }); // => [{ message: 'Invalid value (got string)', path: ['n'] }]
+ */
+export function refine<T, U extends T>(guard: Guard<T>, predicate: (value: T) => value is U, message?: string | ((value: T) => string)): (value: unknown) => value is U;
+/**
+ * Creates a guard that passes when `guard` passes AND `predicate` returns `true` for the (narrowed) value.
+ * @template T - The type checked by `guard`
+ * @param {Guard<T>} guard - The base guard
+ * @param {(value: T) => boolean} predicate - The extra check, only called with values that passed `guard`
+ * @param {string | ((value: T) => string)} [message='Invalid value (got <type>)'] - The issue message, or a function building it
+ * @returns {(value: unknown) => boolean} A guard narrowing to `T`
+ * @throws {TypeError} when `guard` or `predicate` is not a function, or `message` is neither a string, a function nor `undefined`
+ * @example
+ * const isShortString = refine(isString, function (s) { return s.length <= 3; });
+ * isShortString('abc'); // => true
+ * isShortString('abcd'); // => false
+ */
+export function refine<T>(guard: Guard<T>, predicate: (value: T) => boolean, message?: string | ((value: T) => string)): (value: unknown) => value is T;
+/**
+ * Implementation of the overloads above.
+ * @template T - The type checked by `guard`
+ * @param {Guard<T>} guard - The base guard
+ * @param {(value: T) => boolean} predicate - The extra check
+ * @param {string | ((value: T) => string)} [message] - The issue message
+ * @returns {(value: unknown) => boolean} The refined guard
+ * @example
+ * refine(isFiniteNumber, function (n) { return n > 0; })(1); // => true
+ */
+export function refine<T>(guard: Guard<T>, predicate: (value: T) => boolean, message?: string | ((value: T) => string)): (value: unknown) => value is T {
+	assertFunction('refine', 'guard', guard);
+	assertFunction('refine', 'predicate', predicate);
+	if (message !== undefined && typeof message !== 'string' && typeof message !== 'function') {
+		throw new TypeError(`refine: \`message\` must be a string or a function, got ${typeName(message)}`);
+	}
+
+	return explainable(
+		function isRefined(value: unknown): value is T {
+			return guard(value) && predicate(value);
+		},
+		function explainRefined(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
+			if (!collect(guard, value, path, issues)) return false;
+			if (predicate(value as T)) return true;
+
+			issues.push({
+				message: message === undefined ? `Invalid value (got ${typeName(value)})` : typeof message === 'string' ? message : String(message(value as T)),
+				path: path.slice()
+			});
 
 			return false;
 		}
@@ -1273,9 +1638,174 @@ export function withMessage<T>(guard: Guard<T>, message: string | ((value: unkno
 }
 
 /**
+ * Creates a guard that defers to the guard returned by `getter`, called once on first use: the way to write recursive schemas
+ * (`z.lazy()`), whose guard must refer to itself before it exists. Annotate the result (`const isTree: Guard<Tree> = ...`), since
+ * TypeScript cannot infer a recursive type.
+ *
+ * Cycle-safe: a value that reaches itself through the same lazy guard (`node.children = [node]`) is rejected, and {@link explain}
+ * reports `Circular reference` where the lazy guard meets the value again, instead of overflowing the stack. Shared (non-circular) sub-values are fine.
+ * Rejecting cycles also guarantees that recursive code consuming the narrowed value terminates.
+ * @template T - The guarded type
+ * @param {() => Guard<T>} getter - Returns the guard (called once, on the first check)
+ * @returns {(value: unknown) => boolean} A guard narrowing to `T`
+ * @throws {TypeError} when `getter` is not a function, and on first use when it does not return a function
+ * @example
+ * type Tree = { value: number; children: Tree[] };
+ * const isTree: Guard<Tree> = isShape({ value: isFiniteNumber, children: isArrayOf(isLazy(function () { return isTree; })) });
+ * isTree({ value: 1, children: [{ value: 2, children: [] }] }); // => true
+ * explain(isTree, { value: 1, children: [{ value: '2', children: [] }] }); // => [{ message: 'Invalid value (got string)', path: ['children', 0, 'value'] }]
+ * const loop: Tree = { value: 1, children: [] };
+ * loop.children.push(loop);
+ * isTree(loop); // => false
+ * explain(isTree, loop); // => [{ message: 'Circular reference', path: ['children', 0, 'children', 0] }]
+ */
+export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is T {
+	assertFunction('isLazy', 'getter', getter);
+
+	let resolved: Guard<T> | undefined;
+	// The objects being checked (or explained) by this guard right now: meeting one again means a cycle.
+	const checking = new Set<object>();
+	const explaining = new Set<object>();
+
+	/**
+	 * Returns the guard, calling `getter` on first use.
+	 * @returns {Guard<T>} The guard
+	 */
+	function resolve(): Guard<T> {
+		if (resolved === undefined) {
+			const guard = getter();
+
+			if (typeof guard !== 'function') throw new TypeError(`isLazy: \`getter\` must return a function, got ${typeName(guard)}`);
+			resolved = guard;
+		}
+
+		return resolved;
+	}
+
+	return explainable(
+		function isLazyValue(value: unknown): value is T {
+			const guard = resolve();
+
+			if (typeof value !== 'object' || value === null) return guard(value);
+			if (checking.has(value)) return false;
+			checking.add(value);
+			try {
+				return guard(value);
+			} finally {
+				checking.delete(value);
+			}
+		},
+		function explainLazy(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
+			const guard = resolve();
+
+			if (typeof value !== 'object' || value === null) return collect(guard, value, path, issues);
+			if (explaining.has(value)) {
+				issues.push({ message: 'Circular reference', path: path.slice() });
+
+				return false;
+			}
+			explaining.add(value);
+			try {
+				return collect(guard, value, path, issues);
+			} finally {
+				explaining.delete(value);
+			}
+		}
+	);
+}
+
+/**
+ * The type a pattern of {@link isMatching} narrows to: guards give their type, plain objects and arrays are mapped recursively,
+ * dates give `Date`, other functions `unknown`, and any other value its own (literal) type.
+ * @template P - The pattern
+ */
+export type PatternType<P> = P extends (value: unknown) => value is infer T
+	? T
+	: P extends AnyFunction
+		? unknown
+		: P extends Date
+			? Date
+			: P extends object
+				? { -readonly [K in keyof P]: PatternType<P[K]> }
+				: P;
+
+/**
+ * Creates a guard checking that a value deeply matches a partial structural pattern, like ts-pattern's `isMatching`:
+ * - a plain-object pattern matches any non-array object having, as OWN properties (inherited ones never count), every own enumerable
+ *   key of the pattern (strings and symbols) with a matching value; other keys are ignored. Nested patterns are matched recursively.
+ * - an array pattern matches arrays of exactly the same length, element by element (a tuple, not lodash's unordered subset).
+ * - a function in the pattern is called as a guard with the property value (`undefined` when the property is missing, so
+ *   {@link isOptional} makes a key optional), which mixes literals with any guard of this module.
+ * - a `Date` matches dates with the same time; any other value (primitives, maps, class instances…) is compared with SameValueZero
+ *   (`NaN` matches `NaN`, `0` matches `-0`, objects by identity).
+ *
+ * The pattern is compiled once (later mutations do not affect the guard). {@link explain} reports `Missing required property`,
+ * `Expected <literal>` and the issues of nested guards with their paths.
+ * @template P - The pattern
+ * @param {P} pattern - The pattern (a value, a guard, or plain objects and arrays of those)
+ * @returns {(value: unknown) => boolean} A guard narrowing to {@link PatternType}
+ * @throws {TypeError} when the pattern contains itself (a circular reference)
+ * @example
+ * const isAdminEvent = isMatching({ type: 'login', user: { role: 'admin', id: isInteger } });
+ * isAdminEvent({ type: 'login', at: 1, user: { role: 'admin', id: 7, name: 'Ada' } }); // => true
+ * isAdminEvent({ type: 'login', user: { role: 'guest', id: 7 } }); // => false
+ * isMatching({ point: [0, isFiniteNumber] })({ point: [-0, 2] }); // => true
+ * explain(isAdminEvent, { type: 'login', user: { id: 'x' } }); // => [{ message: 'Missing required property', path: ['user', 'role'] }, { message: 'Invalid value (got string)', path: ['user', 'id'] }]
+ */
+export function isMatching<const P>(pattern: P): (value: unknown) => value is PatternType<P> {
+	return compilePattern(pattern, []) as (value: unknown) => value is PatternType<P>;
+}
+
+/**
+ * Compiles a pattern of {@link isMatching} into a guard.
+ * @param {unknown} pattern - The pattern
+ * @param {unknown[]} ancestors - The patterns being compiled around this one (to detect cycles)
+ * @returns {Guard<unknown>} The guard
+ */
+function compilePattern(pattern: unknown, ancestors: unknown[]): Guard<unknown> {
+	if (typeof pattern === 'function') return pattern as Guard<unknown>;
+	if (isDate(pattern)) {
+		const time = dateGetTime.call(pattern);
+
+		return expecting(function isSameDate(value: unknown): value is Date {
+			return isDate(value) && sameValueZero(dateGetTime.call(value), time);
+		}, `a date with time ${time}`);
+	}
+
+	const array = Array.isArray(pattern);
+
+	if (!array && !isPlainObject(pattern)) return literal(pattern);
+	if (ancestors.includes(pattern)) throw new TypeError('isMatching: `pattern` must be acyclic, got a circular reference');
+	ancestors.push(pattern);
+
+	const source = pattern as Record<PropertyKey, unknown>;
+	const keys: PropertyKey[] = array
+		? []
+		: [
+				...Object.keys(source),
+				...Object.getOwnPropertySymbols(source).filter(function (key: symbol): boolean {
+					return Object.prototype.propertyIsEnumerable.call(source, key);
+				})
+			];
+	const guards: Guard<unknown>[] = [];
+	const required: boolean[] = [];
+
+	if (array) for (let index = 0; index < (pattern as unknown[]).length; index++) guards.push(compilePattern(source[index], ancestors));
+	for (const key of keys) {
+		guards.push(compilePattern(source[key], ancestors));
+		required.push(typeof source[key] !== 'function');
+	}
+	ancestors.pop();
+
+	return array ? isTuple(...guards) : shapeGuard(keys, guards, required, undefined);
+}
+
+/**
  * Lists why `value` fails `guard`, with the path of every offending value; an empty array means it passes. Guards built with
- * {@link isShape}, {@link isArrayOf}, {@link isRecordOf}, {@link isTuple}, {@link isUnion}, {@link isOptional}, {@link isNullable},
- * {@link isOneOf} and {@link withMessage} report precise nested issues; any other guard is reported as one issue at its path.
+ * {@link isShape}, {@link isMatching}, {@link isArrayOf}, {@link isRecordOf}, {@link isTuple}, {@link isUnion}, {@link isIntersection},
+ * {@link isOptional}, {@link isNullable}, {@link isLazy}, {@link refine}, {@link isOneOf}, {@link isLiteral}, {@link isNumberInRange} and
+ * {@link withMessage}, and the JSON guards ({@link isJsonValue}…), report precise nested issues; any other guard is reported as one
+ * issue at its path.
  * @param {Guard<unknown>} guard - The guard to check against
  * @param {unknown} value - The value to check
  * @returns {SchemaIssue[]} The issues, in traversal order (empty when `value` passes)
@@ -1345,4 +1875,145 @@ export function toStandardSchema<T>(guard: Guard<T>): StandardSchemaV1<unknown, 
 			}
 		}
 	};
+}
+
+/**
+ * A JSON array: what `JSON.parse` returns for `[...]` text.
+ */
+export type JsonArray = JsonValue[];
+
+/**
+ * A JSON object: what `JSON.parse` returns for `{...}` text.
+ */
+export type JsonObject = { [key: string]: JsonValue };
+
+/**
+ * Any value that `JSON.stringify` writes and `JSON.parse` reads back unchanged: `null`, booleans, finite numbers, strings, and plain
+ * objects and arrays of those.
+ */
+export type JsonValue = string | number | boolean | null | JsonArray | JsonObject;
+
+/** Marks, on the stack of {@link walkJson}, the end of a container's children. */
+const EXIT = {};
+
+/**
+ * Checks that `root` is a JSON value without recursion (so arbitrarily deep values cannot overflow the stack), rejecting cycles.
+ * In reporting mode (`issues` given) every problem is recorded with its path; otherwise the walk stops at the first one.
+ * @param {unknown} root - The value to check
+ * @param {PropertyKey[] | undefined} path - The path of `root` (reporting mode; restored before returning)
+ * @param {SchemaIssue[] | undefined} issues - Where issues are pushed (reporting mode)
+ * @returns {boolean} Whether `root` is a JSON value
+ */
+function walkJson(root: unknown, path: PropertyKey[] | undefined, issues: SchemaIssue[] | undefined): boolean {
+	// Pairs of (key, value), and (container, EXIT) once a container's children are pushed. The root pair is the only one popped from
+	// an otherwise empty stack, and the root's EXIT pair is popped last.
+	const stack: unknown[] = [undefined, root];
+	const ancestors = new Set<unknown>();
+	let passed = true;
+
+	while (stack.length > 0) {
+		const value = stack.pop();
+		const key = stack.pop() as PropertyKey;
+		const isRoot = stack.length === 0;
+		let message: string;
+
+		if (value === EXIT) {
+			ancestors.delete(key);
+			if (path !== undefined && !isRoot) path.pop();
+			continue;
+		}
+		if (typeof value === 'object' && value !== null) {
+			if (ancestors.has(value)) {
+				message = 'Circular reference';
+			} else if (Array.isArray(value) || isPlainObject(value)) {
+				ancestors.add(value);
+				if (path !== undefined && !isRoot) path.push(key);
+				stack.push(value, EXIT);
+				if (Array.isArray(value)) {
+					// Holes read as `undefined`, which is rejected: `JSON.stringify` would write them as `null`.
+					for (let index = value.length - 1; index >= 0; index--) stack.push(index, value[index]);
+				} else {
+					const keys = Object.keys(value);
+
+					for (let index = keys.length - 1; index >= 0; index--) stack.push(keys[index], value[keys[index]]);
+				}
+				continue;
+			} else {
+				message = `Expected a JSON value (got ${describe(value)})`;
+			}
+		} else if (typeof value === 'number') {
+			if (Number.isFinite(value)) continue;
+			message = `Expected a finite number (got ${value})`;
+		} else if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+			continue;
+		} else {
+			message = `Expected a JSON value (got ${typeName(value)})`;
+		}
+		if (issues === undefined) return false;
+		issues.push({ message, path: isRoot ? (path as PropertyKey[]).slice() : [...(path as PropertyKey[]), key] });
+		passed = false;
+	}
+
+	return passed;
+}
+
+/**
+ * Reports the issues of a value checked by one of the JSON guards.
+ * @param {Guard<unknown>} guard - {@link isJsonValue}, {@link isJsonObject} or {@link isJsonArray}
+ * @param {unknown} value - The value to check
+ * @param {PropertyKey[]} path - The path of `value`
+ * @param {SchemaIssue[]} issues - Where issues are pushed
+ * @returns {boolean} Whether `value` passed
+ */
+function explainJson(guard: Guard<unknown>, value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
+	if (guard === isJsonObject ? isPlainObject(value) : guard === isJsonArray ? Array.isArray(value) : true) return walkJson(value, path, issues);
+	issues.push({ message: `Expected ${guard === isJsonObject ? 'a plain object' : 'an array'} (got ${typeName(value)})`, path: path.slice() });
+
+	return false;
+}
+
+/**
+ * Checks that a value survives a JSON round trip unchanged: `null`, booleans, strings, finite numbers (`-0` is accepted, although
+ * JSON writes it as `0`), and plain objects and arrays of those, at any depth. Rejected: `NaN` and `±Infinity` (written as `null`),
+ * `undefined`, functions, symbols and bigints (dropped, or throwing), sparse arrays (holes become `null`), dates, maps, class instances
+ * and other non-plain objects (including those with a `toJSON` method), and circular references (which make `JSON.stringify` throw).
+ * Symbol keys are ignored, as `JSON.stringify` does. The walk is iterative, so arbitrarily deep values cannot overflow the stack, and
+ * {@link explain} reports the path of every offending value.
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether the value is a JsonValue
+ * @example
+ * isJsonValue({ a: [1, 'x', null, { b: true }] }); // => true
+ * isJsonValue({ a: undefined }); // => false
+ * isJsonValue([1, NaN]); // => false
+ * isJsonValue({ at: new Date(0) }); // => false
+ * explain(isJsonValue, { a: [1, Infinity] }); // => [{ message: 'Expected a finite number (got Infinity)', path: ['a', 1] }]
+ */
+export function isJsonValue(value: unknown): value is JsonValue {
+	return walkJson(value, undefined, undefined);
+}
+
+/**
+ * Checks that a value is a plain object that survives a JSON round trip (see {@link isJsonValue}).
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether the value is a JsonObject
+ * @example
+ * isJsonObject({ a: 1 }); // => true
+ * isJsonObject([1]); // => false
+ * isJsonObject({ a: 1n }); // => false
+ */
+export function isJsonObject(value: unknown): value is JsonObject {
+	return isPlainObject(value) && walkJson(value, undefined, undefined);
+}
+
+/**
+ * Checks that a value is an array that survives a JSON round trip (see {@link isJsonValue}).
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether the value is a JsonArray
+ * @example
+ * isJsonArray([1, 'a', { b: null }]); // => true
+ * isJsonArray([1, , 3]); // => false
+ * isJsonArray({ 0: 1 }); // => false
+ */
+export function isJsonArray(value: unknown): value is JsonArray {
+	return Array.isArray(value) && walkJson(value, undefined, undefined);
 }

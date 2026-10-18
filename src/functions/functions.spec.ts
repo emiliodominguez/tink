@@ -1,3 +1,5 @@
+import { AssertionError } from '../guards/index.js';
+import { allPass, anyPass, match, partialRight } from '.';
 import * as helpers from '.';
 
 describe('Functions helpers', function () {
@@ -1720,6 +1722,359 @@ describe('Functions helpers (security)', function () {
 				self: Node = this;
 			}
 			expect(helpers.defaultMemoizeKey({ node: new Node() })).toMatch(/^\[\{"node":"#\d+"\}\]$/);
+		});
+	});
+});
+
+/** Compile-time assertion that `T` is exactly `U`. */
+type Equals<T, U> = (<G>() => G extends T ? 1 : 2) extends <G>() => G extends U ? 1 : 2 ? true : false;
+function assertType<T extends true>(): T | undefined {
+	return undefined;
+}
+
+function isString(value: unknown): value is string {
+	return typeof value === 'string';
+}
+
+function isNumber(value: unknown): value is number {
+	return typeof value === 'number';
+}
+
+function hasLength(value: unknown): value is { length: number } {
+	return (typeof value === 'object' && value !== null && 'length' in value) || typeof value === 'string';
+}
+
+describe('Functions helpers (round 11)', function () {
+	describe('partialRight', function () {
+		function join3(a: string, b: string, c: string): string {
+			return `${a}-${b}-${c}`;
+		}
+
+		it('appends the bound arguments after the call arguments', function () {
+			const withTail = partialRight(join3, 'b', 'c');
+			expect(withTail('a')).toBe('a-b-c');
+			const withLast = partialRight(join3, 'c');
+			expect(withLast('a', 'b')).toBe('a-b-c');
+			expect(partialRight(join3)('a', 'b', 'c')).toBe('a-b-c');
+			expect(partialRight(join3, 'a', 'b', 'c')()).toBe('a-b-c');
+		});
+
+		it('types the returned function with the leading parameters', function () {
+			const withLast = partialRight(join3, 'c');
+			assertType<Equals<Parameters<typeof withLast>, [a: string, b: string]>>();
+			assertType<Equals<ReturnType<typeof withLast>, string>>();
+			const toHex = partialRight(Number.parseInt, 16);
+			assertType<Equals<Parameters<typeof toHex>, [string: string]>>();
+			expect(toHex('ff')).toBe(255);
+			// @ts-expect-error the bound arguments must be a suffix of the parameters
+			partialRight(join3, 1);
+			function rest(first: number, ...others: string[]): string {
+				return `${first}:${others.join(',')}`;
+			}
+			const restBound = partialRight(rest, 'z');
+			assertType<Equals<Parameters<typeof restBound>, [first: number, ...others: string[]]>>();
+			expect(restBound(1, 'y')).toBe('1:y,z');
+		});
+
+		it('shifts the bound arguments left when fewer call arguments are given (like lodash)', function () {
+			const fn = jest.fn(function (...args: unknown[]) {
+				return args;
+			});
+			const bound = partialRight(fn as (a?: unknown, b?: unknown, c?: unknown) => unknown[], 'c');
+			expect((bound as (...args: unknown[]) => unknown[])()).toEqual(['c']);
+			expect((bound as (...args: unknown[]) => unknown[])('a', 'b', 'x')).toEqual(['a', 'b', 'x', 'c']);
+		});
+
+		it('forwards this', function () {
+			const target = {
+				prefix: '>',
+				show: partialRight(function (this: { prefix: string }, value: string, suffix: string): string {
+					return `${this.prefix}${value}${suffix}`;
+				}, '!')
+			};
+			expect(target.show('hi')).toBe('>hi!');
+		});
+
+		it('throws a TypeError when fn is not a function', function () {
+			expect(function () {
+				partialRight(null as any, 1);
+			}).toThrow(new TypeError('partialRight: `fn` must be a function, got null'));
+		});
+	});
+
+	describe('allPass / anyPass', function () {
+		it('allPass is true only when every predicate passes, and stops at the first failure', function () {
+			const calls: string[] = [];
+			const positive = jest.fn(function (n: number) {
+				calls.push('positive');
+				return n > 0;
+			});
+			const even = jest.fn(function (n: number) {
+				calls.push('even');
+				return n % 2 === 0;
+			});
+			const both = allPass(positive, even);
+			expect(both(4)).toBe(true);
+			expect(both(3)).toBe(false);
+			calls.length = 0;
+			expect(both(-2)).toBe(false);
+			expect(calls).toEqual(['positive']);
+		});
+
+		it('anyPass is true as soon as one predicate passes, and stops there', function () {
+			const calls: string[] = [];
+			function small(n: number): boolean {
+				calls.push('small');
+				return n < 10;
+			}
+			function big(n: number): boolean {
+				calls.push('big');
+				return n > 100;
+			}
+			const either = anyPass(small, big);
+			expect(either(5)).toBe(true);
+			expect(calls).toEqual(['small']);
+			expect(either(500)).toBe(true);
+			expect(either(50)).toBe(false);
+		});
+
+		it('returns booleans for truthy/falsy predicate results', function () {
+			expect(
+				allPass(function () {
+					return 'yes';
+				})(1)
+			).toBe(true);
+			expect(
+				anyPass(function () {
+					return 0;
+				})(1)
+			).toBe(false);
+			expect(
+				anyPass(function () {
+					return {};
+				})(1)
+			).toBe(true);
+		});
+
+		it('handles no predicates (allPass: true, anyPass: false)', function () {
+			expect(allPass()(1)).toBe(true);
+			expect(anyPass()(1)).toBe(false);
+		});
+
+		it('forwards this and every argument (filter callbacks receive the index)', function () {
+			const odd = allPass(function (_value: string, index: number) {
+				return index % 2 === 1;
+			} as (value: string, ...rest: never[]) => boolean);
+			expect(['a', 'b', 'c', 'd'].filter(odd)).toEqual(['b', 'd']);
+			const holder = {
+				min: 3,
+				check: anyPass(function (this: { min: number }, n: number) {
+					return n >= this.min;
+				})
+			};
+			expect(holder.check(4)).toBe(true);
+			expect(holder.check(2)).toBe(false);
+		});
+
+		it('forwards exactly the arguments it receives, whatever their number', function () {
+			const seen: unknown[][] = [];
+			function record(...args: unknown[]): boolean {
+				seen.push(args);
+				return true;
+			}
+			const check = allPass(record as (value: unknown, ...rest: never[]) => boolean) as (...args: unknown[]) => boolean;
+			check();
+			check(1);
+			check(1, 2);
+			check(1, 2, 3);
+			check(1, 2, 3, 4);
+			expect(seen).toEqual([[], [1], [1, 2], [1, 2, 3], [1, 2, 3, 4]]);
+		});
+
+		it('copies the predicate list (later changes to the arguments array do not leak in)', function () {
+			const predicates = [isString];
+			const check = anyPass(...predicates);
+			predicates.push(isNumber as any);
+			expect(check(1)).toBe(false);
+		});
+
+		it('keeps type-guard narrowing', function () {
+			const mixed: unknown[] = ['ab', 1, [1, 2], null];
+			const strings = mixed.filter(allPass(isString, hasLength));
+			assertType<Equals<typeof strings, Array<string & { length: number }>>>();
+			expect(strings).toEqual(['ab']);
+			const scalars = mixed.filter(anyPass(isString, isNumber));
+			assertType<Equals<typeof scalars, Array<string | number>>>();
+			expect(scalars).toEqual(['ab', 1]);
+			// A plain predicate in anyPass removes the narrowing.
+			const loose = mixed.filter(
+				anyPass(isString, function (value: unknown): boolean {
+					return value === null;
+				})
+			);
+			assertType<Equals<typeof loose, unknown[]>>();
+			expect(loose).toEqual(['ab', null]);
+			// A plain predicate in allPass adds nothing, and the input type is what every predicate accepts.
+			const shortString = allPass(isString, function (value: string) {
+				return value.length < 2;
+			});
+			assertType<Equals<Parameters<typeof shortString>[0], string>>();
+			const words: string[] = ['a', 'bc'];
+			expect(words.filter(shortString)).toEqual(['a']);
+		});
+
+		it('throws a TypeError naming the first non-function predicate', function () {
+			expect(function () {
+				allPass(isString, 1 as any);
+			}).toThrow(new TypeError('allPass: `predicates[1]` must be a function, got number'));
+			expect(function () {
+				anyPass(null as any);
+			}).toThrow(new TypeError('anyPass: `predicates[0]` must be a function, got null'));
+		});
+	});
+
+	describe('match', function () {
+		type Shape = { kind: 'circle'; radius: number } | { kind: 'square'; size: number } | { kind: 'rect'; width: number; height: number };
+
+		function area(shape: Shape): number {
+			return match(shape, 'kind', {
+				circle: function (circle) {
+					return 3 * circle.radius ** 2;
+				},
+				square: function (square) {
+					return square.size ** 2;
+				},
+				rect: function (rect) {
+					return rect.width * rect.height;
+				}
+			});
+		}
+
+		it('calls the handler of the tag with the value', function () {
+			expect(area({ kind: 'circle', radius: 2 })).toBe(12);
+			expect(area({ kind: 'square', size: 3 })).toBe(9);
+			expect(area({ kind: 'rect', width: 2, height: 5 })).toBe(10);
+		});
+
+		it('narrows handler arguments and unions the results', function () {
+			const shape = { kind: 'circle', radius: 1 } as Shape;
+			const result = match(shape, 'kind', {
+				circle: function (circle) {
+					assertType<Equals<typeof circle, { kind: 'circle'; radius: number }>>();
+					return circle.radius;
+				},
+				square: function (square) {
+					return `${square.size}`;
+				},
+				rect: function () {
+					return null;
+				}
+			});
+			assertType<Equals<typeof result, number | string | null>>();
+			expect(result).toBe(1);
+		});
+
+		it('rejects a missing case at compile time, unless `_` handles the rest', function () {
+			const shape = { kind: 'square', size: 2 } as Shape;
+			expect(function () {
+				match(
+					shape,
+					'kind',
+					// @ts-expect-error the 'rect' and 'square' cases are missing
+					{
+						circle: function () {
+							return 1;
+						}
+					}
+				);
+			}).toThrow(AssertionError);
+			const fallback = match(shape, 'kind', {
+				circle: function () {
+					return 'round';
+				},
+				_: function (other) {
+					assertType<Equals<typeof other, Shape>>();
+					return other.kind;
+				}
+			});
+			assertType<Equals<typeof fallback, string>>();
+			expect(fallback).toBe('square');
+		});
+
+		it('prefers the exact handler over `_`', function () {
+			expect(
+				match({ kind: 'circle', radius: 1 } as Shape, 'kind', {
+					circle: function () {
+						return 'exact';
+					},
+					_: function () {
+						return 'fallback';
+					}
+				})
+			).toBe('exact');
+		});
+
+		it('matches boolean, number and null tags by their string form', function () {
+			type Result = { ok: true; value: number } | { ok: false; error: string };
+			const failure = { ok: false, error: 'offline' } as Result;
+			expect(
+				match(failure, 'ok', {
+					true: function (success) {
+						return success.value;
+					},
+					false: function (error) {
+						return error.error;
+					}
+				})
+			).toBe('offline');
+			type Response = { status: 200; body: string } | { status: 404 } | { status: null };
+			const notFound = { status: 404 } as Response;
+			expect(
+				match(notFound, 'status', {
+					200: function (ok) {
+						return ok.body;
+					},
+					404: function () {
+						return 'missing';
+					},
+					null: function () {
+						return 'none';
+					}
+				})
+			).toBe('missing');
+			expect(match({ status: null } as Response, 'status', { _: String })).toBe('[object Object]');
+		});
+
+		it('throws an AssertionError naming the key and tag of unexpected data', function () {
+			const bad = { kind: 'hexagon' } as unknown as Shape;
+			expect(function () {
+				area(bad);
+			}).toThrow(new AssertionError('match: no handler for `kind` "hexagon"'));
+			const long = { kind: 'x'.repeat(500) } as unknown as Shape;
+			expect(function () {
+				area(long);
+			}).toThrow(new AssertionError(`match: no handler for \`kind\` "${'x'.repeat(100)}"`));
+		});
+
+		it('ignores inherited properties of handlers (hostile tags)', function () {
+			for (const tag of ['toString', '__proto__', 'constructor', 'hasOwnProperty']) {
+				expect(function () {
+					area({ kind: tag } as unknown as Shape);
+				}).toThrow(AssertionError);
+			}
+			const handlers = JSON.parse('{"__proto__": 1}');
+			expect(function () {
+				match({ kind: '__proto__' }, 'kind', handlers);
+			}).toThrow(new TypeError('match: `handlers.__proto__` must be a function, got number'));
+		});
+
+		it('throws a TypeError for a non-object value', function () {
+			expect(function () {
+				match(null as any, 'kind', { _: String });
+			}).toThrow(new TypeError('match: `value` must be an object, got null'));
+			expect(function () {
+				match('circle' as any, 'length', { _: String });
+			}).toThrow(new TypeError('match: `value` must be an object, got string'));
 		});
 	});
 });

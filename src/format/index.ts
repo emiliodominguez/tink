@@ -23,7 +23,7 @@
  *   with U+00A0, or before `AM`/`PM`). Output is returned exactly as `Intl` produces it; compare loosely in tests.
  */
 
-import { createLRUCache } from '../cache/index.js';
+import { createLRUCache, type LRUCache } from '../cache/index.js';
 import type { DateInput } from '../date/index.js';
 import { isDate, isIterable, isString } from '../guards/index.js';
 import { describe } from '../utils/assert.js';
@@ -160,7 +160,7 @@ const ENGLISH_ORDINAL_SUFFIXES: OrdinalSuffixes = { one: 'st', two: 'nd', few: '
 const GENERIC_ORDINAL_SUFFIXES: OrdinalSuffixes = { other: '.' };
 
 /** Module-wide LRU cache of `Intl` formatter instances. */
-const formatterCache = createLRUCache<string, unknown>({ max: FORMATTER_CACHE_SIZE });
+let formatterCache: LRUCache<string, unknown> | undefined;
 
 /** The resolved language of every plural-rules formatter {@link formatOrdinal} has used (see `resolvedLanguage`). */
 const resolvedLanguages = new WeakMap<Intl.PluralRules, string>();
@@ -233,14 +233,6 @@ interface FormatterMemo {
 }
 
 /**
- * Creates an empty {@link FormatterMemo}.
- * @returns {FormatterMemo} A memo that matches nothing
- */
-function createMemo(): FormatterMemo {
-	return { formatter: undefined, locale: undefined, options: {}, size: 0 };
-}
-
-/**
  * Counts the options whose value is not `undefined` (`Intl` treats an `undefined` option as absent).
  * @param {object} options - The options
  * @returns {number} The count
@@ -300,11 +292,13 @@ function getFormatter<T, O>(kind: string, Formatter: new (locales: string[], opt
 
 	if (key === undefined) return new Formatter(locales, options);
 
-	let formatter = formatterCache.get(key) as T | undefined;
+	// Created on first use: a module-level call would be kept by bundlers even when no formatter is imported.
+	const cache = (formatterCache ??= createLRUCache<string, unknown>({ max: FORMATTER_CACHE_SIZE }));
+	let formatter = cache.get(key) as T | undefined;
 
 	if (formatter === undefined) {
 		formatter = new Formatter(locales, options);
-		formatterCache.set(key, formatter);
+		cache.set(key, formatter);
 	}
 
 	if (typeof locale !== 'object') {
@@ -318,25 +312,25 @@ function getFormatter<T, O>(kind: string, Formatter: new (locales: string[], opt
 }
 
 /** Per-call-site memos for {@link getFormatter}. */
-const NUMBER_MEMO = createMemo();
+const NUMBER_MEMO: FormatterMemo = { formatter: undefined, locale: undefined, options: {}, size: 0 };
 /** @see NUMBER_MEMO */
-const CURRENCY_MEMO = createMemo();
+const CURRENCY_MEMO: FormatterMemo = { formatter: undefined, locale: undefined, options: {}, size: 0 };
 /** @see NUMBER_MEMO */
-const PERCENT_MEMO = createMemo();
+const PERCENT_MEMO: FormatterMemo = { formatter: undefined, locale: undefined, options: {}, size: 0 };
 /** @see NUMBER_MEMO */
-const COMPACT_MEMO = createMemo();
+const COMPACT_MEMO: FormatterMemo = { formatter: undefined, locale: undefined, options: {}, size: 0 };
 /** @see NUMBER_MEMO */
-const UNIT_MEMO = createMemo();
+const UNIT_MEMO: FormatterMemo = { formatter: undefined, locale: undefined, options: {}, size: 0 };
 /** @see NUMBER_MEMO */
-const LIST_MEMO = createMemo();
+const LIST_MEMO: FormatterMemo = { formatter: undefined, locale: undefined, options: {}, size: 0 };
 /** @see NUMBER_MEMO */
-const DATE_MEMO = createMemo();
+const DATE_MEMO: FormatterMemo = { formatter: undefined, locale: undefined, options: {}, size: 0 };
 /** @see NUMBER_MEMO */
-const RELATIVE_MEMO = createMemo();
+const RELATIVE_MEMO: FormatterMemo = { formatter: undefined, locale: undefined, options: {}, size: 0 };
 /** @see NUMBER_MEMO */
-const ORDINAL_MEMO = createMemo();
+const ORDINAL_MEMO: FormatterMemo = { formatter: undefined, locale: undefined, options: {}, size: 0 };
 /** @see NUMBER_MEMO */
-const PLURAL_MEMO = createMemo();
+const PLURAL_MEMO: FormatterMemo = { formatter: undefined, locale: undefined, options: {}, size: 0 };
 
 /**
  * Returns the language subtag of the locale a plural-rules formatter resolved to. `resolvedOptions()` allocates and is several times

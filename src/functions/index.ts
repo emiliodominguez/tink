@@ -1,5 +1,5 @@
-import { assertFunction, assertInteger, assertNumber, MAX_TIMEOUT } from '../utils/assert.js';
-import { isPlainObject } from '../guards/index.js';
+import { assertFunction, assertInteger, assertNumber, describe, MAX_TIMEOUT } from '../utils/assert.js';
+import { AssertionError, isPlainObject } from '../guards/index.js';
 import type { AnyFunction } from '../utils/index.js';
 
 /**
@@ -66,9 +66,9 @@ function assertWait(caller: string, name: string, value: number): void {
  * @returns {void}
  * @throws {TypeError} when an element is not a function
  */
-function assertFunctions(caller: string, fns: ReadonlyArray<unknown>): void {
+function assertFunctions(caller: string, fns: ReadonlyArray<unknown>, name = 'fns'): void {
 	// The parameter name is only formatted for an invalid element.
-	for (let i = 0; i < fns.length; i++) if (typeof fns[i] !== 'function') assertFunction(caller, `fns[${i}]`, fns[i]);
+	for (let i = 0; i < fns.length; i++) if (typeof fns[i] !== 'function') assertFunction(caller, `${name}[${i}]`, fns[i]);
 }
 
 /**
@@ -142,6 +142,56 @@ export function partial<A extends unknown[], B extends unknown[], R>(fn: (...arg
 	return function partiallyApplied(this: unknown, ...rest: B): R {
 		return forward(fn as unknown as UnknownFunction, this, append(args, rest)) as R;
 	};
+}
+
+/**
+ * Every suffix of the tuple `A` (including `A` itself and `[]`); a non-tuple array (rest parameters) contributes itself and `[]`.
+ * @example
+ * type S = Suffixes<[number, string]>; // [number, string] | [string] | []
+ */
+type Suffixes<A extends unknown[]> = A extends [unknown, ...infer Tail] ? A | Suffixes<Tail> : A | [];
+
+/**
+ * Removes as many trailing elements from `A` as `S` has. A non-tuple `A` (rest parameters) is returned unchanged.
+ * @example
+ * type D = DropSuffix<[number, string, boolean], [boolean]>; // [number, string]
+ */
+type DropSuffix<A extends unknown[], S extends unknown[]> = number extends A['length']
+	? A
+	: S extends [unknown, ...infer STail]
+		? A extends [...infer Init, unknown]
+			? DropSuffix<Init, STail>
+			: []
+		: A;
+
+/**
+ * Creates a function that invokes `fn` with `args` appended to the arguments it receives (`partialRight(fn, c)(a, b)` calls
+ * `fn(a, b, c)`). `this` is forwarded. As with lodash, the bound arguments always come last, so a call with fewer arguments than
+ * expected shifts them left: bind trailing arguments of functions whose leading arguments are required. Optional parameters of `fn` are
+ * treated as required in the returned function's type.
+ * @template F - The type of the function to partially apply
+ * @template B - The types of the trailing arguments to pre-apply (a suffix of `fn`'s parameters)
+ * @param {F} fn - The function to partially apply
+ * @param {...B} args - The trailing arguments to pre-apply
+ * @returns {(...rest: DropSuffix<Required<Parameters<F>>, B>) => ReturnType<F>} A function accepting the leading arguments
+ * @throws {TypeError} when `fn` is not a function
+ * @example
+ * function greet(greeting: string, name: string): string { return `${greeting}, ${name}!`; }
+ * const greetAda = partialRight(greet, 'Ada');
+ * greetAda('Hello'); // => 'Hello, Ada!'
+ * @example
+ * const toHex = partialRight(Number.parseInt, 16);
+ * toHex('ff'); // => 255
+ */
+export function partialRight<F extends (...args: never[]) => unknown, B extends Suffixes<Required<Parameters<F>>>>(
+	fn: F,
+	...args: B
+): (...rest: DropSuffix<Required<Parameters<F>>, B>) => ReturnType<F> {
+	assertFunction('partialRight', 'fn', fn);
+
+	return function partiallyAppliedRight(this: unknown, ...rest: unknown[]): unknown {
+		return forward(fn as unknown as UnknownFunction, this, append(rest, args));
+	} as (...rest: DropSuffix<Required<Parameters<F>>, B>) => ReturnType<F>;
 }
 
 /**
@@ -1121,6 +1171,119 @@ export function negate<A extends unknown[], T = unknown>(predicate: (this: T, ..
 }
 
 /**
+ * Any predicate: a function whose first parameter is the tested value (further arguments, such as an index, are forwarded).
+ */
+type Predicate = (value: never, ...rest: never[]) => unknown;
+
+/**
+ * The type a predicate narrows its first argument to: `S` for a type guard `(value) => value is S`, `unknown` for any other predicate.
+ * (Matched through a method signature, whose bivariant parameters accept guards over any input type.)
+ * @example
+ * type G = GuardedType<(value: unknown) => value is string>; // string
+ */
+type GuardedType<P> = P extends { guard(value: unknown, ...rest: never[]): value is infer S }['guard'] ? S : unknown;
+
+/**
+ * The intersection of the first-parameter types of a tuple of predicates: what every one of them accepts.
+ */
+type PredicatesInput<P extends readonly unknown[]> = P extends readonly [infer Head, ...infer Tail]
+	? (Head extends (value: infer V, ...rest: never[]) => unknown ? V : never) & PredicatesInput<Tail>
+	: unknown;
+
+/**
+ * The intersection of the types narrowed by a tuple of predicates (`unknown` contributes nothing).
+ */
+type AllGuarded<P extends readonly unknown[]> = P extends readonly [infer Head, ...infer Tail] ? GuardedType<Head> & AllGuarded<Tail> : unknown;
+
+/**
+ * The union of the types narrowed by a tuple of predicates; `unknown` (no narrowing) as soon as one of them is not a type guard.
+ */
+type AnyGuarded<P extends readonly unknown[]> = P extends readonly [infer Head, ...infer Tail] ? GuardedType<Head> | AnyGuarded<Tail> : never;
+
+/**
+ * Builds the {@link allPass}/{@link anyPass} combinator.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {ReadonlyArray<UnknownFunction>} predicates - The predicates
+ * @param {boolean} all - `true` for `allPass` (stop at the first failure), `false` for `anyPass` (stop at the first success)
+ * @returns {UnknownFunction} The combined predicate
+ * @throws {TypeError} when a predicate is not a function
+ */
+function combinePredicates(caller: string, predicates: ReadonlyArray<UnknownFunction>, all: boolean): UnknownFunction {
+	assertFunctions(caller, predicates, 'predicates');
+
+	const list = predicates.slice();
+
+	// Up to three arguments (an `Array.prototype.filter` callback gets three) are passed with `call`, which V8 optimises much better than
+	// `apply` with an argument list.
+	return function combined(this: unknown, a?: unknown, b?: unknown, c?: unknown): boolean {
+		const count = arguments.length;
+
+		for (let i = 0; i < list.length; i++) {
+			const passed =
+				count === 1
+					? list[i].call(this, a)
+					: count === 3
+						? list[i].call(this, a, b, c)
+						: count === 2
+							? list[i].call(this, a, b)
+							: // eslint-disable-next-line prefer-rest-params -- see above
+								list[i].apply(this, arguments as unknown as unknown[]);
+
+			if (!passed === all) return !all;
+		}
+
+		return all;
+	};
+}
+
+/**
+ * Creates a predicate that is `true` when every one of `predicates` returns a truthy value for the same arguments (`true` for no
+ * predicates). Evaluation is left to right and stops at the first falsy result. `this` and every argument are forwarded, so it works as
+ * an `Array.prototype.filter` callback.
+ *
+ * Type guards keep narrowing: combining `(v) => v is A` and `(v) => v is B` gives a guard for `A & B` (plain predicates add nothing).
+ * The input type is the intersection of the predicates' parameter types.
+ * @template P - The tuple of predicate types
+ * @param {...P} predicates - The predicates to combine
+ * @returns {(value: PredicatesInput<P>, ...rest: unknown[]) => value is PredicatesInput<P> & AllGuarded<P>} The combined predicate
+ * @throws {TypeError} when a predicate is not a function
+ * @example
+ * function isString(value: unknown): value is string { return typeof value === 'string'; }
+ * function isShort(value: string): boolean { return value.length <= 3; }
+ * ['ab', 7, 'abcd', 'xyz'].filter(allPass(isString, isShort)); // => ['ab', 'xyz'] // typed as string[]
+ * allPass()(42); // => true
+ */
+export function allPass<P extends Predicate[]>(...predicates: P): (value: PredicatesInput<P>, ...rest: unknown[]) => value is PredicatesInput<P> & AllGuarded<P> {
+	return combinePredicates('allPass', predicates as unknown as UnknownFunction[], true) as unknown as (
+		value: PredicatesInput<P>,
+		...rest: unknown[]
+	) => value is PredicatesInput<P> & AllGuarded<P>;
+}
+
+/**
+ * Creates a predicate that is `true` when at least one of `predicates` returns a truthy value for the same arguments (`false` for no
+ * predicates). Evaluation is left to right and stops at the first truthy result. `this` and every argument are forwarded.
+ *
+ * Type guards keep narrowing: when every predicate is a type guard, `(v) => v is A` and `(v) => v is B` give a guard for `A | B`; with
+ * any plain predicate among them, nothing is narrowed (a `true` result no longer proves any of the guards).
+ * @template P - The tuple of predicate types
+ * @param {...P} predicates - The predicates to combine
+ * @returns {(value: PredicatesInput<P>, ...rest: unknown[]) => value is PredicatesInput<P> & AnyGuarded<P>} The combined predicate
+ * @throws {TypeError} when a predicate is not a function
+ * @example
+ * function isString(value: unknown): value is string { return typeof value === 'string'; }
+ * function isNumber(value: unknown): value is number { return typeof value === 'number'; }
+ * [1, 'a', null, true].filter(anyPass(isString, isNumber)); // => [1, 'a'] // typed as (string | number)[]
+ * anyPass()(42); // => false
+ */
+export function anyPass<P extends Predicate[]>(...predicates: P): (value: PredicatesInput<P>, ...rest: unknown[]) => value is PredicatesInput<P> & AnyGuarded<P> {
+	return combinePredicates('anyPass', predicates as unknown as UnknownFunction[], false) as unknown as (
+		value: PredicatesInput<P>,
+		...rest: unknown[]
+	) => value is PredicatesInput<P> & AnyGuarded<P>;
+}
+
+/**
  * Returns its argument unchanged.
  * @template T - The value type
  * @param {T} value - Any value
@@ -1357,4 +1520,80 @@ export function memoizeLast<F extends AnyFunction>(fn: F, isEqual: (next: Parame
 	});
 
 	return memoizedLast as unknown as MemoizedLast<F>;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// match
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * The values a discriminant ("tag") property may hold to be matched by {@link match}: they are looked up as handler names with `String`.
+ */
+type MatchTag = string | number | boolean | bigint | null | undefined;
+
+/**
+ * One handler per member of the union `T`, keyed by the member's `K` tag, each receiving the narrowed member.
+ * @template T - The discriminated union
+ * @template K - The discriminant key
+ */
+export type MatchCases<T, K extends keyof T> = { [V in T[K] & MatchTag as `${V}`]: (value: Extract<T, { readonly [P in K]: V }>) => unknown };
+
+/**
+ * The handlers accepted by {@link match}: either one per tag (exhaustive), or any subset of them plus a `_` fallback receiving the other members.
+ * @template T - The discriminated union
+ * @template K - The discriminant key
+ */
+export type MatchHandlers<T, K extends keyof T> = MatchCases<T, K> | (Partial<MatchCases<T, K>> & { _: (value: T) => unknown });
+
+/**
+ * The union of the return types of a set of handlers.
+ * @template H - The handlers object
+ */
+export type MatchResult<H> = { [P in keyof H]-?: H[P] extends (...args: never[]) => infer R ? R : never }[keyof H];
+
+/**
+ * Exhaustive pattern matching on a discriminated union: calls the handler named after `value[key]` (the "tag") with `value`, and returns
+ * its result. Each handler's argument is narrowed to the matching union member, the result is the union of the handlers' return types,
+ * and leaving out a tag is a compile error unless a `_` handler catches the remaining ones (a tag literally named `'_'` is handled by `_`).
+ * Boolean, number, `null` and `undefined` tags are matched by their string form (`true`, `404`, `null`).
+ *
+ * At runtime only own properties of `handlers` count (a tag such as `'toString'` or `'__proto__'` never reaches `Object.prototype`). A
+ * tag without a handler and no `_` (data that does not match its type, e.g. from an API) throws an `AssertionError` naming the key and
+ * the tag, like `assertNever`.
+ * @template T - The discriminated union
+ * @template K - The discriminant key
+ * @template H - The handlers object
+ * @param {T} value - The value to match (an object)
+ * @param {K} key - The discriminant property
+ * @param {H} handlers - The handlers, by tag, optionally with a `_` fallback
+ * @returns {MatchResult<H>} The result of the matching handler
+ * @throws {TypeError} when `value` is not an object, or the matching handler is not a function
+ * @throws {AssertionError} when no handler matches the tag and there is no `_` fallback
+ * @example
+ * type Shape = { kind: 'circle'; radius: number } | { kind: 'rect'; width: number; height: number };
+ * function area(shape: Shape): number {
+ *   return match(shape, 'kind', {
+ *     circle: function (circle) { return Math.round(Math.PI * circle.radius ** 2); },
+ *     rect: function (rect) { return rect.width * rect.height; }
+ *   });
+ * }
+ * area({ kind: 'rect', width: 2, height: 3 }); // => 6
+ * area({ kind: 'circle', radius: 1 }); // => 3
+ * area({ kind: 'hexagon' } as unknown as Shape); // throws AssertionError
+ * @example
+ * type Result = { ok: true; value: number } | { ok: false; error: string };
+ * const result: Result = { ok: false, error: 'offline' };
+ * match(result, 'ok', { true: function (success) { return success.value; }, _: function () { return 0; } }); // => 0
+ */
+export function match<T extends object, K extends keyof T, H extends MatchHandlers<T, K>>(value: T, key: K, handlers: H): MatchResult<H> {
+	if (typeof value !== 'object' || value === null) throw new TypeError(`match: \`value\` must be an object, got ${describe(value)}`);
+
+	const tag = String(value[key]);
+	const handler = (Object.hasOwn(handlers, tag) ? handlers[tag as keyof H] : Object.hasOwn(handlers, '_') ? handlers['_' as keyof H] : undefined) as unknown;
+
+	// The tag may come from untrusted data: quote at most 100 characters of it, so that the message stays safe to log.
+	if (handler === undefined) throw new AssertionError(`match: no handler for \`${String(key)}\` ${JSON.stringify(tag.slice(0, 100))}`);
+	assertFunction('match', `handlers.${tag}`, handler);
+
+	return (handler as (value: T) => unknown)(value) as MatchResult<H>;
 }

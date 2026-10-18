@@ -457,7 +457,7 @@ export function memoize(options: MemoizeMethodOptions): UniversalMethodDecorator
  */
 export function memoize(targetOrValue: unknown, keyOrContext?: unknown, descriptor?: unknown): unknown {
 	// Decorators always receive a key or a context: a lone argument is the options of the factory form.
-	if (keyOrContext !== undefined) return decorateMethod('memoize', wrapMemoizeDefault, targetOrValue, keyOrContext, descriptor);
+	if (keyOrContext !== undefined) return decorateMethod('memoize', (wrapMemoizeDefault ??= memoizeWrapper({})), targetOrValue, keyOrContext, descriptor);
 
 	if (typeof targetOrValue !== 'object' || targetOrValue === null) throw new TypeError(`@memoize: \`options\` must be an object, got ${describe(targetOrValue)}`);
 
@@ -470,9 +470,9 @@ export function memoize(targetOrValue: unknown, keyOrContext?: unknown, descript
 }
 
 /**
- * The method wrapper of the bare `@memoize` decorator.
+ * The method wrapper of the bare `@memoize` decorator, created on first use (a module-level call would defeat tree-shaking).
  */
-const wrapMemoizeDefault: MethodWrapper = memoizeWrapper({});
+let wrapMemoizeDefault: MethodWrapper | undefined;
 
 // ---------------------------------------------------------------------------------------------------------------------
 // bound

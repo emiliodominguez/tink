@@ -51,8 +51,8 @@ function getGraphemeSegmenter(): Intl.Segmenter | null {
  */
 const COMPLEX_TEXT = /[\u0300-\u1dff\u200c-\u200d\u2070-\u4dff\ua000-\uffff\r]/;
 
-/** The {@link COMPLEX_TEXT} code units, as the body of a character class. */
-const COMPLEX = COMPLEX_TEXT.source.slice(1, -1);
+/** The {@link COMPLEX_TEXT} code units, as the body of a character class (a literal: a module-level call would defeat tree-shaking). */
+const COMPLEX = '\\u0300-\\u1dff\\u200c-\\u200d\\u2070-\\u4dff\\ua000-\\uffff\\r';
 
 /**
  * Tells whether every UTF-16 code unit of a string is a grapheme cluster on its own, so it can be processed without a segmenter.
@@ -81,9 +81,48 @@ function isSimpleCode(code: number): boolean {
  */
 const COMPLEX_REGION = new RegExp(`[^${COMPLEX}]?(?:[${COMPLEX}]+[^${COMPLEX}]?)+`, 'g');
 
+/** An emoji (`Extended_Pictographic`) with an optional skin tone modifier or emoji presentation selector. */
+const PICTOGRAPH = String.raw`\p{Extended_Pictographic}(?:[\u{1F3FB}-\u{1F3FF}]|\ufe0f)?`;
+
+/**
+ * One grapheme cluster of the common shapes that need no segmenter (a sticky match): an emoji ZWJ sequence of {@link PICTOGRAPH}s, a flag
+ * (a pair of regional indicators), or a code unit that {@link COMPLEX_TEXT} does not match. Every `Extended_Pictographic` code point has the
+ * grapheme-break property Other, so such a cluster ends before any code unit that does not continue it with a modifier, a selector or a
+ * zero-width joiner (checked against `Intl.Segmenter` for all of them).
+ */
+const EMOJI_GRAPHEME = new RegExp(`${PICTOGRAPH}(?:\u200d${PICTOGRAPH})*|[\u{1F1E6}-\u{1F1FF}]{2}|(?![${COMPLEX}])[\0-\uffff]`, 'uy');
+
+/**
+ * Splits a region of {@link COMPLEX_REGION} into graphemes without the (slow) segmenter when it only holds the clusters {@link EMOJI_GRAPHEME}
+ * matches. Any other shape (a combining mark, `\r\n`, a lone regional indicator, a keycap...) is left to the segmenter.
+ * @param {string} region - The region
+ * @param {string[]} graphemes - Receives the graphemes (left as it was when the region cannot be split this way)
+ * @returns {boolean} Whether the region was split
+ */
+function pushEmojiGraphemes(region: string, graphemes: string[]): boolean {
+	const length = graphemes.length;
+
+	EMOJI_GRAPHEME.lastIndex = 0;
+
+	while (EMOJI_GRAPHEME.lastIndex < region.length) {
+		const match = EMOJI_GRAPHEME.exec(region);
+
+		if (match === null) {
+			graphemes.length = length;
+
+			return false;
+		}
+
+		graphemes.push(match[0]);
+	}
+
+	return true;
+}
+
 /**
  * Splits a string into grapheme clusters (or code points when `Intl.Segmenter` is unavailable). Only the regions that may hold
- * multi-code-unit clusters (see {@link COMPLEX_REGION}) go through the (slow) segmenter; every other code unit is a grapheme on its own.
+ * multi-code-unit clusters (see {@link COMPLEX_REGION}) go through the (slow) segmenter, unless they only hold common emoji shapes (see
+ * {@link EMOJI_GRAPHEME}); every other code unit is a grapheme on its own.
  * @param {string} string - The string to split
  * @param {number} [limit=Infinity] - Stop once more than `limit` graphemes have been collected (the ones returned are exact)
  * @returns {string[]} The graphemes of `string` (only the first ones, at least `limit + 1`, when it has more than `limit`)
@@ -107,7 +146,7 @@ function splitGraphemes(string: string, limit: number = Infinity): string[] {
 
 		if (segmenter === null) {
 			for (const codePoint of match[0]) graphemes.push(codePoint);
-		} else {
+		} else if (!pushEmojiGraphemes(match[0], graphemes)) {
 			for (const data of segmenter.segment(match[0])) {
 				if (graphemes.length > limit) break;
 				graphemes.push(data.segment);
@@ -519,7 +558,7 @@ export function removeDiacritics(string: string): string {
 const SLUG_TRANSLITERATIONS: Readonly<Record<string, string>> = { ß: 'ss', æ: 'ae', œ: 'oe', ø: 'o', đ: 'd', ð: 'd', ł: 'l', þ: 'th', ı: 'i' };
 
 /** Matches the letters of {@link SLUG_TRANSLITERATIONS}. */
-const SLUG_LETTERS = new RegExp(`[${Object.keys(SLUG_TRANSLITERATIONS).join('')}]`, 'g');
+const SLUG_LETTERS = /[ßæœøđðłþı]/g;
 
 /**
  * Converts a string to a URL-friendly slug: compatibility-decomposed (NFKD), diacritics removed, a few common Latin letters transliterated
@@ -1392,4 +1431,383 @@ export function stripPrefix(string: string, prefix: string): string {
  */
 export function stripSuffix(string: string, suffix: string): string {
 	return string.endsWith(suffix) ? string.slice(0, string.length - suffix.length) : string;
+}
+
+/**
+ * The sets built by {@link graphemeSet} for the 16 most recent `chars` strings of at most 64 code units (trimming usually repeats the same
+ * characters; longer strings are not kept, so the cache cannot retain attacker-sized strings).
+ */
+const charSets = new Map<string, ReadonlySet<string>>();
+
+/**
+ * Validates the `chars` argument of {@link trimChars} and turns it into a set of graphemes.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {string | ReadonlyArray<string>} chars - A string or an array of strings, each split into graphemes
+ * @returns {ReadonlySet<string>} The graphemes
+ * @throws {TypeError} when `chars` is not a string or an array of strings
+ */
+function graphemeSet(caller: string, chars: string | ReadonlyArray<string>): ReadonlySet<string> {
+	if (typeof chars === 'string') {
+		let cached = charSets.get(chars);
+
+		if (cached === undefined) {
+			cached = new Set(splitGraphemes(chars));
+
+			if (chars.length <= 64) {
+				// Simple eviction keeps the cache bounded: start afresh once it is full.
+				if (charSets.size === 16) charSets.clear();
+				charSets.set(chars, cached);
+			}
+		}
+
+		return cached;
+	}
+
+	const set = new Set<string>();
+
+	for (const item of Array.isArray(chars) ? (chars as ReadonlyArray<unknown>) : [chars]) {
+		if (typeof item !== 'string') throw new TypeError(`${caller}: \`chars\` must be a string or an array of strings, got ${describe(item)}`);
+
+		for (const grapheme of splitGraphemes(item)) set.add(grapheme);
+	}
+
+	return set;
+}
+
+/**
+ * Trims the graphemes of a set from one or both ends of a string (see {@link trimChars}). Plain code units at the ends are compared one at a
+ * time; graphemes are only split where an end holds text that may form multi-code-unit graphemes.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {string} string - The string to trim
+ * @param {string | ReadonlyArray<string>} chars - The graphemes to remove
+ * @param {boolean} fromStart - Whether to trim the start
+ * @param {boolean} fromEnd - Whether to trim the end
+ * @returns {string} The trimmed string
+ * @throws {TypeError} when `chars` is not a string or an array of strings
+ */
+function trimGraphemes(caller: string, string: string, chars: string | ReadonlyArray<string>, fromStart: boolean, fromEnd: boolean): string {
+	const set = graphemeSet(caller, chars);
+
+	let start = 0;
+	let end = string.length;
+
+	while (fromStart && start < end) {
+		// `start` is a grapheme boundary: the code unit there is a whole grapheme when it and the next one are both simple.
+		const grapheme = isSimpleCode(string.charCodeAt(start)) && isSimpleCode(string.charCodeAt(start + 1)) ? string[start] : firstGrapheme(string.slice(start));
+
+		if (!set.has(grapheme)) break;
+
+		start += grapheme.length;
+	}
+
+	// The graphemes between `start` and `end`, split once the end holds complex text (and then always used, so they stay in sync with `end`).
+	let rest: string[] | undefined;
+
+	while (fromEnd && end > start) {
+		// `end` is a grapheme boundary too: the code unit before it is a whole grapheme when it and the previous one are both simple.
+		const grapheme =
+			rest === undefined && isSimpleCode(string.charCodeAt(end - 1)) && isSimpleCode(string.charCodeAt(end - 2))
+				? string[end - 1]
+				: ((rest ??= splitGraphemes(string.slice(start, end))).pop() as string);
+
+		if (!set.has(grapheme)) break;
+
+		end -= grapheme.length;
+	}
+
+	return string.slice(start, end);
+}
+
+/**
+ * Removes every leading and trailing occurrence of the given characters. `chars` is a SET of user-perceived characters (grapheme
+ * clusters), not a substring: `trimChars('abXba', 'ab')` removes any `a` or `b` at either end. A string is split into its graphemes, and an
+ * array is a list of such strings (`['-', '_']` equals `'-_'`). Since whole graphemes are compared, `'👍'` does not remove the `'👍🏽'`
+ * (thumbs up with a skin tone) and `'e'` does not strip the base letter of an `e` followed by a combining accent. Characters are matched
+ * literally: no regular expression is built, so `]`, `\` or `^` need no escaping. An empty set returns the string unchanged.
+ * @param {string} string - The string to trim
+ * @param {string | ReadonlyArray<string>} chars - The characters to remove
+ * @returns {string} The trimmed string
+ * @throws {TypeError} when `chars` is not a string or an array of strings
+ * @example
+ * trimChars('--hello__', '-_'); // => 'hello'
+ * trimChars('/path/to/', ['/']); // => 'path/to'
+ * trimChars('👍🏽ok👍', '👍'); // => '👍🏽ok'
+ * trimChars(']]x]]', ']'); // => 'x'
+ */
+export function trimChars(string: string, chars: string | ReadonlyArray<string>): string {
+	return trimGraphemes('trimChars', string, chars, true, true);
+}
+
+/**
+ * Removes every leading occurrence of the given characters (a set of graphemes, see {@link trimChars}).
+ * @param {string} string - The string to trim
+ * @param {string | ReadonlyArray<string>} chars - The characters to remove
+ * @returns {string} The string without the leading characters
+ * @throws {TypeError} when `chars` is not a string or an array of strings
+ * @example
+ * trimStartChars('000123', '0'); // => '123'
+ * trimStartChars('-_x_-', ['-', '_']); // => 'x_-'
+ */
+export function trimStartChars(string: string, chars: string | ReadonlyArray<string>): string {
+	return trimGraphemes('trimStartChars', string, chars, true, false);
+}
+
+/**
+ * Removes every trailing occurrence of the given characters (a set of graphemes, see {@link trimChars}).
+ * @param {string} string - The string to trim
+ * @param {string | ReadonlyArray<string>} chars - The characters to remove
+ * @returns {string} The string without the trailing characters
+ * @throws {TypeError} when `chars` is not a string or an array of strings
+ * @example
+ * trimEndChars('1.500', '0'); // => '1.5'
+ * trimEndChars('wait...!?', '.!?'); // => 'wait'
+ */
+export function trimEndChars(string: string, chars: string | ReadonlyArray<string>): string {
+	return trimGraphemes('trimEndChars', string, chars, false, true);
+}
+
+/**
+ * How {@link toDelimitedCase} cases each word:
+ * - `'lower'`: `xml.http.request`
+ * - `'upper'`: `XML.HTTP.REQUEST`
+ * - `'capital'`: the first letter upper-cased (title case), the rest lower-cased: `Xml.Http.Request`
+ * - `'preserve'`: the words as they appear in the input: `XML.Http.Request`
+ */
+export type WordCase = 'lower' | 'upper' | 'capital' | 'preserve';
+
+/**
+ * Options accepted by {@link toDelimitedCase}.
+ */
+export interface DelimitedCaseOptions {
+	/** How each word is cased. Defaults to `'lower'`. */
+	readonly case?: WordCase;
+}
+
+/** A cased or case-ignorable character: one that lower- or upper-casing could change, or that changes how a neighbouring `Σ` is lower-cased. */
+const CASE_SENSITIVE = /[\p{Cased}\p{Case_Ignorable}]/u;
+
+/**
+ * Splits a string into words (see {@link toSnakeCase}), cases them and joins them. The result is always the words cased one by one: they
+ * are only cased after joining when the delimiter can neither change nor be changed (it is not empty and holds no cased or case-ignorable
+ * character, unlike `.`, which would turn a final `Σ` into `σ`).
+ * @param {string} string - The string to convert
+ * @param {string} delimiter - The text between words
+ * @param {WordCase} wordCase - How each word is cased
+ * @returns {string} The converted string
+ */
+function joinWords(string: string, delimiter: string, wordCase: WordCase): string {
+	const words = splitWords(string);
+
+	if (wordCase === 'preserve') return words.join(delimiter);
+
+	if (wordCase === 'capital' || delimiter === '' || CASE_SENSITIVE.test(delimiter)) {
+		for (let index = 0; index < words.length; index++) {
+			const word = words[index];
+
+			words[index] = wordCase === 'capital' ? upperFirstLowerRest(word) : wordCase === 'lower' ? word.toLowerCase() : word.toUpperCase();
+		}
+
+		return words.join(delimiter);
+	}
+
+	const joined = words.join(delimiter);
+
+	return wordCase === 'lower' ? joined.toLowerCase() : joined.toUpperCase();
+}
+
+/** The values of {@link WordCase}. */
+const WORD_CASES: ReadonlySet<string> = new Set<WordCase>(['lower', 'upper', 'capital', 'preserve']);
+
+/**
+ * Converts a string to words joined by any delimiter, using the same word detection as every other case helper (see {@link toSnakeCase}:
+ * whitespace, punctuation, camelCase and acronym boundaries; digits stay attached to the preceding letters; apostrophes are dropped).
+ * Case mapping is locale-independent (`'I'` always lower-cases to `'i'`, also on a Turkish system).
+ * @param {string} string - The string to convert
+ * @param {string} delimiter - The text inserted between words (may be empty or longer than one character)
+ * @param {DelimitedCaseOptions} [options={}] - `case`: `'lower'` (default), `'upper'`, `'capital'` or `'preserve'`
+ * @returns {string} The converted string
+ * @throws {TypeError} when `delimiter` is not a string
+ * @throws {RangeError} when `options.case` is not a {@link WordCase}
+ * @example
+ * toDelimitedCase('XMLHttpRequest', '.'); // => 'xml.http.request'
+ * toDelimitedCase('user id', ' | ', { case: 'upper' }); // => 'USER | ID'
+ * toDelimitedCase('helloWorld', '__', { case: 'capital' }); // => 'Hello__World'
+ * toDelimitedCase('XMLHttpRequest', ':', { case: 'preserve' }); // => 'XML:Http:Request'
+ */
+export function toDelimitedCase(string: string, delimiter: string, options: DelimitedCaseOptions = {}): string {
+	const { case: wordCase = 'lower' } = options;
+
+	if (typeof delimiter !== 'string') throw new TypeError(`toDelimitedCase: \`delimiter\` must be a string, got ${describe(delimiter)}`);
+
+	if (!WORD_CASES.has(wordCase)) throw new RangeError(`toDelimitedCase: \`options.case\` must be 'lower', 'upper', 'capital' or 'preserve', got ${String(wordCase)}`);
+
+	return joinWords(string, delimiter, wordCase);
+}
+
+/**
+ * Converts a string to Train-Case: capitalized words joined with `-`, using the same word detection as {@link toSnakeCase}.
+ * @param {string} string - The string to convert
+ * @returns {string} The string in train case
+ * @example
+ * toTrainCase('XMLHttpRequest2Go'); // => 'Xml-Http-Request2-Go'
+ * toTrainCase('content_type'); // => 'Content-Type'
+ */
+export function toTrainCase(string: string): string {
+	return joinWords(string, '-', 'capital');
+}
+
+/**
+ * Converts a string to dot.case: lower-cased words joined with `.`, using the same word detection as {@link toSnakeCase}.
+ * @param {string} string - The string to convert
+ * @returns {string} The string in dot case
+ * @example
+ * toDotCase('iOS17Pro'); // => 'i.os17.pro'
+ * toDotCase('app_Config-key'); // => 'app.config.key'
+ */
+export function toDotCase(string: string): string {
+	return joinWords(string, '.', 'lower');
+}
+
+/**
+ * Converts a string to path/case: lower-cased words joined with `/`, using the same word detection as {@link toSnakeCase}.
+ * @param {string} string - The string to convert
+ * @returns {string} The string in path case
+ * @example
+ * toPathCase('UserProfileSettings'); // => 'user/profile/settings'
+ */
+export function toPathCase(string: string): string {
+	return joinWords(string, '/', 'lower');
+}
+
+/**
+ * Converts a string to "no case": lower-cased words joined with single spaces, using the same word detection as {@link toSnakeCase}
+ * (punctuation and separators are dropped).
+ * @param {string} string - The string to convert
+ * @returns {string} The string in no case
+ * @example
+ * toNoCase('XMLHttpRequest'); // => 'xml http request'
+ * toNoCase('--foo_bar--'); // => 'foo bar'
+ */
+export function toNoCase(string: string): string {
+	return joinWords(string, ' ', 'lower');
+}
+
+/**
+ * Converts a string to Start Case: capitalized words joined with single spaces, using the same word detection as {@link toSnakeCase}.
+ * Unlike {@link toTitleCase}, which only re-cases whitespace-separated words and keeps punctuation, identifiers are split into words
+ * and separators are dropped.
+ * @param {string} string - The string to convert
+ * @returns {string} The string in start case
+ * @example
+ * toStartCase('helloWorld'); // => 'Hello World'
+ * toStartCase('XMLHttpRequest2Go'); // => 'Xml Http Request2 Go'
+ * toStartCase('--foo_bar--'); // => 'Foo Bar'
+ */
+export function toStartCase(string: string): string {
+	return joinWords(string, ' ', 'capital');
+}
+
+/**
+ * Builds `count` graphemes of padding by repeating the graphemes of `fill` (the last repetition is cut short).
+ * @param {string} fill - The padding text (not empty)
+ * @param {number} count - The number of graphemes to produce
+ * @returns {string} The padding
+ */
+function padding(fill: string, count: number): string {
+	// One grapheme per code unit: the native padding cuts the last repetition at the right place.
+	if (isSimpleText(fill)) return ''.padEnd(count, fill);
+
+	const graphemes = splitGraphemes(fill);
+
+	return fill.repeat(Math.floor(count / graphemes.length)) + graphemes.slice(0, count % graphemes.length).join('');
+}
+
+/**
+ * Pads a string to a width in graphemes (see {@link padStart}).
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {string} string - The string to pad
+ * @param {number} width - The target width in graphemes
+ * @param {string} fill - The padding text
+ * @param {number} share - The share of the padding that goes before the string: `1`, `0` or `0.5` (rounded down)
+ * @returns {string} The padded string
+ * @throws {RangeError} when `width` is not a non-negative integer or `fill` is empty
+ * @throws {TypeError} when `width` is not a number or `fill` is not a string
+ */
+function pad(caller: string, string: string, width: number, fill: string, share: number): string {
+	assertInteger(caller, 'width', width);
+
+	if (typeof fill !== 'string' || fill === '') {
+		const message = `${caller}: \`fill\` must be a non-empty string, got ${typeof fill === 'string' ? "''" : describe(fill)}`;
+
+		throw typeof fill === 'string' ? new RangeError(message) : new TypeError(message);
+	}
+
+	const simple = isSimpleText(string);
+	// Splitting stops once `width` graphemes have been seen: a longer string is returned as it is.
+	const missing = width - (simple ? string.length : splitGraphemes(string, width).length);
+
+	if (missing <= 0) return string;
+
+	const before = Math.floor(missing * share);
+
+	// One grapheme per code unit in both: the native methods count and cut the same way.
+	if (simple && isSimpleText(fill)) return string.padStart(string.length + before, fill).padEnd(width, fill);
+
+	return padding(fill, before) + string + padding(fill, missing - before);
+}
+
+/**
+ * Pads the start of a string until it is `width` user-perceived characters (grapheme clusters) wide. Unlike the native
+ * `String.prototype.padStart`, which counts UTF-16 code units (an emoji counts as 2, `'é'` written with a combining accent as 2), widths
+ * are counted in graphemes, and so is the cut of the last repetition of a multi-character `fill`.
+ *
+ * Width means grapheme count: East Asian wide characters (CJK ideographs, full-width forms) and emoji, which terminals usually draw two
+ * columns wide, count as 1. A string that starts with a combining mark (or a fill that ends with a zero-width joiner) can merge with the
+ * padding into fewer graphemes.
+ * @param {string} string - The string to pad
+ * @param {number} width - The target width in graphemes (a non-negative integer); a string at least that wide is returned unchanged
+ * @param {string} [fill=' '] - The padding, repeated and cut as needed (must not be empty)
+ * @returns {string} The padded string
+ * @throws {RangeError} when `width` is not a non-negative integer or `fill` is empty
+ * @throws {TypeError} when `width` is not a number or `fill` is not a string
+ * @example
+ * padStart('42', 5, '0'); // => '00042'
+ * padStart('👍🏽', 3, '*'); // => '**👍🏽'
+ * padStart('x', 4, '👍🏽-'); // => '👍🏽-👍🏽x'
+ */
+export function padStart(string: string, width: number, fill: string = ' '): string {
+	return pad('padStart', string, width, fill, 1);
+}
+
+/**
+ * Pads the end of a string until it is `width` user-perceived characters (grapheme clusters) wide (see {@link padStart}).
+ * @param {string} string - The string to pad
+ * @param {number} width - The target width in graphemes (a non-negative integer); a string at least that wide is returned unchanged
+ * @param {string} [fill=' '] - The padding, repeated and cut as needed (must not be empty)
+ * @returns {string} The padded string
+ * @throws {RangeError} when `width` is not a non-negative integer or `fill` is empty
+ * @throws {TypeError} when `width` is not a number or `fill` is not a string
+ * @example
+ * padEnd('Name', 8, '.'); // => 'Name....'
+ * padEnd('café', 6); // => 'café  '
+ */
+export function padEnd(string: string, width: number, fill: string = ' '): string {
+	return pad('padEnd', string, width, fill, 0);
+}
+
+/**
+ * Pads both ends of a string until it is `width` user-perceived characters (grapheme clusters) wide (see {@link padStart}). When the
+ * padding is odd, the extra grapheme goes at the end. Each side starts its own repetition of `fill`.
+ * @param {string} string - The string to pad
+ * @param {number} width - The target width in graphemes (a non-negative integer); a string at least that wide is returned unchanged
+ * @param {string} [fill=' '] - The padding, repeated and cut as needed (must not be empty)
+ * @returns {string} The padded string
+ * @throws {RangeError} when `width` is not a non-negative integer or `fill` is empty
+ * @throws {TypeError} when `width` is not a number or `fill` is not a string
+ * @example
+ * padCenter('abc', 8, '_-'); // => '_-abc_-_'
+ * padCenter('👍', 5, '*'); // => '**👍**'
+ */
+export function padCenter(string: string, width: number, fill: string = ' '): string {
+	return pad('padCenter', string, width, fill, 0.5);
 }

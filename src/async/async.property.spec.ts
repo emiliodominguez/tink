@@ -1,5 +1,21 @@
 import fc from 'fast-check';
-import { abortable, anySignal, attemptAsync, createDeferred, createLimiter, debounceAsync, mapWithConcurrency, promiseAllObject, retry, sequence } from '.';
+import {
+	abortable,
+	anySignal,
+	attemptAsync,
+	createDeferred,
+	createLimiter,
+	createQueue,
+	createRateLimiter,
+	debounceAsync,
+	filterWithConcurrency,
+	mapSettledWithConcurrency,
+	mapWithConcurrency,
+	memoizeAsync,
+	promiseAllObject,
+	retry,
+	sequence
+} from '.';
 import type { AbortSignalLike } from '../utils/index.js';
 
 /**
@@ -378,5 +394,182 @@ describe('Async helpers (properties)', function () {
 				})
 			);
 		});
+	});
+});
+
+describe('Async helpers (round 11 properties)', function () {
+	afterEach(function () {
+		jest.useRealTimers();
+	});
+
+	it('mapSettledWithConcurrency equals Promise.allSettled of the direct calls; filterWithConcurrency equals Array#filter', async function () {
+		await fc.assert(
+			fc.asyncProperty(
+				fc.array(fc.record({ value: fc.integer({ min: -20, max: 20 }), ticks: fc.integer({ min: 0, max: 4 }) }), { maxLength: 25 }),
+				fc.oneof(fc.integer({ min: 1, max: 6 }), fc.constant(Infinity)),
+				async function (items, concurrency) {
+					async function check(item: { value: number; ticks: number }): Promise<number> {
+						await yieldTicks(item.ticks);
+						if (item.value % 3 === 0) throw new Error(`bad ${item.value}`);
+						return item.value * 2;
+					}
+					const settled = await mapSettledWithConcurrency(items, check, { concurrency });
+					expect(settled).toEqual(await Promise.allSettled(items.map(check)));
+					const kept = await filterWithConcurrency(
+						items,
+						async function (item) {
+							await yieldTicks(item.ticks);
+							return item.value > 0;
+						},
+						concurrency
+					);
+					expect(kept).toEqual(
+						items.filter(function (item) {
+							return item.value > 0;
+						})
+					);
+				}
+			)
+		);
+	});
+
+	it('mapWithConcurrency with stopOnError: false reports every failure exactly once', async function () {
+		await fc.assert(
+			fc.asyncProperty(fc.array(fc.boolean(), { maxLength: 20 }), fc.integer({ min: 1, max: 5 }), async function (failures, concurrency) {
+				const outcome = await mapWithConcurrency(
+					failures,
+					async function (fails, index) {
+						await yieldTicks(index % 3);
+						if (fails) throw index;
+						return index;
+					},
+					{ concurrency, stopOnError: false }
+				).then(
+					function (values) {
+						return { values, errors: [] as unknown[] };
+					},
+					function (error: AggregateError) {
+						return { values: undefined, errors: error.errors };
+					}
+				);
+				const failed = failures.flatMap(function (fails, index) {
+					return fails ? [index] : [];
+				});
+				if (failed.length === 0)
+					expect(outcome.values).toEqual(
+						failures.map(function (_, index) {
+							return index;
+						})
+					);
+				else
+					expect(
+						[...outcome.errors].sort(function (a, b) {
+							return (a as number) - (b as number);
+						})
+					).toEqual(failed);
+			})
+		);
+	});
+
+	it('createQueue starts tasks by decreasing priority, FIFO among equals (a stable sort)', async function () {
+		await fc.assert(
+			fc.asyncProperty(fc.array(fc.integer({ min: -2, max: 2 }), { maxLength: 30 }), fc.integer({ min: 1, max: 4 }), async function (priorities, concurrency) {
+				const queue = createQueue({ concurrency });
+				const order: number[] = [];
+				queue.pause();
+				priorities.forEach(function (priority, id) {
+					queue.add(
+						async function () {
+							order.push(id);
+							await yieldTicks(id % 3);
+						},
+						{ priority }
+					);
+				});
+				queue.resume();
+				await queue.onIdle();
+				const expected = priorities
+					.map(function (priority, id) {
+						return { priority, id };
+					})
+					.sort(function (a, b) {
+						return b.priority - a.priority;
+					})
+					.map(function (task) {
+						return task.id;
+					});
+				expect(order).toEqual(expected);
+			})
+		);
+	});
+
+	it('createRateLimiter starts every call as early as the sliding window allows, in FIFO order', async function () {
+		await fc.assert(
+			fc.asyncProperty(
+				fc.integer({ min: 1, max: 3 }),
+				fc.integer({ min: 1, max: 50 }),
+				fc.array(fc.integer({ min: 0, max: 40 }), { maxLength: 15 }),
+				async function (limit, interval, gaps) {
+					jest.useFakeTimers({ now: 0 });
+					try {
+						const limiter = createRateLimiter({ limit, interval });
+						const starts: number[] = [];
+						const requests: number[] = [];
+						let time = 0;
+						for (const gap of gaps) {
+							await jest.advanceTimersByTimeAsync(gap);
+							time += gap;
+							requests.push(time);
+							limiter.schedule(function () {
+								starts.push(Date.now());
+							});
+						}
+						await jest.advanceTimersByTimeAsync(interval * (gaps.length + 1));
+						// Reference: call i starts at max(its request, the previous start, the start `limit` calls earlier + interval).
+						const expected: number[] = [];
+						requests.forEach(function (request, i) {
+							expected.push(Math.max(request, i > 0 ? expected[i - 1] : 0, i >= limit ? expected[i - limit] + interval : 0));
+						});
+						expect(starts).toEqual(expected);
+						expect(jest.getTimerCount()).toBe(0);
+					} finally {
+						jest.useRealTimers();
+					}
+				}
+			),
+			{ numRuns: 60 }
+		);
+	});
+
+	it('memoizeAsync calls the function once per distinct key, whatever the interleaving', async function () {
+		await fc.assert(
+			fc.asyncProperty(fc.array(fc.record({ key: fc.integer({ min: 0, max: 5 }), ticks: fc.integer({ min: 0, max: 3 }) }), { maxLength: 30 }), async function (calls) {
+				const counts = new Map<number, number>();
+				const memo = memoizeAsync(async function (key: number) {
+					counts.set(key, (counts.get(key) ?? 0) + 1);
+					await yieldTicks(key);
+					return key * 10;
+				});
+				const results = await Promise.all(
+					calls.map(async function (call) {
+						await yieldTicks(call.ticks);
+						return memo(call.key);
+					})
+				);
+				expect(results).toEqual(
+					calls.map(function (call) {
+						return call.key * 10;
+					})
+				);
+				for (const count of counts.values()) expect(count).toBe(1);
+				expect(counts.size).toBe(
+					new Set(
+						calls.map(function (call) {
+							return call.key;
+						})
+					).size
+				);
+			})
+		);
 	});
 });

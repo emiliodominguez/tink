@@ -452,3 +452,55 @@ describe('iterables (properties)', function () {
 		});
 	});
 });
+
+describe('mapConcurrent (properties)', function () {
+	function ascending(a: number, b: number): number {
+		return a - b;
+	}
+
+	async function yieldTicks(n: number): Promise<void> {
+		for (let i = 0; i < n; i++) await Promise.resolve();
+	}
+
+	it('ordered output equals Array#map; unordered output is a permutation of it; read-ahead never exceeds concurrency', async function () {
+		await fc.assert(
+			fc.asyncProperty(
+				fc.array(fc.record({ value: smallInt, delay: fc.nat({ max: 6 }) }), { maxLength: 25 }),
+				fc.oneof(positive, fc.constant(Infinity)),
+				fc.boolean(),
+				async function (items, concurrency, ordered) {
+					let produced = 0;
+					let consumed = 0;
+					let maxAhead = 0;
+					const source = (async function* () {
+						for (const item of items) {
+							produced++;
+							maxAhead = Math.max(maxAhead, produced - consumed);
+							yield item;
+						}
+					})();
+					const output: number[] = [];
+					for await (const value of helpers.mapConcurrent(
+						source,
+						async function (item) {
+							await yieldTicks(item.delay);
+							return item.value * 2;
+						},
+						{ concurrency, ordered }
+					)) {
+						consumed++;
+						output.push(value);
+						await yieldTicks(2);
+					}
+					const expected = items.map(function (item) {
+						return item.value * 2;
+					});
+					if (ordered) expect(output).toEqual(expected);
+					else expect(output.slice().sort(ascending)).toEqual(expected.slice().sort(ascending));
+					// The item being consumed plus at most `concurrency` buffered ones.
+					expect(maxAhead).toBeLessThanOrEqual(Math.min(concurrency, items.length) + 1);
+				}
+			)
+		);
+	});
+});

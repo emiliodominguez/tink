@@ -1,5 +1,5 @@
 import { memoize, type MemoizeCache } from '../functions/index.js';
-import { createLRUCache, type LRUCache, type LRUEvictionReason } from '.';
+import { createLRUCache, createPriorityQueue, type LRUCache, type LRUEvictionReason } from '.';
 
 function fakeClock(start = 0) {
 	const clock = {
@@ -540,5 +540,134 @@ describe('createLRUCache', function () {
 			cache.set('a', 1);
 			expect(cache.size).toBe(1);
 		});
+	});
+});
+
+describe('createPriorityQueue', function () {
+	function ascending(a: number, b: number): number {
+		return a - b;
+	}
+
+	it('throws a TypeError when compare is not a function', function () {
+		expect(function () {
+			createPriorityQueue(undefined as any);
+		}).toThrow(new TypeError('createPriorityQueue: `compare` must be a function, got undefined'));
+	});
+
+	it('pops values in comparator order', function () {
+		const queue = createPriorityQueue(ascending);
+		for (const n of [5, 1, 4, 1, 5, 9, 2, 6]) queue.push(n);
+		const popped: number[] = [];
+		while (queue.size > 0) popped.push(queue.pop() as number);
+		expect(popped).toEqual([1, 1, 2, 4, 5, 5, 6, 9]);
+		expect(queue.pop()).toBeUndefined();
+		expect(queue.peek()).toBeUndefined();
+	});
+
+	it('returns the new size from push and peeks without removing', function () {
+		const queue = createPriorityQueue(ascending);
+		expect(queue.push(3)).toBe(1);
+		expect(queue.push(1)).toBe(2);
+		expect(queue.peek()).toBe(1);
+		expect(queue.size).toBe(2);
+		expect(Object.getOwnPropertyDescriptor(queue, 'size')).toMatchObject({ enumerable: true, configurable: true });
+	});
+
+	it('is stable: equal values leave in insertion order (FIFO)', function () {
+		const queue = createPriorityQueue(function (a: { p: number; id: number }, b: { p: number; id: number }) {
+			return b.p - a.p;
+		});
+		const items = [
+			{ p: 1, id: 0 },
+			{ p: 2, id: 1 },
+			{ p: 1, id: 2 },
+			{ p: 2, id: 3 },
+			{ p: 1, id: 4 },
+			{ p: 1, id: 5 },
+			{ p: 2, id: 6 }
+		];
+		for (const item of items) queue.push(item);
+		const ids: number[] = [];
+		for (let item = queue.pop(); item !== undefined; item = queue.pop()) ids.push(item.id);
+		expect(ids).toEqual([1, 3, 6, 0, 2, 4, 5]);
+	});
+
+	it('treats a NaN comparison as equal (insertion order)', function () {
+		const queue = createPriorityQueue(function (): number {
+			return NaN;
+		});
+		for (const value of ['a', 'b', 'c', 'd']) queue.push(value);
+		expect([...queue]).toEqual(['a', 'b', 'c', 'd']);
+		expect([queue.pop(), queue.pop(), queue.pop(), queue.pop()]).toEqual(['a', 'b', 'c', 'd']);
+	});
+
+	it('iterates a sorted snapshot without changing the queue', function () {
+		const queue = createPriorityQueue(ascending);
+		for (const n of [3, 1, 2]) queue.push(n);
+		const iterator = queue[Symbol.iterator]();
+		queue.push(0);
+		expect([...iterator]).toEqual([1, 2, 3]);
+		expect([...queue]).toEqual([0, 1, 2, 3]);
+		expect(queue.size).toBe(4);
+	});
+
+	it('deletes the oldest occurrence of a value and keeps the heap valid', function () {
+		const queue = createPriorityQueue(function (a: { p: number }, b: { p: number }) {
+			return a.p - b.p;
+		});
+		const shared = { p: 5 };
+		const values = [{ p: 4 }, shared, { p: 1 }, { p: 7 }, shared, { p: 3 }, { p: 6 }, { p: 2 }];
+		for (const value of values) queue.push(value);
+		expect(queue.delete({ p: 1 })).toBe(false);
+		expect(queue.delete(values[2])).toBe(true);
+		expect(queue.delete(shared)).toBe(true);
+		expect(queue.size).toBe(6);
+		expect(
+			[...queue].map(function (value) {
+				return value.p;
+			})
+		).toEqual([2, 3, 4, 5, 6, 7]);
+		expect(queue.delete(shared)).toBe(true);
+		expect(queue.delete(shared)).toBe(false);
+		const order: number[] = [];
+		for (let value = queue.pop(); value !== undefined; value = queue.pop()) order.push(value.p);
+		expect(order).toEqual([2, 3, 4, 6, 7]);
+	});
+
+	it('deletes the last slot and the only value', function () {
+		const queue = createPriorityQueue(ascending);
+		queue.push(1);
+		queue.push(2);
+		expect(queue.delete(2)).toBe(true);
+		expect(queue.delete(1)).toBe(true);
+		expect(queue.size).toBe(0);
+		expect(queue.peek()).toBeUndefined();
+	});
+
+	it('keeps FIFO order among equal values after a delete moves one of them', function () {
+		const queue = createPriorityQueue(function (a: { p: number; id: string }, b: { p: number; id: string }) {
+			return a.p - b.p;
+		});
+		const items = ['a', 'b', 'c', 'd', 'e', 'f'].map(function (id) {
+			return { p: 0, id };
+		});
+		for (const item of items) queue.push(item);
+		queue.delete(items[1]);
+		expect(
+			[...queue].map(function (item) {
+				return item.id;
+			})
+		).toEqual(['a', 'c', 'd', 'e', 'f']);
+	});
+
+	it('clears every value', function () {
+		const queue = createPriorityQueue(ascending);
+		queue.push(1);
+		queue.push(2);
+		queue.clear();
+		expect(queue.size).toBe(0);
+		expect([...queue]).toEqual([]);
+		queue.push(3);
+		expect(queue.pop()).toBe(3);
 	});
 });

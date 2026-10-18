@@ -1,4 +1,4 @@
-import { assertInteger, assertNumber, draw } from '../utils/assert.js';
+import { assertInteger, assertNumber, describe, draw } from '../utils/assert.js';
 import type { RandomGenerator } from '../utils/index.js';
 
 /**
@@ -144,9 +144,9 @@ export function round(number: number, decimals = 0): number {
 	// `1 / -0` is `-Infinity`.
 	const negative = 1 / number < 0;
 	const shifted = shiftDecimal(Math.abs(number), decimals);
-	// Non-finite input (whose string is not a number), or the number already has fewer fractional digits than requested:
-	// rounding is the identity.
-	if (!Number.isFinite(shifted)) return number;
+	// Non-finite input (whose string is not a number), or the number already has at most `decimals` fractional digits: rounding is
+	// the identity (shifting 17 significant digits there and back could change the last one).
+	if (!Number.isFinite(shifted) || decimalPlaces(number) <= decimals) return number;
 	const rounded = shiftDecimal(Math.round(shifted), -decimals);
 	return negative ? -rounded : rounded;
 }
@@ -287,25 +287,80 @@ export function log(number: number, base: number): number {
 }
 
 /**
- * Returns the smallest integer greater than or equal to a number.
+ * Rounds a number up (towards `+Infinity`) to a given number of decimal places. Like {@link round}, it works on the decimal
+ * representation, so values are rounded as written: `ceil(1.1, 2) === 1.1` (the naive `Math.ceil(1.1 * 100) / 100` gives `1.11`).
+ * Negative `decimals` round up to tens, hundreds, etc. Without `decimals` it is exactly `Math.ceil`. Non-finite input is returned as-is.
  * @param {number} number - The number to round up
- * @returns {number} The smallest integer greater than or equal to the number
+ * @param {number} [decimals=0] - The number of decimal places to keep (integer, may be negative)
+ * @returns {number} The smallest multiple of `10 ** -decimals` greater than or equal to the number
+ * @throws {RangeError} when `decimals` is not an integer
+ * @throws {TypeError} when `decimals` is not a number
  * @example
  * ceil(3.14); // => 4
+ * ceil(1.1, 2); // => 1.1
+ * ceil(4.006, 2); // => 4.01
+ * ceil(-4.006, 2); // => -4
+ * ceil(6040, -2); // => 6100
  */
-export function ceil(number: number): number {
-	return Math.ceil(number);
+export function ceil(number: number, decimals = 0): number {
+	return decimals === 0 ? Math.ceil(number) : roundDirected('ceil', Math.ceil, number, decimals);
 }
 
 /**
- * Returns the largest integer less than or equal to a number.
+ * Rounds a number down (towards `-Infinity`) to a given number of decimal places. Like {@link round}, it works on the decimal
+ * representation, so values are rounded as written: `floor(4.35, 2) === 4.35` (the naive `Math.floor(4.35 * 100) / 100` gives `4.34`).
+ * Negative `decimals` round down to tens, hundreds, etc. Without `decimals` it is exactly `Math.floor`. Non-finite input is returned as-is.
  * @param {number} number - The number to round down
- * @returns {number} The largest integer less than or equal to the number
+ * @param {number} [decimals=0] - The number of decimal places to keep (integer, may be negative)
+ * @returns {number} The largest multiple of `10 ** -decimals` less than or equal to the number
+ * @throws {RangeError} when `decimals` is not an integer
+ * @throws {TypeError} when `decimals` is not a number
  * @example
  * floor(3.14); // => 3
+ * floor(4.35, 2); // => 4.35
+ * floor(1.239, 2); // => 1.23
+ * floor(-1.231, 2); // => -1.24
+ * floor(4060, -2); // => 4000
  */
-export function floor(number: number): number {
-	return Math.floor(number);
+export function floor(number: number, decimals = 0): number {
+	return decimals === 0 ? Math.floor(number) : roundDirected('floor', Math.floor, number, decimals);
+}
+
+/**
+ * Rounds a number up or down at a decimal precision, on its decimal representation (shared by {@link ceil} and {@link floor}).
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {(value: number) => number} method - `Math.ceil` or `Math.floor`
+ * @param {number} number - The number to round
+ * @param {number} decimals - The number of decimal places to keep
+ * @returns {number} The rounded number
+ * @throws {RangeError} when `decimals` is not an integer
+ * @throws {TypeError} when `decimals` is not a number
+ * @example
+ * roundDirected('ceil', Math.ceil, 1.1, 2); // => 1.1
+ */
+function roundDirected(caller: string, method: (value: number) => number, number: number, decimals: number): number {
+	assertNumber(caller, 'decimals', decimals, Number.isInteger(decimals), 'an integer');
+	// Fast path (see `round`): unless the scaled product lies within a safety margin of an integer, it rounds to the same integer `k` as
+	// the decimal-shifted value, and `k / 10 ** decimals` is the double nearest to `k e-decimals`.
+	const scale = POWERS_OF_TEN[decimals];
+	const scaled = number * scale;
+	if (Math.abs(scaled - Math.round(scaled)) > Math.abs(scaled) * 2 ** -46) return method(scaled) / scale;
+	if (!Number.isFinite(number)) return number;
+	// The shortest decimal representation is `digits * 10 ** -places`; the last `drop` digits go. Working on the digits (not on a
+	// shifted double, which cannot hold a fraction beyond 2 ** 52) converts to a double only once, so the result never crosses `number`.
+	const [mantissa, exponent = '0'] = String(Math.abs(number)).split('e');
+	const [whole, fraction = ''] = mantissa.split('.');
+	const digits = whole + fraction;
+	const drop = fraction.length - Number(exponent) - decimals;
+	// Already at most `decimals` fractional digits: unchanged.
+	if (drop <= 0) return number;
+	const kept = BigInt(digits.slice(0, Math.max(0, digits.length - drop)) || 0);
+	const negative = 1 / number < 0;
+	// Ceiling a positive number or flooring a negative one moves its magnitude up when a non-zero digit is dropped.
+	const away = (method === Math.ceil) !== negative && /[1-9]/.test(digits.slice(-drop));
+	// A zero result keeps the sign of `number` (`ceil(-0.001, 2)` is `-0`, like `Math.ceil(-0.1)`).
+	const result = Number(`${away ? kept + 1n : kept}e${-decimals}`);
+	return negative ? -result : result;
 }
 
 /**
@@ -816,6 +871,17 @@ export interface FormatBytesOptions {
 	base?: 1000 | 1024;
 }
 
+/**
+ * Throws unless `base` is `1000` or `1024`.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {unknown} base - The value to check
+ * @returns {void}
+ * @throws {RangeError} when `base` is neither `1000` nor `1024`
+ */
+function assertByteBase(caller: string, base: unknown): void {
+	if (base !== 1000 && base !== 1024) throw new RangeError(`${caller}: \`base\` must be 1000 or 1024, got ${String(base)}`);
+}
+
 const SI_BYTE_UNITS: ReadonlyArray<string> = ['B', 'kB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
 const IEC_BYTE_UNITS: ReadonlyArray<string> = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB'];
 
@@ -836,17 +902,18 @@ function interpolateSorted(low: number, high: number, t: number): number {
 }
 
 /**
- * Counts the decimal places in the shortest decimal representation of a finite number.
+ * Counts the decimal places in the shortest decimal representation of a finite number: the power of ten `-k` of its last
+ * significant digit, so it is negative for large numbers written in exponential form (`1.5e+22` has `-21`).
  * @param {number} value - A finite number
- * @returns {number} The number of digits after the decimal point (`0` for integers)
+ * @returns {number} The number of digits after the decimal point (`0` for integers written in full, negative for `1e21` and above)
  * @example
  * decimalPlaces(0.25); // => 2
  * decimalPlaces(1e-7); // => 7
+ * decimalPlaces(1.5e22); // => -21
  */
 function decimalPlaces(value: number): number {
-	const [mantissa, exponent = '0'] = String(Math.abs(value)).split('e');
-	const fraction = mantissa.split('.')[1] ?? '';
-	return Math.max(0, fraction.length - Number(exponent));
+	const [mantissa, exponent = '0'] = String(value).split('e');
+	return (mantissa.split('.')[1] ?? '').length - Number(exponent);
 }
 
 /**
@@ -1037,7 +1104,7 @@ export function formatBytes(bytes: number, options: FormatBytesOptions = {}): st
 	const { decimals = 1, base = 1000 } = options;
 	assertNumber('formatBytes', 'bytes', bytes, Number.isFinite(bytes), 'a finite number');
 	assertInteger('formatBytes', 'decimals', decimals);
-	if (base !== 1000 && base !== 1024) throw new RangeError(`formatBytes: \`base\` must be 1000 or 1024, got ${base}`);
+	assertByteBase('formatBytes', base);
 
 	const units = base === 1024 ? IEC_BYTE_UNITS : SI_BYTE_UNITS;
 	const magnitude = Math.abs(bytes);
@@ -1050,6 +1117,73 @@ export function formatBytes(bytes: number, options: FormatBytesOptions = {}): st
 	}
 	// A template literal prints `-0` as "0", so tiny negative values do not print as "-0".
 	return `${value} ${units[exponent]}`;
+}
+
+/**
+ * Options accepted by {@link parseBytes}.
+ */
+export interface ParseBytesOptions {
+	/**
+	 * The multiple denoted by the SI symbols (`kB`/`KB`, `MB`, …): `1000` (SI, default) or `1024` (the JEDEC convention, as used by
+	 * Windows and for memory sizes). IEC symbols (`KiB`, `MiB`, …) always denote powers of `1024`.
+	 * @default 1000
+	 */
+	base?: 1000 | 1024;
+}
+
+/**
+ * A byte size: a decimal number (optional minus sign, optional fraction and exponent) and an optional unit symbol, possibly
+ * separated by whitespace, with whitespace around. The unit needs a letter, so the whitespace before and after it cannot be
+ * split in several ways (matching is linear).
+ */
+const BYTES_REGEX = /^\s*(-?(?:\d+(?:\.\d+)?|\.\d+))(?:[eE]([+-]?\d+))?(?:\s*([A-Za-z]+))?\s*$/;
+
+/**
+ * Parses a human-readable byte size into a number of bytes: the strict inverse of {@link formatBytes}.
+ *
+ * The unit symbols are case-sensitive and exact: `B`, the SI symbols `kB` (or `KB`), `MB`, `GB`, `TB`, `PB`, `EB`, `ZB`, `YB`
+ * (powers of `base`, `1000` by default) and the IEC symbols `KiB`, `MiB`, `GiB`, `TiB`, `PiB`, `EiB`, `ZiB`, `YiB` (always powers
+ * of `1024`). A bare number is a number of bytes. Anything else (an unknown unit such as `'KiBs'`, bits such as `'Mb'`, a missing
+ * number, trailing text) throws instead of being half-parsed: `bytes.parse('1KiB')` returns `1`, `parseBytes('1KiB')` returns `1024`.
+ * Leading and trailing whitespace is ignored. SI multiples are applied to the decimal digits, so `parseBytes('1.1 kB') === 1100`
+ * exactly (not `1100.0000000000002`). Fractional results are returned as-is (`'0.5 kB'` is `500`, `'1.5 B'` is `1.5`).
+ *
+ * `parseBytes(formatBytes(n, options), options)` is `n` rounded as `formatBytes` displays it, and
+ * `formatBytes(parseBytes(text, options), options) === text` for every `text` that `formatBytes` produced.
+ * @param {string} value - The text to parse, e.g. `'1.5 MB'`, `'2KiB'` or `'512'`
+ * @param {ParseBytesOptions} [options={}] - `base`: what the SI symbols denote, `1000` (default) or `1024`
+ * @returns {number} The number of bytes
+ * @throws {TypeError} when `value` is not a string
+ * @throws {RangeError} when `value` is not a valid byte size, the result is not finite, or `base` is not `1000` or `1024`
+ * @example
+ * parseBytes('1.5 kB'); // => 1500
+ * parseBytes('1 MiB'); // => 1_048_576
+ * parseBytes('1KiB'); // => 1024
+ * parseBytes('2 MB', { base: 1024 }); // => 2_097_152
+ * parseBytes('-2 KiB'); // => -2048
+ * parseBytes('512'); // => 512
+ * parseBytes('1 Mb'); // throws RangeError (bits are not bytes)
+ * parseBytes('12 apples'); // throws RangeError
+ */
+export function parseBytes(value: string, options: ParseBytesOptions = {}): number {
+	const { base = 1000 } = options;
+	assertByteBase('parseBytes', base);
+	if (typeof value !== 'string') throw new TypeError(`parseBytes: \`value\` must be a string, got ${describe(value)}`);
+	const match = BYTES_REGEX.exec(value);
+	let bytes = NaN;
+	if (match !== null) {
+		const unit = match[3] === 'KB' ? 'kB' : match[3] || 'B';
+		// `-1` for an unknown unit; the IEC symbols are the only ones with three letters.
+		const power = Math.max(SI_BYTE_UNITS.indexOf(unit), IEC_BYTE_UNITS.indexOf(unit));
+		const decimal = base === 1000 && unit.length < 3;
+		// SI multiples go into the decimal exponent, so the text is converted to a double only once.
+		if (power >= 0) bytes = Number(`${match[1]}e${Number(match[2] ?? 0) + (decimal ? 3 * power : 0)}`) * (decimal ? 1 : Math.pow(1024, power));
+	}
+	if (!Number.isFinite(bytes)) {
+		const shown = value.length > 50 ? `${value.slice(0, 50)}…` : value;
+		throw new RangeError(`parseBytes: \`value\` must be a finite byte size such as '1.5 MB' or '2 KiB', got ${JSON.stringify(shown)}`);
+	}
+	return bytes;
 }
 
 /**
@@ -1131,7 +1265,7 @@ export function roundToStep(value: number, step: number): number {
 	// Work on the magnitude and restore the sign at the end, exactly like `round` (ties away from zero, `-0` preserved).
 	const negative = 1 / value < 0;
 	const magnitude = Math.abs(value);
-	const stepDecimals = decimalPlaces(step);
+	const stepDecimals = Math.max(0, decimalPlaces(step));
 	const shift = Math.max(decimalPlaces(magnitude), stepDecimals);
 	const scaledValue = shiftDecimal(magnitude, shift);
 	const scaledStep = shiftDecimal(step, shift);

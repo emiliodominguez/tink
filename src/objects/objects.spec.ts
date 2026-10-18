@@ -2055,3 +2055,1237 @@ describe('Objects helpers', function () {
 		});
 	});
 });
+
+describe('Objects helpers (round 11)', function () {
+	const HOSTILE = '{"__proto__":{"x":1},"constructor":{"prototype":{"x":1}}}';
+
+	function hostile(): any {
+		return JSON.parse(HOSTILE);
+	}
+
+	function expectNoPollution(): void {
+		expect(({} as any).x).toBeUndefined();
+		expect((Object.prototype as any).x).toBeUndefined();
+		expect((Object as any).prototype.x).toBeUndefined();
+	}
+
+	describe('defaults', function () {
+		it('fills only absent and undefined keys, first value wins', function () {
+			expect(helpers.defaults({ a: 1, b: undefined, c: null, e: 0 } as any, { a: 9, b: 2, c: 3, d: 4, e: 5 }, { d: 8, f: 6 })).toStrictEqual({
+				a: 1,
+				b: 2,
+				c: null,
+				e: 0,
+				d: 4,
+				f: 6
+			});
+		});
+
+		it('returns a new object, does not mutate inputs and keeps nested values by reference', function () {
+			const target = { a: { x: 1 } };
+			const source = { a: { y: 2 }, b: { z: 3 } };
+			const result = helpers.defaults(target, source);
+			expect(result).not.toBe(target);
+			expect(result.a).toBe(target.a);
+			expect(result.b).toBe(source.b);
+			expect(target).toStrictEqual({ a: { x: 1 } });
+		});
+
+		it('keeps a null prototype and skips nullish sources', function () {
+			const target = Object.create(null);
+			target.a = 1;
+			const result = helpers.defaults(target, null as any, undefined as any, { b: 2 });
+			expect(Object.getPrototypeOf(result)).toBeNull();
+			expect({ ...result }).toStrictEqual({ a: 1, b: 2 });
+		});
+
+		it('drops unsafe keys from the target and the sources without pollution', function () {
+			const result = helpers.defaults(hostile(), hostile(), { ok: 1 });
+			expect(Object.keys(result)).toStrictEqual(['ok']);
+			expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+			expectNoPollution();
+		});
+
+		it('validates its inputs', function () {
+			expect(function () {
+				helpers.defaults([] as any, {});
+			}).toThrow(new TypeError('defaults: `target` must be a plain object, got object'));
+			expect(function () {
+				helpers.defaults({}, {}, 1 as any);
+			}).toThrow(new TypeError('defaults: `sources[1]` must be a plain object, got number'));
+		});
+
+		it('is typed', function () {
+			const result = helpers.defaults({ a: 1 } as { a: number; b?: string; c: string | undefined }, { b: 'x', c: 'y', d: true });
+			assertType<Equals<typeof result, { a: number; b: string; c: string; d: boolean }>>(true);
+			const both = helpers.defaults({} as { a?: number }, {} as { a?: string });
+			assertType<Equals<typeof both, { a?: string | number | undefined }>>(true);
+		});
+	});
+
+	describe('defaultsDeep', function () {
+		it('fills nested plain objects recursively', function () {
+			const result = helpers.defaultsDeep(
+				{ server: { port: 8080, tls: { on: true } }, list: [1] },
+				{ server: { host: 'h', port: 1, tls: { cert: 'c' } }, list: [2] },
+				{ extra: { a: 1 } }
+			);
+			expect(result).toStrictEqual({ server: { port: 8080, tls: { on: true, cert: 'c' }, host: 'h' }, list: [1], extra: { a: 1 } });
+		});
+
+		it('never writes into an input, copies the plain objects it fills from', function () {
+			const target = { a: { x: 1 } };
+			const first = { b: { y: 1 } };
+			const second = { b: { z: 2 } };
+			const result = helpers.defaultsDeep(target, first, second);
+			expect(result).toStrictEqual({ a: { x: 1 }, b: { y: 1, z: 2 } });
+			expect(result.a).not.toBe(target.a);
+			expect(result.b).not.toBe(first.b);
+			expect(first).toStrictEqual({ b: { y: 1 } });
+			expect(target).toStrictEqual({ a: { x: 1 } });
+		});
+
+		it('keeps present non-plain values and does not recurse into them', function () {
+			const when = new Date(0);
+			const result = helpers.defaultsDeep({ when, n: 0, s: { a: 1 } } as any, { when: { a: 1 }, n: { b: 2 }, s: 'str' });
+			expect(result.when).toBe(when);
+			expect(result.n).toBe(0);
+			expect(result.s).toStrictEqual({ a: 1 });
+		});
+
+		it('drops unsafe keys at every level without pollution', function () {
+			const result = helpers.defaultsDeep({ nested: hostile() }, hostile(), { nested: hostile() });
+			expect(result).toStrictEqual({ nested: {} });
+			expectNoPollution();
+		});
+
+		it('rejects circular inputs', function () {
+			const cyclic: any = { a: {} };
+			cyclic.a.self = cyclic;
+			expect(function () {
+				helpers.defaultsDeep({}, cyclic);
+			}).toThrow(new TypeError('defaultsDeep: cannot merge objects with circular references'));
+		});
+
+		it('is typed', function () {
+			const result = helpers.defaultsDeep({ a: { x: 1 } }, { a: { y: 'y' }, b: true });
+			assertType<Equals<typeof result, { a: { x: number; y: string }; b: boolean }>>(true);
+		});
+	});
+
+	describe('defaultsWith', function () {
+		it('treats null as missing with missing: nullish', function () {
+			expect(helpers.defaultsWith({ missing: 'nullish' }, { a: null, b: undefined, c: 0 }, { a: 1, b: 2, c: 3 })).toStrictEqual({ a: 1, b: 2, c: 0 });
+			expect(helpers.defaultsWith({ missing: 'nullish', deep: true }, { a: { b: null } }, { a: { b: { c: 1 } } })).toStrictEqual({ a: { b: { c: 1 } } });
+		});
+
+		it('combines arrays with concat and union, target items first', function () {
+			expect(helpers.defaultsWith({ arrays: 'concat' }, { a: [1, 2] }, { a: [2, 3] })).toStrictEqual({ a: [1, 2, 2, 3] });
+			expect(helpers.defaultsWith({ arrays: 'union', deep: true }, { o: { a: [1, NaN] } }, { o: { a: [NaN, 3] } })).toStrictEqual({ o: { a: [1, NaN, 3] } });
+			expect(helpers.defaultsWith({ arrays: 'concat' }, { a: 1 }, { a: [2] })).toStrictEqual({ a: 1 });
+		});
+
+		it('is shallow by default', function () {
+			const target = { a: { x: 1 } };
+			expect(helpers.defaultsWith({}, target, { a: { y: 2 } }).a).toBe(target.a);
+		});
+
+		it('validates its options', function () {
+			expect(function () {
+				helpers.defaultsWith(null as any, {});
+			}).toThrow(new TypeError('defaultsWith: `options` must be an object, got null'));
+			expect(function () {
+				helpers.defaultsWith({ missing: 'null' as any }, {});
+			}).toThrow(new RangeError(`defaultsWith: \`missing\` must be 'undefined' or 'nullish', got "null"`));
+			expect(function () {
+				helpers.defaultsWith({ arrays: 'merge' as any }, {});
+			}).toThrow(new RangeError(`defaultsWith: \`arrays\` must be 'replace', 'concat' or 'union', got "merge"`));
+		});
+
+		it('drops unsafe keys without pollution', function () {
+			expect(helpers.defaultsWith({ deep: true, missing: 'nullish', arrays: 'union' }, {}, hostile())).toStrictEqual({});
+			expectNoPollution();
+		});
+
+		it('is typed from the options', function () {
+			const deep = helpers.defaultsWith({ deep: true }, { a: { x: 1 } }, { a: { y: 'y' } });
+			assertType<Equals<typeof deep, { a: { x: number; y: string } }>>(true);
+			const combined = helpers.defaultsWith({ arrays: 'concat' }, { a: [1] }, { a: ['x'] });
+			assertType<Equals<typeof combined, { a: Array<number | string> }>>(true);
+			const shallow = helpers.defaultsWith({}, { a: [1] }, { a: ['x'] });
+			assertType<Equals<typeof shallow, { a: number[] }>>(true);
+		});
+	});
+
+	describe('deepMergeWith', function () {
+		it('behaves like deepMerge with replace', function () {
+			const target = { a: { x: 1, y: 2 }, list: [1, 2] };
+			const source = { a: { y: 3 }, list: [9] };
+			expect(helpers.deepMergeWith({}, target, source)).toStrictEqual(helpers.deepMerge(target, source));
+			expect(helpers.deepMergeWith({ arrays: 'replace' }, target, source).list).toBe(source.list);
+		});
+
+		it('concatenates or unites arrays at the same key (never merges them by index)', function () {
+			expect(helpers.deepMergeWith({ arrays: 'concat' }, { a: [1, 2], o: { b: [1] } }, { a: [2, 3], o: { b: [1] } })).toStrictEqual({
+				a: [1, 2, 2, 3],
+				o: { b: [1, 1] }
+			});
+			expect(helpers.deepMergeWith({ arrays: 'union' }, { a: [1, 2] }, { a: [2, 3] }, { a: [3, 4] })).toStrictEqual({ a: [1, 2, 3, 4] });
+			expect(helpers.deepMergeWith({ arrays: 'concat' }, { a: 1 }, { a: [2] })).toStrictEqual({ a: [2] });
+		});
+
+		it('does not use the species of an array subclass', function () {
+			class Tracked extends Array<number> {
+				static override get [Symbol.species](): ArrayConstructor {
+					throw new Error('species used');
+				}
+			}
+			const tracked = Tracked.from([1]);
+			const result = helpers.deepMergeWith({ arrays: 'concat' }, { a: tracked }, { a: [2] });
+			expect(result.a).toStrictEqual([1, 2]);
+			expect(Object.getPrototypeOf(result.a)).toBe(Array.prototype);
+		});
+
+		it('calls the customizer for every source key with the path, falling back on undefined', function () {
+			const calls: unknown[] = [];
+			const result = helpers.deepMergeWith(
+				{
+					customizer: function (targetValue: unknown, sourceValue: unknown, context: helpers.MergeCustomizerContext) {
+						calls.push(helpers.deepClone([targetValue, sourceValue, context.key, context.path]));
+						return typeof targetValue === 'number' && typeof sourceValue === 'number' ? targetValue + sourceValue : undefined;
+					}
+				},
+				{ hits: 1, nested: { n: 1 }, keep: 'k' },
+				{ hits: 2, nested: { n: 5, s: 's' } }
+			);
+			expect(result).toStrictEqual({ hits: 3, nested: { n: 6, s: 's' }, keep: 'k' });
+			expect(calls).toStrictEqual([
+				[1, 2, 'hits', ['hits']],
+				[{ n: 1 }, { n: 5, s: 's' }, 'nested', ['nested']],
+				[1, 5, 'n', ['nested', 'n']],
+				[undefined, 's', 's', ['nested', 's']]
+			]);
+		});
+
+		it('stores the customizer result as is', function () {
+			const replacement = { replaced: true };
+			const result = helpers.deepMergeWith(
+				{
+					customizer: function (_targetValue: unknown, _sourceValue: unknown, context: helpers.MergeCustomizerContext) {
+						return context.key === 'a' ? replacement : undefined;
+					}
+				},
+				{ a: { x: 1 } },
+				{ a: { y: 2 } }
+			);
+			expect(result.a).toBe(replacement);
+		});
+
+		it('validates its options and inputs', function () {
+			expect(function () {
+				helpers.deepMergeWith('x' as any, {});
+			}).toThrow(new TypeError('deepMergeWith: `options` must be an object, got string'));
+			expect(function () {
+				helpers.deepMergeWith({ customizer: 1 as any }, {});
+			}).toThrow(new TypeError('deepMergeWith: `customizer` must be a function, got number'));
+			expect(function () {
+				helpers.deepMergeWith({}, {}, new Map() as any);
+			}).toThrow(new TypeError('deepMergeWith: `sources[0]` must be a plain object, got object'));
+		});
+
+		it('drops unsafe keys without pollution, even with a customizer', function () {
+			const seen: PropertyKey[] = [];
+			const result = helpers.deepMergeWith(
+				{
+					arrays: 'concat',
+					customizer: function (_t: unknown, _s: unknown, context: helpers.MergeCustomizerContext) {
+						seen.push(context.key);
+						return undefined;
+					}
+				},
+				{ a: 1 },
+				hostile()
+			);
+			expect(result).toStrictEqual({ a: 1 });
+			expect(seen).toStrictEqual([]);
+			expectNoPollution();
+		});
+
+		it('is typed', function () {
+			const replace = helpers.deepMergeWith({ arrays: 'replace' }, { a: [1], b: { x: 1 } }, { a: ['x'], b: { y: true } });
+			assertType<Equals<typeof replace, { a: string[]; b: { x: number; y: boolean } }>>(true);
+			const concat = helpers.deepMergeWith({ arrays: 'union' }, { a: [1] }, { a: ['x'] });
+			assertType<Equals<typeof concat, { a: Array<number | string> }>>(true);
+			const custom = helpers.deepMergeWith(
+				{
+					customizer: function () {
+						return undefined;
+					}
+				},
+				{ a: 1 },
+				{ b: 2 }
+			);
+			assertType<Equals<typeof custom, Record<PropertyKey, unknown>>>(true);
+		});
+	});
+
+	describe('updateInObjectByKeys', function () {
+		const state = { user: { name: 'Ada', visits: 1 }, todos: [{ done: false }, { done: true }], other: { x: 1 } };
+
+		it('replaces the value at the path with structural sharing', function () {
+			const next = helpers.updateInObjectByKeys(state, 'todos.0.done', true);
+			expect(next).toStrictEqual({ user: { name: 'Ada', visits: 1 }, todos: [{ done: true }, { done: true }], other: { x: 1 } });
+			expect(state.todos[0].done).toBe(false);
+			expect(next).not.toBe(state);
+			expect(next.todos).not.toBe(state.todos);
+			expect(Array.isArray(next.todos)).toBe(true);
+			expect(next.todos[1]).toBe(state.todos[1]);
+			expect(next.user).toBe(state.user);
+			expect(next.other).toBe(state.other);
+		});
+
+		it('applies an updater to the current value', function () {
+			const next = helpers.updateInObjectByKeys(state, 'user.visits', function (visits) {
+				return visits + 1;
+			});
+			expect(next.user.visits).toBe(2);
+			expect(state.user.visits).toBe(1);
+			const missing = helpers.updateInObjectByKeys({} as Record<string, unknown>, 'a.b', function (current: unknown) {
+				return current === undefined ? 'created' : 'existing';
+			});
+			expect(missing).toStrictEqual({ a: { b: 'created' } });
+		});
+
+		it('returns the same object when the value does not change', function () {
+			expect(helpers.updateInObjectByKeys(state, 'user.name', 'Ada')).toBe(state);
+			expect(helpers.updateInObjectByKeys({ a: NaN }, 'a', NaN)).toStrictEqual({ a: NaN });
+			const zero = { a: 0 };
+			expect(helpers.updateInObjectByKeys(zero, 'a', -0)).not.toBe(zero);
+			const absent = {} as { a?: undefined };
+			expect(helpers.updateInObjectByKeys(absent, 'a', undefined)).not.toBe(absent);
+		});
+
+		it('creates missing containers like setInObjectByKeys and shadows inherited values', function () {
+			expect(helpers.updateInObjectByKeys({} as any, 'a.list.0.id', 7)).toStrictEqual({ a: { list: [{ id: 7 }] } });
+			expect(helpers.updateInObjectByKeys({} as any, 'a.5000', 1)).toStrictEqual({ a: { 5000: 1 } });
+			expect(helpers.updateInObjectByKeys({ a: null } as any, 'a.b', 1)).toStrictEqual({ a: { b: 1 } });
+			const result = helpers.updateInObjectByKeys({} as any, 'toString.x', 1);
+			expect(result).toStrictEqual({ toString: { x: 1 } });
+			expect(typeof Object.prototype.toString).toBe('function');
+		});
+
+		it('keeps prototypes of copied plain objects and arrays', function () {
+			const target = Object.assign(Object.create(null), { a: [1, 2] });
+			const next = helpers.updateInObjectByKeys(target, 'a.1', 3);
+			expect(Object.getPrototypeOf(next)).toBeNull();
+			expect(next.a).toStrictEqual([1, 3]);
+			expect(helpers.updateInObjectByKeys([1, [2]], '1.0', 9)).toStrictEqual([1, [9]]);
+		});
+
+		it('throws on paths through primitives or non-plain objects, and on bad roots', function () {
+			expect(function () {
+				helpers.updateInObjectByKeys({ a: 1 } as any, 'a.b', 2);
+			}).toThrow(new TypeError('updateInObjectByKeys: cannot update "a.b": "a" is a number'));
+			expect(function () {
+				helpers.updateInObjectByKeys({ a: { d: new Date(0) } } as any, 'a.d.x', 2);
+			}).toThrow(new TypeError('updateInObjectByKeys: cannot update "a.d.x": "a.d" is an object that is neither a plain object nor an array'));
+			expect(function () {
+				helpers.updateInObjectByKeys({ f: function () {} } as any, 'f.x', 2);
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.updateInObjectByKeys(new Map() as any, 'a', 1);
+			}).toThrow(new TypeError('updateInObjectByKeys: `target` must be a plain object or an array, got object'));
+		});
+
+		it('rejects unsafe and empty segments without pollution', function () {
+			for (const path of ['__proto__.x', 'constructor.prototype.x', 'a.prototype', 'a..b', '']) {
+				expect(function () {
+					helpers.updateInObjectByKeys(hostile(), path, 1);
+				}).toThrow(RangeError);
+			}
+			const result = helpers.updateInObjectByKeys(hostile(), 'safe', 1);
+			expect(Object.keys(result)).toStrictEqual(['__proto__', 'constructor', 'safe']);
+			expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+			expectNoPollution();
+		});
+
+		it('is typed from the path', function () {
+			const next = helpers.updateInObjectByKeys(state, 'user.visits', function (visits) {
+				assertType<Equals<typeof visits, number>>(true);
+				return visits + 1;
+			});
+			assertType<Equals<typeof next, typeof state>>(true);
+			// @ts-expect-error the value must match the type at the path
+			helpers.updateInObjectByKeys(state, 'user.name', 1);
+			helpers.updateInObjectByKeys(state as Record<string, unknown>, 'anything.goes', 1);
+		});
+	});
+
+	describe('omitInObjectByKeys', function () {
+		it('removes the own property at the path with structural sharing', function () {
+			const config = { a: { b: 1, c: 2 }, d: { e: 3 } };
+			const next = helpers.omitInObjectByKeys(config, 'a.b');
+			expect(next).toStrictEqual({ a: { c: 2 }, d: { e: 3 } });
+			expect(config.a).toStrictEqual({ b: 1, c: 2 });
+			expect(next.d).toBe(config.d);
+			assertType<Equals<typeof next, { a: { c: number }; d: { e: number } }>>(true);
+		});
+
+		it('leaves a hole in arrays', function () {
+			const next = helpers.omitInObjectByKeys({ list: [1, 2, 3] }, 'list.1');
+			expect(next.list.length).toBe(3);
+			expect(1 in next.list).toBe(false);
+			assertType<Equals<typeof next, { list: Array<number | undefined> }>>(true);
+			const nested = helpers.omitInObjectByKeys({ list: [{ a: 1, b: 2 }] }, 'list.0.a');
+			expect(nested).toStrictEqual({ list: [{ b: 2 }] });
+			assertType<Equals<typeof nested, { list: Array<{ a: number; b: number } | { b: number }> }>>(true);
+		});
+
+		it('returns the target itself when the path does not exist', function () {
+			const target = { a: { b: 1 }, s: 'str', n: null };
+			expect(helpers.omitInObjectByKeys(target, 'a.x' as never)).toBe(target);
+			expect(helpers.omitInObjectByKeys(target, 'x.y' as never)).toBe(target);
+			expect(helpers.omitInObjectByKeys(target, 's.length' as never)).toBe(target);
+			expect(helpers.omitInObjectByKeys(target, 'n.x' as never)).toBe(target);
+			const empty = {};
+			expect(helpers.omitInObjectByKeys(empty, 'toString' as never)).toBe(empty);
+		});
+
+		it('throws through non-plain objects, and rejects unsafe segments without pollution', function () {
+			expect(function () {
+				helpers.omitInObjectByKeys({ m: new Map() } as any, 'm.size');
+			}).toThrow(new TypeError('omitInObjectByKeys: cannot update "m.size": "m" is an object that is neither a plain object nor an array'));
+			expect(function () {
+				helpers.omitInObjectByKeys(hostile(), '__proto__.x');
+			}).toThrow(new RangeError('omitInObjectByKeys: `path` must not contain the unsafe segment "__proto__", got "__proto__.x"'));
+			expect(function () {
+				helpers.omitInObjectByKeys(1 as any, 'a');
+			}).toThrow(TypeError);
+			expectNoPollution();
+		});
+	});
+
+	describe('toPath', function () {
+		it('parses dots, indices and quoted keys', function () {
+			expect(helpers.toPath('a')).toStrictEqual(['a']);
+			expect(helpers.toPath("users[0]['first.name'].x")).toStrictEqual(['users', '0', 'first.name', 'x']);
+			expect(helpers.toPath('[12]["a]b"][\'\']')).toStrictEqual(['12', 'a]b', '']);
+			expect(helpers.toPath(String.raw`a["q\"q"]['s\'s']["b\\s"]`)).toStrictEqual(['a', 'q"q', "s's", 'b\\s']);
+			expect(helpers.toPath('a-b.c d.$')).toStrictEqual(['a-b', 'c d', '$']);
+		});
+
+		it('rejects malformed paths with a RangeError', function () {
+			const bad: Array<[string, string]> = [
+				['', 'has an empty segment at index 0'],
+				['a..b', 'has an empty segment at index 2'],
+				['a.', 'has an empty segment at index 2'],
+				['.a', 'has an empty segment at index 0'],
+				['a.[0]', 'has an empty segment at index 2'],
+				['a[]', 'must hold a canonical index or a quoted key in brackets at index 1'],
+				['a[-1]', 'must hold a canonical index or a quoted key in brackets at index 1'],
+				['a[01]', 'must hold a canonical index or a quoted key in brackets at index 1'],
+				['a[b]', 'must hold a canonical index or a quoted key in brackets at index 1'],
+				['a[0', 'must hold a canonical index or a quoted key in brackets at index 1'],
+				['a["b"', "is missing ']' at index 5"],
+				['a["b', 'has an unterminated quoted key at index 1'],
+				[String.raw`a["\n"]`, 'has an invalid escape at index 3'],
+				['a["\\', 'has an invalid escape at index 3'],
+				['a[0]b', 'has an unexpected "b" at index 4'],
+				['a]', 'has an unexpected "]" at index 1']
+			];
+			for (const [path, problem] of bad) {
+				expect(function () {
+					helpers.toPath(path);
+				}).toThrow(new RangeError(`toPath: \`path\` ${problem}, got ${JSON.stringify(path)}`));
+			}
+		});
+
+		it('rejects unsafe segments, quoted or not', function () {
+			for (const path of ['__proto__', 'a.constructor', "a['prototype']", 'a["__proto__"].b']) {
+				expect(function () {
+					helpers.toPath(path);
+				}).toThrow(RangeError);
+			}
+		});
+
+		it('rejects non-strings', function () {
+			expect(function () {
+				helpers.toPath(1 as any);
+			}).toThrow(new TypeError('toPath: `path` must be a string, got number'));
+		});
+	});
+
+	describe('isMatch', function () {
+		it('matches nested partial objects (deep, unlike shallow implementations)', function () {
+			expect(helpers.isMatch({ a: { b: 1, c: 2 }, d: 3 }, { a: { b: 1 } })).toBe(true);
+			expect(helpers.isMatch({ a: { b: 1 } }, { a: { b: 2 } })).toBe(false);
+			expect(helpers.isMatch({ a: 1 }, { a: 1, b: 2 })).toBe(false);
+			expect(helpers.isMatch({ a: 1 }, {})).toBe(true);
+			expect(helpers.isMatch(1, {})).toBe(false);
+			expect(helpers.isMatch(null, { a: 1 })).toBe(false);
+		});
+
+		it('matches arrays exactly by default, or as subsets', function () {
+			expect(helpers.isMatch({ a: [1, 2, 3] }, { a: [3] })).toBe(false);
+			expect(helpers.isMatch({ a: [1, 2, 3] }, { a: [1, 2, 3] })).toBe(true);
+			expect(helpers.isMatch({ a: [{ id: 1, x: 1 }] }, { a: [{ id: 1 }] })).toBe(true);
+			expect(helpers.isMatch({ a: [1, 2, 3] }, { a: [3, 1] }, { arrays: 'subset' })).toBe(true);
+			expect(helpers.isMatch({ a: [1, 2, 3] }, { a: [4] }, { arrays: 'subset' })).toBe(false);
+			expect(helpers.isMatch({ a: { 0: 1, length: 1 } }, { a: [1] })).toBe(false);
+			expect(helpers.isMatch([1, 2], { length: 2 })).toBe(true);
+		});
+
+		it('compares leaves with isEqual semantics', function () {
+			expect(helpers.isMatch({ a: NaN, z: -0 }, { a: NaN, z: 0 })).toBe(true);
+			expect(helpers.isMatch({ when: new Date(1) }, { when: new Date(1) })).toBe(true);
+			expect(helpers.isMatch({ m: new Map([[1, { a: 1, b: 2 }]]) }, { m: new Map([[1, { a: 1 }]]) })).toBe(false);
+			expect(helpers.isMatch({ s: new Set([1, 2]) }, { s: new Set([2, 1]) })).toBe(true);
+		});
+
+		it('requires keys holding undefined to be present', function () {
+			expect(helpers.isMatch({ a: undefined }, { a: undefined })).toBe(true);
+			expect(helpers.isMatch({}, { a: undefined })).toBe(false);
+			expect(helpers.isMatch({ a: 1 }, { a: undefined })).toBe(false);
+		});
+
+		it('reads inherited properties but never unsafe keys', function () {
+			class Point {
+				x = 1;
+				get double(): number {
+					return this.x * 2;
+				}
+			}
+			expect(helpers.isMatch(new Point(), { x: 1, double: 2 })).toBe(true);
+			expect(helpers.isMatch({}, { constructor: Object })).toBe(false);
+			expect(helpers.isMatch({}, { toString: Object.prototype.toString })).toBe(false);
+			expect(helpers.isMatch(hostile(), hostile())).toBe(false);
+			const sym = Symbol('s');
+			expect(helpers.isMatch({ [sym]: 1, a: 1 }, { [sym]: 1 })).toBe(true);
+			expect(helpers.isMatch(function () {}, { length: 0 })).toBe(true);
+			expectNoPollution();
+		});
+
+		it('supports circular values and patterns', function () {
+			const value: any = { a: 1 };
+			value.self = value;
+			const pattern: any = { a: 1 };
+			pattern.self = pattern;
+			expect(helpers.isMatch(value, pattern)).toBe(true);
+		});
+
+		it('validates options', function () {
+			expect(function () {
+				helpers.isMatch({}, {}, { arrays: 'partial' as any });
+			}).toThrow(new RangeError(`isMatch: \`arrays\` must be 'exact' or 'subset', got "partial"`));
+		});
+	});
+
+	describe('shallowEqual', function () {
+		it('compares one level of own enumerable keys with SameValueZero', function () {
+			expect(helpers.shallowEqual({ a: 1, b: NaN, c: 0 }, { c: -0, b: NaN, a: 1 })).toBe(true);
+			expect(helpers.shallowEqual({ a: { x: 1 } }, { a: { x: 1 } })).toBe(false);
+			expect(helpers.shallowEqual({ a: 1 }, { a: 1, b: undefined })).toBe(false);
+			expect(helpers.shallowEqual({ a: 1, b: undefined }, { a: 1, c: undefined })).toBe(false);
+			expect(helpers.shallowEqual({ a: 1 }, { a: 2 })).toBe(false);
+			const sym = Symbol('s');
+			expect(helpers.shallowEqual({ [sym]: 1 }, { [sym]: 1 })).toBe(true);
+			expect(helpers.shallowEqual({ [sym]: 1 }, { [sym]: 2 })).toBe(false);
+			expect(helpers.shallowEqual({ toString: Object.prototype.toString }, { x: 1 })).toBe(false);
+			expect(helpers.shallowEqual({ a: 1 }, Object.defineProperties({}, { a: { value: 1 }, b: { value: 2, enumerable: true } }))).toBe(false);
+		});
+
+		it('handles primitives, identity, prototypes and kinds', function () {
+			expect(helpers.shallowEqual(NaN, NaN)).toBe(true);
+			expect(helpers.shallowEqual(1, '1')).toBe(false);
+			expect(helpers.shallowEqual(null, {})).toBe(false);
+			const object = {};
+			expect(helpers.shallowEqual(object, object)).toBe(true);
+			expect(helpers.shallowEqual({}, Object.create(null))).toBe(false);
+			class A {
+				constructor(public v: number) {}
+			}
+			expect(helpers.shallowEqual(new A(1), new A(1))).toBe(true);
+			expect(helpers.shallowEqual(new A(1), new A(2))).toBe(false);
+			expect(helpers.shallowEqual(new A(1), Object.defineProperty(new A(1), Symbol.toStringTag, { value: 'Tagged' }))).toBe(false);
+		});
+
+		it('compares arrays item by item and never equals an array-like', function () {
+			expect(helpers.shallowEqual([1, NaN], [1, NaN])).toBe(true);
+			expect(helpers.shallowEqual([1], [1, 2])).toBe(false);
+			expect(helpers.shallowEqual([{}], [{}])).toBe(false);
+			expect(helpers.shallowEqual([1, 2], { 0: 1, 1: 2, length: 2 })).toBe(false);
+			// eslint-disable-next-line no-sparse-arrays
+			expect(helpers.shallowEqual([1, , 3], [1, undefined, 3])).toBe(false);
+			// eslint-disable-next-line no-sparse-arrays
+			expect(helpers.shallowEqual([1, , 3], [1, , 3])).toBe(true);
+			const fake = Object.assign(Object.create(Array.prototype), { [Symbol.toStringTag]: 'Array' });
+			expect(helpers.shallowEqual([], fake)).toBe(false);
+		});
+
+		it('compares maps, sets and dates by content', function () {
+			expect(helpers.shallowEqual(new Map([['a', 1]]), new Map([['a', 1]]))).toBe(true);
+			expect(helpers.shallowEqual(new Map([['a', 1]]), new Map([['a', 2]]))).toBe(false);
+			expect(helpers.shallowEqual(new Map([['a', 1]]), new Map([['b', 1]]))).toBe(false);
+			expect(helpers.shallowEqual(new Map(), new Map([['a', 1]]))).toBe(false);
+			expect(helpers.shallowEqual(new Set([1, 2]), new Set([2, 1]))).toBe(true);
+			expect(helpers.shallowEqual(new Set([1]), new Set([2]))).toBe(false);
+			expect(helpers.shallowEqual(new Set([1]), new Set([1, 2]))).toBe(false);
+			expect(helpers.shallowEqual(new Date(1), new Date(1))).toBe(true);
+			expect(helpers.shallowEqual(new Date(1), new Date(2))).toBe(false);
+			const fakeMap = Object.create(Map.prototype);
+			const fakeSet = Object.create(Set.prototype);
+			const fakeDate = Object.defineProperty(Object.create(Date.prototype), Symbol.toStringTag, { value: 'Date' });
+			expect(helpers.shallowEqual(new Map(), fakeMap)).toBe(false);
+			expect(helpers.shallowEqual(new Set(), fakeSet)).toBe(false);
+			expect(helpers.shallowEqual(new Date(0), fakeDate)).toBe(false);
+		});
+
+		it('treats objects with other internal state as equal only to themselves', function () {
+			expect(helpers.shallowEqual(/a/, /a/)).toBe(false);
+			expect(helpers.shallowEqual(new Uint8Array([1]), new Uint8Array([1]))).toBe(false);
+			expect(helpers.shallowEqual(new Error('x'), new Error('x'))).toBe(false);
+			expect(helpers.shallowEqual(Promise.resolve(1), Promise.resolve(1))).toBe(false);
+		});
+	});
+
+	describe('isEqualWith', function () {
+		it('lets the customizer decide pairs, falling back to isEqual', function () {
+			function caseless(a: unknown, b: unknown) {
+				return typeof a === 'string' && typeof b === 'string' ? a.toLowerCase() === b.toLowerCase() : undefined;
+			}
+			expect(helpers.isEqualWith({ name: 'ADA', tags: ['X'] }, { name: 'ada', tags: ['x'] }, caseless)).toBe(true);
+			expect(helpers.isEqualWith({ name: 'ADA' }, { name: 'bob' }, caseless)).toBe(false);
+			expect(
+				helpers.isEqualWith({ a: 1 }, { a: 1 }, function () {
+					return undefined;
+				})
+			).toBe(true);
+			expect(
+				helpers.isEqualWith({ a: 1 }, { b: 2 }, function () {
+					return true;
+				})
+			).toBe(true);
+		});
+
+		it('passes the key, the path and the parents', function () {
+			const calls: Array<[unknown, unknown, unknown[], unknown, unknown]> = [];
+			const a = { x: { y: [0] }, m: new Map([['k', 0]]), s: new Set([{ z: 1 }]) };
+			const b = { x: { y: [-0] }, m: new Map([['k', -0]]), s: new Set([{ z: 1 }]) };
+			expect(
+				helpers.isEqualWith(a, b, function (left, _right, context) {
+					calls.push([left, context.key, context.path, context.parentA, context.parentB]);
+					return undefined;
+				})
+			).toBe(true);
+			expect(calls[0]).toStrictEqual([a, undefined, [], undefined, undefined]);
+			expect(calls[1]).toStrictEqual([a.x, 'x', ['x'], a, b]);
+			expect(calls[2]).toStrictEqual([a.x.y, 'y', ['x', 'y'], a.x, b.x]);
+			expect(calls[3]).toStrictEqual([0, '0', ['x', 'y', '0'], a.x.y, b.x.y]);
+			expect(calls[4]).toStrictEqual([a.m, 'm', ['m'], a, b]);
+			expect(calls[5]).toStrictEqual([0, 'k', ['m', 'k'], a.m, b.m]);
+			expect(calls[7]).toStrictEqual([{ z: 1 }, undefined, ['s', undefined], a.s, b.s]);
+			// Identical values (here the `z: 1` members) are equal without consulting the customizer.
+			expect(calls.length).toBe(8);
+		});
+
+		it('consults the customizer for object map keys', function () {
+			const keys: unknown[] = [];
+			const result = helpers.isEqualWith(new Map([[{ id: 1 }, 'a']]), new Map([[{ id: 1 }, 'a']]), function (_left, _right, context) {
+				keys.push(context.key);
+				return undefined;
+			});
+			expect(result).toBe(true);
+			expect(keys).toContain(undefined);
+		});
+
+		it('can tell 0 from -0, and never sees identical values', function () {
+			function strict(x: unknown, y: unknown) {
+				return typeof x === 'number' && typeof y === 'number' ? Object.is(x, y) : undefined;
+			}
+			expect(helpers.isEqualWith({ a: 0 }, { a: -0 }, strict)).toBe(false);
+			expect(helpers.isEqualWith({ a: NaN }, { a: NaN }, strict)).toBe(true);
+			const never = jest.fn(function () {
+				return false;
+			});
+			const shared = { deep: 1 };
+			expect(helpers.isEqualWith(shared, shared, never)).toBe(true);
+			expect(never).not.toHaveBeenCalled();
+		});
+
+		it('converts other results to booleans', function () {
+			expect(
+				helpers.isEqualWith(1, 2, function () {
+					return 1 as any;
+				})
+			).toBe(true);
+			expect(
+				helpers.isEqualWith({}, {}, function () {
+					return null as any;
+				})
+			).toBe(false);
+		});
+
+		it('keeps cycle detection when the customizer recurses through context.equals', function () {
+			const a: any = { v: 1 };
+			a.self = a;
+			const b: any = { v: 1 };
+			b.self = b;
+			const result = helpers.isEqualWith(a, b, function (left, right, context) {
+				if (helpers.isObject(left) && helpers.isObject(right) && 'self' in left) {
+					return context.equals((left as any).self, (right as any).self) && context.equals((left as any).v, (right as any).v);
+				}
+				return undefined;
+			});
+			expect(result).toBe(true);
+			const c: any = { v: 2 };
+			c.self = c;
+			expect(
+				helpers.isEqualWith(a, c, function (left, right, context) {
+					return helpers.isObject(left) && helpers.isObject(right)
+						? context.equals((left as any).v, (right as any).v) && context.equals((left as any).self, (right as any).self)
+						: undefined;
+				})
+			).toBe(false);
+		});
+
+		it('validates the customizer', function () {
+			expect(function () {
+				helpers.isEqualWith(1, 1, 'x' as any);
+			}).toThrow(new TypeError('isEqualWith: `customizer` must be a function, got string'));
+		});
+	});
+
+	describe('findKey and findEntry', function () {
+		it('return the first own enumerable string key or entry whose value matches', function () {
+			const users = { ada: { age: 36 }, alan: { age: 41 }, grace: { age: 45 } };
+			expect(
+				helpers.findKey(users, function (user) {
+					return user.age > 40;
+				})
+			).toBe('alan');
+			expect(
+				helpers.findEntry(users, function (_user, key) {
+					return key.startsWith('g');
+				})
+			).toStrictEqual(['grace', { age: 45 }]);
+			expect(
+				helpers.findKey(users, function () {
+					return false;
+				})
+			).toBeUndefined();
+			expect(
+				helpers.findEntry({}, function () {
+					return true;
+				})
+			).toBeUndefined();
+		});
+
+		it('ignores inherited and symbol keys and passes the object', function () {
+			const object = Object.assign(Object.create({ inherited: 1 }), { [Symbol('s')]: 1, own: 2 });
+			const seen: unknown[] = [];
+			helpers.findKey(object, function (_value, key, source) {
+				seen.push(key, source === object);
+				return false;
+			});
+			expect(seen).toStrictEqual(['own', true]);
+		});
+
+		it('narrows with type guards', function () {
+			const object = { a: 'x', b: 2 } as { a: string; b: number };
+			const key = helpers.findKey(object, function (value): value is number {
+				return typeof value === 'number';
+			});
+			assertType<Equals<typeof key, 'b' | undefined>>(true);
+			const entry = helpers.findEntry(object, function (value): value is number {
+				return typeof value === 'number';
+			});
+			assertType<Equals<typeof entry, ['b', number] | undefined>>(true);
+			expect(entry).toStrictEqual(['b', 2]);
+		});
+
+		it('validates the predicate', function () {
+			expect(function () {
+				helpers.findKey({}, 1 as any);
+			}).toThrow(new TypeError('findKey: `predicate` must be a function, got number'));
+			expect(function () {
+				helpers.findEntry({}, 1 as any);
+			}).toThrow(new TypeError('findEntry: `predicate` must be a function, got number'));
+		});
+	});
+
+	describe('mapEntries', function () {
+		it('maps keys and values at once, dropping undefined results', function () {
+			const result = helpers.mapEntries({ a: 1, b: -1, c: 2 }, function (value, key) {
+				return value > 0 ? [key.toUpperCase(), value * 10] : undefined;
+			});
+			expect(result).toStrictEqual({ A: 10, C: 20 });
+			const sym = Symbol('s');
+			expect(
+				helpers.mapEntries({ a: 1 }, function (value) {
+					return [sym, value];
+				})
+			).toStrictEqual({ [sym]: 1 });
+			expect(
+				helpers.mapEntries({ a: 1, b: 2 }, function (value) {
+					return [1, value];
+				})
+			).toStrictEqual({ 1: 2 });
+		});
+
+		it('is typed from the returned entries', function () {
+			const exact = helpers.mapEntries({ a: 1 }, function (value) {
+				return ['x', String(value)];
+			});
+			assertType<Equals<typeof exact, { x: string }>>(true);
+			const partial = helpers.mapEntries({ a: 1 }, function (value) {
+				return value > 0 ? (['x', value] as const) : undefined;
+			});
+			assertType<Equals<typeof partial, { x?: number }>>(true);
+			expect(partial).toStrictEqual({ x: 1 });
+		});
+
+		it('defines hostile keys as own data properties without pollution', function () {
+			const result = helpers.mapEntries(hostile(), function (value, key) {
+				return [key, value];
+			});
+			expect(Object.keys(result)).toStrictEqual(['__proto__', 'constructor']);
+			expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+			expectNoPollution();
+		});
+
+		it('validates fn and its results', function () {
+			expect(function () {
+				helpers.mapEntries({}, null as any);
+			}).toThrow(new TypeError('mapEntries: `fn` must be a function, got null'));
+			expect(function () {
+				helpers.mapEntries({ a: 1 }, function () {
+					return 'x' as any;
+				});
+			}).toThrow(new TypeError('mapEntries: `fn` must return undefined or a [key, value] array with a string, number or symbol key, got string for "a"'));
+			expect(function () {
+				helpers.mapEntries({ a: 1 }, function () {
+					return [{}, 1] as any;
+				});
+			}).toThrow(TypeError);
+		});
+	});
+
+	describe('sortKeys', function () {
+		it('sorts string keys by code unit order, symbols last', function () {
+			const sym = Symbol('s');
+			const result = helpers.sortKeys({ [sym]: 0, b: 1, B: 2, a: 3 });
+			expect(Reflect.ownKeys(result)).toStrictEqual(['B', 'a', 'b', sym]);
+		});
+
+		it('cannot move integer-like keys (documented)', function () {
+			expect(Object.keys(helpers.sortKeys({ b: 1, 10: 1, a: 1, 2: 1 }))).toStrictEqual(['2', '10', 'a', 'b']);
+		});
+
+		it('accepts a comparator and a deep option', function () {
+			const reverse = helpers.sortKeys(
+				{ a: 1, c: 2, b: 3 },
+				{
+					compare: function (x, y) {
+						return y.localeCompare(x);
+					}
+				}
+			);
+			expect(Object.keys(reverse)).toStrictEqual(['c', 'b', 'a']);
+			const nested = { z: { y: 1, x: 2 }, list: [{ b: 1, a: 2 }, 3], when: new Date(0) };
+			const shallow = helpers.sortKeys(nested);
+			expect(shallow.z).toBe(nested.z);
+			const deep = helpers.sortKeys(nested, { deep: true });
+			expect(JSON.stringify(deep)).toBe('{"list":[{"a":2,"b":1},3],"when":"1970-01-01T00:00:00.000Z","z":{"x":2,"y":1}}');
+			expect(deep.when).toBe(nested.when);
+			expect(nested.z).toStrictEqual({ y: 1, x: 2 });
+		});
+
+		it('copies arrays (holes kept) and keeps prototypes', function () {
+			// eslint-disable-next-line no-sparse-arrays
+			const sparse = helpers.sortKeys([{ b: 1, a: 1 }, , 3], { deep: true });
+			expect(sparse.length).toBe(3);
+			expect(1 in sparse).toBe(false);
+			expect(Object.keys(sparse[0] as object)).toStrictEqual(['a', 'b']);
+			const shallowArray = [{ b: 1 }];
+			expect(helpers.sortKeys(shallowArray)[0]).toBe(shallowArray[0]);
+			const bare = Object.assign(Object.create(null), { b: 1, a: 2 });
+			expect(Object.getPrototypeOf(helpers.sortKeys(bare))).toBeNull();
+		});
+
+		it('keeps hostile keys as own data properties without pollution', function () {
+			const result: any = helpers.sortKeys(hostile(), { deep: true });
+			expect(Object.keys(result)).toStrictEqual(['__proto__', 'constructor']);
+			expect(result.constructor).toStrictEqual({ prototype: { x: 1 } });
+			expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+			expectNoPollution();
+		});
+
+		it('validates its inputs and rejects cycles in deep mode', function () {
+			expect(function () {
+				helpers.sortKeys(new Date() as any);
+			}).toThrow(new TypeError('sortKeys: `object` must be a plain object or an array, got object'));
+			expect(function () {
+				helpers.sortKeys({}, { compare: 'x' as any });
+			}).toThrow(new TypeError('sortKeys: `compare` must be a function, got string'));
+			const cyclic: any = { a: [] };
+			cyclic.a.push(cyclic);
+			expect(function () {
+				helpers.sortKeys(cyclic, { deep: true });
+			}).toThrow(new TypeError('sortKeys: cannot sort a circular structure'));
+			expect(helpers.sortKeys(cyclic).a).toBe(cyclic.a);
+		});
+	});
+
+	describe('evolve', function () {
+		it('applies functions and nested transforms, sharing untouched values', function () {
+			const input = { name: ' Ada ', stats: { visits: 1, likes: 2 }, other: { x: 1 }, list: [1, 2] };
+			const result = helpers.evolve(input, {
+				name: function (name) {
+					return name.trim().length;
+				},
+				stats: {
+					visits: function (visits) {
+						return visits + 1;
+					}
+				}
+			});
+			expect(result).toStrictEqual({ name: 3, stats: { visits: 2, likes: 2 }, other: { x: 1 }, list: [1, 2] });
+			expect(result.other).toBe(input.other);
+			expect(input.stats.visits).toBe(1);
+			assertType<Equals<typeof result, { name: number; stats: { visits: number; likes: number }; other: { x: number }; list: number[] }>>(true);
+		});
+
+		it('never creates keys and skips nested transforms on non-containers', function () {
+			const input = { a: 1, d: new Date(0), n: null } as { a: number; b?: number; d: Date; n: null };
+			const result = helpers.evolve(input, {
+				b: function () {
+					return 5;
+				},
+				d: { getTime: function () {} } as any,
+				n: { x: function () {} } as any
+			});
+			expect(result).toStrictEqual({ a: 1, d: new Date(0), n: null });
+			expect('b' in result).toBe(false);
+			expect(helpers.evolve({}, { toString: function () {} } as any)).toStrictEqual({});
+		});
+
+		it('evolves arrays by index and keeps prototypes', function () {
+			expect(
+				helpers.evolve([1, { a: 1 }], {
+					0: function (value: number) {
+						return value + 1;
+					},
+					1: {
+						a: function (value: number) {
+							return value * 10;
+						}
+					}
+				} as any)
+			).toStrictEqual([2, { a: 10 }]);
+			const bare = Object.assign(Object.create(null), { a: 1 });
+			expect(
+				Object.getPrototypeOf(
+					helpers.evolve(bare, {
+						a: function (value: number) {
+							return value;
+						}
+					})
+				)
+			).toBeNull();
+		});
+
+		it('handles hostile keys without pollution', function () {
+			const result: any = helpers.evolve(hostile(), {
+				['__proto__']: function () {
+					return { polluted: true };
+				}
+			} as any);
+			expect(Object.keys(result)).toStrictEqual(['__proto__', 'constructor']);
+			expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+			const nested = helpers.evolve({ a: 1 }, hostile());
+			expect(nested).toStrictEqual({ a: 1 });
+			expectNoPollution();
+			expect(({} as any).polluted).toBeUndefined();
+		});
+
+		it('validates its inputs', function () {
+			expect(function () {
+				helpers.evolve(1 as any, {});
+			}).toThrow(new TypeError('evolve: `object` must be a plain object or an array, got number'));
+			expect(function () {
+				helpers.evolve({}, [] as any);
+			}).toThrow(new TypeError('evolve: `transforms` must be a plain object, got object'));
+			expect(function () {
+				helpers.evolve({ a: 1 }, { a: 1 } as any);
+			}).toThrow(new TypeError('evolve: `transforms.a` must be a function or a plain object, got number'));
+			const cyclic: any = { a: {} };
+			cyclic.a.a = cyclic.a;
+			const value: any = { a: {} };
+			value.a.a = value.a;
+			expect(function () {
+				helpers.evolve(value, cyclic);
+			}).toThrow(new TypeError('evolve: `transforms` must not be circular'));
+		});
+	});
+
+	describe('transformKeysDeep and case keys', function () {
+		it('renames string keys of nested plain objects and arrays', function () {
+			const sym = Symbol('s');
+			const when = new Date(0);
+			const map = new Map([['a_b', 1]]);
+			// eslint-disable-next-line no-sparse-arrays
+			const input = { a: { b: 1 }, list: [{ c: 2 }, , 3], [sym]: { d: 1 }, when, map };
+			const result: any = helpers.transformKeysDeep(input, function (key) {
+				return key.toUpperCase();
+			});
+			expect(result.A).toStrictEqual({ B: 1 });
+			expect(result.LIST[0]).toStrictEqual({ C: 2 });
+			expect(1 in result.LIST).toBe(false);
+			expect(result[sym]).toStrictEqual({ D: 1 });
+			expect(result.WHEN).toBe(when);
+			expect(result.MAP).toBe(map);
+			expect(helpers.transformKeysDeep(5, String)).toBe(5);
+		});
+
+		it('throws on collisions instead of silently dropping a value', function () {
+			expect(function () {
+				helpers.transformKeysDeep({ a: 1, A: 2 }, function (key) {
+					return key.toLowerCase();
+				});
+			}).toThrow(new RangeError('transformKeysDeep: keys "a" and "A" both become "a"'));
+			expect(function () {
+				helpers.toCamelCaseKeys({ nested: [{ a_b: 1, aB: 2 }] });
+			}).toThrow(new RangeError('toCamelCaseKeys: keys "a_b" and "aB" both become "aB"'));
+		});
+
+		it('validates fn and rejects cycles', function () {
+			expect(function () {
+				helpers.transformKeysDeep({}, null as any);
+			}).toThrow(new TypeError('transformKeysDeep: `fn` must be a function, got null'));
+			expect(function () {
+				helpers.transformKeysDeep({ a: 1 }, function () {
+					return 1 as any;
+				});
+			}).toThrow(new TypeError('transformKeysDeep: `fn` must return a string, got number for "a"'));
+			const cyclic: any = { a: [] };
+			cyclic.a.push(cyclic);
+			expect(function () {
+				helpers.toSnakeCaseKeys(cyclic);
+			}).toThrow(new TypeError('toSnakeCaseKeys: cannot transform a circular structure'));
+		});
+
+		it('keeps __proto__ as an own data property and never pollutes', function () {
+			const result: any = helpers.toCamelCaseKeys(JSON.parse('{"__proto__":{"pz":1},"constructor":{"prototype":{"x":1}},"my_key":1}'));
+			expect(Object.keys(result)).toStrictEqual(['__proto__', 'constructor', 'myKey']);
+			expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+			expect(result.constructor).toStrictEqual({ prototype: { x: 1 } });
+			const renamed = helpers.transformKeysDeep({ a: 1 }, function () {
+				return '__proto__';
+			});
+			expect(Object.keys(renamed)).toStrictEqual(['__proto__']);
+			expect(Object.getPrototypeOf(renamed)).toBe(Object.prototype);
+			for (const transform of [helpers.toSnakeCaseKeys, helpers.toKebabCaseKeys]) {
+				expect(Object.keys(transform(hostile()))).toStrictEqual(['__proto__', 'constructor']);
+			}
+			expectNoPollution();
+			expect(({} as any).pz).toBeUndefined();
+		});
+
+		it('converts with the strings module splitter (acronyms, digits, unicode)', function () {
+			expect(helpers.toCamelCaseKeys({ XMLHttpRequest: 1, 'user-id2': 2, crème_brûlée: 3, 'Ünïcode KEY': 4 })).toStrictEqual({
+				xmlHttpRequest: 1,
+				userId2: 2,
+				crèmeBrûlée: 3,
+				ünïcodeKey: 4
+			});
+			expect(helpers.toSnakeCaseKeys({ getHTTPResponse2Code: [{ maxRetryCount: 1 }] })).toStrictEqual({ get_http_response2_code: [{ max_retry_count: 1 }] });
+			expect(helpers.toKebabCaseKeys({ fontSize: { lineHeight: 1 } })).toStrictEqual({ 'font-size': { 'line-height': 1 } });
+			const bare = helpers.toCamelCaseKeys(Object.assign(Object.create(null), { a_b: 1 }));
+			expect(Object.getPrototypeOf(bare)).toBeNull();
+		});
+
+		it('types keys exactly like the runtime for ASCII keys', function () {
+			const camel = helpers.toCamelCaseKeys({ user_id: 1, 'home-address': { zip_code: 'x' }, list: [{ created_at: new Date(0) }], XMLHttpRequest: true });
+			assertType<Equals<typeof camel, { userId: number; homeAddress: { zipCode: string }; list: Array<{ createdAt: Date }>; xmlHttpRequest: boolean }>>(true);
+			const snake = helpers.toSnakeCaseKeys({ userID2Code: 1, nested: { fooBAR: 'x' } } as const);
+			assertType<Equals<typeof snake, { readonly user_id2_code: 1; readonly nested: { readonly foo_bar: 'x' } }>>(true);
+			const kebab = helpers.toKebabCaseKeys({ getHTTPResponse: 1, "don't_stop": 2, 3: 'n' });
+			assertType<Equals<typeof kebab, { 'get-http-response': number; 'dont-stop': number; '3': string }>>(true);
+			const unicode = helpers.toCamelCaseKeys({ crème_brûlée: 1 });
+			assertType<Equals<typeof unicode, { [x: string]: number }>>(true);
+			const generic = helpers.transformKeysDeep({ a: { b: 1 }, list: [{ c: 'x' }] }, String);
+			assertType<Equals<typeof generic, Record<string, Record<string, number> | Array<Record<string, string>>>>>(true);
+			assertType<Equals<helpers.CamelCase<'XMLHttpRequest_id'>, 'xmlHttpRequestId'>>(true);
+			assertType<Equals<helpers.SnakeCase<'A0B1 HTTP2'>, 'a0b1_http2'>>(true);
+			assertType<Equals<helpers.KebabCase<'aBC_ABc-AB1cD'>, 'a-bc-a-bc-ab1c-d'>>(true);
+			assertType<Equals<helpers.CamelCase<string>, string>>(true);
+			assertType<Equals<helpers.CamelCase<'a\u0007b'>, string>>(true);
+		});
+	});
+
+	describe('stableStringify and hash', function () {
+		it('encodes JSON values like sorted-key JSON', function () {
+			const value = { b: [1, 'x', null, true, { d: 1, c: [] }], a: 'é"\n', n: -1.5e-7 };
+			expect(helpers.stableStringify(value)).toBe('{"a":"é\\"\\n","b":[1,"x",null,true,{"c":[],"d":1}],"n":-1.5e-7}');
+			expect(JSON.parse(helpers.stableStringify(value))).toStrictEqual(value);
+			expect(helpers.stableStringify({ 10: 1, 2: 1, b: 1 })).toBe('{"10":1,"2":1,"b":1}');
+			expect(helpers.stableStringify('\ud800')).toBe('"\\ud800"');
+		});
+
+		it('is independent of key, map and set insertion order', function () {
+			expect(helpers.stableStringify({ a: 1, b: { c: 1, d: 2 } })).toBe(helpers.stableStringify({ b: { d: 2, c: 1 }, a: 1 }));
+			expect(
+				helpers.stableStringify(
+					new Map<unknown, unknown>([
+						['b', 1],
+						['a', 2]
+					])
+				)
+			).toBe(
+				helpers.stableStringify(
+					new Map<unknown, unknown>([
+						['a', 2],
+						['b', 1]
+					])
+				)
+			);
+			expect(helpers.stableStringify(new Set([3, 1, 2]))).toBe('Set([1,2,3])');
+		});
+
+		it('encodes what JSON cannot, unambiguously', function () {
+			const values: unknown[] = [
+				undefined,
+				null,
+				false,
+				true,
+				NaN,
+				Infinity,
+				-Infinity,
+				0,
+				-0,
+				1n,
+				'1n',
+				'undefined',
+				[undefined],
+				[null],
+				// eslint-disable-next-line no-sparse-arrays
+				[, 1],
+				{},
+				{ a: undefined },
+				[]
+			];
+			const encoded = values.map(helpers.stableStringify);
+			expect(new Set(encoded).size).toBe(values.length);
+			expect(encoded).toStrictEqual([
+				'undefined',
+				'null',
+				'false',
+				'true',
+				'NaN',
+				'Infinity',
+				'-Infinity',
+				'0',
+				'-0',
+				'1n',
+				'"1n"',
+				'"undefined"',
+				'[undefined]',
+				'[null]',
+				'[,1]',
+				'{}',
+				'{"a":undefined}',
+				'[]'
+			]);
+		});
+
+		it('encodes built-in objects', function () {
+			const buffer = new Uint8Array([1, 2, 3]).buffer;
+			const cases: Array<[unknown, string]> = [
+				[new Date(5), 'Date(5)'],
+				[new Date(NaN), 'Date(NaN)'],
+				[/a\/b/gi, 'RegExp("/a\\\\/b/gi")'],
+				[new Map([[{ k: 1 }, new Set(['x'])]]), 'Map([[{"k":1},Set(["x"])]])'],
+				[new Float64Array([-0, NaN]), 'Float64Array([-0,NaN])'],
+				[new BigInt64Array([1n]), 'BigInt64Array([1n])'],
+				[buffer, 'ArrayBuffer([1,2,3])'],
+				[new DataView(buffer, 1, 2), 'DataView([2,3])'],
+				[new Uint8Array(buffer, 1), 'Uint8Array([2,3])'],
+				[Object(1), 'Number(1)'],
+				[Object('s'), 'String("s")'],
+				[Object(true), 'Boolean(true)'],
+				[Object(2n), 'BigInt(2n)'],
+				[Object.assign(Object.create(null), { b: 1, a: 2 }), '{"a":2,"b":1}']
+			];
+			for (const [value, text] of cases) expect(helpers.stableStringify(value)).toBe(text);
+			if (typeof SharedArrayBuffer === 'function') expect(helpers.stableStringify(new SharedArrayBuffer(1))).toBe('SharedArrayBuffer([0])');
+		});
+
+		it('encodes class instances with their name', function () {
+			class Point {
+				constructor(
+					public y: number,
+					public x: number
+				) {}
+			}
+			expect(helpers.stableStringify(new Point(2, 1))).toBe('Point{"x":1,"y":2}');
+			const anonymous = new ((function () {
+				return class {
+					a = 1;
+				};
+			})())();
+			expect(helpers.stableStringify(anonymous)).toBe('?{"a":1}');
+			expect(helpers.stableStringify(Object.create(Object.create(null)))).toBe('?{}');
+			expect(helpers.stableStringify(new Error('x'))).toBe('Error{}');
+		});
+
+		it('throws for values that cannot be encoded deterministically', function () {
+			const cyclic: any = { a: [] };
+			cyclic.a.push(cyclic);
+			const cases: Array<[unknown, string]> = [
+				[function () {}, 'stableStringify: cannot serialize a function'],
+				[{ s: Symbol('s') }, 'stableStringify: cannot serialize a symbol'],
+				[Object(Symbol('s')), 'stableStringify: cannot serialize a symbol'],
+				[new WeakMap(), 'stableStringify: cannot serialize a WeakMap'],
+				[new WeakSet(), 'stableStringify: cannot serialize a WeakSet'],
+				[Promise.resolve(), 'stableStringify: cannot serialize a Promise'],
+				[cyclic, 'stableStringify: cannot serialize a circular structure']
+			];
+			for (const [value, message] of cases) {
+				expect(function () {
+					helpers.stableStringify(value);
+				}).toThrow(new TypeError(message));
+			}
+			const shared = { x: 1 };
+			expect(helpers.stableStringify([shared, shared])).toBe('[{"x":1},{"x":1}]');
+		});
+
+		it('keeps hostile keys as data', function () {
+			expect(helpers.stableStringify(hostile())).toBe('{"__proto__":{"x":1},"constructor":{"prototype":{"x":1}}}');
+		});
+
+		it('hashes the encoding into a 53-bit integer', function () {
+			expect(helpers.hash({ a: 1, b: [1, 2] })).toBe(helpers.hash({ b: [1, 2], a: 1 }));
+			expect(helpers.hash({ a: 1 })).not.toBe(helpers.hash({ a: 2 }));
+			// cyrb53('""'): the reference cyrb53 implementation gives 7929297801672961 for 'a' and 371057489730039 for '""'.
+			expect(helpers.hash('')).toBe(371057489730039);
+			expect(helpers.hash('a', 1)).not.toBe(helpers.hash('a'));
+			expect(helpers.hash(-0)).not.toBe(helpers.hash(0));
+			for (const seed of [0, 1, 4294967295]) expect(Number.isSafeInteger(helpers.hash([1, 'x'], seed))).toBe(true);
+		});
+
+		it('validates the seed', function () {
+			expect(function () {
+				helpers.hash(1, -1);
+			}).toThrow(new RangeError('hash: `seed` must be an integer between 0 and 4294967295, got -1'));
+			expect(function () {
+				helpers.hash(1, 2 ** 32);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.hash(1, 0.5);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.hash(1, '1' as any);
+			}).toThrow(new TypeError('hash: `seed` must be an integer between 0 and 4294967295, got string'));
+		});
+	});
+});

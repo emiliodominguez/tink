@@ -43,17 +43,18 @@ export type ParsedQuery = Record<string, string | string[]>;
 const ARRAY_FORMATS: ReadonlySet<string> = new Set<ArrayFormat>(['repeat', 'comma', 'brackets']);
 
 /**
- * Percent-encodes a query-string component with `encodeURIComponent`. Lone surrogates, which `encodeURIComponent` rejects, are
- * replaced with U+FFFD first (like `URLSearchParams` does).
+ * Percent-encodes text with `encodeURIComponent` (or `encodeURI`). Lone surrogates, which both reject, are replaced with U+FFFD first
+ * (like `URLSearchParams` does).
  * @param {string} value - The text to encode
+ * @param {(value: string) => string} [encode=encodeURIComponent] - The encoder
  * @returns {string} The encoded text
  */
-function encodeComponent(value: string): string {
+function encodeComponent(value: string, encode: (value: string) => string = encodeURIComponent): string {
 	try {
-		return encodeURIComponent(value);
+		return encode(value);
 	} catch {
-		// Only a lone surrogate (a `Cs` code point in a `u` regular expression, unlike a valid pair) makes `encodeURIComponent` throw.
-		return encodeURIComponent(value.replace(/\p{Cs}/gu, '\ufffd'));
+		// Only a lone surrogate (a `Cs` code point in a `u` regular expression, unlike a valid pair) makes the encoders throw.
+		return encode(value.replace(/\p{Cs}/gu, '\ufffd'));
 	}
 }
 
@@ -420,4 +421,375 @@ export function isAbsoluteUrl(string: string): boolean {
 	// so removing them cannot undo it. Otherwise the leading spaces and C0 controls (`[^!-\uffff]`: below `!`), and the tabs and line
 	// breaks, are removed as browsers do, and the string is tested again.
 	return ABSOLUTE_URL.test(string) || (/^[^!-\uffff]|[\t\n\r]/.test(string) && ABSOLUTE_URL.test(string.replace(/^[^!-\uffff]+|[\t\n\r]/g, '')));
+}
+
+/**
+ * A scheme at the start of a URL, as the WHATWG URL parser reads it: an ASCII letter, then ASCII letters, digits, `+`, `-` or `.`, then `:`.
+ */
+const SCHEME = /^[a-z][a-z\d+.-]*:/i;
+
+/**
+ * What the WHATWG URL parser ignores before reading the scheme: leading C0 control characters and spaces, and every ASCII tab or line break.
+ */
+const IGNORED = /^[\0- ]+|[\t\n\r]/g;
+
+/**
+ * The protocols {@link isSafeUrl} allows by default.
+ */
+const SAFE_PROTOCOLS: ReadonlyArray<string> = ['http:', 'https:', 'mailto:', 'tel:'];
+
+/**
+ * Options accepted by {@link isSafeUrl} and {@link sanitizeUrl}.
+ */
+export interface IsSafeUrlOptions {
+	/** The allowed schemes, each ending with `:` and compared case-insensitively. Defaults to `['http:', 'https:', 'mailto:', 'tel:']`. */
+	readonly protocols?: ReadonlyArray<string>;
+	/**
+	 * Whether a URL without a scheme (`/path`, `page.html`, `?q=1`, `#top`, `//host/path`) is allowed. Such a URL is resolved against the
+	 * page, so it inherits the page's own (normally `http:` or `https:`) scheme. Defaults to `true`.
+	 */
+	readonly allowRelative?: boolean;
+}
+
+/**
+ * Checks that a user-supplied URL is safe to put in an `href` or `src`, with an ALLOWLIST of schemes rather than a denylist of dangerous
+ * ones (`javascript:`, `vbscript:`, `data:`... and any scheme invented later are rejected unless listed).
+ *
+ * The scheme is read exactly as browsers (the WHATWG URL parser) read it: leading spaces and C0 control characters are skipped, ASCII tabs
+ * and line breaks are ignored anywhere, and case does not matter, so `' java\tscript:alert(1)'`, `'\x01javascript:x'` and `'JaVaScRiPt:x'`
+ * are all `javascript:` URLs. A string whose scheme is not followed by a valid URL (`https://exa mple.com`) is accepted when its scheme is
+ * allowed: browsers do not navigate to it.
+ *
+ * Relative URLs (no scheme) are allowed by default, since they keep the page's scheme; set `allowRelative: false` to require an absolute
+ * URL. Note that a protocol-relative URL (`//other.example`) is relative too: this function checks the SCHEME, not the destination. To
+ * keep a redirect on the same site, compare origins instead (see `isAbsoluteUrl`).
+ *
+ * HTML entities are NOT decoded: the check applies to the URL the browser receives, so set the value through the DOM (`a.href = url`,
+ * `setAttribute`) or HTML-escape it (e.g. with `escapeHtml` from the strings module, which turns `javascript&colon;` into harmless text);
+ * never concatenate it unescaped into markup.
+ * @param {string} url - The URL to check (any other value is unsafe)
+ * @param {IsSafeUrlOptions} [options={}] - `protocols` (default `['http:', 'https:', 'mailto:', 'tel:']`) and `allowRelative` (default `true`)
+ * @returns {boolean} Whether the URL has an allowed scheme, or no scheme and relative URLs are allowed
+ * @throws {TypeError} when `options.protocols` is not an array of strings
+ * @throws {RangeError} when an entry of `options.protocols` is not a scheme followed by `:` (`'https'` instead of `'https:'`)
+ * @example
+ * isSafeUrl('https://example.com/a?b#c'); // => true
+ * isSafeUrl('/relative/path'); // => true
+ * isSafeUrl(' java\tscript:alert(1)'); // => false
+ * isSafeUrl('data:text/html,<script>alert(1)</script>'); // => false
+ * isSafeUrl('/relative/path', { allowRelative: false }); // => false
+ * isSafeUrl('ftp://files.example.com', { protocols: ['https:', 'FTP:'] }); // => true
+ */
+export function isSafeUrl(url: string, options: IsSafeUrlOptions = {}): boolean {
+	const { protocols = SAFE_PROTOCOLS, allowRelative = true } = options;
+
+	if (!Array.isArray(protocols)) throw new TypeError(`isSafeUrl: \`options.protocols\` must be an array of strings, got ${describe(protocols)}`);
+
+	if (typeof url !== 'string') return false;
+
+	// A scheme found in the string as it is contains no ignored character, so removing them could not change it.
+	const scheme = SCHEME.exec(url) ?? SCHEME.exec(url.replace(IGNORED, ''));
+	const protocol = scheme === null ? '' : scheme[0].toLowerCase();
+	let allowed = scheme === null && allowRelative;
+
+	for (const entry of protocols as ReadonlyArray<unknown>) {
+		if (typeof entry !== 'string') throw new TypeError(`isSafeUrl: \`options.protocols\` must be an array of strings, got ${describe(entry)} in it`);
+
+		if (!(SCHEME.test(entry) && entry.indexOf(':') === entry.length - 1))
+			throw new RangeError(`isSafeUrl: \`options.protocols\` entries must be schemes ending with ':' (such as 'https:'), got ${JSON.stringify(entry)}`);
+
+		if (entry.toLowerCase() === protocol) allowed = true;
+	}
+
+	return allowed;
+}
+
+/**
+ * Returns the URL when {@link isSafeUrl} accepts it, else the fallback. A safe URL is returned unchanged: still set it through the DOM or
+ * HTML-escape it when building markup (see {@link isSafeUrl}).
+ * @template F - The type of the fallback
+ * @param {string} url - The user-supplied URL
+ * @param {F} [fallback='about:blank'] - What to return instead of an unsafe URL (`null` to omit the attribute: `undefined` selects the default)
+ * @param {IsSafeUrlOptions} [options={}] - See {@link isSafeUrl}
+ * @returns {string | F} `url` or `fallback`
+ * @throws {TypeError} see {@link isSafeUrl}
+ * @throws {RangeError} see {@link isSafeUrl}
+ * @example
+ * sanitizeUrl('https://example.com'); // => 'https://example.com'
+ * sanitizeUrl('javascript:alert(1)'); // => 'about:blank'
+ * sanitizeUrl('JAVASCRIPT:alert(1)', '#'); // => '#'
+ * sanitizeUrl('vbscript:x', null); // => null
+ */
+export function sanitizeUrl<F = string>(url: string, fallback: F = 'about:blank' as F, options: IsSafeUrlOptions = {}): string | F {
+	return isSafeUrl(url, options) ? url : fallback;
+}
+
+/**
+ * Returns the index where the path of a URL string ends: its first `?` or `#`, or its length.
+ * @param {string} url - The URL
+ * @returns {number} The end of the part before the query and fragment
+ */
+function pathEnd(url: string): number {
+	const query = url.indexOf('?');
+	const hash = url.indexOf('#');
+
+	return query === -1 ? (hash === -1 ? url.length : hash) : hash === -1 || query < hash ? query : hash;
+}
+
+/**
+ * The part of a URL that the slash helpers never change: an optional scheme followed by its run of slashes (`https://`, `file:///`), or
+ * the leading run of slashes of a relative URL (`/`, or `//` before the host of a protocol-relative URL).
+ */
+const SLASH_PREFIX = /^(?:[a-z][a-z\d+.-]*:)?\/*/i;
+
+/**
+ * Returns the length of the leading run of `/` and `\` (which browsers read as `/`) of a path, with the tabs and line breaks they ignore.
+ * @param {string} path - The path
+ * @returns {number} The index of the first other character
+ */
+function leadingSlashesEnd(path: string): number {
+	let index = 0;
+
+	for (let code = path.charCodeAt(0); code === 47 || code === 92 || code === 9 || code === 10 || code === 13; code = path.charCodeAt(++index));
+
+	return index;
+}
+
+/**
+ * Makes the path of a URL end with `/`. The query and fragment are kept after it (`/a?x=1` → `/a/?x=1`).
+ * @param {string} url - The URL or path
+ * @returns {string} The URL whose path ends with `/` (`''` becomes `'/'`)
+ * @example
+ * withTrailingSlash('/docs'); // => '/docs/'
+ * withTrailingSlash('/search?q=a/b#top'); // => '/search/?q=a/b#top'
+ * withTrailingSlash('https://example.com'); // => 'https://example.com/'
+ */
+export function withTrailingSlash(url: string): string {
+	const end = pathEnd(url);
+
+	return url[end - 1] === '/' ? url : url.slice(0, end) + '/' + url.slice(end);
+}
+
+/**
+ * Removes every trailing `/` from the path of a URL, keeping the query and fragment. The slashes after a scheme (`https://`) and the root
+ * `/` of a relative path are never removed.
+ * @param {string} url - The URL or path
+ * @returns {string} The URL whose path does not end with `/` (unless it is a root)
+ * @example
+ * withoutTrailingSlash('/docs//?page=2'); // => '/docs?page=2'
+ * withoutTrailingSlash('https://example.com/'); // => 'https://example.com'
+ * withoutTrailingSlash('/'); // => '/'
+ */
+export function withoutTrailingSlash(url: string): string {
+	const end = pathEnd(url);
+
+	if (url[end - 1] !== '/') return url;
+
+	const keep = (SLASH_PREFIX.exec(url) as RegExpExecArray)[0].length;
+	let index = end;
+
+	while (index > keep && url[index - 1] === '/') index--;
+
+	return url.slice(0, index) + url.slice(end);
+}
+
+/**
+ * Makes a path start with exactly one `/`. A leading run of slashes collapses into one, so the result is never protocol-relative
+ * (`//evil.example` becomes `/evil.example`); like browsers, `\` counts as `/` and tabs and line breaks in that run are dropped. Meant for
+ * paths: a URL with a scheme is not special-cased (`https://a` becomes `/https://a`).
+ * @param {string} path - The path (may hold a query and fragment)
+ * @returns {string} The path starting with a single `/`
+ * @example
+ * withLeadingSlash('docs/intro'); // => '/docs/intro'
+ * withLeadingSlash('?q=1'); // => '/?q=1'
+ * withLeadingSlash('//evil.example/x'); // => '/evil.example/x'
+ */
+export function withLeadingSlash(path: string): string {
+	const end = leadingSlashesEnd(path);
+
+	return end === 1 && path[0] === '/' ? path : '/' + path.slice(end);
+}
+
+/**
+ * Removes the leading run of slashes of a path (`\`, tabs and line breaks in that run too, as for {@link withLeadingSlash}).
+ * @param {string} path - The path
+ * @returns {string} The path without leading slashes
+ * @example
+ * withoutLeadingSlash('/docs/intro'); // => 'docs/intro'
+ * withoutLeadingSlash('///a'); // => 'a'
+ */
+export function withoutLeadingSlash(path: string): string {
+	return path.slice(leadingSlashesEnd(path));
+}
+
+/**
+ * Collapses every run of `/` in the path of a URL into a single `/`. The query and fragment are left untouched (`?next=https://a//b`
+ * keeps its slashes), and so is the run of slashes after a scheme (`https://`, `file:///`) or at the start of a relative URL (so a
+ * protocol-relative `//host` stays one).
+ * @param {string} url - The URL or path
+ * @returns {string} The URL without repeated slashes in its path
+ * @example
+ * cleanDoubleSlashes('https://example.com//a///b?u=http://x//y'); // => 'https://example.com/a/b?u=http://x//y'
+ * cleanDoubleSlashes('file:///etc//hosts'); // => 'file:///etc/hosts'
+ * cleanDoubleSlashes('//cdn.example.com//lib.js'); // => '//cdn.example.com/lib.js'
+ */
+export function cleanDoubleSlashes(url: string): string {
+	const end = pathEnd(url);
+	const keep = (SLASH_PREFIX.exec(url) as RegExpExecArray)[0].length;
+
+	return url.slice(0, keep) + url.slice(keep, end).replace(/\/\/+/g, '/') + url.slice(end);
+}
+
+/**
+ * Removes the trailing slashes of a base path.
+ * @param {string} base - The base path
+ * @returns {string} The base without its trailing slashes
+ */
+function trimBase(base: string): string {
+	let end = base.length;
+
+	while (base[end - 1] === '/') end--;
+
+	return base.slice(0, end);
+}
+
+/**
+ * Tells whether a URL lies inside a base path, segment by segment: it is the base, or the base followed by `/`, `?` or `#` (`/app/x` and
+ * `/app?x` are inside `/app`, `/application` is not).
+ * @param {string} url - The URL or path
+ * @param {string} root - The base path without trailing slashes (nor query or fragment)
+ * @returns {boolean} Whether `url` is inside the base
+ */
+function isInside(url: string, root: string): boolean {
+	// Past the end, `charAt` gives `''`, which `includes` finds: the base itself is inside.
+	return url.startsWith(root) && '/?#'.includes(url.charAt(root.length));
+}
+
+/**
+ * Mounts a path under a base path (an app served under `/app`): `'/users'` becomes `'/app/users'`. Matching is segment-aware and the
+ * function is idempotent: a path that already is the base or lies under it (`/app`, `/app/users`, but not `/application`) is returned
+ * unchanged. The query and fragment are kept, leading slashes of the path collapse into the one after the base (so the result never
+ * becomes protocol-relative), and a URL with a scheme (`https:`, `mailto:`...) is returned unchanged. An empty or `/` base changes nothing.
+ * @param {string} url - The path (may hold a query and fragment)
+ * @param {string} base - The base path, with or without a trailing slash (or an absolute URL without query or fragment)
+ * @returns {string} The mounted path
+ * @example
+ * withBase('/users?page=2', '/app'); // => '/app/users?page=2'
+ * withBase('users', '/app/'); // => '/app/users'
+ * withBase('/app/users', '/app'); // => '/app/users'
+ * withBase('/application', '/app'); // => '/app/application'
+ * withBase('/v1/items', 'https://api.example.com'); // => 'https://api.example.com/v1/items'
+ */
+export function withBase(url: string, base: string): string {
+	const root = trimBase(base);
+
+	if (root === '' || isInside(url, root) || SCHEME.test(url)) return url;
+
+	// An empty URL, or one that starts with its query or fragment, has no path to join (`charAt(0)` is `''` for the empty URL).
+	return root + ('?#'.includes(url.charAt(0)) ? url : withLeadingSlash(url));
+}
+
+/**
+ * Unmounts a base path: `'/app/users'` becomes `'/users'`, and the base itself becomes `'/'`. Matching is segment-aware: a path outside
+ * the base (`/application` for `/app`) is returned unchanged, and so is any URL when the base is empty or `/`. The query and fragment are
+ * kept, and the leading slashes of the result collapse into one, so `'/app//evil.example'` gives `'/evil.example'`, never a
+ * protocol-relative URL.
+ * @param {string} url - The URL or path
+ * @param {string} base - The base path, with or without a trailing slash (or an absolute URL without query or fragment)
+ * @returns {string} The path relative to the base, starting with `/`
+ * @example
+ * withoutBase('/app/users?page=2', '/app'); // => '/users?page=2'
+ * withoutBase('/app', '/app/'); // => '/'
+ * withoutBase('/application', '/app'); // => '/application'
+ * withoutBase('https://example.com/docs/intro', 'https://example.com/docs'); // => '/intro'
+ */
+export function withoutBase(url: string, base: string): string {
+	const root = trimBase(base);
+
+	return root !== '' && isInside(url, root) ? withLeadingSlash(url.slice(root.length)) : url;
+}
+
+/** A percent-escaped UTF-8 continuation byte (`80`–`BF`). */
+const CONTINUATION = '%[89ab][\\da-f]';
+
+/**
+ * A well-formed UTF-8 sequence of percent-escapes (Unicode Table 3-7: no overlong form, surrogate or code point past U+10FFFF), which
+ * `decodeURIComponent` always accepts.
+ */
+const UTF8_ESCAPES = new RegExp(
+	`%(?:[0-7][\\da-f]|(?:c[2-9a-f]|d[\\da-f])${CONTINUATION}|(?:e0%[ab][\\da-f]|e[1-9a-cef]${CONTINUATION}|ed%[89][\\da-f])${CONTINUATION}|(?:f0%[9ab][\\da-f]|f[1-3]${CONTINUATION}|f4%8[\\da-f])${CONTINUATION}${CONTINUATION})`,
+	'gi'
+);
+
+/**
+ * Decodes a percent-encoded URL component like `decodeURIComponent`, but never throws: every well-formed escape (a valid UTF-8 sequence)
+ * is decoded, and malformed ones (`%E0%A4%A`, a lone `%`, `%ZZ`, invalid UTF-8 such as the Latin-1 `%E9`) are kept as they are, so a
+ * single bad escape in user-supplied text does not lose the rest. A string that `decodeURIComponent` accepts gives exactly its result.
+ *
+ * `+` is NOT decoded to a space (it is component decoding, as in paths and fragments). Query strings, where `+` means a space, are decoded
+ * by `parseQueryString` and `getQueryParam`.
+ * @param {string} string - The encoded text
+ * @returns {string} The decoded text
+ * @example
+ * safeDecodeURIComponent('caf%C3%A9%20au%20lait'); // => 'café au lait'
+ * safeDecodeURIComponent('100%25%20off%'); // => '100% off%'
+ * safeDecodeURIComponent('%E0%A4%A'); // => '%E0%A4%A'
+ * safeDecodeURIComponent('Jos%E9%20Garc%C3%ADa'); // => 'Jos%E9 García'
+ * safeDecodeURIComponent('a+b'); // => 'a+b'
+ */
+export function safeDecodeURIComponent(string: string): string {
+	if (!string.includes('%')) return string;
+
+	try {
+		return decodeURIComponent(string);
+	} catch {
+		return string.replace(UTF8_ESCAPES, decodeURIComponent);
+	}
+}
+
+/**
+ * Sets the fragment of a URL string, replacing any existing one and keeping the query before it. Like the `URL.hash` setter, one leading
+ * `#` of `fragment` is ignored and an empty fragment removes it. The fragment is text: it is percent-encoded where needed (spaces, `%`,
+ * `#`, non-ASCII...) while `/`, `?`, `:`, `=`, `&`... stay readable for hash routers, so `safeDecodeURIComponent` gives it back.
+ * @param {string} url - The URL (absolute or relative)
+ * @param {string} fragment - The new fragment, with or without its `#`
+ * @returns {string} The URL with the new fragment
+ * @example
+ * withFragment('/docs?v=2#old', 'install'); // => '/docs?v=2#install'
+ * withFragment('/app', '#/users/42?tab=info'); // => '/app#/users/42?tab=info'
+ * withFragment('/a', 'section 2 #b'); // => '/a#section%202%20%23b'
+ * withFragment('/a#b', ''); // => '/a'
+ */
+export function withFragment(url: string, fragment: string): string {
+	const text = fragment.startsWith('#') ? fragment.slice(1) : fragment;
+	const base = withoutFragment(url);
+
+	return text === '' ? base : `${base}#${encodeComponent(text, encodeURI).replace(/#/g, '%23')}`;
+}
+
+/**
+ * Removes the fragment (`#...`) of a URL string.
+ * @param {string} url - The URL (absolute or relative)
+ * @returns {string} The URL without its fragment
+ * @example
+ * withoutFragment('/docs?v=2#install'); // => '/docs?v=2'
+ */
+export function withoutFragment(url: string): string {
+	const index = url.indexOf('#');
+
+	return index === -1 ? url : url.slice(0, index);
+}
+
+/**
+ * Removes the query (`?...`) of a URL string and keeps its fragment (a `?` inside the fragment is not a query).
+ * @param {string} url - The URL (absolute or relative)
+ * @returns {string} The URL without its query
+ * @example
+ * withoutQuery('/search?q=a#results'); // => '/search#results'
+ * withoutQuery('/page#section?not-a-query'); // => '/page#section?not-a-query'
+ */
+export function withoutQuery(url: string): string {
+	const { base, hash } = splitUrl(url);
+
+	return base + hash;
 }

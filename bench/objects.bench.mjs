@@ -17,11 +17,32 @@ import {
 	omitBy,
 	pick,
 	pickBy,
-	setInObjectByKeys
+	setInObjectByKeys,
+	defaults as tinkDefaults,
+	defaultsDeep,
+	deepMergeWith,
+	evolve,
+	findKey,
+	hash,
+	isEqualWith,
+	isMatch,
+	mapEntries,
+	omitInObjectByKeys,
+	shallowEqual,
+	sortKeys,
+	stableStringify,
+	toCamelCaseKeys,
+	toPath,
+	toSnakeCaseKeys,
+	updateInObjectByKeys
 } from '@emiliodominguez/tink/objects';
+import { defu } from 'defu';
 import * as toolkit from 'es-toolkit';
 import * as compat from 'es-toolkit/compat';
+import fastStableStringify from 'fast-json-stable-stringify';
 import * as lodash from 'lodash-es';
+import * as radash from 'radash';
+import * as remeda from 'remeda';
 
 // Inputs: a small record (6 keys, a little nesting), a flat 100-key record, a nested config, and 1k (or 100k) user records.
 const small = { id: 7, name: 'Ada', active: true, tags: ['a', 'b'], meta: { created: 1, owner: { id: 1 } }, score: 9.5 };
@@ -117,6 +138,287 @@ function upperKey(_value, key) {
 function compare(name, fn, competitors, baseline) {
 	return baseline === undefined ? { name, fn, competitors } : { name, fn, baseline, competitors };
 }
+
+// Round 11 helpers: defaults, immutable path updates, matching, key transforms, serialization.
+const appDefaults = { server: { host: 'localhost', port: 80, tls: { enabled: false, cert: null } }, log: { level: 'info', pretty: true }, retries: 3, name: 'app' };
+const appConfig = { server: { port: 8080, tls: { enabled: true } }, log: { level: undefined }, name: 'mine' };
+const snakeUsers = JSON.parse(
+	JSON.stringify(users)
+		.replace(/"name"/g, '"user_name"')
+		.replace(/"email"/g, '"email_address"')
+		.replace(/"zip"/g, '"zip_code"')
+);
+const camelUsers = toCamelCaseKeys(snakeUsers);
+const smallCopy = JSON.parse(JSON.stringify(small));
+const recordCopy = { ...record };
+const pattern = { address: { city: 'city-5' }, active: false };
+const mapEntry = function (value, key) {
+	return [key.toUpperCase(), value];
+};
+const caseless = function (a, b) {
+	return typeof a === 'string' && typeof b === 'string' ? a.toLowerCase() === b.toLowerCase() : undefined;
+};
+const shuffled = Object.fromEntries(Object.entries(record).reverse());
+const appState = { user: { profile: { name: 'Ada', visits: 1 }, settings: { theme: 'dark' } }, todos: users.slice(0, 50), flags: { a: true } };
+const increment = function (value) {
+	return value + 1;
+};
+
+const round11 = [
+	compare(
+		'defaults (flat record)',
+		function () {
+			return tinkDefaults({ id: 1, name: undefined }, small);
+		},
+		{
+			'es-toolkit': function () {
+				return compat.defaults({}, { id: 1, name: undefined }, small);
+			},
+			lodash: function () {
+				return lodash.defaults({}, { id: 1, name: undefined }, small);
+			}
+		}
+	),
+	compare(
+		'defaultsDeep (config over defaults)',
+		function () {
+			return defaultsDeep(appConfig, appDefaults);
+		},
+		{
+			defu: function () {
+				return defu(appConfig, appDefaults);
+			},
+			'es-toolkit': function () {
+				return compat.defaultsDeep({}, appConfig, appDefaults);
+			},
+			lodash: function () {
+				return lodash.defaultsDeep({}, appConfig, appDefaults);
+			}
+		}
+	),
+	compare(
+		'deepMergeWith arrays: concat (nested)',
+		function () {
+			return deepMergeWith({ arrays: 'concat' }, defaults, overrides);
+		},
+		{
+			'es-toolkit': function () {
+				return toolkit.mergeWith(toolkit.cloneDeep(defaults), overrides, function (a, b) {
+					return Array.isArray(a) && Array.isArray(b) ? a.concat(b) : undefined;
+				});
+			},
+			lodash: function () {
+				return lodash.mergeWith({}, defaults, overrides, function (a, b) {
+					return Array.isArray(a) && Array.isArray(b) ? a.concat(b) : undefined;
+				});
+			}
+		}
+	),
+	compare(
+		'updateInObjectByKeys (depth 3, immutable)',
+		function () {
+			return updateInObjectByKeys(appState, 'user.profile.visits', increment);
+		},
+		{
+			remeda: function () {
+				return remeda.setPath(appState, ['user', 'profile', 'visits'], appState.user.profile.visits + 1);
+			},
+			'es-toolkit': function () {
+				return compat.update(compat.cloneDeep(appState), 'user.profile.visits', increment);
+			}
+		}
+	),
+	{
+		name: 'omitInObjectByKeys (depth 3, immutable)',
+		fn: function () {
+			return omitInObjectByKeys(appState, 'user.settings.theme');
+		}
+	},
+	compare(
+		'toPath (bracket path)',
+		function () {
+			return toPath("users[12]['first.name'].address.zip");
+		},
+		{
+			'es-toolkit': function () {
+				return compat.toPath("users[12]['first.name'].address.zip");
+			},
+			lodash: function () {
+				return lodash.toPath("users[12]['first.name'].address.zip");
+			},
+			remeda: function () {
+				return remeda.stringToPath("users[12]['first.name'].address.zip");
+			}
+		}
+	),
+	compare(
+		'isMatch (filter 1k users by nested pattern)',
+		function () {
+			return users.filter(function (user) {
+				return isMatch(user, pattern);
+			});
+		},
+		{
+			'es-toolkit': function () {
+				return users.filter(function (user) {
+					return compat.isMatch(user, pattern);
+				});
+			},
+			lodash: function () {
+				return users.filter(function (user) {
+					return lodash.isMatch(user, pattern);
+				});
+			}
+		}
+	),
+	compare(
+		'shallowEqual (100-key record, equal)',
+		function () {
+			return shallowEqual(record, recordCopy);
+		},
+		{
+			remeda: function () {
+				return remeda.isShallowEqual(record, recordCopy);
+			}
+		}
+	),
+	compare(
+		'shallowEqual (small record, different)',
+		function () {
+			return shallowEqual(small, smallCopy);
+		},
+		{
+			remeda: function () {
+				return remeda.isShallowEqual(small, smallCopy);
+			}
+		}
+	),
+	compare(
+		'isEqualWith (1k users, caseless strings)',
+		function () {
+			return isEqualWith(users, copies.users, caseless);
+		},
+		{
+			'es-toolkit': function () {
+				return toolkit.isEqualWith(users, copies.users, caseless);
+			},
+			lodash: function () {
+				return lodash.isEqualWith(users, copies.users, caseless);
+			}
+		}
+	),
+	compare(
+		'findKey (100-key record, last key)',
+		function () {
+			return findKey(record, function (value) {
+				return value === 99;
+			});
+		},
+		{
+			'es-toolkit': function () {
+				return toolkit.findKey(record, function (value) {
+					return value === 99;
+				});
+			},
+			lodash: function () {
+				return lodash.findKey(record, function (value) {
+					return value === 99;
+				});
+			}
+		}
+	),
+	compare(
+		'mapEntries (100-key record)',
+		function () {
+			return mapEntries(record, mapEntry);
+		},
+		{
+			radash: function () {
+				return radash.mapEntries(record, function (key, value) {
+					return [key.toUpperCase(), value];
+				});
+			}
+		}
+	),
+	compare(
+		'sortKeys (100-key record)',
+		function () {
+			return sortKeys(shuffled);
+		},
+		{
+			'es-toolkit': function () {
+				return toolkit.sortKeys(shuffled);
+			}
+		}
+	),
+	compare(
+		'evolve (nested transforms)',
+		function () {
+			return evolve(appState, { user: { profile: { visits: increment } }, flags: { a: lodash.negate(Boolean) } });
+		},
+		{
+			remeda: function () {
+				return remeda.evolve(appState, { user: { profile: { visits: increment } }, flags: { a: lodash.negate(Boolean) } });
+			}
+		}
+	),
+	compare(
+		'toCamelCaseKeys (1k snake_case users)',
+		function () {
+			return toCamelCaseKeys(snakeUsers);
+		},
+		{
+			'es-toolkit': function () {
+				return toolkit.toCamelCaseKeys(snakeUsers);
+			}
+		}
+	),
+	compare(
+		'toSnakeCaseKeys (1k camelCase users)',
+		function () {
+			return toSnakeCaseKeys(camelUsers);
+		},
+		{
+			'es-toolkit': function () {
+				return toolkit.toSnakeCaseKeys(camelUsers);
+			}
+		}
+	),
+	compare(
+		'stableStringify (small record)',
+		function () {
+			return stableStringify(small);
+		},
+		{
+			'fast-json-stable-stringify': function () {
+				return fastStableStringify(small);
+			}
+		},
+		function () {
+			return JSON.stringify(small);
+		}
+	),
+	compare(
+		'stableStringify (1k users)',
+		function () {
+			return stableStringify(users);
+		},
+		{
+			'fast-json-stable-stringify': function () {
+				return fastStableStringify(users);
+			}
+		},
+		function () {
+			return JSON.stringify(users);
+		}
+	),
+	{
+		name: 'hash (small record)',
+		fn: function () {
+			return hash(small);
+		}
+	}
+];
 
 export default [
 	compare(
@@ -640,5 +942,6 @@ export default [
 		fn: function () {
 			return deepFreeze({ a: { b: [1, 2, { c: 3 }] }, d: { e: 1 } });
 		}
-	}
+	},
+	...round11
 ];

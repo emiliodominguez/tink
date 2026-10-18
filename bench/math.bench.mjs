@@ -1,13 +1,18 @@
+import bytes from 'bytes';
 import * as esToolkit from 'es-toolkit';
+import * as esToolkitCompat from 'es-toolkit/compat';
 import * as lodash from 'lodash-es';
 import {
 	average,
+	ceil,
 	clamp,
 	cumulativeSum,
+	floor,
 	formatBytes,
 	inRange,
 	median,
 	normalize,
+	parseBytes,
 	quantile,
 	randomBetween,
 	randomIntBetween,
@@ -32,6 +37,9 @@ const weights = medium.map(function (_, index) {
 	return (index % 13) + 1;
 });
 const toRound = medium.slice(0, 1000);
+const byteStrings = Array.from({ length: 1000 }, function (_, index) {
+	return `${((index * 7.31) % 1000) | 0}.${index % 10} ${['B', 'kB', 'MB', 'GB'][index % 4]}`;
+});
 const byteCounts = Array.from({ length: 1000 }, function (_, index) {
 	return index * index * 1234.5;
 });
@@ -164,6 +172,45 @@ export default [
 		}
 	),
 	scalarCase(
+		'ceil (1000 floats, 2 decimals)',
+		function (value) {
+			return ceil(value, 2);
+		},
+		{
+			'es-toolkit': function (value) {
+				return esToolkitCompat.ceil(value, 2);
+			},
+			lodash: function (value) {
+				return lodash.ceil(value, 2);
+			}
+		}
+	),
+	scalarCase(
+		'floor (1000 floats, 2 decimals)',
+		function (value) {
+			return floor(value, 2);
+		},
+		{
+			'es-toolkit': function (value) {
+				return esToolkitCompat.floor(value, 2);
+			},
+			lodash: function (value) {
+				return lodash.floor(value, 2);
+			}
+		}
+	),
+	scalarCase(
+		'floor (1000 floats, 0 decimals)',
+		function (value) {
+			return floor(value);
+		},
+		{
+			lodash: function (value) {
+				return lodash.floor(value);
+			}
+		}
+	),
+	scalarCase(
 		'clamp (1000 floats)',
 		function (value) {
 			return clamp(value, -100, 100);
@@ -239,6 +286,21 @@ export default [
 			let length = 0;
 			for (let i = 0; i < byteCounts.length; i++) length += formatBytes(byteCounts[i]).length;
 			return length;
+		}
+	},
+	{
+		name: 'parseBytes (1000 strings)',
+		fn: function () {
+			let total = 0;
+			for (let i = 0; i < byteStrings.length; i++) total += parseBytes(byteStrings[i]);
+			return total;
+		},
+		competitors: {
+			bytes: function () {
+				let total = 0;
+				for (let i = 0; i < byteStrings.length; i++) total += bytes.parse(byteStrings[i]);
+				return total;
+			}
 		}
 	}
 ];

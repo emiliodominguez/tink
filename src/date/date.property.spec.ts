@@ -579,4 +579,279 @@ describe('Date helpers (properties)', function () {
 			{ numRuns: 500 }
 		);
 	});
+
+	describe('round 11', function () {
+		const durationArb = fc.record(
+			{
+				years: fc.integer({ min: -50, max: 50 }),
+				months: fc.integer({ min: -30, max: 30 }),
+				weeks: fc.integer({ min: -10, max: 10 }),
+				days: fc.integer({ min: -400, max: 400 }),
+				hours: fc.integer({ min: -100, max: 100 }),
+				minutes: fc.integer({ min: -1000, max: 1000 }),
+				seconds: fc.integer({ min: -1000, max: 1000 }),
+				milliseconds: fc.integer({ min: -5000, max: 5000 })
+			},
+			{ requiredKeys: [] }
+		);
+
+		it('addDuration(start, intervalToDuration(start, end)) is exactly end, in both directions', function () {
+			fc.assert(
+				fc.property(dateArb, dateArb, function (start, end) {
+					const duration = helpers.intervalToDuration(start, end);
+					expect(helpers.addDuration(start, duration).getTime()).toBe(end.getTime());
+				}),
+				{ numRuns: 1000 }
+			);
+		});
+
+		it('intervalToDuration is largest-first: every component has the sign of the interval and is below its limit', function () {
+			fc.assert(
+				fc.property(dateArb, dateArb, function (start, end) {
+					const duration = helpers.intervalToDuration(start, end);
+					const sign = end.getTime() < start.getTime() ? -1 : 1;
+					const { years, months, days, hours, minutes, seconds, milliseconds } = duration;
+					for (const value of [years, months, days, hours, minutes, seconds, milliseconds]) {
+						expect(Number.isInteger(value)).toBe(true);
+						expect(sign * value).toBeGreaterThanOrEqual(0);
+						expect(Object.is(value, -0)).toBe(false);
+					}
+					expect(Math.abs(months)).toBeLessThan(12);
+					expect(Math.abs(days)).toBeLessThan(31);
+					expect(Math.abs(hours)).toBeLessThanOrEqual(24);
+					expect(Math.abs(minutes)).toBeLessThan(60);
+					expect(Math.abs(seconds)).toBeLessThan(60);
+					expect(Math.abs(milliseconds)).toBeLessThan(1000);
+					// The months are complete months, as counted by diffInMonths when going forward.
+					if (sign > 0) expect(years * 12 + months).toBe(helpers.diffInMonths(end, start));
+				}),
+				{ numRuns: 1000 }
+			);
+		});
+
+		it('addDuration applies months, then days, then time; subDuration negates every field', function () {
+			fc.assert(
+				fc.property(dateArb, durationArb, function (date, duration) {
+					const { years = 0, months = 0, weeks = 0, days = 0, hours = 0, minutes = 0, seconds = 0, milliseconds = 0 } = duration;
+					const time = ((hours * 60 + minutes) * 60 + seconds) * 1000 + milliseconds;
+					const calendar = helpers.addMonths(date, years * 12 + months);
+					const result = helpers.addDuration(date, duration);
+					// Same calendar day as month-then-day stepping, and the absolute time on top.
+					const expected = helpers.addDays(calendar, weeks * 7 + days);
+					fc.pre(timeOfDay(expected).join() === timeOfDay(date).join());
+					expect(result.getTime()).toBe(expected.getTime() + time);
+					const negated = Object.fromEntries(
+						Object.entries(duration).map(function ([key, value]) {
+							return [key, 0 - (value as number)];
+						})
+					);
+					expect(helpers.subDuration(date, duration).getTime()).toBe(helpers.addDuration(date, negated).getTime());
+				})
+			);
+		});
+
+		it('toISOStringLocal denotes the same instant and matches the local fields', function () {
+			fc.assert(
+				fc.property(fc.date({ min: new Date(-50_000, 0, 1), max: new Date(50_000, 0, 1), noInvalidDate: true }), fc.boolean(), function (date, milliseconds) {
+					const iso = helpers.toISOStringLocal(date, { milliseconds });
+					expect(iso).toMatch(/^(?:\d{4}|[+-]\d{6})-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{3})?(?:Z|[+-]\d\d:\d\d)$/);
+					expect(new Date(iso).getTime()).toBe(milliseconds ? date.getTime() : date.getTime() - date.getMilliseconds());
+					// Since 1980 every zone has whole-minute offsets: the string shows the wall clock.
+					if (date.getFullYear() >= 1980 && date.getFullYear() <= 9999) {
+						expect(iso.slice(0, 19)).toBe(helpers.formatDate(date, 'YYYY-MM-DD[T]HH:mm:ss'));
+					}
+					if (iso.endsWith('Z') && milliseconds) expect(iso).toBe(date.toISOString());
+				}),
+				{ numRuns: 500 }
+			);
+		});
+
+		it('diffInWeeks counts complete weeks like addWeeks; diffInYears is diffInMonths / 12', function () {
+			fc.assert(
+				fc.property(dateArb, dateArb, function (later, earlier) {
+					const weeks = helpers.diffInWeeks(later, earlier);
+					const [from, to, sign] = later.getTime() >= earlier.getTime() ? [earlier, later, 1] : [later, earlier, -1];
+					const n = sign * weeks;
+					expect(helpers.addWeeks(from, n).getTime()).toBeLessThanOrEqual(to.getTime());
+					expect(helpers.addWeeks(from, n + 1).getTime()).toBeGreaterThan(to.getTime());
+					expect(helpers.diffInYears(later, earlier)).toBe(Math.trunc(helpers.diffInMonths(later, earlier) / 12) + 0);
+					expect(helpers.diffInCalendarYears(later, earlier)).toBe(
+						Math.floor(helpers.diffInCalendarMonths(later, earlier) / 12) + (later.getMonth() < earlier.getMonth() ? 1 : 0)
+					);
+				})
+			);
+		});
+
+		it('startOf/endOf hour and minute bracket the date on wall-clock boundaries', function () {
+			fc.assert(
+				fc.property(dateArb, function (date) {
+					const time = date.getTime();
+					const hourStart = helpers.startOfHour(date);
+					const hourEnd = helpers.endOfHour(date);
+					const minuteStart = helpers.startOfMinute(date);
+					const minuteEnd = helpers.endOfMinute(date);
+					expect(hourStart.getTime()).toBeLessThanOrEqual(minuteStart.getTime());
+					expect(minuteStart.getTime()).toBeLessThanOrEqual(time);
+					expect(time).toBeLessThanOrEqual(minuteEnd.getTime());
+					expect(minuteEnd.getTime()).toBeLessThanOrEqual(hourEnd.getTime());
+					expect([minuteStart.getSeconds(), minuteStart.getMilliseconds(), minuteEnd.getSeconds(), minuteEnd.getMilliseconds()]).toEqual([0, 0, 59, 999]);
+					expect([hourEnd.getMinutes(), hourEnd.getSeconds(), hourEnd.getMilliseconds()]).toEqual([59, 59, 999]);
+					expect(hourStart.getSeconds() + hourStart.getMilliseconds()).toBe(0);
+					expect(minuteEnd.getTime() - minuteStart.getTime()).toBe(59_999);
+					// Idempotent.
+					expect(helpers.startOfHour(hourStart).getTime()).toBe(hourStart.getTime());
+				}),
+				{ numRuns: 500 }
+			);
+		});
+
+		it('roundToNearestMinutes: floor <= date <= ceil, both on the grid, and round picks the nearer one', function () {
+			const stepArb = fc.constantFrom(1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60);
+			fc.assert(
+				fc.property(dateArb, stepArb, function (date, step) {
+					const down = helpers.roundToNearestMinutes(date, step, 'floor');
+					const up = helpers.roundToNearestMinutes(date, step, 'ceil');
+					const nearest = helpers.roundToNearestMinutes(date, step);
+					expect(down.getTime()).toBeLessThanOrEqual(date.getTime());
+					expect(up.getTime()).toBeGreaterThanOrEqual(date.getTime());
+					for (const value of [down, up]) {
+						expect(value.getSeconds() + value.getMilliseconds()).toBe(0);
+						expect(value.getMinutes() % step).toBe(0);
+					}
+					expect([down.getTime(), up.getTime()]).toContain(nearest.getTime());
+					// Outside DST changes, the grid is 60000 * step milliseconds wide.
+					if (up.getTimezoneOffset() === down.getTimezoneOffset()) {
+						expect(up.getTime() - down.getTime()).toBe(date.getTime() === down.getTime() ? 0 : step * 60_000);
+						const nearer = date.getTime() - down.getTime() < up.getTime() - date.getTime() ? down : up;
+						expect(nearest.getTime()).toBe(nearer.getTime());
+					}
+				}),
+				{ numRuns: 500 }
+			);
+		});
+
+		it('eachOfInterval: ascending unit starts, from the unit of start to the unit of end', function () {
+			const unitArb = fc.constantFrom<helpers.IntervalUnit>('year', 'quarter', 'month', 'week', 'day', 'hour', 'minute');
+			const spans = { year: 2e11, quarter: 5e10, month: 2e10, week: 5e9, day: 1e9, hour: 3e8, minute: 5e6 };
+			fc.assert(
+				fc.property(
+					dateArb,
+					fc.double({ min: 0, max: 1, noNaN: true }),
+					unitArb,
+					fc.integer({ min: 1, max: 5 }),
+					weekdayArb,
+					function (start, fraction, unit, step, weekStartsOn) {
+						const end = new Date(start.getTime() + Math.floor(fraction * spans[unit]));
+						const dates = helpers.eachOfInterval(start, end, unit, step, weekStartsOn);
+						expect(dates.length).toBeGreaterThan(0);
+						expect(dates[0].getTime()).toBeLessThanOrEqual(start.getTime());
+						expect(dates[dates.length - 1].getTime()).toBeLessThanOrEqual(end.getTime());
+						for (let i = 1; i < dates.length; i++) expect(dates[i].getTime()).toBeGreaterThan(dates[i - 1].getTime());
+						const startOf: Record<string, (date: Date) => Date> = {
+							year: helpers.startOfYear,
+							quarter: helpers.startOfQuarter,
+							month: helpers.startOfMonth,
+							week: function (date: Date): Date {
+								return helpers.startOfWeek(date, weekStartsOn);
+							},
+							day: helpers.startOfDay,
+							hour: helpers.startOfHour,
+							minute: helpers.startOfMinute
+						};
+						expect(dates[0].getTime()).toBe(startOf[unit](start).getTime());
+						for (const date of dates) expect(startOf[unit](date).getTime()).toBe(date.getTime());
+						if (step === 1) expect(startOf[unit](end).getTime()).toBe(dates[dates.length - 1].getTime());
+					}
+				),
+				{ numRuns: 300 }
+			);
+		});
+
+		it('nextWeekday / previousWeekday land on the weekday 1 to 7 days away', function () {
+			fc.assert(
+				fc.property(dateArb, weekdayArb, function (date, weekday) {
+					const next = helpers.nextWeekday(date, weekday);
+					const previous = helpers.previousWeekday(date, weekday);
+					expect(next.getDay()).toBe(weekday);
+					expect(previous.getDay()).toBe(weekday);
+					expect(helpers.diffInDays(next, date)).toBeGreaterThanOrEqual(1);
+					expect(helpers.diffInDays(next, date)).toBeLessThanOrEqual(7);
+					expect(helpers.diffInDays(date, previous)).toBeGreaterThanOrEqual(1);
+					expect(helpers.diffInDays(date, previous)).toBeLessThanOrEqual(7);
+				})
+			);
+		});
+
+		it('intervalsOverlap is the intersection of half-open (or closed) integer intervals', function () {
+			const intervalArb = fc.tuple(fc.integer({ min: 0, max: 20 }), fc.integer({ min: 0, max: 20 })).map(function ([x, y]) {
+				return { start: Math.min(x, y), end: Math.max(x, y) };
+			});
+			fc.assert(
+				fc.property(intervalArb, intervalArb, fc.boolean(), function (a, b, inclusive) {
+					let shared = false;
+					for (let t = 0; t <= 20; t += 0.5) {
+						const inA = inclusive ? t >= a.start && t <= a.end : t >= a.start && t < a.end;
+						const inB = inclusive ? t >= b.start && t <= b.end : t >= b.start && t < b.end;
+						shared ||= inA && inB;
+					}
+					expect(helpers.intervalsOverlap(a, b, { inclusive })).toBe(shared);
+					expect(helpers.intervalsOverlap(b, a, { inclusive })).toBe(shared);
+				})
+			);
+		});
+
+		it('parseDate inverts formatDate for patterns with every field', function () {
+			const patternArb = fc.constantFrom(
+				'YYYY-MM-DD HH:mm:ss.SSS',
+				'YYYYMMDDHHmmssSSS',
+				'D/M/YYYY h:m:s.SSS a',
+				'[at] hh:mm:ss.SSS A [on] DD.MM.YYYY',
+				'SSS ss mm HH DD MM YYYY',
+				'YYYY-M-D H:mm:ss.SSS'
+			);
+			const wideDateArb = fc.date({ min: new Date(0, 0, 1), max: new Date(9999, 11, 31), noInvalidDate: true });
+			fc.assert(
+				fc.property(wideDateArb, patternArb, function (date, pattern) {
+					const text = helpers.formatDate(date, pattern);
+					const parsed = helpers.parseDate(text, pattern);
+					expect(parsed).toBeInstanceOf(Date);
+					expect(helpers.formatDate(parsed as Date, pattern)).toBe(text);
+					// A repeated wall-clock time (clocks set back) resolves to its first occurrence.
+					if (parsed?.getTime() !== date.getTime()) {
+						expect(parsed?.getTime()).toBeLessThan(date.getTime());
+						expect(parsed?.getTimezoneOffset()).not.toBe(date.getTimezoneOffset());
+					}
+				}),
+				{ numRuns: 1000 }
+			);
+		});
+
+		it('parseDate accepts exactly what formatDate produces (never throws, never half-parses)', function () {
+			const pieceArb = fc.constantFrom('YYYY', 'YY', 'MM', 'M', 'DD', 'D', 'HH', 'H', 'hh', 'h', 'mm', 'm', 'ss', 's', 'SSS', 'A', 'a', '-', ':', ' ', '[T]');
+			const textArb = fc.stringMatching(/^[-0-9: APMapmT]{0,20}$/);
+			fc.assert(
+				fc.property(fc.array(pieceArb, { maxLength: 8 }), textArb, function (pieces, text) {
+					const pattern = pieces.join('');
+					const parsed = helpers.parseDate(text, pattern);
+					if (parsed !== undefined) expect(helpers.formatDate(parsed, pattern)).toBe(text);
+				}),
+				{ numRuns: 1000 }
+			);
+		});
+
+		it('getDayOfYear, isTomorrow, isYesterday, isSameWeek and isSameQuarter agree with the calendar helpers', function () {
+			fc.assert(
+				fc.property(dateArb, dateArb, weekdayArb, function (a, b, weekStartsOn) {
+					expect(helpers.getDayOfYear(a)).toBe(helpers.diffInDays(a, helpers.startOfYear(a)) + 1);
+					expect(helpers.isTomorrow(a, b)).toBe(helpers.diffInDays(a, b) === 1);
+					expect(helpers.isYesterday(a, b)).toBe(helpers.diffInDays(b, a) === 1);
+					expect(helpers.isSameWeek(a, b, weekStartsOn)).toBe(helpers.startOfWeek(a, weekStartsOn).getTime() === helpers.startOfWeek(b, weekStartsOn).getTime());
+					expect(helpers.isSameQuarter(a, b)).toBe(helpers.startOfQuarter(a).getTime() === helpers.startOfQuarter(b).getTime());
+					const tomorrow = helpers.addDays(a, 1);
+					expect(helpers.isTomorrow(tomorrow, a)).toBe(true);
+					expect(helpers.isYesterday(a, tomorrow)).toBe(true);
+				})
+			);
+		});
+	});
 });

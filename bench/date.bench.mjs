@@ -2,26 +2,45 @@ import * as dateFns from 'date-fns';
 import {
 	addBusinessDays,
 	addDays,
+	addDuration,
 	addMonths,
 	addYears,
 	diffInBusinessDays,
+	diffInCalendarMonths,
 	diffInDays,
 	diffInMonths,
+	diffInWeeks,
+	diffInYears,
 	eachDayOfInterval,
+	eachOfInterval,
 	endOfDay,
+	endOfHour,
 	endOfMonth,
 	formatDate,
 	formatDuration,
+	getDayOfYear,
 	getISOWeek,
 	getRelativeTime,
+	intervalsOverlap,
+	intervalToDuration,
 	isSameDay,
+	isSameQuarter,
+	isSameWeek,
+	isTomorrow,
 	isValidDate,
+	nextWeekday,
+	parseDate,
 	parseDuration,
 	parseISODate,
+	roundToNearestMinutes,
 	startOfDay,
+	startOfHour,
+	startOfMinute,
 	startOfMonth,
 	startOfWeek,
-	toISODateString
+	subDuration,
+	toISODateString,
+	toISOStringLocal
 } from '@emiliodominguez/tink/date';
 
 // 100 deterministic dates spread over several years (local time).
@@ -37,6 +56,10 @@ const durations = dates.map(function (date) {
 const durationStrings = durations.map(function (ms, index) {
 	return `${index}d ${ms % 24}h ${ms % 60}m ${(ms % 600) / 10}s`;
 });
+const formatted = dates.map(function (date) {
+	return formatDate(date, 'YYYY-MM-DD HH:mm:ss.SSS');
+});
+const duration = { years: 1, months: 2, weeks: 1, days: 3, hours: 4, minutes: 5, seconds: 6 };
 const mixedValues = dates.map(function (date, index) {
 	return index % 3 === 0 ? new Date(NaN) : index % 3 === 1 ? date : date.getTime();
 });
@@ -262,6 +285,198 @@ export default [
 			return dateFns.formatDistance(date, other, { addSuffix: true }).length;
 		}
 	),
+	dateCase(
+		'addDuration (100 × { y, mo, w, d, h, m, s })',
+		function (date) {
+			return addDuration(date, duration).getTime();
+		},
+		function (date) {
+			return dateFns.add(date, duration).getTime();
+		}
+	),
+	dateCase(
+		'subDuration (100 × { y, mo, w, d, h, m, s })',
+		function (date) {
+			return subDuration(date, duration).getTime();
+		},
+		function (date) {
+			return dateFns.sub(date, duration).getTime();
+		}
+	),
+	dateCase(
+		'intervalToDuration (100 pairs)',
+		function (date, index, other) {
+			return intervalToDuration(date, other).days;
+		},
+		function (date, index, other) {
+			return dateFns.intervalToDuration({ start: date, end: other }).days ?? 0;
+		}
+	),
+	dateCase(
+		'toISOStringLocal (100) vs formatISO',
+		function (date) {
+			return toISOStringLocal(date, { milliseconds: false }).length;
+		},
+		function (date) {
+			return dateFns.formatISO(date).length;
+		}
+	),
+	dateCase(
+		'diffInWeeks (100 pairs)',
+		function (date, index, other) {
+			return diffInWeeks(date, other);
+		},
+		function (date, index, other) {
+			return dateFns.differenceInWeeks(date, other);
+		}
+	),
+	dateCase(
+		'diffInYears (100 pairs)',
+		function (date, index, other) {
+			return diffInYears(date, other);
+		},
+		function (date, index, other) {
+			return dateFns.differenceInYears(date, other);
+		}
+	),
+	dateCase(
+		'diffInCalendarMonths (100 pairs)',
+		function (date, index, other) {
+			return diffInCalendarMonths(date, other);
+		},
+		function (date, index, other) {
+			return dateFns.differenceInCalendarMonths(date, other);
+		}
+	),
+	dateCase(
+		'startOfHour (100)',
+		function (date) {
+			return startOfHour(date).getTime();
+		},
+		function (date) {
+			return dateFns.startOfHour(date).getTime();
+		}
+	),
+	dateCase(
+		'endOfHour (100)',
+		function (date) {
+			return endOfHour(date).getTime();
+		},
+		function (date) {
+			return dateFns.endOfHour(date).getTime();
+		}
+	),
+	dateCase(
+		'startOfMinute (100)',
+		function (date) {
+			return startOfMinute(date).getTime();
+		},
+		function (date) {
+			return dateFns.startOfMinute(date).getTime();
+		}
+	),
+	dateCase(
+		'roundToNearestMinutes (100, 15 min)',
+		function (date) {
+			return roundToNearestMinutes(date, 15).getTime();
+		},
+		function (date) {
+			return dateFns.roundToNearestMinutes(date, { nearestTo: 15 }).getTime();
+		}
+	),
+	dateCase(
+		'nextWeekday (100)',
+		function (date, index) {
+			return nextWeekday(date, index % 7).getTime();
+		},
+		function (date, index) {
+			return dateFns.nextDay(date, index % 7).getTime();
+		}
+	),
+	dateCase(
+		'intervalsOverlap (100 pairs)',
+		function (date, index, other) {
+			return intervalsOverlap({ start: date, end: dates[(index + 1) % 100] < date ? date : dates[(index + 1) % 100] }, { start: other, end: other }, { inclusive: true })
+				? 1
+				: 0;
+		},
+		function (date, index, other) {
+			return dateFns.areIntervalsOverlapping(
+				{ start: date, end: dates[(index + 1) % 100] < date ? date : dates[(index + 1) % 100] },
+				{ start: other, end: other },
+				{ inclusive: true }
+			)
+				? 1
+				: 0;
+		}
+	),
+	dateCase(
+		'getDayOfYear (100)',
+		function (date) {
+			return getDayOfYear(date);
+		},
+		function (date) {
+			return dateFns.getDayOfYear(date);
+		}
+	),
+	dateCase(
+		'isSameWeek (100 pairs)',
+		function (date, index, other) {
+			return isSameWeek(date, other, 1) ? 1 : 0;
+		},
+		function (date, index, other) {
+			return dateFns.isSameWeek(date, other, { weekStartsOn: 1 }) ? 1 : 0;
+		}
+	),
+	dateCase(
+		'isSameQuarter (100 pairs)',
+		function (date, index, other) {
+			return isSameQuarter(date, other) ? 1 : 0;
+		},
+		function (date, index, other) {
+			return dateFns.isSameQuarter(date, other) ? 1 : 0;
+		}
+	),
+	dateCase(
+		'isTomorrow (100)',
+		function (date) {
+			return isTomorrow(date) ? 1 : 0;
+		},
+		function (date) {
+			return dateFns.isTomorrow(date) ? 1 : 0;
+		}
+	),
+	dateCase(
+		"parseDate (100 × 'YYYY-MM-DD HH:mm:ss.SSS')",
+		function (date, index) {
+			return parseDate(formatted[index], 'YYYY-MM-DD HH:mm:ss.SSS').getTime();
+		},
+		function (date, index) {
+			return dateFns.parse(formatted[index], 'yyyy-MM-dd HH:mm:ss.SSS', 0).getTime();
+		}
+	),
+	{
+		name: 'eachOfInterval (1 year of months)',
+		fn: function () {
+			return eachOfInterval(dates[0], dates[12], 'month');
+		},
+		competitors: {
+			'date-fns': function () {
+				return dateFns.eachMonthOfInterval({ start: dates[0], end: dates[12] });
+			}
+		}
+	},
+	{
+		name: 'eachOfInterval (1 week of hours)',
+		fn: function () {
+			return eachOfInterval(dates[0], dates[0].getTime() + 7 * 86_400_000, 'hour');
+		},
+		competitors: {
+			'date-fns': function () {
+				return dateFns.eachHourOfInterval({ start: dates[0], end: dates[0].getTime() + 7 * 86_400_000 });
+			}
+		}
+	},
 	{
 		name: 'eachDayOfInterval (1 year)',
 		fn: function () {

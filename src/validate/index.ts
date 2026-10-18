@@ -1,4 +1,6 @@
 import { daysInMonth } from '../date/index.js';
+import { explain, ValidationError, type Guard, type JsonValue } from '../guards/index.js';
+import { describe } from '../utils/assert.js';
 
 /**
  * Options accepted by {@link isUrl}.
@@ -810,4 +812,165 @@ export function isSlug(value: unknown): value is string {
  */
 export function isNumericString(value: unknown): value is string {
 	return typeof value === 'string' && NUMERIC_PATTERN.test(value) && Number.isFinite(Number(value));
+}
+
+/**
+ * What {@link parseJson} does with the keys that turn parsed JSON into a prototype-pollution payload: an own `__proto__` key, and a
+ * `constructor` key whose value is an object with a `prototype` key. `'error'` fails the parse, `'remove'` deletes those keys (the whole
+ * `constructor` property), `'ignore'` keeps them (plain `JSON.parse` behaviour).
+ */
+export type ProtoAction = 'error' | 'remove' | 'ignore';
+
+/**
+ * Options accepted by {@link parseJson}.
+ */
+export interface ParseJsonOptions {
+	/** What to do with `__proto__` and `constructor.prototype` keys. Defaults to `'error'`. */
+	readonly proto?: ProtoAction;
+}
+
+/**
+ * The outcome of {@link parseJson}: `[undefined, value]` on success, `[error, undefined]` on failure. It is assignable to the
+ * `Result` tuple of `functions.attempt`, with a precise error type.
+ * @template T - The parsed (and validated) type
+ */
+export type ParseJsonResult<T> = [error: SyntaxError | TypeError | ValidationError, value: undefined] | [error: undefined, value: T];
+
+/** Text that may hold a forbidden key: spelled out, or hidden behind a `\u` escape. */
+const PROTO_HINT = /__proto__|constructor|\\u/;
+
+const hasOwn = Object.prototype.hasOwnProperty;
+
+/**
+ * Finds (or, with `remove`, deletes) the forbidden keys of a parsed JSON value. Iterative, so deep values cannot overflow the stack.
+ * @param {object} root - An object or array returned by `JSON.parse`
+ * @param {boolean} remove - Delete the keys instead of reporting the first one
+ * @returns {string | undefined} The first forbidden key found (`undefined` when there is none, or when removing)
+ */
+function findProtoKey(root: object, remove: boolean): string | undefined {
+	const stack = [root];
+
+	while (stack.length > 0) {
+		const node = stack.pop() as Record<string, unknown>;
+
+		if (Array.isArray(node)) {
+			for (let index = 0; index < node.length; index++) pushObject(stack, node[index]);
+			continue;
+		}
+		if (hasOwn.call(node, '__proto__')) {
+			if (!remove) return '__proto__';
+			delete node['__proto__'];
+		}
+
+		const constructor = hasOwn.call(node, 'constructor') ? node['constructor'] : undefined;
+
+		if (typeof constructor === 'object' && constructor !== null && hasOwn.call(constructor, 'prototype')) {
+			if (!remove) return 'constructor.prototype';
+			delete node['constructor'];
+		}
+		for (const key in node) pushObject(stack, node[key]);
+	}
+
+	return undefined;
+}
+
+/**
+ * Pushes `value` onto `stack` when it is an object (primitives hold no keys to scan).
+ * @param {object[]} stack - The stack
+ * @param {unknown} value - The value
+ * @returns {void}
+ */
+function pushObject(stack: object[], value: unknown): void {
+	if (typeof value === 'object' && value !== null) stack.push(value);
+}
+
+/**
+ * Parses JSON text without throwing, returning a `[error, value]` tuple (see {@link ParseJsonResult}). With a guard (any guard of the
+ * guards module: `isShape`, `isArrayOf`, `isMatching`, …) the value is also validated: the result is typed by the guard, and invalid
+ * data gives a `ValidationError` whose `issues` carry the path of every problem (see the guards module's `explain`).
+ *
+ * Unlike `JSON.parse`, the parsed value cannot carry a prototype-pollution payload. `JSON.parse('{"__proto__": {"admin": true}}')`
+ * creates an OWN `__proto__` property, harmless by itself, but a later `Object.assign`, spread-into-class or naive deep merge
+ * writes it through the `__proto__` setter and replaces (or pollutes) a prototype. With the default `proto: 'error'` such text fails
+ * with a `SyntaxError` (like secure-json-parse): legitimate JSON never needs these keys, so their presence is a signal that should be
+ * seen, not silently repaired; `'remove'` deletes them instead (for lenient ingestion), and `'ignore'` keeps them. Keys hidden behind
+ * `\u` escapes are found too. Text without `__proto__`, `constructor` or a `\u` escape skips the check entirely.
+ *
+ * Errors are returned, not thrown: a `SyntaxError` for invalid JSON (with the engine's message) or a forbidden key, a `TypeError` when
+ * `text` is not a string, a `ValidationError` when the guard rejects the value. Only programming errors throw: an invalid `guard` or
+ * `options`, or a guard that throws itself.
+ * @param {string} text - The JSON text
+ * @param {ParseJsonOptions} [options] - `proto` (default `'error'`): what to do with `__proto__` and `constructor.prototype` keys
+ * @returns {ParseJsonResult<JsonValue>} `[undefined, value]` on success, `[error, undefined]` on failure
+ * @throws {TypeError} when `options` is not an object
+ * @throws {RangeError} when `options.proto` is not `'error'`, `'remove'` or `'ignore'`
+ * @example
+ * parseJson('{"a":[1,2]}'); // => [undefined, { a: [1, 2] }]
+ * const [error] = parseJson('{bad');
+ * error instanceof SyntaxError; // => true
+ * parseJson('{"__proto__":{"admin":true}}')[0] instanceof SyntaxError; // => true
+ * parseJson('{"a":1,"__proto__":{"admin":true}}', { proto: 'remove' }); // => [undefined, { a: 1 }]
+ */
+export function parseJson(text: string, options?: ParseJsonOptions): ParseJsonResult<JsonValue>;
+/**
+ * Parses JSON text without throwing and validates the value with `guard`.
+ * @template T - The type the guard narrows to
+ * @param {string} text - The JSON text
+ * @param {Guard<T>} guard - The guard the parsed value must pass
+ * @param {ParseJsonOptions} [options] - `proto` (default `'error'`): what to do with `__proto__` and `constructor.prototype` keys
+ * @returns {ParseJsonResult<T>} `[undefined, value]` on success, `[error, undefined]` on failure
+ * @throws {TypeError} when `guard` is not a function or `options` is not an object
+ * @throws {RangeError} when `options.proto` is not `'error'`, `'remove'` or `'ignore'`
+ * @example
+ * import { isShape, isInteger, ValidationError } from '@emiliodominguez/tink/guards';
+ * const isConfig = isShape({ port: isInteger });
+ * parseJson('{"port":8080}', isConfig); // => [undefined, { port: 8080 }]
+ * const [error] = parseJson('{"port":"80"}', isConfig);
+ * error instanceof ValidationError; // => true
+ * (error as ValidationError).issues; // => [{ message: 'Invalid value (got string)', path: ['port'] }]
+ */
+export function parseJson<T>(text: string, guard: Guard<T>, options?: ParseJsonOptions): ParseJsonResult<T>;
+/**
+ * Implementation of the overloads above.
+ * @param {string} text - The JSON text
+ * @param {Guard<unknown> | ParseJsonOptions} [guardOrOptions] - The guard, or the options
+ * @param {ParseJsonOptions} [options] - The options, after a guard
+ * @returns {ParseJsonResult<unknown>} The outcome
+ * @example
+ * parseJson('1'); // => [undefined, 1]
+ */
+export function parseJson(text: string, guardOrOptions?: Guard<unknown> | ParseJsonOptions, options?: ParseJsonOptions): ParseJsonResult<unknown> {
+	const guard = typeof guardOrOptions === 'function' ? guardOrOptions : undefined;
+
+	if (guard === undefined && guardOrOptions !== undefined) options = guardOrOptions as ParseJsonOptions;
+	if (options !== undefined && (typeof options !== 'object' || options === null)) {
+		throw new TypeError(`parseJson: \`options\` must be an object, got ${describe(options)}`);
+	}
+
+	const proto = options?.proto ?? 'error';
+
+	if (proto !== 'error' && proto !== 'remove' && proto !== 'ignore') {
+		throw new RangeError(`parseJson: \`proto\` must be 'error', 'remove' or 'ignore', got ${String(proto)}`);
+	}
+	if (typeof text !== 'string') return [new TypeError(`parseJson: \`text\` must be a string, got ${describe(text)}`), undefined];
+
+	let value: unknown;
+
+	try {
+		value = JSON.parse(text);
+	} catch (error) {
+		return [error as SyntaxError, undefined];
+	}
+	if (proto !== 'ignore' && PROTO_HINT.test(text)) {
+		const key = typeof value === 'object' && value !== null ? findProtoKey(value, proto === 'remove') : undefined;
+
+		if (key !== undefined) return [new SyntaxError(`parseJson: JSON contains a forbidden "${key}" key`), undefined];
+	}
+	if (guard !== undefined) {
+		const issues = explain(guard, value);
+
+		if (issues.length > 0) return [new ValidationError(issues), undefined];
+	}
+
+	return [undefined, value];
 }

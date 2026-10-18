@@ -1,36 +1,67 @@
 import {
+	averageBy,
 	chunk,
+	chunkBy,
+	combinations,
 	compact,
 	countBy,
 	difference,
 	differenceBy,
+	differenceWith,
 	drop,
+	dropLast,
+	dropLastWhile,
 	flatten,
 	flattenDeep,
 	groupBy,
 	intersection,
 	intersectionBy,
+	intersectionWith,
 	isSubset,
 	keyBy,
 	maxBy,
+	medianBy,
 	minBy,
+	nthBy,
+	orderBy,
 	partition,
+	permutations,
+	powerSet,
 	range,
 	removeDuplicates,
+	rotate,
 	sample,
+	sampleSize,
 	shuffle,
 	sortBy,
+	sortedIndexBy,
+	sortedLastIndex,
+	splitWhen,
 	sumBy,
+	swap,
 	symmetricDifference,
+	symmetricDifferenceBy,
 	take,
+	takeFirstBy,
+	takeLast,
+	takeLastWhile,
+	toArray,
+	toggle,
 	union,
+	unionBy,
+	unionWith,
 	uniqueBy,
+	uniqueWith,
 	unzip,
 	windowed,
-	zip
+	zip,
+	zipObject,
+	zipWith
 } from '@emiliodominguez/tink/arrays';
 import * as toolkit from 'es-toolkit';
 import * as lodash from 'lodash-es';
+import * as radash from 'radash';
+import * as remeda from 'remeda';
 
 // Realistic inputs at three sizes: small (10), medium (1k) and large (100k) items.
 const SIZES = [10, 1_000, 100_000];
@@ -124,6 +155,26 @@ function isSenior(user) {
 function decade(n) {
 	return n - (n % 10);
 }
+
+/**
+ * @param {{ id: number }} a - A record
+ * @param {{ id: number }} b - Another record
+ * @returns {boolean} Whether both have the same id
+ */
+function sameId(a, b) {
+	return a.id === b.id;
+}
+/**
+ * @param {number} a - A number
+ * @param {number} b - A number
+ * @param {number} [c=0] - An optional third number
+ * @returns {number} The sum
+ */
+function add(a, b, c = 0) {
+	return a + b + c;
+}
+// Small alphabet for the combinatorics cases.
+const LETTERS = Array.from('abcdefghijklmnopqrst');
 
 export default [
 	...sized('chunk', SIZES, function (n) {
@@ -662,6 +713,412 @@ export default [
 				},
 				lodash: function () {
 					return lodash.differenceBy(a, b, decade);
+				}
+			}
+		};
+	}),
+	...sized('orderBy (team asc, score desc)', SIZES, function (n) {
+		const users = people(n);
+		return {
+			fn: function () {
+				return orderBy(users, [byTeam, byScore], ['asc', 'desc']);
+			},
+			competitors: {
+				'es-toolkit': function () {
+					return toolkit.orderBy(users, [byTeam, byScore], ['asc', 'desc']);
+				},
+				lodash: function () {
+					return lodash.orderBy(users, [byTeam, byScore], ['asc', 'desc']);
+				},
+				remeda: function () {
+					return remeda.sortBy(users, byTeam, [byScore, 'desc']);
+				}
+			}
+		};
+	}),
+	...sized('takeFirstBy (top 10 by score)', SIZES, function (n) {
+		const users = people(n);
+		return {
+			fn: function () {
+				return takeFirstBy(users, 10, byScore, 'desc');
+			},
+			baseline: function () {
+				return sortBy(users, byScore, 'desc').slice(0, 10);
+			},
+			competitors: {
+				remeda: function () {
+					return remeda.takeFirstBy(users, 10, [byScore, 'desc']);
+				}
+			}
+		};
+	}),
+	...sized('nthBy (10th by score)', [1_000, 100_000], function (n) {
+		const users = people(n);
+		return {
+			fn: function () {
+				return nthBy(users, 9, byScore);
+			},
+			competitors: {
+				remeda: function () {
+					return remeda.nthBy(users, 9, byScore);
+				}
+			}
+		};
+	}),
+	...sized('takeLast / dropLast (n = 3)', [10, 1_000], function (n) {
+		const numbers = integers(n, n);
+		return {
+			fn: function () {
+				return [takeLast(numbers, 3), dropLast(numbers, 3)];
+			},
+			competitors: {
+				'es-toolkit': function () {
+					return [toolkit.takeRight(numbers, 3), toolkit.dropRight(numbers, 3)];
+				},
+				lodash: function () {
+					return [lodash.takeRight(numbers, 3), lodash.dropRight(numbers, 3)];
+				},
+				remeda: function () {
+					return [remeda.takeLast(numbers, 3), remeda.dropLast(numbers, 3)];
+				}
+			}
+		};
+	}),
+	...sized('takeLastWhile / dropLastWhile (seniors)', [10, 1_000], function (n) {
+		const users = people(n);
+		return {
+			fn: function () {
+				return [takeLastWhile(users, isSenior), dropLastWhile(users, isSenior)];
+			},
+			competitors: {
+				'es-toolkit': function () {
+					return [toolkit.takeRightWhile(users, isSenior), toolkit.dropRightWhile(users, isSenior)];
+				},
+				lodash: function () {
+					return [lodash.takeRightWhile(users, isSenior), lodash.dropRightWhile(users, isSenior)];
+				},
+				remeda: function () {
+					return [remeda.takeLastWhile(users, isSenior), remeda.dropLastWhile(users, isSenior)];
+				}
+			}
+		};
+	}),
+	...sized('zipObject', [10, 1_000], function (n) {
+		const keys = people(n).map(byName);
+		const values = integers(n, n);
+		return {
+			fn: function () {
+				return zipObject(keys, values);
+			},
+			competitors: {
+				'es-toolkit': function () {
+					return toolkit.zipObject(keys, values);
+				},
+				lodash: function () {
+					return lodash.zipObject(keys, values);
+				},
+				radash: function () {
+					return radash.zipToObject(keys, values);
+				}
+			}
+		};
+	}),
+	...sized('sampleSize (10 items)', SIZES, function (n) {
+		const numbers = integers(n, n);
+		return {
+			fn: function () {
+				return sampleSize(numbers, 10);
+			},
+			competitors: {
+				'es-toolkit': function () {
+					return toolkit.sampleSize(numbers, Math.min(10, n));
+				},
+				lodash: function () {
+					return lodash.sampleSize(numbers, 10);
+				},
+				remeda: function () {
+					return remeda.sample(numbers, 10);
+				}
+			}
+		};
+	}),
+	...sized('sampleSize (half)', [1_000], function (n) {
+		const numbers = integers(n, n);
+		return {
+			fn: function () {
+				return sampleSize(numbers, n / 2);
+			},
+			competitors: {
+				'es-toolkit': function () {
+					return toolkit.sampleSize(numbers, n / 2);
+				},
+				lodash: function () {
+					return lodash.sampleSize(numbers, n / 2);
+				}
+			}
+		};
+	}),
+	...sized('toArray (an item, an array)', [10], function (n) {
+		const numbers = integers(n, n);
+		return {
+			fn: function () {
+				return [toArray(1), toArray(numbers)];
+			},
+			competitors: {
+				lodash: function () {
+					return [lodash.castArray(1), lodash.castArray(numbers)];
+				}
+			}
+		};
+	}),
+	...sized('chunkBy (team runs)', [1_000], function (n) {
+		const users = sortBy(people(n), byTeam);
+		return {
+			fn: function () {
+				return chunkBy(users, byTeam);
+			},
+			competitors: {
+				'es-toolkit': function () {
+					return toolkit.chunkBy(users, byTeam);
+				}
+			}
+		};
+	}),
+	...sized('splitWhen', [10, 1_000], function (n) {
+		const users = people(n);
+		return {
+			fn: function () {
+				return splitWhen(users, isSenior);
+			},
+			competitors: {
+				remeda: function () {
+					return remeda.splitWhen(users, isSenior);
+				}
+			}
+		};
+	}),
+	...sized('unionBy (records by id)', [10, 1_000], function (n) {
+		const a = people(n);
+		const b = people(n).slice(n / 2);
+		return {
+			fn: function () {
+				return unionBy(a, b, byId);
+			},
+			competitors: {
+				'es-toolkit': function () {
+					return toolkit.unionBy(a, b, byId);
+				},
+				lodash: function () {
+					return lodash.unionBy(a, b, byId);
+				}
+			}
+		};
+	}),
+	...sized('symmetricDifferenceBy (numbers by decade)', [10, 1_000], function (n) {
+		const a = integers(n, 10 * n);
+		const b = integers(n, 10 * n, 5);
+		return {
+			fn: function () {
+				return symmetricDifferenceBy(a, b, decade);
+			},
+			competitors: {
+				'es-toolkit': function () {
+					return toolkit.xorBy(a, b, decade);
+				},
+				lodash: function () {
+					return lodash.xorBy(a, b, decade);
+				}
+			}
+		};
+	}),
+	...sized('differenceWith / intersectionWith (records)', [10, 300], function (n) {
+		const a = people(n);
+		const b = people(n).slice(n / 2);
+		return {
+			fn: function () {
+				return [differenceWith(a, b, sameId), intersectionWith(a, b, sameId)];
+			},
+			competitors: {
+				'es-toolkit': function () {
+					return [toolkit.differenceWith(a, b, sameId), toolkit.intersectionWith(a, b, sameId)];
+				},
+				lodash: function () {
+					return [lodash.differenceWith(a, b, sameId), lodash.intersectionWith(a, b, sameId)];
+				},
+				remeda: function () {
+					return [remeda.differenceWith(a, b, sameId), remeda.intersectionWith(a, b, sameId)];
+				}
+			}
+		};
+	}),
+	...sized('uniqueWith / unionWith (records)', [10, 300], function (n) {
+		const a = people(n).concat(people(n / 2));
+		const b = people(n).slice(n / 2);
+		return {
+			fn: function () {
+				return [uniqueWith(a, sameId), unionWith(a, b, sameId)];
+			},
+			competitors: {
+				'es-toolkit': function () {
+					return [toolkit.uniqWith(a, sameId), toolkit.unionWith(a, b, sameId)];
+				},
+				lodash: function () {
+					return [lodash.uniqWith(a, sameId), lodash.unionWith(a, b, sameId)];
+				}
+			}
+		};
+	}),
+	...sized('toggle', [10, 1_000], function (n) {
+		const numbers = integers(n, n);
+		return {
+			fn: function () {
+				return [toggle(numbers, numbers[n >> 1]), toggle(numbers, -1)];
+			},
+			competitors: {
+				radash: function () {
+					return [radash.toggle(numbers, numbers[n >> 1]), radash.toggle(numbers, -1)];
+				}
+			}
+		};
+	}),
+	...sized('averageBy', SIZES, function (n) {
+		const users = people(n);
+		return {
+			fn: function () {
+				return averageBy(users, byScore);
+			},
+			competitors: {
+				'es-toolkit': function () {
+					return toolkit.meanBy(users, byScore);
+				},
+				lodash: function () {
+					return lodash.meanBy(users, byScore);
+				},
+				remeda: function () {
+					return remeda.meanBy(users, byScore);
+				}
+			}
+		};
+	}),
+	...sized('medianBy', SIZES, function (n) {
+		const users = people(n);
+		return {
+			fn: function () {
+				return medianBy(users, byScore);
+			},
+			competitors: {
+				'es-toolkit': function () {
+					return toolkit.medianBy(users, byScore);
+				}
+			}
+		};
+	}),
+	{
+		name: 'combinations (20 choose 3)',
+		fn: function () {
+			return combinations(LETTERS, 3);
+		},
+		competitors: {
+			'es-toolkit': function () {
+				return toolkit.combinations(LETTERS, 3);
+			}
+		}
+	},
+	{
+		name: 'permutations (7 items)',
+		fn: function () {
+			return permutations(LETTERS.slice(0, 7));
+		}
+	},
+	{
+		name: 'powerSet (12 items)',
+		fn: function () {
+			return powerSet(LETTERS.slice(0, 12));
+		}
+	},
+	...sized('zipWith (2 arrays)', [10, 1_000], function (n) {
+		const a = integers(n, n);
+		const b = integers(n, n, 3);
+		return {
+			fn: function () {
+				return zipWith(add, a, b);
+			},
+			competitors: {
+				'es-toolkit': function () {
+					return toolkit.zipWith(a, b, add);
+				},
+				lodash: function () {
+					return lodash.zipWith(a, b, add);
+				},
+				remeda: function () {
+					return remeda.zipWith(a, b, add);
+				}
+			}
+		};
+	}),
+	...sized('zipWith (3 arrays)', [1_000], function (n) {
+		const a = integers(n, n);
+		const b = integers(n, n, 3);
+		const c = integers(n, n, 7);
+		return {
+			fn: function () {
+				return zipWith(add, a, b, c);
+			},
+			competitors: {
+				'es-toolkit': function () {
+					return toolkit.zipWith(a, b, c, add);
+				},
+				lodash: function () {
+					return lodash.zipWith(a, b, c, add);
+				}
+			}
+		};
+	}),
+	...sized('swap / rotate', [10, 1_000], function (n) {
+		const numbers = integers(n, n);
+		return {
+			fn: function () {
+				return [swap(numbers, 1, -2), rotate(numbers, 3)];
+			},
+			competitors: {
+				'remeda + radash': function () {
+					return [remeda.swapIndices(numbers, 1, -2), radash.shift(numbers, 3)];
+				}
+			}
+		};
+	}),
+	...sized('sortedLastIndex', [1_000, 100_000], function (n) {
+		const sorted = range(n).map(function (value) {
+			return value - (value % 4);
+		});
+		const value = sorted[n >> 1];
+		return {
+			fn: function () {
+				return sortedLastIndex(sorted, value);
+			},
+			competitors: {
+				lodash: function () {
+					return lodash.sortedLastIndex(sorted, value);
+				},
+				remeda: function () {
+					return remeda.sortedLastIndex(sorted, value);
+				}
+			}
+		};
+	}),
+	...sized('sortedIndexBy (records by score)', [1_000, 100_000], function (n) {
+		const sorted = sortBy(people(n), byScore);
+		const value = sorted[n >> 1];
+		return {
+			fn: function () {
+				return sortedIndexBy(sorted, value, byScore);
+			},
+			competitors: {
+				lodash: function () {
+					return lodash.sortedIndexBy(sorted, value, byScore);
+				},
+				remeda: function () {
+					return remeda.sortedIndexBy(sorted, value, byScore);
 				}
 			}
 		};

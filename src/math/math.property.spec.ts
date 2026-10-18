@@ -81,6 +81,9 @@ describe('Math helpers (property-based)', function () {
 				return Number(`${mantissa}e${Number(current) + exponent}`);
 			}
 			function reference(x: number, d: number): number {
+				// A number written with at most `d` decimals is already rounded (shifting it there and back could change its last digit).
+				const [mantissa, exponent = '0'] = String(x).split('e');
+				if ((mantissa.split('.')[1] ?? '').length - Number(exponent) <= d) return x;
 				const shifted = shift(Math.abs(x), d);
 				if (!Number.isFinite(shifted)) return x;
 				const rounded = shift(Math.round(shifted), -d);
@@ -667,6 +670,117 @@ describe('Math helpers (property-based)', function () {
 						}
 					}
 				})
+			);
+		});
+	});
+
+	describe('ceil / floor with decimals', function () {
+		// Decimal reference on exact integers: x = k * 10^-e, rounded at d decimals with BigInt arithmetic.
+		const literal = fc.tuple(fc.integer({ min: -1e12, max: 1e12 }), fc.integer({ min: 0, max: 10 })).map(function ([k, e]) {
+			return { k, e, x: Number(`${k}e-${e}`) };
+		});
+
+		it('should match exact decimal arithmetic on numbers written with few digits', function () {
+			fc.assert(
+				fc.property(literal, fc.integer({ min: -4, max: 12 }), function ({ k, e, x }, d) {
+					// x * 10^d = k * 10^(d - e): as an exact fraction num / den.
+					const num = BigInt(k) * 10n ** BigInt(Math.max(0, d - e));
+					const den = 10n ** BigInt(Math.max(0, e - d));
+					const down = num >= 0n || num % den === 0n ? num / den : num / den - 1n;
+					const up = num % den === 0n ? num / den : down + 1n;
+					expect(helpers.floor(x, d)).toBe(Number(`${down}e${-d}`) + 0 || (num < 0n && down === 0n ? -0 : 0));
+					expect(helpers.ceil(x, d)).toBe(Number(`${up}e${-d}`) + 0 || (num < 0n && up === 0n ? -0 : 0));
+				}),
+				{ numRuns: 2000 }
+			);
+		});
+
+		it('should bracket the number: floor(x, d) <= x <= ceil(x, d), less than one unit apart', function () {
+			fc.assert(
+				fc.property(fc.double({ noNaN: true, noDefaultInfinity: true }), fc.integer({ min: -20, max: 20 }), function (x, d) {
+					const down = helpers.floor(x, d);
+					const up = helpers.ceil(x, d);
+					expect(down).toBeLessThanOrEqual(x);
+					expect(up).toBeGreaterThanOrEqual(x);
+					expect(up - down).toBeLessThanOrEqual(10 ** -d * (1 + 1e-9) + 4 * Number.EPSILON * Math.abs(x));
+					// Idempotent, and equal to Math.ceil / Math.floor without decimals.
+					expect(helpers.ceil(up, d)).toBe(up);
+					expect(helpers.floor(down, d)).toBe(down);
+					expect(helpers.ceil(x)).toBe(Math.ceil(x));
+					expect(helpers.floor(x)).toBe(Math.floor(x));
+				}),
+				{ numRuns: 1000 }
+			);
+		});
+
+		it('should be the identity for numbers already written with at most d decimals', function () {
+			fc.assert(
+				fc.property(fc.double({ noNaN: true, noDefaultInfinity: true }), function (x) {
+					const [mantissa, exponent = '0'] = String(x).split('e');
+					const places = (mantissa.split('.')[1] ?? '').length - Number(exponent);
+					for (const d of [places, places + 1, places + 5]) {
+						expect(helpers.ceil(x, d)).toBe(x);
+						expect(helpers.floor(x, d)).toBe(x);
+						expect(helpers.round(x, d)).toBe(x);
+					}
+				})
+			);
+		});
+	});
+
+	describe('parseBytes', function () {
+		it('should invert formatBytes: format(parse(format(n))) === format(n)', function () {
+			// Up to 1e30 bytes (a million YB) the text has at most 13 significant digits; beyond 15, formatBytes' binary division is the limit.
+			fc.assert(
+				fc.property(
+					fc.double({ min: -1e30, max: 1e30, noNaN: true }),
+					fc.constantFrom(1000 as const, 1024 as const),
+					fc.integer({ min: 0, max: 6 }),
+					function (bytes, base, decimals) {
+						const text = helpers.formatBytes(bytes, { base, decimals });
+						expect(helpers.formatBytes(helpers.parseBytes(text, { base }), { base, decimals })).toBe(text);
+					}
+				),
+				{ numRuns: 1000 }
+			);
+		});
+
+		it('should give back the exact byte count when formatBytes keeps every digit', function () {
+			fc.assert(
+				fc.property(fc.integer({ min: -1e15, max: 1e15 }), fc.constantFrom(1000 as const, 1024 as const), function (bytes, base) {
+					const text = helpers.formatBytes(bytes, { base, decimals: 30 });
+					expect(helpers.parseBytes(text, { base })).toBe(bytes);
+					expect(helpers.parseBytes(` ${text.replace(' ', '')} `, { base })).toBe(bytes);
+				}),
+				{ numRuns: 1000 }
+			);
+		});
+
+		it('should scale exactly: n units of k-th power is n * base^k', function () {
+			const units = ['B', 'kB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
+			fc.assert(
+				fc.property(fc.integer({ min: 0, max: 999_999 }), fc.integer({ min: 0, max: 3 }), fc.integer({ min: 0, max: 8 }), function (digits, places, k) {
+					const text = `${(digits / 10 ** places).toFixed(places)} ${units[k]}`;
+					expect(helpers.parseBytes(text)).toBe(Number(`${digits}e${3 * k - places}`));
+					expect(helpers.parseBytes(text, { base: 1024 })).toBe((digits / 10 ** places) * 1024 ** k);
+				})
+			);
+		});
+
+		it('should reject (never half-parse) anything that is not a number followed by a known unit', function () {
+			fc.assert(
+				fc.property(fc.string({ maxLength: 12 }), function (text) {
+					let parsed: number | undefined;
+					try {
+						parsed = helpers.parseBytes(text);
+					} catch (error) {
+						expect(error).toBeInstanceOf(RangeError);
+						return;
+					}
+					expect(text.trim()).toMatch(/^-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?\s*(?:B|[kKMGTPEZY]B|[KMGTPEZY]iB)?$/);
+					expect(Number.isFinite(parsed)).toBe(true);
+				}),
+				{ numRuns: 2000 }
 			);
 		});
 	});

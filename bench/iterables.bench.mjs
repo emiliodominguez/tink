@@ -8,6 +8,7 @@ import {
 	find,
 	flatMap,
 	map,
+	mapConcurrent,
 	reduce,
 	scan,
 	take,
@@ -16,6 +17,7 @@ import {
 	windowed,
 	zip
 } from '@emiliodominguez/tink/iterables';
+import { pMapIterable } from 'p-map';
 
 // No library offers the same lazy, closing-aware helpers, so each case is compared with what one would write instead:
 // eager array methods (`array`), hand-written generators (`generator`), and the native iterator helpers (`iterator helpers`).
@@ -342,5 +344,57 @@ export default [
 				}
 			}
 		};
+	}),
+	// Async and awaited by the runner: lazy concurrent mapping of an async source, consumed with `for await`.
+	...[10, 1_000].flatMap(function (n) {
+		const numbers = integers(n, n);
+		/**
+		 * An async source over `numbers`.
+		 * @returns {AsyncGenerator<number>} The source
+		 */
+		async function* source() {
+			for (const value of numbers) yield value;
+		}
+		/**
+		 * @param {number} value - A number
+		 * @returns {Promise<number>} Twice the number
+		 */
+		async function doubleAsync(value) {
+			return value * 2;
+		}
+		/**
+		 * Drains an async iterable.
+		 * @param {AsyncIterable<number>} iterable - The iterable
+		 * @returns {Promise<number>} The sum of its items
+		 */
+		async function drain(iterable) {
+			let sum = 0;
+			for await (const value of iterable) sum += value;
+			return sum;
+		}
+		return [
+			{
+				name: `mapConcurrent (${label(n)}, concurrency 8)`,
+				fn: function () {
+					return drain(mapConcurrent(source(), doubleAsync, 8));
+				},
+				competitors: {
+					'p-map pMapIterable': function () {
+						return drain(pMapIterable(source(), doubleAsync, { concurrency: 8 }));
+					}
+				}
+			},
+			{
+				name: `mapConcurrent unordered (${label(n)}, conc. 8)`,
+				fn: function () {
+					return drain(mapConcurrent(source(), doubleAsync, { concurrency: 8, ordered: false }));
+				},
+				competitors: {
+					'p-map pMapIterable (ordered only)': function () {
+						return drain(pMapIterable(source(), doubleAsync, { concurrency: 8 }));
+					}
+				}
+			}
+		];
 	})
 ];

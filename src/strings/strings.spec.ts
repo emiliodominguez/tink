@@ -1258,3 +1258,219 @@ describe('String helpers', function () {
 		});
 	});
 });
+
+describe('String helpers (round 11)', function () {
+	describe('trimChars / trimStartChars / trimEndChars', function () {
+		it('should trim a set of characters, not a substring', function () {
+			expect(helpers.trimChars('--hello__', '-_')).toBe('hello');
+			expect(helpers.trimChars('abXba', 'ab')).toBe('X');
+			expect(helpers.trimChars('abXba', 'ba')).toBe('X');
+			expect(helpers.trimStartChars('-_x_-', '-_')).toBe('x_-');
+			expect(helpers.trimEndChars('-_x_-', '-_')).toBe('-_x');
+			expect(helpers.trimEndChars('1.500', '0')).toBe('1.5');
+		});
+
+		it('should accept an array of characters, each split into graphemes', function () {
+			expect(helpers.trimChars('-_x_-', ['-', '_'])).toBe('x');
+			expect(helpers.trimChars('-_x_-', ['-_'])).toBe('x');
+			expect(helpers.trimChars('-x-', [])).toBe('-x-');
+		});
+
+		it('should treat regular expression syntax literally', function () {
+			expect(helpers.trimChars(']]x]]', ']')).toBe('x');
+			expect(helpers.trimChars('^^x^^', '^')).toBe('x');
+			expect(helpers.trimChars('\\x\\', '\\')).toBe('x');
+			expect(helpers.trimChars('.*x*.', '.*')).toBe('x');
+			expect(helpers.trimChars('a-z', 'a-z')).toBe('');
+		});
+
+		it('should handle empty inputs', function () {
+			expect(helpers.trimChars('', '-')).toBe('');
+			expect(helpers.trimChars('---', '-')).toBe('');
+			expect(helpers.trimChars('-x-', '')).toBe('-x-');
+			expect(helpers.trimStartChars('---', '-')).toBe('');
+			expect(helpers.trimEndChars('---', '-')).toBe('');
+		});
+
+		it('should compare whole graphemes', function () {
+			expect(helpers.trimChars('👍x👍', '👍')).toBe('x');
+			expect(helpers.trimChars('👍🏽ok👍', '👍')).toBe('👍🏽ok');
+			expect(helpers.trimChars('👍🏽ok👍🏽', '👍🏽')).toBe('ok');
+			expect(helpers.trimChars('éxe', 'e')).toBe('éx');
+			expect(helpers.trimChars('éxé', 'é')).toBe('x');
+			expect(helpers.trimChars('\r\nx\r\n', '\n')).toBe('\r\nx\r\n');
+			expect(helpers.trimChars('\r\nx\n\r\n', '\r\n')).toBe('x\n');
+			expect(helpers.trimChars('🇫🇷🇩🇪x🇩🇪🇫🇷', '🇫🇷')).toBe('🇩🇪x🇩🇪');
+			expect(helpers.trimChars('日本日', '日')).toBe('本');
+		});
+
+		it('should mix plain and complex graphemes at the ends', function () {
+			expect(helpers.trimChars('-👍-é-x-👍-é-', '-👍é')).toBe('x');
+			expect(helpers.trimChars('a👍🏽b', 'ab')).toBe('👍🏽');
+			expect(helpers.trimEndChars('x👍🏽-👍', '-👍')).toBe('x👍🏽');
+			expect(helpers.trimStartChars('👍🏽👍x', '👍🏽')).toBe('👍x');
+		});
+
+		it('should give the same results for many different and long character sets', function () {
+			for (let code = 0x61; code < 0x61 + 20; code++) {
+				const char = String.fromCharCode(code);
+				expect(helpers.trimChars(`${char}${char}x${char}`, char)).toBe('x');
+				expect(helpers.trimChars(`${char}${char}x${char}`, char)).toBe('x');
+			}
+			const long = '-'.repeat(65) + '_';
+			expect(helpers.trimChars('-_x_-', long)).toBe('x');
+			expect(helpers.trimChars('-_x_-', long)).toBe('x');
+		});
+
+		it('should fall back to code points without Intl.Segmenter', function () {
+			const fallback = loadWithoutSegmenter();
+
+			expect(fallback.trimChars('👍x👍', '👍')).toBe('x');
+			expect(fallback.trimChars('éxe', 'e')).toBe('́x');
+		});
+
+		it('should reject chars that are not strings', function () {
+			expect(function () {
+				helpers.trimChars('x', 5 as any);
+			}).toThrow(new TypeError('trimChars: `chars` must be a string or an array of strings, got number'));
+			expect(function () {
+				helpers.trimStartChars('x', ['-', null] as any);
+			}).toThrow(new TypeError('trimStartChars: `chars` must be a string or an array of strings, got null'));
+			expect(function () {
+				helpers.trimEndChars('x', undefined as any);
+			}).toThrow(TypeError);
+		});
+	});
+
+	describe('toDelimitedCase and the extra case styles', function () {
+		it('should share the word splitter of the other case helpers', function () {
+			expect(helpers.toTrainCase('XMLHttpRequest2Go')).toBe('Xml-Http-Request2-Go');
+			expect(helpers.toDotCase('XMLHttpRequest2Go')).toBe('xml.http.request2.go');
+			expect(helpers.toPathCase('XMLHttpRequest2Go')).toBe('xml/http/request2/go');
+			expect(helpers.toNoCase('XMLHttpRequest2Go')).toBe('xml http request2 go');
+			expect(helpers.toStartCase('XMLHttpRequest2Go')).toBe('Xml Http Request2 Go');
+			expect(helpers.toStartCase('iOS17Pro')).toBe('I Os17 Pro');
+			expect(helpers.toTrainCase("don't stop")).toBe('Dont-Stop');
+			expect(helpers.toStartCase('--foo_bar--')).toBe('Foo Bar');
+			expect(helpers.toNoCase('SOME_CONSTANT')).toBe('some constant');
+		});
+
+		it('should return an empty string when there are no words', function () {
+			for (const fn of [helpers.toTrainCase, helpers.toDotCase, helpers.toPathCase, helpers.toNoCase, helpers.toStartCase]) {
+				expect(fn('')).toBe('');
+				expect(fn(' -_. ')).toBe('');
+			}
+		});
+
+		it('should handle Unicode words and title-case letters', function () {
+			expect(helpers.toStartCase('crème brûlée')).toBe('Crème Brûlée');
+			expect(helpers.toTrainCase('ǆungla straße')).toBe('ǅungla-Straße');
+			expect(helpers.toStartCase('ßtraße')).toBe('Sstraße');
+		});
+
+		it('should case each word on its own (final sigma before a case-ignorable delimiter)', function () {
+			expect(helpers.toDotCase('ΟΔΟΣ ΒΓ')).toBe('οδος.βγ');
+			expect(helpers.toDelimitedCase('ΟΔΟΣ ΒΓ', ':')).toBe('οδος:βγ');
+			expect(helpers.toDelimitedCase('ab cd', 'X')).toBe('abXcd');
+		});
+
+		it('should be locale-independent', function () {
+			expect(helpers.toNoCase('TITLE ISTANBUL')).toBe('title istanbul');
+		});
+
+		it('should support every word case and any delimiter', function () {
+			expect(helpers.toDelimitedCase('XMLHttpRequest', '.')).toBe('xml.http.request');
+			expect(helpers.toDelimitedCase('XMLHttpRequest', '.', {})).toBe('xml.http.request');
+			expect(helpers.toDelimitedCase('XMLHttpRequest', '.', { case: 'lower' })).toBe('xml.http.request');
+			expect(helpers.toDelimitedCase('XMLHttpRequest', '.', { case: 'upper' })).toBe('XML.HTTP.REQUEST');
+			expect(helpers.toDelimitedCase('XMLHttpRequest', '.', { case: 'capital' })).toBe('Xml.Http.Request');
+			expect(helpers.toDelimitedCase('XMLHttpRequest', '.', { case: 'preserve' })).toBe('XML.Http.Request');
+			expect(helpers.toDelimitedCase('user id', ' | ', { case: 'upper' })).toBe('USER | ID');
+			expect(helpers.toDelimitedCase('helloWorld', '')).toBe('helloworld');
+			expect(helpers.toDelimitedCase('straße', '-', { case: 'upper' })).toBe('STRASSE');
+		});
+
+		it('should agree with the existing case helpers', function () {
+			const inputs = ['XMLHttpRequest', 'hello world', 'version2Beta', 'SOME_CONSTANT_NAME', 'Crème brûlée', 'ΟΔΟΣ ΑΓΟΡΑΣ'];
+
+			for (const input of inputs) {
+				expect(helpers.toDelimitedCase(input, '_')).toBe(helpers.toSnakeCase(input));
+				expect(helpers.toDelimitedCase(input, '-')).toBe(helpers.toKebabCase(input));
+				expect(helpers.toDelimitedCase(input, '_', { case: 'upper' })).toBe(helpers.toConstantCase(input));
+				expect(helpers.toDelimitedCase(input, '', { case: 'capital' })).toBe(helpers.toPascalCase(input));
+			}
+		});
+
+		it('should validate the delimiter and the case', function () {
+			expect(function () {
+				helpers.toDelimitedCase('a b', 1 as any);
+			}).toThrow(new TypeError('toDelimitedCase: `delimiter` must be a string, got number'));
+			expect(function () {
+				helpers.toDelimitedCase('a b', '-', { case: 'title' as any });
+			}).toThrow(new RangeError("toDelimitedCase: `options.case` must be 'lower', 'upper', 'capital' or 'preserve', got title"));
+		});
+	});
+
+	describe('padStart / padEnd / padCenter', function () {
+		it('should pad plain text like the native methods', function () {
+			expect(helpers.padStart('42', 5, '0')).toBe('00042');
+			expect(helpers.padStart('42', 5)).toBe('   42');
+			expect(helpers.padEnd('Name', 8, '.')).toBe('Name....');
+			expect(helpers.padEnd('ab', 7, 'xyz')).toBe('abxyzxy');
+			expect(helpers.padStart('ab', 7, 'xyz')).toBe('xyzxyab');
+			expect(helpers.padCenter('abc', 8, '_-')).toBe('_-abc_-_');
+			expect(helpers.padCenter('abc', 7)).toBe('  abc  ');
+			expect(helpers.padCenter('', 3, '*')).toBe('***');
+		});
+
+		it('should return the string unchanged when it is already wide enough', function () {
+			expect(helpers.padStart('hello', 3)).toBe('hello');
+			expect(helpers.padEnd('hello', 5)).toBe('hello');
+			expect(helpers.padCenter('hello', 0)).toBe('hello');
+			expect(helpers.padCenter('', 0)).toBe('');
+			expect(helpers.padStart('👍🏽👍🏽👍🏽', 2)).toBe('👍🏽👍🏽👍🏽');
+		});
+
+		it('should count graphemes, not code units', function () {
+			expect(helpers.padStart('👍🏽', 3, '*')).toBe('**👍🏽');
+			expect(helpers.padEnd('café', 6)).toBe('café  ');
+			expect(helpers.padEnd('café', 6)).toBe('café  ');
+			expect(helpers.padCenter('👍', 5, '*')).toBe('**👍**');
+			expect(helpers.padCenter('日本', 6, '・')).toBe('・・日本・・');
+		});
+
+		it('should cut a multi-grapheme fill by graphemes', function () {
+			expect(helpers.padStart('x', 4, '👍🏽-')).toBe('👍🏽-👍🏽x');
+			expect(helpers.padEnd('x', 3, 'éa')).toBe('xéa');
+			expect(helpers.padEnd('x', 4, 'éa')).toBe('xéaé');
+			expect(helpers.padCenter('x', 4, '👍🏽')).toBe('👍🏽x👍🏽👍🏽');
+		});
+
+		it('should validate the width and the fill', function () {
+			expect(function () {
+				helpers.padStart('x', -1);
+			}).toThrow(new RangeError('padStart: `width` must be an integer >= 0, got -1'));
+			expect(function () {
+				helpers.padEnd('x', 1.5);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.padCenter('x', Infinity);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.padCenter('x', '3' as any);
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.padStart('x', 3, '');
+			}).toThrow(new RangeError("padStart: `fill` must be a non-empty string, got ''"));
+			expect(function () {
+				helpers.padEnd('x', 3, 0 as any);
+			}).toThrow(new TypeError('padEnd: `fill` must be a non-empty string, got number'));
+		});
+	});
+});
+
+describe('internal tables', function () {
+	it('keeps the slug transliteration regex in sync with its table', function () {
+		expect(helpers.toSlug('ßæœøđðłþı')).toBe('ssaeoeoddlthi');
+	});
+});

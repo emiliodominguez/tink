@@ -439,3 +439,192 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 
 	return cache;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// createPriorityQueue
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * A priority queue (binary heap) as returned by {@link createPriorityQueue}. Values that compare equal leave in insertion order.
+ * @template T - The value type
+ */
+export interface PriorityQueue<T> extends Iterable<T> {
+	/** Number of queued values. */
+	readonly size: number;
+	/** Adds a value in O(log n) and returns the new size. */
+	push(value: T): number;
+	/** Removes and returns the first value (the one `compare` orders first; the oldest among equals) in O(log n); `undefined` when empty. */
+	pop(): T | undefined;
+	/** Returns the first value without removing it, in O(1); `undefined` when empty. */
+	peek(): T | undefined;
+	/** Removes the oldest queued occurrence of `value` (compared with `===`) in O(n); returns whether one was found. */
+	delete(value: T): boolean;
+	/** Removes every value. */
+	clear(): void;
+	/** The queued values in the order `pop` would return them (a sorted snapshot taken when called; the queue is not changed). */
+	[Symbol.iterator](): IterableIterator<T>;
+}
+
+/**
+ * Creates a priority queue backed by a binary heap: `push` and `pop` are O(log n) and `peek` is O(1). `compare(a, b)` works like an
+ * `Array.prototype.sort` comparator: a negative result means `a` leaves the queue before `b` (so `(a, b) => a - b` gives a min-queue and
+ * `(a, b) => b - a` a max-queue).
+ *
+ * The queue is stable: values that compare equal (`0`, or `NaN`, which is treated as equal like `sort` does) leave in insertion order
+ * (FIFO), which plain binary heaps do not guarantee. That is what keeps task schedulers fair among tasks of the same priority.
+ * `compare` is called during `push`, `pop`, `delete` and iteration, so it must not change the queue; it should be a consistent total
+ * order, or the pop order is unspecified (though every value still comes out exactly once).
+ * @template T - The value type
+ * @param {(a: T, b: T) => number} compare - Orders two values (negative: `a` first, positive: `b` first, zero: insertion order)
+ * @returns {PriorityQueue<T>} A new, empty queue
+ * @throws {TypeError} when `compare` is not a function
+ * @example
+ * const tasks = createPriorityQueue(function (a: { name: string; priority: number }, b: { name: string; priority: number }) { return b.priority - a.priority; });
+ * tasks.push({ name: 'email', priority: 1 });
+ * tasks.push({ name: 'deploy', priority: 5 });
+ * tasks.push({ name: 'backup', priority: 1 });
+ * tasks.size; // => 3
+ * tasks.peek()?.name; // => 'deploy'
+ * [...tasks].map(function (task) { return task.name; }); // => ['deploy', 'email', 'backup'] // equal priorities stay FIFO
+ * tasks.pop()?.name; // => 'deploy'
+ * tasks.pop()?.name; // => 'email'
+ */
+export function createPriorityQueue<T>(compare: (a: T, b: T) => number): PriorityQueue<T> {
+	assertFunction('createPriorityQueue', 'compare', compare);
+
+	// The heap as two parallel arrays (no object per value): the values, and the insertion number of each, which breaks ties.
+	let values: T[] = [];
+	let order: number[] = [];
+	let inserted = 0;
+
+	/**
+	 * Whether `a` (inserted as number `rankA`) leaves before `b` (inserted as number `rankB`).
+	 * @param {T} a - A value
+	 * @param {number} rankA - Its insertion number
+	 * @param {T} b - Another value
+	 * @param {number} rankB - Its insertion number
+	 * @returns {boolean} `true` when `a` comes first
+	 */
+	function precedes(a: T, rankA: number, b: T, rankB: number): boolean {
+		const result = compare(a, b);
+
+		// `NaN` is neither below nor above zero, so it counts as equal.
+		return result < 0 || (!(result > 0) && rankA < rankB);
+	}
+
+	/**
+	 * Places `value` (inserted as number `rank`) at heap index `i` or above, moving the parents it precedes down (one write per level).
+	 * @param {number} i - The free heap index to start from
+	 * @param {T} value - The value to place
+	 * @param {number} rank - Its insertion number
+	 * @returns {number} The index where it was placed
+	 */
+	function siftUp(i: number, value: T, rank: number): number {
+		while (i > 0) {
+			const parent = (i - 1) >> 1;
+
+			if (!precedes(value, rank, values[parent], order[parent])) break;
+			values[i] = values[parent];
+			order[i] = order[parent];
+			i = parent;
+		}
+		values[i] = value;
+		order[i] = rank;
+
+		return i;
+	}
+
+	/**
+	 * Places `value` (inserted as number `rank`) at heap index `i` or below, moving up the children that precede it.
+	 * @param {number} i - The free heap index to start from
+	 * @param {T} value - The value to place
+	 * @param {number} rank - Its insertion number
+	 * @returns {void}
+	 */
+	function siftDown(i: number, value: T, rank: number): void {
+		const length = values.length;
+
+		for (;;) {
+			let child = 2 * i + 1;
+
+			if (child >= length) break;
+			if (child + 1 < length && precedes(values[child + 1], order[child + 1], values[child], order[child])) child++;
+			if (!precedes(values[child], order[child], value, rank)) break;
+			values[i] = values[child];
+			order[i] = order[child];
+			i = child;
+		}
+		values[i] = value;
+		order[i] = rank;
+	}
+
+	/**
+	 * Removes the value at heap index `i` and restores the heap.
+	 * @param {number} i - A heap index
+	 * @returns {T} The removed value
+	 */
+	function removeAt(i: number): T {
+		const removed = values[i];
+		const value = values.pop() as T;
+		const rank = order.pop() as number;
+
+		// The last value fills the hole; it may belong above or below it.
+		if (i < values.length && siftUp(i, value, rank) === i) siftDown(i, value, rank);
+
+		return removed;
+	}
+
+	const queue = {
+		push(value: T): number {
+			siftUp(values.length, value, inserted++);
+
+			return values.length;
+		},
+		pop(): T | undefined {
+			return values.length === 0 ? undefined : removeAt(0);
+		},
+		peek(): T | undefined {
+			return values[0];
+		},
+		delete(value: T): boolean {
+			let found = -1;
+
+			// The oldest occurrence: the one with the smallest insertion number.
+			for (let i = 0; i < values.length; i++) if (values[i] === value && (found < 0 || order[i] < order[found])) found = i;
+			if (found < 0) return false;
+			removeAt(found);
+
+			return true;
+		},
+		clear(): void {
+			values = [];
+			order = [];
+		},
+		[Symbol.iterator](): IterableIterator<T> {
+			const indexes = values.map(function (_, i) {
+				return i;
+			});
+
+			// Insertion numbers are unique, so `precedes` is a strict total order and two distinct slots are never equal.
+			return indexes
+				.sort(function (i, j) {
+					return precedes(values[i], order[i], values[j], order[j]) ? -1 : 1;
+				})
+				.map(function (i) {
+					return values[i];
+				})
+				.values();
+		}
+	} as PriorityQueue<T>;
+
+	Object.defineProperties(queue, {
+		[SIZE]: {
+			value: function (): number {
+				return values.length;
+			}
+		},
+		size: { get: getSize, enumerable: true, configurable: true }
+	});
+
+	return queue;
+}

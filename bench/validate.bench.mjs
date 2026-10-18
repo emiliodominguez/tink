@@ -11,8 +11,11 @@ import {
 	isSemver,
 	isSlug,
 	isUrl,
-	isUuid
+	isUuid,
+	parseJson
 } from '@emiliodominguez/tink/validate';
+import { isArrayOf, isInteger, isShape, isString } from '@emiliodominguez/tink/guards';
+import { z } from 'zod';
 
 // No validation library is installed: the competitors are the snippets people usually paste (a typical regex, `URL.canParse`, ...).
 // Most of them are looser than our validators (they accept inputs we reject on purpose), so a ratio below 1 can be the price of correctness.
@@ -96,7 +99,117 @@ function predicateCase(name, ours, inputs, others) {
 	};
 }
 
+// parseJson inputs: a small API payload, a ~100 KB document, and texts that trigger the prototype-key scan.
+const record = { id: 1, name: 'Ada Lovelace', email: 'ada@example.com', tags: ['math', 'poetry'], active: true, score: 9.5 };
+const smallText = JSON.stringify(record);
+const largeText = JSON.stringify(
+	Array.from({ length: 800 }, function (_, index) {
+		return { ...record, id: index };
+	})
+);
+const constructorText = JSON.stringify(
+	Array.from({ length: 800 }, function (_, index) {
+		return { ...record, id: index, constructor: 'Ford' };
+	})
+);
+const isRecord = isShape({ id: isInteger, name: isString, email: isString, tags: isArrayOf(isString) });
+const zodRecord = z.object({ id: z.number().int(), name: z.string(), email: z.string(), tags: z.array(z.string()) });
+const isRecords = isArrayOf(isRecord);
+const zodRecords = z.array(zodRecord);
+
+/**
+ * The usual "safe" JSON.parse snippet: try/catch plus a reviver dropping `__proto__` keys.
+ * @param {string} text - The JSON text
+ * @returns {unknown} The parsed value, or undefined
+ */
+function reviverParse(text) {
+	try {
+		return JSON.parse(text, function (key, value) {
+			return key === '__proto__' ? undefined : value;
+		});
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Plain JSON.parse in try/catch (no prototype-key protection).
+ * @param {string} text - The JSON text
+ * @returns {unknown} The parsed value, or undefined
+ */
+function tryParse(text) {
+	try {
+		return JSON.parse(text);
+	} catch {
+		return undefined;
+	}
+}
+
 export default [
+	{
+		name: 'parseJson (small payload)',
+		fn: function () {
+			return parseJson(smallText);
+		},
+		baseline: function () {
+			return tryParse(smallText);
+		},
+		competitors: {
+			'JSON.parse + reviver': function () {
+				return reviverParse(smallText);
+			}
+		}
+	},
+	{
+		name: 'parseJson (100 KB array)',
+		fn: function () {
+			return parseJson(largeText);
+		},
+		baseline: function () {
+			return tryParse(largeText);
+		},
+		competitors: {
+			'JSON.parse + reviver': function () {
+				return reviverParse(largeText);
+			}
+		}
+	},
+	{
+		name: 'parseJson (100 KB with "constructor" keys: full scan)',
+		fn: function () {
+			return parseJson(constructorText);
+		},
+		baseline: function () {
+			return tryParse(constructorText);
+		},
+		competitors: {
+			'JSON.parse + reviver': function () {
+				return reviverParse(constructorText);
+			}
+		}
+	},
+	{
+		name: 'parseJson + guard (small payload)',
+		fn: function () {
+			return parseJson(smallText, isRecord);
+		},
+		competitors: {
+			zod: function () {
+				return zodRecord.safeParse(tryParse(smallText));
+			}
+		}
+	},
+	{
+		name: 'parseJson + guard (100 KB array)',
+		fn: function () {
+			return parseJson(largeText, isRecords);
+		},
+		competitors: {
+			zod: function () {
+				return zodRecords.safeParse(tryParse(largeText));
+			}
+		}
+	},
 	predicateCase('isEmail', isEmail, emails, { 'typical regex': matches(TYPICAL_EMAIL), 'WHATWG regex': matches(WHATWG_EMAIL) }),
 	predicateCase('isUrl', isUrl, urls, {
 		'URL.canParse': function (value) {

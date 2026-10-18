@@ -893,3 +893,174 @@ describe('String helpers (properties)', function () {
 		});
 	});
 });
+
+/** Graphemes that never merge with a neighbour when concatenated in any order. */
+const safeGrapheme = fc.constantFrom('a', 'Z', '0', ' ', '-', '.', 'é', 'é', '👍🏽', '👍', '中', '가', 'か', '🇫🇷', 'ж');
+const safeText = fc.array(safeGrapheme, { maxLength: 12 }).map(function (parts) {
+	return parts.join('');
+});
+const fill = fc.array(safeGrapheme, { minLength: 1, maxLength: 3 }).map(function (parts) {
+	return parts.join('');
+});
+
+/**
+ * Reference trim: removes the graphemes of `chars` from the ends of the grapheme list of `string`.
+ */
+function referenceTrim(string: string, chars: string, fromStart: boolean, fromEnd: boolean): string {
+	const set = new Set(graphemes(chars));
+	const list = graphemes(string);
+	let start = 0;
+	let end = list.length;
+	while (fromStart && start < end && set.has(list[start])) start++;
+	while (fromEnd && end > start && set.has(list[end - 1])) end--;
+	return list.slice(start, end).join('');
+}
+
+describe('String helpers (round 11 properties)', function () {
+	describe('grapheme splitting of emoji', function () {
+		const emojiText = fc.string({
+			unit: fc.constantFrom(
+				...['a', ' ', '1', '©', '❤', '\ufe0f', '\u200d', '\u20e3', '👍', '\u{1F3FD}', '👨', '👩', '👧', '🏳', '🌈', '🇫', '🇷', '🇩', '🇪', '🏴', '\u{E0067}', '\u{E007F}'],
+				...['e\u0301', '\r', '\n', '中', 'か', '\u0600', '\u{1F9D1}\u200d\u{1F4BB}', '\u{1F469}\u{1F3FB}\u200d\u{1F91D}\u200d\u{1F468}\u{1F3FF}']
+			),
+			maxLength: 16
+		});
+
+		it('matches Intl.Segmenter on emoji sequences, flags, modifiers and joiners', function () {
+			fc.assert(
+				fc.property(emojiText, function (s) {
+					expect(helpers.reverse(s)).toBe(graphemes(s).reverse().join(''));
+					expect(helpers.mask(s, { visibleEnd: 0 })).toBe('*'.repeat(graphemes(s).length));
+				}),
+				{ numRuns: 500 }
+			);
+		});
+	});
+
+	describe('trimChars / trimStartChars / trimEndChars', function () {
+		const chars = fc.string({ unit: fc.constantFrom('a', ' ', '.', '\r', '\n', 'e', '́', 'é', '👍', '👍🏽', '中', '‍', '؀', 'ก') });
+
+		it('match a reference built on Intl.Segmenter, on text mixing plain and complex graphemes', function () {
+			fc.assert(
+				fc.property(mixedText, chars, function (s, set) {
+					expect(helpers.trimChars(s, set)).toBe(referenceTrim(s, set, true, true));
+					expect(helpers.trimStartChars(s, set)).toBe(referenceTrim(s, set, true, false));
+					expect(helpers.trimEndChars(s, set)).toBe(referenceTrim(s, set, false, true));
+				})
+			);
+		});
+
+		it('match the reference on arbitrary code points, with chars taken from the string itself', function () {
+			fc.assert(
+				fc.property(fc.string({ unit: 'binary' }), fc.nat(), fc.nat(), function (s, from, length) {
+					const set = s.slice(from % (s.length + 1), (from % (s.length + 1)) + (length % 4));
+					expect(helpers.trimChars(s, set)).toBe(referenceTrim(s, set, true, true));
+				})
+			);
+		});
+
+		it('are idempotent, compose, and return a slice of the input', function () {
+			fc.assert(
+				fc.property(mixedText, chars, function (s, set) {
+					const trimmed = helpers.trimChars(s, set);
+					expect(helpers.trimChars(trimmed, set)).toBe(trimmed);
+					expect(helpers.trimStartChars(helpers.trimEndChars(s, set), set)).toBe(trimmed);
+					expect(s.includes(trimmed)).toBe(true);
+					expect(helpers.trimChars(s, graphemes(set))).toBe(trimmed);
+				})
+			);
+		});
+
+		it('equal the native trim for ASCII whitespace sets', function () {
+			fc.assert(
+				fc.property(fc.string({ unit: fc.constantFrom(' ', '\t', '\n', 'a', 'b') }), function (s) {
+					expect(helpers.trimChars(s, ' \t\n')).toBe(s.trim());
+					expect(helpers.trimStartChars(s, [' ', '\t', '\n'])).toBe(s.trimStart());
+					expect(helpers.trimEndChars(s, ' \t\n')).toBe(s.trimEnd());
+				})
+			);
+		});
+	});
+
+	describe('toDelimitedCase and the extra case styles', function () {
+		const text = fc.oneof(mixedText, fc.string(), fc.string({ unit: fc.constantFrom('a', 'B', 'Σ', 'ς', 'İ', '1', '_', '-', ' ', '.', "'", 'É', 'ǆ', 'ß') }));
+
+		it('join the same words as the existing helpers', function () {
+			fc.assert(
+				fc.property(text, function (s) {
+					const words = helpers.toNoCase(s);
+					expect(helpers.toSnakeCase(s)).toBe(words.split(' ').join('_'));
+					expect(helpers.toKebabCase(s)).toBe(words.split(' ').join('-'));
+					expect(helpers.toDotCase(s)).toBe(words.split(' ').join('.'));
+					expect(helpers.toPathCase(s)).toBe(words.split(' ').join('/'));
+					expect(helpers.toTrainCase(s)).toBe(helpers.toStartCase(s).split(' ').join('-'));
+					expect(helpers.toPascalCase(s)).toBe(helpers.toStartCase(s).split(' ').join(''));
+					expect(helpers.toConstantCase(s)).toBe(helpers.toDelimitedCase(s, '_', { case: 'upper' }));
+					expect(words).toBe(helpers.toDelimitedCase(s, ' ', { case: 'preserve' }).toLowerCase());
+				})
+			);
+		});
+
+		it('never let the delimiter change the casing of the words', function () {
+			fc.assert(
+				fc.property(
+					text,
+					fc.constantFrom('.', ':', "'", 'X', '', '--'),
+					fc.constantFrom<helpers.WordCase>('lower', 'upper', 'capital', 'preserve'),
+					function (s, delimiter, wordCase) {
+						const reference = helpers.toDelimitedCase(s, '\u0000', { case: wordCase });
+						expect(helpers.toDelimitedCase(s, delimiter, { case: wordCase })).toBe(reference.split('\u0000').join(delimiter));
+					}
+				)
+			);
+		});
+	});
+
+	describe('padStart / padEnd / padCenter', function () {
+		it('reach exactly the target width in graphemes and keep the string', function () {
+			fc.assert(
+				fc.property(safeText, fc.nat(20), fill, function (s, width, padding) {
+					const length = graphemes(s).length;
+					const start = helpers.padStart(s, width, padding);
+					const end = helpers.padEnd(s, width, padding);
+					const center = helpers.padCenter(s, width, padding);
+
+					for (const result of [start, end, center]) expect(graphemes(result)).toHaveLength(Math.max(width, length));
+
+					expect(start.endsWith(s)).toBe(true);
+					expect(end.startsWith(s)).toBe(true);
+
+					const before = Math.floor(Math.max(width - length, 0) / 2);
+					expect(center).toBe(helpers.padStart(s, length + before, padding) + helpers.padEnd('', Math.max(width - length, 0) - before, padding));
+				})
+			);
+		});
+
+		it('use the fill graphemes in order, cut at the end', function () {
+			fc.assert(
+				fc.property(fc.nat(20), fill, function (width, padding) {
+					const expected = Array.from({ length: width }, function (_, index) {
+						const list = graphemes(padding);
+						return list[index % list.length];
+					}).join('');
+					expect(helpers.padEnd('', width, padding)).toBe(expected);
+					expect(helpers.padStart('', width, padding)).toBe(expected);
+				})
+			);
+		});
+
+		it('equal the native methods on ASCII', function () {
+			fc.assert(
+				fc.property(
+					fc.string({ unit: fc.constantFrom('a', 'b', ' ', '~') }),
+					fc.nat(20),
+					fc.string({ unit: fc.constantFrom('x', 'y', '-'), minLength: 1 }),
+					function (s, width, padding) {
+						expect(helpers.padStart(s, width, padding)).toBe(s.padStart(width, padding));
+						expect(helpers.padEnd(s, width, padding)).toBe(s.padEnd(width, padding));
+					}
+				)
+			);
+		});
+	});
+});

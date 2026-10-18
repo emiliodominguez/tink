@@ -1,6 +1,7 @@
 import fc from 'fast-check';
 import * as helpers from '.';
 import { isPlainObject } from '../guards/index.js';
+import * as strings from '../strings/index.js';
 
 const UNSAFE = new Set(['__proto__', 'constructor', 'prototype']);
 
@@ -600,5 +601,324 @@ describe('objects (properties)', function () {
 				})
 			);
 		});
+	});
+});
+
+describe('Objects helpers (round 11) - properties', function () {
+	const json = fc.jsonValue({ maxDepth: 3 });
+	const jsonObject = fc.dictionary(fc.string({ maxLength: 4 }), json, { maxKeys: 6, noNullPrototype: true });
+	const safeName = fc.string({ minLength: 1, maxLength: 4 }).filter(function (key) {
+		return !UNSAFE.has(key) && !key.includes('.');
+	});
+
+	/**
+	 * Copies an object tree with the keys of every plain object inserted in reverse order.
+	 */
+	function reverseKeys(value: unknown): unknown {
+		if (Array.isArray(value)) return value.map(reverseKeys);
+		if (!isPlainObject(value)) return value;
+		const copy: Record<string, unknown> = {};
+		for (const key of Object.keys(value).reverse())
+			Object.defineProperty(copy, key, { value: reverseKeys(value[key]), enumerable: true, writable: true, configurable: true });
+		return copy;
+	}
+
+	it('defaults equals a per-key reference (first value that is not undefined)', function () {
+		fc.assert(
+			fc.property(record, record, function (target, source) {
+				const result = helpers.defaults(target, source) as Record<string, unknown>;
+				const expected: Record<string, unknown> = {};
+				const own = Object.prototype.hasOwnProperty;
+				for (const key of [...Object.keys(target), ...Object.keys(source)]) {
+					if (UNSAFE.has(key) || own.call(expected, key)) continue;
+					Object.defineProperty(expected, key, {
+						value: own.call(target, key) && (target[key] !== undefined || !own.call(source, key)) ? target[key] : source[key],
+						enumerable: true,
+						writable: true,
+						configurable: true
+					});
+				}
+				return helpers.isEqual(result, expected);
+			})
+		);
+	});
+
+	it('defaultsDeep(a, b) equals deepMerge(b, a) for JSON data', function () {
+		fc.assert(
+			fc.property(jsonObject, jsonObject, function (a, b) {
+				return helpers.isEqual(helpers.defaultsDeep(a, b), helpers.deepMerge(b, a));
+			})
+		);
+	});
+
+	it('deepMergeWith with the default options equals deepMerge', function () {
+		fc.assert(
+			fc.property(jsonObject, jsonObject, jsonObject, function (a, b, c) {
+				return helpers.isEqual(helpers.deepMergeWith({}, a, b, c), helpers.deepMerge(a, b, c));
+			})
+		);
+	});
+
+	it('deepMergeWith concat keeps every item of both arrays in order; union removes repeats', function () {
+		const list = fc.array(fc.integer({ min: 0, max: 5 }), { maxLength: 6 });
+		fc.assert(
+			fc.property(list, list, function (left, right) {
+				const concat = helpers.deepMergeWith({ arrays: 'concat' }, { a: left }, { a: right }).a;
+				const union = helpers.deepMergeWith({ arrays: 'union' }, { a: left }, { a: right }).a;
+				return helpers.isEqual(concat, [...left, ...right]) && helpers.isEqual(union, [...new Set([...left, ...right])]);
+			})
+		);
+	});
+
+	it('updateInObjectByKeys writes the value, leaves the input intact and shares the untouched branches', function () {
+		fc.assert(
+			fc.property(jsonObject, fc.array(safeName, { minLength: 1, maxLength: 4 }), json, function (object, segments, value) {
+				const path = segments.join('.');
+				const before = helpers.deepClone(object);
+				let result: Record<string, unknown>;
+				try {
+					result = helpers.updateInObjectByKeys(object, path, function () {
+						return value;
+					});
+				} catch (error) {
+					// Only a primitive on the path can make it fail.
+					return error instanceof TypeError && helpers.isEqual(object, before);
+				}
+				const [head] = segments;
+				const sharing = Object.keys(object).every(function (key) {
+					return key === head || result[key] === object[key];
+				});
+				return helpers.isEqual(object, before) && helpers.isEqual(helpers.getFromObjectByKeys(result, path as never), value) && sharing;
+			})
+		);
+	});
+
+	it('omitInObjectByKeys removes the path and nothing else', function () {
+		fc.assert(
+			fc.property(jsonObject, fc.array(safeName, { minLength: 1, maxLength: 3 }), function (object, segments) {
+				const path = segments.join('.');
+				const before = helpers.deepClone(object);
+				const result = helpers.omitInObjectByKeys(object, path as never) as object;
+				const mutated = helpers.deepClone(object);
+				helpers.deleteFromObjectByKeys(mutated, path);
+				const unchanged = !helpers.hasInObjectByKeys(object, path) || !Object.prototype.hasOwnProperty.call(object, segments[0]);
+				return (
+					helpers.isEqual(object, before) &&
+					helpers.isEqual(result, mutated) &&
+					(result === object) === helpers.isEqual(mutated, before) &&
+					(unchanged || result !== object)
+				);
+			})
+		);
+	});
+
+	it('toPath round-trips quoted bracket paths and plain dot paths, and never half-parses', function () {
+		const segment = fc.string({ maxLength: 5 }).filter(function (key) {
+			return !UNSAFE.has(key);
+		});
+		fc.assert(
+			fc.property(fc.array(segment, { minLength: 1, maxLength: 5 }), fc.constantFrom('"', "'"), function (segments, quote) {
+				const path = segments
+					.map(function (key) {
+						return '[' + quote + key.replace(/[\\'"]/g, '\\$&') + quote + ']';
+					})
+					.join('');
+				return helpers.isEqual(helpers.toPath(path), segments);
+			})
+		);
+		fc.assert(
+			fc.property(
+				fc.array(
+					safeName.filter(function (key) {
+						return !/[[\]]/.test(key);
+					}),
+					{ minLength: 1, maxLength: 5 }
+				),
+				function (segments) {
+					return helpers.isEqual(helpers.toPath(segments.join('.')), segments);
+				}
+			)
+		);
+		fc.assert(
+			fc.property(fc.string({ maxLength: 12, unit: fc.constantFrom('a', '.', '[', ']', '0', '1', "'", '"', '\\') }), function (path) {
+				let segments: string[];
+				try {
+					segments = helpers.toPath(path);
+				} catch (error) {
+					return error instanceof RangeError;
+				}
+				// A successful parse re-parses identically from its canonical form.
+				const canonical = segments
+					.map(function (key) {
+						return '["' + key.replace(/[\\"]/g, '\\$&') + '"]';
+					})
+					.join('');
+				return helpers.isEqual(helpers.toPath(canonical), segments);
+			})
+		);
+	});
+
+	it('isMatch accepts equal values and sub-objects, and agrees with isEqual on leaves', function () {
+		fc.assert(
+			fc.property(jsonObject, fc.array(fc.string({ maxLength: 4 })), function (object, keys) {
+				const sub = helpers.pick(
+					object,
+					keys.filter(function (key) {
+						return !UNSAFE.has(key);
+					}) as never[]
+				);
+				return helpers.isMatch(object, helpers.deepClone(object)) === !hasUnsafeKey(object) && helpers.isMatch(object, sub) === !hasUnsafeKey(sub);
+			})
+		);
+		fc.assert(
+			fc.property(anyValue, anyValue, function (a, b) {
+				// Non-plain leaves are compared with isEqual.
+				return isPlainObject(b) || Array.isArray(b) || helpers.isMatch(a, b) === helpers.isEqual(a, b);
+			})
+		);
+	});
+
+	/**
+	 * Whether a JSON tree has a key that `isMatch` never reads.
+	 */
+	function hasUnsafeKey(value: unknown): boolean {
+		if (Array.isArray(value)) return value.some(hasUnsafeKey);
+		if (!isPlainObject(value)) return false;
+		return Object.keys(value).some(function (key) {
+			return UNSAFE.has(key) || hasUnsafeKey(value[key]);
+		});
+	}
+
+	it('shallowEqual agrees with isEqual on flat records and holds for shallow clones', function () {
+		const flat = fc.dictionary(fc.string({ maxLength: 2 }), fc.oneof(fc.integer({ min: -2, max: 2 }), fc.constant(NaN), fc.boolean(), fc.constant(null)), { maxKeys: 4 });
+		fc.assert(
+			fc.property(flat, flat, function (a, b) {
+				return helpers.shallowEqual(a, b) === helpers.isEqual(a, b) && helpers.shallowEqual(a, helpers.clone(a));
+			})
+		);
+		fc.assert(
+			fc.property(fc.oneof(record, fc.array(anyValue)), function (value) {
+				return helpers.shallowEqual(value, helpers.clone(value)) && helpers.shallowEqual(helpers.clone(value), value);
+			})
+		);
+	});
+
+	it('transformKeysDeep with the identity copies the data; the case helpers agree with the strings module', function () {
+		fc.assert(
+			fc.property(json, function (value) {
+				const copy = helpers.transformKeysDeep(value, function (key) {
+					return key;
+				});
+				return helpers.isEqual(copy, value) && (!isPlainObject(value) || copy !== value);
+			})
+		);
+		fc.assert(
+			fc.property(fc.dictionary(fc.string({ maxLength: 8 }), fc.integer(), { maxKeys: 5 }), function (object) {
+				let result: Record<string, unknown>;
+				try {
+					result = helpers.toSnakeCaseKeys(object) as Record<string, unknown>;
+				} catch (error) {
+					// Only a collision can make it fail.
+					const names = Object.keys(object).map(function (key) {
+						return key === '__proto__' ? key : strings.toSnakeCase(key);
+					});
+					return error instanceof RangeError && new Set(names).size < names.length;
+				}
+				return Object.keys(object).every(function (key) {
+					return result[key === '__proto__' ? key : strings.toSnakeCase(key)] === object[key];
+				});
+			})
+		);
+	});
+
+	it('stableStringify ignores key order, round-trips JSON, and is injective on JSON data', function () {
+		fc.assert(
+			fc.property(json, function (value) {
+				const text = helpers.stableStringify(value);
+				return text === helpers.stableStringify(reverseKeys(value)) && helpers.isEqual(JSON.parse(text), value);
+			})
+		);
+		const small = fc.jsonValue({ maxDepth: 2 }).map(function (value) {
+			return JSON.parse(JSON.stringify(value).replace(/-0\b(?!\.)/g, '0'));
+		});
+		fc.assert(
+			fc.property(small, small, function (a, b) {
+				return (helpers.stableStringify(a) === helpers.stableStringify(b)) === helpers.isEqual(a, b);
+			})
+		);
+	});
+
+	it('stableStringify and hash give the same result for deep clones of any data', function () {
+		fc.assert(
+			fc.property(anyValue, function (value) {
+				let text: string;
+				try {
+					text = helpers.stableStringify(value);
+				} catch (error) {
+					// fast-check's anything() may contain symbols (keys are ignored, values are not).
+					return error instanceof TypeError;
+				}
+				const clone = helpers.deepClone(value);
+				return (
+					text === helpers.stableStringify(clone) &&
+					helpers.hash(value) === helpers.hash(clone) &&
+					Number.isSafeInteger(helpers.hash(value)) &&
+					helpers.hash(value) >= 0
+				);
+			})
+		);
+	});
+
+	it('sortKeys sorts, keeps the data and is idempotent', function () {
+		fc.assert(
+			fc.property(jsonObject, function (object) {
+				const sorted = helpers.sortKeys(object, { deep: true });
+				const keys = Object.keys(sorted);
+				const integers = keys.filter(function (key) {
+					return /^(?:0|[1-9]\d*)$/.test(key) && Number(key) < 2 ** 32 - 1;
+				});
+				const others = keys.slice(integers.length);
+				return (
+					helpers.isEqual(sorted, object) &&
+					helpers.isEqual(others, [...others].sort()) &&
+					JSON.stringify(helpers.sortKeys(sorted, { deep: true })) === JSON.stringify(sorted)
+				);
+			})
+		);
+	});
+
+	it('evolve with identity transforms copies the data; mapEntries with identity entries matches Object.entries', function () {
+		fc.assert(
+			fc.property(jsonObject, function (object) {
+				const identity: Record<string, (value: unknown) => unknown> = {};
+				for (const key of Object.keys(object)) {
+					Object.defineProperty(identity, key, {
+						value: function (value: unknown) {
+							return value;
+						},
+						enumerable: true
+					});
+				}
+				const evolved = helpers.evolve(object, identity as never);
+				const mapped = helpers.mapEntries(object, function (value, key) {
+					return [key, value];
+				});
+				return helpers.isEqual(evolved, object) && evolved !== object && helpers.isEqual(mapped, object);
+			})
+		);
+	});
+
+	it('findEntry matches Object.entries(...).find', function () {
+		fc.assert(
+			fc.property(fc.dictionary(fc.string(), fc.integer(), { maxKeys: 8 }), fc.integer(), function (object, threshold) {
+				function above(value: number): boolean {
+					return value > threshold;
+				}
+				const expected = Object.entries(object).find(function ([, value]) {
+					return above(value);
+				});
+				return helpers.isEqual(helpers.findEntry(object, above), expected) && helpers.findKey(object, above) === expected?.[0];
+			})
+		);
 	});
 });

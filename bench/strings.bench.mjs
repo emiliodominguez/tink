@@ -5,17 +5,23 @@ import {
 	escape,
 	escapeRegExp as esEscapeRegExp,
 	kebabCase,
+	lowerCase,
 	lowerFirst,
+	pad as esPad,
 	pascalCase,
 	reverseString,
 	snakeCase,
 	startCase,
+	trim as esTrim,
+	trimEnd as esTrimEnd,
+	trimStart as esTrimStart,
 	unescape,
 	upperFirst,
 	words
 } from 'es-toolkit';
-import { repeat as esRepeat, template as esTemplate, truncate as esTruncate } from 'es-toolkit/compat';
+import { padEnd as esPadEnd, padStart as esPadStart, repeat as esRepeat, template as esTemplate, truncate as esTruncate } from 'es-toolkit/compat';
 import * as lodash from 'lodash-es';
+import * as radash from 'radash';
 import {
 	capitalize,
 	escapeHtml,
@@ -23,18 +29,29 @@ import {
 	getWords,
 	interpolate,
 	levenshtein,
+	padCenter,
+	padEnd,
+	padStart,
 	removeDiacritics,
 	repeat,
 	reverse,
 	similarity,
 	toCamelCase,
 	toConstantCase,
+	toDelimitedCase,
+	toDotCase,
 	toKebabCase,
+	toNoCase,
 	toPascalCase,
 	toSlug,
 	toSnakeCase,
+	toStartCase,
 	toTitleCase,
+	toTrainCase,
 	trim,
+	trimChars,
+	trimEndChars,
+	trimStartChars,
 	truncate,
 	uncapitalize,
 	unescapeHtml
@@ -110,7 +127,115 @@ function threeWay(label, ours, others) {
 	});
 }
 
+const fenced = ['--hello-world__', '__init__', '-_-', 'plain', '---a-very-long-identifier-with-dashes---', '_x_', '', '-_-_-_-_-_value-_-_-_-_-'];
+const longFenced = '-_'.repeat(20) + longAscii + '_-'.repeat(20);
+const unicodeFenced = '··' + unicode + '··';
+const labels = ['id', 'Name', 'Ünïcödé', '👍🏽', 'a longer label', 'x', '日本語', ''];
+
+/**
+ * Builds a case trimming the same inputs with a set of characters, for ours and the competitors (es-toolkit takes an array of characters).
+ * @param {string} name - The case name
+ * @param {string[]} list - The inputs
+ * @param {string} chars - The characters to trim
+ * @returns {object} The case
+ */
+function trimCase(name, list, chars) {
+	const array = Array.from(chars);
+	return {
+		name: `trimChars (${name})`,
+		fn: function () {
+			return each(function (value) {
+				return trimChars(value, chars);
+			}, list);
+		},
+		competitors: {
+			'es-toolkit': function () {
+				return each(function (value) {
+					return esTrim(value, array);
+				}, list);
+			},
+			lodash: function () {
+				return each(function (value) {
+					return lodash.trim(value, chars);
+				}, list);
+			},
+			radash: function () {
+				return each(function (value) {
+					return radash.trim(value, chars);
+				}, list);
+			}
+		}
+	};
+}
+
+/**
+ * Builds a case padding the labels to a width, for ours and the competitors.
+ * @param {string} name - The helper name
+ * @param {(value: string, width: number, fill: string) => string} ours - Our implementation
+ * @param {Record<string, (value: string, width: number, fill: string) => string>} others - The competitors
+ * @param {string} fill - The fill
+ * @returns {object} The case
+ */
+function padCase(name, ours, others, fill) {
+	const competitors = {};
+	for (const [lib, fn] of Object.entries(others)) {
+		competitors[lib] = function () {
+			return each(function (value) {
+				return fn(value, 16, fill);
+			}, labels);
+		};
+	}
+	return {
+		name: `${name} (8 labels to 16, fill ${JSON.stringify(fill)})`,
+		fn: function () {
+			return each(function (value) {
+				return ours(value, 16, fill);
+			}, labels);
+		},
+		competitors
+	};
+}
+
 export default [
+	trimCase('8 short identifiers', fenced, '-_'),
+	trimCase('long ASCII 1.6 KB', [longFenced], '-_'),
+	trimCase('unicode 0.7 KB', [unicodeFenced], '·'),
+	{
+		name: 'trimStartChars + trimEndChars (8 short identifiers)',
+		fn: function () {
+			return each(function (value) {
+				return trimStartChars(value, '-') + trimEndChars(value, '_');
+			}, fenced);
+		},
+		competitors: {
+			'es-toolkit': function () {
+				return each(function (value) {
+					return esTrimStart(value, '-') + esTrimEnd(value, '_');
+				}, fenced);
+			},
+			lodash: function () {
+				return each(function (value) {
+					return lodash.trimStart(value, '-') + lodash.trimEnd(value, '_');
+				}, fenced);
+			}
+		}
+	},
+	...threeWay('toStartCase', toStartCase, { 'es-toolkit': startCase, lodash: lodash.startCase, radash: radash.title }),
+	...threeWay('toNoCase ~ lowerCase', toNoCase, { 'es-toolkit': lowerCase, lodash: lodash.lowerCase }),
+	...threeWay('toTrainCase', toTrainCase, {}),
+	...threeWay('toDotCase', toDotCase, {}),
+	{
+		name: 'toDelimitedCase (8 identifiers, upper)',
+		fn: function () {
+			return each(function (value) {
+				return toDelimitedCase(value, '.', { case: 'upper' });
+			}, identifiers);
+		}
+	},
+	padCase('padStart', padStart, { 'es-toolkit': esPadStart, lodash: lodash.padStart }, ' '),
+	padCase('padEnd', padEnd, { 'es-toolkit': esPadEnd, lodash: lodash.padEnd }, '.'),
+	padCase('padCenter', padCenter, { 'es-toolkit': esPad, lodash: lodash.pad }, '*'),
+	padCase('padStart', padStart, { 'es-toolkit': esPadStart, lodash: lodash.padStart }, '-='),
 	...threeWay('toCamelCase', toCamelCase, { 'es-toolkit': camelCase, lodash: lodash.camelCase }),
 	...threeWay('toSnakeCase', toSnakeCase, { 'es-toolkit': snakeCase, lodash: lodash.snakeCase }),
 	...threeWay('toKebabCase', toKebabCase, { 'es-toolkit': kebabCase, lodash: lodash.kebabCase }),
