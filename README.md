@@ -1,4 +1,4 @@
-![js-helpers: Small utilities. Solid foundations. Yellow, graphite and aluminum code-shaped building blocks.](https://raw.githubusercontent.com/emiliodominguez/js-helpers/main/docs/assets/js-helpers-banner.jpg)
+![tink — Small utilities. Solid foundations.](./docs/assets/tink-logo.svg)
 
 [![CI](https://img.shields.io/github/actions/workflow/status/emiliodominguez/js-helpers/tests.yml?branch=main&style=for-the-badge&label=CI&labelColor=161b22&logo=githubactions&logoColor=white)](https://github.com/emiliodominguez/js-helpers/actions/workflows/tests.yml)
 [![TypeScript: strict](https://img.shields.io/badge/TS-strict-3178c6?style=for-the-badge&labelColor=161b22&logo=typescript&logoColor=white)](./tsconfig.json)
@@ -6,7 +6,7 @@
 [![Property tests: fast-check](https://img.shields.io/badge/tests-fast--check-8250df?style=for-the-badge&labelColor=161b22&logo=jest&logoColor=white)](#testing-philosophy)
 [![License: MIT](https://img.shields.io/badge/license-MIT-3da639?style=for-the-badge&labelColor=161b22&logo=opensourceinitiative&logoColor=white)](./LICENSE)
 
-**Strictly typed utilities for everyday JavaScript.**
+**tink — Strictly typed utilities for everyday JavaScript.**
 
 20 focused modules. Zero runtime dependencies. Import the helpers you need, with types and examples available in your editor.
 
@@ -15,15 +15,15 @@
 ## Install
 
 ```bash
-npm install @emiliodominguez/js-helpers
+npm install @emiliodominguez/tink
 ```
 
 <details>
 <summary>Using Yarn or pnpm?</summary>
 
 ```bash
-yarn add @emiliodominguez/js-helpers
-pnpm add @emiliodominguez/js-helpers
+yarn add @emiliodominguez/tink
+pnpm add @emiliodominguez/tink
 ```
 
 </details>
@@ -35,10 +35,10 @@ pnpm add @emiliodominguez/js-helpers
 Import directly from a module so your bundler can keep only what you use:
 
 ```ts
-import { chunk } from '@emiliodominguez/js-helpers/arrays';
-import { isDefined } from '@emiliodominguez/js-helpers/guards';
-import { round } from '@emiliodominguez/js-helpers/math';
-import { toSlug } from '@emiliodominguez/js-helpers/strings';
+import { chunk } from '@emiliodominguez/tink/arrays';
+import { isDefined } from '@emiliodominguez/tink/guards';
+import { round } from '@emiliodominguez/tink/math';
+import { toSlug } from '@emiliodominguez/tink/strings';
 
 chunk([1, 2, 3, 4, 5], 2); // [[1, 2], [3, 4], [5]]
 [1, null, 2, undefined].filter(isDefined); // [1, 2], inferred as number[]
@@ -52,7 +52,7 @@ toSlug('Café Society!'); // 'cafe-society'
 The root entry groups helpers by module, avoiding name clashes such as `strings.isEmpty` and `objects.isEmpty`:
 
 ```ts
-import { math, objects } from '@emiliodominguez/js-helpers';
+import { math, objects } from '@emiliodominguez/tink';
 
 math.round(1.005, 2); // 1.01 (naive Math.round(x * 100) / 100 gives 1)
 objects.isEqual(new Map([[1, { a: [1] }]]), new Map([[1, { a: [1] }]])); // true
@@ -60,7 +60,7 @@ objects.isEqual(new Map([[1, { a: [1] }]]), new Map([[1, { a: [1] }]])); // true
 
 </details>
 
-## Why js-helpers?
+## Why tink?
 
 - **Types that follow your data.** Narrowing predicates, path-aware getters, tuple-typed `zip`, and typed `curry`, `compose` and `pipe`.
 - **Care with the edge cases.** Unicode-aware strings, DST-safe date arithmetic, compensated summation, circular-reference support and prototype-pollution checks.
@@ -119,15 +119,15 @@ Choose a recipe to see the imports and usage together.
 These integration snippets use application-provided values such as `user`, `defaults`, `userInput`, `url`, `urls`, `input`, `fetchPage` and `persist`.
 
 ```ts
-import { getFromObjectByKeys, deepMerge } from '@emiliodominguez/js-helpers/objects';
-import { isDefined } from '@emiliodominguez/js-helpers/guards';
-import { retry, withTimeout, mapWithConcurrency } from '@emiliodominguez/js-helpers/async';
-import { debounce } from '@emiliodominguez/js-helpers/functions';
-import { addMonths, formatDate } from '@emiliodominguez/js-helpers/date';
-import { getReadableTextColor } from '@emiliodominguez/js-helpers/color';
-import { formatCompact, formatCurrency } from '@emiliodominguez/js-helpers/format';
-import { compareSemver, isEmail } from '@emiliodominguez/js-helpers/validate';
-import { withQuery } from '@emiliodominguez/js-helpers/url';
+import { getFromObjectByKeys, deepMerge } from '@emiliodominguez/tink/objects';
+import { isDefined } from '@emiliodominguez/tink/guards';
+import { retry, withTimeout, mapWithConcurrency } from '@emiliodominguez/tink/async';
+import { debounce } from '@emiliodominguez/tink/functions';
+import { addMonths, formatDate } from '@emiliodominguez/tink/date';
+import { getReadableTextColor } from '@emiliodominguez/tink/color';
+import { formatCompact, formatCurrency } from '@emiliodominguez/tink/format';
+import { compareSemver, isEmail } from '@emiliodominguez/tink/validate';
+import { withQuery } from '@emiliodominguez/tink/url';
 
 // Type-safe deep access: the return type is inferred from the path.
 const city = getFromObjectByKeys(user, 'address.city', 'Unknown'); // string
@@ -173,12 +173,12 @@ isEmail(input); // narrows `unknown` to `string`
 The caching example wraps your application's `fetchUser` function. The remaining examples are self-contained.
 
 ```ts
-import { createLRUCache } from '@emiliodominguez/js-helpers/cache';
-import { createEmitter } from '@emiliodominguez/js-helpers/emitter';
-import { memoize } from '@emiliodominguez/js-helpers/functions';
-import { count, filter, map, take, toArray } from '@emiliodominguez/js-helpers/iterables';
-import { createRandom } from '@emiliodominguez/js-helpers/random';
-import { createStore } from '@emiliodominguez/js-helpers/store';
+import { createLRUCache } from '@emiliodominguez/tink/cache';
+import { createEmitter } from '@emiliodominguez/tink/emitter';
+import { memoize } from '@emiliodominguez/tink/functions';
+import { count, filter, map, take, toArray } from '@emiliodominguez/tink/iterables';
+import { createRandom } from '@emiliodominguez/tink/random';
+import { createStore } from '@emiliodominguez/tink/store';
 
 // Bounded, expiring memoization.
 const getUser = memoize(fetchUser, { cache: createLRUCache({ max: 500, ttl: 60_000 }) });
@@ -220,10 +220,10 @@ const rng = createRandom('docs');
 <summary>UI helpers: fuzzy search, easing, CSS colors and diffs</summary>
 
 ```ts
-import { diffSequences } from '@emiliodominguez/js-helpers/arrays';
-import { parseColor } from '@emiliodominguez/js-helpers/color';
-import { cssEase, interpolate } from '@emiliodominguez/js-helpers/easing';
-import { fuzzySearch, highlight } from '@emiliodominguez/js-helpers/search';
+import { diffSequences } from '@emiliodominguez/tink/arrays';
+import { parseColor } from '@emiliodominguez/tink/color';
+import { cssEase, interpolate } from '@emiliodominguez/tink/easing';
+import { fuzzySearch, highlight } from '@emiliodominguez/tink/search';
 
 // Command palette: rank matches, then render highlighted segments (no innerHTML needed).
 const [best] = fuzzySearch(['Open File', 'Save File', 'Toggle Sidebar'], 'of');
@@ -254,7 +254,7 @@ The decorators detect at runtime which decorator style they were applied with. T
 - TC39 standard decorators (TypeScript 5+ without `experimentalDecorators`).
 
 ```ts
-import { memoize, bound, debounced, readonly } from '@emiliodominguez/js-helpers/decorators';
+import { memoize, bound, debounced, readonly } from '@emiliodominguez/tink/decorators';
 
 class SearchBox {
 	@readonly id = crypto.randomUUID(); // write-once: reassigning throws TypeError
