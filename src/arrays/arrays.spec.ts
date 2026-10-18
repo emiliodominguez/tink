@@ -203,14 +203,14 @@ describe('Arrays helpers', function () {
 		});
 	});
 
-	describe('removeDuplicates', function () {
+	describe('unique', function () {
 		it('should keep the original sign of zero on the hashed path (more than 32 items)', function () {
 			const many = Array.from({ length: 40 }, function (_, index) {
 				return index + 1;
 			});
-			const negativeFirst = helpers.removeDuplicates([-0, ...many, 0]);
-			const positiveFirst = helpers.removeDuplicates([0, ...many, -0]);
-			const noZero = helpers.removeDuplicates([...many, ...many]);
+			const negativeFirst = helpers.unique([-0, ...many, 0]);
+			const positiveFirst = helpers.unique([0, ...many, -0]);
+			const noZero = helpers.unique([...many, ...many]);
 
 			expect(negativeFirst).toHaveLength(41);
 			expect(Object.is(negativeFirst[0], -0)).toBe(true);
@@ -220,15 +220,15 @@ describe('Arrays helpers', function () {
 
 		it('should give the same result for long inputs (more than 16 items)', function () {
 			const long = [3, -0, 3, NaN, 'x', 0, NaN, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 'x', -0, 11];
-			const result = helpers.removeDuplicates(long);
+			const result = helpers.unique(long);
 			expect(result).toStrictEqual([3, -0, NaN, 'x', 1, 2, 4, 5, 6, 7, 8, 9, 10, 11]);
 			expect(Object.is(result[1], -0)).toBe(true);
-			expect(helpers.removeDuplicates([0, ...long])[0]).toBe(0);
-			expect(Object.is(helpers.removeDuplicates([0, ...long])[0], 0)).toBe(true);
+			expect(helpers.unique([0, ...long])[0]).toBe(0);
+			expect(Object.is(helpers.unique([0, ...long])[0], 0)).toBe(true);
 		});
 
 		it('should keep the original -0 instead of the +0 a Set hands back', function () {
-			expect(Object.is(helpers.removeDuplicates([-0, 0])[0], -0)).toBe(true);
+			expect(Object.is(helpers.unique([-0, 0])[0], -0)).toBe(true);
 			expect(Object.is(helpers.union([-0], [1])[0], -0)).toBe(true);
 			expect(Object.is(helpers.union([1], [-0])[1], -0)).toBe(true);
 			expect(Object.is(helpers.symmetricDifference([-0], [1])[0], -0)).toBe(true);
@@ -236,27 +236,27 @@ describe('Arrays helpers', function () {
 		});
 
 		it('should remove duplicates from an array', function () {
-			expect(helpers.removeDuplicates([1, 2, 2, 3, 4, 4])).toStrictEqual([1, 2, 3, 4]);
+			expect(helpers.unique([1, 2, 2, 3, 4, 4])).toStrictEqual([1, 2, 3, 4]);
 		});
 
 		it('should keep the sign of the FIRST zero only', function () {
-			expect(helpers.removeDuplicates([1, -0, 2, 0])).toStrictEqual([1, -0, 2]);
-			expect(helpers.removeDuplicates([1, 0, 2, -0])).toStrictEqual([1, 0, 2]);
+			expect(helpers.unique([1, -0, 2, 0])).toStrictEqual([1, -0, 2]);
+			expect(helpers.unique([1, 0, 2, -0])).toStrictEqual([1, 0, 2]);
 			// eslint-disable-next-line no-sparse-arrays
-			expect(helpers.removeDuplicates([undefined, , 0n, 0n])).toStrictEqual([undefined, 0n]);
+			expect(helpers.unique([undefined, , 0n, 0n])).toStrictEqual([undefined, 0n]);
 		});
 
 		it('should accept one-shot iterables', function () {
 			function* values(): Generator<number> {
 				yield* [3, -0, 3, 0, 1];
 			}
-			expect(helpers.removeDuplicates(values())).toStrictEqual([3, -0, 1]);
+			expect(helpers.unique(values())).toStrictEqual([3, -0, 1]);
 		});
 
 		it('should keep first-occurrence order and handle NaN and strings', function () {
-			expect(helpers.removeDuplicates([3, NaN, 1, 3, NaN])).toStrictEqual([3, NaN, 1]);
-			expect(helpers.removeDuplicates('hello')).toStrictEqual(['h', 'e', 'l', 'o']);
-			expect(helpers.removeDuplicates([])).toStrictEqual([]);
+			expect(helpers.unique([3, NaN, 1, 3, NaN])).toStrictEqual([3, NaN, 1]);
+			expect(helpers.unique('hello')).toStrictEqual(['h', 'e', 'l', 'o']);
+			expect(helpers.unique([])).toStrictEqual([]);
 		});
 	});
 

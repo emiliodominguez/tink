@@ -531,56 +531,56 @@ describe('Objects helpers', function () {
 		});
 	});
 
-	describe('getFromObjectByKeys', function () {
+	describe('getPath', function () {
 		it('should return the correct nested value (inferred path type)', function () {
 			const target = { a: { b: { c: 'hello world' } } };
-			const result = helpers.getFromObjectByKeys(target, 'a.b.c');
+			const result = helpers.getPath(target, 'a.b.c');
 			assertType<Equals<typeof result, string>>(true);
 			expect(result).toBe('hello world');
 		});
 
 		it('should return the correct value for non-nested keys', function () {
-			expect(helpers.getFromObjectByKeys({ a: 'hello world' }, 'a')).toBe('hello world');
+			expect(helpers.getPath({ a: 'hello world' }, 'a')).toBe('hello world');
 		});
 
 		it('should return undefined for non-existing keys', function () {
-			expect(helpers.getFromObjectByKeys({ a: 'hello world' }, 'b' as any)).toBeUndefined();
+			expect(helpers.getPath({ a: 'hello world' }, 'b' as any)).toBeUndefined();
 		});
 
 		it('returns the default value for a nullish target, whatever the number of segments', function () {
-			expect(helpers.getFromObjectByKeys(null as any, 'a', 'fallback')).toBe('fallback');
-			expect(helpers.getFromObjectByKeys(undefined as any, 'a.b', 'fallback')).toBe('fallback');
-			expect(helpers.getFromObjectByKeys(null as any, 'a')).toBeUndefined();
+			expect(helpers.getPath(null as any, 'a', 'fallback')).toBe('fallback');
+			expect(helpers.getPath(undefined as any, 'a.b', 'fallback')).toBe('fallback');
+			expect(helpers.getPath(null as any, 'a')).toBeUndefined();
 		});
 
 		it('does not throw on missing or null intermediates (used to throw)', function () {
 			const target: { a: { x?: { y: number } | null } } = { a: {} };
-			expect(helpers.getFromObjectByKeys(target, 'a.x.y')).toBeUndefined();
+			expect(helpers.getPath(target, 'a.x.y')).toBeUndefined();
 			target.a.x = null;
-			expect(helpers.getFromObjectByKeys(target, 'a.x.y')).toBeUndefined();
-			expect(helpers.getFromObjectByKeys(target, 'a.x')).toBeNull();
+			expect(helpers.getPath(target, 'a.x.y')).toBeUndefined();
+			expect(helpers.getPath(target, 'a.x')).toBeNull();
 		});
 
 		it('supports array index segments', function () {
 			const target = { list: [{ id: 1 }, { id: 2 }] };
-			const result = helpers.getFromObjectByKeys(target, 'list.1.id');
+			const result = helpers.getPath(target, 'list.1.id');
 			assertType<Equals<typeof result, number | undefined>>(true);
 			expect(result).toBe(2);
-			expect(helpers.getFromObjectByKeys(target, 'list.5.id')).toBeUndefined();
+			expect(helpers.getPath(target, 'list.5.id')).toBeUndefined();
 		});
 
 		it('returns the default value only when the resolved value is undefined', function () {
 			const target: { a: { b?: number; n: null; z: number } } = { a: { n: null, z: 0 } };
-			const fallback = helpers.getFromObjectByKeys(target, 'a.b', 42);
+			const fallback = helpers.getPath(target, 'a.b', 42);
 			assertType<Equals<typeof fallback, number>>(true);
 			expect(fallback).toBe(42);
-			expect(helpers.getFromObjectByKeys(target, 'a.z', 42)).toBe(0);
-			expect(helpers.getFromObjectByKeys(target, 'a.n', 42)).toBeNull();
-			expect(helpers.getFromObjectByKeys({ a: null as { b: string } | null }, 'a.b', 'def')).toBe('def');
+			expect(helpers.getPath(target, 'a.z', 42)).toBe(0);
+			expect(helpers.getPath(target, 'a.n', 42)).toBeNull();
+			expect(helpers.getPath({ a: null as { b: string } | null }, 'a.b', 'def')).toBe('def');
 		});
 	});
 
-	describe('setInObjectByKeys', function () {
+	describe('setPath', function () {
 		it('shadows an inherited accessor with a new own container instead of assigning through it', function () {
 			class Settings {
 				/**
@@ -591,14 +591,14 @@ describe('Objects helpers', function () {
 					return undefined;
 				}
 			}
-			const settings = helpers.setInObjectByKeys(new Settings() as any, 'theme.color', 'red');
+			const settings = helpers.setPath(new Settings() as any, 'theme.color', 'red');
 			expect(Object.getOwnPropertyDescriptor(settings, 'theme')?.value).toStrictEqual({ color: 'red' });
 			expect(new Settings().theme).toBeUndefined();
 		});
 
 		it('sets nested values, creating objects and arrays as needed, and returns the target', function () {
 			const target: Record<string, any> = { keep: 1 };
-			const result = helpers.setInObjectByKeys(target, 'a.list.0.id', 7);
+			const result = helpers.setPath(target, 'a.list.0.id', 7);
 			expect(result).toBe(target);
 			expect(target).toStrictEqual({ keep: 1, a: { list: [{ id: 7 }] } });
 			expect(Array.isArray(target.a.list)).toBe(true);
@@ -606,22 +606,22 @@ describe('Objects helpers', function () {
 
 		it('reuses existing intermediates and replaces null ones', function () {
 			const target: Record<string, any> = { a: { b: 1 }, n: null, list: [{ x: 1 }] };
-			helpers.setInObjectByKeys(target, 'a.c', 2);
-			helpers.setInObjectByKeys(target, 'n.deep', true);
-			helpers.setInObjectByKeys(target, 'list.0.y', 3);
-			helpers.setInObjectByKeys(target, 'top', 'v');
+			helpers.setPath(target, 'a.c', 2);
+			helpers.setPath(target, 'n.deep', true);
+			helpers.setPath(target, 'list.0.y', 3);
+			helpers.setPath(target, 'top', 'v');
 			expect(target).toStrictEqual({ a: { b: 1, c: 2 }, n: { deep: true }, list: [{ x: 1, y: 3 }], top: 'v' });
 		});
 
 		it('throws RangeError for empty segments', function () {
 			expect(function () {
-				helpers.setInObjectByKeys({}, '', 1);
+				helpers.setPath({}, '', 1);
 			}).toThrow(RangeError);
 			expect(function () {
-				helpers.setInObjectByKeys({}, 'a..b', 1);
+				helpers.setPath({}, 'a..b', 1);
 			}).toThrow(RangeError);
 			expect(function () {
-				helpers.setInObjectByKeys({}, 'a.', 1);
+				helpers.setPath({}, 'a.', 1);
 			}).toThrow(RangeError);
 		});
 
@@ -629,7 +629,7 @@ describe('Objects helpers', function () {
 			for (const path of ['__proto__.polluted', 'a.constructor.prototype.polluted', 'prototype', 'a.__proto__']) {
 				const target = {};
 				expect(function () {
-					helpers.setInObjectByKeys(target, path, 1);
+					helpers.setPath(target, path, 1);
 				}).toThrow(RangeError);
 				expect(target).toStrictEqual({});
 			}
@@ -638,11 +638,11 @@ describe('Objects helpers', function () {
 
 		it('throws TypeError when an intermediate is a primitive', function () {
 			expect(function () {
-				helpers.setInObjectByKeys({ a: 1 }, 'a.b', 2);
-			}).toThrow(new TypeError('setInObjectByKeys: cannot set "a.b": "a" is a number, not an object'));
+				helpers.setPath({ a: 1 }, 'a.b', 2);
+			}).toThrow(new TypeError('setPath: cannot set "a.b": "a" is a number, not an object'));
 			expect(function () {
-				helpers.setInObjectByKeys({}, 'a.__proto__', 2);
-			}).toThrow(new RangeError('setInObjectByKeys: `path` must not contain the unsafe segment "__proto__", got "a.__proto__"'));
+				helpers.setPath({}, 'a.__proto__', 2);
+			}).toThrow(new RangeError('setPath: `path` must not contain the unsafe segment "__proto__", got "a.__proto__"'));
 		});
 	});
 
@@ -1156,30 +1156,30 @@ describe('Objects helpers', function () {
 			expect(Object.getOwnPropertyDescriptor(result, Symbol.unscopables)).toStrictEqual({ value: 20, writable: true, enumerable: true, configurable: true });
 		});
 
-		it('setInObjectByKeys never writes through inherited properties (built-ins stay untouched)', function () {
+		it('setPath never writes through inherited properties (built-ins stay untouched)', function () {
 			const target: Record<string, any> = {};
-			helpers.setInObjectByKeys(target, 'toString.polluted', 1);
+			helpers.setPath(target, 'toString.polluted', 1);
 			expect((Object.prototype.toString as any).polluted).toBeUndefined();
 			expect(target.toString).toStrictEqual({ polluted: 1 });
 			expect(Object.prototype.hasOwnProperty.call(target, 'toString')).toBe(true);
 
 			const list: any[] = [];
-			helpers.setInObjectByKeys(list, 'map.polluted', 1);
+			helpers.setPath(list, 'map.polluted', 1);
 			expect((Array.prototype.map as any).polluted).toBeUndefined();
 
 			const shared = { defaults: { a: 1 } };
 			const instance = Object.create(shared) as Record<string, any>;
-			helpers.setInObjectByKeys(instance, 'defaults.a', 2);
+			helpers.setPath(instance, 'defaults.a', 2);
 			expect(shared.defaults.a).toBe(1);
 			expect(instance.defaults).toStrictEqual({ a: 2 });
 		});
 
-		it('setInObjectByKeys only creates arrays for canonical array indices', function () {
+		it('setPath only creates arrays for canonical array indices', function () {
 			const target: Record<string, any> = {};
-			helpers.setInObjectByKeys(target, 'a.01', 1);
-			helpers.setInObjectByKeys(target, 'b.4294967295', 2);
-			helpers.setInObjectByKeys(target, 'c.1000', 3);
-			helpers.setInObjectByKeys(target, 'd.0', 4);
+			helpers.setPath(target, 'a.01', 1);
+			helpers.setPath(target, 'b.4294967295', 2);
+			helpers.setPath(target, 'c.1000', 3);
+			helpers.setPath(target, 'd.0', 4);
 			expect(Array.isArray(target.a)).toBe(false);
 			expect(target.a).toStrictEqual({ '01': 1 });
 			expect(Array.isArray(target.b)).toBe(false);
@@ -1418,51 +1418,51 @@ describe('Objects helpers', function () {
 		});
 	});
 
-	describe('hasInObjectByKeys / deleteFromObjectByKeys', function () {
-		it('hasInObjectByKeys follows own and inherited properties, except Object.prototype members (behaviour change: own only)', function () {
+	describe('hasPath / deletePath', function () {
+		it('hasPath follows own and inherited properties, except Object.prototype members (behaviour change: own only)', function () {
 			const target = { a: { b: [undefined], s: 'text', n: null }, fn: Object.assign(function () {}, { x: 1 }) };
-			expect(helpers.hasInObjectByKeys(target, 'a')).toBe(true);
-			expect(helpers.hasInObjectByKeys(target, 'a.b.0')).toBe(true);
-			expect(helpers.hasInObjectByKeys(target, 'a.n')).toBe(true);
-			expect(helpers.hasInObjectByKeys(target, 'fn.x')).toBe(true);
-			expect(helpers.hasInObjectByKeys({ fn: Object.assign(function () {}, { inner: { z: 1 } }) }, 'fn.inner.z')).toBe(true);
-			expect(helpers.hasInObjectByKeys(target, 'a.b.1')).toBe(false);
-			expect(helpers.hasInObjectByKeys(target, 'a.toString')).toBe(false);
-			expect(helpers.hasInObjectByKeys(target, 'a.s.length')).toBe(true);
-			expect(helpers.hasInObjectByKeys(target, 'a.n.x')).toBe(false);
-			expect(helpers.hasInObjectByKeys(target, 'missing.x.y')).toBe(false);
-			expect(helpers.hasInObjectByKeys(Object.create({ a: { b: 1 } }), 'a.b')).toBe(true);
+			expect(helpers.hasPath(target, 'a')).toBe(true);
+			expect(helpers.hasPath(target, 'a.b.0')).toBe(true);
+			expect(helpers.hasPath(target, 'a.n')).toBe(true);
+			expect(helpers.hasPath(target, 'fn.x')).toBe(true);
+			expect(helpers.hasPath({ fn: Object.assign(function () {}, { inner: { z: 1 } }) }, 'fn.inner.z')).toBe(true);
+			expect(helpers.hasPath(target, 'a.b.1')).toBe(false);
+			expect(helpers.hasPath(target, 'a.toString')).toBe(false);
+			expect(helpers.hasPath(target, 'a.s.length')).toBe(true);
+			expect(helpers.hasPath(target, 'a.n.x')).toBe(false);
+			expect(helpers.hasPath(target, 'missing.x.y')).toBe(false);
+			expect(helpers.hasPath(Object.create({ a: { b: 1 } }), 'a.b')).toBe(true);
 		});
 
-		it('deleteFromObjectByKeys deletes own properties and reports success', function () {
+		it('deletePath deletes own properties and reports success', function () {
 			const target: Record<string, any> = { a: { b: 1, c: 2 }, list: [1, 2, 3] };
-			expect(helpers.deleteFromObjectByKeys(target, 'a.b')).toBe(true);
+			expect(helpers.deletePath(target, 'a.b')).toBe(true);
 			expect(target).toStrictEqual({ a: { c: 2 }, list: [1, 2, 3] });
-			expect(helpers.deleteFromObjectByKeys(target, 'a.b')).toBe(false);
-			expect(helpers.deleteFromObjectByKeys(target, 'list.1')).toBe(true);
+			expect(helpers.deletePath(target, 'a.b')).toBe(false);
+			expect(helpers.deletePath(target, 'list.1')).toBe(true);
 			expect(target.list).toHaveLength(3);
 			expect(1 in target.list).toBe(false);
-			expect(helpers.deleteFromObjectByKeys(target, 'a.toString')).toBe(false);
-			expect(helpers.deleteFromObjectByKeys(target, 'nope.x')).toBe(false);
-			expect(helpers.deleteFromObjectByKeys(target, 'a')).toBe(true);
+			expect(helpers.deletePath(target, 'a.toString')).toBe(false);
+			expect(helpers.deletePath(target, 'nope.x')).toBe(false);
+			expect(helpers.deletePath(target, 'a')).toBe(true);
 			expect(target).toStrictEqual({ list: [1, , 3] }); // eslint-disable-line no-sparse-arrays
 		});
 
-		it('deleteFromObjectByKeys never deletes inherited properties and returns false for non-configurable ones', function () {
+		it('deletePath never deletes inherited properties and returns false for non-configurable ones', function () {
 			const proto = { shared: 1 };
 			const child = Object.create(proto) as Record<string, unknown>;
-			expect(helpers.deleteFromObjectByKeys(child, 'shared')).toBe(false);
+			expect(helpers.deletePath(child, 'shared')).toBe(false);
 			expect(proto.shared).toBe(1);
 			const locked = Object.defineProperty({}, 'fixed', { value: 1, configurable: false });
-			expect(helpers.deleteFromObjectByKeys(locked, 'fixed')).toBe(false);
-			expect(helpers.deleteFromObjectByKeys([1, 2], 'length')).toBe(false);
+			expect(helpers.deletePath(locked, 'fixed')).toBe(false);
+			expect(helpers.deletePath([1, 2], 'length')).toBe(false);
 		});
 
-		it('deleteFromObjectByKeys follows own properties of functions', function () {
+		it('deletePath follows own properties of functions', function () {
 			const target = { fn: Object.assign(function () {}, { inner: { z: 1 }, x: 2 }) };
-			expect(helpers.deleteFromObjectByKeys(target, 'fn.inner.z')).toBe(true);
-			expect(helpers.deleteFromObjectByKeys(target, 'fn.x')).toBe(true);
-			expect(helpers.deleteFromObjectByKeys(target, 'fn.name.x')).toBe(false);
+			expect(helpers.deletePath(target, 'fn.inner.z')).toBe(true);
+			expect(helpers.deletePath(target, 'fn.x')).toBe(true);
+			expect(helpers.deletePath(target, 'fn.name.x')).toBe(false);
 			expect(target.fn.inner).toStrictEqual({});
 			expect('x' in target.fn).toBe(false);
 		});
@@ -1711,16 +1711,16 @@ describe('Objects helpers', function () {
 		});
 
 		it('creates path containers as ordinary own properties and overwrites existing leaves', function () {
-			const target = helpers.setInObjectByKeys({ a: { b: 1 } } as Record<string, any>, 'a.b', 2);
+			const target = helpers.setPath({ a: { b: 1 } } as Record<string, any>, 'a.b', 2);
 			expect(target).toStrictEqual({ a: { b: 2 } });
-			const created = helpers.setInObjectByKeys({} as Record<string, any>, 'x.y', 1);
+			const created = helpers.setPath({} as Record<string, any>, 'x.y', 1);
 			expect(Object.getOwnPropertyDescriptor(created, 'x')).toStrictEqual({ value: { y: 1 }, writable: true, enumerable: true, configurable: true });
 		});
 
 		it('names the offending path prefix in path errors', function () {
 			expect(function () {
-				helpers.setInObjectByKeys({ a: { b: 1 } }, 'a.b.c.d', 2);
-			}).toThrow(new TypeError('setInObjectByKeys: cannot set "a.b.c.d": "a.b" is a number, not an object'));
+				helpers.setPath({ a: { b: 1 } }, 'a.b.c.d', 2);
+			}).toThrow(new TypeError('setPath: cannot set "a.b.c.d": "a.b" is a number, not an object'));
 			expect(function () {
 				helpers.unflattenObject({ 'a.b': 1, 'a.b.c.d': 2 });
 			}).toThrow(new TypeError('unflattenObject: cannot set "a.b.c.d": "a.b" is already set by another key'));
@@ -1764,14 +1764,14 @@ describe('Objects helpers', function () {
 			expect(helpers.diff(loop, loop)).toStrictEqual({ added: [], removed: [], changed: [] });
 		});
 
-		it('hasInObjectByKeys sees the own properties of primitives, like getFromObjectByKeys (behaviour change)', function () {
-			expect(helpers.hasInObjectByKeys({ name: 'abc' }, 'name.length')).toBe(true);
-			expect(helpers.hasInObjectByKeys({ name: 'abc' }, 'name.0')).toBe(true);
-			expect(helpers.hasInObjectByKeys({ name: 'abc' }, 'name.3')).toBe(false);
-			expect(helpers.hasInObjectByKeys({ n: 1 }, 'n.toFixed')).toBe(true);
-			expect(helpers.deleteFromObjectByKeys({ name: 'abc' }, 'name.0')).toBe(false);
-			expect(helpers.hasInObjectByKeys({ a: null }, 'a.b.c')).toBe(false);
-			expect(helpers.hasInObjectByKeys({ a: undefined }, 'a.b.c')).toBe(false);
+		it('hasPath sees the own properties of primitives, like getPath (behaviour change)', function () {
+			expect(helpers.hasPath({ name: 'abc' }, 'name.length')).toBe(true);
+			expect(helpers.hasPath({ name: 'abc' }, 'name.0')).toBe(true);
+			expect(helpers.hasPath({ name: 'abc' }, 'name.3')).toBe(false);
+			expect(helpers.hasPath({ n: 1 }, 'n.toFixed')).toBe(true);
+			expect(helpers.deletePath({ name: 'abc' }, 'name.0')).toBe(false);
+			expect(helpers.hasPath({ a: null }, 'a.b.c')).toBe(false);
+			expect(helpers.hasPath({ a: undefined }, 'a.b.c')).toBe(false);
 		});
 	});
 
@@ -1788,29 +1788,29 @@ describe('Objects helpers', function () {
 			}
 		}
 
-		it('getFromObjectByKeys never resolves __proto__/constructor/prototype nor Object.prototype members', function () {
+		it('getPath never resolves __proto__/constructor/prototype nor Object.prototype members', function () {
 			const permissions = { viewer: { read: true } } as any;
-			expect(helpers.getFromObjectByKeys(permissions, 'viewer.constructor')).toBeUndefined();
-			expect(helpers.getFromObjectByKeys(permissions, 'viewer.constructor', false)).toBe(false);
-			expect(helpers.getFromObjectByKeys({} as any, 'constructor.constructor')).toBeUndefined();
-			expect(helpers.getFromObjectByKeys({} as any, '__proto__')).toBeUndefined();
-			expect(helpers.getFromObjectByKeys({} as any, 'toString', 'x')).toBe('x');
-			expect(helpers.getFromObjectByKeys({ a: {} } as any, 'a.hasOwnProperty', 'x')).toBe('x');
-			expect(helpers.getFromObjectByKeys({ fn: function () {} } as any, 'fn.prototype')).toBeUndefined();
-			expect(helpers.getFromObjectByKeys({ list: [1] } as any, 'list.constructor')).toBeUndefined();
+			expect(helpers.getPath(permissions, 'viewer.constructor')).toBeUndefined();
+			expect(helpers.getPath(permissions, 'viewer.constructor', false)).toBe(false);
+			expect(helpers.getPath({} as any, 'constructor.constructor')).toBeUndefined();
+			expect(helpers.getPath({} as any, '__proto__')).toBeUndefined();
+			expect(helpers.getPath({} as any, 'toString', 'x')).toBe('x');
+			expect(helpers.getPath({ a: {} } as any, 'a.hasOwnProperty', 'x')).toBe('x');
+			expect(helpers.getPath({ fn: function () {} } as any, 'fn.prototype')).toBeUndefined();
+			expect(helpers.getPath({ list: [1] } as any, 'list.constructor')).toBeUndefined();
 			// Even own data keys with those names never resolve.
-			expect(helpers.getFromObjectByKeys(JSON.parse('{"__proto__":{"x":1},"constructor":2,"prototype":3}'), '__proto__.x')).toBeUndefined();
-			expect(helpers.getFromObjectByKeys(JSON.parse('{"constructor":2}'), 'constructor', 0)).toBe(0);
-			expect(helpers.getFromObjectByKeys(JSON.parse('{"prototype":3}'), 'prototype', 0)).toBe(0);
+			expect(helpers.getPath(JSON.parse('{"__proto__":{"x":1},"constructor":2,"prototype":3}'), '__proto__.x')).toBeUndefined();
+			expect(helpers.getPath(JSON.parse('{"constructor":2}'), 'constructor', 0)).toBe(0);
+			expect(helpers.getPath(JSON.parse('{"prototype":3}'), 'prototype', 0)).toBe(0);
 		});
 
-		it('getFromObjectByKeys keeps own shadows of Object.prototype names, other inherited properties and primitive properties', function () {
-			expect(helpers.getFromObjectByKeys({ toString: 'own' } as any, 'toString')).toBe('own');
-			expect(helpers.getFromObjectByKeys({ user: new Person() } as any, 'user.fullName')).toBe('Ada Lovelace');
-			expect(helpers.getFromObjectByKeys({ a: Object.create({ inherited: 1 }) } as any, 'a.inherited')).toBe(1);
-			expect(helpers.getFromObjectByKeys({ name: 'abc' } as any, 'name.length')).toBe(3);
-			expect(helpers.getFromObjectByKeys({ name: 'abc' } as any, 'name.1')).toBe('b');
-			expect(helpers.getFromObjectByKeys({ list: [1, 2] } as any, 'list.length')).toBe(2);
+		it('getPath keeps own shadows of Object.prototype names, other inherited properties and primitive properties', function () {
+			expect(helpers.getPath({ toString: 'own' } as any, 'toString')).toBe('own');
+			expect(helpers.getPath({ user: new Person() } as any, 'user.fullName')).toBe('Ada Lovelace');
+			expect(helpers.getPath({ a: Object.create({ inherited: 1 }) } as any, 'a.inherited')).toBe(1);
+			expect(helpers.getPath({ name: 'abc' } as any, 'name.length')).toBe(3);
+			expect(helpers.getPath({ name: 'abc' } as any, 'name.1')).toBe('b');
+			expect(helpers.getPath({ list: [1, 2] } as any, 'list.length')).toBe(2);
 			// A method a class (or a built-in prototype other than Object.prototype) defines is not an Object.prototype member.
 			class Custom {
 				/**
@@ -1821,23 +1821,23 @@ describe('Objects helpers', function () {
 					return 'custom';
 				}
 			}
-			expect((helpers.getFromObjectByKeys({ c: new Custom() } as any, 'c.toString') as () => string).call(new Custom())).toBe('custom');
-			expect(helpers.getFromObjectByKeys({ list: [] } as any, 'list.toString')).toBe(Array.prototype.toString);
-			expect(helpers.getFromObjectByKeys({ name: 'abc' } as any, 'name.toString')).toBe(String.prototype.toString);
-			expect(helpers.getFromObjectByKeys({ n: 1 } as any, 'n.hasOwnProperty')).toBeUndefined();
-			expect(helpers.getFromObjectByKeys({ bare: Object.create(null) } as any, 'bare.toString', 'x')).toBe('x');
+			expect((helpers.getPath({ c: new Custom() } as any, 'c.toString') as () => string).call(new Custom())).toBe('custom');
+			expect(helpers.getPath({ list: [] } as any, 'list.toString')).toBe(Array.prototype.toString);
+			expect(helpers.getPath({ name: 'abc' } as any, 'name.toString')).toBe(String.prototype.toString);
+			expect(helpers.getPath({ n: 1 } as any, 'n.hasOwnProperty')).toBeUndefined();
+			expect(helpers.getPath({ bare: Object.create(null) } as any, 'bare.toString', 'x')).toBe('x');
 		});
 
-		it('getFromObjectByKeys does not see properties added to Object.prototype (pollution gadgets)', function () {
+		it('getPath does not see properties added to Object.prototype (pollution gadgets)', function () {
 			(Object.prototype as any).isAdmin = true;
 			try {
-				expect(helpers.getFromObjectByKeys({ user: {} } as any, 'user.isAdmin', false)).toBe(false);
-				expect(helpers.hasInObjectByKeys({ user: {} }, 'user.isAdmin')).toBe(false);
+				expect(helpers.getPath({ user: {} } as any, 'user.isAdmin', false)).toBe(false);
+				expect(helpers.hasPath({ user: {} }, 'user.isAdmin')).toBe(false);
 				expect(helpers.getProperty({} as any, 'isAdmin')).toBeUndefined();
 				expect(helpers.pick({} as any, ['isAdmin'])).toStrictEqual({});
-				expect(helpers.getFromObjectByKeys({ user: { isAdmin: false } } as any, 'user.isAdmin')).toBe(false);
+				expect(helpers.getPath({ user: { isAdmin: false } } as any, 'user.isAdmin')).toBe(false);
 				// A property an intermediate prototype defines (even with the same value) still resolves.
-				expect(helpers.getFromObjectByKeys({ user: Object.create({ isAdmin: true }) } as any, 'user.isAdmin')).toBe(true);
+				expect(helpers.getPath({ user: Object.create({ isAdmin: true }) } as any, 'user.isAdmin')).toBe(true);
 			} finally {
 				delete (Object.prototype as any).isAdmin;
 			}
@@ -1855,7 +1855,7 @@ describe('Objects helpers', function () {
 			expect(helpers.getProperty({ [sym]: 1 }, sym)).toBe(1);
 		});
 
-		it('hasInObjectByKeys agrees with getFromObjectByKeys', function () {
+		it('hasPath agrees with getPath', function () {
 			const target: any = { viewer: { read: true, none: undefined }, user: new Person(), name: 'abc', fn: function () {}, a: Object.create({ inherited: 1 }) };
 			const paths = [
 				'viewer.constructor',
@@ -1880,12 +1880,12 @@ describe('Objects helpers', function () {
 			const missing = Symbol('missing');
 			for (const path of paths) {
 				// `true` exactly when the path resolves: to a defined value (not the default), or to a property holding `undefined`.
-				const value = helpers.getFromObjectByKeys(target, path as any, missing);
-				expect([path, helpers.hasInObjectByKeys(target, path)]).toStrictEqual([path, value !== missing || path === 'viewer.none']);
+				const value = helpers.getPath(target, path as any, missing);
+				expect([path, helpers.hasPath(target, path)]).toStrictEqual([path, value !== missing || path === 'viewer.none']);
 			}
 			expect(
 				paths.map(function (path) {
-					return helpers.hasInObjectByKeys(target, path);
+					return helpers.hasPath(target, path);
 				})
 			).toStrictEqual([false, false, false, false, true, true, false, true, true, true, true, false, true, false, false, true, true, false]);
 		});
@@ -1899,7 +1899,7 @@ describe('Objects helpers', function () {
 			expect(helpers.pick(function named() {} as any, ['prototype', 'name'])).toStrictEqual({ name: 'named' });
 		});
 
-		it('deleteFromObjectByKeys rejects __proto__/constructor/prototype and empty segments', function () {
+		it('deletePath rejects __proto__/constructor/prototype and empty segments', function () {
 			class Service {
 				/**
 				 * A method every instance shares.
@@ -1910,26 +1910,26 @@ describe('Objects helpers', function () {
 				}
 			}
 			expect(function () {
-				helpers.deleteFromObjectByKeys({ C: Service }, 'C.prototype.run');
-			}).toThrow(new RangeError('deleteFromObjectByKeys: `path` must not contain the unsafe segment "prototype", got "C.prototype.run"'));
+				helpers.deletePath({ C: Service }, 'C.prototype.run');
+			}).toThrow(new RangeError('deletePath: `path` must not contain the unsafe segment "prototype", got "C.prototype.run"'));
 			expect(typeof Service.prototype.run).toBe('function');
 			for (const path of ['__proto__.toString', 'a.constructor', 'constructor']) {
 				expect(function () {
-					helpers.deleteFromObjectByKeys({ a: {} }, path);
+					helpers.deletePath({ a: {} }, path);
 				}).toThrow(RangeError);
 			}
 			expect(function () {
-				helpers.deleteFromObjectByKeys({ a: {} }, 'a..b');
-			}).toThrow(new RangeError('deleteFromObjectByKeys: `path` must not contain empty segments, got "a..b"'));
+				helpers.deletePath({ a: {} }, 'a..b');
+			}).toThrow(new RangeError('deletePath: `path` must not contain empty segments, got "a..b"'));
 			expect(typeof Object.prototype.toString).toBe('function');
 		});
 
-		it('hasInObjectByKeys returns false for unsafe segments', function () {
+		it('hasPath returns false for unsafe segments', function () {
 			class C {}
-			expect(helpers.hasInObjectByKeys({ C }, 'C.prototype.constructor')).toBe(false);
-			expect(helpers.hasInObjectByKeys({ C }, 'C.prototype')).toBe(false);
-			expect(helpers.hasInObjectByKeys({}, 'constructor')).toBe(false);
-			expect(helpers.hasInObjectByKeys(JSON.parse('{"__proto__":1}'), '__proto__')).toBe(false);
+			expect(helpers.hasPath({ C }, 'C.prototype.constructor')).toBe(false);
+			expect(helpers.hasPath({ C }, 'C.prototype')).toBe(false);
+			expect(helpers.hasPath({}, 'constructor')).toBe(false);
+			expect(helpers.hasPath(JSON.parse('{"__proto__":1}'), '__proto__')).toBe(false);
 		});
 
 		it('unflattenObject does not build huge sparse arrays (arrayLimit, default 1000)', function () {
@@ -1967,13 +1967,13 @@ describe('Objects helpers', function () {
 			}).toThrow(new TypeError('unflattenObject: `arrayLimit` must be an integer >= 0 or Infinity, got string'));
 		});
 
-		it('setInObjectByKeys creates a plain object instead of a huge array, but writes into existing arrays', function () {
-			const target: any = helpers.setInObjectByKeys({}, 'a.4294967294', 1);
+		it('setPath creates a plain object instead of a huge array, but writes into existing arrays', function () {
+			const target: any = helpers.setPath({}, 'a.4294967294', 1);
 			expect(target).toStrictEqual({ a: { 4294967294: 1 } });
-			expect(helpers.setInObjectByKeys({}, 'a.1001.b', 1)).toStrictEqual({ a: { 1001: { b: 1 } } });
-			expect(Array.isArray((helpers.setInObjectByKeys({}, 'a.1000', 1) as any).a)).toBe(true);
+			expect(helpers.setPath({}, 'a.1001.b', 1)).toStrictEqual({ a: { 1001: { b: 1 } } });
+			expect(Array.isArray((helpers.setPath({}, 'a.1000', 1) as any).a)).toBe(true);
 			const existing: any = { list: [] };
-			helpers.setInObjectByKeys(existing, 'list.5000', 1);
+			helpers.setPath(existing, 'list.5000', 1);
 			expect(existing.list).toHaveLength(5001);
 		});
 
@@ -2281,11 +2281,11 @@ describe('Objects helpers (round 11)', function () {
 		});
 	});
 
-	describe('updateInObjectByKeys', function () {
+	describe('updatePath', function () {
 		const state = { user: { name: 'Ada', visits: 1 }, todos: [{ done: false }, { done: true }], other: { x: 1 } };
 
 		it('replaces the value at the path with structural sharing', function () {
-			const next = helpers.updateInObjectByKeys(state, 'todos.0.done', true);
+			const next = helpers.updatePath(state, 'todos.0.done', true);
 			expect(next).toStrictEqual({ user: { name: 'Ada', visits: 1 }, todos: [{ done: true }, { done: true }], other: { x: 1 } });
 			expect(state.todos[0].done).toBe(false);
 			expect(next).not.toBe(state);
@@ -2297,86 +2297,86 @@ describe('Objects helpers (round 11)', function () {
 		});
 
 		it('applies an updater to the current value', function () {
-			const next = helpers.updateInObjectByKeys(state, 'user.visits', function (visits) {
+			const next = helpers.updatePath(state, 'user.visits', function (visits) {
 				return visits + 1;
 			});
 			expect(next.user.visits).toBe(2);
 			expect(state.user.visits).toBe(1);
-			const missing = helpers.updateInObjectByKeys({} as Record<string, unknown>, 'a.b', function (current: unknown) {
+			const missing = helpers.updatePath({} as Record<string, unknown>, 'a.b', function (current: unknown) {
 				return current === undefined ? 'created' : 'existing';
 			});
 			expect(missing).toStrictEqual({ a: { b: 'created' } });
 		});
 
 		it('returns the same object when the value does not change', function () {
-			expect(helpers.updateInObjectByKeys(state, 'user.name', 'Ada')).toBe(state);
-			expect(helpers.updateInObjectByKeys({ a: NaN }, 'a', NaN)).toStrictEqual({ a: NaN });
+			expect(helpers.updatePath(state, 'user.name', 'Ada')).toBe(state);
+			expect(helpers.updatePath({ a: NaN }, 'a', NaN)).toStrictEqual({ a: NaN });
 			const zero = { a: 0 };
-			expect(helpers.updateInObjectByKeys(zero, 'a', -0)).not.toBe(zero);
+			expect(helpers.updatePath(zero, 'a', -0)).not.toBe(zero);
 			const absent = {} as { a?: undefined };
-			expect(helpers.updateInObjectByKeys(absent, 'a', undefined)).not.toBe(absent);
+			expect(helpers.updatePath(absent, 'a', undefined)).not.toBe(absent);
 		});
 
-		it('creates missing containers like setInObjectByKeys and shadows inherited values', function () {
-			expect(helpers.updateInObjectByKeys({} as any, 'a.list.0.id', 7)).toStrictEqual({ a: { list: [{ id: 7 }] } });
-			expect(helpers.updateInObjectByKeys({} as any, 'a.5000', 1)).toStrictEqual({ a: { 5000: 1 } });
-			expect(helpers.updateInObjectByKeys({ a: null } as any, 'a.b', 1)).toStrictEqual({ a: { b: 1 } });
-			const result = helpers.updateInObjectByKeys({} as any, 'toString.x', 1);
+		it('creates missing containers like setPath and shadows inherited values', function () {
+			expect(helpers.updatePath({} as any, 'a.list.0.id', 7)).toStrictEqual({ a: { list: [{ id: 7 }] } });
+			expect(helpers.updatePath({} as any, 'a.5000', 1)).toStrictEqual({ a: { 5000: 1 } });
+			expect(helpers.updatePath({ a: null } as any, 'a.b', 1)).toStrictEqual({ a: { b: 1 } });
+			const result = helpers.updatePath({} as any, 'toString.x', 1);
 			expect(result).toStrictEqual({ toString: { x: 1 } });
 			expect(typeof Object.prototype.toString).toBe('function');
 		});
 
 		it('keeps prototypes of copied plain objects and arrays', function () {
 			const target = Object.assign(Object.create(null), { a: [1, 2] });
-			const next = helpers.updateInObjectByKeys(target, 'a.1', 3);
+			const next = helpers.updatePath(target, 'a.1', 3);
 			expect(Object.getPrototypeOf(next)).toBeNull();
 			expect(next.a).toStrictEqual([1, 3]);
-			expect(helpers.updateInObjectByKeys([1, [2]], '1.0', 9)).toStrictEqual([1, [9]]);
+			expect(helpers.updatePath([1, [2]], '1.0', 9)).toStrictEqual([1, [9]]);
 		});
 
 		it('throws on paths through primitives or non-plain objects, and on bad roots', function () {
 			expect(function () {
-				helpers.updateInObjectByKeys({ a: 1 } as any, 'a.b', 2);
-			}).toThrow(new TypeError('updateInObjectByKeys: cannot update "a.b": "a" is a number'));
+				helpers.updatePath({ a: 1 } as any, 'a.b', 2);
+			}).toThrow(new TypeError('updatePath: cannot update "a.b": "a" is a number'));
 			expect(function () {
-				helpers.updateInObjectByKeys({ a: { d: new Date(0) } } as any, 'a.d.x', 2);
-			}).toThrow(new TypeError('updateInObjectByKeys: cannot update "a.d.x": "a.d" is an object that is neither a plain object nor an array'));
+				helpers.updatePath({ a: { d: new Date(0) } } as any, 'a.d.x', 2);
+			}).toThrow(new TypeError('updatePath: cannot update "a.d.x": "a.d" is an object that is neither a plain object nor an array'));
 			expect(function () {
-				helpers.updateInObjectByKeys({ f: function () {} } as any, 'f.x', 2);
+				helpers.updatePath({ f: function () {} } as any, 'f.x', 2);
 			}).toThrow(TypeError);
 			expect(function () {
-				helpers.updateInObjectByKeys(new Map() as any, 'a', 1);
-			}).toThrow(new TypeError('updateInObjectByKeys: `target` must be a plain object or an array, got object'));
+				helpers.updatePath(new Map() as any, 'a', 1);
+			}).toThrow(new TypeError('updatePath: `target` must be a plain object or an array, got object'));
 		});
 
 		it('rejects unsafe and empty segments without pollution', function () {
 			for (const path of ['__proto__.x', 'constructor.prototype.x', 'a.prototype', 'a..b', '']) {
 				expect(function () {
-					helpers.updateInObjectByKeys(hostile(), path, 1);
+					helpers.updatePath(hostile(), path, 1);
 				}).toThrow(RangeError);
 			}
-			const result = helpers.updateInObjectByKeys(hostile(), 'safe', 1);
+			const result = helpers.updatePath(hostile(), 'safe', 1);
 			expect(Object.keys(result)).toStrictEqual(['__proto__', 'constructor', 'safe']);
 			expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
 			expectNoPollution();
 		});
 
 		it('is typed from the path', function () {
-			const next = helpers.updateInObjectByKeys(state, 'user.visits', function (visits) {
+			const next = helpers.updatePath(state, 'user.visits', function (visits) {
 				assertType<Equals<typeof visits, number>>(true);
 				return visits + 1;
 			});
 			assertType<Equals<typeof next, typeof state>>(true);
 			// @ts-expect-error the value must match the type at the path
-			helpers.updateInObjectByKeys(state, 'user.name', 1);
-			helpers.updateInObjectByKeys(state as Record<string, unknown>, 'anything.goes', 1);
+			helpers.updatePath(state, 'user.name', 1);
+			helpers.updatePath(state as Record<string, unknown>, 'anything.goes', 1);
 		});
 	});
 
-	describe('omitInObjectByKeys', function () {
+	describe('omitPath', function () {
 		it('removes the own property at the path with structural sharing', function () {
 			const config = { a: { b: 1, c: 2 }, d: { e: 3 } };
-			const next = helpers.omitInObjectByKeys(config, 'a.b');
+			const next = helpers.omitPath(config, 'a.b');
 			expect(next).toStrictEqual({ a: { c: 2 }, d: { e: 3 } });
 			expect(config.a).toStrictEqual({ b: 1, c: 2 });
 			expect(next.d).toBe(config.d);
@@ -2384,34 +2384,34 @@ describe('Objects helpers (round 11)', function () {
 		});
 
 		it('leaves a hole in arrays', function () {
-			const next = helpers.omitInObjectByKeys({ list: [1, 2, 3] }, 'list.1');
+			const next = helpers.omitPath({ list: [1, 2, 3] }, 'list.1');
 			expect(next.list.length).toBe(3);
 			expect(1 in next.list).toBe(false);
 			assertType<Equals<typeof next, { list: Array<number | undefined> }>>(true);
-			const nested = helpers.omitInObjectByKeys({ list: [{ a: 1, b: 2 }] }, 'list.0.a');
+			const nested = helpers.omitPath({ list: [{ a: 1, b: 2 }] }, 'list.0.a');
 			expect(nested).toStrictEqual({ list: [{ b: 2 }] });
 			assertType<Equals<typeof nested, { list: Array<{ a: number; b: number } | { b: number }> }>>(true);
 		});
 
 		it('returns the target itself when the path does not exist', function () {
 			const target = { a: { b: 1 }, s: 'str', n: null };
-			expect(helpers.omitInObjectByKeys(target, 'a.x' as never)).toBe(target);
-			expect(helpers.omitInObjectByKeys(target, 'x.y' as never)).toBe(target);
-			expect(helpers.omitInObjectByKeys(target, 's.length' as never)).toBe(target);
-			expect(helpers.omitInObjectByKeys(target, 'n.x' as never)).toBe(target);
+			expect(helpers.omitPath(target, 'a.x' as never)).toBe(target);
+			expect(helpers.omitPath(target, 'x.y' as never)).toBe(target);
+			expect(helpers.omitPath(target, 's.length' as never)).toBe(target);
+			expect(helpers.omitPath(target, 'n.x' as never)).toBe(target);
 			const empty = {};
-			expect(helpers.omitInObjectByKeys(empty, 'toString' as never)).toBe(empty);
+			expect(helpers.omitPath(empty, 'toString' as never)).toBe(empty);
 		});
 
 		it('throws through non-plain objects, and rejects unsafe segments without pollution', function () {
 			expect(function () {
-				helpers.omitInObjectByKeys({ m: new Map() } as any, 'm.size');
-			}).toThrow(new TypeError('omitInObjectByKeys: cannot update "m.size": "m" is an object that is neither a plain object nor an array'));
+				helpers.omitPath({ m: new Map() } as any, 'm.size');
+			}).toThrow(new TypeError('omitPath: cannot update "m.size": "m" is an object that is neither a plain object nor an array'));
 			expect(function () {
-				helpers.omitInObjectByKeys(hostile(), '__proto__.x');
-			}).toThrow(new RangeError('omitInObjectByKeys: `path` must not contain the unsafe segment "__proto__", got "__proto__.x"'));
+				helpers.omitPath(hostile(), '__proto__.x');
+			}).toThrow(new RangeError('omitPath: `path` must not contain the unsafe segment "__proto__", got "__proto__.x"'));
 			expect(function () {
-				helpers.omitInObjectByKeys(1 as any, 'a');
+				helpers.omitPath(1 as any, 'a');
 			}).toThrow(TypeError);
 			expectNoPollution();
 		});

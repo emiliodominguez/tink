@@ -62,7 +62,7 @@ match(shape, 'kind', {
 These integration snippets use application-provided values such as `user`, `defaults`, `userInput`, `url`, `urls`, `input`, `fetchPage` and `persist`.
 
 ```ts
-import { getFromObjectByKeys, deepMerge } from 'tinkit/objects';
+import { getPath, deepMerge } from 'tinkit/objects';
 import { isDefined } from 'tinkit/guards';
 import { retry, withTimeout, mapWithConcurrency } from 'tinkit/async';
 import { debounce } from 'tinkit/functions';
@@ -73,7 +73,7 @@ import { compareSemver, isEmail } from 'tinkit/validate';
 import { withQuery } from 'tinkit/url';
 
 // Type-safe deep access: the return type is inferred from the path.
-const city = getFromObjectByKeys(user, 'address.city', 'Unknown'); // string
+const city = getPath(user, 'address.city', 'Unknown'); // string
 
 // Narrowing filters.
 const ids = [1, null, 2, undefined].filter(isDefined); // number[]

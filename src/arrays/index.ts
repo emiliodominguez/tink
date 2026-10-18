@@ -158,9 +158,9 @@ export function flattenDeep<T>(array: ReadonlyArray<T>): Array<FlatDeep<T>> {
  * @param {Iterable<T>} iterable - The iterable to be processed
  * @returns {T[]} A new array with duplicates removed, in first-appearance order
  * @example
- * removeDuplicates([1, 2, 2, 3, 1]); // => [1, 2, 3]
+ * unique([1, 2, 2, 3, 1]); // => [1, 2, 3]
  */
-export function removeDuplicates<T>(iterable: Iterable<T>): T[] {
+export function unique<T>(iterable: Iterable<T>): T[] {
 	const values: ReadonlyArray<T> = Array.isArray(iterable) ? iterable : Array.from(iterable);
 	if (values.length <= 32) {
 		// Short inputs: scanning the result (`includes` is SameValueZero, and keeps the first zero as is) beats building a Set.
@@ -200,7 +200,7 @@ function areShortArrays<T>(a: Iterable<unknown>, b: Iterable<T>): b is ReadonlyA
  */
 export function union<T>(a: Iterable<T>, b: Iterable<T>): T[] {
 	// `concat` joins two arrays faster than spreading them.
-	return removeDuplicates(Array.isArray(a) && Array.isArray(b) ? a.concat(b) : [...a, ...b]);
+	return unique(Array.isArray(a) && Array.isArray(b) ? a.concat(b) : [...a, ...b]);
 }
 
 /**
@@ -1702,7 +1702,7 @@ function keepDistinct<T>(items: Iterable<T>, equals: (x: T, y: T) => boolean, re
 }
 
 /**
- * Remove the items `equals` to an earlier item, keeping the first occurrence: {@link removeDuplicates} with a custom equality, for
+ * Remove the items `equals` to an earlier item, keeping the first occurrence: {@link unique} with a custom equality, for
  * values that have no identity key (e.g. points within a tolerance). It compares every pair, in O(n²): when a key exists, prefer
  * {@link uniqueBy}, which is O(n).
  * @template T

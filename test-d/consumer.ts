@@ -1,6 +1,6 @@
 // Compiled against the BUILT declarations by scripts/check-types.mjs: proves the published .d.ts files are valid for a
 // consumer with no DOM or Node types (skipLibCheck off), resolve through the exports map, and stay cheap to type-check.
-import { getFromObjectByKeys, setInObjectByKeys, deepMerge, merge, pick, omit } from 'tinkit/objects';
+import { getPath, setPath, deepMerge, merge, pick, omit } from 'tinkit/objects';
 import { curry, pipe, compose } from 'tinkit/functions';
 import type { NestedKeyOf, PathValue } from 'tinkit/utils';
 import { isShape, isString, isInteger, isOptional, isArrayOf, isUnion, isNullable, isTuple, toStandardSchema } from 'tinkit/guards';
@@ -38,9 +38,9 @@ interface Org {
 }
 
 declare const org: Org;
-const a = getFromObjectByKeys(org, 'owner.address.geo.meta.source');
-const b = getFromObjectByKeys(org, 'billing.invoices.0.lines.3.qty');
-const c = getFromObjectByKeys(org, 'members.2.posts.1.comments.0.author.address.city', 'n/a');
+const a = getPath(org, 'owner.address.geo.meta.source');
+const b = getPath(org, 'billing.invoices.0.lines.3.qty');
+const c = getPath(org, 'members.2.posts.1.comments.0.author.address.city', 'n/a');
 type K = NestedKeyOf<Org>;
 const keys: K[] = ['owner', 'billing.plan'];
 type V = PathValue<Org, 'owner.friends.0.posts.0.comments.0.author.name'>;
@@ -68,7 +68,7 @@ const f = pipe(
 const g = compose(String, function (x: number) {
 	return x * 2;
 });
-setInObjectByKeys(org, 'owner.name', 'Ada');
+setPath(org, 'owner.name', 'Ada');
 
 // Guards double as Standard Schema validators: assignable to the official spec type, with the inferred output.
 const isAccount = isShape({

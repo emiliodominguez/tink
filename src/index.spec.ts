@@ -11,7 +11,7 @@ import { createEmitter } from './emitter/index.js';
 import { debounce, memoize as memoizeFn } from './functions/index.js';
 import { isDefined } from './guards/index.js';
 import { count, filter, map, take, toArray } from './iterables/index.js';
-import { deepMerge, getFromObjectByKeys } from './objects/index.js';
+import { deepMerge, getPath } from './objects/index.js';
 import { createRandom } from './random/index.js';
 import { fuzzySearch, highlight } from './search/index.js';
 import { createStore } from './store/index.js';
@@ -70,7 +70,7 @@ describe('README examples', function () {
 
 		expect(Object.keys(deepMerge({ theme: 'light' }, JSON.parse('{"__proto__": {"isAdmin": true}}')))).toEqual(['theme']);
 		expect(({} as Record<string, unknown>).isAdmin).toBeUndefined();
-		expect(getFromObjectByKeys({ viewer: { read: true } }, 'viewer.constructor' as never, false)).toBe(false);
+		expect(getPath({ viewer: { read: true } }, 'viewer.constructor' as never, false)).toBe(false);
 		expect(root.url.sanitizeUrl(' JAVASCRIPT:alert(1)')).toBe('about:blank');
 		expect(root.url.isAbsoluteUrl('/\\evil.com')).toBe(true);
 
@@ -146,7 +146,7 @@ describe('README examples', function () {
 
 	it('should match the "A taste" section', async function () {
 		const user: { address: { city?: string } } = { address: {} };
-		const city: string = getFromObjectByKeys(user, 'address.city', 'Unknown');
+		const city: string = getPath(user, 'address.city', 'Unknown');
 		const ids: number[] = [1, null, 2, undefined].filter(isDefined);
 		const config = deepMerge({ theme: 'light', retries: 1 }, JSON.parse('{"__proto__": {"polluted": true}, "retries": 3}'));
 

@@ -7,7 +7,7 @@
 - 145: `=== DEEP_NESTING` → `!==` — same: the Set is created at the first level instead of the 64th, mirroring `parents` from then on.
 - 145: `=== DEEP_NESTING` → `false` — never switches to the Set: the list scan gives the same answers (quadratic only for > 64 levels).
 - 146: `deepParents === undefined ? parents.includes(value) : …` → `true ? …` — `parents` is always maintained, so scanning it answers the same as the mirror Set.
-- 163: removeDuplicates `values.length <= 32` → `true` — `includes` scan (SameValueZero, keeps the first zero as is) gives the same result as the Set path with its -0 fix-up; threshold only.
+- 163: unique `values.length <= 32` → `true` — `includes` scan (SameValueZero, keeps the first zero as is) gives the same result as the Set path with its -0 fix-up; threshold only.
 - 163: `<= 32` → `false` — Set path for short inputs: same result.
 - 163: `<= 32` → `< 32` — threshold shift: both paths agree at length 32.
 - 163: `<= 32` → `> 32` — swaps the two equivalent paths.

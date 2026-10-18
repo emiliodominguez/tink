@@ -5,7 +5,7 @@
 Key facts for code generation:
 - ESM only, zero dependencies, Node >= 20.19 or any modern browser/runtime. TypeScript types ship in the package.
 - Import from module entry points: `import { debounce } from 'tinkit/functions'` (the root entry exposes namespaces: `import { functions } from 'tinkit'`).
-- Helpers never mutate their inputs unless the name or docs say so (`setInObjectByKeys`, `deleteFromObjectByKeys`).
+- Helpers never mutate their inputs unless the name or docs say so (`setPath`, `deletePath`).
 - Invalid arguments throw `TypeError` (wrong type) or `RangeError` (invalid value) whose message names the function and the parameter (`fn: param must be …, got …`).
 - Randomised helpers take an optional `random` generator last; the default is `Math.random`. Pass `secureRandom` (random module) for tokens, OTPs and lotteries.
 - Type guards compose into validators: `isShape`, `isArrayOf`, `isUnion`, `isOptional`…; `explain` lists issues with paths, `ensure` throws a `ValidationError`, `toStandardSchema` adapts any guard for tRPC, TanStack Form, Hono and other Standard Schema consumers.

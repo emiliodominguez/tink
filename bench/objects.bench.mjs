@@ -3,10 +3,10 @@ import {
 	deepClone,
 	deepFreeze,
 	deepMerge,
-	deleteFromObjectByKeys,
+	deletePath,
 	flattenObject,
-	getFromObjectByKeys,
-	hasInObjectByKeys,
+	getPath,
+	hasPath,
 	invert,
 	isEmpty,
 	isEqual,
@@ -17,7 +17,7 @@ import {
 	omitBy,
 	pick,
 	pickBy,
-	setInObjectByKeys,
+	setPath,
 	defaults as tinkDefaults,
 	defaultsDeep,
 	deepMergeWith,
@@ -27,14 +27,14 @@ import {
 	isEqualWith,
 	isMatch,
 	mapEntries,
-	omitInObjectByKeys,
+	omitPath,
 	shallowEqual,
 	sortKeys,
 	stableStringify,
 	toCamelCaseKeys,
 	toPath,
 	toSnakeCaseKeys,
-	updateInObjectByKeys
+	updatePath
 } from 'tinkit/objects';
 import { defu } from 'defu';
 import * as toolkit from 'es-toolkit';
@@ -215,9 +215,9 @@ const round11 = [
 		}
 	),
 	compare(
-		'updateInObjectByKeys (depth 3, immutable)',
+		'updatePath (depth 3, immutable)',
 		function () {
-			return updateInObjectByKeys(appState, 'user.profile.visits', increment);
+			return updatePath(appState, 'user.profile.visits', increment);
 		},
 		{
 			remeda: function () {
@@ -229,9 +229,9 @@ const round11 = [
 		}
 	),
 	{
-		name: 'omitInObjectByKeys (depth 3, immutable)',
+		name: 'omitPath (depth 3, immutable)',
 		fn: function () {
-			return omitInObjectByKeys(appState, 'user.settings.theme');
+			return omitPath(appState, 'user.settings.theme');
 		}
 	},
 	compare(
@@ -784,9 +784,9 @@ export default [
 		}
 	),
 	compare(
-		'getFromObjectByKeys (1 segment)',
+		'getPath (1 segment)',
 		function () {
-			return getFromObjectByKeys(small, 'name');
+			return getPath(small, 'name');
 		},
 		{
 			'es-toolkit/compat': function () {
@@ -798,9 +798,9 @@ export default [
 		}
 	),
 	compare(
-		'getFromObjectByKeys (3 segments)',
+		'getPath (3 segments)',
 		function () {
-			return getFromObjectByKeys(config, 'server.tls.cert');
+			return getPath(config, 'server.tls.cert');
 		},
 		{
 			'es-toolkit/compat': function () {
@@ -812,9 +812,9 @@ export default [
 		}
 	),
 	compare(
-		'getFromObjectByKeys (array index)',
+		'getPath (array index)',
 		function () {
-			return getFromObjectByKeys(config, 'db.replicas.1.host');
+			return getPath(config, 'db.replicas.1.host');
 		},
 		{
 			'es-toolkit/compat': function () {
@@ -826,9 +826,9 @@ export default [
 		}
 	),
 	compare(
-		'setInObjectByKeys (existing path)',
+		'setPath (existing path)',
 		function () {
-			return setInObjectByKeys(small, 'meta.owner.id', 2);
+			return setPath(small, 'meta.owner.id', 2);
 		},
 		{
 			'es-toolkit/compat': function () {
@@ -840,9 +840,9 @@ export default [
 		}
 	),
 	compare(
-		'setInObjectByKeys (new path)',
+		'setPath (new path)',
 		function () {
-			return setInObjectByKeys({}, 'a.b.0.c', 1);
+			return setPath({}, 'a.b.0.c', 1);
 		},
 		{
 			'es-toolkit/compat': function () {
@@ -854,9 +854,9 @@ export default [
 		}
 	),
 	compare(
-		'hasInObjectByKeys (3 segments)',
+		'hasPath (3 segments)',
 		function () {
-			return hasInObjectByKeys(config, 'server.tls.cert');
+			return hasPath(config, 'server.tls.cert');
 		},
 		{
 			'es-toolkit/compat': function () {
@@ -868,10 +868,10 @@ export default [
 		}
 	),
 	compare(
-		'deleteFromObjectByKeys (fresh object)',
+		'deletePath (fresh object)',
 		function () {
 			const target = { a: { b: 1, c: 2 } };
-			deleteFromObjectByKeys(target, 'a.b');
+			deletePath(target, 'a.b');
 			return target;
 		},
 		{

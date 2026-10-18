@@ -243,8 +243,8 @@ function definePlain(object: object, key: PropertyKey, value: unknown): void {
 }
 
 /**
- * Whether reading `key` from `object` must NOT resolve, which is the read rule shared by {@link getFromObjectByKeys},
- * {@link getProperty}, {@link hasInObjectByKeys} and {@link pick}: `__proto__`, `constructor` and `prototype` never resolve (not even
+ * Whether reading `key` from `object` must NOT resolve, which is the read rule shared by {@link getPath},
+ * {@link getProperty}, {@link hasPath} and {@link pick}: `__proto__`, `constructor` and `prototype` never resolve (not even
  * as own data keys), and neither does a key that is not own and comes from `Object.prototype` (`toString`, `hasOwnProperty`... and
  * anything a pollution added there). Own properties and properties inherited from any other prototype (class getters, `Array` and
  * `String` methods, `Object.create(proto)` parents) are readable; so are primitives' own properties (a string's `length` and indices).
@@ -746,7 +746,7 @@ function parseWritablePath(caller: string, label: string, path: string, separato
 
 /**
  * Writes `value` at the (already validated) `segments` inside `target`, creating missing containers. Shared by
- * {@link setInObjectByKeys} and {@link unflattenObject}.
+ * {@link setPath} and {@link unflattenObject}.
  * Only OWN properties are traversed: an inherited value (e.g. `Object.prototype.toString`) is never written through; it is shadowed
  * by a new own container instead, so shared prototypes and built-ins cannot be modified.
  * @param {object} target - The object to modify
@@ -831,12 +831,12 @@ function assignPath(
  * @param {P} keys - The dot-separated path
  * @returns {PathValue<T, P>} The value found at the path (or `undefined`)
  * @example
- * getFromObjectByKeys({ a: { b: [{ id: 1 }] } }, 'a.b.0.id'); // => 1
- * getFromObjectByKeys({ a: {} as { x?: { y: number } } }, 'a.x.y'); // => undefined
- * getFromObjectByKeys({ name: 'Ada' }, 'name.length'); // => 3
- * getFromObjectByKeys({ viewer: { read: true } } as Record<string, object>, 'viewer.constructor' as never, false); // => false
+ * getPath({ a: { b: [{ id: 1 }] } }, 'a.b.0.id'); // => 1
+ * getPath({ a: {} as { x?: { y: number } } }, 'a.x.y'); // => undefined
+ * getPath({ name: 'Ada' }, 'name.length'); // => 3
+ * getPath({ viewer: { read: true } } as Record<string, object>, 'viewer.constructor' as never, false); // => false
  */
-export function getFromObjectByKeys<T extends object, P extends NestedKeyOf<T>>(target: T, keys: P): PathValue<T, P>;
+export function getPath<T extends object, P extends NestedKeyOf<T>>(target: T, keys: P): PathValue<T, P>;
 /**
  * Safely reads a nested value through a dot-separated path, returning `defaultValue` when the resolved value is `undefined`.
  * @template T - The object type
@@ -847,17 +847,17 @@ export function getFromObjectByKeys<T extends object, P extends NestedKeyOf<T>>(
  * @param {D} defaultValue - The value returned when the path resolves to `undefined`
  * @returns {Exclude<PathValue<T, P>, undefined> | D} The value found at the path, or `defaultValue`
  * @example
- * getFromObjectByKeys({ a: {} as { x?: number } }, 'a.x', 0); // => 0
+ * getPath({ a: {} as { x?: number } }, 'a.x', 0); // => 0
  */
-export function getFromObjectByKeys<T extends object, P extends NestedKeyOf<T>, D>(target: T, keys: P, defaultValue: D): Exclude<PathValue<T, P>, undefined> | D;
+export function getPath<T extends object, P extends NestedKeyOf<T>, D>(target: T, keys: P, defaultValue: D): Exclude<PathValue<T, P>, undefined> | D;
 /**
- * Implementation of {@link getFromObjectByKeys}.
+ * Implementation of {@link getPath}.
  * @param {object} target - The object to read from
  * @param {string} keys - The dot-separated path
  * @param {unknown} [defaultValue] - The fallback value
  * @returns {unknown} The resolved value
  */
-export function getFromObjectByKeys(target: object, keys: string, defaultValue?: unknown): unknown {
+export function getPath(target: object, keys: string, defaultValue?: unknown): unknown {
 	let current: unknown = target;
 	// A single segment (the most common path) is read directly, without splitting.
 	if (keys.indexOf('.') === -1) current = current == null ? undefined : readKey(current, keys);
@@ -886,11 +886,11 @@ export function getFromObjectByKeys(target: object, keys: string, defaultValue?:
  * @throws {RangeError} when a segment is `__proto__`, `constructor` or `prototype` (prototype pollution guard)
  * @throws {TypeError} when an existing intermediate value is a primitive (it would have to be overwritten)
  * @example
- * setInObjectByKeys({}, 'a.list.0.id', 7); // => { a: { list: [{ id: 7 }] } }
- * setInObjectByKeys({}, 'a.5000', 1); // => { a: { 5000: 1 } }
+ * setPath({}, 'a.list.0.id', 7); // => { a: { list: [{ id: 7 }] } }
+ * setPath({}, 'a.5000', 1); // => { a: { 5000: 1 } }
  */
-export function setInObjectByKeys<T extends object>(target: T, path: string, value: unknown): T {
-	assignPath(target, parseWritablePath('setInObjectByKeys', '`path`', path, '.'), value, path, '.', 'setInObjectByKeys', ARRAY_LIMIT);
+export function setPath<T extends object>(target: T, path: string, value: unknown): T {
+	assignPath(target, parseWritablePath('setPath', '`path`', path, '.'), value, path, '.', 'setPath', ARRAY_LIMIT);
 	return target;
 }
 
@@ -901,7 +901,7 @@ export function setInObjectByKeys<T extends object>(target: T, path: string, val
 export type PathUpdateValue<T, P extends string> = [P] extends [NestedKeyOf<T>] ? ([PathValue<T, P>] extends [undefined] ? unknown : PathValue<T, P>) : unknown;
 
 /**
- * The type produced by {@link omitInObjectByKeys}: `T` without the property at the dot-separated path `P` (an array element becomes a
+ * The type produced by {@link omitPath}: `T` without the property at the dot-separated path `P` (an array element becomes a
  * hole, so the item type gains `undefined`; a nested path makes the items of an array `Item | ItemWithoutIt`).
  * @example
  * type O = OmitAtPath<{ a: { b: number; c: string } }, 'a.b'>; // { a: { c: string } }
@@ -932,7 +932,7 @@ function copyContainer(container: object): object {
 }
 
 /**
- * Copies a container (plain object or array) on the path of {@link updateInObjectByKeys}/{@link omitInObjectByKeys} with `key` set to
+ * Copies a container (plain object or array) on the path of {@link updatePath}/{@link omitPath} with `key` set to
  * `value` (or deleted, when `remove` is set).
  * @param {object} container - The plain object or array to copy
  * @param {string} key - The key to change
@@ -948,7 +948,7 @@ function withKey(container: object, key: string, value: unknown, remove: boolean
 }
 
 /**
- * Recursive worker of {@link updateInObjectByKeys} and {@link omitInObjectByKeys}: rebuilds the containers on the path, sharing
+ * Recursive worker of {@link updatePath} and {@link omitPath}: rebuilds the containers on the path, sharing
  * everything else, and returns `node` itself when nothing changes.
  * @param {string} caller - Name of the public function, for error messages
  * @param {string} path - The original path, for error messages
@@ -974,7 +974,7 @@ function rewritePath(caller: string, path: string, node: object, segments: Reado
 	let child: object;
 	if (isContainer(current)) child = current;
 	else if (current == null || (update === undefined && !isObject(current) && !isFunction(current))) {
-		// Nothing to delete below a missing or primitive value; a missing container is created for an update (see `setInObjectByKeys`).
+		// Nothing to delete below a missing or primitive value; a missing container is created for an update (see `setPath`).
 		if (update === undefined) return node;
 		const nextIndex = parseIndex(segments[index + 1]);
 		child = nextIndex !== -1 && nextIndex <= ARRAY_LIMIT ? [] : {};
@@ -988,7 +988,7 @@ function rewritePath(caller: string, path: string, node: object, segments: Reado
 }
 
 /**
- * Validates the arguments of {@link updateInObjectByKeys}/{@link omitInObjectByKeys} and runs {@link rewritePath}.
+ * Validates the arguments of {@link updatePath}/{@link omitPath} and runs {@link rewritePath}.
  * @param {string} caller - Name of the public function
  * @param {unknown} target - The root
  * @param {string} path - The dot-separated path
@@ -1003,15 +1003,15 @@ function rewriteRoot(caller: string, target: unknown, path: string, update: ((cu
 }
 
 /**
- * IMMUTABLE counterpart of {@link setInObjectByKeys}: returns a NEW root in which the value at the dot-separated path is replaced by
+ * IMMUTABLE counterpart of {@link setPath}: returns a NEW root in which the value at the dot-separated path is replaced by
  * `valueOrUpdater` (or, when it is a function, by `valueOrUpdater(currentValue)`). Inputs are never mutated: only the plain objects and
  * arrays ON THE PATH are copied (keeping their prototype, arrays stay arrays); everything else is shared with the input (structural
  * sharing). When the new value is `Object.is`-equal to the current own value, `target` itself is returned (handy for memoized UIs).
- * - Same path rules as {@link setInObjectByKeys}: `__proto__`, `constructor`, `prototype` and empty segments are rejected; only own
+ * - Same path rules as {@link setPath}: `__proto__`, `constructor`, `prototype` and empty segments are rejected; only own
  *   properties are followed; a missing (or `null`/`undefined`) intermediate is created as an array when the next segment is a canonical
  *   index up to 1000, as a plain object otherwise.
  * - Containers that cannot be copied faithfully (class instances, maps, dates...) are not traversed: a `TypeError` is thrown.
- * - To store a function, wrap it: `updateInObjectByKeys(o, 'onClick', function () { return handler; })`.
+ * - To store a function, wrap it: `updatePath(o, 'onClick', function () { return handler; })`.
  * @template T - The object type
  * @template P - The path
  * @param {T} target - The root (a plain object or an array)
@@ -1023,14 +1023,14 @@ function rewriteRoot(caller: string, target: unknown, path: string, update: ((cu
  * @throws {TypeError} when an intermediate value is a primitive or an object that is neither a plain object nor an array
  * @example
  * const state = { user: { name: 'Ada', visits: 1 }, todos: [{ done: false }] };
- * const next = updateInObjectByKeys(state, 'user.visits', function (n) { return n + 1; });
+ * const next = updatePath(state, 'user.visits', function (n) { return n + 1; });
  * next; // => { user: { name: 'Ada', visits: 2 }, todos: [{ done: false }] }
  * state.user.visits; // => 1
  * next.todos === state.todos; // => true
- * updateInObjectByKeys(state, 'user.name', 'Ada') === state; // => true
- * updateInObjectByKeys({}, 'a.list.0', 'x' as never); // => { a: { list: ['x'] } }
+ * updatePath(state, 'user.name', 'Ada') === state; // => true
+ * updatePath({}, 'a.list.0', 'x' as never); // => { a: { list: ['x'] } }
  */
-export function updateInObjectByKeys<T extends object, P extends string>(
+export function updatePath<T extends object, P extends string>(
 	target: T,
 	path: P,
 	valueOrUpdater: PathUpdateValue<T, P> | ((current: PathUpdateValue<T, P>) => PathUpdateValue<T, P>)
@@ -1041,14 +1041,14 @@ export function updateInObjectByKeys<T extends object, P extends string>(
 			: function (): unknown {
 					return valueOrUpdater;
 				};
-	return rewriteRoot('updateInObjectByKeys', target, path, update) as T;
+	return rewriteRoot('updatePath', target, path, update) as T;
 }
 
 /**
- * IMMUTABLE counterpart of {@link deleteFromObjectByKeys}: returns a NEW root without the own property at the dot-separated path,
+ * IMMUTABLE counterpart of {@link deletePath}: returns a NEW root without the own property at the dot-separated path,
  * copying only the plain objects and arrays on the path (structural sharing). Deleting an array element leaves a hole (the length is
- * unchanged), like {@link deleteFromObjectByKeys}. When the path does not exist, `target` itself is returned. Same path rules as
- * {@link updateInObjectByKeys}.
+ * unchanged), like {@link deletePath}. When the path does not exist, `target` itself is returned. Same path rules as
+ * {@link updatePath}.
  * @template T - The object type
  * @template P - The path
  * @param {T} target - The root (a plain object or an array)
@@ -1059,13 +1059,13 @@ export function updateInObjectByKeys<T extends object, P extends string>(
  * @throws {TypeError} when an intermediate object on the path is neither a plain object nor an array
  * @example
  * const config = { a: { b: 1, c: 2 }, d: { e: 3 } };
- * const next = omitInObjectByKeys(config, 'a.b');
+ * const next = omitPath(config, 'a.b');
  * next; // => { a: { c: 2 }, d: { e: 3 } }
  * next.d === config.d; // => true
- * omitInObjectByKeys(config, 'a.x' as never) === config; // => true
+ * omitPath(config, 'a.x' as never) === config; // => true
  */
-export function omitInObjectByKeys<T extends object, P extends string>(target: T, path: P): OmitAtPath<T, P> {
-	return rewriteRoot('omitInObjectByKeys', target, path, undefined) as OmitAtPath<T, P>;
+export function omitPath<T extends object, P extends string>(target: T, path: P): OmitAtPath<T, P> {
+	return rewriteRoot('omitPath', target, path, undefined) as OmitAtPath<T, P>;
 }
 
 /**
@@ -1085,7 +1085,7 @@ function invalidPath(path: string, index: number, problem: string): never {
  * canonical array index (`[0]`) or a quoted key (`['b.c']`, `["x"]`, with `\\`, `\'` and `\"` as the only escapes). The parser is
  * STRICT: anything else (empty names, `a..b`, a trailing `.`, `a.[0]`, `[]`, `[-1]`, `[01]`, an unquoted name in brackets, a missing
  * `]`, an unterminated quote, text right after `]`) is rejected rather than half-parsed, and so are `__proto__`, `constructor` and
- * `prototype` segments. The `...ByKeys` helpers keep their plain dot syntax: join the segments with `'.'` when none contains one.
+ * `prototype` segments. The `...Path` helpers (`getPath`, `setPath`…) keep their plain dot syntax: join the segments with `'.'` when none contains one.
  * @param {string} path - The path, e.g. `"a[0]['b.c'].d"`
  * @returns {string[]} The segments (indices as strings), e.g. `['a', '0', 'b.c', 'd']`
  * @throws {TypeError} when `path` is not a string
@@ -2329,7 +2329,7 @@ export function flattenObject(object: object, options: FlattenOptions = {}): Rec
 
 /**
  * Rebuilds a nested object from a flat record of paths (the inverse of {@link flattenObject}). Keys are processed in `Object.keys` order;
- * each one is split on `separator` and its value written like {@link setInObjectByKeys} does: a missing container is created as an array
+ * each one is split on `separator` and its value written like {@link setPath} does: a missing container is created as an array
  * when the next segment is a canonical array index (`'0'`, `'12'`) no larger than `arrayLimit` (default 1000), as a plain object
  * otherwise; an array built by earlier keys becomes a plain object (same entries) as soon as a key gives it an index above the limit.
  * So input such as a parsed query string `tags.4294967294=x` cannot build a 4-billion-element sparse array. The root is always a plain object.
@@ -2373,7 +2373,7 @@ export function unflattenObject(record: Readonly<Record<string, unknown>>, optio
 // ---------------------------------------------------------------------------------------------------------------------
 
 /**
- * Checks whether a dot-separated path exists in an object: it is `true` exactly when {@link getFromObjectByKeys} resolves the path
+ * Checks whether a dot-separated path exists in an object: it is `true` exactly when {@link getPath} resolves the path
  * to a property (whose value may be `undefined`) rather than falling back to the default value. Segments follow the same rule: own
  * and inherited properties count (class getters, a string's `length` and indices, `Object.create(proto)` parents), but a
  * `__proto__`, `constructor` or `prototype` segment never does, nor does an `Object.prototype` member the object does not own
@@ -2382,12 +2382,12 @@ export function unflattenObject(record: Readonly<Record<string, unknown>>, optio
  * @param {string} path - The dot-separated path, e.g. `'a.b.0'`
  * @returns {boolean} Whether every segment of the path resolves
  * @example
- * hasInObjectByKeys({ a: { b: [undefined] } }, 'a.b.0'); // => true
- * hasInObjectByKeys({ a: {} }, 'a.toString'); // => false // an Object.prototype member
- * hasInObjectByKeys({ a: {} }, 'a.constructor'); // => false
- * hasInObjectByKeys({ name: 'Ada' }, 'name.length'); // => true
+ * hasPath({ a: { b: [undefined] } }, 'a.b.0'); // => true
+ * hasPath({ a: {} }, 'a.toString'); // => false // an Object.prototype member
+ * hasPath({ a: {} }, 'a.constructor'); // => false
+ * hasPath({ name: 'Ada' }, 'name.length'); // => true
  */
-export function hasInObjectByKeys(target: object, path: string): boolean {
+export function hasPath(target: object, path: string): boolean {
 	const segments = path.split('.');
 	const last = segments.length - 1;
 	let current: unknown = target;
@@ -2401,7 +2401,7 @@ export function hasInObjectByKeys(target: object, path: string): boolean {
 /**
  * Deletes the property at a dot-separated path. MUTATES `target`. Only OWN properties are followed and deleted
  * (an inherited property is never removed from a prototype). Deleting an array element leaves a hole (the length is unchanged).
- * Like {@link setInObjectByKeys}, the path may not contain `__proto__`, `constructor` or `prototype` segments, so it cannot remove
+ * Like {@link setPath}, the path may not contain `__proto__`, `constructor` or `prototype` segments, so it cannot remove
  * a method shared by every instance of a class (`'Service.prototype.run'`).
  * @param {object} target - The object to modify
  * @param {string} path - The dot-separated path, e.g. `'a.b.0'`
@@ -2410,13 +2410,13 @@ export function hasInObjectByKeys(target: object, path: string): boolean {
  * @throws {RangeError} when a segment is `__proto__`, `constructor` or `prototype`
  * @example
  * const config = { a: { b: 1, c: 2 } };
- * deleteFromObjectByKeys(config, 'a.b'); // => true
+ * deletePath(config, 'a.b'); // => true
  * config; // => { a: { c: 2 } }
- * deleteFromObjectByKeys(config, 'a.x'); // => false
- * deleteFromObjectByKeys({ C: class {} }, 'C.prototype.m'); // throws RangeError
+ * deletePath(config, 'a.x'); // => false
+ * deletePath({ C: class {} }, 'C.prototype.m'); // throws RangeError
  */
-export function deleteFromObjectByKeys(target: object, path: string): boolean {
-	const segments = parseWritablePath('deleteFromObjectByKeys', '`path`', path, '.');
+export function deletePath(target: object, path: string): boolean {
+	const segments = parseWritablePath('deletePath', '`path`', path, '.');
 	const last = segments.length - 1;
 	let current: unknown = target;
 	for (let index = 0; index < last; index++) {

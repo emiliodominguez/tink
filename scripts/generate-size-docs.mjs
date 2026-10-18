@@ -39,15 +39,15 @@ const LODASH = [
 	['sumBy', 'arrays', 'sumBy', 'Compensated (Kahan–Neumaier) summation.'],
 	['take', 'arrays', 'take', ''],
 	['union', 'arrays', 'union', 'Two arrays instead of a variadic list.'],
-	['uniq', 'arrays', 'removeDuplicates', ''],
+	['uniq', 'arrays', 'unique', ''],
 	['uniqBy', 'arrays', 'uniqueBy', ''],
 	['unzip', 'arrays', 'unzip', ''],
 	['xor', 'arrays', 'symmetricDifference', 'Two arrays instead of a variadic list.'],
 	['zip', 'arrays', 'zip', ''],
 	['clone', 'objects', 'clone', ''],
 	['cloneDeep', 'objects', 'deepClone', 'Also clones Maps, Sets, typed arrays and class instances (prototype kept); cycle-safe.'],
-	['get', 'objects', 'getFromObjectByKeys', 'Dot paths only (`a.0.b`), typed path autocompletion; never resolves `__proto__`, `constructor` or `Object.prototype` members.'],
-	['has', 'objects', 'hasInObjectByKeys', 'Own properties only.'],
+	['get', 'objects', 'getPath', 'Dot paths only (`a.0.b`), typed path autocompletion; never resolves `__proto__`, `constructor` or `Object.prototype` members.'],
+	['has', 'objects', 'hasPath', 'Agrees with `getPath`: never resolves `__proto__`, `constructor` or `Object.prototype` members.'],
 	['invert', 'objects', 'invert', 'Throws for values that are not strings, numbers or symbols.'],
 	['isEmpty', 'objects', 'isEmpty', ''],
 	['isEqual', 'objects', 'isEqual', ''],
@@ -58,8 +58,8 @@ const LODASH = [
 	['omitBy', 'objects', 'omitBy', ''],
 	['pick', 'objects', 'pick', ''],
 	['pickBy', 'objects', 'pickBy', ''],
-	['set', 'objects', 'setInObjectByKeys', 'Mutates and returns `target`, like lodash; rejects `__proto__`/`constructor`/`prototype` segments.'],
-	['unset', 'objects', 'deleteFromObjectByKeys', ''],
+	['set', 'objects', 'setPath', 'Mutates and returns `target`, like lodash; rejects `__proto__`/`constructor`/`prototype` segments.'],
+	['unset', 'objects', 'deletePath', ''],
 	['after', 'functions', 'after', ''],
 	['before', 'functions', 'before', ''],
 	['constant', 'functions', 'constant', ''],
@@ -128,7 +128,7 @@ const LODASH = [
 	['isMatch', 'objects', 'isMatch', 'Arrays match exactly unless `{ arrays: \'subset\' }`.'],
 	['mergeWith', 'objects', 'deepMergeWith', 'Options first (`arrays` strategy, `customizer`); returns a NEW object.'],
 	['toPath', 'objects', 'toPath', 'Throws on malformed paths.'],
-	['update', 'objects', 'updateInObjectByKeys', 'Immutable: returns a new root with structural sharing (lodash mutates).'],
+	['update', 'objects', 'updatePath', 'Immutable: returns a new root with structural sharing (lodash mutates).'],
 	['overEvery', 'functions', 'allPass', 'Preserves type-guard narrowing.'],
 	['overSome', 'functions', 'anyPass', 'Preserves type-guard narrowing.'],
 	['partialRight', 'functions', 'partialRight', 'No placeholders.'],
@@ -272,7 +272,7 @@ import debounce from 'lodash/debounce';
 import get from 'lodash/get';
 // after
 import { debounce } from 'tinkit/functions';
-import { getFromObjectByKeys } from 'tinkit/objects';
+import { getPath } from 'tinkit/objects';
 \`\`\`
 
 Sizes are what each import adds to a bundle on its own (esbuild, minified, gzip level 9, lodash measured from \`lodash-es\`).

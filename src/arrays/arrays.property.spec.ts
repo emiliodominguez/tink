@@ -101,11 +101,11 @@ describe('arrays (property-based)', function () {
 		);
 	});
 
-	it('removeDuplicates is idempotent, preserves membership and matches the naive reference', function () {
+	it('unique is idempotent, preserves membership and matches the naive reference', function () {
 		fc.assert(
 			fc.property(smallInts, function (array) {
-				const unique = helpers.removeDuplicates(array);
-				expect(helpers.removeDuplicates(unique)).toStrictEqual(unique);
+				const unique = helpers.unique(array);
+				expect(helpers.unique(unique)).toStrictEqual(unique);
 				expect(unique).toStrictEqual(naiveUnique(array));
 				expect(new Set(unique).size).toBe(unique.length);
 				for (const value of array) expect(unique).toContain(value);
@@ -113,7 +113,7 @@ describe('arrays (property-based)', function () {
 		);
 	});
 
-	it('removeDuplicates keeps the first of each SameValueZero class (short and long inputs alike, -0 and NaN included)', function () {
+	it('unique keeps the first of each SameValueZero class (short and long inputs alike, -0 and NaN included)', function () {
 		const value = fc.oneof(fc.integer({ min: -4, max: 4 }), fc.constantFrom(-0, NaN, 'a', 'b', undefined));
 		fc.assert(
 			fc.property(fc.array(value, { maxLength: 60 }), function (array) {
@@ -127,8 +127,8 @@ describe('arrays (property-based)', function () {
 						expected.push(item);
 					}
 				}
-				expect(helpers.removeDuplicates(array)).toStrictEqual(expected);
-				expect(helpers.removeDuplicates(new Set(array).values())).toHaveLength(expected.length);
+				expect(helpers.unique(array)).toStrictEqual(expected);
+				expect(helpers.unique(new Set(array).values())).toHaveLength(expected.length);
 			})
 		);
 	});
@@ -355,7 +355,7 @@ describe('arrays (property-based)', function () {
 						})
 					).toBe(item);
 				}
-				expect(helpers.uniqueBy(items.map(keyOf), Number)).toStrictEqual(helpers.removeDuplicates(items.map(keyOf)));
+				expect(helpers.uniqueBy(items.map(keyOf), Number)).toStrictEqual(helpers.unique(items.map(keyOf)));
 			})
 		);
 	});
@@ -663,7 +663,7 @@ describe('arrays (property-based)', function () {
 					expect(helpers.intersectionBy(a, b, Number)).toStrictEqual(helpers.intersection(a, b));
 					const kept = helpers.intersectionBy(a, b, modulo).map(modulo);
 					const dropped = helpers.differenceBy(a, b, modulo).map(modulo);
-					expect(sortedNumbers([...kept, ...dropped])).toStrictEqual(sortedNumbers(helpers.removeDuplicates(a.map(modulo))));
+					expect(sortedNumbers([...kept, ...dropped])).toStrictEqual(sortedNumbers(helpers.unique(a.map(modulo))));
 				})
 			);
 		});
@@ -967,7 +967,7 @@ describe('Arrays properties (ordering, slicing, set algebra, combinatorics)', fu
 			fc.property(values, values, function (a, b) {
 				expect(helpers.unionBy(a, b, self)).toStrictEqual(helpers.union(a, b));
 				expect(helpers.symmetricDifferenceBy(a, b, self)).toStrictEqual(helpers.symmetricDifference(a, b));
-				expect(helpers.uniqueWith(a, same)).toStrictEqual(helpers.removeDuplicates(a));
+				expect(helpers.uniqueWith(a, same)).toStrictEqual(helpers.unique(a));
 				expect(helpers.unionWith(a, b, same)).toStrictEqual(helpers.union(a, b));
 				expect(helpers.differenceWith(a, b, same)).toStrictEqual(helpers.difference(a, b));
 				expect(helpers.intersectionWith(a, b, same)).toStrictEqual(helpers.intersection(a, b));

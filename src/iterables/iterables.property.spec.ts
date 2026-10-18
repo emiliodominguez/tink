@@ -148,7 +148,7 @@ describe('iterables (properties)', function () {
 			);
 		});
 
-		it('unique ≡ arrays.removeDuplicates, and unique(keyFn) ≡ arrays.uniqueBy', function () {
+		it('unique ≡ arrays.unique, and unique(keyFn) ≡ arrays.uniqueBy', function () {
 			fc.assert(
 				fc.property(fc.array(fc.oneof(smallInt, fc.constant(NaN), fc.constant(-0)), { maxLength: 30 }), function (xs) {
 					const deduplicated = helpers.toArray(helpers.unique(once(xs)));
@@ -158,7 +158,7 @@ describe('iterables (properties)', function () {
 							return value;
 						})
 					);
-					expect(deduplicated).toStrictEqual(arrays.removeDuplicates(xs));
+					expect(deduplicated).toStrictEqual(arrays.unique(xs));
 					function key(value: number, index: number): number {
 						return Math.abs(value) + (index % 2);
 					}

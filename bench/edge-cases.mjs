@@ -155,7 +155,7 @@ const CASES = [
 			return polluted;
 		},
 		ours: function () {
-			tink.objects.setInObjectByKeys({}, '__proto__.polluted', true);
+			tink.objects.setPath({}, '__proto__.polluted', true);
 			return {}.polluted;
 		}
 	},

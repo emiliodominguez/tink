@@ -3,7 +3,7 @@
 Key facts for code generation:
 - ESM only, zero dependencies, Node >= 20.19 or any modern browser/runtime. TypeScript types ship in the package.
 - Import from module entry points: `import { debounce } from 'tinkit/functions'` (the root entry exposes namespaces: `import { functions } from 'tinkit'`).
-- Helpers never mutate their inputs unless the name or docs say so (`setInObjectByKeys`, `deleteFromObjectByKeys`).
+- Helpers never mutate their inputs unless the name or docs say so (`setPath`, `deletePath`).
 - Invalid arguments throw `TypeError` (wrong type) or `RangeError` (invalid value) whose message names the function and the parameter (`fn: param must be …, got …`).
 - Randomised helpers take an optional `random` generator last; the default is `Math.random`. Pass `secureRandom` (random module) for tokens, OTPs and lotteries.
 - Type guards compose into validators: `isShape`, `isArrayOf`, `isUnion`, `isOptional`…; `explain` lists issues with paths, `ensure` throws a `ValidationError`, `toStandardSchema` adapts any guard for tRPC, TanStack Form, Hono and other Standard Schema consumers.
@@ -18,7 +18,7 @@ Import: `import { … } from 'tinkit/arrays';`
 - `last<T>(array: ReadonlyArray<T>): T | undefined` — Get the last item in an array.
 - `flatten<T>(array: ReadonlyArray<T | ReadonlyArray<T>>): T[]` — Flatten an array by exactly one level, like `Array.prototype.flat()` (holes in sparse arrays are skipped).
 - `flattenDeep<T>(array: ReadonlyArray<T>): Array<FlatDeep<T>>` — Recursively flatten nested arrays of any depth, like `Array.prototype.flat(Infinity)` (holes are skipped).
-- `removeDuplicates<T>(iterable: Iterable<T>): T[]` — Remove duplicates from an iterable (SameValueZero equality), keeping the first occurrence of each value.
+- `unique<T>(iterable: Iterable<T>): T[]` — Remove duplicates from an iterable (SameValueZero equality), keeping the first occurrence of each value.
 - `union<T>(a: Iterable<T>, b: Iterable<T>): T[]` — Get the union of two iterables: every distinct value from `a`, then every distinct value of `b` not already in `a`.
 - `intersection<T>(a: Iterable<T>, b: Iterable<T>): T[]` — Get the intersection of two iterables: the distinct values of `a` that also appear in `b`.
 - `difference<T>(a: Iterable<T>, b: Iterable<T>): T[]` — Get the difference of two iterables: the distinct values of `a` that do not appear in `b`.
@@ -57,7 +57,7 @@ Import: `import { … } from 'tinkit/arrays';`
 - `longestCommonSubsequence<T>(a: Iterable<T>, b: Iterable<T>, equals: (x: T, y: T) => boolean = sameValueZero, options: DiffOptions = {}): T[]` — Computes a longest common subsequence of `a` and `b`: the longest list of elements that appear in both, in the same relative order (not necessarily contiguously).
 - `unionBy<T, U = T>(a: Iterable<T>, b: Iterable<U>, keyFn: (item: T | U) => unknown): Array<T | U>` — Like `union`, but items are compared by the key `keyFn` returns (SameValueZero): every item of `a`, then of `b`, whose key was not seen before, so only the FIRST item per key is kept.
 - `symmetricDifferenceBy<T, U = T>(a: Iterable<T>, b: Iterable<U>, keyFn: (item: T | U) => unknown): Array<T | U>` — Like `symmetricDifference`, but items are compared by the key `keyFn` returns (SameValueZero): the items of `a` whose key is not the key of any item of `b`, followed by the items of `b` whose key is not the key of any item of `a`, keeping only the FIRST item per key.
-- `uniqueWith<T>(iterable: Iterable<T>, equals: (x: T, y: T) => boolean): T[]` — Remove the items `equals` to an earlier item, keeping the first occurrence: `removeDuplicates` with a custom equality, for values that have no identity key (e.g. points within a tolerance).
+- `uniqueWith<T>(iterable: Iterable<T>, equals: (x: T, y: T) => boolean): T[]` — Remove the items `equals` to an earlier item, keeping the first occurrence: `unique` with a custom equality, for values that have no identity key (e.g. points within a tolerance).
 - `unionWith<T, U = T>(a: Iterable<T>, b: Iterable<U>, equals: (x: T | U, y: T | U) => boolean): Array<T | U>` — `union` with a custom equality: every item of `a`, then of `b`, not `equals` to an item already kept (first occurrence wins).
 - `differenceWith<T, U = T>(a: Iterable<T>, b: Iterable<U>, equals: (x: T, y: T | U) => boolean): T[]` — `difference` with a custom equality: the items of `a` not `equals` to any item of `b`, keeping only the first of several items of `a` that are `equals` to each other.
 - `intersectionWith<T, U = T>(a: Iterable<T>, b: Iterable<U>, equals: (x: T, y: T | U) => boolean): T[]` — `intersection` with a custom equality: the items of `a` `equals` to some item of `b`, keeping only the first of several items of `a` that are `equals` to each other.
@@ -104,10 +104,10 @@ Import: `import { … } from 'tinkit/objects';`
 - `mapValues<T extends object, R>(object: T, fn: (value: T[keyof T], key: keyof T, object: T) => R): { [K in keyof T]: R }` — Creates a new object with the same own enumerable (string and symbol) keys, whose values are the results of `fn`.
 - `mapKeys<T extends object, K extends PropertyKey>(object: T, fn: (value: T[keyof T], key: keyof T, object: T) => K): Record<K, T[keyof T]>` — Creates a new object with the same values, whose keys are the results of `fn`.
 - `invert<T extends Record<PropertyKey, PropertyKey>>(object: T): Invert<T>` — Creates a new object whose keys are the values of `object` and whose values are the (string) keys.
-- `getFromObjectByKeys<T extends object, P extends NestedKeyOf<T>>(target: T, keys: P): PathValue<T, P>` — Safely reads a nested value through a dot-separated path (array elements are addressed with numeric segments: `'list.0.id'`).
-- `setInObjectByKeys<T extends object>(target: T, path: string, value: unknown): T` — Sets a nested value through a dot-separated path.
-- `updateInObjectByKeys<T extends object, P extends string>(target: T, path: P, valueOrUpdater: PathUpdateValue<T, P> | ((current: PathUpdateValue<T, P>) => PathUpdateValue<T, P>)): T` — IMMUTABLE counterpart of `setInObjectByKeys`: returns a NEW root in which the value at the dot-separated path is replaced by `valueOrUpdater` (or, when it is a function, by `valueOrUpdater(currentValue)`).
-- `omitInObjectByKeys<T extends object, P extends string>(target: T, path: P): OmitAtPath<T, P>` — IMMUTABLE counterpart of `deleteFromObjectByKeys`: returns a NEW root without the own property at the dot-separated path, copying only the plain objects and arrays on the path (structural sharing).
+- `getPath<T extends object, P extends NestedKeyOf<T>>(target: T, keys: P): PathValue<T, P>` — Safely reads a nested value through a dot-separated path (array elements are addressed with numeric segments: `'list.0.id'`).
+- `setPath<T extends object>(target: T, path: string, value: unknown): T` — Sets a nested value through a dot-separated path.
+- `updatePath<T extends object, P extends string>(target: T, path: P, valueOrUpdater: PathUpdateValue<T, P> | ((current: PathUpdateValue<T, P>) => PathUpdateValue<T, P>)): T` — IMMUTABLE counterpart of `setPath`: returns a NEW root in which the value at the dot-separated path is replaced by `valueOrUpdater` (or, when it is a function, by `valueOrUpdater(currentValue)`).
+- `omitPath<T extends object, P extends string>(target: T, path: P): OmitAtPath<T, P>` — IMMUTABLE counterpart of `deletePath`: returns a NEW root without the own property at the dot-separated path, copying only the plain objects and arrays on the path (structural sharing).
 - `toPath(path: string): string[]` — Parses a property path written in JavaScript accessor syntax into its segments: dot-separated names (`a.b`) and brackets holding a canonical array index (`[0]`) or a quoted key (`['b.c']`, `["x"]`, with `\\`, `\'` and `\"` as the only escapes).
 - `deepClone<T>(value: T): T` — Creates a deep copy of a value without using `structuredClone`.
 - `deepMerge<T extends object, S extends object[]>(target: T, ...sources: S): DeepMergeAll<T, S>` — Deeply merges plain objects into a NEW object, left to right (later sources win).
@@ -128,8 +128,8 @@ Import: `import { … } from 'tinkit/objects';`
 - `compactObject<T extends object>(object: T): CompactObject<T>` — Creates a SHALLOW copy of an object without the own properties whose value is `undefined`.
 - `flattenObject(object: object, options: FlattenOptions = {}): Record<string, unknown>` — Flattens nested plain objects and arrays into a single-level record mapping each LEAF path to its value.
 - `unflattenObject(record: Readonly<Record<string, unknown>>, options: UnflattenOptions = {}): Record<string, unknown>` — Rebuilds a nested object from a flat record of paths (the inverse of `flattenObject`).
-- `hasInObjectByKeys(target: object, path: string): boolean` — Checks whether a dot-separated path exists in an object: it is `true` exactly when `getFromObjectByKeys` resolves the path to a property (whose value may be `undefined`) rather than falling back to the default value.
-- `deleteFromObjectByKeys(target: object, path: string): boolean` — Deletes the property at a dot-separated path.
+- `hasPath(target: object, path: string): boolean` — Checks whether a dot-separated path exists in an object: it is `true` exactly when `getPath` resolves the path to a property (whose value may be `undefined`) rather than falling back to the default value.
+- `deletePath(target: object, path: string): boolean` — Deletes the property at a dot-separated path.
 - `diff(a: object, b: object): ObjectDiff` — Computes the structural differences between two trees of plain objects and arrays, as dot-separated paths (array elements use numeric segments: `'list.0'`).
 - `findKey<T extends object, S extends T[keyof T]>(object: T, predicate: (value: T[keyof T], key: StringKeyOf<T>, object: T) => value is S): KeysMatching<T, S> | undefined` — Returns the first own enumerable string key (in `Object.keys` order) whose value satisfies `predicate`.
 - `findEntry<T extends object, S extends T[keyof T]>(object: T, predicate: (value: T[keyof T], key: StringKeyOf<T>, object: T) => value is S): [KeysMatching<T, S>, S] | undefined` — Returns the first `[key, value]` own enumerable string-keyed entry whose value satisfies a type-guard `predicate`, narrowed.

@@ -332,7 +332,7 @@ describe('objects (properties)', function () {
 		});
 	});
 
-	describe('setInObjectByKeys / getFromObjectByKeys', function () {
+	describe('setPath / getPath', function () {
 		const segment = fc.oneof(fc.stringMatching(/^[a-z]{1,5}$/), fc.nat(4).map(String));
 		const path = fc.array(segment, { minLength: 1, maxLength: 5 }).map(function (segments) {
 			return segments.join('.');
@@ -342,8 +342,8 @@ describe('objects (properties)', function () {
 			fc.assert(
 				fc.property(path, anyValue, function (keys, value) {
 					const target: Record<string, unknown> = {};
-					expect(helpers.setInObjectByKeys(target, keys, value)).toBe(target);
-					expect(Object.is(helpers.getFromObjectByKeys(target, keys as any), value)).toBe(true);
+					expect(helpers.setPath(target, keys, value)).toBe(target);
+					expect(Object.is(helpers.getPath(target, keys as any), value)).toBe(true);
 				})
 			);
 		});
@@ -353,15 +353,15 @@ describe('objects (properties)', function () {
 				fc.property(path, path, fc.integer(), fc.integer(), function (first, second, a, b) {
 					fc.pre(!first.startsWith(second) && !second.startsWith(first));
 					const target: Record<string, unknown> = {};
-					helpers.setInObjectByKeys(target, first, a);
-					helpers.setInObjectByKeys(target, second, b);
-					expect(helpers.getFromObjectByKeys(target, first as any)).toBe(a);
-					expect(helpers.getFromObjectByKeys(target, second as any)).toBe(b);
+					helpers.setPath(target, first, a);
+					helpers.setPath(target, second, b);
+					expect(helpers.getPath(target, first as any)).toBe(a);
+					expect(helpers.getPath(target, second as any)).toBe(b);
 				})
 			);
 		});
 
-		it('hasInObjectByKeys agrees with getFromObjectByKeys, and unsafe or Object.prototype names never resolve', function () {
+		it('hasPath agrees with getPath, and unsafe or Object.prototype names never resolve', function () {
 			const names = fc.constantFrom('a', 'b', '0', '1', 'length', 'constructor', '__proto__', 'prototype', 'toString', 'valueOf', 'hasOwnProperty');
 			const tree = fc.dictionary(names, fc.jsonValue(), { maxKeys: 4, noNullPrototype: true });
 			const jsonish = fc.oneof(tree, fc.jsonValue(), fc.dictionary(names, tree, { maxKeys: 3, noNullPrototype: true }));
@@ -373,8 +373,8 @@ describe('objects (properties)', function () {
 				fc.property(jsonish, anyPath, function (value, keys) {
 					const root = { root: value } as Record<string, unknown>;
 					const fullPath = `root.${keys}`;
-					const resolved = helpers.getFromObjectByKeys(root, fullPath as any, missing);
-					const has = helpers.hasInObjectByKeys(root, fullPath);
+					const resolved = helpers.getPath(root, fullPath as any, missing);
+					const has = helpers.hasPath(root, fullPath);
 					if (resolved !== missing) expect(has).toBe(true);
 					// JSON values hold no `undefined`, so a path that exists never falls back to the default.
 					else expect(has).toBe(false);
@@ -399,10 +399,10 @@ describe('objects (properties)', function () {
 			);
 		});
 
-		it('getFromObjectByKeys never throws and falls back to the default on missing paths', function () {
+		it('getPath never throws and falls back to the default on missing paths', function () {
 			fc.assert(
 				fc.property(fc.jsonValue(), path, function (value, keys) {
-					const result = helpers.getFromObjectByKeys({ root: value } as Record<string, unknown>, `root.${keys}` as any, 'fallback');
+					const result = helpers.getPath({ root: value } as Record<string, unknown>, `root.${keys}` as any, 'fallback');
 					expect(result).not.toBeUndefined();
 				})
 			);
@@ -456,12 +456,12 @@ describe('objects (properties)', function () {
 			);
 		});
 
-		it('flattenObject maps every path to a leaf readable with getFromObjectByKeys', function () {
+		it('flattenObject maps every path to a leaf readable with getPath', function () {
 			fc.assert(
 				fc.property(jsonTree(roundTripKey), function (tree) {
 					for (const [path, value] of Object.entries(helpers.flattenObject(tree))) {
-						expect(helpers.getFromObjectByKeys(tree, path as any)).toBe(value);
-						expect(helpers.hasInObjectByKeys(tree, path)).toBe(true);
+						expect(helpers.getPath(tree, path as any)).toBe(value);
+						expect(helpers.hasPath(tree, path)).toBe(true);
 						const isNonEmptyContainer = typeof value === 'object' && value !== null && Object.keys(value).length > 0;
 						expect(isNonEmptyContainer).toBe(false);
 					}
@@ -543,25 +543,25 @@ describe('objects (properties)', function () {
 					for (const object of collectObjects(result)) if (Array.isArray(object)) expect(object.length).toBeLessThanOrEqual(arrayLimit + 1);
 					// Every key is still readable at its path.
 					keys.forEach(function (k, i) {
-						expect(helpers.getFromObjectByKeys(result, k as any)).toBe(i);
+						expect(helpers.getPath(result, k as any)).toBe(i);
 					});
 				})
 			);
 		});
 
-		it('hasInObjectByKeys / deleteFromObjectByKeys agree with setInObjectByKeys', function () {
+		it('hasPath / deletePath agree with setPath', function () {
 			const path = fc.array(fc.oneof(fc.stringMatching(/^[a-z]{1,3}$/), fc.nat(3).map(String)), { minLength: 1, maxLength: 4 }).map(function (segments) {
 				return segments.join('.');
 			});
 			fc.assert(
 				fc.property(path, fc.anything(), function (keys, value) {
 					const target: Record<string, unknown> = {};
-					expect(helpers.hasInObjectByKeys(target, keys)).toBe(false);
-					helpers.setInObjectByKeys(target, keys, value);
-					expect(helpers.hasInObjectByKeys(target, keys)).toBe(true);
-					expect(helpers.deleteFromObjectByKeys(target, keys)).toBe(true);
-					expect(helpers.hasInObjectByKeys(target, keys)).toBe(false);
-					expect(helpers.deleteFromObjectByKeys(target, keys)).toBe(false);
+					expect(helpers.hasPath(target, keys)).toBe(false);
+					helpers.setPath(target, keys, value);
+					expect(helpers.hasPath(target, keys)).toBe(true);
+					expect(helpers.deletePath(target, keys)).toBe(true);
+					expect(helpers.hasPath(target, keys)).toBe(false);
+					expect(helpers.deletePath(target, keys)).toBe(false);
 				})
 			);
 		});
@@ -588,14 +588,14 @@ describe('objects (properties)', function () {
 			);
 		});
 
-		it('diff paths are consistent with hasInObjectByKeys and the trees are equal iff the diff is empty', function () {
+		it('diff paths are consistent with hasPath and the trees are equal iff the diff is empty', function () {
 			fc.assert(
 				fc.property(overlappingTree, overlappingTree, function (a, b) {
 					const { added, removed, changed } = helpers.diff(a, b);
-					for (const path of added) expect([helpers.hasInObjectByKeys(a, path), helpers.hasInObjectByKeys(b, path)]).toStrictEqual([false, true]);
-					for (const path of removed) expect([helpers.hasInObjectByKeys(a, path), helpers.hasInObjectByKeys(b, path)]).toStrictEqual([true, false]);
+					for (const path of added) expect([helpers.hasPath(a, path), helpers.hasPath(b, path)]).toStrictEqual([false, true]);
+					for (const path of removed) expect([helpers.hasPath(a, path), helpers.hasPath(b, path)]).toStrictEqual([true, false]);
 					for (const path of changed) {
-						expect(helpers.isEqual(helpers.getFromObjectByKeys(a, path as any), helpers.getFromObjectByKeys(b, path as any))).toBe(false);
+						expect(helpers.isEqual(helpers.getPath(a, path as any), helpers.getPath(b, path as any))).toBe(false);
 					}
 					expect(added.length + removed.length + changed.length === 0).toBe(helpers.isEqual(a, b));
 				})
@@ -670,14 +670,14 @@ describe('Objects helpers (round 11) - properties', function () {
 		);
 	});
 
-	it('updateInObjectByKeys writes the value, leaves the input intact and shares the untouched branches', function () {
+	it('updatePath writes the value, leaves the input intact and shares the untouched branches', function () {
 		fc.assert(
 			fc.property(jsonObject, fc.array(safeName, { minLength: 1, maxLength: 4 }), json, function (object, segments, value) {
 				const path = segments.join('.');
 				const before = helpers.deepClone(object);
 				let result: Record<string, unknown>;
 				try {
-					result = helpers.updateInObjectByKeys(object, path, function () {
+					result = helpers.updatePath(object, path, function () {
 						return value;
 					});
 				} catch (error) {
@@ -688,20 +688,20 @@ describe('Objects helpers (round 11) - properties', function () {
 				const sharing = Object.keys(object).every(function (key) {
 					return key === head || result[key] === object[key];
 				});
-				return helpers.isEqual(object, before) && helpers.isEqual(helpers.getFromObjectByKeys(result, path as never), value) && sharing;
+				return helpers.isEqual(object, before) && helpers.isEqual(helpers.getPath(result, path as never), value) && sharing;
 			})
 		);
 	});
 
-	it('omitInObjectByKeys removes the path and nothing else', function () {
+	it('omitPath removes the path and nothing else', function () {
 		fc.assert(
 			fc.property(jsonObject, fc.array(safeName, { minLength: 1, maxLength: 3 }), function (object, segments) {
 				const path = segments.join('.');
 				const before = helpers.deepClone(object);
-				const result = helpers.omitInObjectByKeys(object, path as never) as object;
+				const result = helpers.omitPath(object, path as never) as object;
 				const mutated = helpers.deepClone(object);
-				helpers.deleteFromObjectByKeys(mutated, path);
-				const unchanged = !helpers.hasInObjectByKeys(object, path) || !Object.prototype.hasOwnProperty.call(object, segments[0]);
+				helpers.deletePath(mutated, path);
+				const unchanged = !helpers.hasPath(object, path) || !Object.prototype.hasOwnProperty.call(object, segments[0]);
 				return (
 					helpers.isEqual(object, before) &&
 					helpers.isEqual(result, mutated) &&

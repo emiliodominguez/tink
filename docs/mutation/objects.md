@@ -36,7 +36,7 @@ apply LESS often (or a write helper always use `Object.defineProperty`) cannot b
 - 657: `&&` → `||` — also assigns on a fresh container whose key is inherited (see next line: nothing on `Object.prototype`/`Array.prototype` can intercept it) and on a non-fresh target where the key is nowhere in the prototype chain (no setter can run): same effect.
 - 657: `!(segment in current)` → `segment in current` — fresh containers are `{}` (only `__proto__` could intercept, and it is rejected) or `[]` written with canonical indices only: assignment has the same effect.
 - 660: `fresh = true` → `false` — only forces the `hasOwn` lookups and `defineOwn` that a fresh container does not need.
-- 712: getFromObjectByKeys `keys.indexOf('.') === -1` → `false` — splitting a single-segment path gives the same one-step read.
+- 712: getPath `keys.indexOf('.') === -1` → `false` — splitting a single-segment path gives the same one-step read.
 - 712: `'.'` → `""` — same (always splits).
 - 761: copyWith `isOrdinary(…)` → `false` — the generic copy gives the same result for plain objects and dense arrays.
 - 761: fast-path block removed — same.

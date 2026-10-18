@@ -53,7 +53,6 @@ Whole module: **6.7 kB**
 | `powerSet`                 |      269 B |
 | `range`                    |      507 B |
 | `removeAt`                 |      421 B |
-| `removeDuplicates`         |      227 B |
 | `rotate`                   |      293 B |
 | `sample`                   |      301 B |
 | `sampleSize`               |      600 B |
@@ -62,7 +61,7 @@ Whole module: **6.7 kB**
 | `sortedIndex`              |      376 B |
 | `sortedIndexBy`            |      496 B |
 | `sortedLastIndex`          |      381 B |
-| `sortedLastIndexBy`        |      500 B |
+| `sortedLastIndexBy`        |      499 B |
 | `splitWhen`                |      319 B |
 | `sumBy`                    |      298 B |
 | `swap`                     |      362 B |
@@ -77,6 +76,7 @@ Whole module: **6.7 kB**
 | `union`                    |      254 B |
 | `unionBy`                  |      257 B |
 | `unionWith`                |      264 B |
+| `unique`                   |      220 B |
 | `uniqueBy`                 |      264 B |
 | `uniqueWith`               |      260 B |
 | `unzip`                    |      192 B |
@@ -523,59 +523,59 @@ Whole module: **3.9 kB**
 
 Whole module: **8.4 kB**
 
-| Export                   | min + gzip |
-| ------------------------ | ---------: |
-| `clone`                  |     1.4 kB |
-| `compactObject`          |      572 B |
-| `deepClone`              |     1.4 kB |
-| `deepFreeze`             |      615 B |
-| `deepMerge`              |     1.2 kB |
-| `deepMergeWith`          |     1.3 kB |
-| `defaults`               |     1.2 kB |
-| `defaultsDeep`           |     1.2 kB |
-| `defaultsWith`           |     1.3 kB |
-| `deleteFromObjectByKeys` |      702 B |
-| `deleteProperty`         |      289 B |
-| `diff`                   |     1.8 kB |
-| `evolve`                 |     1.7 kB |
-| `findEntry`              |      436 B |
-| `findKey`                |      441 B |
-| `flattenObject`          |      833 B |
-| `getFromObjectByKeys`    |      497 B |
-| `getProperty`            |      423 B |
-| `getPropertyNames`       |      294 B |
-| `hasInObjectByKeys`      |      498 B |
-| `hasProperty`            |      309 B |
-| `hash`                   |     1.6 kB |
-| `invert`                 |      487 B |
-| `isEmpty`                |      575 B |
-| `isEqual`                |     1.6 kB |
-| `isEqualWith`            |     1.7 kB |
-| `isMatch`                |     1.9 kB |
-| `mapEntries`             |      600 B |
-| `mapKeys`                |      542 B |
-| `mapValues`              |      592 B |
-| `merge`                  |      329 B |
-| `omit`                   |      479 B |
-| `omitBy`                 |      572 B |
-| `omitInObjectByKeys`     |     2.1 kB |
-| `pick`                   |      499 B |
-| `pickBy`                 |      548 B |
-| `setInObjectByKeys`      |     1.0 kB |
-| `setProperty`            |      348 B |
-| `shallowEqual`           |      904 B |
-| `sortKeys`               |      914 B |
-| `stableStringify`        |     1.3 kB |
-| `toCamelCaseKeys`        |     1.6 kB |
-| `toKebabCaseKeys`        |     1.4 kB |
-| `toPath`                 |      822 B |
-| `toSnakeCaseKeys`        |     1.4 kB |
-| `transformKeysDeep`      |      981 B |
-| `typedEntries`           |      294 B |
-| `typedFromEntries`       |      381 B |
-| `typedKeys`              |      295 B |
-| `unflattenObject`        |     1.3 kB |
-| `updateInObjectByKeys`   |     2.1 kB |
+| Export              | min + gzip |
+| ------------------- | ---------: |
+| `clone`             |     1.4 kB |
+| `compactObject`     |      572 B |
+| `deepClone`         |     1.4 kB |
+| `deepFreeze`        |      615 B |
+| `deepMerge`         |     1.2 kB |
+| `deepMergeWith`     |     1.3 kB |
+| `defaults`          |     1.2 kB |
+| `defaultsDeep`      |     1.2 kB |
+| `defaultsWith`      |     1.3 kB |
+| `deletePath`        |      694 B |
+| `deleteProperty`    |      289 B |
+| `diff`              |     1.8 kB |
+| `evolve`            |     1.7 kB |
+| `findEntry`         |      436 B |
+| `findKey`           |      441 B |
+| `flattenObject`     |      834 B |
+| `getPath`           |      488 B |
+| `getProperty`       |      423 B |
+| `getPropertyNames`  |      294 B |
+| `hasPath`           |      492 B |
+| `hasProperty`       |      309 B |
+| `hash`              |     1.6 kB |
+| `invert`            |      487 B |
+| `isEmpty`           |      575 B |
+| `isEqual`           |     1.6 kB |
+| `isEqualWith`       |     1.7 kB |
+| `isMatch`           |     1.9 kB |
+| `mapEntries`        |      600 B |
+| `mapKeys`           |      541 B |
+| `mapValues`         |      592 B |
+| `merge`             |      330 B |
+| `omit`              |      479 B |
+| `omitBy`            |      572 B |
+| `omitPath`          |     2.1 kB |
+| `pick`              |      498 B |
+| `pickBy`            |      548 B |
+| `setPath`           |     1.0 kB |
+| `setProperty`       |      348 B |
+| `shallowEqual`      |      905 B |
+| `sortKeys`          |      914 B |
+| `stableStringify`   |     1.3 kB |
+| `toCamelCaseKeys`   |     1.6 kB |
+| `toKebabCaseKeys`   |     1.4 kB |
+| `toPath`            |      822 B |
+| `toSnakeCaseKeys`   |     1.4 kB |
+| `transformKeysDeep` |      980 B |
+| `typedEntries`      |      294 B |
+| `typedFromEntries`  |      381 B |
+| `typedKeys`         |      295 B |
+| `unflattenObject`   |     1.3 kB |
+| `updatePath`        |     2.1 kB |
 
 ## random
 

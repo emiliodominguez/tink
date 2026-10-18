@@ -28,7 +28,7 @@ import {
 	permutations,
 	powerSet,
 	range,
-	removeDuplicates,
+	unique,
 	rotate,
 	sample,
 	sampleSize,
@@ -253,11 +253,11 @@ export default [
 			}
 		};
 	}),
-	...sized('removeDuplicates (numbers, ~50% dupes)', SIZES, function (n) {
+	...sized('unique (numbers, ~50% dupes)', SIZES, function (n) {
 		const numbers = integers(n, Math.max(1, n >> 1));
 		return {
 			fn: function () {
-				return removeDuplicates(numbers);
+				return unique(numbers);
 			},
 			baseline: function () {
 				return Array.from(new Set(numbers));
@@ -272,11 +272,11 @@ export default [
 			}
 		};
 	}),
-	...sized('removeDuplicates (strings, ~50% dupes)', SIZES, function (n) {
+	...sized('unique (strings, ~50% dupes)', SIZES, function (n) {
 		const words = integers(n, Math.max(1, n >> 1)).map(String);
 		return {
 			fn: function () {
-				return removeDuplicates(words);
+				return unique(words);
 			},
 			competitors: {
 				'es-toolkit': function () {

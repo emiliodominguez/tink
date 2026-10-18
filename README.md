@@ -64,11 +64,11 @@ const schema = toStandardSchema(isUser); // for your form or RPC library
 ## Hostile input is a non-event
 
 ```ts
-import { deepMerge, getFromObjectByKeys } from 'tinkit/objects';
+import { deepMerge, getPath } from 'tinkit/objects';
 import { isAbsoluteUrl, sanitizeUrl } from 'tinkit/url';
 
 deepMerge(defaults, JSON.parse('{"__proto__": {"isAdmin": true}}')); // key dropped, Object.prototype untouched
-getFromObjectByKeys(permissions, 'viewer.constructor', false); // false: inherited Object members never resolve
+getPath(permissions, 'viewer.constructor', false); // false: inherited Object members never resolve
 sanitizeUrl(' JAVASCRIPT:alert(1)'); // 'about:blank': parsed the way a browser parses it
 isAbsoluteUrl('/\\evil.com'); // true: browsers send it to evil.com, so it is not a safe relative redirect
 ```
@@ -96,7 +96,7 @@ More examples, including dates, text and decorators, are in [Recipes](./docs/REC
 | Module                                   | Highlights                                                                                                                                       |
 | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | [`arrays`](./docs/API.md#arrays)         | `orderBy`, `groupBy`, `partition`, `chunk`, top-N `takeFirstBy`, `sampleSize`, combinatorics, Myers `diffSequences`, set algebra (`…By`/`…With`) |
-| [`objects`](./docs/API.md#objects)       | `deepClone`, `deepMerge`/`defaults`, `isEqual`/`isMatch`, immutable `updateInObjectByKeys`, `toCamelCaseKeys`, `stableStringify`/`hash`, `diff`  |
+| [`objects`](./docs/API.md#objects)       | `deepClone`, `deepMerge`/`defaults`, `isEqual`/`isMatch`, immutable `updatePath`, `toCamelCaseKeys`, `stableStringify`/`hash`, `diff`            |
 | [`guards`](./docs/API.md#guards)         | 50+ predicates, `isShape`/`isUnion`/`isLazy`/`refine` schemas, `isMatching`, `explain`/`ensure`, `toStandardSchema`, `assertNever`               |
 | [`strings`](./docs/API.md#strings)       | every case style, grapheme-aware `padStart`/`trimChars`/`truncate`, `toSlug`, `dedent`, `wordWrap`, `levenshtein`, `mask`, `escapeHtml`          |
 | [`math`](./docs/API.md#math)             | precise `sum`/`round`/`ceil`/`floor`, `quantile`, `variance`, `clamp`/`lerp`, `formatBytes`/`parseBytes`, Miller–Rabin `isPrime`                 |
