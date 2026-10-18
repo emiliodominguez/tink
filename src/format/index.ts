@@ -638,7 +638,24 @@ export function formatOrdinal(n: number, options: FormatOrdinalOptions = {}): st
 	const rules = getFormatter('plural', Intl.PluralRules, locale, { type: 'ordinal' }, ORDINAL_MEMO);
 	const table = suffixes ?? (resolvedLanguage(rules) === 'en' ? ENGLISH_ORDINAL_SUFFIXES : GENERIC_ORDINAL_SUFFIXES);
 
-	return `${formatNumber(value, { locale })}${table[rules.select(value)] ?? table.other}`;
+	return `${formatNumber(value, { locale })}${table[rules.select(ordinalSubject(value))] ?? table.other}`;
+}
+
+/**
+ * The number whose ordinal category is that of `value` as PRINTED. Above `2^53` the printed digits (the shortest round-trip form,
+ * `1e23` prints as `100…000`) differ from the exact double (`99999999999999991611392`) that `Intl.PluralRules` looks at, so the
+ * category is taken from a safe integer with the same last six printed digits instead (and far from the small values that some locales
+ * single out, such as Italian's 8, 11, 80 and 800).
+ * @param {number} value - A finite integer
+ * @returns {number} `value`, or a safe integer ending like it when it is not safe
+ * @example
+ * ordinalSubject(1e23); // => 1e15
+ */
+function ordinalSubject(value: number): number {
+	if (Number.isSafeInteger(value)) return value;
+
+	const digits = new Intl.NumberFormat('en-US', { useGrouping: false }).format(Math.abs(value));
+	return 1e15 + Number(digits.slice(-6));
 }
 
 /**

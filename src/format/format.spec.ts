@@ -618,6 +618,14 @@ describe('Format helpers', function () {
 	});
 
 	describe('formatOrdinal', function () {
+		it('picks the suffix of the printed digits above 2^53, not of the exact double', function () {
+			// 1e23 is exactly 99999999999999991611392 but prints as 100…000; 2^57 prints as …870 but is …872.
+			expect(helpers.formatOrdinal(1e23)).toBe('100,000,000,000,000,000,000,000th');
+			expect(helpers.formatOrdinal(2 ** 57)).toBe('144,115,188,075,855,870th');
+			expect(helpers.formatOrdinal(-(2 ** 57))).toBe('-144,115,188,075,855,870th');
+			expect(helpers.formatOrdinal(2 ** 53)).toBe('9,007,199,254,740,992nd');
+		});
+
 		it('should use English suffixes for English locales', function () {
 			const expected: Record<number, string> = {
 				1: '1st',
