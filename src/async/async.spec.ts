@@ -204,6 +204,18 @@ describe('Async helpers', function () {
 	});
 
 	describe('withTimeout', function () {
+		it('should handle the rejection of the promise when `ms` is invalid', async function () {
+			const unhandled = jest.fn();
+			process.on('unhandledRejection', unhandled);
+			try {
+				await expect(withTimeout(Promise.reject(new Error('inner')), -1)).rejects.toThrow(RangeError);
+				await new Promise(setImmediate);
+				expect(unhandled).not.toHaveBeenCalled();
+			} finally {
+				process.off('unhandledRejection', unhandled);
+			}
+		});
+
 		it('should resolve with the value when the promise settles in time and clear the timer', async function () {
 			jest.useFakeTimers();
 
@@ -255,6 +267,20 @@ describe('Async helpers', function () {
 	});
 
 	describe('retry', function () {
+		it('should keep a zero delay at zero when the backoff factor overflows', async function () {
+			let attempts = 0;
+			const result = await retry(
+				function () {
+					attempts++;
+					if (attempts < 5) throw new Error('busy');
+					return 'ok';
+				},
+				{ retries: 5, delay: 0, factor: 1e300 }
+			);
+			expect(result).toBe('ok');
+			expect(attempts).toBe(5);
+		});
+
 		it('should validate the jitter random generator like the other modules do', async function () {
 			const failing = jest.fn(function () {
 				throw new Error('busy');
@@ -1444,6 +1470,18 @@ describe('Async helpers (round 2)', function () {
 	});
 
 	describe('abortable', function () {
+		it('should handle the rejection of the promise when `signal` is invalid', async function () {
+			const unhandled = jest.fn();
+			process.on('unhandledRejection', unhandled);
+			try {
+				await expect(abortable(Promise.reject(new Error('inner')), {} as any)).rejects.toThrow(TypeError);
+				await new Promise(setImmediate);
+				expect(unhandled).not.toHaveBeenCalled();
+			} finally {
+				process.off('unhandledRejection', unhandled);
+			}
+		});
+
 		it('should resolve like the promise and remove its listener', async function () {
 			const signal = new CountingSignal();
 			const promise = abortable(Promise.resolve('value'), signal);
@@ -1764,6 +1802,37 @@ describe('Async helpers (round 11)', function () {
 	});
 
 	describe('filterWithConcurrency', function () {
+		it('does not read `items` when the signal is already aborted, like mapWithConcurrency', async function () {
+			let pulled = 0;
+			/**
+			 * @yields {number} 0, 1 and 2, counting the reads
+			 */
+			function* counting(): Generator<number> {
+				for (let i = 0; i < 3; i++) {
+					pulled++;
+					yield i;
+				}
+			}
+			const controller = new AbortController();
+			controller.abort(new AbortError('stopped'));
+			await expect(
+				filterWithConcurrency(
+					counting(),
+					function () {
+						return true;
+					},
+					{ signal: controller.signal }
+				)
+			).rejects.toThrow('stopped');
+			expect(pulled).toBe(0);
+			// Array-likes are still accepted, as by Array.from.
+			await expect(
+				filterWithConcurrency({ length: 2, 0: 'a', 1: 'b' } as unknown as Iterable<string>, function (value) {
+					return value === 'b';
+				})
+			).resolves.toEqual(['b']);
+		});
+
 		it('keeps the items whose (async) predicate is truthy, in input order', async function () {
 			const result = await filterWithConcurrency(
 				[5, 1, 4, 2, 3],

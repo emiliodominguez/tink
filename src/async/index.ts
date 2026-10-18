@@ -194,13 +194,20 @@ export function sleep(ms: number, options: SleepOptions = {}): Promise<void> {
  */
 export function withTimeout<T>(promise: PromiseLike<T> | T, ms: number, message?: string): Promise<T> {
 	return new Promise<T>(function (resolve, reject) {
-		assertDelay('withTimeout', 'ms', ms);
+		const settled = Promise.resolve(promise);
+		try {
+			assertDelay('withTimeout', 'ms', ms);
+		} catch (error) {
+			// The argument error wins, but `promise` may still reject: handle it so it does not surface as an unhandled rejection.
+			settled.catch(noop);
+			throw error;
+		}
 
 		const timer = setTimeout(function () {
 			reject(new TimeoutError(message ?? `Operation timed out after ${ms} ms`));
 		}, ms);
 
-		Promise.resolve(promise).then(
+		settled.then(
 			function (value) {
 				clearTimeout(timer);
 				resolve(value);
@@ -260,7 +267,8 @@ export async function retry<T>(fn: (attempt: number) => Promise<T> | T, options:
 
 			onRetry?.(error, attempt);
 
-			const base = Math.min(delay * factor ** (attempt - 1), maxDelay, MAX_TIMEOUT);
+			// A zero delay stays zero: once `factor ** n` overflows, `0 * Infinity` would be `NaN`.
+			const base = delay === 0 ? 0 : Math.min(delay * factor ** (attempt - 1), maxDelay, MAX_TIMEOUT);
 			const wait = jitter ? draw('retry', random) * base : base;
 
 			// Always yield to the event loop, even for a zero delay: a synchronously throwing `fn` with `retries: Infinity` would otherwise
@@ -562,8 +570,18 @@ export function filterWithConcurrency<T>(items: Iterable<T>, predicate: Concurre
  * @returns {Promise<T[]>} The kept items, in input order
  */
 export async function filterWithConcurrency<T>(items: Iterable<T>, predicate: ConcurrentCallback<T, unknown>, options?: number | ConcurrencyOptions): Promise<T[]> {
-	const list = Array.from(items);
-	const keep = await runConcurrently('filterWithConcurrency', 'predicate', list, predicate as ConcurrentCallback<unknown, unknown>, options);
+	let list: T[] = [];
+
+	/**
+	 * Reads `items` only when `runConcurrently` does, after it has checked the arguments and the signal (as for `mapWithConcurrency`).
+	 * @yields {T} The items, kept in `list` to filter them afterwards
+	 */
+	function* deferred(): Generator<T> {
+		list = Array.from(items);
+		yield* list;
+	}
+
+	const keep = await runConcurrently('filterWithConcurrency', 'predicate', { [Symbol.iterator]: deferred }, predicate as ConcurrentCallback<unknown, unknown>, options);
 
 	return list.filter(function (_, index) {
 		return keep[index];
@@ -1885,7 +1903,14 @@ function combineSignals(caller: string, inputs: AbortSignalLike[]): [AbortSignal
  */
 export function abortable<T>(promise: PromiseLike<T> | T, signal: AbortSignalLike | null | undefined): Promise<T> {
 	return new Promise<T>(function (resolve, reject) {
-		assertOptionalSignal('abortable', 'signal', signal);
+		const settled = Promise.resolve(promise);
+		try {
+			assertOptionalSignal('abortable', 'signal', signal);
+		} catch (error) {
+			// The argument error wins, but `promise` may still reject: handle it so it does not surface as an unhandled rejection.
+			settled.catch(noop);
+			throw error;
+		}
 
 		/**
 		 * Abort listener: rejects with the abort reason.
@@ -1895,7 +1920,7 @@ export function abortable<T>(promise: PromiseLike<T> | T, signal: AbortSignalLik
 			reject(abortReason(signal as AbortSignalLike));
 		}
 
-		Promise.resolve(promise).then(
+		settled.then(
 			function (value) {
 				signal?.removeEventListener('abort', onAbort);
 				resolve(value);
