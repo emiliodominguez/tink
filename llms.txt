@@ -1,6 +1,6 @@
 # tink (tinkit)
 
-> Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities (20 modules, 579 exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, fuzzy search, caches, emitters and stores. Property-tested and mutation-tested.
+> Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities (20 modules, 591 exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, fuzzy search, caches, emitters and stores. Property-tested and mutation-tested.
 
 Key facts for code generation:
 - ESM only, zero dependencies, Node >= 20.19 or any modern browser/runtime. TypeScript types ship in the package.
@@ -9,6 +9,7 @@ Key facts for code generation:
 - Invalid arguments throw `TypeError` (wrong type) or `RangeError` (invalid value) whose message names the function and the parameter (`fn: param must be …, got …`).
 - Randomised helpers take an optional `random` generator last; the default is `Math.random`. Pass `secureRandom` (random module) for tokens, OTPs and lotteries.
 - Type guards compose into validators: `isShape`, `isArrayOf`, `isUnion`, `isOptional`…; `explain` lists issues with paths, `ensure` throws a `ValidationError`, `toStandardSchema` adapts any guard for tRPC, TanStack Form, Hono and other Standard Schema consumers.
+- To convert as well as check (environment variables, query strings, forms, API payloads), use `parse`/`safeParse` from `tinkit/validate` with a plain object of guards and parsers: `parse({ PORT: withDefault(asInteger, 3000), DEBUG: withDefault(asBoolean, false), DATABASE_URL: isUrl }, process.env)`. Unknown keys are stripped; `asNumber`, `asInteger`, `asBoolean` and `asDate` coerce strictly (`''` and `'false'` are not `0` and `true`); `optional`, `withDefault`, `transform`, `chain` and `arrayOf` compose; every parser is a Standard Schema validator, and zod schemas can be nested.
 
 ## Modules
 
@@ -24,7 +25,7 @@ Key facts for code generation:
 - [search](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#search): Fuzzy matching and ranking with highlight ranges, for command palettes and filter-as-you-type UIs. Import from `tinkit/search`.
 - [easing](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#easing): Animation easing curves, CSS-accurate cubic-bezier() and steps(), and an analytic spring. Import from `tinkit/easing`.
 - [format](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#format): Deterministic, cached Intl formatting: numbers, currency, percent, compact, units, lists, dates, ordinals. Import from `tinkit/format`.
-- [validate](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#validate): Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates. Import from `tinkit/validate`.
+- [validate](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#validate): Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates, and zod-like parsing with coercion, defaults and transforms. Import from `tinkit/validate`.
 - [date](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#date): DST-safe, non-mutating local-time date arithmetic, formatting and parsing. Import from `tinkit/date`.
 - [iterables](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#iterables): Lazy, generator-based pipelines over any (async) iterable, with exact pull counts and early-exit cleanup. Import from `tinkit/iterables`.
 - [cache](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#cache): O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock; plugs into memoize. Import from `tinkit/cache`.

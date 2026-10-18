@@ -7,6 +7,7 @@ Key facts for code generation:
 - Invalid arguments throw `TypeError` (wrong type) or `RangeError` (invalid value) whose message names the function and the parameter (`fn: param must be …, got …`).
 - Randomised helpers take an optional `random` generator last; the default is `Math.random`. Pass `secureRandom` (random module) for tokens, OTPs and lotteries.
 - Type guards compose into validators: `isShape`, `isArrayOf`, `isUnion`, `isOptional`…; `explain` lists issues with paths, `ensure` throws a `ValidationError`, `toStandardSchema` adapts any guard for tRPC, TanStack Form, Hono and other Standard Schema consumers.
+- To convert as well as check (environment variables, query strings, forms, API payloads), use `parse`/`safeParse` from `tinkit/validate` with a plain object of guards and parsers: `parse({ PORT: withDefault(asInteger, 3000), DEBUG: withDefault(asBoolean, false), DATABASE_URL: isUrl }, process.env)`. Unknown keys are stripped; `asNumber`, `asInteger`, `asBoolean` and `asDate` coerce strictly (`''` and `'false'` are not `0` and `true`); `optional`, `withDefault`, `transform`, `chain` and `arrayOf` compose; every parser is a Standard Schema validator, and zod schemas can be nested.
 
 ## arrays
 
@@ -203,6 +204,10 @@ Import: `import { … } from 'tinkit/guards';`
 - `withMessage<T>(guard: Guard<T>, message: string | ((value: unknown) => string)): (value: unknown) => value is T` — Wraps a guard so that `explain` (and `ensure`, `toStandardSchema`) reports `message` instead of the inner issues when it fails.
 - `isLiteral<const T extends Primitive>(value: T): (value: unknown) => value is T` — Creates a guard accepting exactly one primitive value (`z.literal()`), compared with SameValueZero: `isLiteral(NaN)` accepts `NaN` and `isLiteral(0)` accepts `-0`.
 - `isNumberInRange(min: number, max: number): (value: unknown) => value is number` — Creates a guard accepting finite numbers between `min` and `max`, both inclusive.
+- `isIntegerInRange(min: number, max: number): (value: unknown) => value is number` — Creates a guard accepting integers between `min` and `max`, both inclusive (`z.number().int().min().max()`): ports, ages, page numbers.
+- `isStringOfLength(min: number, max: number): (value: unknown) => value is string` — Creates a guard accepting strings whose length (in UTF-16 code units, like `String#length` and zod) is between `min` and `max`, both inclusive: `isStringOfLength(1, 50)` is `z.string().min(1).max(50)`.
+- `isStringMatching(pattern: RegExp): (value: unknown) => value is string` — Creates a guard accepting strings that match `pattern` (`z.string().regex()`).
+- `isDiscriminatedUnion<const K extends string, const V extends ShapeGuards>(key: K, variants: V): (value: unknown) => value is DiscriminatedUnionType<K, V>` — Creates a guard for a discriminated (tagged) union (`z.discriminatedUnion()`): objects whose OWN string property `key` names one of the `variants`, and that pass that variant's guard.
 - `isIntersection<const G extends ReadonlyArray<Guard<unknown>>>(...guards: G): (value: unknown) => value is UnionToIntersection<Infer<G[number]>>` — Creates a guard that passes when EVERY one of `guards` passes, narrowing to the intersection of their types (`z.intersection()`).
 - `refine<T, U extends T>(guard: Guard<T>, predicate: (value: T) => value is U, message?: string | ((value: T) => string)): (value: unknown) => value is U` — Creates a guard that passes when `guard` passes AND `predicate` accepts the (narrowed) value (`.refine()` in zod).
 - `isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is T` — Creates a guard that defers to the guard returned by `getter`, called once on first use: the way to write recursive schemas (`z.lazy()`), whose guard must refer to itself before it exists.
@@ -509,7 +514,7 @@ Import: `import { … } from 'tinkit/format';`
 
 ## validate
 
-Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates.
+Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates, and zod-like parsing with coercion, defaults and transforms.
 Import: `import { … } from 'tinkit/validate';`
 
 - `isEmail(value: unknown): value is string` — Checks whether a value is an email address, using the WHATWG HTML "valid email address" grammar (the one browsers apply to `<input type="email">`) plus the usual length limits: at most 64 characters before the `@`, 254 characters in total and 63 characters per domain label.
@@ -531,6 +536,14 @@ Import: `import { … } from 'tinkit/validate';`
 - `isSlug(value: unknown): value is string` — Checks whether a value is a URL slug: lowercase ASCII letters and digits in runs separated by single hyphens, with no leading or trailing hyphen.
 - `isNumericString(value: unknown): value is string` — Checks whether a value is a string holding a finite decimal number: an optional sign, digits with an optional fraction (`1`, `1.5`, `1.`, `.5`) and an optional exponent (`1e-7`, `2.5E+3`).
 - `parseJson(text: string, options?: ParseJsonOptions): ParseJsonResult<JsonValue>` — Parses JSON text without throwing, returning a `[error, value]` tuple (see `ParseJsonResult`).
+- `parse<S extends Schema>(schema: S, value: unknown): SchemaOutput<S>` — Parses `value` with `schema` and returns the output, or throws a `ValidationError` listing every problem with its path.
+- `safeParse<S extends Schema>(schema: S, value: unknown): ParseResult<SchemaOutput<S>>` — Parses `value` with `schema` like `parse`, but returns a `[error, value]` tuple instead of throwing for invalid data (zod's `safeParse`, shaped like `parseJson`'s result).
+- `toParser<S extends Schema>(schema: S): Parser<SchemaOutput<S>>` — Turns any `Schema` into a `Parser`: a Standard Schema validator to hand to tRPC, TanStack Form, Hono and the rest of the ecosystem, with the coercions, defaults and transforms of the schema applied to its output.
+- `withDefault<S extends Schema>(schema: S, fallback: Exclude<SchemaOutput<S>, undefined> | (() => Exclude<SchemaOutput<S>, undefined>)): Parser<Exclude<SchemaOutput<S>, undefined>>` — Creates a parser that returns `fallback` when the value is `undefined` (missing), and parses it with `schema` otherwise (`.default()` in zod).
+- `optional<S extends Schema>(schema: S): Parser<SchemaOutput<S> | undefined>` — Creates a parser that accepts `undefined` (returned as is) and parses any other value with `schema`: in an object schema the key becomes optional (`.optional()` in zod).
+- `transform<S extends Schema, U>(schema: S, fn: (value: SchemaOutput<S>) => U): Parser<U>` — Creates a parser that parses the value with `schema`, then maps the output with `fn` (`.transform()` in zod).
+- `chain<A extends Schema, B extends Schema>(first: A, second: B): Parser<SchemaOutput<B>>` — Creates a parser that parses the value with `first`, then parses its output with `second` (`.pipe()` in zod): coerce, then check.
+- `arrayOf<S extends Schema>(schema: S): Parser<SchemaOutput<S>[]>` — Creates a parser for arrays whose elements are parsed with `schema`, returning a new array of the outputs (`z.array()`).
 
 ## date
 
