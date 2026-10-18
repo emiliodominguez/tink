@@ -11,7 +11,7 @@
 Collection helpers: set algebra, grouping, chunking, sorting, sampling.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/arrays';
+import { … } from '@emiliodominguez/tink/arrays';
 ```
 
 | Export                     | Description                                                                                                                                                                                                                  |
@@ -64,7 +64,7 @@ import { … } from '@emiliodominguez/js-helpers/arrays';
 Shallow/deep cloning, merging, equality, path access and object reshaping.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/objects';
+import { … } from '@emiliodominguez/tink/objects';
 ```
 
 | Export                   | Description                                                                                                                                                                |
@@ -105,7 +105,7 @@ import { … } from '@emiliodominguez/js-helpers/objects';
 Runtime type predicates that narrow `unknown` values.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/guards';
+import { … } from '@emiliodominguez/tink/guards';
 ```
 
 | Export                     | Description                                                                                                                                                                                                                      |
@@ -155,7 +155,7 @@ import { … } from '@emiliodominguez/js-helpers/guards';
 Unicode-aware transformations, case conversion, escaping, templating and text metrics.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/strings';
+import { … } from '@emiliodominguez/tink/strings';
 ```
 
 | Export                | Description                                                                                                                                                                                                                                                                                              |
@@ -210,7 +210,7 @@ import { … } from '@emiliodominguez/js-helpers/strings';
 Query-string building and parsing, URL joining and query merging, without URL object types.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/url';
+import { … } from '@emiliodominguez/tink/url';
 ```
 
 | Export             | Description                                                                                                                                                       |
@@ -227,7 +227,7 @@ import { … } from '@emiliodominguez/js-helpers/url';
 Precise arithmetic, statistics, number theory and random numbers.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/math';
+import { … } from '@emiliodominguez/tink/math';
 ```
 
 | Export               | Description                                                                                                                                                                                                                                                                                            |
@@ -282,7 +282,7 @@ import { … } from '@emiliodominguez/js-helpers/math';
 Function composition, currying, memoization and rate limiting.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/functions';
+import { … } from '@emiliodominguez/tink/functions';
 ```
 
 | Export              | Description                                                                                                                                                                                                                 |
@@ -315,7 +315,7 @@ import { … } from '@emiliodominguez/js-helpers/functions';
 Promise utilities: retries, timeouts, polling, limiters, keyed Promise.all and async debounce.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/async';
+import { … } from '@emiliodominguez/tink/async';
 ```
 
 | Export                    | Description                                                                                                                                                                                                                                                       |
@@ -344,7 +344,7 @@ import { … } from '@emiliodominguez/js-helpers/async';
 Hex/RGB/HSL conversion, mixing, lightening and WCAG contrast checks.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/color';
+import { … } from '@emiliodominguez/tink/color';
 ```
 
 | Export                 | Description                                                                                                                                                                                                                                                                                                   |
@@ -371,7 +371,7 @@ import { … } from '@emiliodominguez/js-helpers/color';
 Fuzzy matching and ranking with highlight ranges, for command palettes and filter-as-you-type UIs.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/search';
+import { … } from '@emiliodominguez/tink/search';
 ```
 
 | Export        | Description                                                                                                                                                                                             |
@@ -385,7 +385,7 @@ import { … } from '@emiliodominguez/js-helpers/search';
 Animation easing curves, CSS-accurate cubic-bezier() and steps(), and an analytic spring.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/easing';
+import { … } from '@emiliodominguez/tink/easing';
 ```
 
 | Export          | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -412,7 +412,7 @@ import { … } from '@emiliodominguez/js-helpers/easing';
 Deterministic, cached Intl formatting: numbers, currency, percent, compact, units, lists, dates, ordinals.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/format';
+import { … } from '@emiliodominguez/tink/format';
 ```
 
 | Export               | Description                                                                                                                                                                                                                        |
@@ -433,7 +433,7 @@ import { … } from '@emiliodominguez/js-helpers/format';
 Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/validate';
+import { … } from '@emiliodominguez/tink/validate';
 ```
 
 | Export                | Description                                                                                                                                                                                                                                                                                                                                                                                                                 |
@@ -462,7 +462,7 @@ import { … } from '@emiliodominguez/js-helpers/validate';
 DST-safe, non-mutating local-time date arithmetic, formatting and parsing.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/date';
+import { … } from '@emiliodominguez/tink/date';
 ```
 
 | Export               | Description                                                                                                                                                                                                                                                                                                                                                              |
@@ -528,7 +528,7 @@ import { … } from '@emiliodominguez/js-helpers/date';
 Lazy, generator-based pipelines over any (async) iterable, with exact pull counts and early-exit cleanup.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/iterables';
+import { … } from '@emiliodominguez/tink/iterables';
 ```
 
 | Export         | Description                                                                                                                                                                                                                     |
@@ -571,7 +571,7 @@ import { … } from '@emiliodominguez/js-helpers/iterables';
 O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock; plugs into memoize.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/cache';
+import { … } from '@emiliodominguez/tink/cache';
 ```
 
 | Export           | Description                                                                                                                                                                                                                                   |
@@ -583,7 +583,7 @@ import { … } from '@emiliodominguez/js-helpers/cache';
 Typed event emitter with wildcard listeners, waitFor and error isolation.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/emitter';
+import { … } from '@emiliodominguez/tink/emitter';
 ```
 
 | Export          | Description                                          |
@@ -595,7 +595,7 @@ import { … } from '@emiliodominguez/js-helpers/emitter';
 Tiny state store compatible with React useSyncExternalStore, with derived selectors.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/store';
+import { … } from '@emiliodominguez/tink/store';
 ```
 
 | Export        | Description                                                                                                                                                                                             |
@@ -607,7 +607,7 @@ import { … } from '@emiliodominguez/js-helpers/store';
 Seeded deterministic PRNG plus cryptographically secure ids, UUIDs and bytes.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/random';
+import { … } from '@emiliodominguez/tink/random';
 ```
 
 | Export           | Description                                                                                                |
@@ -625,7 +625,7 @@ import { … } from '@emiliodominguez/js-helpers/random';
 Class decorators for TypeScript (legacy and TC39 standard) and Babel.
 
 ```ts
-import { … } from '@emiliodominguez/js-helpers/decorators';
+import { … } from '@emiliodominguez/tink/decorators';
 ```
 
 | Export       | Description                                                                                                                                                                                                                                                                                                                  |
