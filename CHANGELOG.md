@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.1
+
+API clean-up shipped right after the first release (1.0.0 is deprecated; nothing depended on it yet):
+
+- **Renamed** the path helpers to short, consistent names: `getPath`, `setPath`, `hasPath`, `deletePath`, `updatePath` and `omitPath` (were `getFromObjectByKeys`, `setInObjectByKeys`, `hasInObjectByKeys`, `deleteFromObjectByKeys`, `updateInObjectByKeys` and `omitInObjectByKeys`), and `removeDuplicates` to `unique`, matching `uniqueBy`, `uniqueWith` and `iterables.unique`.
+- **Removed** the type-guard re-exports from `objects` (import guards from `tinkit/guards`) and the unused `DeepPartial`, `UnArray` and `NestedPick` types.
+- **Docs:** new README banner, rendered from `docs/assets/banner.html`.
+
 ## 1.0.0
 
 Initial release of **tinkit** (`npm install tinkit`): strictly typed, zero-dependency, tree-shakeable utilities, published as ESM for Node 20.19+ and modern browsers.
