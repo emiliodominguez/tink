@@ -1,6 +1,17 @@
 import { daysInMonth } from '../date/index.js';
-import { explain, ValidationError, type Guard, type JsonValue } from '../guards/index.js';
+import {
+	explain,
+	isDate,
+	isPlainObject,
+	ValidationError,
+	type Guard,
+	type JsonValue,
+	type SchemaIssue,
+	type StandardSchemaResult,
+	type StandardSchemaV1
+} from '../guards/index.js';
 import { describe } from '../utils/assert.js';
+import type { AnyFunction } from '../utils/index.js';
 
 /**
  * Options accepted by {@link isUrl}.
@@ -974,3 +985,1087 @@ export function parseJson(text: string, guardOrOptions?: Guard<unknown> | ParseJ
 
 	return [undefined, value];
 }
+
+/** What a {@link Fast} parse returns for an invalid value. */
+const FAIL = Symbol('tink.fail');
+
+/**
+ * Parses `value` without reporting anything: returns the output, or {@link FAIL} at the first problem. Valid values (the common case)
+ * only take this path; invalid ones are parsed again by the schema's {@link Run}, which builds the issues and their paths.
+ */
+type Fast = (value: unknown) => unknown;
+
+/**
+ * Parses `value` in reporting mode: returns the output, pushing an issue (with the path of the offending value) for every problem
+ * found. When issues were added, the output is meaningless. Only called after the {@link Fast} parse of the same schema failed for
+ * `value` (see {@link rerun}); it may still succeed when the schema is not deterministic.
+ */
+type Run = (value: unknown, path: PropertyKey[], issues: SchemaIssue[]) => unknown;
+
+/** A compiled schema. */
+interface Node {
+	/** The non-reporting parse. */
+	readonly fast: Fast;
+	/** The reporting parse. */
+	readonly run: Run;
+	/** The guard, when the schema is a guard (its output is then its input). */
+	readonly guard: Guard<unknown> | undefined;
+}
+
+/** A parser created by this module. */
+interface CompiledParser<T> extends StandardSchemaV1<unknown, T> {
+	/**
+	 * The compiled schema, so that nesting a parser skips the Standard Schema adapter. A plain string key (like `'~standard'`), not a
+	 * symbol: a computed key would keep the exported parser constants, and everything they reference, in every bundle of the module.
+	 */
+	readonly '~tink': Node;
+}
+
+/** Guards, foreign Standard Schema validators and object schemas, compiled on first use. */
+const compiled = new WeakMap<object, Node>();
+
+/** Whether `new Function` works here: unknown until the first object schema is compiled, `false` under a CSP without `'unsafe-eval'`. */
+let jit: boolean | undefined;
+
+/**
+ * A parser: a [Standard Schema](https://standardschema.dev) validator whose output may differ from its input (a number parsed from a
+ * string, a default filled in, a transformed value). Built by {@link asNumber}, {@link withDefault}, {@link toParser} and the other
+ * parser helpers of this module; run it with {@link parse} or {@link safeParse}, or hand it to tRPC, TanStack Form, Hono and every other
+ * Standard Schema consumer.
+ * @template T - The output type
+ */
+export type Parser<T> = StandardSchemaV1<unknown, T>;
+
+/**
+ * Any [Standard Schema](https://standardschema.dev) v1 validator: the parsers of this module, the guards module's `toStandardSchema`,
+ * zod, valibot, ArkType… Only synchronous validators can be used in a {@link Schema}.
+ */
+export interface StandardSchemaLike {
+	/** The Standard Schema properties. */
+	readonly '~standard': {
+		/** The Standard Schema version (always `1`). */
+		readonly version: 1;
+		/** The library that created the validator. */
+		readonly vendor: string;
+		/** Validates an unknown value. */
+		readonly validate: (value: unknown) => unknown;
+		/** Type-only carrier of the output type. */
+		readonly types?: { readonly output: unknown } | undefined;
+	};
+}
+
+/**
+ * A plain object of schemas: parses an object whose properties match, and returns a NEW object with only these keys (unknown keys
+ * are stripped, like `z.object()`).
+ */
+export interface ObjectSchema {
+	readonly [key: string]: Schema;
+}
+
+/**
+ * What {@link parse} accepts:
+ * - a guard (`isString`, `isUrl`, `isShape(…)`…): the value must pass it and is returned unchanged;
+ * - a parser ({@link asInteger}, {@link withDefault}, {@link arrayOf}…) or any synchronous Standard Schema validator (zod included):
+ *   its output is returned;
+ * - a plain object of schemas ({@link ObjectSchema}), nested as deep as needed.
+ */
+export type Schema = Guard<unknown> | StandardSchemaLike | ObjectSchema;
+
+/**
+ * The output type of a {@link Schema}: the guarded type of a guard, the output of a parser or Standard Schema validator, and for object
+ * schemas an object type whose properties are optional when their output can be `undefined`.
+ * @template S - The schema
+ * @example
+ * const schema = { port: withDefault(asInteger, 3000), host: isUrl };
+ * type Config = SchemaOutput<typeof schema>; // { port: number; host: string }
+ */
+export type SchemaOutput<S> = S extends ((value: unknown) => value is infer T)
+	? T
+	: S extends { readonly '~standard': { readonly types?: infer Types } }
+		? NonNullable<Types> extends { readonly output: infer O }
+			? O
+			: unknown
+		: S extends ObjectSchema
+			? // An index signature (the `ObjectSchema` type itself) has no known keys: stop there instead of recursing forever.
+				string extends keyof S
+				? Record<string, unknown>
+				: ObjectOutput<S>
+			: never;
+
+/**
+ * The output type of an {@link ObjectSchema}.
+ * @template S - The object schema
+ */
+type ObjectOutput<S extends ObjectSchema> = {
+	-readonly [K in keyof S as undefined extends SchemaOutput<S[K]> ? never : K]: SchemaOutput<S[K]>;
+} & {
+	-readonly [K in keyof S as undefined extends SchemaOutput<S[K]> ? K : never]?: SchemaOutput<S[K]>;
+} extends infer O
+	? { [K in keyof O]: O[K] }
+	: never;
+
+/**
+ * The outcome of {@link safeParse}: `[undefined, value]` on success, `[error, undefined]` on failure, like {@link parseJson}.
+ * @template T - The parsed type
+ */
+export type ParseResult<T> = [error: ValidationError, value: undefined] | [error: undefined, value: T];
+
+/**
+ * Builds the `TypeError` thrown for something that is not a {@link Schema}.
+ * @param {string} caller - The public function name
+ * @param {string} name - The schema's name in the message, e.g. `schema.user.tags`
+ * @param {unknown} schema - The offending value
+ * @returns {TypeError} The error
+ */
+function invalidSchema(caller: string, name: string, schema: unknown): TypeError {
+	return new TypeError(
+		Array.isArray(schema)
+			? `${caller}: \`${name}\` must be a guard, a parser or a plain object of schemas, got array (use arrayOf for arrays)`
+			: `${caller}: \`${name}\` must be a guard, a parser or a plain object of schemas, got ${describe(schema)}`
+	);
+}
+
+/**
+ * Compiles a schema, caching guards, Standard Schema validators and object schemas.
+ * @param {string} caller - The public function name, for errors
+ * @param {string} name - The schema's name, for errors
+ * @param {unknown} schema - The schema
+ * @param {object[]} ancestors - The object schemas being compiled around this one (to detect cycles)
+ * @returns {Node} The compiled schema
+ * @throws {TypeError} when `schema` is not a {@link Schema}, or contains itself
+ */
+function compile(caller: string, name: string, schema: unknown, ancestors: object[]): Node {
+	if ((typeof schema !== 'function' && typeof schema !== 'object') || schema === null) throw invalidSchema(caller, name, schema);
+
+	const own = (schema as Partial<CompiledParser<unknown>>)['~tink'];
+
+	if (own !== undefined) return own;
+
+	let node = compiled.get(schema);
+
+	if (node !== undefined) return node;
+	if (typeof schema === 'function') node = guardNode(schema as Guard<unknown>);
+	else if (isStandardSchema(schema)) node = standardNode(schema);
+	else if (isPlainObject(schema)) node = objectNode(caller, name, schema as ObjectSchema, ancestors);
+	else throw invalidSchema(caller, name, schema);
+	compiled.set(schema, node);
+
+	return node;
+}
+
+/**
+ * Whether `value` looks like a Standard Schema validator.
+ * @param {object} value - A non-null object
+ * @returns {boolean} `true` when `value['~standard'].validate` is a function
+ */
+function isStandardSchema(value: object): value is StandardSchemaLike {
+	const props = (value as Partial<StandardSchemaLike>)['~standard'];
+
+	return typeof props === 'object' && props !== null && typeof props.validate === 'function';
+}
+
+/**
+ * Compiles a guard: valid values are returned as they are, invalid ones are explained (see the guards module's `explain`).
+ * @param {Guard<unknown>} guard - The guard
+ * @returns {Node} The compiled guard
+ */
+function guardNode(guard: Guard<unknown>): Node {
+	return {
+		fast: function fastGuard(value: unknown): unknown {
+			return guard(value) ? value : FAIL;
+		},
+		run: function runGuard(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			if (guard(value)) return value;
+
+			const found = explain(guard, value);
+
+			// A guard that rejected the value but accepts it when explained (it is not deterministic) still fails.
+			if (found.length === 0) issues.push({ message: `Invalid value (got ${describe(value)})`, path: path.slice() });
+			for (const issue of found) issues.push({ message: issue.message, path: [...path, ...issue.path] });
+
+			return value;
+		},
+		guard
+	};
+}
+
+/**
+ * Compiles a foreign Standard Schema validator (zod, valibot…). Its issue paths, which may hold `{ key }` segments, are flattened to keys.
+ * @param {StandardSchemaLike} schema - The validator
+ * @returns {Node} The compiled validator
+ */
+function standardNode(schema: StandardSchemaLike): Node {
+	const props = schema['~standard'];
+
+	/**
+	 * Calls the validator.
+	 * @param {unknown} value - The value
+	 * @returns {StandardSchemaResult<unknown>} Its result
+	 * @throws {TypeError} when the validator returns a promise
+	 */
+	function check(value: unknown): StandardSchemaResult<unknown> {
+		const result = props.validate(value) as StandardSchemaResult<unknown> | PromiseLike<unknown>;
+
+		if (typeof (result as PromiseLike<unknown>).then === 'function') {
+			throw new TypeError('parse: Standard Schema validators must be synchronous, got one returning a promise');
+		}
+
+		return result as StandardSchemaResult<unknown>;
+	}
+
+	return {
+		fast: function fastStandard(value: unknown): unknown {
+			const result = check(value);
+
+			return result.issues === undefined ? result.value : FAIL;
+		},
+		run: function runStandard(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			const result = check(value);
+			const found = result.issues;
+
+			if (found === undefined) return result.value;
+			if (found.length === 0) issues.push({ message: `Invalid value (got ${describe(value)})`, path: path.slice() });
+			for (const issue of found as ReadonlyArray<{ readonly message: string; readonly path?: ReadonlyArray<PropertyKey | { readonly key: PropertyKey }> }>) {
+				const segments = (issue.path ?? []).map(function (segment: PropertyKey | { readonly key: PropertyKey }): PropertyKey {
+					return typeof segment === 'object' ? segment.key : segment;
+				});
+
+				issues.push({ message: issue.message, path: [...path, ...segments] });
+			}
+
+			return undefined;
+		},
+		guard: undefined
+	};
+}
+
+/**
+ * Sets `output[key]`, as an own property even for `__proto__` (a plain assignment would replace the prototype instead).
+ * @param {Record<string, unknown>} output - The object being built
+ * @param {string} key - The key
+ * @param {unknown} value - The value
+ * @returns {void}
+ */
+function assign(output: Record<string, unknown>, key: string, value: unknown): void {
+	if (key === '__proto__') Object.defineProperty(output, key, { value, enumerable: true, writable: true, configurable: true });
+	else output[key] = value;
+}
+
+/**
+ * Compiles an object schema. Its fast parse is generated code when `new Function` is available (see {@link generateObject}),
+ * and {@link objectLoop} otherwise.
+ * @param {string} caller - The public function name, for errors
+ * @param {string} name - The schema's name, for errors
+ * @param {ObjectSchema} schema - The object schema
+ * @param {object[]} ancestors - The object schemas being compiled around this one
+ * @returns {Node} The compiled schema
+ * @throws {TypeError} when a property is not a {@link Schema}, or the schema contains itself
+ */
+function objectNode(caller: string, name: string, schema: ObjectSchema, ancestors: object[]): Node {
+	if (ancestors.includes(schema)) throw new TypeError(`${caller}: \`${name}\` must be acyclic, got a circular reference`);
+	ancestors.push(schema);
+
+	const keys = Object.keys(schema);
+	const children = keys.map(function (key: string): Node {
+		return compile(caller, `${name}.${key}`, schema[key], ancestors);
+	});
+
+	ancestors.pop();
+
+	const loop = objectLoop(keys, children);
+
+	return { fast: generateObject(keys, children, loop) ?? loop, run: objectRun(keys, children), guard: undefined };
+}
+
+/**
+ * Builds the fast parse of an object schema as a loop over its keys: the fallback when code generation is unavailable, and the path
+ * taken by generated code for objects whose properties might be inherited.
+ * @param {ReadonlyArray<string>} keys - The keys
+ * @param {ReadonlyArray<Node>} children - The compiled schema of each key
+ * @returns {Fast} The fast parse
+ */
+function objectLoop(keys: ReadonlyArray<string>, children: ReadonlyArray<Node>): Fast {
+	return function fastObjectLoop(value: unknown): unknown {
+		if (typeof value !== 'object' || value === null || Array.isArray(value)) return FAIL;
+
+		const output: Record<string, unknown> = {};
+
+		for (let index = 0; index < keys.length; index++) {
+			const key = keys[index];
+			const child = children[index];
+			// Inherited properties never count, so a polluted `Object.prototype` cannot fill in a missing key.
+			const present = hasOwn.call(value, key);
+			let result = present ? (value as Record<string, unknown>)[key] : undefined;
+
+			if (child.guard !== undefined) {
+				if (!child.guard(result)) return FAIL;
+			} else if ((result = child.fast(result)) === FAIL) {
+				return FAIL;
+			}
+			if (result !== undefined || present) assign(output, key, result);
+		}
+
+		return output;
+	};
+}
+
+/**
+ * Generates the fast parse of an object schema: one named property access and one direct call per key, which V8 optimises far better
+ * than a loop over keys (zod 4 does the same). Only the keys reach the generated source, as JSON string literals; guards and parsers
+ * are passed in as arguments. Objects that inherit from `Object.prototype` (or nothing) are read directly once `Object.prototype` is known
+ * to hold none of the keys, since every defined value is then an own property; other objects, and a polluted `Object.prototype`, take `loop`.
+ * @param {ReadonlyArray<string>} keys - The keys
+ * @param {ReadonlyArray<Node>} children - The compiled schema of each key
+ * @param {Fast} loop - The loop to fall back to
+ * @returns {Fast | undefined} The generated parse, or `undefined` when code generation is disabled (CSP, Cloudflare Workers…)
+ */
+function generateObject(keys: ReadonlyArray<string>, children: ReadonlyArray<Node>, loop: Fast): Fast | undefined {
+	if (jit === false) return undefined;
+
+	const literals = keys.map(function (key: string): string {
+		return JSON.stringify(key);
+	});
+	const lines = children.map(function (child: Node, index: number): string {
+		const key = literals[index];
+		const read =
+			child.guard === undefined
+				? `result = c${index}(value[${key}]); if (result === FAIL) return FAIL;`
+				: `result = value[${key}]; if (!c${index}(result)) return FAIL;`;
+
+		return `${read} if (result !== undefined || hasOwn.call(value, ${key})) output[${key}] = result;`;
+	});
+	const source = [
+		...children.map(function (_: Node, index: number): string {
+			return `const c${index} = children[${index}];`;
+		}),
+		'return function fastObject(value) {',
+		"if (typeof value !== 'object' || value === null || isArray(value)) return FAIL;",
+		'const proto = getPrototypeOf(value);',
+		`if ((proto !== OP && proto !== null)${literals
+			.map(function (key: string): string {
+				return ` || ${key} in OP`;
+			})
+			.join('')}) return loop(value);`,
+		'const output = {};',
+		'let result;',
+		...lines,
+		'return output;',
+		'};'
+	].join('\n');
+
+	try {
+		const factory = new Function('FAIL', 'OP', 'isArray', 'getPrototypeOf', 'hasOwn', 'loop', 'children', source) as (...args: unknown[]) => Fast;
+
+		jit = true;
+
+		return factory(
+			FAIL,
+			Object.prototype,
+			Array.isArray,
+			Object.getPrototypeOf,
+			hasOwn,
+			loop,
+			children.map(function (child: Node): AnyFunction {
+				return child.guard ?? child.fast;
+			})
+		);
+	} catch {
+		// Code generation from strings is disallowed (a Content Security Policy without 'unsafe-eval', Cloudflare Workers…).
+		jit = false;
+
+		return undefined;
+	}
+}
+
+/**
+ * Builds the reporting parse of an object schema.
+ * @param {ReadonlyArray<string>} keys - The keys
+ * @param {ReadonlyArray<Node>} children - The compiled schema of each key
+ * @returns {Run} The reporting parse
+ */
+function objectRun(keys: ReadonlyArray<string>, children: ReadonlyArray<Node>): Run {
+	return function runObject(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+		if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+			issues.push({ message: `Expected an object (got ${Array.isArray(value) ? 'array' : describe(value)})`, path: path.slice() });
+
+			return undefined;
+		}
+
+		const output: Record<string, unknown> = {};
+
+		for (let index = 0; index < keys.length; index++) {
+			const key = keys[index];
+			const present = hasOwn.call(value, key);
+			const before = issues.length;
+
+			path.push(key);
+
+			const result = rerun(children[index], present ? (value as Record<string, unknown>)[key] : undefined, path, issues);
+
+			path.pop();
+			if (issues.length > before) {
+				if (!present) {
+					issues.length = before;
+					issues.push({ message: 'Missing required property', path: [...path, key] });
+				}
+			} else if (result !== undefined || present) {
+				assign(output, key, result);
+			}
+		}
+
+		return output;
+	};
+}
+
+/**
+ * Parses a child of an invalid object or array in reporting mode: valid children (usually most of them) take the fast parse, and only
+ * the invalid ones the slower reporting parse.
+ * @param {Node} node - The child's compiled schema
+ * @param {unknown} value - The child value
+ * @param {PropertyKey[]} path - Its path
+ * @param {SchemaIssue[]} issues - Where issues are pushed
+ * @returns {unknown} The output
+ */
+function rerun(node: Node, value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+	const output = node.fast(value);
+
+	return output === FAIL ? node.run(value, path, issues) : output;
+}
+
+/**
+ * Parses `value`: the fast parse first, then, for invalid values only, the reporting parse.
+ * @param {Fast} fast - The fast parse
+ * @param {Run} run - The reporting parse
+ * @param {unknown} value - The value to parse
+ * @param {SchemaIssue[]} issues - Where issues are pushed
+ * @returns {unknown} The output (meaningless when issues were added)
+ */
+function execute(fast: Fast, run: Run, value: unknown, issues: SchemaIssue[]): unknown {
+	const output = fast(value);
+
+	return output === FAIL ? run(value, [], issues) : output;
+}
+
+/**
+ * Parses `value` as a Standard Schema `validate` call.
+ * @param {Fast} fast - The fast parse
+ * @param {Run} run - The reporting parse
+ * @param {unknown} value - The value to parse
+ * @returns {StandardSchemaResult<unknown>} The output, or the issues
+ */
+function validateWith(fast: Fast, run: Run, value: unknown): StandardSchemaResult<unknown> {
+	const issues: SchemaIssue[] = [];
+	const output = execute(fast, run, value, issues);
+
+	return issues.length === 0 ? { value: output } : { issues };
+}
+
+/**
+ * Wraps a compiled schema into a parser.
+ * @template T - The output type
+ * @param {Node} node - The compiled schema
+ * @returns {Parser<T>} The parser
+ */
+function toCompiledParser<T>(node: Node): Parser<T> {
+	return {
+		'~tink': node,
+		'~standard': {
+			version: 1,
+			vendor: 'tink',
+			validate: function validate(value: unknown): StandardSchemaResult<T> {
+				return validateWith(node.fast, node.run, value) as StandardSchemaResult<T>;
+			}
+		}
+	} as CompiledParser<T>;
+}
+
+/**
+ * Parses `value` with `schema` and returns the output, or throws a {@link ValidationError} listing every problem with its path. The
+ * zod-like, zero-dependency way to read environment variables, query strings, form data and API payloads: guards check, parsers
+ * ({@link asInteger}, {@link withDefault}…) convert, and plain objects nest and strip unknown keys.
+ *
+ * Object schemas are compiled on first use and cached, so define schemas once (at module level) and do not mutate them. Where
+ * `new Function` is allowed, an object schema compiles to specialised code (like zod 4's), which makes parsing faster than zod;
+ * under a Content Security Policy without `'unsafe-eval'`, or on Cloudflare Workers, a slower loop is used instead (the first attempt
+ * may log a CSP violation report). Missing and inherited properties are parsed as `undefined` (so a missing key fails with `Missing
+ * required property`, unless its schema accepts `undefined`), and keys whose output is `undefined` are left out when the input lacked
+ * them. Valid input is parsed once; invalid input is parsed a second time to collect every issue with its path.
+ * @template S - The schema
+ * @param {S} schema - A guard, a parser, a Standard Schema validator or a plain object of those (see {@link Schema})
+ * @param {unknown} value - The value to parse
+ * @returns {SchemaOutput<S>} The parsed value
+ * @throws {ValidationError} when `value` does not match `schema`
+ * @throws {TypeError} when `schema` is not a {@link Schema}, or a Standard Schema validator in it is asynchronous
+ * @example
+ * import { isOneOf } from 'tinkit/guards';
+ * const env = parse(
+ *   { PORT: withDefault(asInteger, 3000), DEBUG: withDefault(asBoolean, false), MODE: isOneOf(['dev', 'prod']), DATABASE_URL: isUrl },
+ *   { PORT: '8080', MODE: 'prod', DATABASE_URL: 'https://db.example.com', HOME: '/root' }
+ * );
+ * env; // => { PORT: 8080, DEBUG: false, MODE: 'prod', DATABASE_URL: 'https://db.example.com' } // typed, HOME stripped
+ * parse({ PORT: asInteger }, { PORT: '80.5' }); // throws ValidationError
+ * parse([isUrl], ['https://example.com']); // throws TypeError // arrays take arrayOf(isUrl)
+ */
+export function parse<S extends Schema>(schema: S, value: unknown): SchemaOutput<S> {
+	const node = compile('parse', 'schema', schema, []);
+	const issues: SchemaIssue[] = [];
+	const output = execute(node.fast, node.run, value, issues);
+
+	if (issues.length > 0) throw new ValidationError(issues);
+
+	return output as SchemaOutput<S>;
+}
+
+/**
+ * Parses `value` with `schema` like {@link parse}, but returns a `[error, value]` tuple instead of throwing for invalid data (zod's
+ * `safeParse`, shaped like {@link parseJson}'s result). Invalid schemas still throw.
+ * @template S - The schema
+ * @param {S} schema - A guard, a parser, a Standard Schema validator or a plain object of those (see {@link Schema})
+ * @param {unknown} value - The value to parse
+ * @returns {ParseResult<SchemaOutput<S>>} `[undefined, output]` on success, `[ValidationError, undefined]` on failure
+ * @throws {TypeError} when `schema` is not a {@link Schema}, or a Standard Schema validator in it is asynchronous
+ * @example
+ * import { isString } from 'tinkit/guards';
+ * const query = { page: withDefault(asInteger, 1), q: optional(isString) };
+ * safeParse(query, { page: '2' }); // => [undefined, { page: 2 }]
+ * const [error] = safeParse(query, { page: 'two', q: 3 });
+ * error?.issues; // => [{ message: 'Expected an integer or an integer string (got string)', path: ['page'] }, { message: 'Invalid value (got number)', path: ['q'] }]
+ */
+export function safeParse<S extends Schema>(schema: S, value: unknown): ParseResult<SchemaOutput<S>> {
+	const node = compile('safeParse', 'schema', schema, []);
+	const issues: SchemaIssue[] = [];
+	const output = execute(node.fast, node.run, value, issues);
+	const result: ParseResult<unknown> = issues.length === 0 ? [undefined, output] : [new ValidationError(issues), undefined];
+
+	return result as ParseResult<SchemaOutput<S>>;
+}
+
+/**
+ * Turns any {@link Schema} into a {@link Parser}: a Standard Schema validator to hand to tRPC, TanStack Form, Hono and the rest of the
+ * ecosystem, with the coercions, defaults and transforms of the schema applied to its output.
+ * @template S - The schema
+ * @param {S} schema - A guard, a parser, a Standard Schema validator or a plain object of those
+ * @returns {Parser<SchemaOutput<S>>} The parser (`schema` itself when it is already a parser of this module)
+ * @throws {TypeError} when `schema` is not a {@link Schema}
+ * @example
+ * const form = toParser({ age: asInteger, newsletter: withDefault(asBoolean, false) });
+ * form['~standard'].validate({ age: '36' }); // => { value: { age: 36, newsletter: false } }
+ * form['~standard'].validate({}); // => { issues: [{ message: 'Missing required property', path: ['age'] }] }
+ */
+export function toParser<S extends Schema>(schema: S): Parser<SchemaOutput<S>> {
+	const node = compile('toParser', 'schema', schema, []);
+
+	return (schema as Partial<CompiledParser<unknown>>)['~tink'] === node ? (schema as Parser<SchemaOutput<S>>) : toCompiledParser(node);
+}
+
+/**
+ * Creates a parser that returns `fallback` when the value is `undefined` (missing), and parses it with `schema` otherwise (`.default()`
+ * in zod). `null` is not missing: it goes to `schema`. When `fallback` is a function it is called for every missing value, so mutable
+ * defaults are never shared between results (wrap a function default in another function: `withDefault(isFunction, () => noop)`);
+ * keep it free of side effects, since an invalid input is parsed twice. The fallback itself is not validated.
+ * @template S - The schema
+ * @param {S} schema - The schema for present values
+ * @param {SchemaOutput<S> | (() => SchemaOutput<S>)} fallback - The default, or a function returning it
+ * @returns {Parser<Exclude<SchemaOutput<S>, undefined>>} The parser; in an object schema the key becomes required in the output type
+ * @throws {TypeError} when `schema` is not a {@link Schema}
+ * @example
+ * import { isString } from 'tinkit/guards';
+ * parse({ port: withDefault(asInteger, 3000) }, {}); // => { port: 3000 }
+ * parse({ port: withDefault(asInteger, 3000) }, { port: '80' }); // => { port: 80 }
+ * const tags = withDefault(arrayOf(isString), function () { return []; });
+ * parse(tags, undefined) !== parse(tags, undefined); // => true // a fresh array on every parse
+ */
+export function withDefault<S extends Schema>(
+	schema: S,
+	fallback: Exclude<SchemaOutput<S>, undefined> | (() => Exclude<SchemaOutput<S>, undefined>)
+): Parser<Exclude<SchemaOutput<S>, undefined>> {
+	const node = compile('withDefault', 'schema', schema, []);
+
+	/**
+	 * Returns the default.
+	 * @returns {unknown} `fallback`, or what it returns when it is a function
+	 */
+	function fill(): unknown {
+		return typeof fallback === 'function' ? (fallback as () => unknown)() : fallback;
+	}
+
+	return toCompiledParser({
+		fast: function fastWithDefault(value: unknown): unknown {
+			return value === undefined ? fill() : node.fast(value);
+		},
+		// Only reached when the fast parse failed, so never for `undefined`.
+		run: node.run,
+		guard: undefined
+	});
+}
+
+/**
+ * Creates a parser that accepts `undefined` (returned as is) and parses any other value with `schema`: in an object schema the key
+ * becomes optional (`.optional()` in zod). For guards, the guards module's `isOptional` does the same.
+ * @template S - The schema
+ * @param {S} schema - The schema for defined values
+ * @returns {Parser<SchemaOutput<S> | undefined>} The parser
+ * @throws {TypeError} when `schema` is not a {@link Schema}
+ * @example
+ * parse({ limit: optional(asInteger) }, {}); // => {}
+ * parse({ limit: optional(asInteger) }, { limit: '10' }); // => { limit: 10 }
+ */
+export function optional<S extends Schema>(schema: S): Parser<SchemaOutput<S> | undefined> {
+	const node = compile('optional', 'schema', schema, []);
+
+	return toCompiledParser({
+		fast: function fastOptional(value: unknown): unknown {
+			return value === undefined ? undefined : node.fast(value);
+		},
+		// Only reached when the fast parse failed, so never for `undefined`.
+		run: node.run,
+		guard: undefined
+	});
+}
+
+/**
+ * Creates a parser that parses the value with `schema`, then maps the output with `fn` (`.transform()` in zod). `fn` only runs when
+ * `schema` succeeded; keep it free of side effects, since an invalid input is parsed twice. To validate the transformed value,
+ * {@link chain} a schema after it.
+ * @template S - The schema
+ * @template U - The transformed type
+ * @param {S} schema - The schema applied first
+ * @param {(value: SchemaOutput<S>) => U} fn - Maps the parsed value
+ * @returns {Parser<U>} The parser
+ * @throws {TypeError} when `schema` is not a {@link Schema} or `fn` is not a function
+ * @example
+ * import { isString } from 'tinkit/guards';
+ * const email = transform(isString, function (s) { return s.trim().toLowerCase(); });
+ * parse(email, '  Ada@Example.COM '); // => 'ada@example.com'
+ * parse(transform(arrayOf(asInteger), function (ids) { return new Set(ids); }), ['1', '2', '2']); // => new Set([1, 2])
+ */
+export function transform<S extends Schema, U>(schema: S, fn: (value: SchemaOutput<S>) => U): Parser<U> {
+	const node = compile('transform', 'schema', schema, []);
+
+	if (typeof fn !== 'function') throw new TypeError(`transform: \`fn\` must be a function, got ${describe(fn)}`);
+
+	return toCompiledParser({
+		fast: function fastTransform(value: unknown): unknown {
+			const output = node.fast(value);
+
+			return output === FAIL ? FAIL : fn(output as SchemaOutput<S>);
+		},
+		run: function runTransform(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			const before = issues.length;
+			const output = node.run(value, path, issues);
+
+			return issues.length > before ? undefined : fn(output as SchemaOutput<S>);
+		},
+		guard: undefined
+	});
+}
+
+/**
+ * Creates a parser that parses the value with `first`, then parses its output with `second` (`.pipe()` in zod): coerce, then check.
+ * @template A - The first schema
+ * @template B - The second schema
+ * @param {A} first - The schema applied to the input
+ * @param {B} second - The schema applied to the output of `first`
+ * @returns {Parser<SchemaOutput<B>>} The parser
+ * @throws {TypeError} when `first` or `second` is not a {@link Schema}
+ * @example
+ * import { isIntegerInRange } from 'tinkit/guards';
+ * const port = chain(asInteger, isIntegerInRange(1, 65535));
+ * parse(port, '8080'); // => 8080
+ * safeParse(port, '70000')[0]?.issues; // => [{ message: 'Expected an integer between 1 and 65535 (got 70000)', path: [] }]
+ */
+export function chain<A extends Schema, B extends Schema>(first: A, second: B): Parser<SchemaOutput<B>> {
+	const head = compile('chain', 'first', first, []);
+	const tail = compile('chain', 'second', second, []);
+
+	return toCompiledParser({
+		fast: function fastChain(value: unknown): unknown {
+			const output = head.fast(value);
+
+			return output === FAIL ? FAIL : tail.fast(output);
+		},
+		run: function runChain(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			const before = issues.length;
+			const output = rerun(head, value, path, issues);
+
+			return issues.length > before ? undefined : rerun(tail, output, path, issues);
+		},
+		guard: undefined
+	});
+}
+
+/**
+ * Creates a parser for arrays whose elements are parsed with `schema`, returning a new array of the outputs (`z.array()`). Every
+ * index from `0` to `length - 1` is parsed, so holes are parsed as `undefined`. For elements that only need checking, the guards
+ * module's `isArrayOf` works too (and returns the array itself).
+ * @template S - The element schema
+ * @param {S} schema - The schema of each element
+ * @returns {Parser<SchemaOutput<S>[]>} The parser
+ * @throws {TypeError} when `schema` is not a {@link Schema}
+ * @example
+ * parse(arrayOf(asInteger), ['1', '2', 3]); // => [1, 2, 3]
+ * safeParse(arrayOf(asInteger), ['1', 'x'])[0]?.issues; // => [{ message: 'Expected an integer or an integer string (got string)', path: [1] }]
+ */
+export function arrayOf<S extends Schema>(schema: S): Parser<SchemaOutput<S>[]> {
+	const node = compile('arrayOf', 'schema', schema, []);
+	const { guard, fast } = node;
+
+	return toCompiledParser({
+		fast: function fastArray(value: unknown): unknown {
+			if (!Array.isArray(value)) return FAIL;
+
+			const output: unknown[] = [];
+
+			for (let index = 0; index < value.length; index++) {
+				let element = value[index];
+
+				if (guard !== undefined) {
+					if (!guard(element)) return FAIL;
+				} else if ((element = fast(element)) === FAIL) {
+					return FAIL;
+				}
+				output.push(element);
+			}
+
+			return output;
+		},
+		run: function runArray(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			if (!Array.isArray(value)) {
+				issues.push({ message: `Expected an array (got ${describe(value)})`, path: path.slice() });
+
+				return undefined;
+			}
+
+			const output: unknown[] = [];
+
+			for (let index = 0; index < value.length; index++) {
+				path.push(index);
+				output.push(rerun(node, value[index], path, issues));
+				path.pop();
+			}
+
+			return output;
+		},
+		guard: undefined
+	});
+}
+
+/**
+ * Reports the value a leaf parser rejected. Leaf parsers are deterministic, and their reporting parse only runs after their fast parse
+ * failed, so it never needs to parse again.
+ * @param {unknown} value - The rejected value
+ * @param {PropertyKey[]} path - Its path
+ * @param {SchemaIssue[]} issues - Where the issue is pushed
+ * @param {string} expected - What the parser accepts, for the message
+ * @returns {undefined} Nothing (the output of a failed parse)
+ */
+function reject(value: unknown, path: PropertyKey[], issues: SchemaIssue[], expected: string): undefined {
+	issues.push({ message: `Expected ${expected} (got ${describe(value)})`, path: path.slice() });
+
+	return undefined;
+}
+
+/**
+ * Coerces to a finite number.
+ * @param {unknown} value - The value
+ * @returns {unknown} The number, or {@link FAIL}
+ */
+function fastNumber(value: unknown): unknown {
+	if (typeof value === 'number') return Number.isFinite(value) ? value : FAIL;
+	if (typeof value !== 'string') return FAIL;
+
+	const text = value.trim();
+
+	if (!NUMERIC_PATTERN.test(text)) return FAIL;
+
+	const number = Number(text);
+
+	return Number.isFinite(number) ? number : FAIL;
+}
+
+/**
+ * Reports a value {@link asNumber} rejected.
+ * @param {unknown} value - The value
+ * @param {PropertyKey[]} path - Its path
+ * @param {SchemaIssue[]} issues - Where issues are pushed
+ * @returns {unknown} Always `undefined`
+ */
+function runNumber(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+	return reject(value, path, issues, 'a number or a numeric string');
+}
+
+/** An optional sign and decimal digits: the strings {@link asInteger} accepts (after trimming). */
+const INTEGER_PATTERN = /^[+-]?[0-9]+$/;
+
+/**
+ * Coerces to a safe integer.
+ * @param {unknown} value - The value
+ * @returns {unknown} The integer, or {@link FAIL}
+ */
+function fastInteger(value: unknown): unknown {
+	if (typeof value === 'number') return Number.isSafeInteger(value) ? value : FAIL;
+	if (typeof value !== 'string') return FAIL;
+
+	const text = value.trim();
+
+	if (!INTEGER_PATTERN.test(text)) return FAIL;
+
+	const integer = Number(text);
+
+	return Number.isSafeInteger(integer) ? integer : FAIL;
+}
+
+/**
+ * Reports a value {@link asInteger} rejected.
+ * @param {unknown} value - The value
+ * @param {PropertyKey[]} path - Its path
+ * @param {SchemaIssue[]} issues - Where issues are pushed
+ * @returns {unknown} Always `undefined`
+ */
+function runInteger(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+	return reject(value, path, issues, 'an integer or an integer string');
+}
+
+/**
+ * Coerces to a boolean.
+ * @param {unknown} value - The value
+ * @returns {unknown} The boolean, or {@link FAIL}
+ */
+function fastBoolean(value: unknown): unknown {
+	if (typeof value === 'boolean') return value;
+	switch (typeof value === 'string' ? value.trim().toLowerCase() : value) {
+		case 'true':
+		case 'yes':
+		case 'on':
+		case '1':
+		case 1:
+			return true;
+		case 'false':
+		case 'no':
+		case 'off':
+		case '0':
+		case 0:
+			return false;
+		default:
+			return FAIL;
+	}
+}
+
+/**
+ * Reports a value {@link asBoolean} rejected.
+ * @param {unknown} value - The value
+ * @param {PropertyKey[]} path - Its path
+ * @param {SchemaIssue[]} issues - Where issues are pushed
+ * @returns {unknown} Always `undefined`
+ */
+function runBoolean(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+	return reject(value, path, issues, 'a boolean or a boolean string such as "true" or "false"');
+}
+
+/**
+ * Coerces to a valid `Date`.
+ * @param {unknown} value - The value
+ * @returns {unknown} The date, or {@link FAIL}
+ */
+function fastDate(value: unknown): unknown {
+	if (isDate(value)) return Number.isNaN(Date.prototype.getTime.call(value)) ? FAIL : value;
+	if (typeof value === 'number') {
+		const date = new Date(value);
+
+		return Number.isNaN(date.getTime()) ? FAIL : date;
+	}
+	if (typeof value !== 'string') return FAIL;
+
+	const time = isoTimestamp(value.trim());
+
+	return time === time ? new Date(time) : FAIL;
+}
+
+/**
+ * Reads the decimal number written from `start` to `end` (excluded) in `text`.
+ * @param {string} text - The text
+ * @param {number} start - The index of the first digit
+ * @param {number} end - The index after the last digit
+ * @returns {number} The number, or `-1` when a character is not an ASCII digit (or is past the end of `text`)
+ */
+function digitsAt(text: string, start: number, end: number): number {
+	let number = 0;
+
+	for (let index = start; index < end; index++) {
+		const digit = text.charCodeAt(index) - 48;
+
+		// Written so that `NaN` (past the end of `text`) fails too.
+		if (!(digit >= 0 && digit <= 9)) return -1;
+		number = number * 10 + digit;
+	}
+
+	return number;
+}
+
+/**
+ * Parses the strings {@link isIsoDateTimeString} or {@link isIsoDateString} accept, to the timestamp `new Date(text)` gives (fractions
+ * of a millisecond are truncated, `YYYY-MM-DD` is UTC midnight), in one pass over the characters: about three times faster than
+ * validating with those, then letting `Date` parse the text again.
+ * @param {string} text - The text
+ * @returns {number} The timestamp in milliseconds, or `NaN` for any other string
+ */
+function isoTimestamp(text: string): number {
+	const length = text.length;
+
+	if (length < 10 || text.charCodeAt(4) !== 45 || text.charCodeAt(7) !== 45) return NaN;
+
+	const year = digitsAt(text, 0, 4);
+	const month = digitsAt(text, 5, 7);
+	const day = digitsAt(text, 8, 10);
+
+	if (year < 0 || month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month - 1)) return NaN;
+
+	// Days since 1970-01-01 in the proleptic Gregorian calendar (Howard Hinnant's `days_from_civil`), exact for every 4-digit year.
+	const shifted = month <= 2 ? year - 1 : year;
+	const era = Math.floor(shifted / 400);
+	const yearOfEra = shifted - era * 400;
+	const dayOfYear = Math.floor((153 * (month > 2 ? month - 3 : month + 9) + 2) / 5) + day - 1;
+	const days = era * 146097 + yearOfEra * 365 + Math.floor(yearOfEra / 4) - Math.floor(yearOfEra / 100) + dayOfYear - 719468;
+
+	if (length === 10) return days * 864e5;
+
+	const separator = text.charCodeAt(10);
+
+	// The shortest date-time is `YYYY-MM-DDThh:mm:ssZ`.
+	if (length < 20 || (separator !== 84 && separator !== 116) || text.charCodeAt(13) !== 58 || text.charCodeAt(16) !== 58) return NaN;
+
+	const hours = digitsAt(text, 11, 13);
+	const minutes = digitsAt(text, 14, 16);
+	const seconds = digitsAt(text, 17, 19);
+
+	if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59 || seconds < 0 || seconds > 59) return NaN;
+
+	let index = 19;
+	let milliseconds = 0;
+
+	if (text.charCodeAt(index) === 46) {
+		const start = ++index;
+
+		for (let digit = text.charCodeAt(index) - 48; digit >= 0 && digit <= 9; digit = text.charCodeAt(++index) - 48) {
+			if (index - start < 3) milliseconds = milliseconds * 10 + digit;
+		}
+		if (index === start) return NaN;
+		milliseconds *= index - start === 1 ? 100 : index - start === 2 ? 10 : 1;
+	}
+
+	const sign = text.charCodeAt(index);
+	let offset = 0;
+
+	if (sign === 90 || sign === 122) {
+		if (index + 1 !== length) return NaN;
+	} else if ((sign === 43 || sign === 45) && index + 6 === length && text.charCodeAt(index + 3) === 58) {
+		const offsetHours = digitsAt(text, index + 1, index + 3);
+		const offsetMinutes = digitsAt(text, index + 4, index + 6);
+
+		if (offsetHours < 0 || offsetHours > 23 || offsetMinutes < 0 || offsetMinutes > 59) return NaN;
+		offset = (sign === 43 ? 1 : -1) * (offsetHours * 60 + offsetMinutes);
+	} else {
+		return NaN;
+	}
+
+	return days * 864e5 + hours * 36e5 + minutes * 6e4 + seconds * 1e3 + milliseconds - offset * 6e4;
+}
+
+/**
+ * Reports a value {@link asDate} rejected.
+ * @param {unknown} value - The value
+ * @param {PropertyKey[]} path - Its path
+ * @param {SchemaIssue[]} issues - Where issues are pushed
+ * @returns {unknown} Always `undefined`
+ */
+function runDate(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+	return reject(value, path, issues, 'a valid date, an ISO 8601 string or a timestamp');
+}
+
+/**
+ * Parses finite numbers, and numeric strings (surrounding whitespace ignored) to numbers: `z.coerce.number()` without its traps.
+ * The empty string, `'abc'`, `'Infinity'`, `'0x1f'`, `NaN`, `null`, booleans and dates are rejected instead of becoming `0`, `1`,
+ * `NaN` or a timestamp. For integers use {@link asInteger}; to check a range, {@link chain} a guard such as `isNumberInRange`.
+ * @example
+ * parse(asNumber, '42.5'); // => 42.5
+ * parse(asNumber, ' -1e3 '); // => -1000
+ * parse(asNumber, 7); // => 7
+ * parse(asNumber, ''); // throws ValidationError // z.coerce.number() gives 0
+ * parse(asNumber, null); // throws ValidationError // z.coerce.number() gives 0
+ */
+export const asNumber: Parser<number> = {
+	'~tink': { fast: fastNumber, run: runNumber, guard: undefined },
+	'~standard': {
+		version: 1,
+		vendor: 'tink',
+		validate: function validate(value: unknown): StandardSchemaResult<number> {
+			return validateWith(fastNumber, runNumber, value) as StandardSchemaResult<number>;
+		}
+	}
+} as CompiledParser<number>;
+
+/**
+ * Parses safe integers, and strings of decimal digits with an optional sign (surrounding whitespace ignored), to numbers. Fractions
+ * (`'1.5'`, `1.5`), exponents (`'1e3'`), the empty string and integers beyond `Number.MAX_SAFE_INTEGER` (which would silently lose
+ * precision) are rejected.
+ * @example
+ * parse(asInteger, '8080'); // => 8080
+ * parse(asInteger, '-3'); // => -3
+ * parse(asInteger, '1.5'); // throws ValidationError
+ * parse(asInteger, '9007199254740993'); // throws ValidationError // would round to 9007199254740992
+ */
+export const asInteger: Parser<number> = {
+	'~tink': { fast: fastInteger, run: runInteger, guard: undefined },
+	'~standard': {
+		version: 1,
+		vendor: 'tink',
+		validate: function validate(value: unknown): StandardSchemaResult<number> {
+			return validateWith(fastInteger, runInteger, value) as StandardSchemaResult<number>;
+		}
+	}
+} as CompiledParser<number>;
+
+/**
+ * Parses booleans, the numbers `1` and `0`, and the strings `'true'`/`'false'`, `'yes'`/`'no'`, `'on'`/`'off'` and `'1'`/`'0'` (case and
+ * surrounding whitespace ignored) to booleans: environment variables, query strings and checkboxes (an HTML checkbox sends `'on'`).
+ * Anything else, the empty string included, is rejected: unlike `z.coerce.boolean()`, `'false'` is `false`.
+ * @example
+ * parse(asBoolean, 'false'); // => false // z.coerce.boolean() gives true
+ * parse(asBoolean, ' YES '); // => true
+ * parse(asBoolean, 'on'); // => true
+ * parse(asBoolean, 0); // => false
+ * parse(asBoolean, 'maybe'); // throws ValidationError
+ */
+export const asBoolean: Parser<boolean> = {
+	'~tink': { fast: fastBoolean, run: runBoolean, guard: undefined },
+	'~standard': {
+		version: 1,
+		vendor: 'tink',
+		validate: function validate(value: unknown): StandardSchemaResult<boolean> {
+			return validateWith(fastBoolean, runBoolean, value) as StandardSchemaResult<boolean>;
+		}
+	}
+} as CompiledParser<boolean>;
+
+/**
+ * Parses valid dates (returned as they are), timestamps in milliseconds, and ISO 8601 strings: RFC 3339 date-times with an offset
+ * (see {@link isIsoDateTimeString}) and `YYYY-MM-DD` dates, read as UTC midnight like `new Date('2024-01-05')`. Invalid dates,
+ * impossible calendar dates (`'2023-02-29'`), local date-times without an offset and loose formats (`'01/05/2024'`, `''`) are rejected,
+ * so the result never depends on the machine's time zone.
+ * @example
+ * parse(asDate, '2024-02-29T12:00:00Z'); // => new Date(Date.UTC(2024, 1, 29, 12))
+ * parse(asDate, '2024-01-05'); // => new Date(Date.UTC(2024, 0, 5))
+ * parse(asDate, 0); // => new Date(0)
+ * parse(asDate, '2023-02-29'); // throws ValidationError
+ * parse(asDate, '2024-01-05T12:00:00'); // throws ValidationError // no offset: the time zone would be guessed
+ */
+export const asDate: Parser<Date> = {
+	'~tink': { fast: fastDate, run: runDate, guard: undefined },
+	'~standard': {
+		version: 1,
+		vendor: 'tink',
+		validate: function validate(value: unknown): StandardSchemaResult<Date> {
+			return validateWith(fastDate, runDate, value) as StandardSchemaResult<Date>;
+		}
+	}
+} as CompiledParser<Date>;

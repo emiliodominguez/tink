@@ -17,7 +17,10 @@ const MODULES = [
 	['search', 'Fuzzy matching and ranking with highlight ranges, for command palettes and filter-as-you-type UIs.'],
 	['easing', 'Animation easing curves, CSS-accurate cubic-bezier() and steps(), and an analytic spring.'],
 	['format', 'Deterministic, cached Intl formatting: numbers, currency, percent, compact, units, lists, dates, ordinals.'],
-	['validate', 'Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates.'],
+	[
+		'validate',
+		'Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates, and zod-like parsing with coercion, defaults and transforms.'
+	],
 	['date', 'DST-safe, non-mutating local-time date arithmetic, formatting and parsing.'],
 	['iterables', 'Lazy, generator-based pipelines over any (async) iterable, with exact pull counts and early-exit cleanup.'],
 	['cache', 'O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock; plugs into memoize.'],
@@ -152,7 +155,8 @@ const PRINCIPLES = `Key facts for code generation:
 - Helpers never mutate their inputs unless the name or docs say so (\`setPath\`, \`deletePath\`).
 - Invalid arguments throw \`TypeError\` (wrong type) or \`RangeError\` (invalid value) whose message names the function and the parameter (\`fn: param must be …, got …\`).
 - Randomised helpers take an optional \`random\` generator last; the default is \`Math.random\`. Pass \`secureRandom\` (random module) for tokens, OTPs and lotteries.
-- Type guards compose into validators: \`isShape\`, \`isArrayOf\`, \`isUnion\`, \`isOptional\`…; \`explain\` lists issues with paths, \`ensure\` throws a \`ValidationError\`, \`toStandardSchema\` adapts any guard for tRPC, TanStack Form, Hono and other Standard Schema consumers.`;
+- Type guards compose into validators: \`isShape\`, \`isArrayOf\`, \`isUnion\`, \`isOptional\`…; \`explain\` lists issues with paths, \`ensure\` throws a \`ValidationError\`, \`toStandardSchema\` adapts any guard for tRPC, TanStack Form, Hono and other Standard Schema consumers.
+- To convert as well as check (environment variables, query strings, forms, API payloads), use \`parse\`/\`safeParse\` from \`tinkit/validate\` with a plain object of guards and parsers: \`parse({ PORT: withDefault(asInteger, 3000), DEBUG: withDefault(asBoolean, false), DATABASE_URL: isUrl }, process.env)\`. Unknown keys are stripped; \`asNumber\`, \`asInteger\`, \`asBoolean\` and \`asDate\` coerce strictly (\`''\` and \`'false'\` are not \`0\` and \`true\`); \`optional\`, \`withDefault\`, \`transform\`, \`chain\` and \`arrayOf\` compose; every parser is a Standard Schema validator, and zod schemas can be nested.`;
 
 const llms = `# tink (tinkit)
 

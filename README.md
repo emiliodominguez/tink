@@ -61,6 +61,25 @@ const [error, user] = parseJson(body, isUser); // never throws: a typed User, or
 const schema = toStandardSchema(isUser); // for your form or RPC library
 ```
 
+When the input needs converting as well as checking, `parse` takes a plain object of guards and parsers. Coercion is strict where `z.coerce` is not, and object schemas compile to specialized code, faster than zod 4 on the bundled benchmarks:
+
+```ts
+import { isIntegerInRange, isOneOf } from 'tinkit/guards';
+import { asBoolean, asInteger, chain, isUrl, parse, withDefault } from 'tinkit/validate';
+
+const env = parse(
+	{
+		PORT: withDefault(chain(asInteger, isIntegerInRange(1, 65535)), 3000),
+		DEBUG: withDefault(asBoolean, false), // 'false' is false, 'on' is true; z.coerce.boolean() turns 'false' into true
+		MODE: isOneOf(['dev', 'prod']),
+		DATABASE_URL: isUrl
+	},
+	process.env
+); // { PORT: number; DEBUG: boolean; MODE: 'dev' | 'prod'; DATABASE_URL: string }, every other variable stripped
+```
+
+`asNumber('')` fails instead of returning `0`, `asInteger` rejects integers that would lose precision, and `asDate` rejects `'2023-02-29'` and offset-less local times. Every parser is a Standard Schema validator, and zod schemas can be nested inside.
+
 ## Hostile input is a non-event
 
 ```ts
@@ -93,28 +112,28 @@ More examples, including dates, text and decorators, are in [Recipes](./docs/REC
 
 ## Modules
 
-| Module                                   | Highlights                                                                                                                                       |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [`arrays`](./docs/API.md#arrays)         | `orderBy`, `groupBy`, `partition`, `chunk`, top-N `takeFirstBy`, `sampleSize`, combinatorics, Myers `diffSequences`, set algebra (`…By`/`…With`) |
-| [`objects`](./docs/API.md#objects)       | `deepClone`, `deepMerge`/`defaults`, `isEqual`/`isMatch`, immutable `updatePath`, `toCamelCaseKeys`, `stableStringify`/`hash`, `diff`            |
-| [`guards`](./docs/API.md#guards)         | 50+ predicates, `isShape`/`isUnion`/`isLazy`/`refine` schemas, `isMatching`, `explain`/`ensure`, `toStandardSchema`, `assertNever`               |
-| [`strings`](./docs/API.md#strings)       | every case style, grapheme-aware `padStart`/`trimChars`/`truncate`, `toSlug`, `dedent`, `wordWrap`, `levenshtein`, `mask`, `escapeHtml`          |
-| [`math`](./docs/API.md#math)             | precise `sum`/`round`/`ceil`/`floor`, `quantile`, `variance`, `clamp`/`lerp`, `formatBytes`/`parseBytes`, Miller–Rabin `isPrime`                 |
-| [`functions`](./docs/API.md#functions)   | `debounce`/`throttle` with `cancel`/`flush`, `memoize`, exhaustive `match`, `curry`, `pipe`, `allPass`/`anyPass`, `attempt`                      |
-| [`async`](./docs/API.md#async)           | `retry`, `withTimeout`, priority `createQueue`, `createRateLimiter`, `memoizeAsync`, abortable `mapWithConcurrency`, `pollUntil`                 |
-| [`date`](./docs/API.md#date)             | DST-safe `addDuration`/`addMonths`, `intervalToDuration`, strict `parseDate`/`formatDate`, ISO weeks, `toISOStringLocal`, `eachOfInterval`       |
-| [`format`](./docs/API.md#format)         | deterministic, cached Intl formatting: `formatCurrency`, `formatCompact`, `formatPercent`, `formatList`, `formatOrdinal`, …                      |
-| [`validate`](./docs/API.md#validate)     | ReDoS-safe predicates: `isEmail`, `isUrl` (look-alike safe), `isUuid`, `isIP`, `isSemver`, Luhn, base64, and safe `parseJson(text, guard)`       |
-| [`color`](./docs/API.md#color)           | CSS `parseColor` (hex, `rgb()`, `hsl()`), `mix`, `lighten`/`darken`, WCAG `contrastRatio`, `getReadableTextColor`, `meetsContrast`               |
-| [`search`](./docs/API.md#search)         | `fuzzyMatch`/`fuzzySearch` with optimal scoring and highlight ranges, `highlight` segments for rendering matches                                 |
-| [`easing`](./docs/API.md#easing)         | 31 tree-shakeable easings, CSS-accurate `cubicBezier`/`steps`, analytic `spring`, `interpolate`                                                  |
-| [`url`](./docs/API.md#url)               | `buildQueryString`/`parseQueryString` (pollution-safe), `isSafeUrl`/`sanitizeUrl`, `withQuery`, `joinUrl`, `withBase`, slash helpers             |
-| [`iterables`](./docs/API.md#iterables)   | lazy `map`/`filter`/`take`/`chunk`/`zip` over any (async) iterable, bounded `mapConcurrent` with backpressure                                    |
-| [`cache`](./docs/API.md#cache)           | O(1) `createLRUCache` with TTL and eviction reasons, stable binary-heap `createPriorityQueue`                                                    |
-| [`emitter`](./docs/API.md#emitter)       | typed `createEmitter` with wildcard listeners, `once`, `waitFor` (timeout/abort) and error isolation                                             |
-| [`store`](./docs/API.md#store)           | `createStore` for `useSyncExternalStore`, with equality-gated updates and cached `select()` stores                                               |
-| [`random`](./docs/API.md#random)         | seeded `createRandom` (cross-platform deterministic), secure `secureRandom`/`randomId`/`randomUUID`/`randomBytes`, `weightedRandom`              |
-| [`decorators`](./docs/API.md#decorators) | `@memoize`/`@once` (per instance), `@bound`, `@debounced`, `@throttled`, `@retryable`, `@timeout`, `@readonly`, `@deprecated`                    |
+| Module                                   | Highlights                                                                                                                                                                                   |
+| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`arrays`](./docs/API.md#arrays)         | `orderBy`, `groupBy`, `partition`, `chunk`, top-N `takeFirstBy`, `sampleSize`, combinatorics, Myers `diffSequences`, set algebra (`…By`/`…With`)                                             |
+| [`objects`](./docs/API.md#objects)       | `deepClone`, `deepMerge`/`defaults`, `isEqual`/`isMatch`, immutable `updatePath`, `toCamelCaseKeys`, `stableStringify`/`hash`, `diff`                                                        |
+| [`guards`](./docs/API.md#guards)         | 50+ predicates, `isShape`/`isUnion`/`isDiscriminatedUnion`/`isLazy`/`refine` schemas, `isStringOfLength`, `isMatching`, `explain`/`ensure`, `toStandardSchema`                               |
+| [`strings`](./docs/API.md#strings)       | every case style, grapheme-aware `padStart`/`trimChars`/`truncate`, `toSlug`, `dedent`, `wordWrap`, `levenshtein`, `mask`, `escapeHtml`                                                      |
+| [`math`](./docs/API.md#math)             | precise `sum`/`round`/`ceil`/`floor`, `quantile`, `variance`, `clamp`/`lerp`, `formatBytes`/`parseBytes`, Miller–Rabin `isPrime`                                                             |
+| [`functions`](./docs/API.md#functions)   | `debounce`/`throttle` with `cancel`/`flush`, `memoize`, exhaustive `match`, `curry`, `pipe`, `allPass`/`anyPass`, `attempt`                                                                  |
+| [`async`](./docs/API.md#async)           | `retry`, `withTimeout`, priority `createQueue`, `createRateLimiter`, `memoizeAsync`, abortable `mapWithConcurrency`, `pollUntil`                                                             |
+| [`date`](./docs/API.md#date)             | DST-safe `addDuration`/`addMonths`, `intervalToDuration`, strict `parseDate`/`formatDate`, ISO weeks, `toISOStringLocal`, `eachOfInterval`                                                   |
+| [`format`](./docs/API.md#format)         | deterministic, cached Intl formatting: `formatCurrency`, `formatCompact`, `formatPercent`, `formatList`, `formatOrdinal`, …                                                                  |
+| [`validate`](./docs/API.md#validate)     | ReDoS-safe predicates (`isEmail`, look-alike safe `isUrl`, `isUuid`, `isIP`, `isSemver`…), safe `parseJson`, zod-like `parse` with strict `asInteger`/`asBoolean`/`asDate` and `withDefault` |
+| [`color`](./docs/API.md#color)           | CSS `parseColor` (hex, `rgb()`, `hsl()`), `mix`, `lighten`/`darken`, WCAG `contrastRatio`, `getReadableTextColor`, `meetsContrast`                                                           |
+| [`search`](./docs/API.md#search)         | `fuzzyMatch`/`fuzzySearch` with optimal scoring and highlight ranges, `highlight` segments for rendering matches                                                                             |
+| [`easing`](./docs/API.md#easing)         | 31 tree-shakeable easings, CSS-accurate `cubicBezier`/`steps`, analytic `spring`, `interpolate`                                                                                              |
+| [`url`](./docs/API.md#url)               | `buildQueryString`/`parseQueryString` (pollution-safe), `isSafeUrl`/`sanitizeUrl`, `withQuery`, `joinUrl`, `withBase`, slash helpers                                                         |
+| [`iterables`](./docs/API.md#iterables)   | lazy `map`/`filter`/`take`/`chunk`/`zip` over any (async) iterable, bounded `mapConcurrent` with backpressure                                                                                |
+| [`cache`](./docs/API.md#cache)           | O(1) `createLRUCache` with TTL and eviction reasons, stable binary-heap `createPriorityQueue`                                                                                                |
+| [`emitter`](./docs/API.md#emitter)       | typed `createEmitter` with wildcard listeners, `once`, `waitFor` (timeout/abort) and error isolation                                                                                         |
+| [`store`](./docs/API.md#store)           | `createStore` for `useSyncExternalStore`, with equality-gated updates and cached `select()` stores                                                                                           |
+| [`random`](./docs/API.md#random)         | seeded `createRandom` (cross-platform deterministic), secure `secureRandom`/`randomId`/`randomUUID`/`randomBytes`, `weightedRandom`                                                          |
+| [`decorators`](./docs/API.md#decorators) | `@memoize`/`@once` (per instance), `@bound`, `@debounced`, `@throttled`, `@retryable`, `@timeout`, `@readonly`, `@deprecated`                                                                |
 
 ## Numbers
 

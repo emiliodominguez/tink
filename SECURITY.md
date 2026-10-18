@@ -26,6 +26,10 @@ The helpers are designed to be safe on untrusted input (query strings, JSON bodi
 - escaping helpers (`escapeHtml`, `escapeRegExp`) whose output is not safe in the documented context;
 - anything in the published package or release pipeline that could let a third party ship code under this package's name.
 
+`parse` (`validate` module) compiles each object schema once with `new Function`, like zod 4: only the schema's keys reach the generated
+source, as `JSON.stringify` string literals, and no input value is ever evaluated. Where code generation is disallowed (a Content Security
+Policy without `'unsafe-eval'`, Cloudflare Workers) it falls back to a loop; the first attempt may still log a CSP violation report.
+
 Documented costs (for example the O(n·m) of `levenshtein` or `fuzzyMatch`) and `Math.random` defaults (pass `secureRandom` from the
 `random` module where unpredictability matters) are not vulnerabilities, but unclear documentation about them is a welcome report.
 

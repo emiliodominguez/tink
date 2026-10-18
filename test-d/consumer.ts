@@ -3,8 +3,23 @@
 import { getPath, setPath, deepMerge, merge, pick, omit, toCamelCaseKeys } from 'tinkit/objects';
 import { curry, pipe, compose } from 'tinkit/functions';
 import type { NestedKeyOf, PathValue } from 'tinkit/utils';
-import { isShape, isString, isInteger, isOptional, isArrayOf, isUnion, isNullable, isTuple, toStandardSchema } from 'tinkit/guards';
+import {
+	isShape,
+	isString,
+	isInteger,
+	isOptional,
+	isArrayOf,
+	isUnion,
+	isNullable,
+	isTuple,
+	toStandardSchema,
+	isDiscriminatedUnion,
+	isFiniteNumber,
+	isIntegerInRange
+} from 'tinkit/guards';
 import type { Infer } from 'tinkit/guards';
+import { arrayOf, asBoolean, asDate, asInteger, chain, isUrl, optional, parse, safeParse, toParser, transform, withDefault } from 'tinkit/validate';
+import type { SchemaOutput } from 'tinkit/validate';
 import type { StandardSchemaV1 } from '@standard-schema/spec';
 // The root entry pulls in every module's declarations.
 import * as everything from 'tinkit';
@@ -86,8 +101,50 @@ const output: SpecOutput = { id: 'a', email: 'x', tags: ['t'], manager: { id: 2 
 // @ts-expect-error `id` must be a string or a number
 const wrong: Account = { id: true, tags: [], manager: null, position: [0, 0] };
 
+// Discriminated unions add the tag to each variant's type.
+const isFigure = isDiscriminatedUnion('type', { circle: isShape({ radius: isFiniteNumber }), square: isShape({ side: isFiniteNumber }) });
+type Figure = Infer<typeof isFigure>;
+const figure: Figure = { type: 'circle', radius: 1 };
+// @ts-expect-error a square has a side, not a radius
+const badFigure: Figure = { type: 'square', radius: 1 };
+
+// Parsers: the output type follows coercions, defaults, transforms and nesting; guards mix in.
+const envSchema = {
+	PORT: withDefault(chain(asInteger, isIntegerInRange(1, 65535)), 3000),
+	DEBUG: withDefault(asBoolean, false),
+	DATABASE_URL: isUrl,
+	STARTED: optional(asDate),
+	TAGS: withDefault(arrayOf(isString), function (): string[] {
+		return [];
+	}),
+	NAME_LENGTH: transform(isString, function (name) {
+		return name.length;
+	}),
+	owner: { id: asInteger, email: isOptional(isString) }
+};
+type Env = SchemaOutput<typeof envSchema>;
+type ExpectedEnv = {
+	PORT: number;
+	DEBUG: boolean;
+	DATABASE_URL: string;
+	STARTED?: Date | undefined;
+	TAGS: string[];
+	NAME_LENGTH: number;
+	owner: { id: number; email?: string | undefined };
+};
+const env: ExpectedEnv = parse(envSchema, {});
+const envBack: Env = env;
+// @ts-expect-error PORT is parsed to a number
+const envWrong: Env = { ...env, PORT: '80' };
+const [envError, parsedEnv] = safeParse(envSchema, {});
+const port: number | undefined = envError === undefined ? parsedEnv.PORT : undefined;
+const envSpec: StandardSchemaV1<unknown, Env> = toParser(envSchema);
+// @ts-expect-error the default must match the schema's output
+const badDefault = withDefault(asInteger, 'x');
+
 // README tour: key transforms keep their value types.
 const camel: { userId: number; createdAt: string } = toCamelCaseKeys({ user_id: 1, created_at: '2024-01-01' });
 // @ts-expect-error the snake_case key no longer exists
 const snake = camel.user_id;
 export { a, b, c, keys, v, m, dm, p, o, r, f, g, everything, spec, output, wrong, camel, snake };
+export { figure, badFigure, envBack, envWrong, port, envSpec, badDefault };

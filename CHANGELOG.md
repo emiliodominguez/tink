@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+Zod-like schemas, without the dependency:
+
+- **`validate`: `parse` / `safeParse`** take a plain object of guards and parsers, return a typed output with unknown keys stripped, and report every issue with its path (`ValidationError`). Object schemas compile to specialized code on first use (falling back to a loop where `new Function` is blocked, e.g. by a CSP), and the bundled benchmarks parse nested records 1.6× faster than zod 4.
+- **Strict coercion:** `asNumber`, `asInteger`, `asBoolean` and `asDate` reject what `z.coerce` silently converts (`''` → `0`, `'false'` → `true`, `null` → `0`, `'2023-02-29'` → March 1st, unsafe integers).
+- **Combinators:** `withDefault`, `optional`, `transform`, `chain` (zod's `.pipe()`), `arrayOf`, and `toParser` to hand any schema to a Standard Schema consumer. Every parser is a Standard Schema validator, and Standard Schema validators (zod, valibot…) can be nested in a schema.
+- **`guards`:** `isDiscriminatedUnion` (direct variant lookup, with the tag added to each variant's type), `isIntegerInRange`, `isStringOfLength` and `isStringMatching` (stateless with `g`/`y` regexes). Their failures are explained without echoing the rejected strings.
+
 ## 1.0.1
 
 API clean-up shipped right after the first release (1.0.0 is deprecated; nothing depended on it yet):

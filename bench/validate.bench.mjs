@@ -12,9 +12,16 @@ import {
 	isSlug,
 	isUrl,
 	isUuid,
-	parseJson
+	parseJson,
+	arrayOf,
+	asBoolean,
+	asDate,
+	asInteger,
+	chain,
+	safeParse,
+	withDefault
 } from 'tinkit/validate';
-import { isArrayOf, isInteger, isShape, isString } from 'tinkit/guards';
+import { isArrayOf, isInteger, isIntegerInRange, isOneOf, isShape, isString } from 'tinkit/guards';
 import { z } from 'zod';
 
 // No validation library is installed: the competitors are the snippets people usually paste (a typical regex, `URL.canParse`, ...).
@@ -117,6 +124,47 @@ const zodRecord = z.object({ id: z.number().int(), name: z.string(), email: z.st
 const isRecords = isArrayOf(isRecord);
 const zodRecords = z.array(zodRecord);
 
+// parse inputs: environment variables (strings to coerce, defaults to fill, ~30 unrelated keys to strip) and API records to strip.
+const environment = { PORT: '8080', MODE: 'prod', DATABASE_URL: 'https://db.example.com/app', WORKERS: '8' };
+for (let index = 0; index < 30; index++) environment[`UNRELATED_${index}`] = `value ${index}`;
+const envSchema = {
+	PORT: withDefault(asInteger, 3000),
+	DEBUG: withDefault(asBoolean, false),
+	MODE: isOneOf(['dev', 'prod']),
+	DATABASE_URL: isUrl,
+	WORKERS: chain(asInteger, isIntegerInRange(1, 64))
+};
+const zodEnv = z.object({
+	PORT: z.coerce.number().int().default(3000),
+	DEBUG: z.stringbool().default(false),
+	MODE: z.enum(['dev', 'prod']),
+	DATABASE_URL: z.url(),
+	WORKERS: z.coerce.number().int().min(1).max(64)
+});
+const accounts = Array.from({ length: 100 }, function (_, index) {
+	return {
+		id: String(index),
+		name: `user${index}`,
+		joined: '2024-01-05T10:00:00Z',
+		tags: ['a', 'b'],
+		profile: { age: String(20 + (index % 50)), city: 'x' },
+		secret: 'drop me'
+	};
+});
+const accountsSchema = arrayOf({ id: asInteger, name: isString, joined: asDate, tags: arrayOf(isString), profile: { age: asInteger, city: isString } });
+const zodAccounts = z.array(
+	z.object({
+		id: z.coerce.number().int(),
+		name: z.string(),
+		joined: z.coerce.date(),
+		tags: z.array(z.string()),
+		profile: z.object({ age: z.coerce.number().int(), city: z.string() })
+	})
+);
+const badAccounts = accounts.map(function (account, index) {
+	return index % 10 === 0 ? { ...account, id: 'x', profile: { city: 1 } } : account;
+});
+
 /**
  * The usual "safe" JSON.parse snippet: try/catch plus a reviver dropping `__proto__` keys.
  * @param {string} text - The JSON text
@@ -207,6 +255,39 @@ export default [
 		competitors: {
 			zod: function () {
 				return zodRecords.safeParse(tryParse(largeText));
+			}
+		}
+	},
+	{
+		name: 'safeParse: environment variables (coerce, defaults, strip)',
+		fn: function () {
+			return safeParse(envSchema, environment);
+		},
+		competitors: {
+			zod: function () {
+				return zodEnv.safeParse(environment);
+			}
+		}
+	},
+	{
+		name: 'safeParse: 100 nested records (coerce, strip)',
+		fn: function () {
+			return safeParse(accountsSchema, accounts);
+		},
+		competitors: {
+			zod: function () {
+				return zodAccounts.safeParse(accounts);
+			}
+		}
+	},
+	{
+		name: 'safeParse: 100 nested records, 10 invalid (issue reporting)',
+		fn: function () {
+			return safeParse(accountsSchema, badAccounts);
+		},
+		competitors: {
+			zod: function () {
+				return zodAccounts.safeParse(badAccounts);
 			}
 		}
 	},
