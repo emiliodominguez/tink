@@ -12,7 +12,7 @@ import {
 	isSlug,
 	isUrl,
 	isUuid
-} from '@emiliodominguez/js-helpers/validate';
+} from '@emiliodominguez/tink/validate';
 
 // No validation library is installed: the competitors are the snippets people usually paste (a typical regex, `URL.canParse`, ...).
 // Most of them are looser than our validators (they accept inputs we reject on purpose), so a ratio below 1 can be the price of correctness.

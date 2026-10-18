@@ -294,7 +294,7 @@ Whole module: **2.9 kB**
 
 ## guards
 
-Whole module: **2.8 kB**
+Whole module: **2.7 kB**
 
 | Export             | min + gzip |
 | ------------------ | ---------: |
@@ -345,7 +345,7 @@ Whole module: **2.8 kB**
 | `isUnion`          |      625 B |
 | `isWeakMap`        |      312 B |
 | `isWeakSet`        |      311 B |
-| `toStandardSchema` |      539 B |
+| `toStandardSchema` |      534 B |
 | `withMessage`      |      463 B |
 
 ## iterables
@@ -360,7 +360,7 @@ Whole module: **2.1 kB**
 | `count`        |      294 B |
 | `countItems`   |      460 B |
 | `cycle`        |      425 B |
-| `drop`         |      537 B |
+| `drop`         |      538 B |
 | `dropWhile`    |      463 B |
 | `enumerate`    |      404 B |
 | `every`        |      441 B |

@@ -1,6 +1,6 @@
 {
 	"$schema": "https://typedoc.org/schema.json",
-	"name": "js-helpers",
+	"name": "tink",
 	"entryPoints": [
 		"src/arrays",
 		"src/async",

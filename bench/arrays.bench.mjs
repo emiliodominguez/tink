@@ -28,7 +28,7 @@ import {
 	unzip,
 	windowed,
 	zip
-} from '@emiliodominguez/js-helpers/arrays';
+} from '@emiliodominguez/tink/arrays';
 import * as toolkit from 'es-toolkit';
 import * as lodash from 'lodash-es';
 

@@ -151,7 +151,7 @@ An adversarial review (prototype pollution, ReDoS, resource exhaustion, validato
 
 See [Migrating from 1.x](./README.md#migrating-from-1x).
 
-- The package is renamed to `@emiliodominguez/js-helpers`, because `js-helpers` is taken on npm.
+- The package is renamed to `@emiliodominguez/tink`.
 - **Behaviour:**
     - `isError` decides same-realm objects with `instanceof`, so a plain object faking `Symbol.toStringTag` `'Error'` is no longer an error;
         - the `isDate`/`isRegExp`/`isMap`/`isSet`/`isWeakMap`/`isWeakSet` guards reject a genuine instance whose prototype was swapped to an unrelated object from the same realm (cross-realm instances still pass);

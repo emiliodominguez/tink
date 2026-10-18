@@ -297,7 +297,7 @@ describe('toStandardSchema', function () {
 
 	it('should implement Standard Schema v1', function () {
 		expect(schema['~standard'].version).toBe(1);
-		expect(schema['~standard'].vendor).toBe('js-helpers');
+		expect(schema['~standard'].vendor).toBe('tink');
 		expect(schema['~standard'].validate({ email: 'a' })).toEqual({ value: { email: 'a' } });
 		expect(schema['~standard'].validate({})).toEqual({ issues: [{ message: 'Missing required property', path: ['email'] }] });
 	});

@@ -22,7 +22,7 @@ import {
 	startOfMonth,
 	startOfWeek,
 	toISODateString
-} from '@emiliodominguez/js-helpers/date';
+} from '@emiliodominguez/tink/date';
 
 // 100 deterministic dates spread over several years (local time).
 const dates = Array.from({ length: 100 }, function (_, index) {

@@ -49,7 +49,7 @@ toSlug('Café Society!'); // 'cafe-society'
 Type guards compose into validators with path-aware errors, and plug into any library that speaks [Standard Schema](https://standardschema.dev) (tRPC, TanStack Form, React Hook Form, Hono…):
 
 ```ts
-import { ensure, explain, isArrayOf, isInteger, isOptional, isShape, isString, toStandardSchema, type Infer } from '@emiliodominguez/js-helpers/guards';
+import { ensure, explain, isArrayOf, isInteger, isOptional, isShape, isString, toStandardSchema, type Infer } from '@emiliodominguez/tink/guards';
 
 const isUser = isShape({ id: isInteger, name: isString, tags: isArrayOf(isString), email: isOptional(isString) });
 type User = Infer<typeof isUser>; // { id: number; name: string; tags: string[]; email?: string }
@@ -339,7 +339,7 @@ Every helper that has an equivalent in a popular library is benchmarked against 
 <details>
 <summary>Where it is slower, and why</summary>
 
-Most remaining gaps exist because js-helpers does more work for correctness:
+Most remaining gaps exist because tink does more work for correctness:
 
 - **`strings.reverse`, `truncate`, `getWords`:** they keep grapheme clusters intact, so emoji such as 👍🏽 and combining marks survive.
 - **`math.sum` and `math.round`:** `sum` uses compensated summation (`sum([0.1, 0.2, 0.3]) === 0.6`), and `round` is decimal-correct (`round(1.005, 2) === 1.01`).

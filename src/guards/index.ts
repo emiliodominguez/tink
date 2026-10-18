@@ -872,7 +872,7 @@ export type StandardSchemaResult<Output> = { readonly value: Output; readonly is
 export interface StandardSchemaProps<Input = unknown, Output = Input> {
 	/** The Standard Schema version (always `1`). */
 	readonly version: 1;
-	/** The library that created the schema (`'js-helpers'`). */
+	/** The library that created the schema (`'tink'`). */
 	readonly vendor: string;
 	/** Validates an unknown value; never throws for invalid data. */
 	readonly validate: (value: unknown) => StandardSchemaResult<Output>;
@@ -1337,7 +1337,7 @@ export function toStandardSchema<T>(guard: Guard<T>): StandardSchemaV1<unknown, 
 	return {
 		'~standard': {
 			version: 1,
-			vendor: 'js-helpers',
+			vendor: 'tink',
 			validate: function validate(value: unknown): StandardSchemaResult<T> {
 				const issues = explain(guard, value);
 

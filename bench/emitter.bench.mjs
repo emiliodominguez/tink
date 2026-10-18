@@ -1,4 +1,4 @@
-import { createEmitter } from '@emiliodominguez/js-helpers/emitter';
+import { createEmitter } from '@emiliodominguez/tink/emitter';
 import mitt from 'mitt';
 
 /**

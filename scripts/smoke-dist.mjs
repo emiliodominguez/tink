@@ -1,16 +1,16 @@
 // Smoke-tests the BUILT package through its public `exports` map (unit tests run against `src`),
 // catching packaging or minification regressions. Run after `yarn build`.
 import assert from 'node:assert/strict';
-import * as root from '@emiliodominguez/js-helpers';
-import { chunk } from '@emiliodominguez/js-helpers/arrays';
-import { TimeoutError, AbortError, withTimeout, retry } from '@emiliodominguez/js-helpers/async';
-import { addMonths, formatDate } from '@emiliodominguez/js-helpers/date';
-import { memoize as memoizeMethod } from '@emiliodominguez/js-helpers/decorators';
-import { debounce, curry } from '@emiliodominguez/js-helpers/functions';
-import { isPlainObject } from '@emiliodominguez/js-helpers/guards';
-import { round, sum } from '@emiliodominguez/js-helpers/math';
-import { deepClone, deepMerge, isEqual } from '@emiliodominguez/js-helpers/objects';
-import { toKebabCase, reverse } from '@emiliodominguez/js-helpers/strings';
+import * as root from '@emiliodominguez/tink';
+import { chunk } from '@emiliodominguez/tink/arrays';
+import { TimeoutError, AbortError, withTimeout, retry } from '@emiliodominguez/tink/async';
+import { addMonths, formatDate } from '@emiliodominguez/tink/date';
+import { memoize as memoizeMethod } from '@emiliodominguez/tink/decorators';
+import { debounce, curry } from '@emiliodominguez/tink/functions';
+import { isPlainObject } from '@emiliodominguez/tink/guards';
+import { round, sum } from '@emiliodominguez/tink/math';
+import { deepClone, deepMerge, isEqual } from '@emiliodominguez/tink/objects';
+import { toKebabCase, reverse } from '@emiliodominguez/tink/strings';
 
 assert.deepEqual(Object.keys(root).sort(), [
 	'arrays',

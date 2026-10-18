@@ -1,4 +1,4 @@
-import { buildQueryString, getQueryParam, isAbsoluteUrl, joinUrl, parseQueryString, withQuery } from '@emiliodominguez/js-helpers/url';
+import { buildQueryString, getQueryParam, isAbsoluteUrl, joinUrl, parseQueryString, withQuery } from '@emiliodominguez/tink/url';
 
 // Competitors: what users naturally write with the platform's URLSearchParams / URL (no library in this category is installed).
 const query = '?q=hello+world&page=2&sort=desc&tag=a&tag=b&ids[]=1&ids[]=2&empty&utm_source=newsletter&ref=%C3%A9t%C3%A9';

@@ -1,7 +1,7 @@
 // The bench runner is synchronous, so these cases only measure synchronous overhead, and leave nothing pending behind them (every
 // promise they create is either settled without reactions or never settles and is garbage collected). Awaited throughput against
 // p-limit / es-toolkit (`mapAsync`, `limitAsync`) is not measurable here: their work runs in microtasks after the case returns.
-import { createDeferred, createLimiter, throwIfAborted } from '@emiliodominguez/js-helpers/async';
+import { createDeferred, createLimiter, throwIfAborted } from '@emiliodominguez/tink/async';
 
 /**
  * A minimal p-limit-style limiter (array queue, no validation, no counters, no clearQueue rejection): the theoretical best for queueing.

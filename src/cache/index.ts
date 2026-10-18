@@ -162,7 +162,7 @@ function assertTTL(caller: string, ttl: number): void {
  * sessions.prune(); // optional (e.g. on an interval): reclaims the memory of expired entries nobody looked up
  * @example
  * // Bounded memoization
- * import { memoize } from '@emiliodominguez/js-helpers/functions';
+ * import { memoize } from '@emiliodominguez/tink/functions';
  * const square = memoize(function (n: number): number { return n * n; }, { cache: createLRUCache({ max: 100 }) });
  * square(4); // => 16
  */

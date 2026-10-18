@@ -1,5 +1,5 @@
 import bezier from 'bezier-easing';
-import { cubicBezier, easeInOutCubic, easeInOutElastic, easeOutBounce, interpolate, spring, steps } from '@emiliodominguez/js-helpers/easing';
+import { cubicBezier, easeInOutCubic, easeInOutElastic, easeOutBounce, interpolate, spring, steps } from '@emiliodominguez/tink/easing';
 
 // One animation's worth of frames: 1000 progress values in [0, 1].
 const frames = Array.from({ length: 1000 }, function (_, i) {

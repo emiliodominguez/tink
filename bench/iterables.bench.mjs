@@ -15,7 +15,7 @@ import {
 	unique,
 	windowed,
 	zip
-} from '@emiliodominguez/js-helpers/iterables';
+} from '@emiliodominguez/tink/iterables';
 
 // No library offers the same lazy, closing-aware helpers, so each case is compared with what one would write instead:
 // eager array methods (`array`), hand-written generators (`generator`), and the native iterator helpers (`iterator helpers`).

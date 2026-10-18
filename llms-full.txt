@@ -1,8 +1,8 @@
-# @emiliodominguez/js-helpers — full API index
+# @emiliodominguez/tink — full API index
 
 Key facts for code generation:
 - ESM only, zero dependencies, Node >= 20.19 or any modern browser/runtime. TypeScript types ship in the package.
-- Import from module entry points: `import { debounce } from '@emiliodominguez/js-helpers/functions'` (the root entry exposes namespaces: `import { functions } from '@emiliodominguez/js-helpers'`).
+- Import from module entry points: `import { debounce } from '@emiliodominguez/tink/functions'` (the root entry exposes namespaces: `import { functions } from '@emiliodominguez/tink'`).
 - Helpers never mutate their inputs unless the name or docs say so (`setInObjectByKeys`, `deleteFromObjectByKeys`).
 - Invalid arguments throw `TypeError` (wrong type) or `RangeError` (invalid value) whose message names the function and the parameter (`fn: param must be …, got …`).
 - Randomised helpers take an optional `random` generator last; the default is `Math.random`. Pass `secureRandom` (random module) for tokens, OTPs and lotteries.
@@ -11,7 +11,7 @@ Key facts for code generation:
 ## arrays
 
 Collection helpers: set algebra, grouping, chunking, sorting, sampling.
-Import: `import { … } from '@emiliodominguez/js-helpers/arrays';`
+Import: `import { … } from '@emiliodominguez/tink/arrays';`
 
 - `contains<T>(array: ReadonlyArray<T>, value: T): boolean` — Check if an array contains a value, using SameValueZero equality (so `NaN` is found and `0` matches `-0`).
 - `first<T>(array: ReadonlyArray<T>): T | undefined` — Get the first item in an array.
@@ -59,7 +59,7 @@ Import: `import { … } from '@emiliodominguez/js-helpers/arrays';`
 ## objects
 
 Shallow/deep cloning, merging, equality, path access and object reshaping.
-Import: `import { … } from '@emiliodominguez/js-helpers/objects';`
+Import: `import { … } from '@emiliodominguez/tink/objects';`
 
 - `merge<T extends object, S extends object[]>(target: T, ...sources: S): MergeAll<T, S>` — Shallowly merges one or more source objects into a NEW object, left to right (later keys win, like `{ ...target, ...a, ...b }`).
 - `clone<T>(value: T): T` — Creates a shallow copy of a value.
@@ -95,7 +95,7 @@ Import: `import { … } from '@emiliodominguez/js-helpers/objects';`
 ## guards
 
 Runtime type predicates that narrow `unknown` values, composable into path-aware, Standard Schema-compatible validators.
-Import: `import { … } from '@emiliodominguez/js-helpers/guards';`
+Import: `import { … } from '@emiliodominguez/tink/guards';`
 
 - `isObject(value: unknown): value is object` — Checks whether a value is a non-null object (`typeof value === 'object'`).
 - `isArray(value: unknown): value is unknown[]` — Checks whether a value is an array (works across realms, uses `Array.isArray`).
@@ -150,7 +150,7 @@ Import: `import { … } from '@emiliodominguez/js-helpers/guards';`
 ## strings
 
 Unicode-aware transformations, case conversion, escaping, templating and text metrics.
-Import: `import { … } from '@emiliodominguez/js-helpers/strings';`
+Import: `import { … } from '@emiliodominguez/tink/strings';`
 
 - `reverse(string: string): string` — Reverses a string by user-perceived characters (grapheme clusters), so emoji, surrogate pairs and combining marks are kept intact.
 - `capitalize(string: string): string` — Upper-cases the first user-perceived character (grapheme cluster) of a string and leaves the rest untouched.
@@ -200,7 +200,7 @@ Import: `import { … } from '@emiliodominguez/js-helpers/strings';`
 ## url
 
 Query-string building and parsing, URL joining and query merging, without URL object types.
-Import: `import { … } from '@emiliodominguez/js-helpers/url';`
+Import: `import { … } from '@emiliodominguez/tink/url';`
 
 - `buildQueryString(params: QueryParams, options: BuildQueryStringOptions = {}): string` — Builds a query string (WITHOUT the leading `?`) from a record of parameters.
 - `parseQueryString(query: string): ParsedQuery` — Parses a query string into a record.
@@ -212,7 +212,7 @@ Import: `import { … } from '@emiliodominguez/js-helpers/url';`
 ## math
 
 Precise arithmetic, statistics, number theory and random numbers.
-Import: `import { … } from '@emiliodominguez/js-helpers/math';`
+Import: `import { … } from '@emiliodominguez/tink/math';`
 
 - `sum(numbers: ReadonlyArray<number>): number` — Calculates the sum of an array of numbers using Neumaier (improved Kahan–Babuška) compensated summation, which keeps the rounding error independent of the number of elements and makes the result (practically) independent of their order.
 - `round(number: number, decimals = 0): number` — Rounds a number to a given number of decimal places, using its decimal representation so that values like `1.005` round as written (`round(1.005, 2) === 1.01`).
@@ -262,7 +262,7 @@ Import: `import { … } from '@emiliodominguez/js-helpers/math';`
 ## functions
 
 Function composition, currying, memoization and rate limiting.
-Import: `import { … } from '@emiliodominguez/js-helpers/functions';`
+Import: `import { … } from '@emiliodominguez/tink/functions';`
 
 - `bind<T, A extends unknown[], R>(fn: (this: T, ...args: A) => R, thisArg: T): (...args: A) => R` — Creates a function that always invokes `fn` with `thisArg` as `this`, regardless of how it is called.
 - `partial<A extends unknown[], B extends unknown[], R>(fn: (...args: [...A, ...B]) => R, ...args: A): (...rest: B) => R` — Creates a function that invokes `fn` with `args` prepended to the arguments it receives.
@@ -290,7 +290,7 @@ Import: `import { … } from '@emiliodominguez/js-helpers/functions';`
 ## async
 
 Promise utilities: retries, timeouts, polling, limiters, keyed Promise.all and async debounce.
-Import: `import { … } from '@emiliodominguez/js-helpers/async';`
+Import: `import { … } from '@emiliodominguez/tink/async';`
 
 - `AbortErrornew (message = 'The operation was aborted.')` — Error used to reject operations cancelled through an abort signal that carries no `reason`.
 - `TimeoutErrornew (message = 'The operation timed out.')` — Error used by `withTimeout` when the wrapped promise does not settle in time.
@@ -314,7 +314,7 @@ Import: `import { … } from '@emiliodominguez/js-helpers/async';`
 ## color
 
 Hex/RGB/HSL conversion, mixing, lightening and WCAG contrast checks.
-Import: `import { … } from '@emiliodominguez/js-helpers/color';`
+Import: `import { … } from '@emiliodominguez/tink/color';`
 
 - `parseHex(hex: string): Rgba` — Parses a CSS hex colour.
 - `parseColor(input: string): Rgba` — Parses a CSS colour string (CSS Color 4) into an `Rgba` colour.
@@ -336,7 +336,7 @@ Import: `import { … } from '@emiliodominguez/js-helpers/color';`
 ## search
 
 Fuzzy matching and ranking with highlight ranges, for command palettes and filter-as-you-type UIs.
-Import: `import { … } from '@emiliodominguez/js-helpers/search';`
+Import: `import { … } from '@emiliodominguez/tink/search';`
 
 - `fuzzyMatch(query: string, target: string, options: FuzzyMatchOptions = {}): FuzzyMatch | undefined` — Fuzzy-matches `query` against `target` (as in command palettes and filter-as-you-type lists): the query matches when all of its characters appear in the target in order, not necessarily contiguously.
 - `fuzzySearch(items: Iterable<string>, query: string, options?: FuzzySearchOptions<string>): Array<FuzzySearchResult<string>>` — Fuzzy-filters and ranks `items` by how well they match `query` (see `fuzzyMatch` for the matching and scoring rules).
@@ -345,7 +345,7 @@ Import: `import { … } from '@emiliodominguez/js-helpers/search';`
 ## easing
 
 Animation easing curves, CSS-accurate cubic-bezier() and steps(), and an analytic spring.
-Import: `import { … } from '@emiliodominguez/js-helpers/easing';`
+Import: `import { … } from '@emiliodominguez/tink/easing';`
 
 - `easeOut(easing: EasingFunction): EasingFunction` — Turns an ease-in function into its ease-out counterpart by point reflection: `t => 1 - easing(1 - t)`.
 - `easeInOut(easing: EasingFunction): EasingFunction` — Builds a symmetric ease-in-out function from an ease-in function: the first half runs `easing` at double speed, the second half its reflection, so that `g(1 - t) === 1 - g(t)` and `g(0.5) === 0.5`.
@@ -367,7 +367,7 @@ Import: `import { … } from '@emiliodominguez/js-helpers/easing';`
 ## format
 
 Deterministic, cached Intl formatting: numbers, currency, percent, compact, units, lists, dates, ordinals.
-Import: `import { … } from '@emiliodominguez/js-helpers/format';`
+Import: `import { … } from '@emiliodominguez/tink/format';`
 
 - `formatNumber(value: number | bigint, options: FormatNumberOptions = {}): string` — Formats a number with locale-aware grouping and decimal separators via `Intl.NumberFormat` (every non-style option passes through: `minimumFractionDigits`, `maximumFractionDigits`, `signDisplay`, `useGrouping`, `notation`, …).
 - `formatCurrency(value: number | bigint, currency: string, options: FormatCurrencyOptions = {}): string` — Formats an amount of money via `Intl.NumberFormat` with `style: 'currency'`.
@@ -383,7 +383,7 @@ Import: `import { … } from '@emiliodominguez/js-helpers/format';`
 ## validate
 
 Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates.
-Import: `import { … } from '@emiliodominguez/js-helpers/validate';`
+Import: `import { … } from '@emiliodominguez/tink/validate';`
 
 - `isEmail(value: unknown): value is string` — Checks whether a value is an email address, using the WHATWG HTML "valid email address" grammar (the one browsers apply to `<input type="email">`) plus the usual length limits: at most 64 characters before the `@`, 254 characters in total and 63 characters per domain label.
 - `isUrl(value: unknown, options: IsUrlOptions = {}): value is string` — Checks whether a value is an absolute URL with an allowed scheme, parsing it with the WHATWG `URL` parser (`globalThis.URL`).
@@ -407,7 +407,7 @@ Import: `import { … } from '@emiliodominguez/js-helpers/validate';`
 ## date
 
 DST-safe, non-mutating local-time date arithmetic, formatting and parsing.
-Import: `import { … } from '@emiliodominguez/js-helpers/date';`
+Import: `import { … } from '@emiliodominguez/tink/date';`
 
 - `isValidDate(value: unknown): value is Date` — Checks whether a value is a `Date` instance holding a valid time (i.e. not `new Date(NaN)`).
 - `addDays(date: DateInput, amount: number): Date` — Adds a number of calendar days (local time).
@@ -468,7 +468,7 @@ Import: `import { … } from '@emiliodominguez/js-helpers/date';`
 ## iterables
 
 Lazy, generator-based pipelines over any (async) iterable, with exact pull counts and early-exit cleanup.
-Import: `import { … } from '@emiliodominguez/js-helpers/iterables';`
+Import: `import { … } from '@emiliodominguez/tink/iterables';`
 
 - `count(start = 0, step = 1): IterableIterator<number>` — Lazily count from `start` by `step`, forever: `start, start + step, start + 2 * step, ...`.
 - `repeatValue<T>(value: T, times = Infinity): IterableIterator<T>` — Lazily yield the same value `times` times (forever by default).
@@ -506,28 +506,28 @@ Import: `import { … } from '@emiliodominguez/js-helpers/iterables';`
 ## cache
 
 O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock; plugs into memoize.
-Import: `import { … } from '@emiliodominguez/js-helpers/cache';`
+Import: `import { … } from '@emiliodominguez/tink/cache';`
 
 - `createLRUCache<K = unknown, V = unknown>(options: LRUCacheOptions<K, V>): LRUCache<K, V>` — Creates a least-recently-used cache backed by a `Map` for lookups and a doubly linked list for recency, so `get`, `set`, `peek`, `has` and `delete` are O(1) (a hit only relinks two list nodes; it never re-inserts the key into the `Map`).
 
 ## emitter
 
 Typed event emitter with wildcard listeners, waitFor and error isolation.
-Import: `import { … } from '@emiliodominguez/js-helpers/emitter';`
+Import: `import { … } from '@emiliodominguez/tink/emitter';`
 
 - `createEmitter<Events extends EventMap>(): Emitter<Events>` — Creates a strictly typed, synchronous event emitter.
 
 ## store
 
 Tiny state store compatible with React useSyncExternalStore, with derived selectors.
-Import: `import { … } from '@emiliodominguez/js-helpers/store';`
+Import: `import { … } from '@emiliodominguez/tink/store';`
 
 - `createStore<S>(initialState: S, options: StoreOptions<S> = {}): Store<S>` — Creates a tiny synchronous state container, usable from React 18+ without any React dependency: `const state = useSyncExternalStore(store.subscribe, store.getState);` (methods can be passed unbound).
 
 ## random
 
 Seeded deterministic PRNG plus cryptographically secure ids, UUIDs and bytes.
-Import: `import { … } from '@emiliodominguez/js-helpers/random';`
+Import: `import { … } from '@emiliodominguez/tink/random';`
 
 - `createRandom(seed: number | string): SeededRandom` — Creates a deterministic, seedable pseudo-random generator (sfc32, seeded through the cyrb128 string hash).
 - `randomBytes(length: number): Uint8Array` — Generates cryptographically secure random bytes using `globalThis.crypto.getRandomValues`.
@@ -541,7 +541,7 @@ Import: `import { … } from '@emiliodominguez/js-helpers/random';`
 ## decorators
 
 Class decorators for TypeScript (legacy and TC39 standard) and Babel.
-Import: `import { … } from '@emiliodominguez/js-helpers/decorators';`
+Import: `import { … } from '@emiliodominguez/tink/decorators';`
 
 - `readonly(targetOrValue: object, keyOrContext: string | symbol, descriptor?: undefined): void` — Makes a class field write-once: the value assigned by the field initializer (or the first assignment) is kept, and the instance gets an enumerable, non-writable, non-configurable own property.
 - `log<T extends AnyFunction>(targetOrValue: object, keyOrContext: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>` — Logs every call of the decorated method with `console.log`: `"<name> method called with arguments:" args`, then `"<name> method returned:" result`.

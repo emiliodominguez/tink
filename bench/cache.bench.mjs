@@ -1,4 +1,4 @@
-import { createLRUCache } from '@emiliodominguez/js-helpers/cache';
+import { createLRUCache } from '@emiliodominguez/tink/cache';
 
 /**
  * A minimal LRU cache (Map re-insertion for recency, no TTL, no callbacks, no validation): the theoretical best for this API.

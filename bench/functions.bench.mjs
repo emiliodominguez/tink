@@ -19,8 +19,8 @@ import {
 	throttle,
 	times,
 	unary
-} from '@emiliodominguez/js-helpers/functions';
-import { memoize as memoizeDecorator } from '@emiliodominguez/js-helpers/decorators';
+} from '@emiliodominguez/tink/functions';
+import { memoize as memoizeDecorator } from '@emiliodominguez/tink/decorators';
 import * as esToolkit from 'es-toolkit';
 import * as esCompat from 'es-toolkit/compat';
 import * as lodash from 'lodash-es';

@@ -18,7 +18,7 @@ import {
 	pick,
 	pickBy,
 	setInObjectByKeys
-} from '@emiliodominguez/js-helpers/objects';
+} from '@emiliodominguez/tink/objects';
 import * as toolkit from 'es-toolkit';
 import * as compat from 'es-toolkit/compat';
 import * as lodash from 'lodash-es';

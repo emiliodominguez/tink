@@ -13,7 +13,7 @@ import {
 	isSet,
 	isString,
 	isTypedArray
-} from '@emiliodominguez/js-helpers/guards';
+} from '@emiliodominguez/tink/guards';
 import * as esToolkit from 'es-toolkit';
 import * as lodash from 'lodash-es';
 

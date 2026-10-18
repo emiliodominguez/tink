@@ -122,7 +122,7 @@ const sections = MODULES.map(function ([name, description]) {
 			return `| \`${row.name}\`${row.kind === 'class' ? ' _(class)_' : ''} | ${row.summary} |`;
 		})
 		.join('\n');
-	return `## ${name}\n\n${description}\n\n\`\`\`ts\nimport { … } from '@emiliodominguez/js-helpers/${name}';\n\`\`\`\n\n| Export | Description |\n| --- | --- |\n${rows}\n`;
+	return `## ${name}\n\n${description}\n\n\`\`\`ts\nimport { … } from '@emiliodominguez/tink/${name}';\n\`\`\`\n\n| Export | Description |\n| --- | --- |\n${rows}\n`;
 });
 
 const toc = MODULES.map(function ([name]) {
@@ -137,13 +137,13 @@ writeFileSync('docs/API.md', output);
 const REPO = 'https://github.com/emiliodominguez/js-helpers/blob/main';
 const PRINCIPLES = `Key facts for code generation:
 - ESM only, zero dependencies, Node >= 20.19 or any modern browser/runtime. TypeScript types ship in the package.
-- Import from module entry points: \`import { debounce } from '@emiliodominguez/js-helpers/functions'\` (the root entry exposes namespaces: \`import { functions } from '@emiliodominguez/js-helpers'\`).
+- Import from module entry points: \`import { debounce } from '@emiliodominguez/tink/functions'\` (the root entry exposes namespaces: \`import { functions } from '@emiliodominguez/tink'\`).
 - Helpers never mutate their inputs unless the name or docs say so (\`setInObjectByKeys\`, \`deleteFromObjectByKeys\`).
 - Invalid arguments throw \`TypeError\` (wrong type) or \`RangeError\` (invalid value) whose message names the function and the parameter (\`fn: param must be …, got …\`).
 - Randomised helpers take an optional \`random\` generator last; the default is \`Math.random\`. Pass \`secureRandom\` (random module) for tokens, OTPs and lotteries.
 - Type guards compose into validators: \`isShape\`, \`isArrayOf\`, \`isUnion\`, \`isOptional\`…; \`explain\` lists issues with paths, \`ensure\` throws a \`ValidationError\`, \`toStandardSchema\` adapts any guard for tRPC, TanStack Form, Hono and other Standard Schema consumers.`;
 
-const llms = `# @emiliodominguez/js-helpers
+const llms = `# tink (@emiliodominguez/tink)
 
 > Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities (${MODULES.length} modules, ${[...EXPORTS.values()].reduce(function (total, rows) {
 	return total + rows.length;
@@ -154,24 +154,24 @@ ${PRINCIPLES}
 ## Modules
 
 ${MODULES.map(function ([name, description]) {
-	return `- [${name}](${REPO}/docs/API.md#${name}): ${description} Import from \`@emiliodominguez/js-helpers/${name}\`.`;
+	return `- [${name}](${REPO}/docs/API.md#${name}): ${description} Import from \`@emiliodominguez/tink/${name}\`.`;
 }).join('\n')}
 
 ## Docs
 
 - [Full API index with signatures](llms-full.txt): every export with its signature and summary.
 - [API reference](${REPO}/docs/API.md)
-- [Migrating from lodash](${REPO}/docs/MIGRATING-FROM-LODASH.md): lodash → js-helpers mapping with behavioural notes and sizes.
+- [Migrating from lodash](${REPO}/docs/MIGRATING-FROM-LODASH.md): lodash → tink mapping with behavioural notes and sizes.
 - [Import cost of every helper](${REPO}/docs/SIZES.md)
 - [Security policy](${REPO}/SECURITY.md)
 `;
 
-const full = `# @emiliodominguez/js-helpers — full API index
+const full = `# @emiliodominguez/tink — full API index
 
 ${PRINCIPLES}
 
 ${MODULES.map(function ([name, description]) {
-	return `## ${name}\n\n${description}\nImport: \`import { … } from '@emiliodominguez/js-helpers/${name}';\`\n\n${EXPORTS.get(name)
+	return `## ${name}\n\n${description}\nImport: \`import { … } from '@emiliodominguez/tink/${name}';\`\n\n${EXPORTS.get(name)
 		.map(function (row) {
 			return `- \`${row.name}${row.signature}\`${row.summary ? ` — ${row.summary}` : ''}`;
 		})
