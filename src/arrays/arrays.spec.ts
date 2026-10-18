@@ -2592,6 +2592,14 @@ describe('Arrays helpers (ordering, slicing, set algebra, combinatorics)', funct
 			expect(helpers.powerSet([])).toStrictEqual([[]]);
 		});
 
+		it('combinations counts C(n, k) as C(n, n - k), so k close to the length is not mistaken for a huge result', function () {
+			expect(helpers.combinations(helpers.range(36), 35)).toHaveLength(36);
+			expect(helpers.combinations(helpers.range(40), 38)).toHaveLength(780);
+			expect(function () {
+				helpers.combinations(new Array(100_000), 99_999);
+			}).toThrow(new RangeError('combinations: the result would contain 100000 tuples holding 9999900000 items, more than 2 ** 32 - 1'));
+		});
+
 		it('reject results larger than arrays can hold before allocating them', function () {
 			expect(function () {
 				helpers.combinations(new Array(100_000), 3);

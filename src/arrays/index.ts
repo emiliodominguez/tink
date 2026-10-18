@@ -2536,9 +2536,11 @@ export function combinations<T>(array: ReadonlyArray<T>, k: number): T[][] {
 	assertInteger('combinations', 'k', k, 0);
 	const length = array.length;
 	if (k > length) return [];
-	// C(length, k), computed incrementally (each step is an exact integer) and stopped as soon as it is too large.
+	// C(length, k) = C(length, length - k), computed incrementally (each step is an exact integer) and stopped as soon as it is too
+	// large. Counting up to the smaller of the two never passes the peak C(length, length / 2), which can be too large on its own.
+	const smaller = Math.min(k, length - k);
 	let count = 1;
-	for (let i = 0; i < k && count <= MAX_ARRAY_LENGTH; i++) count = (count * (length - i)) / (i + 1);
+	for (let i = 0; i < smaller && count <= MAX_ARRAY_LENGTH; i++) count = (count * (length - i)) / (i + 1);
 	assertResultSize('combinations', count, count * k);
 	const result: T[][] = [];
 	// Filled with `push`, so that V8 keeps the array packed (`range` returns a holey one, which is slower to read).
