@@ -2259,4 +2259,90 @@ describe('Date helpers', function () {
 			expect(helpers.isSameQuarter(new Date(2024, 0, 1), new Date(2023, 0, 1))).toBe(false);
 		});
 	});
+
+	describe('skipped calendar days and repeated fractions of an hour', function () {
+		it('endOfYear ends on the last local day of the year when December 31st was skipped', function () {
+			withTimeZone('Pacific/Kiritimati', function () {
+				// Kiritimati skipped December 31st, 1994 (UTC-10 to UTC+14).
+				expect(helpers.endOfYear(new Date(1994, 5, 1, 12)).getTime()).toBe(helpers.endOfMonth(new Date(1994, 11, 15, 12)).getTime());
+				expect(helpers.toISOStringLocal(helpers.endOfYear(new Date(1994, 5, 1, 12)))).toBe('1994-12-30T23:59:59.999-10:00');
+			});
+		});
+
+		it('business days and weekdays skip a day that does not exist', function () {
+			withTimeZone('Pacific/Apia', function () {
+				// Samoa skipped Friday, December 30th, 2011.
+				const thursday = new Date(2011, 11, 29, 10);
+				expect(parts(helpers.addBusinessDays(thursday, 1))).toEqual([2012, 0, 2, 10, 0, 0, 0]);
+				expect(parts(helpers.addBusinessDays(new Date(2011, 11, 31, 10), -1))).toEqual([2011, 11, 29, 10, 0, 0, 0]);
+				expect(parts(helpers.nextWeekday(thursday, 5))).toEqual([2012, 0, 6, 10, 0, 0, 0]);
+				expect(parts(helpers.previousWeekday(new Date(2012, 0, 1, 10), 5))).toEqual([2011, 11, 23, 10, 0, 0, 0]);
+			});
+		});
+
+		it('eachDayOfInterval lists each existing local day once', function () {
+			withTimeZone('Pacific/Apia', function () {
+				const days = helpers.eachDayOfInterval(new Date(2011, 11, 29), new Date(2012, 0, 1)).map(function (date) {
+					return parts(date).slice(0, 3);
+				});
+				expect(days).toEqual([
+					[2011, 11, 29],
+					[2011, 11, 31],
+					[2012, 0, 1]
+				]);
+			});
+		});
+
+		it('parseISODate rejects a skipped calendar day, like parseDate', function () {
+			withTimeZone('Pacific/Apia', function () {
+				expect(helpers.parseISODate('2011-12-30')).toBeUndefined();
+				expect(helpers.parseDate('2011-12-30', 'YYYY-MM-DD')).toBeUndefined();
+				expect(parts(helpers.parseISODate('2011-12-31') as Date)).toEqual([2011, 11, 31, 0, 0, 0, 0]);
+			});
+		});
+
+		it('endOfHour ends where the next hour starts, past a repeated half hour', function () {
+			withTimeZone('Australia/Lord_Howe', function () {
+				// 2024-04-07 02:00 (+11:00) became 01:30 (+10:30): the wall clock shows 01:30-02:00 twice.
+				const early = new Date('2024-04-06T14:02:00Z');
+				const late = new Date('2024-04-06T15:15:00Z');
+				expect(helpers.startOfHour(early).getTime()).toBe(helpers.startOfHour(late).getTime());
+				expect(helpers.toISOStringLocal(helpers.endOfHour(early))).toBe('2024-04-07T01:59:59.999+10:30');
+				expect(helpers.endOfHour(late).getTime()).toBe(helpers.endOfHour(early).getTime());
+			});
+		});
+	});
+
+	describe('regressions', function () {
+		it('isLeapYear accepts Dates from another realm', function () {
+			expect(helpers.isLeapYear(vm.runInNewContext('new Date(2024, 5, 1)'))).toBe(true);
+		});
+
+		it('parseDate reads YYYY as 4 digits when an empty literal separates it from a number', function () {
+			const pattern = 'YYYY[]MMDD[T]HHmmss.SSS';
+			const date = new Date(2024, 1, 29, 13, 7, 9, 3);
+			expect(helpers.parseDate(helpers.formatDate(date, pattern), pattern)?.getTime()).toBe(date.getTime());
+		});
+
+		it('isValidDate does not narrow an invalid Date away from Date', function () {
+			/**
+			 * Returns the time of a date, NaN included.
+			 */
+			function timeOf(date: Date): number {
+				if (!helpers.isValidDate(date)) return date.getTime();
+				return date.getTime();
+			}
+			/**
+			 * Describes a date or a string.
+			 */
+			function describeValue(value: Date | string): string {
+				if (!helpers.isValidDate(value)) return typeof value === 'string' ? value : 'invalid date';
+				const valid: helpers.ValidDate = value;
+				return valid.toISOString();
+			}
+			expect(timeOf(new Date(NaN))).toBeNaN();
+			expect(describeValue(new Date(NaN))).toBe('invalid date');
+			expect(describeValue('text')).toBe('text');
+		});
+	});
 });

@@ -537,7 +537,7 @@ Import: `import { … } from 'tinkit/validate';`
 DST-safe, non-mutating local-time date arithmetic, formatting and parsing.
 Import: `import { … } from 'tinkit/date';`
 
-- `isValidDate(value: unknown): value is Date` — Checks whether a value is a `Date` instance holding a valid time (i.e. not `new Date(NaN)`).
+- `isValidDate(value: unknown): value is ValidDate` — Checks whether a value is a `Date` instance holding a valid time (i.e. not `new Date(NaN)`).
 - `addDays(date: DateInput, amount: number): Date` — Adds a number of calendar days (local time).
 - `addWeeks(date: DateInput, amount: number): Date` — Adds a number of weeks (7 calendar days each, local time).
 - `addMonths(date: DateInput, amount: number): Date` — Adds a number of calendar months (local time).

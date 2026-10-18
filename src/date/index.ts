@@ -587,8 +587,17 @@ function lastInstantOfDay(date: Date, days = 1): Date {
 	return ensureInRange(date);
 }
 
+declare const validDate: unique symbol;
+
 /**
- * Checks whether a value is a `Date` instance holding a valid time (i.e. not `new Date(NaN)`).
+ * A `Date` known to hold a valid time, as narrowed by {@link isValidDate}. The brand only exists in the type system: a `Date` that
+ * fails the check is still a `Date`, so `if (!isValidDate(date))` keeps `date` typed as one.
+ */
+export type ValidDate = Date & { readonly [validDate]: true };
+
+/**
+ * Checks whether a value is a `Date` instance holding a valid time (i.e. not `new Date(NaN)`). It narrows `value` to
+ * {@link ValidDate}, a `Date`, when it returns `true`, and leaves its type alone otherwise (an invalid `Date` is still a `Date`).
  * @param {unknown} value - The value to check
  * @returns {boolean} `true` when `value` is a valid `Date`
  * @example
@@ -597,7 +606,7 @@ function lastInstantOfDay(date: Date, days = 1): Date {
  * isValidDate(Date.now()); // => false // a number, not a Date
  * isValidDate(Object.create(Date.prototype)); // => false // not a real Date
  */
-export function isValidDate(value: unknown): value is Date {
+export function isValidDate(value: unknown): value is ValidDate {
 	return isDate(value) && !Number.isNaN(Date.prototype.getTime.call(value));
 }
 
@@ -939,9 +948,8 @@ export function startOfYear(date: DateInput): Date {
 export function endOfYear(date: DateInput): Date {
 	const result = toValidDate(date);
 
-	result.setMonth(11, 31);
-
-	return lastInstantOfDay(result);
+	// Counted from `date`'s own day, like `endOfMonth`: `setMonth(11, 31)` would move to January 1st in a zone that skipped December 31st.
+	return lastInstantOfDay(result, daysFromCivil(result.getFullYear(), 11, 31) - epochDay(result) + 1);
 }
 
 /**
@@ -1005,7 +1013,7 @@ export function isSameYear(a: DateInput, b: DateInput): boolean {
  * isLeapYear(new Date(2000, 5, 1)); // => true
  */
 export function isLeapYear(yearOrDate: number | Date): boolean {
-	const year = yearOrDate instanceof Date ? toValidDate(yearOrDate).getFullYear() : yearOrDate;
+	const year = isDate(yearOrDate) ? toValidDate(yearOrDate).getFullYear() : yearOrDate;
 
 	assertNumber('isLeapYear', 'yearOrDate', year, Number.isInteger(year), 'an integer or a Date');
 
@@ -1329,7 +1337,10 @@ export function parseISODate(value: string): Date | undefined {
 
 	if (monthIndex < 0 || monthIndex > 11 || day < 1 || day > daysInMonth(year, monthIndex)) return undefined;
 
-	return localMidnight(year, monthIndex, day);
+	const date = localMidnight(year, monthIndex, day);
+
+	// A calendar day that the time zone skipped (Samoa's December 30th, 2011) starts on the next day: like `parseDate`, reject it.
+	return date.getDate() === day ? date : undefined;
 }
 
 /**
@@ -1568,7 +1579,26 @@ export function addBusinessDays(date: DateInput, amount: number): Date {
 		if (weekday !== 0 && weekday !== 6) remaining -= 1;
 	}
 
-	return addDays(start, offset);
+	let result = addDays(start, offset);
+
+	// Only where a whole calendar day was skipped (Samoa's December 30th, 2011): the target day does not exist, `addDays` lands on the
+	// next one, which can be a weekend day. Keep going in the direction of travel to the next weekday.
+	while (isWeekendDay(result)) {
+		offset += sign;
+		result = addDays(start, offset);
+	}
+
+	return result;
+}
+
+/**
+ * Checks whether a date falls on a Saturday or a Sunday (local time).
+ * @param {Date} date - A valid date
+ * @returns {boolean} `true` on weekends
+ */
+function isWeekendDay(date: Date): boolean {
+	const day = date.getDay();
+	return day === 0 || day === 6;
 }
 
 /**
@@ -2114,7 +2144,15 @@ export function startOfHour(date: DateInput): Date {
  * endOfHour(new Date(2024, 4, 10, 15, 42)); // => new Date(2024, 4, 10, 15, 59, 59, 999)
  */
 export function endOfHour(date: DateInput): Date {
-	return justBefore(gridBoundary(toValidDate(date), MS_PER_HOUR, 'next'));
+	const valid = toValidDate(date);
+	const start = gridBoundary(new Date(valid), MS_PER_HOUR, 'floor').getTime();
+	let next = gridBoundary(valid, MS_PER_HOUR, 'next');
+
+	// After clocks are set back by a fraction of an hour (Lord Howe Island: 02:00 becomes 01:30), the wall clock shows the same hour
+	// again past the first boundary: the hour that `startOfHour` returns ends where the next hour starts.
+	while (gridBoundary(new Date(next), MS_PER_HOUR, 'floor').getTime() === start) next = gridBoundary(next, MS_PER_HOUR, 'next');
+
+	return justBefore(next);
 }
 
 /**
@@ -2250,7 +2288,9 @@ function eachUnit(caller: string, start: DateInput, end: DateInput, index: numbe
 
 	if (!byTime) {
 		for (let k = 0; k < count; k++) {
-			result.push(byMonth ? localMidnight(0, first + k * size, 1) : localMidnight(1970, 0, 1 + first + k * size));
+			const date = byMonth ? localMidnight(0, first + k * size, 1) : localMidnight(1970, 0, 1 + first + k * size);
+			// A skipped calendar day (Samoa's December 30th, 2011) starts where the next one does: list that instant once.
+			if (result.length === 0 || result[result.length - 1].getTime() !== date.getTime()) result.push(date);
 		}
 
 		return result;
@@ -2291,7 +2331,23 @@ export function nextWeekday(date: DateInput, weekday: WeekdayIndex): Date {
 
 	const result = toValidDate(date);
 
-	return shiftCalendar(result, 0, mod(weekday - result.getDay() - 1, DAYS_PER_WEEK) + 1);
+	return onWeekday(result, mod(weekday - result.getDay() - 1, DAYS_PER_WEEK) + 1, weekday);
+}
+
+/**
+ * Shifts a date by a number of days that should land on `weekday`, one more week further when that day was skipped (Samoa's
+ * December 30th, 2011, a Friday: the shift then lands on the next day).
+ * @param {Date} date - A valid date, which is mutated
+ * @param {number} days - The shift, in calendar days
+ * @param {number} weekday - The weekday the result must fall on
+ * @returns {Date} The shifted date
+ * @throws {RangeError} when the result is out of range
+ */
+function onWeekday(date: Date, days: number, weekday: number): Date {
+	const time = date.getTime();
+	const result = shiftCalendar(date, 0, days);
+
+	return result.getDay() === weekday ? result : shiftCalendar(new Date(time), 0, days + Math.sign(days) * DAYS_PER_WEEK);
 }
 
 /**
@@ -2311,7 +2367,7 @@ export function previousWeekday(date: DateInput, weekday: WeekdayIndex): Date {
 
 	const result = toValidDate(date);
 
-	return shiftCalendar(result, 0, -1 - mod(result.getDay() - weekday - 1, DAYS_PER_WEEK));
+	return onWeekday(result, -1 - mod(result.getDay() - weekday - 1, DAYS_PER_WEEK), weekday);
 }
 
 /**
@@ -2436,9 +2492,11 @@ export function parseDate(value: string, pattern: string): Date | undefined {
 			continue;
 		}
 
-		// A formatter is always followed by a literal text, empty when another token follows directly.
-		const next = parts[i + 2];
-		const followedByNumber = parts[i + 1] === '' && typeof next === 'function' && next !== FORMATTERS.A && next !== FORMATTERS.a;
+		// A formatter is always followed by a literal text, empty when another token follows directly (empty `[]` literals too).
+		let after = i + 1;
+		while (parts[after] === '') after++;
+		const next = parts[after];
+		const followedByNumber = typeof next === 'function' && next !== FORMATTERS.A && next !== FORMATTERS.a;
 		const maxDigits = token.length === 1 ? 2 : token === 'YYYY' && !followedByNumber ? Infinity : token.length;
 		const start = position;
 
