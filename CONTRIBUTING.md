@@ -3,8 +3,16 @@
 ## Setup
 
 ```bash
-yarn install   # also installs the git hooks: lint-staged on commit, `yarn validate` on push
+yarn install   # also installs the git hooks: lint-staged on commit, commitlint on the message, `yarn validate` on push
 yarn validate  # lint, format, types, tests in 4 time zones, doctests, build, dist smoke test, size budget, exports
+```
+
+## Commits
+
+Messages follow [Conventional Commits](https://www.conventionalcommits.org) (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`…), checked by commitlint on commit and on pull requests:
+
+```text
+fix: read the npm 12 pack --json report in the size check
 ```
 
 ## Module layout
