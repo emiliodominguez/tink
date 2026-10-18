@@ -1,7 +1,7 @@
 {
-	"name": "@emiliodominguez/js-helpers",
+	"name": "@emiliodominguez/tink",
 	"version": "2.0.0",
-	"description": "Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities for arrays, objects, strings, math, functions, async flows, dates, type guards and decorators — property-tested with fast-check.",
+	"description": "tink: strictly typed, zero-dependency, tree-shakeable TypeScript utilities for everyday JavaScript.",
 	"keywords": [
 		"typescript",
 		"utilities",
