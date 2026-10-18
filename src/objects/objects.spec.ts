@@ -3289,3 +3289,12 @@ describe('Objects helpers (round 11)', function () {
 		});
 	});
 });
+
+describe('isMatch regression', function () {
+	it('matches a shared sub-object by identity, but not an equal copy with a key it never reads', function () {
+		const object = { '': { prototype: '' } };
+
+		expect(helpers.isMatch(object, { '': object[''] })).toBe(true);
+		expect(helpers.isMatch(object, { '': { prototype: '' } })).toBe(false);
+	});
+});

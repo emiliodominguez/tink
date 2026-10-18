@@ -761,8 +761,9 @@ describe('Objects helpers (round 11) - properties', function () {
 	it('isMatch accepts equal values and sub-objects, and agrees with isEqual on leaves', function () {
 		fc.assert(
 			fc.property(jsonObject, fc.array(fc.string({ maxLength: 4 })), function (object, keys) {
+				// Built from a clone: a sub-object sharing references with `object` matches by identity, even through keys isMatch never reads.
 				const sub = helpers.pick(
-					object,
+					helpers.deepClone(object),
 					keys.filter(function (key) {
 						return !UNSAFE.has(key);
 					}) as never[]
