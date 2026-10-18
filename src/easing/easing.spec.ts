@@ -17,6 +17,14 @@ for (const family of families) {
 
 describe('Easing helpers', function () {
 	describe('named easings', function () {
+		it.each(
+			named.filter(function ([name]) {
+				return name !== 'linear';
+			})
+		)('%s should map -0 to 0, never -0', function (_name, easing) {
+			expect(Object.is(easing(-0), -0)).toBe(false);
+		});
+
 		it.each(named)('%s should map 0 to exactly 0 and 1 to exactly 1, and NaN to NaN', function (_name, easing) {
 			expect(easing).toBeInstanceOf(Function);
 			expect(easing(0)).toBe(0);
@@ -103,6 +111,15 @@ describe('Easing helpers', function () {
 	});
 
 	describe('cubicBezier', function () {
+		it('should keep a flat end flat when extrapolating to ±Infinity', function () {
+			expect(helpers.cssEase(Infinity)).toBe(1);
+			expect(helpers.cssEaseOut(Infinity)).toBe(1);
+			expect(helpers.cssEaseIn(-Infinity)).toBe(0);
+			expect(helpers.cubicBezier(0.42, 0, 1, 1)(-Infinity)).toBe(0);
+			// A sloped end still extrapolates along its tangent.
+			expect(helpers.cubicBezier(0.1, 0.6, 0.7, 1.4)(-1)).toBeCloseTo(-6, 10);
+		});
+
 		it('should match browser reference values for the CSS presets', function () {
 			// Values from Chromium's gfx::CubicBezier (which solves to ~1e-7).
 			expect(helpers.cssEase(0.5)).toBeCloseTo(0.8024033877399112, 8);
@@ -292,6 +309,12 @@ describe('Easing helpers', function () {
 	});
 
 	describe('spring', function () {
+		it('should settle heavily over-damped springs whose ζ² overflows', function () {
+			const duration = helpers.spring({ damping: 1e160 }).duration;
+			expect(Number.isFinite(duration)).toBe(true);
+			expect(duration / helpers.spring({ damping: 1e154 }).duration).toBeCloseTo(1e6, 0);
+		});
+
 		it('should start at 0 and settle at 1 (under-damped, default options)', function () {
 			const { position, duration, easing } = helpers.spring();
 			expect(position(0)).toBe(0);

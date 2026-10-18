@@ -4,8 +4,11 @@ import { assertFunction, assertInteger, assertNumber, describe as typeName } fro
 /**
  * An easing function: maps animation progress `t` (`0` at the start, `1` at the end) to eased progress.
  *
- * Every easing of this module returns exactly `0` for `t = 0` and exactly `1` for `t = 1`. Outside `[0, 1]` they extrapolate their
- * formula (e.g. `easeInQuad(2) === 4`; the circular easings return `NaN` beyond `±1`), and `NaN` gives `NaN`.
+ * Every easing of this module returns exactly `0` (never `-0`) for `t = 0` and exactly `1` for `t = 1`, except the CSS `steps()` curves
+ * that jump at the start (`steps(4, 'jump-start')(0) === 0.25`, as in CSS). Outside `[0, 1]` the formula easings extrapolate their
+ * formula (e.g. `easeInQuad(2) === 4`; the circular easings return `NaN` where their square root is undefined: `easeInCirc` beyond
+ * `±1`, `easeOutCirc` below `0` or above `2`), `cubicBezier` extrapolates linearly and `spring().easing` stays at `0` or `1`. `NaN`
+ * gives `NaN`.
  */
 export type EasingFunction = (t: number) => number;
 
@@ -187,7 +190,8 @@ export function easeInOutQuad(t: number): number {
  * easeInCubic(0.5); // => 0.125
  */
 export function easeInCubic(t: number): number {
-	return t * t * t;
+	// `+ 0` turns -0 into 0.
+	return t * t * t + 0;
 }
 /**
  * Cubic ease-out.
@@ -251,7 +255,8 @@ export function easeInOutQuart(t: number): number {
  */
 export function easeInQuint(t: number): number {
 	const square = t * t;
-	return square * square * t;
+	// `+ 0` turns -0 into 0.
+	return square * square * t + 0;
 }
 /**
  * Quintic ease-out.
@@ -415,8 +420,8 @@ export function easeInOutBack(t: number): number {
  * easeInElastic(1); // => 1
  */
 export function easeInElastic(t: number): number {
-	// Pinned at t = 0 (the formula gives 2^-10 · sin(...) there); at t = 1 the formula is exactly 1.
-	return t === 0 ? t : -(2 ** (10 * t - 10)) * Math.sin((10 * t - 10.75) * ((2 * Math.PI) / 3));
+	// Pinned at t = 0 (the formula gives 2^-10 · sin(...) there, and -0 must give 0); at t = 1 the formula is exactly 1.
+	return t === 0 ? 0 : -(2 ** (10 * t - 10)) * Math.sin((10 * t - 10.75) * ((2 * Math.PI) / 3));
 }
 /**
  * Elastic ease-out: overshoots and oscillates around the target.
@@ -543,7 +548,11 @@ export function cubicBezier(x1: number, y1: number, x2: number, y2: number): Eas
 
 	return function (t) {
 		// `+ 0` turns -0 into 0; t = 0 and t = 1 are returned as-is (a gradient may overflow to Infinity, and Infinity · 0 is NaN).
-		if (!(t > 0 && t < 1)) return t < 0 ? startGradient * t + 0 : t > 1 ? 1 + endGradient * (t - 1) : t + 0;
+		// A flat end stays flat, even at ±Infinity (0 · Infinity would be NaN).
+		if (!(t > 0 && t < 1)) {
+			if (t < 0) return startGradient === 0 ? 0 : startGradient * t + 0;
+			return t > 1 ? (endGradient === 0 ? 1 : 1 + endGradient * (t - 1)) : t + 0;
+		}
 		// x(s) is only precise (relative to t) near s = 0, so the second half solves x̄(u) = 1 - t for u = 1 - s (1 - t is exact there).
 		const s = t <= 0.5 ? solveBezier(ax, bx, cx, t) : 1 - solveBezier(mirroredAx, mirroredBx, mirroredCx, 1 - t);
 		return ((ay * s + by) * s + cy) * s;
@@ -691,8 +700,8 @@ export function spring(options: SpringOptions = {}): Spring {
 			return x;
 		};
 	} else {
-		// Over-damped: x = C1·e^(r1·t) + C2·e^(r2·t); r1 = ω²/r2 avoids cancellation for large ζ.
-		const r2 = -omega * (zeta + Math.sqrt(zeta * zeta - 1));
+		// Over-damped: x = C1·e^(r1·t) + C2·e^(r2·t); r1 = ω²/r2 avoids cancellation for large ζ, and √(ζ - 1)·√(ζ + 1) the overflow of ζ².
+		const r2 = -omega * (zeta + Math.sqrt(zeta - 1) * Math.sqrt(zeta + 1));
 		const r1 = (omega * omega) / r2;
 		const c2 = (velocity + r1) / (r2 - r1);
 		const c1 = -1 - c2;
