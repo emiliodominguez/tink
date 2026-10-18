@@ -1122,54 +1122,6 @@ describe('Objects helpers', function () {
 		});
 	});
 
-	describe('backward-compatible guard re-exports', function () {
-		it('are the same functions as in the guards module', function () {
-			const names = [
-				'isObject',
-				'isArray',
-				'isFunction',
-				'isString',
-				'isNumber',
-				'isBoolean',
-				'isUndefined',
-				'isNull',
-				'isSymbol',
-				'isPromise',
-				'isRegExp',
-				'isError',
-				'isMap',
-				'isSet',
-				'isWeakMap',
-				'isWeakSet'
-			] as const;
-			const objectsExports: Record<string, unknown> = { ...helpers };
-			const guardsExports: Record<string, unknown> = { ...guards };
-			for (const name of names) {
-				expect(objectsExports[name]).toBe(guardsExports[name]);
-			}
-		});
-
-		it('keep their original behaviour', function () {
-			expect(helpers.isObject({ a: 1 })).toBe(true);
-			expect(helpers.isObject(function () {})).toBe(false);
-			expect(helpers.isArray([1])).toBe(true);
-			expect(helpers.isString('a')).toBe(true);
-			expect(helpers.isNumber(1)).toBe(true);
-			expect(helpers.isBoolean(false)).toBe(true);
-			expect(helpers.isUndefined(undefined)).toBe(true);
-			expect(helpers.isNull(null)).toBe(true);
-			expect(helpers.isSymbol(Symbol('x'))).toBe(true);
-			expect(helpers.isFunction(function () {})).toBe(true);
-			expect(helpers.isPromise(Promise.resolve())).toBe(true);
-			expect(helpers.isRegExp(/a/)).toBe(true);
-			expect(helpers.isError(new Error('e'))).toBe(true);
-			expect(helpers.isMap(new Map())).toBe(true);
-			expect(helpers.isSet(new Set())).toBe(true);
-			expect(helpers.isWeakMap(new WeakMap())).toBe(true);
-			expect(helpers.isWeakSet(new WeakSet())).toBe(true);
-		});
-	});
-
 	describe('round 2 regressions', function () {
 		it('omit drops numeric keys (they are strings at runtime)', function () {
 			const result = helpers.omit({ 1: 'a', 2: 'b', x: true }, [1, 'x']);
@@ -2731,7 +2683,7 @@ describe('Objects helpers (round 11)', function () {
 			const b: any = { v: 1 };
 			b.self = b;
 			const result = helpers.isEqualWith(a, b, function (left, right, context) {
-				if (helpers.isObject(left) && helpers.isObject(right) && 'self' in left) {
+				if (guards.isObject(left) && guards.isObject(right) && 'self' in left) {
 					return context.equals((left as any).self, (right as any).self) && context.equals((left as any).v, (right as any).v);
 				}
 				return undefined;
@@ -2741,7 +2693,7 @@ describe('Objects helpers (round 11)', function () {
 			c.self = c;
 			expect(
 				helpers.isEqualWith(a, c, function (left, right, context) {
-					return helpers.isObject(left) && helpers.isObject(right)
+					return guards.isObject(left) && guards.isObject(right)
 						? context.equals((left as any).v, (right as any).v) && context.equals((left as any).self, (right as any).self)
 						: undefined;
 				})

@@ -123,7 +123,7 @@ More examples, including dates, text and decorators, are in [Recipes](./docs/REC
 
 ## How it's tested
 
-3,673 tests, run in four time zones before every push, with 100% statement and branch coverage. They include [fast-check](https://fast-check.dev) property tests for the laws behind each helper, all 1,426 JSDoc example assertions run against the build, and [mutation testing](./docs/mutation/README.md).
+3,600+ tests, run in four time zones before every push, with 100% statement and branch coverage. They include [fast-check](https://fast-check.dev) property tests for the laws behind each helper, every JSDoc example (1,400+ assertions) run against the build, and [mutation testing](./docs/mutation/README.md).
 
 ## Docs
 

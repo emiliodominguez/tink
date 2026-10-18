@@ -1,31 +1,7 @@
-import {
-	isArray,
-	isBoolean,
-	isDate,
-	isArrayBuffer,
-	isError,
-	isFunction,
-	isMap,
-	isNull,
-	isNumber,
-	isObject,
-	isPlainObject,
-	isPromise,
-	isRegExp,
-	isSet,
-	isString,
-	isSymbol,
-	isUndefined,
-	isWeakMap,
-	isWeakSet
-} from '../guards/index.js';
+import { isDate, isArrayBuffer, isError, isFunction, isMap, isObject, isPlainObject, isPromise, isRegExp, isSet, isWeakMap, isWeakSet } from '../guards/index.js';
 import { toCamelCase, toKebabCase, toSnakeCase } from '../strings/index.js';
 import { assertFunction, assertInteger, assertNumber, describe } from '../utils/assert.js';
 import type { AnyFunction, DeepReadonly, NestedKeyOf, PathValue, Primitive, UnionToIntersection } from '../utils/index.js';
-
-// Backward compatibility: these type guards MOVED to the `guards` module (where they are real type predicates).
-// They are re-exported here so existing `objects` imports keep working; prefer importing them from `guards`.
-export { isObject, isArray, isFunction, isString, isNumber, isBoolean, isUndefined, isNull, isSymbol, isPromise, isRegExp, isError, isMap, isSet, isWeakMap, isWeakSet };
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Types

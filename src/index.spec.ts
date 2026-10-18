@@ -44,7 +44,7 @@ describe('root entry', function () {
 			'validate'
 		]);
 		expect(root.strings.isEmpty).not.toBe(root.objects.isEmpty);
-		expect(root.objects.isString).toBe(root.guards.isString);
+		expect('isString' in root.objects).toBe(false); // guards live in one place
 	});
 });
 

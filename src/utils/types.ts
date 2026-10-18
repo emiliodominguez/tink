@@ -16,15 +16,6 @@ export type AnyFunction = (...args: never[]) => unknown;
 export type UnionToIntersection<U> = (U extends unknown ? (arg: U) => void : never) extends (arg: infer I) => void ? I : never;
 
 /**
- * Recursively marks every property of `T` as optional.
- */
-export type DeepPartial<T> = T extends Primitive | AnyFunction | Date | RegExp
-	? T
-	: T extends ReadonlyArray<infer U>
-		? ReadonlyArray<DeepPartial<U>>
-		: { [K in keyof T]?: DeepPartial<T[K]> };
-
-/**
  * Recursively marks every property of `T` as `readonly`.
  */
 export type DeepReadonly<T> = T extends Primitive | AnyFunction
@@ -85,20 +76,6 @@ type PathSegmentValue<T, K extends string> = K extends keyof NonNullable<T>
  * type V = PathValue<{ a: { b: string } }, 'a.b'>; // string
  */
 export type PathValue<T, P extends string> = P extends `${infer K}.${infer Rest}` ? PathValue<PathSegmentValue<T, K>, Rest> : PathSegmentValue<T, P>;
-
-/**
- * Removes the array wrapper from `T`, if any.
- */
-export type UnArray<T> = T extends ReadonlyArray<infer U> ? U : T;
-
-/**
- * Picks `K` from `T` and `KNK` from the nested property `KN` (which can be an object or an array of objects).
- * @example
- * type P = NestedPick<User, 'id', 'posts', 'title'>; // { id: number; posts: { title: string }[] }
- */
-export type NestedPick<T, K extends keyof T, KN extends keyof T, KNK extends keyof UnArray<T[KN]>> = Pick<T, K> & {
-	[Key in KN]: T[KN] extends ReadonlyArray<unknown> ? Array<Pick<UnArray<T[KN]>, KNK>> : Pick<UnArray<T[KN]>, KNK>;
-};
 
 /**
  * Structural subset of the standard `AbortSignal`, so the library works without the DOM or Node type libraries.
