@@ -1,6 +1,6 @@
 # tink (@emiliodominguez/tink)
 
-> Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities (20 modules, 426 exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, fuzzy search, caches, emitters and stores. Property-tested and mutation-tested.
+> Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities (20 modules, 579 exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, fuzzy search, caches, emitters and stores. Property-tested and mutation-tested.
 
 Key facts for code generation:
 - ESM only, zero dependencies, Node >= 20.19 or any modern browser/runtime. TypeScript types ship in the package.

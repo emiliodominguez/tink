@@ -33,7 +33,7 @@ Import: `import { … } from '@emiliodominguez/tink/arrays';`
 - `countBy<T, K extends PropertyKey>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => K): Record<K, number>` — Count the items of an array per key returned by `keyFn`.
 - `partition<T, S extends T>(array: ReadonlyArray<T>, predicate: (item: T, index: number) => item is S): [S[], Exclude<T, S>[]]` — Split an array in two: the items matching a type-guard `predicate`, and the others.
 - `uniqueBy<T>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => unknown): T[]` — Remove items whose key (as returned by `keyFn`, compared with SameValueZero) was already seen, keeping the first occurrence.
-- `sortBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey, order: SortOrder = 'asc'): T[]` — Return a sorted copy of an array, ordered by the key `selector` returns for each item.
+- `sortBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey | null | undefined, order: SortOrder = 'asc'): T[]` — Return a sorted copy of an array, ordered by the key `selector` returns for each item.
 - `shuffle<T>(array: ReadonlyArray<T>, random: RandomGenerator = Math.random): T[]` — Return a shuffled copy of an array using the Fisher–Yates algorithm (the input is not mutated).
 - `sample<T>(array: ReadonlyArray<T>, random: RandomGenerator = Math.random): T | undefined` — Pick a random item from an array.
 - `take<T>(array: ReadonlyArray<T>, n: number): T[]` — Return the first `n` items of an array (or all of them when it is shorter).
@@ -41,8 +41,8 @@ Import: `import { … } from '@emiliodominguez/tink/arrays';`
 - `unzip<T extends ReadonlyArray<unknown>>(tuples: ReadonlyArray<T>): Unzipped<T> | []` — Split an array of tuples into one array per tuple position: the inverse of `zip`.
 - `windowed<T>(array: ReadonlyArray<T>, size: number, step = 1): T[][]` — Return the sliding windows of `size` consecutive items, starting every `step` items.
 - `pairwise<T>(array: ReadonlyArray<T>): Array<[T, T]>` — Return every pair of adjacent items: `[a[0], a[1]], [a[1], a[2]], ...` (empty for arrays with fewer than 2 items).
-- `minBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey): T | undefined` — Return the item with the SMALLEST key, using the same ordering rules as `sortBy` (numbers/bigints numerically and before strings, strings by UTF-16 code units, `Date`s by timestamp).
-- `maxBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey): T | undefined` — Return the item with the LARGEST key, using the same ordering rules as `sortBy` (numbers/bigints numerically and before strings, strings by UTF-16 code units, `Date`s by timestamp).
+- `minBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey | null | undefined): T | undefined` — Return the item with the SMALLEST key, using the same ordering rules as `sortBy` (numbers/bigints numerically and before strings, strings by UTF-16 code units, `Date`s by timestamp).
+- `maxBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey | null | undefined): T | undefined` — Return the item with the LARGEST key, using the same ordering rules as `sortBy` (numbers/bigints numerically and before strings, strings by UTF-16 code units, `Date`s by timestamp).
 - `sumBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => number): number` — Add up the numbers returned by `selector` for each item, using compensated (Neumaier) summation like `sum` from the math module (same algorithm, same result), so the rounding error does not grow with the number of items.
 - `move<T>(array: ReadonlyArray<T>, from: number, to: number): T[]` — Return a copy of an array with the item at `from` moved to position `to` (the input is not mutated).
 - `insertAt<T>(array: ReadonlyArray<T>, index: number, ...items: T[]): T[]` — Return a copy of an array with `items` inserted before position `index` (the input is not mutated).
@@ -55,6 +55,36 @@ Import: `import { … } from '@emiliodominguez/tink/arrays';`
 - `intersectionBy<T, U = T>(a: Iterable<T>, b: Iterable<U>, keyFn: (item: T | U) => unknown): T[]` — Like `intersection`, but items are compared by the key `keyFn` returns (SameValueZero): the items of `a` whose key is also the key of an item of `b`, keeping only the FIRST item of `a` per key.
 - `diffSequences<T>(a: Iterable<T>, b: Iterable<T>, equals: (x: T, y: T) => boolean = sameValueZero, options: DiffOptions = {}): Array<DiffOperation<T>>` — Computes a minimal edit script turning sequence `a` into sequence `b`: a list of `'equal'`, `'delete'` and `'insert'` operations (see `DiffOperation`) with the smallest possible number of deletions plus insertions.
 - `longestCommonSubsequence<T>(a: Iterable<T>, b: Iterable<T>, equals: (x: T, y: T) => boolean = sameValueZero, options: DiffOptions = {}): T[]` — Computes a longest common subsequence of `a` and `b`: the longest list of elements that appear in both, in the same relative order (not necessarily contiguously).
+- `unionBy<T, U = T>(a: Iterable<T>, b: Iterable<U>, keyFn: (item: T | U) => unknown): Array<T | U>` — Like `union`, but items are compared by the key `keyFn` returns (SameValueZero): every item of `a`, then of `b`, whose key was not seen before, so only the FIRST item per key is kept.
+- `symmetricDifferenceBy<T, U = T>(a: Iterable<T>, b: Iterable<U>, keyFn: (item: T | U) => unknown): Array<T | U>` — Like `symmetricDifference`, but items are compared by the key `keyFn` returns (SameValueZero): the items of `a` whose key is not the key of any item of `b`, followed by the items of `b` whose key is not the key of any item of `a`, keeping only the FIRST item per key.
+- `uniqueWith<T>(iterable: Iterable<T>, equals: (x: T, y: T) => boolean): T[]` — Remove the items `equals` to an earlier item, keeping the first occurrence: `removeDuplicates` with a custom equality, for values that have no identity key (e.g. points within a tolerance).
+- `unionWith<T, U = T>(a: Iterable<T>, b: Iterable<U>, equals: (x: T | U, y: T | U) => boolean): Array<T | U>` — `union` with a custom equality: every item of `a`, then of `b`, not `equals` to an item already kept (first occurrence wins).
+- `differenceWith<T, U = T>(a: Iterable<T>, b: Iterable<U>, equals: (x: T, y: T | U) => boolean): T[]` — `difference` with a custom equality: the items of `a` not `equals` to any item of `b`, keeping only the first of several items of `a` that are `equals` to each other.
+- `intersectionWith<T, U = T>(a: Iterable<T>, b: Iterable<U>, equals: (x: T, y: T | U) => boolean): T[]` — `intersection` with a custom equality: the items of `a` `equals` to some item of `b`, keeping only the first of several items of `a` that are `equals` to each other.
+- `orderBy<T>(array: ReadonlyArray<T>, selectors: ReadonlyArray<(item: T, index: number) => SortKey | null | undefined>, orders: SortOrder | ReadonlyArray<SortOrder> = 'asc'): T[]` — Return a sorted copy of an array, ordered by several keys: by the first selector's key, then items with equal first keys by the second selector's key, and so on, each key in its own direction.
+- `takeFirstBy<T>(array: ReadonlyArray<T>, n: number, selector: (item: T, index: number) => SortKey | null | undefined, order: SortOrder = 'asc'): T[]` — Return the `n` first items of `sortBy(array, selector, order)` without sorting the whole array: a bounded heap selects them in O(length · log n), then only they are sorted.
+- `nthBy<T>(array: ReadonlyArray<T>, index: number, selector: (item: T, index: number) => SortKey | null | undefined, order: SortOrder = 'asc'): T | undefined` — Return the item at position `index` of `sortBy(array, selector, order)` without sorting the whole array (a bounded heap of `position + 1` items, O(length · log position)): `0` is the first ranked item, `1` the second...
+- `sortedIndexBy<T>(sortedArray: ReadonlyArray<T>, value: T, selector: (item: T) => SortKey | null | undefined, order: SortOrder = 'asc'): number` — Find, by binary search (O(log n) selector calls), the LOWEST index at which `value` can be inserted into `sortedArray` keeping it sorted by the key `selector` returns (before any items with an equal key).
+- `sortedLastIndexBy<T>(sortedArray: ReadonlyArray<T>, value: T, selector: (item: T) => SortKey | null | undefined, order: SortOrder = 'asc'): number` — Like `sortedIndexBy`, but returns the HIGHEST insertion index (after any items with an equal key), which keeps insertion order among equal keys when used to insert.
+- `sortedLastIndex<T extends number | string | bigint>(sortedArray: ReadonlyArray<T>, value: T): number` — Find, by binary search (O(log n)), the HIGHEST index at which `value` can be inserted into `sortedArray` keeping it sorted (after any equal items): the upper-bound counterpart of `sortedIndex`.
+- `takeLast<T>(array: ReadonlyArray<T>, n: number): T[]` — Return the last `n` items of an array (or all of them when it is shorter).
+- `dropLast<T>(array: ReadonlyArray<T>, n: number): T[]` — Return an array without its last `n` items.
+- `takeLastWhile<T>(array: ReadonlyArray<T>, predicate: (item: T, index: number) => boolean): T[]` — Return the longest suffix of an array whose items all match `predicate`, scanning from the end and stopping at the first item that does not match.
+- `dropLastWhile<T>(array: ReadonlyArray<T>, predicate: (item: T, index: number) => boolean): T[]` — Return an array without its longest suffix whose items all match `predicate` (scanning from the end, stopping at the first item that does not match).
+- `chunkBy<T>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => unknown): T[][]` — Split an array into runs of ADJACENT items with the same key (compared with SameValueZero, so `NaN` keys group together), like Python's `itertools.groupby`: unlike `groupBy`, a key that comes back after another one starts a new run.
+- `splitWhen<T>(array: ReadonlyArray<T>, predicate: (item: T, index: number) => boolean): [T[], T[]]` — Split an array in two at the first item matching `predicate`: the items before it, and the rest (starting with that item).
+- `swap<T>(array: ReadonlyArray<T>, i: number, j: number): T[]` — Return a copy of an array with the items at positions `i` and `j` exchanged (the input is not mutated).
+- `rotate<T>(array: ReadonlyArray<T>, k: number): T[]` — Return a copy of an array rotated by `k` positions (the input is not mutated): a positive `k` moves every item `k` places towards the END, the last items wrapping around to the front (like Python's `deque.rotate`); a negative `k` rotates towards the start.
+- `toggle<T>(array: ReadonlyArray<T>, item: T, keyFn?: (item: T) => unknown): T[]` — Return a copy of an array where `item` is removed if present, or appended otherwise: the state change of a checkbox list or tag picker.
+- `toArray<T>(value: T | ReadonlyArray<T> | null | undefined): T[]` — Normalize a value that may be a single item, an array of items, or nothing, into a fresh array (lodash's `castArray`).
+- `zipObject<const K extends PropertyKey, V>(keys: ReadonlyArray<K>, values: ReadonlyArray<V>): Record<K, V>` — Build an object from a list of keys and a list of values: `{ [keys[i]]: values[i] }`, like `Object.fromEntries(zip(keys, values))`.
+- `zipWith<T extends Array<ReadonlyArray<unknown>>, R>(fn: (...values: Zipped<T>) => R, ...arrays: T): R[]` — Combine arrays element-wise with `fn`: `fn(a[i], b[i], ...)` for every index, truncating to the length of the SHORTEST array like `zip` (lodash pads the shorter arrays with `undefined` instead, which `fn`'s parameter types would not reveal).
+- `sampleSize<T>(array: ReadonlyArray<T>, n: number, random: RandomGenerator = Math.random): T[]` — Return `n` distinct random items of an array (sampling WITHOUT replacement: positions are distinct, so equal values may repeat only if the input repeats them).
+- `averageBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => number): number` — Return the mean of the numbers `selector` returns for each item, added up with compensated summation like `sumBy` (so `0.1`, `0.2`, `0.3` average to exactly `0.2`).
+- `medianBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => number): number` — Return the median of the numbers `selector` returns for each item (the mean of the two middle values for an even count), with the semantics of `median` from the math module: keys are converted once with unary `+`, and the result does not depend on the item order.
+- `combinations<T>(array: ReadonlyArray<T>, k: number): T[][]` — Return every combination of `k` items of an array (subsets of `k` POSITIONS, items in input order), in lexicographic order of positions, like Python's `itertools.combinations`.
+- `permutations<T>(array: ReadonlyArray<T>, k = array.length): T[][]` — Return every arrangement of `k` items of an array (ordered selections of `k` distinct POSITIONS), in lexicographic order of positions, like Python's `itertools.permutations`.
+- `powerSet<T>(array: ReadonlyArray<T>): T[][]` — Return every subset of an array (`2 ** length` of them, items in input order), in binary-counting order: item `i` is in subset `m` when bit `i` of `m` is set, so `[]` comes first and the whole array last.
 
 ## objects
 
@@ -76,9 +106,19 @@ Import: `import { … } from '@emiliodominguez/tink/objects';`
 - `invert<T extends Record<PropertyKey, PropertyKey>>(object: T): Invert<T>` — Creates a new object whose keys are the values of `object` and whose values are the (string) keys.
 - `getFromObjectByKeys<T extends object, P extends NestedKeyOf<T>>(target: T, keys: P): PathValue<T, P>` — Safely reads a nested value through a dot-separated path (array elements are addressed with numeric segments: `'list.0.id'`).
 - `setInObjectByKeys<T extends object>(target: T, path: string, value: unknown): T` — Sets a nested value through a dot-separated path.
+- `updateInObjectByKeys<T extends object, P extends string>(target: T, path: P, valueOrUpdater: PathUpdateValue<T, P> | ((current: PathUpdateValue<T, P>) => PathUpdateValue<T, P>)): T` — IMMUTABLE counterpart of `setInObjectByKeys`: returns a NEW root in which the value at the dot-separated path is replaced by `valueOrUpdater` (or, when it is a function, by `valueOrUpdater(currentValue)`).
+- `omitInObjectByKeys<T extends object, P extends string>(target: T, path: P): OmitAtPath<T, P>` — IMMUTABLE counterpart of `deleteFromObjectByKeys`: returns a NEW root without the own property at the dot-separated path, copying only the plain objects and arrays on the path (structural sharing).
+- `toPath(path: string): string[]` — Parses a property path written in JavaScript accessor syntax into its segments: dot-separated names (`a.b`) and brackets holding a canonical array index (`[0]`) or a quoted key (`['b.c']`, `["x"]`, with `\\`, `\'` and `\"` as the only escapes).
 - `deepClone<T>(value: T): T` — Creates a deep copy of a value without using `structuredClone`.
 - `deepMerge<T extends object, S extends object[]>(target: T, ...sources: S): DeepMergeAll<T, S>` — Deeply merges plain objects into a NEW object, left to right (later sources win).
+- `deepMergeWith<O extends DeepMergeOptions, T extends object, S extends object[]>(options: O, target: T, ...sources: S): DeepMergeWithResult<O, T, S>` — `deepMerge` with options: an array strategy and a customizer.
+- `defaults<T extends object, S extends object[]>(target: T, ...sources: S): DefaultsAll<T, S>` — Fills the MISSING keys of a copy of `target` from `sources`: a key keeps the first value that is not `undefined`, looking at the target first, then each source in order (lodash `defaults`, without mutating anything).
+- `defaultsDeep<T extends object, S extends object[]>(target: T, ...sources: S): DefaultsAll<T, S, true>` — `defaults` that also fills nested plain objects recursively: a plain object of the target and a plain object of a source at the same key are filled key by key; any other present value (arrays included) is kept as is.
+- `defaultsWith<O extends DefaultsOptions, T extends object, S extends object[]>(options: O, target: T, ...sources: S): DefaultsWithResult<O, T, S>` — `defaults` / `defaultsDeep` with options, making explicit the choices the popular libraries disagree on.
 - `isEqual(a: unknown, b: unknown): boolean` — Deep structural equality.
+- `isEqualWith(a: unknown, b: unknown, customizer: EqualityCustomizer): boolean` — `isEqual` with a customizer consulted for every compared pair of non-identical values (`Object.is`: identical values are always equal, so `0` and `-0` do reach it), the roots included, before the default rules: `customizer(a, b, { key, path, parentA, parentB, equals })` returns `true` or `false` to settle that pair, or `undefined` to fall back to `isEqual`'s rules (whose nested comparisons consult the customizer again).
+- `isMatch(value: unknown, pattern: unknown, options: IsMatchOptions = {}): boolean` — Deep PARTIAL match: whether `value` has every key of `pattern` with a matching value, recursively for plain objects.
+- `shallowEqual(a: unknown, b: unknown): boolean` — One-level equality: `true` when the values are SameValueZero-equal, or are objects of the same prototype and kind whose own members are SameValueZero-equal (no deep comparison, O(n)).
 - `deepFreeze<T>(object: T): DeepReadonly<T>` — Recursively freezes an object and every object reachable through its own (string and symbol) data properties, as well as `Map` keys/values and `Set` members.
 - `typedKeys<T extends object>(object: T): Array<StringKeyOf<T>>` — `Object.keys` with a precise return type: the OWN ENUMERABLE STRING keys of an object (symbol keys and inherited keys are excluded, numeric keys are returned as strings).
 - `typedEntries<T extends object>(object: T): Array<EntryOf<T>>` — `Object.entries` with a precise return type: `[key, value]` pairs for the OWN ENUMERABLE STRING keys of an object (symbol keys and inherited keys are excluded).
@@ -91,6 +131,17 @@ Import: `import { … } from '@emiliodominguez/tink/objects';`
 - `hasInObjectByKeys(target: object, path: string): boolean` — Checks whether a dot-separated path exists in an object: it is `true` exactly when `getFromObjectByKeys` resolves the path to a property (whose value may be `undefined`) rather than falling back to the default value.
 - `deleteFromObjectByKeys(target: object, path: string): boolean` — Deletes the property at a dot-separated path.
 - `diff(a: object, b: object): ObjectDiff` — Computes the structural differences between two trees of plain objects and arrays, as dot-separated paths (array elements use numeric segments: `'list.0'`).
+- `findKey<T extends object, S extends T[keyof T]>(object: T, predicate: (value: T[keyof T], key: StringKeyOf<T>, object: T) => value is S): KeysMatching<T, S> | undefined` — Returns the first own enumerable string key (in `Object.keys` order) whose value satisfies `predicate`.
+- `findEntry<T extends object, S extends T[keyof T]>(object: T, predicate: (value: T[keyof T], key: StringKeyOf<T>, object: T) => value is S): [KeysMatching<T, S>, S] | undefined` — Returns the first `[key, value]` own enumerable string-keyed entry whose value satisfies a type-guard `predicate`, narrowed.
+- `mapEntries<T extends object, K extends PropertyKey, V>(object: T, fn: (value: T[keyof T], key: StringKeyOf<T>, object: T) => readonly [K, V]): Record<K, V>` — Creates a new object by mapping every own enumerable string-keyed entry (in `Object.keys` order) to a new `[key, value]` pair.
+- `sortKeys<T extends object>(object: T, options: SortKeysOptions = {}): T` — Returns a copy of a plain object (or an array) whose own enumerable string keys are inserted in sorted order, for stable output and readable diffs.
+- `evolve<T extends object, E extends Evolver<T>>(object: T, transforms: E): Evolved<T, E>` — Returns a copy of a plain object (or an array) in which the values of the keys named in `transforms` are replaced: a function receives the current value and returns the new one; a nested plain object of transforms applies recursively to a nested plain object or array.
+- `transformKeysDeep<T>(value: T, fn: (key: string) => string): TransformKeysDeep<T>` — Returns a deep copy of the plain objects and arrays of `value` in which every own enumerable STRING key of every plain object is renamed by `fn` (symbol keys are kept).
+- `toCamelCaseKeys<T>(value: T): CamelCaseKeys<T>` — Deeply renames the keys of plain objects (also inside arrays) to camelCase with `strings/toCamelCase`, the same word splitter as every case function of tink (acronyms: `XMLHttpRequest` → `xmlHttpRequest`; digits stay attached: `version2`), so the result TYPE (`CamelCaseKeys`) matches the runtime keys exactly for ASCII keys.
+- `toSnakeCaseKeys<T>(value: T): SnakeCaseKeys<T>` — Deeply renames the keys of plain objects (also inside arrays) to snake_case with `strings/toSnakeCase`; same rules as `toCamelCaseKeys`.
+- `toKebabCaseKeys<T>(value: T): KebabCaseKeys<T>` — Deeply renames the keys of plain objects (also inside arrays) to kebab-case with `strings/toKebabCase`; same rules as `toCamelCaseKeys`.
+- `stableStringify(value: unknown): string` — Serializes a value into a DETERMINISTIC string: two values give the same string exactly when they hold the same data, whatever the insertion order of their keys or `Map`/`Set` entries, which makes the result usable as a cache key, a memoization key or the input of `hash`.
+- `hash(value: unknown, seed: number = 0): number` — Hashes a value: the 53-bit cyrb53 hash of its `stableStringify` encoding, so equal data gives equal hashes whatever the key order.
 
 ## guards
 
@@ -117,12 +168,19 @@ Import: `import { … } from '@emiliodominguez/tink/guards';`
 - `isWeakSet(value: unknown): value is WeakSet<object>` — Checks whether a value is a genuine `WeakSet` (brand check: cross-realm and subclass instances pass; objects that merely inherit from `WeakSet.prototype`, and proxies, fail).
 - `isNil(value: unknown): value is null | undefined` — Checks whether a value is `null` or `undefined`.
 - `isDefined<T>(value: T): value is NonNullable<T>` — Checks whether a value is neither `null` nor `undefined`, narrowing `T` to `NonNullable<T>`.
+- `isTruthy<T>(value: T): value is Exclude<T, Falsy>` — Checks whether a value is truthy, narrowing it to `Exclude<T, Falsy>`: unlike `array.filter(Boolean)`, `array.filter(isTruthy)` narrows the element type.
+- `isFalsy<T>(value: T): value is FalsyPart<T>` — Checks whether a value is falsy (`false`, `0`, `-0`, `0n`, `''`, `null`, `undefined` or `NaN`), narrowing it to `FalsyPart`: `string \| undefined` becomes `'' \| undefined`, and a wide `number` stays `number` (it may be `NaN`).
 - `isPlainObject(value: unknown): value is Record<PropertyKey, unknown>` — Checks whether a value is a plain object: an object whose prototype is exactly `Object.prototype` or `null` (object literals, `Object.create(null)`, `JSON.parse` output).
 - `isPrimitive(value: unknown): value is Primitive` — Checks whether a value is a primitive (`string`, `number`, `bigint`, `boolean`, `symbol`, `null` or `undefined`).
 - `isIterable(value: unknown): value is Iterable<unknown>` — Checks whether a value implements the iterable protocol (`value[Symbol.iterator]` is a function).
 - `isAsyncIterable(value: unknown): value is AsyncIterable<unknown>` — Checks whether a value implements the async iterable protocol (`value[Symbol.asyncIterator]` is a function).
 - `isFiniteNumber(value: unknown): value is number` — Checks whether a value is a finite number (excludes `NaN` and `±Infinity`).
 - `isInteger(value: unknown): value is number` — Checks whether a value is an integer number (finite, no fractional part).
+- `isPositiveNumber(value: unknown): value is number` — Checks whether a value is a finite number greater than zero.
+- `isNonNegativeNumber(value: unknown): value is number` — Checks whether a value is a finite number greater than or equal to zero.
+- `isPositiveInteger(value: unknown): value is number` — Checks whether a value is an integer greater than zero (`1`, `2`, …; `1e21` too: use `isSafeInteger` to bound it).
+- `isNonNegativeInteger(value: unknown): value is number` — Checks whether a value is an integer greater than or equal to zero (an index or a count).
+- `isSafeInteger(value: unknown): value is number` — Checks whether a value is a safe integer: an integer in `[-(2^53 - 1), 2^53 - 1]`, the range where every integer is exactly representable (so `n + 1 !== n`).
 - `isNonEmptyString(value: unknown): value is string` — Checks whether a value is a primitive string with at least one UTF-16 code unit.
 - `isNonEmptyArray<T>(value: T[] | null | undefined): value is [T, ...T[]]` — Checks whether a (mutable) array has at least one element, narrowing it to a non-empty tuple `[T, ...T[]]` so that `value[0]` is typed `T` (not `T \| undefined` under `noUncheckedIndexedAccess`).
 - `isKeyOf<T extends object>(object: T, key: unknown): key is keyof T` — Checks whether `key` is an OWN property key of `object` (string, number or symbol; enumerable or not), narrowing `key` to `keyof T`.
@@ -143,9 +201,18 @@ Import: `import { … } from '@emiliodominguez/tink/guards';`
 - `isNullable<T>(guard: Guard<T>): (value: unknown) => value is T | null` — Creates a guard that also accepts `null` (`z.nullable()`).
 - `isTuple<const G extends ReadonlyArray<Guard<unknown>>>(...guards: G): (value: unknown) => value is { -readonly [K in keyof G]: Infer<G[K]> }` — Creates a guard for arrays of exactly `guards.length` elements, each checked by the guard at the same index (`z.tuple()`).
 - `withMessage<T>(guard: Guard<T>, message: string | ((value: unknown) => string)): (value: unknown) => value is T` — Wraps a guard so that `explain` (and `ensure`, `toStandardSchema`) reports `message` instead of the inner issues when it fails.
+- `isLiteral<const T extends Primitive>(value: T): (value: unknown) => value is T` — Creates a guard accepting exactly one primitive value (`z.literal()`), compared with SameValueZero: `isLiteral(NaN)` accepts `NaN` and `isLiteral(0)` accepts `-0`.
+- `isNumberInRange(min: number, max: number): (value: unknown) => value is number` — Creates a guard accepting finite numbers between `min` and `max`, both inclusive.
+- `isIntersection<const G extends ReadonlyArray<Guard<unknown>>>(...guards: G): (value: unknown) => value is UnionToIntersection<Infer<G[number]>>` — Creates a guard that passes when EVERY one of `guards` passes, narrowing to the intersection of their types (`z.intersection()`).
+- `refine<T, U extends T>(guard: Guard<T>, predicate: (value: T) => value is U, message?: string | ((value: T) => string)): (value: unknown) => value is U` — Creates a guard that passes when `guard` passes AND `predicate` accepts the (narrowed) value (`.refine()` in zod).
+- `isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is T` — Creates a guard that defers to the guard returned by `getter`, called once on first use: the way to write recursive schemas (`z.lazy()`), whose guard must refer to itself before it exists.
+- `isMatching<const P>(pattern: P): (value: unknown) => value is PatternType<P>` — Creates a guard checking that a value deeply matches a partial structural pattern, like ts-pattern's `isMatching`.
 - `explain(guard: Guard<unknown>, value: unknown): SchemaIssue[]` — Lists why `value` fails `guard`, with the path of every offending value; an empty array means it passes.
 - `ensure<T>(guard: Guard<T>, value: unknown): T` — Returns `value` typed as `T` when it passes `guard`, and throws a `ValidationError` listing every issue otherwise.
 - `toStandardSchema<T>(guard: Guard<T>): StandardSchemaV1<unknown, T>` — Turns any guard into a [Standard Schema](https://standardschema.dev) v1 validator, so the guards of this module plug straight into tRPC, TanStack Form, React Hook Form, Hono, Elysia and the rest of the ecosystem (issues carry paths, see `explain`).
+- `isJsonValue(value: unknown): value is JsonValue` — Checks that a value survives a JSON round trip unchanged: `null`, booleans, strings, finite numbers (`-0` is accepted, although JSON writes it as `0`), and plain objects and arrays of those, at any depth.
+- `isJsonObject(value: unknown): value is JsonObject` — Checks that a value is a plain object that survives a JSON round trip (see `isJsonValue`).
+- `isJsonArray(value: unknown): value is JsonArray` — Checks that a value is an array that survives a JSON round trip (see `isJsonValue`).
 
 ## strings
 
@@ -196,6 +263,18 @@ Import: `import { … } from '@emiliodominguez/tink/strings';`
 - `ensureSuffix(string: string, suffix: string): string` — Appends `suffix` unless the string already ends with it.
 - `stripPrefix(string: string, prefix: string): string` — Removes `prefix` from the start of the string once, if present.
 - `stripSuffix(string: string, suffix: string): string` — Removes `suffix` from the end of the string once, if present.
+- `trimChars(string: string, chars: string | ReadonlyArray<string>): string` — Removes every leading and trailing occurrence of the given characters.
+- `trimStartChars(string: string, chars: string | ReadonlyArray<string>): string` — Removes every leading occurrence of the given characters (a set of graphemes, see `trimChars`).
+- `trimEndChars(string: string, chars: string | ReadonlyArray<string>): string` — Removes every trailing occurrence of the given characters (a set of graphemes, see `trimChars`).
+- `toDelimitedCase(string: string, delimiter: string, options: DelimitedCaseOptions = {}): string` — Converts a string to words joined by any delimiter, using the same word detection as every other case helper (see `toSnakeCase`: whitespace, punctuation, camelCase and acronym boundaries; digits stay attached to the preceding letters; apostrophes are dropped).
+- `toTrainCase(string: string): string` — Converts a string to Train-Case: capitalized words joined with `-`, using the same word detection as `toSnakeCase`.
+- `toDotCase(string: string): string` — Converts a string to dot.case: lower-cased words joined with `.`, using the same word detection as `toSnakeCase`.
+- `toPathCase(string: string): string` — Converts a string to path/case: lower-cased words joined with `/`, using the same word detection as `toSnakeCase`.
+- `toNoCase(string: string): string` — Converts a string to "no case": lower-cased words joined with single spaces, using the same word detection as `toSnakeCase` (punctuation and separators are dropped).
+- `toStartCase(string: string): string` — Converts a string to Start Case: capitalized words joined with single spaces, using the same word detection as `toSnakeCase`.
+- `padStart(string: string, width: number, fill: string = ' '): string` — Pads the start of a string until it is `width` user-perceived characters (grapheme clusters) wide.
+- `padEnd(string: string, width: number, fill: string = ' '): string` — Pads the end of a string until it is `width` user-perceived characters (grapheme clusters) wide (see `padStart`).
+- `padCenter(string: string, width: number, fill: string = ' '): string` — Pads both ends of a string until it is `width` user-perceived characters (grapheme clusters) wide (see `padStart`).
 
 ## url
 
@@ -208,6 +287,19 @@ Import: `import { … } from '@emiliodominguez/tink/url';`
 - `joinUrl(...parts: string[]): string` — Joins URL parts with exactly one `/` between them.
 - `getQueryParam(url: string, key: string): string | undefined` — Reads the first value of a query parameter from a URL string (see `parseQueryString` for the decoding rules).
 - `isAbsoluteUrl(string: string): boolean` — Checks whether a string is an absolute URL, i.e. one that names its own host (or file) instead of being resolved against the current page.
+- `isSafeUrl(url: string, options: IsSafeUrlOptions = {}): boolean` — Checks that a user-supplied URL is safe to put in an `href` or `src`, with an ALLOWLIST of schemes rather than a denylist of dangerous ones (`javascript:`, `vbscript:`, `data:`...
+- `sanitizeUrl<F = string>(url: string, fallback: F = 'about:blank' as F, options: IsSafeUrlOptions = {}): string | F` — Returns the URL when `isSafeUrl` accepts it, else the fallback.
+- `withTrailingSlash(url: string): string` — Makes the path of a URL end with `/`.
+- `withoutTrailingSlash(url: string): string` — Removes every trailing `/` from the path of a URL, keeping the query and fragment.
+- `withLeadingSlash(path: string): string` — Makes a path start with exactly one `/`.
+- `withoutLeadingSlash(path: string): string` — Removes the leading run of slashes of a path (`\`, tabs and line breaks in that run too, as for `withLeadingSlash`).
+- `cleanDoubleSlashes(url: string): string` — Collapses every run of `/` in the path of a URL into a single `/`.
+- `withBase(url: string, base: string): string` — Mounts a path under a base path (an app served under `/app`): `'/users'` becomes `'/app/users'`.
+- `withoutBase(url: string, base: string): string` — Unmounts a base path: `'/app/users'` becomes `'/users'`, and the base itself becomes `'/'`.
+- `safeDecodeURIComponent(string: string): string` — Decodes a percent-encoded URL component like `decodeURIComponent`, but never throws: every well-formed escape (a valid UTF-8 sequence) is decoded, and malformed ones (`%E0%A4%A`, a lone `%`, `%ZZ`, invalid UTF-8 such as the Latin-1 `%E9`) are kept as they are, so a single bad escape in user-supplied text does not lose the rest.
+- `withFragment(url: string, fragment: string): string` — Sets the fragment of a URL string, replacing any existing one and keeping the query before it.
+- `withoutFragment(url: string): string` — Removes the fragment (`#...`) of a URL string.
+- `withoutQuery(url: string): string` — Removes the query (`?...`) of a URL string and keeps its fragment (a `?` inside the fragment is not a query).
 
 ## math
 
@@ -224,8 +316,8 @@ Import: `import { … } from '@emiliodominguez/tink/math';`
 - `sqrt(number: number): number` — Finds the square root of a number.
 - `pow(base: number, exponent: number): number` — Raises a base to an exponent.
 - `log(number: number, base: number): number` — Returns the logarithm of a number in the given base.
-- `ceil(number: number): number` — Returns the smallest integer greater than or equal to a number.
-- `floor(number: number): number` — Returns the largest integer less than or equal to a number.
+- `ceil(number: number, decimals = 0): number` — Rounds a number up (towards `+Infinity`) to a given number of decimal places.
+- `floor(number: number, decimals = 0): number` — Rounds a number down (towards `-Infinity`) to a given number of decimal places.
 - `modulo(dividend: number, divisor: number): number` — Mathematical (floored) modulo: the result always has the sign of the `divisor` (so for a positive divisor it lies in `[0, divisor)`), unlike the JavaScript `%` operator (see `remainder`).
 - `remainder(dividend: number, divisor: number): number` — Truncated remainder, identical to the JavaScript `%` operator: the result has the sign of the `dividend`.
 - `randomBetween(minimum: number, maximum: number, random: RandomGenerator = Math.random): number` — Generates a random floating-point number in the half-open range `[minimum, maximum)`.
@@ -255,6 +347,7 @@ Import: `import { … } from '@emiliodominguez/tink/math';`
 - `weightedAverage(values: ReadonlyArray<number>, weights: ReadonlyArray<number>): number` — Computes the weighted arithmetic mean `Σ(value × weight) / Σ(weight)`, using the compensated `sum`.
 - `normalize(numbers: ReadonlyArray<number>): number[]` — Min–max normalization: linearly rescales the numbers so the smallest becomes `0` and the largest `1`.
 - `formatBytes(bytes: number, options: FormatBytesOptions = {}): string` — Formats a byte count as a human-readable string, using SI units (`kB`, `MB`, …, powers of `1000`) by default, or IEC binary units (`KiB`, `MiB`, …, powers of `1024`) with `{ base: 1024 }`.
+- `parseBytes(value: string, options: ParseBytesOptions = {}): number` — Parses a human-readable byte size into a number of bytes: the strict inverse of `formatBytes`.
 - `ordinal(n: number): string` — Converts an integer to its English ordinal string (`1st`, `2nd`, `3rd`, `4th`, `11th`, `12th`, `13th`, `21st`, `112th`, …).
 - `nthRoot(value: number, n: number): number` — Computes the real `n`-th root of a number.
 - `roundToStep(value: number, step: number): number` — Rounds a number to the nearest multiple of `step` (e.g. snapping to quarters with `step = 0.25`).
@@ -266,6 +359,7 @@ Import: `import { … } from '@emiliodominguez/tink/functions';`
 
 - `bind<T, A extends unknown[], R>(fn: (this: T, ...args: A) => R, thisArg: T): (...args: A) => R` — Creates a function that always invokes `fn` with `thisArg` as `this`, regardless of how it is called.
 - `partial<A extends unknown[], B extends unknown[], R>(fn: (...args: [...A, ...B]) => R, ...args: A): (...rest: B) => R` — Creates a function that invokes `fn` with `args` prepended to the arguments it receives.
+- `partialRight<F extends (...args: never[]) => unknown, B extends Suffixes<Required<Parameters<F>>>>(fn: F, ...args: B): (...rest: DropSuffix<Required<Parameters<F>>, B>) => ReturnType<F>` — Creates a function that invokes `fn` with `args` appended to the arguments it receives (`partialRight(fn, c)(a, b)` calls `fn(a, b, c)`).
 - `curry<A extends unknown[], R>(fn: (...args: A) => R, arity: number = fn.length): Curried<A, R>` — Curries `fn`: the returned function collects arguments (one or several at a time) until `arity` of them have been supplied, then invokes `fn` with all of them and the `this` of the final call.
 - `compose(): <T>(value: T) => T` — Composes functions from right to left: `compose(f, g, h)(...args)` is `f(g(h(...args)))`.
 - `pipe(): <T>(value: T) => T` — Composes functions from left to right: `pipe(f, g, h)(...args)` is `h(g(f(...args)))`.
@@ -277,6 +371,8 @@ Import: `import { … } from '@emiliodominguez/tink/functions';`
 - `before<F extends AnyFunction>(n: number, fn: F): (this: ThisParameterType<F>, ...args: Parameters<F>) => ReturnType<F> | undefined` — Creates a function that invokes `fn` only while it has been called fewer than `n` times; later calls return the last result.
 - `after<F extends AnyFunction>(n: number, fn: F): (this: ThisParameterType<F>, ...args: Parameters<F>) => ReturnType<F> | undefined` — Creates a function that invokes `fn` only once it has been called at least `n` times (from the `n`-th call on); earlier calls return `undefined`.
 - `negate<A extends unknown[], T = unknown>(predicate: (this: T, ...args: A) => unknown): (this: T, ...args: A) => boolean` — Creates a predicate that returns the boolean negation of `predicate`.
+- `allPass<P extends Predicate[]>(...predicates: P): (value: PredicatesInput<P>, ...rest: unknown[]) => value is PredicatesInput<P> & AllGuarded<P>` — Creates a predicate that is `true` when every one of `predicates` returns a truthy value for the same arguments (`true` for no predicates).
+- `anyPass<P extends Predicate[]>(...predicates: P): (value: PredicatesInput<P>, ...rest: unknown[]) => value is PredicatesInput<P> & AnyGuarded<P>` — Creates a predicate that is `true` when at least one of `predicates` returns a truthy value for the same arguments (`false` for no predicates).
 - `identity<T>(value: T): T` — Returns its argument unchanged.
 - `noop(..._args: unknown[]): void` — Does nothing and returns `undefined`, whatever the arguments.
 - `attempt<A extends unknown[], R>(fn: (...args: A) => R, ...args: A): Result<R>` — Calls `fn(...args)` and captures its outcome as a `Result` tuple instead of throwing.
@@ -286,6 +382,7 @@ Import: `import { … } from '@emiliodominguez/tink/functions';`
 - `constant<T>(value: T): (..._args: unknown[]) => T` — Creates a function that ignores its arguments and always returns `value` (the same reference every time).
 - `shallowEqualArgs(next: ReadonlyArray<unknown>, previous: ReadonlyArray<unknown>): boolean` — Compares two argument lists element-wise with SameValueZero (`===`, except that `NaN` equals `NaN`).
 - `memoizeLast<F extends AnyFunction>(fn: F, isEqual: (next: Parameters<F>, previous: Parameters<F>) => boolean = shallowEqualArgs): MemoizedLast<F>` — Creates a function that remembers only its latest call: when called again with equal arguments (and the same `this`), it returns the cached result without invoking `fn`; otherwise it invokes `fn` and replaces the cache.
+- `match<T extends object, K extends keyof T, H extends MatchHandlers<T, K>>(value: T, key: K, handlers: H): MatchResult<H>` — Exhaustive pattern matching on a discriminated union: calls the handler named after `value[key]` (the "tag") with `value`, and returns its result.
 
 ## async
 
@@ -298,13 +395,18 @@ Import: `import { … } from '@emiliodominguez/tink/async';`
 - `sleep(ms: number, options: SleepOptions = {}): Promise<void>` — Resolves after `ms` milliseconds.
 - `withTimeout<T>(promise: PromiseLike<T> | T, ms: number, message?: string): Promise<T>` — Races `promise` against a timer: resolves/rejects like `promise` if it settles within `ms` milliseconds, otherwise rejects with a `TimeoutError`.
 - `retry<T>(fn: (attempt: number) => Promise<T> | T, options: RetryOptions = {}, random: RandomGenerator = Math.random): Promise<T>` — Calls `fn` until it succeeds, retrying up to `options.retries` times with exponential backoff: the delay before retry `k` (1-based) is `min(delay * factor^(k - 1), maxDelay)`, optionally randomised with full jitter.
-- `mapWithConcurrency<T, R>(items: Iterable<T>, mapper: (item: T, index: number) => Promise<R> | R, concurrency = Infinity): Promise<R[]>` — Maps `items` with an async `mapper`, running at most `concurrency` mappers at the same time, and resolves with the results in input order.
+- `mapWithConcurrency<T, R>(items: Iterable<T>, mapper: ConcurrentCallback<T, R>, options?: number | ConcurrencyOptions): Promise<R[]>` — Maps `items` with an async `mapper`, running at most `concurrency` mappers at the same time, and resolves with the results in input order.
+- `mapSettledWithConcurrency<T, R>(items: Iterable<T>, mapper: ConcurrentCallback<T, R>, options?: number | ConcurrencyOptions): Promise<Array<PromiseSettledResult<Awaited<R>>>>` — Like `mapWithConcurrency`, but never rejects because of a mapper: resolves with a `PromiseSettledResult` per item, in input order (like `Promise.allSettled`).
+- `filterWithConcurrency<T, S extends T>(items: Iterable<T>, predicate: (item: T, index: number, signal: AbortSignalLike | undefined) => item is S, options?: number | ConcurrencyOptions): Promise<S[]>` — Filters `items` with an async `predicate`, running at most `concurrency` predicates at the same time, and resolves with the items whose predicate returned (or resolved to) a truthy value, in input order.
 - `attemptAsync<T>(fnOrPromise: PromiseLike<T> | (() => PromiseLike<T> | T)): Promise<Result<T>>` — Awaits a promise (or calls a possibly async function and awaits its result) and captures the outcome as a `Result` tuple.
 - `createLimiter(concurrency: number, options: LimiterOptions = {}): Limiter` — Creates a limiter that runs at most `concurrency` tasks at the same time, starting waiting tasks in FIFO order (like `p-limit`).
+- `createQueue(options: QueueOptions = {}): Queue` — Creates a task queue that runs at most `concurrency` tasks at the same time, starting the waiting task with the highest `priority` first and tasks of equal priority in FIFO order (a stable binary heap, so `add` and every start are O(log n)).
+- `createRateLimiter(options: RateLimiterOptions): RateLimiter` — Creates a rate limiter that starts at most `limit` calls within any window of `interval` milliseconds.
 - `pollUntil<T>(check: () => T | PromiseLike<T>, options: PollOptions = {}): Promise<Truthy<Awaited<T>>>` — Calls `check` immediately and then every `interval` ms (waiting for async checks to settle in between, so checks never overlap) until it returns (or resolves to) a truthy value, and resolves with that value.
 - `promiseAllObject<T extends object>(obj: T): Promise<{ -readonly [K in keyof T]: Awaited<T[K]> }>` — Like `Promise.all`, but for an object of promises (or values): resolves with an object with the same keys and the awaited values.
 - `promiseAllSettledObject<T extends object>(obj: T): Promise<{ -readonly [K in keyof T]: PromiseSettledResult<Awaited<T[K]>> }>` — Like `Promise.allSettled`, but for an object of promises (or values): resolves with an object with the same keys and a `PromiseSettledResult` for each value.
 - `debounceAsync<F extends (...args: never[]) => unknown>(fn: F, wait: number): DebouncedAsync<F>` — Creates a debounced version of a (possibly async) function: `fn` is invoked `wait` ms after the last call of a burst, with the latest `this` and arguments, and every call of the burst returns a promise that settles with the result of that single invocation.
+- `memoizeAsync<F extends AnyFunction>(fn: F, options: MemoizeAsyncOptions<F> = {}): MemoizedAsync<F>` — Memoizes an async (or promise-returning) function, correctly.
 - `sequence<T>(tasks: Iterable<() => PromiseLike<T> | T>): Promise<T[]>` — Runs (possibly async) tasks one at a time, in iteration order, and resolves with their results in the same order.
 - `timeoutSignal(ms: number): PlatformAbortSignal` — Creates an `AbortSignal` that aborts with a `TimeoutError` after `ms` milliseconds — like the platform's `AbortSignal.timeout`, but with this library's `TimeoutError` as the reason (so `error instanceof TimeoutError` works across the async helpers).
 - `anySignal(signals: Iterable<AbortSignalLike | null | undefined>): PlatformAbortSignal` — Combines abort signals: returns a new `AbortSignal` that aborts as soon as any of the inputs aborts, with that input's `reason` (or an `AbortError` when it has none) — like the platform's `AbortSignal.any`, but accepting any `AbortSignalLike`.
@@ -351,15 +453,40 @@ Import: `import { … } from '@emiliodominguez/tink/easing';`
 - `easeInOut(easing: EasingFunction): EasingFunction` — Builds a symmetric ease-in-out function from an ease-in function: the first half runs `easing` at double speed, the second half its reflection, so that `g(1 - t) === 1 - g(t)` and `g(0.5) === 0.5`.
 - `linear(t: number): number` — No easing: `t => t`.
 - `easeInQuad(t: number): number` — Quadratic ease-in: `t²`.
+- `easeOutQuad(t: number): number` — Quadratic ease-out.
+- `easeInOutQuad(t: number): number` — Quadratic ease-in-out.
 - `easeInCubic(t: number): number` — Cubic ease-in: `t³` (computed with multiplications, like the other power easings: much faster than `**`).
+- `easeOutCubic(t: number): number` — Cubic ease-out.
+- `easeInOutCubic(t: number): number` — Cubic ease-in-out.
 - `easeInQuart(t: number): number` — Quartic ease-in: `t⁴`.
+- `easeOutQuart(t: number): number` — Quartic ease-out.
+- `easeInOutQuart(t: number): number` — Quartic ease-in-out.
 - `easeInQuint(t: number): number` — Quintic ease-in: `t⁵`.
+- `easeOutQuint(t: number): number` — Quintic ease-out.
+- `easeInOutQuint(t: number): number` — Quintic ease-in-out.
 - `easeInSine(t: number): number` — Sinusoidal ease-in: `1 - cos(t·π/2)`.
+- `easeOutSine(t: number): number` — Sinusoidal ease-out (`sin(t·π/2)`).
+- `easeInOutSine(t: number): number` — Sinusoidal ease-in-out (`(1 - cos(t·π)) / 2`).
 - `easeInExpo(t: number): number` — Exponential ease-in: `2^(10t - 10)`, pinned to `0` at `t = 0`.
+- `easeOutExpo(t: number): number` — Exponential ease-out.
+- `easeInOutExpo(t: number): number` — Exponential ease-in-out.
 - `easeInCirc(t: number): number` — Circular ease-in: `1 - √(1 - t²)` (`NaN` for `\|t\| > 1`).
+- `easeOutCirc(t: number): number` — Circular ease-out (`√(1 - (1 - t)²)`).
+- `easeInOutCirc(t: number): number` — Circular ease-in-out.
 - `easeInBack(t: number): number` — "Back" ease-in: pulls back slightly (about 10%) before moving forward: `t²·((c + 1)t - c)` with `c = 1.70158`.
+- `easeOutBack(t: number): number` — "Back" ease-out: overshoots the target slightly before settling.
+- `easeInOutBack(t: number): number` — "Back" ease-in-out.
 - `easeInElastic(t: number): number` — Elastic ease-in: a growing oscillation, `-2^(10t - 10)·sin((10t - 10.75)·2π/3)`, pinned to `0` and `1` at the ends.
+- `easeOutElastic(t: number): number` — Elastic ease-out: overshoots and oscillates around the target.
+- `easeInOutElastic(t: number): number` — Elastic ease-in-out.
+- `easeOutBounce(t: number): number` — Bounce ease-out: falls to the target and bounces three times (base curve of the bounce family).
+- `easeInBounce(t: number): number` — Bounce ease-in (reflection of `easeOutBounce`).
+- `easeInOutBounce(t: number): number` — Bounce ease-in-out.
 - `cubicBezier(x1: number, y1: number, x2: number, y2: number): EasingFunction` — Creates an easing function equivalent to CSS `cubic-bezier(x1, y1, x2, y2)`: the curve from `(0, 0)` to `(1, 1)` with control points `(x1, y1)` and `(x2, y2)`, evaluated by solving `x(s) = t` for the curve parameter `s` to ~1e-12 (Newton–Raphson, safeguarded by bisection, which always converges because `x` is monotonic when `x1, x2 ∈ [0, 1]`; for `t > 0.5` on the mirrored curve, so that both ends are equally precise), then returning `y(s)`.
+- `cssEase(t: number): number` — CSS `ease`: `cubic-bezier(0.25, 0.1, 0.25, 1)` (the default `transition-timing-function`).
+- `cssEaseIn(t: number): number` — CSS `ease-in`: `cubic-bezier(0.42, 0, 1, 1)`.
+- `cssEaseOut(t: number): number` — CSS `ease-out`: `cubic-bezier(0, 0, 0.58, 1)`.
+- `cssEaseInOut(t: number): number` — CSS `ease-in-out`: `cubic-bezier(0.42, 0, 0.58, 1)`.
 - `steps(count: number, position: StepPosition = 'jump-end'): EasingFunction` — Creates a step easing function equivalent to CSS `steps(count, position)`: the output jumps between `jumps + 1` evenly spaced levels `0, 1/jumps, ..., 1`, where `jumps` is `count` (`jump-start` / `jump-end`), `count - 1` (`jump-none`) or `count + 1` (`jump-both`).
 - `spring(options: SpringOptions = {}): Spring` — Solves a damped harmonic oscillator (mass `m` on a spring of stiffness `k` with damping `c`) released at position `0` with initial `velocity` towards a target at `1`, in closed form (under-, critically and over-damped cases), like the physics springs of SwiftUI, Framer Motion or React Spring.
 - `interpolate(from: number, to: number, t: number, easing: EasingFunction = linear): number` — Interpolates between two numbers with an easing function: `lerp(from, to, easing(t))`.
@@ -403,6 +530,7 @@ Import: `import { … } from '@emiliodominguez/tink/validate';`
 - `isBase64(value: unknown, options: IsBase64Options = {}): value is string` — Checks whether a value is base64 (RFC 4648 §4) or, with `urlSafe`, base64url (§5) text.
 - `isSlug(value: unknown): value is string` — Checks whether a value is a URL slug: lowercase ASCII letters and digits in runs separated by single hyphens, with no leading or trailing hyphen.
 - `isNumericString(value: unknown): value is string` — Checks whether a value is a string holding a finite decimal number: an optional sign, digits with an optional fraction (`1`, `1.5`, `1.`, `.5`) and an optional exponent (`1e-7`, `2.5E+3`).
+- `parseJson(text: string, options?: ParseJsonOptions): ParseJsonResult<JsonValue>` — Parses JSON text without throwing, returning a `[error, value]` tuple (see `ParseJsonResult`).
 
 ## date
 
@@ -464,6 +592,29 @@ Import: `import { … } from '@emiliodominguez/tink/date';`
 - `clampDate(date: DateInput, min: DateInput, max: DateInput): Date` — Clamps a date into the closed range `[min, max]`.
 - `formatDuration(ms: number, options: FormatDurationOptions = {}): string` — Formats a millisecond duration as a compact string such as `'1d 2h 3m'`.
 - `parseDuration(value: string): number` — Parses a duration string made of `<number><unit>` tokens (units `d`, `h`, `m`, `s`, `ms`, lowercase; whitespace between and inside tokens is optional; decimals such as `'1.5h'` or `'.5s'` are allowed) into milliseconds, e.g. `'1h 30m'` → `5_400_000`.
+- `addDuration(date: DateInput, duration: Duration): Date` — Adds a `Duration` to a date, applying the units LARGEST FIRST (the order of date-fns' `add`, Luxon and Temporal): years and months together, with the end-of-month clamping of `addMonths`; then weeks and days, as calendar days that keep the wall-clock time (like `addDays`); then hours, minutes, seconds and milliseconds on the absolute timeline (like `addHours`).
+- `subDuration(date: DateInput, duration: Duration): Date` — Subtracts a `Duration` from a date: the same as `addDuration` with every field negated (so the largest units are still applied first, with end-of-month clamping).
+- `intervalToDuration(start: DateInput, end: DateInput): IntervalDuration` — Breaks the interval from `start` to `end` into calendar components, largest first: the most complete months (reported as `years` and `months`) that fit after `start` (with the end-of-month clamping of `addMonths`), then the most complete days that fit after that, then the remaining absolute time as `hours` (normally below 24, but 24 when the last day lasts 25 hours), `minutes`, `seconds` and `milliseconds`.
+- `toISOStringLocal(date: DateInput, options: ToISOStringLocalOptions = {}): string` — Formats a date as an RFC 3339 / ISO 8601 timestamp in LOCAL time with its UTC offset, e.g. `'2026-10-18T09:30:00.000+02:00'`: what people usually expect from `Date#toISOString()`, which always uses UTC (`Z`).
+- `diffInWeeks(later: DateInput, earlier: DateInput): number` — Returns the signed number of COMPLETE weeks between two dates: for `later >= earlier` it is the largest `n` such that `addWeeks(earlier, n) <= later` (calendar weeks that keep the wall-clock time, so a week across a DST change still counts once); for `later < earlier` it is `-diffInWeeks(earlier, later)`.
+- `diffInYears(later: DateInput, earlier: DateInput): number` — Returns the signed number of COMPLETE years between two dates: for `later >= earlier` it is the largest `n` such that `addYears(earlier, n) <= later` (time of day included); for `later < earlier` it is `-diffInYears(earlier, later)`.
+- `diffInCalendarMonths(later: DateInput, earlier: DateInput): number` — Returns the signed number of calendar months between two dates (local time), ignoring the day and the time of day: `12 * (later's year - earlier's year) + (later's month - earlier's month)`.
+- `diffInCalendarYears(later: DateInput, earlier: DateInput): number` — Returns the signed number of calendar years between two dates (local time), ignoring everything but the year.
+- `startOfHour(date: DateInput): Date` — Returns the start of the local wall-clock hour (`HH:00:00.000`) containing `date`.
+- `endOfHour(date: DateInput): Date` — Returns the last millisecond of the local wall-clock hour (`HH:59:59.999`) containing `date`: the instant before the next hour starts (see `startOfHour` for the DST behaviour).
+- `startOfMinute(date: DateInput): Date` — Returns the start of the local wall-clock minute (`HH:mm:00.000`) containing `date` (see `startOfHour` for the DST behaviour).
+- `endOfMinute(date: DateInput): Date` — Returns the last millisecond of the local wall-clock minute (`HH:mm:59.999`) containing `date`.
+- `roundToNearestMinutes(date: DateInput, step = 1, mode: RoundingMode = 'round'): Date` — Rounds a date to a grid of `step` minutes of the local wall clock (`step` must divide 60, so the grid restarts at every hour: `:00`, `:15`, `:30`, `:45` for 15), e.g. to snap a time picker to 5- or 15-minute slots.
+- `eachOfInterval(start: DateInput, end: DateInput, unit: IntervalUnit, step = 1, weekStartsOn: WeekdayIndex = 0): Date[]` — Returns the start of every `unit` from the one containing `start` to the one containing `end` (both included), stepping by `step` units: years (January 1st), quarters, months (the 1st), weeks (starting on `weekStartsOn`), days (each at the start of the day, like `eachDayOfInterval`), hours or minutes.
+- `nextWeekday(date: DateInput, weekday: WeekdayIndex): Date` — Returns the next given weekday STRICTLY after `date` (local time), keeping the time of day like `addDays`: on a Monday, `nextWeekday(date, 1)` is the following Monday, 7 days later (never `date` itself).
+- `previousWeekday(date: DateInput, weekday: WeekdayIndex): Date` — Returns the previous given weekday STRICTLY before `date` (local time), keeping the time of day like `addDays`: on a Monday, `previousWeekday(date, 1)` is the Monday before, 7 days earlier (never `date` itself).
+- `intervalsOverlap(a: Interval, b: Interval, options: IntervalsOverlapOptions = {}): boolean` — Checks whether two time intervals overlap (bookings, calendar events…).
+- `parseDate(value: string, pattern: string): Date | undefined` — Parses a date written with a `formatDate` pattern (same tokens, same `[literal]` syntax), in LOCAL time: the strict inverse of `formatDate`.
+- `getDayOfYear(date: DateInput): number` — Returns the day of the year (1-366) of the LOCAL calendar date.
+- `isTomorrow(date: DateInput, now: DateInput = new Date()): boolean` — Checks whether a date falls on the LOCAL calendar day after `now`'s.
+- `isYesterday(date: DateInput, now: DateInput = new Date()): boolean` — Checks whether a date falls on the LOCAL calendar day before `now`'s.
+- `isSameWeek(a: DateInput, b: DateInput, weekStartsOn: WeekdayIndex = 0): boolean` — Checks whether two dates fall in the same local week (see `startOfWeek`).
+- `isSameQuarter(a: DateInput, b: DateInput): boolean` — Checks whether two dates fall in the same local calendar quarter (of the same year).
 
 ## iterables
 
@@ -501,6 +652,7 @@ Import: `import { … } from '@emiliodominguez/tink/iterables';`
 - `filterAsync<T, S extends T>(iterable: AwaitableIterable<T>, predicate: (value: T, index: number) => value is S): AsyncIterableIterator<S>` — Lazily keep the items of an async (or sync) iterable matching a (sync) type guard, narrowing the item type.
 - `takeAsync<T>(iterable: AwaitableIterable<T>, n: number): AsyncIterableIterator<T>` — Lazily yield the first `n` items of an async (or sync) iterable; exactly `n` items are pulled, then the source is closed.
 - `chunkAsync<T>(iterable: AwaitableIterable<T>, size: number): AsyncIterableIterator<T[]>` — Lazily split an async (or sync) iterable into consecutive chunks of `size` items; only the last chunk may be shorter.
+- `mapConcurrent<T, U>(iterable: AwaitableIterable<T>, fn: (value: T, index: number, signal: AbortSignalLike | undefined) => U | PromiseLike<U>, options: number | MapConcurrentOptions): AsyncIterableIterator<U>` — Lazily maps an async (or sync) iterable with a possibly async `fn`, running up to `concurrency` mappings at the same time: the streaming counterpart of `mapWithConcurrency` (from the async module), for sources too large or too slow to collect first.
 - `toArrayAsync<T>(iterable: AwaitableIterable<T>): Promise<T[]>` — Collect the items of an async (or sync) iterable into a new array, awaiting each item in turn (like `Array.fromAsync`).
 
 ## cache
@@ -509,6 +661,7 @@ O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock; pl
 Import: `import { … } from '@emiliodominguez/tink/cache';`
 
 - `createLRUCache<K = unknown, V = unknown>(options: LRUCacheOptions<K, V>): LRUCache<K, V>` — Creates a least-recently-used cache backed by a `Map` for lookups and a doubly linked list for recency, so `get`, `set`, `peek`, `has` and `delete` are O(1) (a hit only relinks two list nodes; it never re-inserts the key into the `Map`).
+- `createPriorityQueue<T>(compare: (a: T, b: T) => number): PriorityQueue<T>` — Creates a priority queue backed by a binary heap: `push` and `pop` are O(log n) and `peek` is O(1).
 
 ## emitter
 
