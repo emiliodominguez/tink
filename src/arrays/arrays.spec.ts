@@ -2701,3 +2701,32 @@ describe('Arrays helpers (ordering, slicing, set algebra, combinatorics)', funct
 		});
 	});
 });
+
+describe('deterministic coverage of size-dependent paths', function () {
+	it('sorts more than 12 rows with the native stable sort', function () {
+		const rows = Array.from({ length: 20 }, function (_, i) {
+			return { key: (i * 7) % 5, i };
+		});
+		const sorted = helpers.orderBy(rows, [
+			function (row) {
+				return row.key;
+			}
+		]);
+		expect(
+			sorted.map(function (row) {
+				return row.i;
+			})
+		).toEqual([0, 5, 10, 15, 3, 8, 13, 18, 1, 6, 11, 16, 4, 9, 14, 19, 2, 7, 12, 17]);
+	});
+
+	it('samples a few items of a long array through recorded swaps, including a swapped position', function () {
+		const items = Array.from({ length: 1000 }, function (_, i) {
+			return i;
+		});
+		expect(
+			helpers.sampleSize(items, 3, function () {
+				return 0.5;
+			})
+		).toEqual([500, 0, 501]);
+	});
+});

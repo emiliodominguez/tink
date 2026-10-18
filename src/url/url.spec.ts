@@ -631,3 +631,10 @@ describe('URL helpers (round 11)', function () {
 		});
 	});
 });
+
+describe('fragment before a question mark', function () {
+	it('treats a ? inside the fragment as part of the fragment', function () {
+		expect(helpers.withTrailingSlash('/a#x?y')).toBe('/a/#x?y');
+		expect(helpers.withoutQuery('/a#x?y')).toBe('/a#x?y');
+	});
+});

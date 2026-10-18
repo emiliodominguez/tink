@@ -2078,3 +2078,9 @@ describe('Functions helpers (round 11)', function () {
 		});
 	});
 });
+
+describe('defaultMemoizeKey nested numbers', function () {
+	it('serialises nested numbers and booleans, marking -0 and non-finite numbers', function () {
+		expect(helpers.defaultMemoizeKey({ a: -0, b: NaN, c: Infinity, d: 1.5, e: true })).toBe('[{"a":"-0","b":"NaN","c":"Infinity","d":1.5,"e":true}]');
+	});
+});

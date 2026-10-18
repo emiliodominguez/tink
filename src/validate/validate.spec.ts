@@ -1051,3 +1051,10 @@ describe('edge cases', function () {
 		expect(helpers.isNumericString('-.125e2')).toBe(true);
 	});
 });
+
+describe('isUrl IDNA mapping', function () {
+	it('rejects a non-ASCII label that IDNA maps to plain ASCII', function () {
+		expect(helpers.isUrl('https://ẞa.com')).toBe(false);
+		expect(helpers.isUrl('https://münchen.de')).toBe(true);
+	});
+});

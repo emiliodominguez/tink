@@ -1474,3 +1474,11 @@ describe('internal tables', function () {
 		expect(helpers.toSlug('ßæœøđðłþı')).toBe('ssaeoeoddlthi');
 	});
 });
+
+describe('getWords on non-ASCII text without words', function () {
+	it('returns no words for punctuation only', function () {
+		expect(helpers.getWords('—…—')).toEqual([]);
+		expect(helpers.toSnakeCase('—…—')).toBe('');
+		expect(helpers.getWords('é')).toEqual(['é']);
+	});
+});
