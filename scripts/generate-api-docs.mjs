@@ -28,6 +28,17 @@ const MODULES = [
 ];
 
 /**
+ * The text a `{@link}` tag displays: its `| label` when there is one, otherwise the target without its `module!` prefix.
+ * @param {ts.JSDocLink | ts.JSDocLinkCode | ts.JSDocLinkPlain} part - The link tag
+ * @returns {string} The label, without backticks
+ */
+function linkLabel(part) {
+	const target = (part.name ? part.name.getText() : '') + part.text;
+	const pipe = target.indexOf('|');
+	return (pipe === -1 ? target.slice(target.indexOf('!') + 1) : target.slice(pipe + 1)).replace(/`/g, '').trim();
+}
+
+/**
  * Extracts the first sentence of a JSDoc comment, rendering `{@link X}` as inline code.
  * @param {ts.JSDoc | undefined} doc - The JSDoc node
  * @returns {string} The summary sentence
@@ -39,7 +50,7 @@ function summarize(doc) {
 			? doc.comment
 			: doc.comment
 					.map(function (part) {
-						return part.kind === ts.SyntaxKind.JSDocText ? part.text : '`' + (part.name ? part.name.getText() : part.text) + '`';
+						return part.kind === ts.SyntaxKind.JSDocText ? part.text : '`' + linkLabel(part) + '`';
 					})
 					.join('');
 	const flat = text

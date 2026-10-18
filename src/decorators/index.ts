@@ -783,7 +783,7 @@ export function retryable(options: RetryOptions = {}, random: RandomGenerator = 
 }
 
 /**
- * Creates a decorator for async methods that rejects with a {@link TimeoutError} when the returned promise does not settle within
+ * Creates a decorator for async methods that rejects with a {@link async!TimeoutError | `TimeoutError`} when the returned promise does not settle within
  * `ms` milliseconds (using {@link withTimeout}; the timer is always cleared, but the underlying operation is not cancelled).
  * A synchronous throw of the method becomes a rejection. `this` is preserved.
  * @param {number} ms - The time limit in milliseconds (`0` to `2^31 - 1`)
