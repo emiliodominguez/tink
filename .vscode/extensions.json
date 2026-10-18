@@ -1,7 +1,3 @@
 {
-    "recommendations": [
-        "dbaeumer.vscode-eslint",
-        "esbenp.prettier-vscode",
-        "santacodes.santacodes-region-viewer"
-    ]
+	"recommendations": ["oxc.oxc-vscode", "santacodes.santacodes-region-viewer"]
 }

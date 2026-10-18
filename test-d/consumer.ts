@@ -1,12 +1,11 @@
 // Compiled against the BUILT declarations by scripts/check-types.mjs: proves the published .d.ts files are valid for a
 // consumer with no DOM or Node types (skipLibCheck off), resolve through the exports map, and stay cheap to type-check.
-import { getPath, setPath, deepMerge, merge, pick, omit } from 'tinkit/objects';
+import { getPath, setPath, deepMerge, merge, pick, omit, toCamelCaseKeys } from 'tinkit/objects';
 import { curry, pipe, compose } from 'tinkit/functions';
 import type { NestedKeyOf, PathValue } from 'tinkit/utils';
 import { isShape, isString, isInteger, isOptional, isArrayOf, isUnion, isNullable, isTuple, toStandardSchema } from 'tinkit/guards';
 import type { Infer } from 'tinkit/guards';
 import type { StandardSchemaV1 } from '@standard-schema/spec';
-import { toCamelCaseKeys } from 'tinkit/objects';
 // The root entry pulls in every module's declarations.
 import * as everything from 'tinkit';
 
@@ -90,5 +89,5 @@ const wrong: Account = { id: true, tags: [], manager: null, position: [0, 0] };
 // README tour: key transforms keep their value types.
 const camel: { userId: number; createdAt: string } = toCamelCaseKeys({ user_id: 1, created_at: '2024-01-01' });
 // @ts-expect-error the snake_case key no longer exists
-camel.user_id;
-export { a, b, c, keys, v, m, dm, p, o, r, f, g, everything, spec, output, wrong, camel };
+const snake = camel.user_id;
+export { a, b, c, keys, v, m, dm, p, o, r, f, g, everything, spec, output, wrong, camel, snake };

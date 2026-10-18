@@ -24,8 +24,7 @@
 				background:
 					radial-gradient(520px 380px at 12% 18%, rgba(138, 215, 255, 0.34), transparent 70%),
 					radial-gradient(560px 420px at 92% 96%, rgba(167, 139, 250, 0.3), transparent 70%),
-					radial-gradient(420px 300px at 70% 8%, rgba(255, 196, 222, 0.28), transparent 70%),
-					linear-gradient(160deg, #fdfcff 0%, #f3f0ff 100%);
+					radial-gradient(420px 300px at 70% 8%, rgba(255, 196, 222, 0.28), transparent 70%), linear-gradient(160deg, #fdfcff 0%, #f3f0ff 100%);
 				font-family: 'Inter', sans-serif;
 				color: #0c1935;
 			}
@@ -127,20 +126,40 @@
 
 			<svg class="art" viewBox="0 0 440 460" aria-hidden="true">
 				<defs>
-					<linearGradient id="left" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#8ad7ff" /><stop offset="1" stop-color="#a78bfa" /></linearGradient>
-					<linearGradient id="right" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#fff4f5" /><stop offset="1" stop-color="#ddd6fe" /></linearGradient>
-					<linearGradient id="mintLeft" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#9df0d0" /><stop offset="1" stop-color="#5fd1c4" /></linearGradient>
-					<linearGradient id="mintRight" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#f2fffa" /><stop offset="1" stop-color="#c9f3e6" /></linearGradient>
-					<linearGradient id="peachLeft" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#ffd2a8" /><stop offset="1" stop-color="#ff9fb8" /></linearGradient>
-					<linearGradient id="peachRight" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#fff8f1" /><stop offset="1" stop-color="#ffe0e6" /></linearGradient>
-					<linearGradient id="spark" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#dc5bff" /><stop offset="1" stop-color="#278dff" /></linearGradient>
+					<linearGradient id="left" x1="0" y1="0" x2="1" y2="1">
+						<stop stop-color="#8ad7ff" />
+						<stop offset="1" stop-color="#a78bfa" />
+					</linearGradient>
+					<linearGradient id="right" x1="0" y1="0" x2="1" y2="1">
+						<stop stop-color="#fff4f5" />
+						<stop offset="1" stop-color="#ddd6fe" />
+					</linearGradient>
+					<linearGradient id="mintLeft" x1="0" y1="0" x2="1" y2="1">
+						<stop stop-color="#9df0d0" />
+						<stop offset="1" stop-color="#5fd1c4" />
+					</linearGradient>
+					<linearGradient id="mintRight" x1="0" y1="0" x2="1" y2="1">
+						<stop stop-color="#f2fffa" />
+						<stop offset="1" stop-color="#c9f3e6" />
+					</linearGradient>
+					<linearGradient id="peachLeft" x1="0" y1="0" x2="1" y2="1">
+						<stop stop-color="#ffd2a8" />
+						<stop offset="1" stop-color="#ff9fb8" />
+					</linearGradient>
+					<linearGradient id="peachRight" x1="0" y1="0" x2="1" y2="1">
+						<stop stop-color="#fff8f1" />
+						<stop offset="1" stop-color="#ffe0e6" />
+					</linearGradient>
+					<linearGradient id="spark" x1="0" y1="0" x2="1" y2="1">
+						<stop stop-color="#dc5bff" />
+						<stop offset="1" stop-color="#278dff" />
+					</linearGradient>
 					<filter id="blur" x="-40%" y="-40%" width="180%" height="200%"><feGaussianBlur stdDeviation="14" /></filter>
 				</defs>
 
 				<!-- Ground shadows -->
 				<ellipse cx="205" cy="420" rx="150" ry="22" fill="#a78bfa" opacity=".22" filter="url(#blur)" />
 				<ellipse cx="64" cy="432" rx="52" ry="9" fill="#5fd1c4" opacity=".25" filter="url(#blur)" />
-
 
 				<!-- Small peach block, floating: about to click into place -->
 				<g transform="translate(26 56) scale(0.42) rotate(-8 92 101)" stroke="#0c1935" stroke-width="17" stroke-linejoin="round">
@@ -181,7 +200,9 @@
 			<div class="copy">
 				<div class="wordmark">t<span class="i">ı</span>nk<span class="i blue">ı</span>t</div>
 				<div class="tagline">Small utilities. Solid foundations.</div>
-				<div class="install"><span class="prompt">$</span><span>npm i <span class="name">tinkit</span></span></div>
+				<div class="install">
+					<span class="prompt">$</span><span>npm i <span class="name">tinkit</span></span>
+				</div>
 				<div class="facts"><span>~600 typed helpers</span><span>20 modules</span><span>0 dependencies</span><span>tree-shakeable</span></div>
 			</div>
 		</div>

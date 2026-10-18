@@ -1,22 +1,4 @@
-import {
-	chunk,
-	concat,
-	countItems,
-	drop,
-	enumerate,
-	filter,
-	find,
-	flatMap,
-	map,
-	mapConcurrent,
-	reduce,
-	scan,
-	take,
-	toArray,
-	unique,
-	windowed,
-	zip
-} from 'tinkit/iterables';
+import { chunk, concat, countItems, drop, enumerate, filter, find, flatMap, map, mapConcurrent, reduce, scan, take, toArray, unique, windowed, zip } from 'tinkit/iterables';
 import { pMapIterable } from 'p-map';
 
 // No library offers the same lazy, closing-aware helpers, so each case is compared with what one would write instead:

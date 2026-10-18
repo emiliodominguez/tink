@@ -34,18 +34,13 @@ function minimalStore(initial) {
  */
 function setup(count) {
 	const store = createStore({ counter: 0, items: [] });
-	let seen = 0;
 	for (let i = 0; i < count; i++) {
 		const selected = store.select(function (state) {
 			return i % 2 === 0 ? state.counter : state.items;
 		});
-		selected.subscribe(function () {
-			seen += 1;
-		});
+		selected.subscribe(function () {});
 	}
-	store.subscribe(function () {
-		seen += 1;
-	});
+	store.subscribe(function () {});
 	return store;
 }
 

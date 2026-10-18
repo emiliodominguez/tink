@@ -86,6 +86,6 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: yarn
 
-      # Some dev tooling (ESLint plugins, lint-staged) requires Node 22+; the library itself supports Node 20.19+.
+      # Some dev tooling (lint-staged, commitlint) requires Node 22+; the library itself supports Node 20.19+.
       - run: yarn install --frozen-lockfile --ignore-engines
       - run: yarn test:coverage

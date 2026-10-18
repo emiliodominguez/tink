@@ -49,10 +49,10 @@ function summarize(doc) {
 	const codeSpans = [];
 	const masked = flat.replace(/`[^`]*`/g, function (code) {
 		codeSpans.push(code);
-		return `\u0000${codeSpans.length - 1}\u0000`;
+		return `\uE000${codeSpans.length - 1}\uE000`;
 	});
 	const match = /^(.+?(?<!\b(?:i\.e|e\.g|etc))\.)(\s|$)/.exec(masked);
-	const sentence = (match ? match[1] : masked).replace(/\u0000(\d+)\u0000/g, function (_placeholder, index) {
+	const sentence = (match ? match[1] : masked).replace(/\uE000(\d+)\uE000/g, function (_placeholder, index) {
 		return codeSpans[Number(index)];
 	});
 	return sentence.replace(/\|/g, '\\|');

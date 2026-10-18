@@ -564,7 +564,17 @@ export function isSafeInteger(value: unknown): value is number {
  * Any built-in typed array (the eleven `TypedArray` constructors of ES2022). `DataView` is not a typed array.
  */
 export type TypedArray =
-	Int8Array | Uint8Array | Uint8ClampedArray | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array | BigInt64Array | BigUint64Array;
+	| Int8Array
+	| Uint8Array
+	| Uint8ClampedArray
+	| Int16Array
+	| Uint16Array
+	| Int32Array
+	| Uint32Array
+	| Float32Array
+	| Float64Array
+	| BigInt64Array
+	| BigUint64Array;
 
 /**
  * A type-guard function, as accepted by {@link isArrayOf} and {@link isRecordOf}.
@@ -980,7 +990,7 @@ export function assertNever(value: never, message?: string): never {
  * const isPoint = isShape({ x: isFiniteNumber, y: isFiniteNumber });
  * type Point = Infer<typeof isPoint>; // { x: number; y: number }
  */
-export type Infer<G> = G extends (value: unknown) => value is infer T ? T : never;
+export type Infer<G> = G extends ((value: unknown) => value is infer T) ? T : never;
 
 /**
  * A validation problem found by {@link explain}: a human-readable `message` and the `path` (property keys and array indexes) of the
@@ -1719,7 +1729,7 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
  * dates give `Date`, other functions `unknown`, and any other value its own (literal) type.
  * @template P - The pattern
  */
-export type PatternType<P> = P extends (value: unknown) => value is infer T
+export type PatternType<P> = P extends ((value: unknown) => value is infer T)
 	? T
 	: P extends AnyFunction
 		? unknown

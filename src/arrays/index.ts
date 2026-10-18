@@ -1351,7 +1351,9 @@ export function intersectionBy<T, U = T>(a: Iterable<T>, b: Iterable<U>, keyFn: 
  * @template T - The element type
  */
 export type DiffOperation<T> =
-	{ type: 'equal'; value: T; indexA: number; indexB: number } | { type: 'delete'; value: T; indexA: number } | { type: 'insert'; value: T; indexB: number };
+	| { type: 'equal'; value: T; indexA: number; indexB: number }
+	| { type: 'delete'; value: T; indexA: number }
+	| { type: 'insert'; value: T; indexB: number };
 
 /**
  * Options accepted by {@link diffSequences} and {@link longestCommonSubsequence}.

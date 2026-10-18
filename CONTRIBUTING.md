@@ -29,7 +29,7 @@ New modules must be re-exported as a namespace from `src/index.ts`; deep imports
 
 ## Code rules
 
-ESLint enforces most of these:
+oxlint enforces most of these:
 
 - **No arrow functions.** Use function declarations, or `function () {}` expressions for callbacks.
 - **Full JSDoc** on every function: summary, `@template`, `@param`, `@returns`, `@throws`, `@example`.
