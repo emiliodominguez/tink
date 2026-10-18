@@ -3,13 +3,13 @@
 process.env.TZ = 'America/New_York'; // the DST rows need a zone with a fall-back hour; Node applies TZ changes at runtime
 
 const tink = {
-	arrays: await import('tinkjs/arrays'),
-	async: await import('tinkjs/async'),
-	date: await import('tinkjs/date'),
-	math: await import('tinkjs/math'),
-	objects: await import('tinkjs/objects'),
-	strings: await import('tinkjs/strings'),
-	url: await import('tinkjs/url')
+	arrays: await import('tinkit/arrays'),
+	async: await import('tinkit/async'),
+	date: await import('tinkit/date'),
+	math: await import('tinkit/math'),
+	objects: await import('tinkit/objects'),
+	strings: await import('tinkit/strings'),
+	url: await import('tinkit/url')
 };
 const toolkit = await import('es-toolkit');
 const lodash = await import('lodash-es');

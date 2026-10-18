@@ -16,7 +16,7 @@ import {
 	unique,
 	windowed,
 	zip
-} from 'tinkjs/iterables';
+} from 'tinkit/iterables';
 import { pMapIterable } from 'p-map';
 
 // No library offers the same lazy, closing-aware helpers, so each case is compared with what one would write instead:

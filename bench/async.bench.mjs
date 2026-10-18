@@ -11,7 +11,7 @@ import {
 	mapWithConcurrency,
 	memoizeAsync,
 	throwIfAborted
-} from 'tinkjs/async';
+} from 'tinkit/async';
 import * as esToolkit from 'es-toolkit';
 import * as lodash from 'lodash-es';
 import pMap, { pMapSettled } from 'p-map';

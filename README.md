@@ -11,13 +11,13 @@
 ~600 tree-shakeable helpers · 20 modules · zero dependencies · a median of 450 B per import
 
 ```bash
-npm install tinkjs
+npm install tinkit
 ```
 
 ```ts
-import { orderBy } from 'tinkjs/arrays';
-import { isShape, isInteger, isString } from 'tinkjs/guards';
-import { retry } from 'tinkjs/async';
+import { orderBy } from 'tinkit/arrays';
+import { isShape, isInteger, isString } from 'tinkit/guards';
+import { retry } from 'tinkit/async';
 ```
 
 ESM, fully typed, Node 20.19+ and modern browsers. Each module is a deep import, so your bundle only contains the helpers you call.
@@ -46,8 +46,8 @@ None of these are hand-written: `yarn build && yarn compare` recomputes every ro
 Type guards narrow, compose into schemas, report every issue with its path, and plug into anything that speaks [Standard Schema](https://standardschema.dev) (tRPC, TanStack Form, React Hook Form, Hono…). No second validation library.
 
 ```ts
-import { explain, isArrayOf, isInteger, isOneOf, isShape, isString, toStandardSchema, type Infer } from 'tinkjs/guards';
-import { parseJson } from 'tinkjs/validate';
+import { explain, isArrayOf, isInteger, isOneOf, isShape, isString, toStandardSchema, type Infer } from 'tinkit/guards';
+import { parseJson } from 'tinkit/validate';
 
 const isUser = isShape({ id: isInteger, email: isString, roles: isArrayOf(isOneOf(['admin', 'editor'])) });
 type User = Infer<typeof isUser>; // { id: number; email: string; roles: ('admin' | 'editor')[] }
@@ -64,8 +64,8 @@ const schema = toStandardSchema(isUser); // for your form or RPC library
 ## Hostile input is a non-event
 
 ```ts
-import { deepMerge, getFromObjectByKeys } from 'tinkjs/objects';
-import { isAbsoluteUrl, sanitizeUrl } from 'tinkjs/url';
+import { deepMerge, getFromObjectByKeys } from 'tinkit/objects';
+import { isAbsoluteUrl, sanitizeUrl } from 'tinkit/url';
 
 deepMerge(defaults, JSON.parse('{"__proto__": {"isAdmin": true}}')); // key dropped, Object.prototype untouched
 getFromObjectByKeys(permissions, 'viewer.constructor', false); // false: inherited Object members never resolve
@@ -78,7 +78,7 @@ Every regex runs in linear time, validators reject look-alike hosts and invisibl
 ## Async that cleans up after itself
 
 ```ts
-import { createQueue, createRateLimiter, mapWithConcurrency, memoizeAsync } from 'tinkjs/async';
+import { createQueue, createRateLimiter, mapWithConcurrency, memoizeAsync } from 'tinkit/async';
 
 const getUser = memoizeAsync(fetchUser, { ttl: 60_000 }); // concurrent calls share one request; failures are never cached
 const limiter = createRateLimiter({ limit: 10, interval: 1_000 }); // sliding window; calls queue instead of being dropped

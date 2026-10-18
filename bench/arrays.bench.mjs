@@ -57,7 +57,7 @@ import {
 	zip,
 	zipObject,
 	zipWith
-} from 'tinkjs/arrays';
+} from 'tinkit/arrays';
 import * as toolkit from 'es-toolkit';
 import * as lodash from 'lodash-es';
 import * as radash from 'radash';

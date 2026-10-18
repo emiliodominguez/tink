@@ -262,7 +262,8 @@ function parseCssFunction(text: string): Rgba | undefined {
 	}
 
 	if (units[3] !== '' && units[3] !== '%') return undefined;
-	const a = clamp(units[3] === '%' ? values[3] / 100 : values[3], 0, 1);
+	// `+ 0` turns a clamped `-0` into `0`: colour channels never carry a signed zero.
+	const a = clamp(units[3] === '%' ? values[3] / 100 : values[3], 0, 1) + 0;
 
 	if (match[1][0] === 'r' || match[1][0] === 'R') {
 		for (let i = 0; i < 3; i++) {
@@ -392,7 +393,7 @@ export function toRgba(input: ColorInput): Rgba {
 		r: toByte(readChannel('toRgba', 'input.r', input.r)),
 		g: toByte(readChannel('toRgba', 'input.g', input.g)),
 		b: toByte(readChannel('toRgba', 'input.b', input.b)),
-		a: clamp(alpha, 0, 1)
+		a: clamp(alpha, 0, 1) + 0 // no signed zero
 	};
 }
 
@@ -549,8 +550,8 @@ export function hslToRgb(hsl: Hsl): Rgb {
 function hslValuesToRgb<T extends Rgb>(hue: number, saturation: number, lightness: number, target: T): T {
 	// The floating-point `%` inside `modulo` is slow: skip it for hues already in range.
 	const h = hue >= 0 && hue < 360 ? hue : modulo(hue, 360);
-	const l = clamp(lightness, 0, 100) / 100;
-	const chroma = (clamp(saturation, 0, 100) / 100) * Math.min(l, 1 - l);
+	const l = (clamp(lightness, 0, 100) + 0) / 100;
+	const chroma = ((clamp(saturation, 0, 100) + 0) / 100) * Math.min(l, 1 - l);
 	target.r = hslChannel(0, h, l, chroma);
 	target.g = hslChannel(8, h, l, chroma);
 	target.b = hslChannel(4, h, l, chroma);
@@ -599,7 +600,7 @@ export function mix(colorA: ColorInput, colorB: ColorInput, weight = 0.5): Rgba 
 		g: toByte(lerp(a.g, b.g, weight)),
 		b: toByte(lerp(a.b, b.b, weight)),
 		// Clamp to the inputs: `(1 - w) * x + w * y` can overshoot max(x, y) by one ulp.
-		a: clamp(lerp(a.a, b.a, weight), Math.min(a.a, b.a), Math.max(a.a, b.a))
+		a: clamp(lerp(a.a, b.a, weight), Math.min(a.a, b.a), Math.max(a.a, b.a)) + 0
 	};
 }
 

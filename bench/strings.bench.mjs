@@ -55,7 +55,7 @@ import {
 	truncate,
 	uncapitalize,
 	unescapeHtml
-} from 'tinkjs/strings';
+} from 'tinkit/strings';
 
 // Input classes: short ASCII identifiers, long ASCII text (~1.6 KB) and unicode-heavy text (accents, CJK, emoji).
 const identifiers = [

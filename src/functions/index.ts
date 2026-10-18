@@ -713,7 +713,7 @@ export interface Throttled<F extends AnyFunction> {
  * @throws {TypeError} when `fn` is not a function, or `wait` is not a number
  * @throws {RangeError} when `wait` is negative, `NaN` or infinite, or when both `leading` and `trailing` are `false`
  * @example
- * import { sleep } from 'tinkjs/async';
+ * import { sleep } from 'tinkit/async';
  * const positions: number[] = [];
  * const onScroll = throttle(function (y: number): void { positions.push(y); }, 20, { trailing: true });
  * onScroll(10); // leading edge: runs now
@@ -874,7 +874,7 @@ export interface Debounced<F extends AnyFunction> {
  * @throws {TypeError} when `fn` is not a function, or `wait` or `maxWait` is not a number
  * @throws {RangeError} when `wait` or `maxWait` is negative, `NaN` or infinite, or when both `leading` and `trailing` are `false`
  * @example
- * import { sleep } from 'tinkjs/async';
+ * import { sleep } from 'tinkit/async';
  * const saved: string[] = [];
  * const save = debounce(function (text: string): void { saved.push(text); }, 20);
  * save('h');

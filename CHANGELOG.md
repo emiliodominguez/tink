@@ -2,7 +2,7 @@
 
 ## 1.0.0
 
-First release as **tinkjs** (`npm install tinkjs`). tink is the successor of the `js-helpers` 1.x codebase, fully reviewed and rewritten: every module is strictly typed, documented with complete JSDoc, and covered by example-based and property-based tests. Notes for code coming from `js-helpers` 1.x are in [Upgrading from js-helpers 1.x](#upgrading-from-js-helpers-1x).
+First release as **tinkit** (`npm install tinkit`). tink is the successor of the `js-helpers` 1.x codebase, fully reviewed and rewritten: every module is strictly typed, documented with complete JSDoc, and covered by example-based and property-based tests. Notes for code coming from `js-helpers` 1.x are in [Upgrading from js-helpers 1.x](#upgrading-from-js-helpers-1x).
 
 ### Added
 
@@ -53,6 +53,7 @@ An adversarial review (prototype pollution, ReDoS, resource exhaustion, validato
 - **validate:** `isUrl` rejects invisible/format characters, look-alike (NFKC-unstable) and percent-encoded hosts, ideographic dots, backslashes in the authority, empty labels and non-canonical numeric hosts; `isBase64` only accepts canonical encodings; `isCreditCardNumber` rejects all-zero numbers.
 - **strings:** `escapeHtml`/`unescapeHtml` always return strings (an array query value was returned unescaped); `escapeRegExp` follows TC39 `RegExp.escape` (safe inside classes and with the `v` flag); `mask` no longer reveals secrets shorter than the visible window; `toNumber` accepts exactly what `isNumericString` accepts.
 - **Denial of service:** `formatDate` tokenizes patterns in linear time (was quadratic); `fuzzyMatch` rejects impossible queries before allocating (was gigabytes); `isPrime` uses deterministic Miller–Rabin (311 ms → 0.1 ms worst case); `retry` always yields to the event loop (infinite retries of a throwing function froze the thread); `windowed`/`cartesianProduct` check output sizes before allocating; template, pattern and locale caches skip keys over 1 kB.
+- **Signed zero:** `clamp` returns an in-range value unchanged, so `clamp(-0, 0, 1)` is `-0` (it used to return `0`); colour channels still never carry a signed zero.
 - **Ordering and rounding:** `sortBy`/`minBy`/`maxBy` treat `null`/`undefined` keys as unorderable like `NaN` (`null` used to sort as `0`); `round` and `roundToStep` return numbers that already have at most `decimals` digits unchanged (`round(1.1773748397827148, 20)` used to alter the last digit); `ceil`/`floor` take a second `decimals` parameter (beware `array.map(ceil)`, which now passes the index).
 - **Consistency:** math aggregates coerce numeric strings once (`sum(['1','2'])` was `'012'`); `weightedRandom` rejects non-number weights; `sleep`/`retry`/`pollUntil` validate signals up front; `memoize` keys distinguish dates from strings and key class instances, errors, functions and symbols by identity; `@memoize`/`@once` no longer share state across detached calls; error messages truncate quoted input; `assertNever` never serialises the whole value.
 
@@ -159,7 +160,7 @@ An adversarial review (prototype pollution, ReDoS, resource exhaustion, validato
 
 ### Changed (breaking, from js-helpers 1.x)
 
-- The package is renamed to `tinkjs` and restarts at 1.0.0.
+- The package is renamed to `tinkit` and restarts at 1.0.0.
 - **Behaviour:**
     - `isError` decides same-realm objects with `instanceof`, so a plain object faking `Symbol.toStringTag` `'Error'` is no longer an error;
         - the `isDate`/`isRegExp`/`isMap`/`isSet`/`isWeakMap`/`isWeakSet` guards reject a genuine instance whose prototype was swapped to an unrelated object from the same realm (cross-realm instances still pass);
@@ -171,7 +172,7 @@ An adversarial review (prototype pollution, ReDoS, resource exhaustion, validato
 
 ### Upgrading from js-helpers 1.x
 
-Replace `js-helpers` imports with `tinkjs/<module>` deep imports, then review these behaviour changes:
+Replace `js-helpers` imports with `tinkit/<module>` deep imports, then review these behaviour changes:
 
 **arrays**
 

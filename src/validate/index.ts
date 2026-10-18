@@ -922,7 +922,7 @@ export function parseJson(text: string, options?: ParseJsonOptions): ParseJsonRe
  * @throws {TypeError} when `guard` is not a function or `options` is not an object
  * @throws {RangeError} when `options.proto` is not `'error'`, `'remove'` or `'ignore'`
  * @example
- * import { isShape, isInteger, ValidationError } from 'tinkjs/guards';
+ * import { isShape, isInteger, ValidationError } from 'tinkit/guards';
  * const isConfig = isShape({ port: isInteger });
  * parseJson('{"port":8080}', isConfig); // => [undefined, { port: 8080 }]
  * const [error] = parseJson('{"port":"80"}', isConfig);

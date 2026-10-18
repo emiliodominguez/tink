@@ -1,4 +1,4 @@
-import { createEmitter } from 'tinkjs/emitter';
+import { createEmitter } from 'tinkit/emitter';
 import mitt from 'mitt';
 
 /**

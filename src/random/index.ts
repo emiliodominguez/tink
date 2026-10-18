@@ -382,7 +382,7 @@ let secureSource: CryptoLike | undefined;
  * const r = secureRandom();
  * r >= 0 && r < 1; // => true
  * @example
- * import { randomIntBetween } from 'tinkjs/math';
+ * import { randomIntBetween } from 'tinkit/math';
  * randomIntBetween(100000, 999999, secureRandom); // e.g. 482913 (a 6-digit one-time code)
  */
 export function secureRandom(): number {

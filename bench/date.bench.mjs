@@ -41,7 +41,7 @@ import {
 	subDuration,
 	toISODateString,
 	toISOStringLocal
-} from 'tinkjs/date';
+} from 'tinkit/date';
 
 // 100 deterministic dates spread over several years (local time).
 const dates = Array.from({ length: 100 }, function (_, index) {

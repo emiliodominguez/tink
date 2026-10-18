@@ -23,8 +23,8 @@ import {
 	throttle,
 	times,
 	unary
-} from 'tinkjs/functions';
-import { memoize as memoizeDecorator } from 'tinkjs/decorators';
+} from 'tinkit/functions';
+import { memoize as memoizeDecorator } from 'tinkit/decorators';
 import * as esToolkit from 'es-toolkit';
 import * as esCompat from 'es-toolkit/compat';
 import * as lodash from 'lodash-es';

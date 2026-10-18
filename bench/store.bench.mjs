@@ -1,4 +1,4 @@
-import { createStore } from 'tinkjs/store';
+import { createStore } from 'tinkit/store';
 
 /**
  * A minimal hand-written store (no re-entrancy queue, no error isolation, no selectors): the theoretical best for setState + notify.

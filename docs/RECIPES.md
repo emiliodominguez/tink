@@ -5,7 +5,7 @@ Copy-paste examples, grouped by task. Every snippet's results are asserted by th
 ## Async without the usual footguns
 
 ```ts
-import { createQueue, createRateLimiter, mapWithConcurrency, memoizeAsync } from 'tinkjs/async';
+import { createQueue, createRateLimiter, mapWithConcurrency, memoizeAsync } from 'tinkit/async';
 
 const getUser = memoizeAsync(fetchUser, { ttl: 60_000 }); // concurrent calls share one request; failures are never cached
 const limiter = createRateLimiter({ limit: 10, interval: 1_000 }); // sliding window: calls queue instead of being dropped
@@ -18,7 +18,7 @@ await mapWithConcurrency(urls, fetchPage, { concurrency: 8, signal }); // stops 
 ## Dates that survive month ends and DST
 
 ```ts
-import { addDuration, formatDate, intervalToDuration, parseDate } from 'tinkjs/date';
+import { addDuration, formatDate, intervalToDuration, parseDate } from 'tinkit/date';
 
 formatDate(addDuration(new Date(2024, 0, 31), { months: 1, days: 1 }), 'YYYY-MM-DD'); // '2024-03-01' (Feb 29, then one day)
 intervalToDuration(new Date(2024, 0, 31), new Date(2024, 2, 1, 12)); // { years: 0, months: 1, days: 1, hours: 12, … }
@@ -30,10 +30,10 @@ parseDate('2023-02-29', 'YYYY-MM-DD'); // undefined: strict inverse of formatDat
 ## Text that respects emoji, and keys that keep their types
 
 ```ts
-import { padStart, reverse } from 'tinkjs/strings';
-import { toCamelCaseKeys } from 'tinkjs/objects';
-import { orderBy, takeFirstBy } from 'tinkjs/arrays';
-import { match } from 'tinkjs/functions';
+import { padStart, reverse } from 'tinkit/strings';
+import { toCamelCaseKeys } from 'tinkit/objects';
+import { orderBy, takeFirstBy } from 'tinkit/arrays';
+import { match } from 'tinkit/functions';
 
 reverse('a👍🏽b'); // 'b👍🏽a' (split('').reverse() breaks the skin tone)
 padStart('🇦🇷', 3, '·'); // '··🇦🇷' (a flag is one character, not four code units)
@@ -62,15 +62,15 @@ match(shape, 'kind', {
 These integration snippets use application-provided values such as `user`, `defaults`, `userInput`, `url`, `urls`, `input`, `fetchPage` and `persist`.
 
 ```ts
-import { getFromObjectByKeys, deepMerge } from 'tinkjs/objects';
-import { isDefined } from 'tinkjs/guards';
-import { retry, withTimeout, mapWithConcurrency } from 'tinkjs/async';
-import { debounce } from 'tinkjs/functions';
-import { addMonths, formatDate } from 'tinkjs/date';
-import { getReadableTextColor } from 'tinkjs/color';
-import { formatCompact, formatCurrency } from 'tinkjs/format';
-import { compareSemver, isEmail } from 'tinkjs/validate';
-import { withQuery } from 'tinkjs/url';
+import { getFromObjectByKeys, deepMerge } from 'tinkit/objects';
+import { isDefined } from 'tinkit/guards';
+import { retry, withTimeout, mapWithConcurrency } from 'tinkit/async';
+import { debounce } from 'tinkit/functions';
+import { addMonths, formatDate } from 'tinkit/date';
+import { getReadableTextColor } from 'tinkit/color';
+import { formatCompact, formatCurrency } from 'tinkit/format';
+import { compareSemver, isEmail } from 'tinkit/validate';
+import { withQuery } from 'tinkit/url';
 
 // Type-safe deep access: the return type is inferred from the path.
 const city = getFromObjectByKeys(user, 'address.city', 'Unknown'); // string
@@ -113,12 +113,12 @@ isEmail(input); // narrows `unknown` to `string`
 The caching example wraps your application's `fetchUser` function. The remaining examples are self-contained.
 
 ```ts
-import { createLRUCache } from 'tinkjs/cache';
-import { createEmitter } from 'tinkjs/emitter';
-import { memoize } from 'tinkjs/functions';
-import { count, filter, map, take, toArray } from 'tinkjs/iterables';
-import { createRandom } from 'tinkjs/random';
-import { createStore } from 'tinkjs/store';
+import { createLRUCache } from 'tinkit/cache';
+import { createEmitter } from 'tinkit/emitter';
+import { memoize } from 'tinkit/functions';
+import { count, filter, map, take, toArray } from 'tinkit/iterables';
+import { createRandom } from 'tinkit/random';
+import { createStore } from 'tinkit/store';
 
 // Bounded, expiring memoization.
 const getUser = memoize(fetchUser, { cache: createLRUCache({ max: 500, ttl: 60_000 }) });
@@ -157,10 +157,10 @@ const rng = createRandom('docs');
 ## UI helpers: fuzzy search, easing, CSS colors and diffs
 
 ```ts
-import { diffSequences } from 'tinkjs/arrays';
-import { parseColor } from 'tinkjs/color';
-import { cssEase, interpolate } from 'tinkjs/easing';
-import { fuzzySearch, highlight } from 'tinkjs/search';
+import { diffSequences } from 'tinkit/arrays';
+import { parseColor } from 'tinkit/color';
+import { cssEase, interpolate } from 'tinkit/easing';
+import { fuzzySearch, highlight } from 'tinkit/search';
 
 // Command palette: rank matches, then render highlighted segments (no innerHTML needed).
 const [best] = fuzzySearch(['Open File', 'Save File', 'Toggle Sidebar'], 'of');
@@ -188,7 +188,7 @@ The decorators detect at runtime which decorator style they were applied with. T
 - TC39 standard decorators (TypeScript 5+ without `experimentalDecorators`).
 
 ```ts
-import { memoize, bound, debounced, readonly } from 'tinkjs/decorators';
+import { memoize, bound, debounced, readonly } from 'tinkit/decorators';
 
 class SearchBox {
 	@readonly id = crypto.randomUUID(); // write-once: reassigning throws TypeError

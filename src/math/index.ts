@@ -489,10 +489,12 @@ export function toDegrees(radians: number): number {
  * clamp(15, 0, 10); // => 10
  * clamp(-5, 0, 10); // => 0
  * clamp(5, 0, 10); // => 5
+ * Object.is(clamp(-0, 0, 10), -0); // => true
  */
 export function clamp(value: number, minimum: number, maximum: number): number {
 	if (!(minimum <= maximum)) throw new RangeError(`clamp: \`minimum\` must not be greater than \`maximum\`, got ${minimum} and ${maximum}`);
-	return Math.min(Math.max(value, minimum), maximum);
+	// Plain comparisons, not Math.min/Math.max: an in-range value is returned as is (`-0` stays `-0`), and `NaN` compares false.
+	return value < minimum ? minimum : value > maximum ? maximum : value;
 }
 
 /**

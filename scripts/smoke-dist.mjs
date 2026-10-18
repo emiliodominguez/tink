@@ -1,16 +1,16 @@
 // Smoke-tests the BUILT package through its public `exports` map (unit tests run against `src`),
 // catching packaging or minification regressions. Run after `yarn build`.
 import assert from 'node:assert/strict';
-import * as root from 'tinkjs';
-import { chunk } from 'tinkjs/arrays';
-import { TimeoutError, AbortError, withTimeout, retry } from 'tinkjs/async';
-import { addMonths, formatDate } from 'tinkjs/date';
-import { memoize as memoizeMethod } from 'tinkjs/decorators';
-import { debounce, curry } from 'tinkjs/functions';
-import { isPlainObject } from 'tinkjs/guards';
-import { round, sum } from 'tinkjs/math';
-import { deepClone, deepMerge, isEqual } from 'tinkjs/objects';
-import { toKebabCase, reverse } from 'tinkjs/strings';
+import * as root from 'tinkit';
+import { chunk } from 'tinkit/arrays';
+import { TimeoutError, AbortError, withTimeout, retry } from 'tinkit/async';
+import { addMonths, formatDate } from 'tinkit/date';
+import { memoize as memoizeMethod } from 'tinkit/decorators';
+import { debounce, curry } from 'tinkit/functions';
+import { isPlainObject } from 'tinkit/guards';
+import { round, sum } from 'tinkit/math';
+import { deepClone, deepMerge, isEqual } from 'tinkit/objects';
+import { toKebabCase, reverse } from 'tinkit/strings';
 
 assert.deepEqual(Object.keys(root).sort(), [
 	'arrays',

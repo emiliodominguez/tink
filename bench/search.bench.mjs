@@ -1,5 +1,5 @@
 import Fuse from 'fuse.js';
-import { fuzzyMatch, fuzzySearch, highlight } from 'tinkjs/search';
+import { fuzzyMatch, fuzzySearch, highlight } from 'tinkit/search';
 
 // Deterministic command-palette-like labels: "Category: Verb Noun", dotted command ids and file paths.
 const categories = ['File', 'Edit', 'View', 'Git', 'Terminal', 'Debug', 'Search', 'Editor', 'Workspace', 'Preferences', 'Format', 'Refactor'];

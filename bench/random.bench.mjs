@@ -1,6 +1,6 @@
 import { shuffle as esShuffle } from 'es-toolkit';
 import { customAlphabet, nanoid } from 'nanoid';
-import { createRandom, randomBytes, randomGaussian, randomId, randomUUID, weightedRandom } from 'tinkjs/random';
+import { createRandom, randomBytes, randomGaussian, randomId, randomUUID, weightedRandom } from 'tinkit/random';
 
 const rng = createRandom('bench');
 const items = Array.from({ length: 100 }, function (_, index) {

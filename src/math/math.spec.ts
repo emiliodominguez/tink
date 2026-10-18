@@ -545,6 +545,13 @@ describe('Math helpers', function () {
 	});
 
 	describe('clamp', function () {
+		it('should return an in-range value unchanged, keeping the sign of zero', function () {
+			expect(Object.is(helpers.clamp(-0, 0, 0), -0)).toBe(true);
+			expect(Object.is(helpers.clamp(-0, -1, 1), -0)).toBe(true);
+			expect(Object.is(helpers.clamp(0, -0, 0), 0)).toBe(true);
+			expect(helpers.clamp(NaN, 0, 1)).toBeNaN();
+		});
+
 		it('should clamp values into the range', function () {
 			expect(helpers.clamp(15, 0, 10)).toBe(10);
 			expect(helpers.clamp(-5, 0, 10)).toBe(0);

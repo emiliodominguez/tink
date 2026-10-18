@@ -11,7 +11,7 @@
 Collection helpers: set algebra, grouping, chunking, sorting, sampling.
 
 ```ts
-import { … } from 'tinkjs/arrays';
+import { … } from 'tinkit/arrays';
 ```
 
 | Export                     | Description                                                                                                                                                                                                                                                                 |
@@ -94,7 +94,7 @@ import { … } from 'tinkjs/arrays';
 Shallow/deep cloning, merging, equality, path access and object reshaping.
 
 ```ts
-import { … } from 'tinkjs/objects';
+import { … } from 'tinkit/objects';
 ```
 
 | Export                   | Description                                                                                                                                                                                                                                                                                                                                                                                                                             |
@@ -156,7 +156,7 @@ import { … } from 'tinkjs/objects';
 Runtime type predicates that narrow `unknown` values, composable into path-aware, Standard Schema-compatible validators.
 
 ```ts
-import { … } from 'tinkjs/guards';
+import { … } from 'tinkit/guards';
 ```
 
 | Export                      | Description                                                                                                                                                                                                                                              |
@@ -232,7 +232,7 @@ import { … } from 'tinkjs/guards';
 Unicode-aware transformations, case conversion, escaping, templating and text metrics.
 
 ```ts
-import { … } from 'tinkjs/strings';
+import { … } from 'tinkit/strings';
 ```
 
 | Export                | Description                                                                                                                                                                                                                                                                                                              |
@@ -299,7 +299,7 @@ import { … } from 'tinkjs/strings';
 Query-string building and parsing, URL joining and query merging, without URL object types.
 
 ```ts
-import { … } from 'tinkjs/url';
+import { … } from 'tinkit/url';
 ```
 
 | Export                   | Description                                                                                                                                                                                                                                                                                                                               |
@@ -329,7 +329,7 @@ import { … } from 'tinkjs/url';
 Precise arithmetic, statistics, number theory and random numbers.
 
 ```ts
-import { … } from 'tinkjs/math';
+import { … } from 'tinkit/math';
 ```
 
 | Export               | Description                                                                                                                                                                                                                                                                                            |
@@ -385,7 +385,7 @@ import { … } from 'tinkjs/math';
 Function composition, currying, memoization and rate limiting.
 
 ```ts
-import { … } from 'tinkjs/functions';
+import { … } from 'tinkit/functions';
 ```
 
 | Export              | Description                                                                                                                                                                                                                 |
@@ -422,7 +422,7 @@ import { … } from 'tinkjs/functions';
 Promise utilities: retries, timeouts, polling, limiters, keyed Promise.all and async debounce.
 
 ```ts
-import { … } from 'tinkjs/async';
+import { … } from 'tinkit/async';
 ```
 
 | Export                      | Description                                                                                                                                                                                                                                                       |
@@ -456,7 +456,7 @@ import { … } from 'tinkjs/async';
 Hex/RGB/HSL conversion, mixing, lightening and WCAG contrast checks.
 
 ```ts
-import { … } from 'tinkjs/color';
+import { … } from 'tinkit/color';
 ```
 
 | Export                 | Description                                                                                                                                                                                                                                                                                                   |
@@ -483,7 +483,7 @@ import { … } from 'tinkjs/color';
 Fuzzy matching and ranking with highlight ranges, for command palettes and filter-as-you-type UIs.
 
 ```ts
-import { … } from 'tinkjs/search';
+import { … } from 'tinkit/search';
 ```
 
 | Export        | Description                                                                                                                                                                                             |
@@ -497,7 +497,7 @@ import { … } from 'tinkjs/search';
 Animation easing curves, CSS-accurate cubic-bezier() and steps(), and an analytic spring.
 
 ```ts
-import { … } from 'tinkjs/easing';
+import { … } from 'tinkit/easing';
 ```
 
 | Export             | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -549,7 +549,7 @@ import { … } from 'tinkjs/easing';
 Deterministic, cached Intl formatting: numbers, currency, percent, compact, units, lists, dates, ordinals.
 
 ```ts
-import { … } from 'tinkjs/format';
+import { … } from 'tinkit/format';
 ```
 
 | Export               | Description                                                                                                                                                                                                                        |
@@ -570,7 +570,7 @@ import { … } from 'tinkjs/format';
 Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates.
 
 ```ts
-import { … } from 'tinkjs/validate';
+import { … } from 'tinkit/validate';
 ```
 
 | Export                | Description                                                                                                                                                                                                                                                                                                                                                                                                                 |
@@ -600,7 +600,7 @@ import { … } from 'tinkjs/validate';
 DST-safe, non-mutating local-time date arithmetic, formatting and parsing.
 
 ```ts
-import { … } from 'tinkjs/date';
+import { … } from 'tinkit/date';
 ```
 
 | Export                  | Description                                                                                                                                                                                                                                                                                                                                                                                                                |
@@ -689,7 +689,7 @@ import { … } from 'tinkjs/date';
 Lazy, generator-based pipelines over any (async) iterable, with exact pull counts and early-exit cleanup.
 
 ```ts
-import { … } from 'tinkjs/iterables';
+import { … } from 'tinkit/iterables';
 ```
 
 | Export          | Description                                                                                                                                                                                                                                               |
@@ -733,7 +733,7 @@ import { … } from 'tinkjs/iterables';
 O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock; plugs into memoize.
 
 ```ts
-import { … } from 'tinkjs/cache';
+import { … } from 'tinkit/cache';
 ```
 
 | Export                | Description                                                                                                                                                                                                                                   |
@@ -746,7 +746,7 @@ import { … } from 'tinkjs/cache';
 Typed event emitter with wildcard listeners, waitFor and error isolation.
 
 ```ts
-import { … } from 'tinkjs/emitter';
+import { … } from 'tinkit/emitter';
 ```
 
 | Export          | Description                                          |
@@ -758,7 +758,7 @@ import { … } from 'tinkjs/emitter';
 Tiny state store compatible with React useSyncExternalStore, with derived selectors.
 
 ```ts
-import { … } from 'tinkjs/store';
+import { … } from 'tinkit/store';
 ```
 
 | Export        | Description                                                                                                                                                                                             |
@@ -770,7 +770,7 @@ import { … } from 'tinkjs/store';
 Seeded deterministic PRNG plus cryptographically secure ids, UUIDs and bytes.
 
 ```ts
-import { … } from 'tinkjs/random';
+import { … } from 'tinkit/random';
 ```
 
 | Export           | Description                                                                                                                                                                                                                                      |
@@ -789,7 +789,7 @@ import { … } from 'tinkjs/random';
 Class decorators for TypeScript (legacy and TC39 standard) and Babel.
 
 ```ts
-import { … } from 'tinkjs/decorators';
+import { … } from 'tinkit/decorators';
 ```
 
 | Export       | Description                                                                                                                                                                                                                                                                                                                  |

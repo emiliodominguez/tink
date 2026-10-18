@@ -271,8 +271,8 @@ Every helper is a named export of a module entry point, so the import changes fr
 import debounce from 'lodash/debounce';
 import get from 'lodash/get';
 // after
-import { debounce } from 'tinkjs/functions';
-import { getFromObjectByKeys } from 'tinkjs/objects';
+import { debounce } from 'tinkit/functions';
+import { getFromObjectByKeys } from 'tinkit/objects';
 \`\`\`
 
 Sizes are what each import adds to a bundle on its own (esbuild, minified, gzip level 9, lodash measured from \`lodash-es\`).
