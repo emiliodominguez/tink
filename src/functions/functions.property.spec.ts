@@ -312,7 +312,8 @@ describe('Functions helpers (properties)', function () {
 
 			fc.assert(
 				fc.property(fc.array(value, { minLength: 2, maxLength: 4 }), function (args) {
-					expect((defaultMemoizeKey(...args) as string).replace(/"#\d+"/g, '"identity"')).toBe(referenceKey(args));
+					// Only identity markers in value position are normalised: a dictionary KEY such as "#0" stays as is.
+					expect((defaultMemoizeKey(...args) as string).replace(/"#\d+"(?!:)/g, '"identity"')).toBe(referenceKey(args));
 				})
 			);
 		});

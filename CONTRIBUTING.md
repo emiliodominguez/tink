@@ -62,6 +62,17 @@ range(0, 1, 0); // throws RangeError
 - The module's exports are in scope; use `import { x } from 'tinkjs/<module>'` lines for other modules. `@decorator` syntax works (TC39 standard decorators).
 - Blocks must be self-contained. Dates use local constructors (`new Date(2024, 0, 31)`) so examples pass in every time zone. A block that can't run (DOM, network, placeholders) starts with `// doctest: skip`.
 
+### Stress-testing properties
+
+Property tests draw new random inputs on every run, so a rare counterexample can make a single run fail. Before pushing a new property, run it with ten times the usual inputs:
+
+```bash
+yarn test:stress                  # every *.property.spec.ts, 1,000 cases per property
+FC_RUNS=5000 yarn test:stress src/url   # more cases, one module
+```
+
+A failure prints the seed and the shrunk counterexample: turn it into a unit test, then fix the code or the property's oracle.
+
 ### Mutation testing
 
 Coverage only shows that code ran. [Stryker](https://stryker-mutator.io) checks that the tests _notice_ when the code changes: it introduces small bugs ("mutants") such as flipping `>=` to `>` or deleting a condition, and reports every mutant that no test kills.

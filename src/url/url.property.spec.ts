@@ -408,7 +408,9 @@ describe('URL helpers (round 11 properties)', function () {
 							return (upper && index % 2 === 0 ? letter.toUpperCase() : letter) + noise[index];
 						});
 						const url = `${lead}${name.join('')}:${rest}`;
-						expect(URL.parse(url)?.protocol).toBe('javascript:');
+						// Some disguises do not even parse (`javascript://\\`); those must be rejected too.
+						const parsed = URL.parse(url);
+						if (parsed !== null) expect(parsed.protocol).toBe('javascript:');
 						expect(helpers.isSafeUrl(url)).toBe(false);
 						expect(helpers.sanitizeUrl(url)).toBe('about:blank');
 					}

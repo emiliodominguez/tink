@@ -72,6 +72,7 @@
 		"test:coverage": "jest --coverage",
 		"test:tz": "node scripts/test-timezones.mjs",
 		"test:docs": "node scripts/doctest.mjs",
+		"test:stress": "jest -c jest.stress.cjs",
 		"test:mutation": "stryker run",
 		"bench": "node scripts/bench.mjs",
 		"compare": "node bench/edge-cases.mjs",
