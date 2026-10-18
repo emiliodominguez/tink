@@ -1053,8 +1053,22 @@ describe('edge cases', function () {
 });
 
 describe('isUrl IDNA mapping', function () {
+	const original = globalThis.URL;
+
+	afterEach(function () {
+		globalThis.URL = original;
+	});
+
 	it('rejects a non-ASCII label that IDNA maps to plain ASCII', function () {
+		// UTS #46 before 15.1 (older ICU) case-folds `ẞ` to `ss`; newer versions keep `ß`, so the mapping is stubbed.
+		(globalThis as any).URL = function (this: any, input: string) {
+			this.hostname = input === 'https://ẞa.com' ? 'ssa.com' : new original(input).hostname;
+		};
 		expect(helpers.isUrl('https://ẞa.com')).toBe(false);
 		expect(helpers.isUrl('https://münchen.de')).toBe(true);
+	});
+
+	it('follows the runtime IDNA mapping of `ẞ`', function () {
+		expect(helpers.isUrl('https://ẞa.com')).toBe(new original('https://ẞa.com').hostname.startsWith('xn--'));
 	});
 });

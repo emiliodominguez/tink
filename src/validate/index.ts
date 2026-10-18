@@ -209,7 +209,7 @@ function writtenHost(authority: string): string | undefined {
 
 /**
  * Checks that every label of an internationalized host name stays one after IDNA processing: the ASCII labels are only lower-cased, and the
- * others become punycode (`xn--`) labels, not ASCII ones (IDNA case folding maps `ẞ` to `ss`).
+ * others become punycode (`xn--`) labels, not ASCII ones (before UTS #46 15.1, IDNA case folding maps `ẞ` to `ss`).
  * @param {string} host - The host as written
  * @param {string} hostname - The host as parsed
  * @returns {boolean} `true` when the labels correspond one to one
@@ -234,8 +234,8 @@ function isEncodingOf(host: string, hostname: string): boolean {
  *
  * The host is also checked against the text, so that for an accepted URL the host a client connects to is the one a reader (or a
  * string-based allow/deny list) sees: `new URL(value).hostname` is the written host, lower-cased, or its punycode form for
- * internationalized names (`münchen.de`, `例え.jp`; each non-ASCII label must stay a punycode label, so `https://ẞa.com`, which IDNA case
- * folding turns into `ssa.com`, is rejected). So the following are also rejected: invisible characters anywhere (format characters
+ * internationalized names (`münchen.de`, `例え.jp`; each non-ASCII label must stay a punycode label, so `https://ẞa.com`, which older IDNA case
+ * folding turns into `ssa.com`, is rejected there). So the following are also rejected: invisible characters anywhere (format characters
  * such as U+00AD soft hyphen, U+200B zero-width space or bidi controls, and other default-ignorable code points such as U+034F or
  * variation selectors), a backslash in the authority (`http://evil.com\@good.com`, which parsers disagree on), and host names with
  * a `%` (percent-decoded by the parser), an empty label (`https://a..b`, `https://.`; one trailing dot is allowed), characters that
