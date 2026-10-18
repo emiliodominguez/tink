@@ -53,6 +53,30 @@ function createSignal(): AbortSignalLike & { abort(reason?: unknown): void; list
 
 describe('createEmitter', function () {
 	describe('types', function () {
+		it('types handlers on "*" as wildcard handlers, even when an index signature makes "*" a key', function () {
+			const counts = createEmitter<Record<string, number>>();
+			const received: unknown[][] = [];
+			// @ts-expect-error a '*' listener receives (event, payload), not the payload
+			counts.on('*', function (n: number) {
+				received.push([n]);
+			});
+			// @ts-expect-error same for once
+			counts.once('*', function (n: number) {
+				received.push([n]);
+			});
+			counts.on('*', function (event, payload) {
+				const name: string = event;
+				const value: number = payload;
+				received.push([name, value]);
+			});
+			counts.on('count', function (n) {
+				// The payload is still inferred for other events.
+				received.push([n.toFixed(0)]);
+			});
+			counts.emit('count', 1);
+			expect(received).toEqual([['1'], ['count'], ['count'], ['count', 1]]);
+		});
+
 		it('types payloads, optional payloads and wildcard handlers', function () {
 			const events = createEmitter<TestEvents>();
 
