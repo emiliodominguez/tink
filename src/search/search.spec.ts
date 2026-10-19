@@ -1,3 +1,4 @@
+import type { FuzzySearchKeyedOptions } from '.';
 import * as helpers from '.';
 
 describe('Search helpers', function () {
@@ -433,5 +434,20 @@ describe('Search helpers', function () {
 			expect(helpers.fuzzyMatch('é😀', long)?.ranges).toEqual([[299, 302]]);
 			expect(helpers.fuzzyMatch('éé', 'é'.repeat(40))?.ranges).toEqual([[0, 2]]);
 		});
+	});
+});
+
+describe('fuzzySearch options types', function () {
+	it('accepts keyed options built ahead of the call', function () {
+		const options: FuzzySearchKeyedOptions<{ n: string }> = {
+			key: function (item) {
+				return item.n;
+			}
+		};
+		expect(
+			helpers.fuzzySearch([{ n: 'abc' }], 'a', options).map(function (result) {
+				return result.key;
+			})
+		).toEqual(['abc']);
 	});
 });

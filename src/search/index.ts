@@ -39,7 +39,7 @@ export interface FuzzyMatch {
 }
 
 /**
- * Options accepted by {@link fuzzySearch}.
+ * Options accepted by {@link fuzzySearch}. Items that are not strings need a `key`: type such options as {@link FuzzySearchKeyedOptions}.
  * @template T - The type of the searched items
  */
 export interface FuzzySearchOptions<T> {
@@ -61,6 +61,12 @@ export interface FuzzySearchOptions<T> {
 	 */
 	caseSensitive?: boolean;
 }
+
+/**
+ * {@link FuzzySearchOptions} with the `key` that items other than strings need (for options built ahead of the call).
+ * @template T - The type of the searched items
+ */
+export type FuzzySearchKeyedOptions<T> = FuzzySearchOptions<T> & { key: (item: T) => string | ReadonlyArray<string> };
 
 /**
  * One result of {@link fuzzySearch}.
@@ -425,7 +431,7 @@ export function fuzzyMatch(query: string, target: string, options: FuzzyMatchOpt
  * results[0].ranges; // => [[0, 1], [8, 9]]
  */
 export function fuzzySearch<T extends string>(items: Iterable<T>, query: string, options?: FuzzySearchOptions<T>): Array<FuzzySearchResult<T>>;
-export function fuzzySearch<T>(items: Iterable<T>, query: string, options: FuzzySearchOptions<T> & Required<Pick<FuzzySearchOptions<T>, 'key'>>): Array<FuzzySearchResult<T>>;
+export function fuzzySearch<T>(items: Iterable<T>, query: string, options: FuzzySearchKeyedOptions<T>): Array<FuzzySearchResult<T>>;
 export function fuzzySearch<T>(items: Iterable<T>, query: string, options: FuzzySearchOptions<T> = {}): Array<FuzzySearchResult<T>> {
 	const { key, limit = Infinity, threshold = -Infinity } = options;
 	const caseSensitive = options.caseSensitive === true;
