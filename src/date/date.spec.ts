@@ -1345,6 +1345,12 @@ describe('Date helpers', function () {
 	});
 
 	describe('formatDuration', function () {
+		it('rejects a sparse units array instead of formatting its holes', function () {
+			expect(function () {
+				helpers.formatDuration(1000, { units: new Array(1) });
+			}).toThrow(new RangeError('formatDuration: `units` must only contain d, h, m, s, ms, got undefined'));
+		});
+
 		it('formats with every unit by default, skipping zeros', function () {
 			expect(helpers.formatDuration(93_784_005)).toBe('1d 2h 3m 4s 5ms');
 			expect(helpers.formatDuration(5_400_000)).toBe('1h 30m');
@@ -2261,6 +2267,32 @@ describe('Date helpers', function () {
 	});
 
 	describe('skipped calendar days and repeated fractions of an hour', function () {
+		it('keeps the day when the repeated hour after midnight belongs to the new day', function () {
+			withTimeZone('America/Havana', function () {
+				// On 2024-11-03 the clock went back from 01:00 to 00:00: midnight happened twice, both times on November 3rd.
+				expect(helpers.toISOStringLocal(helpers.endOfDay(new Date('2024-11-02T12:00-04:00')))).toBe('2024-11-02T23:59:59.999-04:00');
+			});
+		});
+
+		it('measures and enumerates up to the edges of the representable range', function () {
+			withTimeZone('UTC', function () {
+				const max = 8.64e15;
+				const min = -8.64e15;
+				expect(helpers.diffInMonths(max, max - 20 * 864e5)).toBe(0);
+				expect(helpers.diffInWeeks(max, max - 6.9 * 864e5)).toBe(0);
+				expect(helpers.getRelativeTime(max, max - 20 * 864e5)).toBe('in 2 weeks');
+				expect(helpers.intervalToDuration(max - 3_600_000, max).hours).toBe(1);
+				expect(helpers.intervalToDuration(min + 20 * 864e5, min).days).toBe(-20);
+				expect(helpers.eachDayOfInterval(max, max)).toHaveLength(1);
+				const pattern = 'YYYY-MM-DD HH:mm:ss.SSS';
+				expect(helpers.parseDate(helpers.formatDate(max, pattern), pattern)?.getTime()).toBe(max);
+			});
+			withTimeZone('America/Los_Angeles', function () {
+				const pattern = 'YYYY-MM-DD HH:mm:ss.SSS';
+				expect(helpers.parseDate(helpers.formatDate(-8.64e15, pattern), pattern)?.getTime()).toBe(-8.64e15);
+			});
+		});
+
 		it('endOfWeek ends the week whose first day was skipped on its last day', function () {
 			withTimeZone('Pacific/Apia', function () {
 				// With weeks starting on Friday, the week of Saturday 2011-12-31 began on the skipped Friday 30th.
@@ -2368,6 +2400,29 @@ describe('Date helpers', function () {
 			expect(timeOf(new Date(NaN))).toBeNaN();
 			expect(describeValue(new Date(NaN))).toBe('invalid date');
 			expect(describeValue('text')).toBe('text');
+		});
+	});
+});
+
+describe('Date helpers under prototype pollution', function () {
+	function polluted(key: string, value: unknown, fn: () => void): void {
+		(Object.prototype as Record<string, unknown>)[key] = value;
+		try {
+			fn();
+		} finally {
+			delete (Object.prototype as Record<string, unknown>)[key];
+		}
+	}
+
+	it('parseDate and addDuration ignore inherited fields', function () {
+		polluted('S', 7, function () {
+			expect(helpers.parseDate('2024-01-05', 'YYYY-MM-DD')?.getMilliseconds()).toBe(0);
+		});
+		polluted('Y', 1999, function () {
+			expect(helpers.parseDate('05', 'MM')?.getFullYear()).toBe(2000);
+		});
+		polluted('days', 5, function () {
+			expect(helpers.addDuration(0, {}).getTime()).toBe(0);
 		});
 	});
 });

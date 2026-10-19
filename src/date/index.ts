@@ -448,6 +448,8 @@ function localMidnight(year: number, monthIndex: number, day: number): Date {
 	const result = new Date(2000, 0, 1, 12);
 
 	result.setFullYear(year, monthIndex, day);
+	// Noon of the first or last representable day can be out of range while its midnight is not: go through midnight then.
+	if (Number.isNaN(result.getTime())) result.setTime(new Date(2000, 0, 1).setFullYear(year, monthIndex, day));
 	result.setHours(0, 0, 0, 0);
 
 	return ensureInRange(result);
@@ -513,6 +515,18 @@ function calendarMonthDiff(later: Date, earlier: Date): number {
  * shiftCalendar(new Date(2023, 0, 31), 1, 1); // => new Date(2023, 2, 1) // Jan 31 → Feb 28 → Mar 1
  */
 function shiftCalendar(date: Date, months: number, days: number): Date {
+	return ensureInRange(shiftCalendarUnchecked(date, months, days));
+}
+
+/**
+ * {@link shiftCalendar} without the range check: the result is an invalid `Date` when it is out of range (for trial shifts, which
+ * treat that as overshooting).
+ * @param {Date} date - A valid date, which is mutated (callers pass a fresh copy)
+ * @param {number} months - The integer number of months to move by
+ * @param {number} days - The integer number of days to move by after the months
+ * @returns {Date} `date`, moved (invalid when out of range)
+ */
+function shiftCalendarUnchecked(date: Date, months: number, days: number): Date {
 	// Re-setting the same wall-clock time would move an instant in a repeated (fall-back) hour to its first occurrence.
 	if (months === 0 && days === 0) return date;
 
@@ -527,7 +541,7 @@ function shiftCalendar(date: Date, months: number, days: number): Date {
 		date.setFullYear(year, month, Math.min(date.getDate(), daysInMonth(year, month)) + days);
 	}
 
-	return ensureInRange(date);
+	return date;
 }
 
 /**
@@ -553,7 +567,8 @@ function diffInCompleteUnits(later: DateInput, earlier: DateInput, unitMonths: n
 	// The calendar difference counts at most one unit too many (when the time of day or a clamped day is not reached yet).
 	const units = Math.floor(unitMonths === 0 ? diffInDays(end, start) / unitDays : calendarMonthDiff(end, start) / unitMonths);
 
-	return shiftCalendar(start, units * unitMonths, units * unitDays).getTime() > end.getTime() ? units - 1 : units;
+	// A trial shift past the representable range (an invalid date) overshoots too.
+	return !(shiftCalendarUnchecked(start, units * unitMonths, units * unitDays).getTime() <= end.getTime()) ? units - 1 : units;
 }
 
 /**
@@ -590,7 +605,15 @@ function lastInstantOfDay(date: Date, days = 1): Date {
 	if (shift > 0) {
 		const second = new Date(date.getTime() + shift * MS_PER_MINUTE);
 
-		if (second.getDate() === date.getDate() && second.getHours() === 0 && second.getMinutes() === 0 && second.getSeconds() === 0) date.setTime(second.getTime());
+		// Only when the previous day came back in between (not when the repeated hour starts the new day, as in Havana at 01:00).
+		if (
+			second.getDate() === date.getDate() &&
+			second.getHours() === 0 &&
+			second.getMinutes() === 0 &&
+			second.getSeconds() === 0 &&
+			new Date(second.getTime() - 1).getDate() !== second.getDate()
+		)
+			date.setTime(second.getTime());
 	}
 	date.setTime(date.getTime() - 1);
 
@@ -1729,10 +1752,13 @@ export function formatDuration(ms: number, options: FormatDurationOptions = {}):
 	if (!Array.isArray(units)) throw new TypeError(`formatDuration: \`units\` must be an array of duration units, got ${describe(units)}`);
 	if (units.length === 0) throw new RangeError('formatDuration: `units` must not be empty');
 
-	units.forEach(function (unit: unknown): void {
+	// An index loop, unlike `forEach`, also visits the holes of a sparse array.
+	for (let i = 0; i < units.length; i++) {
+		const unit: unknown = units[i];
+
 		if (!DURATION_UNITS.includes(unit as DurationUnit))
-			throw new RangeError(`formatDuration: \`units\` must only contain ${DURATION_UNITS.join(', ')}, got ${String(unit)}`);
-	});
+			throw new RangeError(`formatDuration: \`units\` must only contain ${DURATION_UNITS.join(', ')}, got ${typeof unit === 'string' ? unit : describe(unit)}`);
+	}
 
 	assertCount('formatDuration', 'largest', largest, 1, true);
 
@@ -1833,7 +1859,8 @@ function applyDuration(caller: string, date: DateInput, duration: Duration, sign
 	const totals = [0, 0, 0];
 
 	DURATION_FIELDS.forEach(function (field: keyof Duration, index: number): void {
-		const amount = duration[field];
+		// Own fields only, like the check of unknown fields above (an inherited `days` must not move the date).
+		const amount = Object.prototype.hasOwnProperty.call(duration, field) ? duration[field] : undefined;
 
 		if (amount === undefined) return;
 
@@ -1916,23 +1943,24 @@ export function intervalToDuration(start: DateInput, end: DateInput): IntervalDu
 	const target = to.getTime();
 	const sign = target < from.getTime() ? -1 : 1;
 	let months = calendarMonthDiff(to, from);
-	let reached = shiftCalendar(new Date(from), months, 0);
+	// Trial shifts may land past the representable range (an invalid date): that counts as too far.
+	let reached = shiftCalendarUnchecked(new Date(from), months, 0);
 
 	// One month too far (the day or the time of day is not reached yet) in the direction of travel.
-	if (sign * (reached.getTime() - target) > 0) {
+	if (!(sign * (reached.getTime() - target) <= 0)) {
 		months -= sign;
 		reached = shiftCalendar(new Date(from), months, 0);
 	}
 
 	let days = diffInDays(to, reached);
 
-	reached = shiftCalendar(new Date(from), months, days);
+	reached = shiftCalendarUnchecked(new Date(from), months, days);
 
 	// Likewise one day too far (the time of day is not reached yet).
 
-	while (sign * (reached.getTime() - target) > 0) {
+	while (!(sign * (reached.getTime() - target) <= 0)) {
 		days -= sign;
-		reached = shiftCalendar(new Date(from), months, days);
+		reached = shiftCalendarUnchecked(new Date(from), months, days);
 	}
 
 	const rest = target - reached.getTime();
@@ -2483,7 +2511,8 @@ export function parseDate(value: string, pattern: string): Date | undefined {
 
 	const parts = cached(compiledPatterns, pattern, compilePattern);
 	// Field values by key: Y (YYYY), y (YY), M, D, H, h, m, s, S, A (1 for PM).
-	const fields: Partial<Record<string, number>> = {};
+	// A null prototype: a polluted `Object.prototype` must not supply missing fields.
+	const fields: Partial<Record<string, number>> = Object.create(null) as Partial<Record<string, number>>;
 	let position = 0;
 
 	for (let i = 0; i < parts.length; i++) {
@@ -2523,9 +2552,15 @@ export function parseDate(value: string, pattern: string): Date | undefined {
 	}
 
 	const date = new Date(2000, 0, 1, 12);
+	const year = fields.Y ?? 2000 + (fields.y ?? 0);
+	const hours = fields.H ?? ((fields.h ?? 0) % 12) + (fields.A ?? 0) * 12;
 
-	date.setFullYear(fields.Y ?? 2000 + (fields.y ?? 0), (fields.M ?? 1) - 1, fields.D ?? 1);
-	date.setHours(fields.H ?? ((fields.h ?? 0) % 12) + (fields.A ?? 0) * 12, fields.m ?? 0, fields.s ?? 0, fields.S ?? 0);
+	date.setFullYear(year, (fields.M ?? 1) - 1, fields.D ?? 1);
+	// Noon of the first or last representable day can be out of range while the parsed time is not: go through that time then.
+	if (Number.isNaN(date.getTime())) {
+		date.setTime(new Date(2000, 0, 1, hours, fields.m ?? 0, fields.s ?? 0, fields.S ?? 0).setFullYear(year, (fields.M ?? 1) - 1, fields.D ?? 1));
+	}
+	date.setHours(hours, fields.m ?? 0, fields.s ?? 0, fields.S ?? 0);
 
 	return isValidDate(date) && formatDate(date, pattern) === value ? date : undefined;
 }
