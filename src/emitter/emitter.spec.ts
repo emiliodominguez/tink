@@ -1,6 +1,6 @@
 import { AbortError, TimeoutError } from '../async/index.js';
 import type { AbortSignalLike } from '../utils/index.js';
-import { createEmitter, type EmitArgs, type Emitter, type WildcardHandler } from '.';
+import { createEmitter, type EmitArgs, type Emitter, type EventHandler, type Unsubscribe, type WildcardHandler } from '.';
 
 interface TestEvents {
 	ready: void;
@@ -75,6 +75,35 @@ describe('createEmitter', function () {
 			});
 			counts.emit('count', 1);
 			expect(received).toEqual([['1'], ['count'], ['count'], ['count', 1]]);
+		});
+
+		it('types handlers of union and generic event names after their payloads', function () {
+			const events = createEmitter<{ message: { text: string }; flag: boolean }>();
+			const received: unknown[] = [];
+			const name = 'flag' as 'message' | 'flag';
+			// @ts-expect-error a union name may carry a `message` payload
+			events.on(name, function (_value: boolean) {});
+			events.on(name, function (payload) {
+				const value: boolean | { text: string } = payload;
+				received.push(value);
+			});
+			function subscribe<K extends 'message' | 'flag'>(event: K, handler: EventHandler<{ message: { text: string }; flag: boolean }[K]>): Unsubscribe {
+				return events.on(event, handler);
+			}
+			function relay<M extends { count: number }>(emitter: Emitter<M>): Unsubscribe {
+				return emitter.on('count', function (count) {
+					received.push(count.toFixed(1));
+				});
+			}
+			subscribe('message', function (message) {
+				received.push(message.text);
+			});
+			const counts = createEmitter<{ count: number }>();
+			relay(counts);
+			events.emit('flag', true);
+			events.emit('message', { text: 'hi' });
+			counts.emit('count', 2);
+			expect(received).toEqual([true, 'hi', '2.0']);
 		});
 
 		it('types payloads, optional payloads and wildcard handlers', function () {
