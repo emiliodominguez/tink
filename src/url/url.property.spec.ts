@@ -625,3 +625,214 @@ describe('URL helpers (round 11 properties)', function () {
 		});
 	});
 });
+
+/** A segment of a generated route pattern. */
+interface Piece {
+	/** The parameter name, or `undefined` for static text. */
+	name: string | undefined;
+	prefix: string;
+	suffix: string;
+	optional: boolean;
+}
+
+/** A generated route pattern: its segments and an optional final splat. */
+interface Route {
+	pieces: Piece[];
+	splat: { name: string; optional: boolean } | undefined;
+	trailing: boolean;
+}
+
+/** Static text: no dot segment, no character with a meaning in patterns. */
+const staticText = fc.stringMatching(/^[a-zA-Z0-9é~.-]{1,3}$/).filter(function (text) {
+	return text !== '.' && text !== '..';
+});
+/** Text after a parameter: it cannot start with a character of a name. */
+const suffixText = fc.oneof(fc.constant(''), fc.stringMatching(/^[.~-][a-z.~-]{0,2}$/));
+
+/**
+ * Generates route patterns (parameters are named `p0`, `p1`... so names are unique).
+ * @param {boolean} allowTrailing - Whether the pattern may end with `/`
+ */
+function route(allowTrailing: boolean): fc.Arbitrary<Route> {
+	const piece = fc.record({
+		param: fc.boolean(),
+		prefix: fc.oneof(fc.constant(''), staticText),
+		suffix: suffixText,
+		optional: fc.boolean()
+	});
+	return fc
+		.record({
+			pieces: fc.array(piece, { maxLength: 5 }),
+			splat: fc.option(fc.record({ named: fc.boolean(), optional: fc.boolean() }), { nil: undefined }),
+			trailing: fc.boolean()
+		})
+		.map(function ({ pieces, splat, trailing }): Route {
+			return {
+				pieces: pieces.map(function (item, index): Piece {
+					return item.param
+						? { name: `p${index}`, prefix: item.prefix, suffix: item.suffix, optional: item.optional }
+						: { name: undefined, prefix: item.prefix === '' ? 's' : item.prefix, suffix: '', optional: item.optional };
+				}),
+				splat: splat === undefined ? undefined : { name: splat.named ? 'rest' : '*', optional: splat.optional },
+				trailing: allowTrailing && splat === undefined && trailing && pieces.length > 0
+			};
+		});
+}
+
+/**
+ * Writes a generated route as a pattern.
+ * @param {Route} spec - The route
+ */
+function patternOf(spec: Route): string {
+	let pattern = '';
+	for (const piece of spec.pieces) pattern += '/' + piece.prefix + (piece.name === undefined ? '' : ':' + piece.name + piece.suffix) + (piece.optional ? '?' : '');
+	if (spec.splat !== undefined) pattern += '/*' + (spec.splat.name === '*' ? '' : spec.splat.name) + (spec.splat.optional ? '?' : '');
+	return (pattern || '/') + (spec.trailing ? '/' : '');
+}
+
+/**
+ * A reference matcher (case-sensitive, strict, decoded-identity segments): tries every way to skip optional segments, preferring to
+ * take the earliest ones, which is what "filled from the left" means.
+ * @param {Route} spec - The route
+ * @param {string[]} segments - The pathname segments
+ */
+function naiveMatch(spec: Route, segments: string[]): Record<string, string> | null {
+	const optional = spec.pieces.filter(function (piece) {
+		return piece.optional;
+	});
+	for (let mask = 2 ** optional.length - 1; mask >= 0; mask--) {
+		const chosen = spec.pieces.filter(function (piece) {
+			return !piece.optional || (mask & (2 ** (optional.length - 1 - optional.indexOf(piece)))) !== 0;
+		});
+		if (chosen.length > segments.length || (spec.splat === undefined && chosen.length !== segments.length)) continue;
+		const params: Record<string, string> = {};
+		const fits = chosen.every(function (piece, index) {
+			const text = segments[index];
+			if (piece.name === undefined) return text === piece.prefix;
+			if (text.length <= piece.prefix.length + piece.suffix.length || !text.startsWith(piece.prefix) || !text.endsWith(piece.suffix)) return false;
+			params[piece.name] = text.slice(piece.prefix.length, text.length - piece.suffix.length);
+			return true;
+		});
+		if (!fits) continue;
+		const rest = segments.slice(chosen.length).join('/');
+		if (spec.splat !== undefined) {
+			// A splat never starts with an empty segment (a leading separator).
+			if (chosen.length < segments.length && segments[chosen.length] === '') continue;
+			if (chosen.length === segments.length && !spec.splat.optional) continue;
+			if (rest !== '') params[spec.splat.name] = rest;
+		}
+		return params;
+	}
+	return null;
+}
+
+/** A parameter value that round-trips: well-formed, non-empty, without a `.` or `..` part between `/` or `\` separators. */
+const paramValue = fc.oneof(fc.string({ unit: 'binary', minLength: 1, maxLength: 6 }), fc.stringMatching(/^[./\\a]{1,5}$/)).filter(function (text) {
+	return !/(?:^|[/\\])\.\.?(?=$|[/\\])/.test(text) && !/\p{Cs}/u.test(text);
+});
+/** A splat value: segments that are not dot segments (possibly empty), not empty overall. */
+const splatValue = fc
+	.array(
+		paramValue.filter(function (text) {
+			return !text.includes('/') && !text.startsWith('\\');
+		}),
+		{ minLength: 1, maxLength: 4 }
+	)
+	.chain(function (parts) {
+		return fc.constantFrom(parts.join('/'), parts.join('//'));
+	});
+
+describe('route patterns (properties)', function () {
+	it('matches what compilePath builds back to the same parameters when every segment is present', function () {
+		fc.assert(
+			fc.property(route(true), fc.array(paramValue, { minLength: 6, maxLength: 6 }), splatValue, function (spec, values, rest) {
+				const pattern = patternOf(spec);
+				const params: Record<string, string> = {};
+				spec.pieces.forEach(function (piece, index) {
+					if (piece.name !== undefined) params[piece.name] = values[index];
+				});
+				// Static text around a value can make a dot part (`\\` then `.`): the builder rightly refuses those.
+				fc.pre(
+					spec.pieces.every(function (piece, index) {
+						return piece.name === undefined || !/(?:^|[/\\])\.\.?(?=$|[/\\])/.test(piece.prefix + values[index] + piece.suffix);
+					})
+				);
+				if (spec.splat !== undefined) params[spec.splat.name] = rest;
+				const built = (helpers.compilePath(pattern) as (params: object) => string)(params);
+				expect({ ...helpers.matchPath(pattern, built, { strict: true }) }).toEqual(params);
+				expect({ ...helpers.matchPath(pattern, built) }).toEqual(params);
+				expect({ ...helpers.matchPath(pattern, built, { caseSensitive: true }) }).toEqual(params);
+			})
+		);
+	});
+
+	it('builds pathnames that match back to the same parameters, or throws a RangeError', function () {
+		fc.assert(
+			fc.property(route(true), fc.array(fc.option(paramValue, { nil: undefined }), { minLength: 7, maxLength: 7 }), function (spec, values) {
+				const pattern = patternOf(spec);
+				const params: Record<string, string | undefined> = {};
+				spec.pieces.forEach(function (piece, index) {
+					if (piece.name !== undefined) params[piece.name] = piece.optional ? values[index] : (values[index] ?? 'v');
+				});
+				if (spec.splat !== undefined) params[spec.splat.name] = spec.splat.optional ? values[6] : (values[6] ?? 'v');
+				let built: string;
+				try {
+					built = (helpers.compilePath(pattern) as (params: object) => string)(params);
+				} catch (error) {
+					// Only an ambiguous combination of optional segments, a dot segment or a splat starting with a separator may be refused.
+					expect(error).toBeInstanceOf(RangeError);
+					expect((error as Error).message).toMatch(/must match back to themselves|must not make a dot segment|must not start with a separator/);
+					return;
+				}
+				const given = Object.fromEntries(
+					Object.entries(params).filter(function (entry) {
+						return entry[1] !== undefined;
+					})
+				);
+				expect({ ...helpers.matchPath(pattern, built, { strict: true }) }).toEqual(given);
+			})
+		);
+	});
+
+	it('agrees with a reference matcher that tries every combination of optional segments', function () {
+		fc.assert(
+			fc.property(
+				route(false),
+				fc.array(fc.oneof(staticText, fc.constantFrom('s', 'a', 'b', '', 'a.x', 'b-', 's~', '~'), fc.stringMatching(/^[a-z~.-]{1,4}$/)), { maxLength: 7 }),
+				function (spec, raw) {
+					const pattern = patternOf(spec);
+					const built = '/' + raw.join('/');
+					const segments = built === '/' ? [] : built.slice(1).split('/');
+					fc.pre(
+						!segments.some(function (part) {
+							return part === '.' || part === '..';
+						})
+					);
+					const matched = helpers.matchPath(pattern, built, { strict: true, caseSensitive: true });
+					const expected = naiveMatch(spec, segments);
+					expect(matched === null ? null : { ...matched }).toEqual(expected);
+				}
+			)
+		);
+	});
+
+	it('never throws on any pathname, and only captures non-empty decoded text', function () {
+		fc.assert(
+			fc.property(fc.string({ unit: 'binary' }), fc.constantFrom('/:a', '/:a/*b?', '/x-:a?/*', '/:a?/:b?'), fc.boolean(), function (pathname, pattern, strict) {
+				const matched = helpers.matchPath(pattern, pathname, { strict });
+				if (matched === null) return;
+				for (const captured of Object.values(matched)) expect(captured).not.toBe('');
+				expect(pathname.startsWith('/')).toBe(true);
+				if (pattern === '/:a')
+					expect(matched.a).toBe(
+						helpers.safeDecodeURIComponent(
+							pathname
+								.slice(1)
+								.replace(/[?#].*$/s, '')
+								.replace(/\/$/, '')
+						)
+					);
+			})
+		);
+	});
+});

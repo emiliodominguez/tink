@@ -784,3 +784,524 @@ describe('URL helpers (hostile inputs)', function () {
 		expect(url).toBe('about:blank');
 	});
 });
+
+type Equals<X, Y> = (<V>() => V extends X ? 1 : 2) extends <V>() => V extends Y ? 1 : 2 ? true : false;
+
+function assertType<T extends true>(_value: T): void {}
+
+describe('route patterns', function () {
+	describe('matchPath', function () {
+		it('captures named parameters in a null-prototype object', function () {
+			const params = helpers.matchPath('/users/:id/posts/:postId', '/users/42/posts/7');
+			expect(params).toEqual({ id: '42', postId: '7' });
+			expect(Object.getPrototypeOf(params)).toBeNull();
+			const none = helpers.matchPath('/about', '/about');
+			expect(none).toEqual({});
+			expect(Object.getPrototypeOf(none)).toBeNull();
+		});
+
+		it('returns null when the pathname does not match', function () {
+			expect(helpers.matchPath('/users/:id', '/users')).toBeNull();
+			expect(helpers.matchPath('/users/:id', '/users/1/2')).toBeNull();
+			expect(helpers.matchPath('/users/:id', '/posts/1')).toBeNull();
+			expect(helpers.matchPath('/', '/x')).toBeNull();
+			expect(helpers.matchPath('/x', '/')).toBeNull();
+		});
+
+		it('needs a pathname starting with a slash', function () {
+			expect(helpers.matchPath('/users/:id', 'users/42')).toBeNull();
+			expect(helpers.matchPath('/', '')).toBeNull();
+			expect(helpers.matchPath('/users/:id', 'https://x.example/users/42')).toBeNull();
+		});
+
+		it('ignores the query and the fragment', function () {
+			expect(helpers.matchPath('/users/:id', '/users/42?tab=a/b#top')).toEqual({ id: '42' });
+			expect(helpers.matchPath('/users/:id', '/users/42#frag?x')).toEqual({ id: '42' });
+			expect(helpers.matchPath('/', '/?q')).toEqual({});
+		});
+
+		it('fills optional segments from the left, without losing a match', function () {
+			expect(helpers.matchPath('/:a?/:b?/c', '/x/y/c')).toEqual({ a: 'x', b: 'y' });
+			expect(helpers.matchPath('/:a?/:b?/c', '/x/c')).toEqual({ a: 'x' });
+			expect(helpers.matchPath('/:a?/:b?/c', '/c')).toEqual({});
+			expect(helpers.matchPath('/:a?/x/:b?', '/x/x')).toEqual({ a: 'x' });
+			expect(helpers.matchPath('/:a?/x/:b?', '/x')).toEqual({});
+			expect(helpers.matchPath('/:a?/x/:b?', '/y/x/z')).toEqual({ a: 'y', b: 'z' });
+			expect(helpers.matchPath('/:a?/:b', '/v')).toEqual({ b: 'v' });
+			expect(helpers.matchPath('/:a?/:b?/c', '/x/y/z/c')).toBeNull();
+			const params = helpers.matchPath('/users/:id/:tab?', '/users/1') as Record<string, string>;
+			expect('tab' in params).toBe(false);
+		});
+
+		it('supports optional static segments', function () {
+			expect(helpers.matchPath('/docs?', '/')).toEqual({});
+			expect(helpers.matchPath('/docs?', '/docs')).toEqual({});
+			expect(helpers.matchPath('/docs?', '/doc')).toBeNull();
+			expect(helpers.matchPath('/project/task?/:id', '/project/task/1')).toEqual({ id: '1' });
+			expect(helpers.matchPath('/project/task?/:id', '/project/1')).toEqual({ id: '1' });
+			expect(helpers.matchPath('/project/task?/:id', '/project/task')).toEqual({ id: 'task' });
+		});
+
+		it('captures a parameter between static text in a segment', function () {
+			expect(helpers.matchPath('/@:handle', '/@ada')).toEqual({ handle: 'ada' });
+			expect(helpers.matchPath('/:file.json', '/notes.json')).toEqual({ file: 'notes' });
+			expect(helpers.matchPath('/v:major/api', '/v2/api')).toEqual({ major: '2' });
+			expect(helpers.matchPath('/a-:id-b', '/a-x-y-b')).toEqual({ id: 'x-y' });
+			expect(helpers.matchPath('/:name$x', '/ab')).toEqual({ name$x: 'ab' });
+			expect(helpers.matchPath('/:_1~x', '/ab~x')).toEqual({ _1: 'ab' });
+			expect(helpers.matchPath('/:id.json?', '/')).toEqual({});
+			expect(helpers.matchPath('/:id.json?', '/1.json')).toEqual({ id: '1' });
+		});
+
+		it('never captures empty text', function () {
+			expect(helpers.matchPath('/@:handle', '/@')).toBeNull();
+			expect(helpers.matchPath('/:file.json', '/.json')).toBeNull();
+			expect(helpers.matchPath('/a-:id-a', '/a-a')).toBeNull();
+			expect(helpers.matchPath('/users/:id', '/users/')).toBeNull();
+			expect(helpers.matchPath('/users/:id/x', '/users//x')).toBeNull();
+			expect(helpers.matchPath('/users/:id', '/users/42//')).toBeNull();
+			expect(helpers.matchPath('/a/b', '/a//b')).toBeNull();
+		});
+
+		it('captures the rest of the pathname with a splat', function () {
+			expect(helpers.matchPath('/files/*path', '/files/a/b/c.txt')).toEqual({ path: 'a/b/c.txt' });
+			expect(helpers.matchPath('/files/*path', '/files/x')).toEqual({ path: 'x' });
+			expect(helpers.matchPath('/files/*path', '/files')).toBeNull();
+			expect(helpers.matchPath('/files/*path', '/files/')).toBeNull();
+			expect(helpers.matchPath('/files/*path', '/files/a//b')).toEqual({ path: 'a//b' });
+			expect(helpers.matchPath('/files/*path', '/files//')).toBeNull();
+			expect(helpers.matchPath('/*', '/a/b')).toEqual({ '*': 'a/b' });
+			expect(helpers.matchPath('/*', '/')).toBeNull();
+			expect(helpers.matchPath('/:a/*rest', '/x/y')).toEqual({ a: 'x', rest: 'y' });
+			expect(helpers.matchPath('/:a?/*rest', '/x')).toEqual({ rest: 'x' });
+			expect(helpers.matchPath('/:a?/*rest', '/x/y')).toEqual({ a: 'x', rest: 'y' });
+		});
+
+		it('supports optional splats', function () {
+			expect(helpers.matchPath('/files/*path?', '/files')).toEqual({});
+			expect(helpers.matchPath('/files/*path?', '/files/')).toEqual({});
+			expect(helpers.matchPath('/files/*path?', '/files/a/b')).toEqual({ path: 'a/b' });
+			expect(helpers.matchPath('/*?', '/')).toEqual({});
+			expect(helpers.matchPath('/files/*path?', '/files/', { strict: true })).toBeNull();
+		});
+
+		it('decodes each segment before comparing it, static text included', function () {
+			expect(helpers.matchPath('/café/:x', '/caf%C3%A9/a%20b')).toEqual({ x: 'a b' });
+			expect(helpers.matchPath('/caf%C3%A9', '/café')).toEqual({});
+			expect(helpers.matchPath('/a%3Ab', '/a:b')).toEqual({});
+			expect(helpers.matchPath('/users/:id', '/users/a%2Fb')).toEqual({ id: 'a/b' });
+			expect(helpers.matchPath('/users/:id', '/users/%E0%A4%A')).toEqual({ id: '%E0%A4%A' });
+			expect(helpers.matchPath('/users/:id', '/users/100%')).toEqual({ id: '100%' });
+			expect(helpers.matchPath('/files/*p', '/files/a%2Fb/c%20d')).toEqual({ p: 'a/b/c d' });
+			expect(helpers.matchPath('/a', '/%61')).toEqual({});
+		});
+
+		it('never matches a pathname with a dot segment', function () {
+			expect(helpers.matchPath('/files/*path', '/files/../etc/passwd')).toBeNull();
+			expect(helpers.matchPath('/files/*path', '/files/a/./b')).toBeNull();
+			expect(helpers.matchPath('/files/*path', '/files/%2e%2E/x')).toBeNull();
+			expect(helpers.matchPath('/users/:id', '/users/..')).toBeNull();
+			expect(helpers.matchPath('/users/:id', '/users/%2e')).toBeNull();
+			expect(helpers.matchPath('/users/:id', '/users/...')).toEqual({ id: '...' });
+			expect(helpers.matchPath('/users/:id', '/users/.x')).toEqual({ id: '.x' });
+		});
+
+		it('compares static text without case unless caseSensitive is set', function () {
+			expect(helpers.matchPath('/Users/:id', '/uSERS/AbC')).toEqual({ id: 'AbC' });
+			expect(helpers.matchPath('/Users/:id', '/uSERS/AbC', { caseSensitive: true })).toBeNull();
+			expect(helpers.matchPath('/Users/:id', '/Users/AbC', { caseSensitive: true })).toEqual({ id: 'AbC' });
+			expect(helpers.matchPath('/V:major.JSON', '/v1.json')).toEqual({ major: '1' });
+			expect(helpers.matchPath('/V:major.JSON', '/v1.json', { caseSensitive: true })).toBeNull();
+			expect(helpers.matchPath('/V:major.JSON', '/V1.JSON', { caseSensitive: true })).toEqual({ major: '1' });
+		});
+
+		it('folds the case of ASCII letters only, keeping lengths', function () {
+			expect(helpers.matchPath('/ΟΔΟΣ', '/οδος')).toBeNull();
+			expect(helpers.matchPath('/ΟΔΟΣ', '/ΟΔΟΣ')).toEqual({});
+			expect(helpers.matchPath('/straße', '/STRASSE')).toBeNull();
+			expect(helpers.matchPath('/straße:x', '/STRASSEx')).toBeNull();
+			expect(helpers.matchPath('/straße', '/STRAßE')).toEqual({});
+		});
+
+		it('ignores one trailing slash unless strict is set', function () {
+			expect(helpers.matchPath('/users/:id', '/users/42/')).toEqual({ id: '42' });
+			expect(helpers.matchPath('/users/:id/', '/users/42')).toEqual({ id: '42' });
+			expect(helpers.matchPath('/users/:id/', '/users/42/')).toEqual({ id: '42' });
+			expect(helpers.matchPath('/', '//')).toEqual({});
+			expect(helpers.matchPath('/users/:id', '/users/42/', { strict: true })).toBeNull();
+			expect(helpers.matchPath('/users/:id/', '/users/42', { strict: true })).toBeNull();
+			expect(helpers.matchPath('/users/:id/', '/users/42/', { strict: true })).toEqual({ id: '42' });
+			expect(helpers.matchPath('/', '//', { strict: true })).toBeNull();
+			expect(helpers.matchPath('/', '/', { strict: true })).toEqual({});
+			expect(helpers.matchPath('/:id?/', '/', { strict: true })).toEqual({});
+			expect(helpers.matchPath('/:id?/', '/x', { strict: true })).toBeNull();
+		});
+
+		it('keeps the trailing slash in a splat in strict mode', function () {
+			expect(helpers.matchPath('/files/*p', '/files/a/', { strict: true })).toEqual({ p: 'a/' });
+			expect(helpers.matchPath('/files/*p', '/files/a/')).toEqual({ p: 'a' });
+			expect(helpers.matchPath('/files/*p', '/files/', { strict: true })).toBeNull();
+			expect(helpers.matchPath('/files/*p', '/files/a', { strict: true })).toEqual({ p: 'a' });
+		});
+
+		it('stores parameters named after Object.prototype members as own keys', function () {
+			const params = helpers.matchPath('/:__proto__/:constructor/:toString', '/a/b/c') as Record<string, string>;
+			expect(Object.keys(params)).toEqual(['__proto__', 'constructor', 'toString']);
+			expect(params.__proto__).toBe('a');
+			expect(Object.getPrototypeOf(params)).toBeNull();
+			expect(({} as Record<string, unknown>).a).toBeUndefined();
+		});
+
+		it('reads the options once', function () {
+			let reads = 0;
+			const options = {
+				get strict() {
+					reads++;
+					return true;
+				}
+			};
+			expect(helpers.matchPath('/a', '/a', options)).toEqual({});
+			expect(reads).toBe(1);
+		});
+
+		it('keeps matching correctly when more patterns than the cache holds are used', function () {
+			for (let index = 0; index < 600; index++) expect(helpers.matchPath(`/p${index}/:x`, `/p${index}/v`)).toEqual({ x: 'v' });
+			expect(helpers.matchPath('/p0/:x', '/p0/w')).toEqual({ x: 'w' });
+			expect(helpers.matchPath('/p599/:x', '/p599/w')).toEqual({ x: 'w' });
+		});
+
+		it('runs in linear time on adversarial input', function () {
+			const optional = Array.from({ length: 40 }, function (_value, index) {
+				return `/:p${index}?`;
+			}).join('');
+			const start = Date.now();
+			// Every optional parameter could take each segment: a backtracking matcher would try 2^40 combinations.
+			expect(helpers.matchPath(`${optional}/end`, '/x'.repeat(40) + '/nope')).toBeNull();
+			expect(helpers.matchPath(`${optional}/end`, '/x'.repeat(39) + '/end')).toEqual(
+				Object.fromEntries(
+					Array.from({ length: 39 }, function (_value, index) {
+						return [`p${index}`, 'x'];
+					})
+				)
+			);
+			const long = '/a'.repeat(200_000);
+			expect(helpers.matchPath('/a/*rest', long)).toEqual({ rest: long.slice(3) });
+			expect(helpers.matchPath('/:a/:b', long)).toBeNull();
+			expect(helpers.matchPath('/a/*rest', '/a/' + '%'.repeat(500_000))).toEqual({ rest: '%'.repeat(500_000) });
+			expect(helpers.matchPath('/:a-', '/' + '-'.repeat(500_000))).toEqual({ a: '-'.repeat(499_999) });
+			expect(Date.now() - start).toBeLessThan(2000);
+		});
+
+		it('rejects malformed patterns', function () {
+			const cases: Array<[string, string]> = [
+				['users', "must start with '/'"],
+				['', "must start with '/'"],
+				['/a//b', 'has an empty segment'],
+				['//', 'has an empty segment'],
+				['/a/?', 'has an empty segment'],
+				['/a/*/b', 'must end with its splat'],
+				['/a/*x/', 'must end with its splat'],
+				['/a/b*', "can only have a '*' at the start of a segment"],
+				['/:a*', "can only have a '*' at the start of a segment"],
+				['/:', 'has a parameter without a valid name'],
+				['/:1', 'has a parameter without a valid name'],
+				['/a:-', 'has a parameter without a valid name'],
+				['/:a:b', 'has two parameters in one segment'],
+				['/:a/:a', 'has the parameter "a" twice'],
+				['/:a/*a', 'has the parameter "a" twice'],
+				['/a/./b', 'has a dot segment'],
+				['/a/%2E%2E', 'has a dot segment'],
+				['/a#b', "must not contain '#'"],
+				['/a?b', "can only have a '?' at the end of a segment"],
+				['/a??', "can only have a '?' at the end of a segment"],
+				['/*1', 'has an invalid splat name "1"'],
+				['/*a-b', 'has an invalid splat name "a-b"']
+			];
+			for (const [pattern, problem] of cases) {
+				expect(function () {
+					helpers.matchPath(pattern, '/');
+				}).toThrow(new RangeError(`matchPath: \`pattern\` ${problem}, got ${JSON.stringify(pattern)}`));
+			}
+		});
+
+		it('rejects arguments of the wrong type', function () {
+			expect(function () {
+				helpers.matchPath(1 as never, '/');
+			}).toThrow(new TypeError('matchPath: `pattern` must be a string, got number'));
+			expect(function () {
+				helpers.matchPath('/', null as never);
+			}).toThrow(new TypeError('matchPath: `pathname` must be a string, got null'));
+		});
+
+		it('types the parameters from the pattern', function () {
+			const params = helpers.matchPath('/users/:id/posts/:postId?/*rest', '/users/1/posts/x');
+			assertType<Equals<typeof params, { id: string; rest: string; postId?: string } | null>>(true);
+			assertType<Equals<helpers.PathParams<'/@:handle/:file.json'>, { handle: string; file: string }>>(true);
+			assertType<Equals<helpers.PathParams<'/*'>, { '*': string }>>(true);
+			assertType<Equals<helpers.PathParams<'/files/*?'>, { '*'?: string }>>(true);
+			assertType<Equals<keyof helpers.PathParams<'/about'>, never>>(true);
+			assertType<Equals<helpers.PathParams<string>, Record<string, string | undefined>>>(true);
+			assertType<Equals<helpers.PathParamsInput<'/:id'>, { id: string | number }>>(true);
+			expect(params).toEqual({ id: '1', rest: 'x' });
+		});
+	});
+
+	describe('compilePath', function () {
+		it('builds pathnames, percent-encoding the parameters', function () {
+			const build = helpers.compilePath('/users/:id/posts/:postId?');
+			expect(build({ id: 42 })).toBe('/users/42/posts');
+			expect(build({ id: 'a/b', postId: 'x y' })).toBe('/users/a%2Fb/posts/x%20y');
+			expect(build({ id: '?#%&é', postId: undefined })).toBe('/users/%3F%23%25%26%C3%A9/posts');
+			expect(build({ id: '\ud800' })).toBe('/users/%EF%BF%BD/posts');
+			expect(build({ id: -0 })).toBe('/users/0/posts');
+			expect(build({ id: 1e21 })).toBe('/users/1e%2B21/posts');
+		});
+
+		it('writes static text, optional or not, and the trailing slash as in the pattern', function () {
+			expect(helpers.compilePath('/@:handle/:file.json')({ handle: 'ada', file: 'a b' })).toBe('/@ada/a%20b.json');
+			expect(helpers.compilePath('/docs?/:x?/')({})).toBe('/docs/');
+			expect(helpers.compilePath('/caf%C3%A9/café')()).toBe('/caf%C3%A9/café');
+			expect(helpers.compilePath('/')()).toBe('/');
+			expect(helpers.compilePath('/:a?')({})).toBe('/');
+			expect(helpers.compilePath('/:a?/')()).toBe('/');
+			expect(helpers.compilePath('/users/')()).toBe('/users/');
+		});
+
+		it('builds splats as sub-paths', function () {
+			const build = helpers.compilePath('/files/*path');
+			expect(build({ path: 'docs/read me.md' })).toBe('/files/docs/read%20me.md');
+			expect(build({ path: 'a//b' })).toBe('/files/a//b');
+			expect(build({ path: 'a%2Fb' })).toBe('/files/a%252Fb');
+			expect(build({ path: 7 })).toBe('/files/7');
+			expect(helpers.compilePath('/*')({ '*': 'x/y' })).toBe('/x/y');
+			expect(helpers.compilePath('/files/*path?')({})).toBe('/files');
+			expect(function () {
+				build({ path: 'a/../b' });
+			}).toThrow(new RangeError("compilePath: `params.path` must not make a dot segment ('.' or '..'), got \"..\""));
+			expect(function () {
+				build({ path: '' });
+			}).toThrow(RangeError);
+		});
+
+		it('rejects missing, empty and dot-segment values', function () {
+			const build = helpers.compilePath('/users/:id');
+			expect(function () {
+				build({} as never);
+			}).toThrow(new TypeError('compilePath: `params.id` must be a string or a number, got undefined'));
+			expect(function () {
+				(build as (params?: object) => string)();
+			}).toThrow(new TypeError('compilePath: `params.id` must be a string or a number, got undefined'));
+			expect(function () {
+				build({ id: null } as never);
+			}).toThrow(new TypeError('compilePath: `params.id` must be a string or a number, got null'));
+			expect(function () {
+				build({ id: true } as never);
+			}).toThrow(new TypeError('compilePath: `params.id` must be a string or a number, got boolean'));
+			expect(function () {
+				build({ id: '' });
+			}).toThrow(new RangeError('compilePath: `params.id` must be a non-empty string or a finite number, got ""'));
+			expect(function () {
+				build({ id: NaN });
+			}).toThrow(new RangeError('compilePath: `params.id` must be a non-empty string or a finite number, got "NaN"'));
+			expect(function () {
+				build({ id: -Infinity });
+			}).toThrow(RangeError);
+			expect(function () {
+				build({ id: '.' });
+			}).toThrow(new RangeError("compilePath: `params.id` must not make a dot segment ('.' or '..'), got \".\""));
+			expect(function () {
+				helpers.compilePath('/:x?')({ x: '' });
+			}).toThrow(RangeError);
+			expect(build({ id: '...' })).toBe('/users/...');
+			// The whole segment counts: static text around the value can make (or prevent) a dot segment.
+			expect(helpers.compilePath('/:x-')({ x: '.' })).toBe('/.-');
+			expect(function () {
+				helpers.compilePath('/.:x')({ x: '.' });
+			}).toThrow(new RangeError("compilePath: `params.x` must not make a dot segment ('.' or '..'), got \".\""));
+		});
+
+		it('reads own parameters only and ignores unknown keys', function () {
+			expect(function () {
+				helpers.compilePath('/:constructor')({} as never);
+			}).toThrow(new TypeError('compilePath: `params.constructor` must be a string or a number, got undefined'));
+			const inherited = Object.create({ id: 'x' }) as { id: string };
+			expect(function () {
+				helpers.compilePath('/:id')(inherited);
+			}).toThrow(TypeError);
+			expect(helpers.compilePath('/:__proto__')(JSON.parse('{"__proto__":"p"}'))).toBe('/p');
+			expect(helpers.compilePath('/:id')({ id: 1, extra: 2 } as never)).toBe('/1');
+		});
+
+		it('rejects params that are not an object', function () {
+			expect(function () {
+				helpers.compilePath('/a')(null as never);
+			}).toThrow(new TypeError('compilePath: `params` must be an object, got null'));
+			expect(function () {
+				helpers.compilePath('/a')('x' as never);
+			}).toThrow(new TypeError('compilePath: `params` must be an object, got string'));
+		});
+
+		it('rejects malformed patterns at once', function () {
+			expect(function () {
+				helpers.compilePath('/a//b');
+			}).toThrow(new RangeError('compilePath: `pattern` has an empty segment, got "/a//b"'));
+			expect(function () {
+				helpers.compilePath(null as never);
+			}).toThrow(new TypeError('compilePath: `pattern` must be a string, got null'));
+		});
+
+		it('builds pathnames that match back to the same parameters', function () {
+			const pattern = '/@:user/:lang?/files/*path';
+			const params = { user: 'a/b c', path: 'x/é y/z' };
+			expect(helpers.matchPath(pattern, helpers.compilePath(pattern)(params))).toEqual(params);
+		});
+
+		it('types the builder from the pattern', function () {
+			const build = helpers.compilePath('/users/:id/:tab?');
+			assertType<Equals<Parameters<typeof build>, [params: { id: string | number; tab?: string | number }]>>(true);
+			const about = helpers.compilePath('/about');
+			expect(function () {
+				// @ts-expect-error `id` is required
+				build({ tab: 'x' });
+			}).toThrow(TypeError);
+			expect(function () {
+				// @ts-expect-error the parameters are required
+				build();
+			}).toThrow(TypeError);
+			expect(about()).toBe('/about');
+		});
+	});
+});
+
+describe('route patterns (review regressions)', function () {
+	it('never matches traversal hidden behind encoded separators', function () {
+		expect(helpers.matchPath('/files/:name', '/files/..%2F..%2Fetc%2Fpasswd')).toBeNull();
+		expect(helpers.matchPath('/files/*path', '/files/a%2F..%2F..%2Fetc')).toBeNull();
+		expect(helpers.matchPath('/files/:name', '/files/..%5C..%5Cwin.ini')).toBeNull();
+		expect(helpers.matchPath('/files/:name', '/files/a%2F.')).toBeNull();
+		expect(helpers.matchPath('/files/:name', '/files/a\\..\\b')).toBeNull();
+		// Legitimate encoded slashes (which compilePath writes) still match.
+		expect(helpers.matchPath('/users/:id', '/users/a%2Fb')).toEqual({ id: 'a/b' });
+		expect(helpers.matchPath('/users/:id', '/users/a%2F.b%2F...')).toEqual({ id: 'a/.b/...' });
+		expect(helpers.matchPath('/users/:id', '/users/%2Fx')).toEqual({ id: '/x' });
+	});
+
+	it('never gives a splat a leading separator (an absolute path)', function () {
+		expect(helpers.matchPath('/files/*path', '/files//etc/passwd')).toBeNull();
+		expect(helpers.matchPath('/files/*path', '/files/%2Fetc/passwd')).toBeNull();
+		expect(helpers.matchPath('/files/*path', '/files/%5Cetc')).toBeNull();
+		expect(helpers.matchPath('/files/*path', '/files///')).toBeNull();
+		expect(helpers.matchPath('/files/*path?', '/files//x')).toBeNull();
+		expect(helpers.matchPath('/files/*path', '/files/a//b')).toEqual({ path: 'a//b' });
+	});
+
+	it('refuses to build what matchPath would refuse', function () {
+		expect(function () {
+			helpers.compilePath('/files/:name')({ name: '../etc' });
+		}).toThrow(new RangeError("compilePath: `params.name` must not make a dot segment ('.' or '..'), got \"../etc\""));
+		expect(function () {
+			helpers.compilePath('/files/:name')({ name: 'a\\..' });
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.compilePath('/files/*path')({ path: '/etc' });
+		}).toThrow(new RangeError('compilePath: `params.path` must not start with a separator, got "/etc"'));
+		expect(function () {
+			helpers.compilePath('/files/*path')({ path: '\\etc' });
+		}).toThrow(RangeError);
+		expect(helpers.compilePath('/users/:id')({ id: '/x' })).toBe('/users/%2Fx');
+		expect(function () {
+			helpers.matchPath('/a%2F..', '/');
+		}).toThrow(new RangeError('matchPath: `pattern` has a dot segment, got "/a%2F.."'));
+	});
+
+	it('folds the case of ASCII letters only', function () {
+		expect(helpers.matchPath('/admin', '/admın')).toBeNull();
+		expect(helpers.matchPath('/settings', '/ſettings')).toBeNull();
+		expect(helpers.matchPath('/K:x', '/Ky')).toBeNull();
+		expect(helpers.matchPath('/x-:id-s', '/x-1-ſ')).toBeNull();
+		expect(helpers.matchPath('/ADMIN/:x', '/admin/Y')).toEqual({ x: 'Y' });
+		expect(helpers.matchPath('/café', '/CAFé')).toEqual({});
+		expect(helpers.matchPath('/café', '/CAFÉ')).toBeNull();
+	});
+
+	it('refuses to build a pathname that would match back to other parameters', function () {
+		expect(function () {
+			helpers.compilePath('/:a?/:b?')({ b: 'x' });
+		}).toThrow(new RangeError('compilePath: `params` must match back to themselves, but "/:a?/:b?" reads "/x" as {"a":"x"}'));
+		expect(function () {
+			helpers.compilePath('/:a?/docs?')({});
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.compilePath('/:a?/Docs')({ a: 'DOCS' });
+		}).not.toThrow();
+		expect(helpers.compilePath('/:a?/:b?')({ a: 'x' })).toBe('/x');
+		expect(helpers.compilePath('/:a?/:b?')({ a: 'x', b: 'y' })).toBe('/x/y');
+		expect(helpers.compilePath('/:a?/docs?')({ a: 'x' })).toBe('/x/docs');
+		// Static text that decodes together with the encoded value.
+		expect(function () {
+			helpers.compilePath('/%:x')({ x: '41' });
+		}).toThrow(new RangeError('compilePath: `params` must match back to themselves, but "/%:x" reads "/%41" as null'));
+		expect(helpers.compilePath('/%:x')({ x: 'z' })).toBe('/%z');
+	});
+
+	it('reads own options only, and checks them', function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		proto.strict = true;
+		proto.caseSensitive = true;
+		try {
+			expect(helpers.matchPath('/A', '/a/')).toEqual({});
+		} finally {
+			delete proto.strict;
+			delete proto.caseSensitive;
+		}
+		expect(function () {
+			helpers.matchPath('/a', '/a', null as never);
+		}).toThrow(new TypeError('matchPath: `options` must be an object, got null'));
+		expect(function () {
+			helpers.matchPath('/a', '/a', 'strict' as never);
+		}).toThrow(new TypeError('matchPath: `options` must be an object, got string'));
+	});
+
+	it('bounds the number of pattern segments', function () {
+		const huge = '/a'.repeat(20_000);
+		expect(function () {
+			helpers.matchPath(huge, huge);
+		}).toThrow(new RangeError(`matchPath: \`pattern\` must have at most 256 segments, got ${JSON.stringify(huge)}`));
+		const largest = Array.from({ length: 256 }, function (_value, index) {
+			return `/:p${index}?`;
+		}).join('');
+		expect(helpers.matchPath(largest, '/x')).toEqual({ p0: 'x' });
+		expect(function () {
+			helpers.matchPath(largest + '/x', '/x');
+		}).toThrow(RangeError);
+	});
+
+	it('keeps the most recently used patterns in its cache', function () {
+		for (let index = 0; index < 500; index++) helpers.matchPath(`/lru${index}/:x`, '/x');
+		helpers.matchPath('/lru0/:x', '/x');
+		const remove = jest.spyOn(Map.prototype, 'delete');
+		try {
+			helpers.matchPath('/lru500/:x', '/x');
+			expect(remove).toHaveBeenCalledWith('/lru1/:x');
+			expect(remove).not.toHaveBeenCalledWith('/lru0/:x');
+		} finally {
+			remove.mockRestore();
+		}
+	});
+
+	it('types union and template patterns', function () {
+		const pattern = '/a/:x' as '/a/:x' | '/b/:y';
+		const params = helpers.matchPath(pattern, '/a/1');
+		assertType<Equals<typeof params, { x: string } | { y: string } | null>>(true);
+		expect(helpers.compilePath(pattern)({ x: 1 })).toBe('/a/1');
+		assertType<Equals<helpers.PathParams<`/users/${string}`>, Record<string, string | undefined>>>(true);
+		assertType<Equals<helpers.PathParams<'/:a-:b'>, never>>(true);
+		assertType<Equals<helpers.PathParams<'/:1abc'>, never>>(true);
+		assertType<Equals<helpers.PathParams<'/:'>, never>>(true);
+		assertType<Equals<helpers.PathParams<'/*1'>, never>>(true);
+		assertType<Equals<helpers.PathParams<'users/:id'>, never>>(true);
+		assertType<Equals<helpers.PathParams<'/a?b/:id'>, never>>(true);
+		assertType<Equals<helpers.PathParams<'/a*/:id'>, never>>(true);
+		assertType<Equals<helpers.PathParams<'/:a_1$/:b?'>, { a_1$: string; b?: string }>>(true);
+	});
+});

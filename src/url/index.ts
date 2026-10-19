@@ -923,3 +923,657 @@ export function withoutQuery(url: string): string {
 
 	return base + hash;
 }
+
+/** An upper-case ASCII letter. */
+type UpperLetter = 'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'P' | 'Q' | 'R' | 'S' | 'T' | 'U' | 'V' | 'W' | 'X' | 'Y' | 'Z';
+
+/** A decimal digit. */
+type Digit = '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9';
+
+/** A character of a route parameter name (see {@link matchPath}): an ASCII letter, a digit, `_` or `$`. */
+type NameChar = UpperLetter | Lowercase<UpperLetter> | Digit | '_' | '$';
+
+/**
+ * The parameter name at the start of `S` (what follows a `:`): its leading run of name characters.
+ * @template S - The text after the `:`
+ * @template Name - The name read so far
+ */
+type TakeName<S extends string, Name extends string = ''> = S extends `${infer Char}${infer Rest}` ? (Char extends NameChar ? TakeName<Rest, `${Name}${Char}`> : Name) : Name;
+
+/**
+ * Whether `N` is a valid parameter name: name characters only, not starting with a digit.
+ * @template N - The name
+ */
+type IsName<N extends string> = N extends '' | `${Digit}${string}` ? false : [TakeName<N>] extends [N] ? true : false;
+
+/**
+ * Whether a pattern segment (without its final `?`) is one {@link matchPath} rejects: a misplaced `?` or `*`, a parameter without a
+ * valid name, two parameters, or an invalid splat name.
+ * @template S - The segment
+ */
+type InvalidSegment<S extends string> = S extends `${string}?${string}`
+	? true
+	: S extends `*${infer Name}`
+		? Name extends ''
+			? false
+			: IsName<Name> extends true
+				? false
+				: true
+		: S extends `${string}*${string}`
+			? true
+			: S extends `${string}:${infer Rest}`
+				? Rest extends `${string}:${string}`
+					? true
+					: IsName<TakeName<Rest>> extends true
+						? false
+						: true
+				: false;
+
+/**
+ * A pattern segment without its final `?`.
+ * @template S - The segment
+ */
+type WithoutMark<S extends string> = S extends `${infer Body}?` ? Body : S;
+
+/**
+ * The `/`-separated segments of a route pattern, as a union.
+ * @template P - The pattern
+ */
+type PatternSegments<P extends string> = P extends `${infer Head}/${infer Rest}` ? Head | PatternSegments<Rest> : P;
+
+/**
+ * The parameter a pattern segment (without its `?`) captures: the name of a splat (`'*'` for an unnamed one) or of a `:name`, `never`
+ * for a static segment.
+ * @template S - The segment
+ */
+type SegmentName<S extends string> = S extends `*${infer Name}` ? (Name extends '' ? '*' : Name) : S extends `${string}:${infer Rest}` ? TakeName<Rest> : never;
+
+/**
+ * The parameters of the required segments of a union of pattern segments.
+ * @template S - The segments
+ */
+type RequiredNames<S extends string> = S extends `${string}?` ? never : SegmentName<S>;
+
+/**
+ * The parameters of the optional (`?`) segments of a union of pattern segments.
+ * @template S - The segments
+ */
+type OptionalNames<S extends string> = S extends `${infer Body}?` ? SegmentName<Body> : never;
+
+/**
+ * Flattens an intersection of object types (cosmetic: editor tooltips show a single object type).
+ * @template T - The type
+ */
+type Flatten<T> = { [K in keyof T]: T[K] };
+
+/**
+ * The parameters of a route pattern, each mapped to `V`: required for required segments, optional for `?` segments. A union of
+ * patterns gives the union of their parameters; a pattern that is not fully known (`string`, `` `/users/${string}` ``) gives a record
+ * of optional values; a pattern that {@link matchPath} rejects gives `never`.
+ * @template P - The pattern
+ * @template V - The value type
+ */
+type ParamsOf<P extends string, V> = P extends unknown
+	? // A key type with a `string` hole makes an index signature, which `{}` satisfies.
+		Record<never, never> extends Record<P, 1>
+		? Record<string, V | undefined>
+		: P extends `/${string}`
+			? true extends InvalidSegment<WithoutMark<PatternSegments<P>>>
+				? never
+				: Flatten<{ [K in RequiredNames<PatternSegments<P>>]: V } & { [K in OptionalNames<PatternSegments<P>>]?: V }>
+			: never
+	: never;
+
+/**
+ * The parameters {@link matchPath} captures from a route pattern, typed from the pattern itself: a `:name` or a splat is a required
+ * `string`, and an optional one (in a segment ending with `?`) an optional `string`. An unnamed splat (`*`) is captured as `'*'`. A union
+ * of patterns gives a union of parameter types, a pattern that is not fully known a record of optional strings, and a malformed pattern
+ * (a parameter name starting with a digit, two parameters in a segment...) `never`.
+ * @template P - The pattern
+ * @example
+ * type A = PathParams<'/users/:id/posts/:postId?'>; // { id: string; postId?: string }
+ * type B = PathParams<'/files/*path'>; // { path: string }
+ */
+export type PathParams<P extends string> = ParamsOf<P, string>;
+
+/**
+ * The parameters accepted by the builder of {@link compilePath}: the keys of {@link PathParams}, with a string or a finite number each.
+ * @template P - The pattern
+ */
+export type PathParamsInput<P extends string> = ParamsOf<P, string | number>;
+
+/**
+ * The function {@link compilePath} returns: it builds a pathname from parameters (which may be omitted when the pattern requires none).
+ * @template P - The pattern
+ */
+export type PathBuilder<P extends string> = Record<never, never> extends PathParamsInput<P> ? (params?: PathParamsInput<P>) => string : (params: PathParamsInput<P>) => string;
+
+/**
+ * Options accepted by {@link matchPath}.
+ */
+export interface MatchPathOptions {
+	/**
+	 * Whether static text must match with the same case (`/Users` vs `/users`). Without it, only ASCII letters are folded (like a RegExp
+	 * `i` flag without `u`), so `/admin` does not match `/admın`. Parameters always keep their case. Defaults to `false`.
+	 */
+	readonly caseSensitive?: boolean;
+	/**
+	 * Whether the pathname must end with `/` exactly when the pattern does (the root `/` matches either way). Defaults to `false`: a
+	 * single trailing slash is ignored on both sides.
+	 */
+	readonly strict?: boolean;
+}
+
+/** A segment of a parsed route pattern. */
+interface RouteToken {
+	/** The parameter name, `'*'` for an unnamed splat, `undefined` for a static segment. */
+	readonly name: string | undefined;
+	/** Whether the segment ends with `?`. */
+	readonly optional: boolean;
+	/** The decoded static text: the whole segment for a static segment, the text before the parameter otherwise. */
+	readonly prefix: string;
+	/** The decoded static text after the parameter. */
+	readonly suffix: string;
+	/** `prefix` with its ASCII letters lower-cased, for case-insensitive matching. */
+	readonly foldedPrefix: string;
+	/** `suffix` with its ASCII letters lower-cased, for case-insensitive matching. */
+	readonly foldedSuffix: string;
+	/** `prefix` as written in the pattern, for building. */
+	readonly rawPrefix: string;
+	/** `suffix` as written in the pattern, for building. */
+	readonly rawSuffix: string;
+}
+
+/** A parsed route pattern. */
+interface RoutePattern {
+	/** The segments, without the splat. */
+	readonly tokens: ReadonlyArray<RouteToken>;
+	/** The final splat, if any. */
+	readonly splat: RouteToken | undefined;
+	/** Whether the pattern ends with `/`. */
+	readonly trailing: boolean;
+	/** How many segments are required (the splat aside). */
+	readonly required: number;
+}
+
+/** A parameter or splat name: an ASCII letter, `_` or `$`, then ASCII letters, digits, `_` or `$`. */
+const PARAM_NAME = /^[A-Za-z_$][\w$]*/;
+
+/** The parsed route patterns, by pattern, least recently used first (that one is dropped beyond {@link PATTERN_CACHE_SIZE}). */
+const PATTERNS = new Map<string, RoutePattern>();
+
+/** How many parsed route patterns are kept. */
+const PATTERN_CACHE_SIZE = 500;
+
+/** The most segments a route pattern may have: matching takes time quadratic in the number of optional segments, and recurses once per segment. */
+const MAX_PATTERN_SEGMENTS = 256;
+
+/** A `.` or `..` part of decoded text, between `/` or `\` separators (which browsers and servers read as `/`). */
+const DOT_PART = /(?:^|[/\\])\.\.?(?=$|[/\\])/;
+
+/**
+ * Throws the `RangeError` of a malformed route pattern.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {string} pattern - The pattern
+ * @param {string} problem - What is wrong
+ * @returns {never} Never returns
+ * @throws {RangeError} always
+ */
+function invalidPattern(caller: string, pattern: string, problem: string): never {
+	throw new RangeError(`${caller}: \`pattern\` ${problem}, got ${JSON.stringify(pattern)}`);
+}
+
+/**
+ * Whether decoded text holds a dot segment, which browsers and servers resolve (`/a/../b` is `/b`): `.` or `..` alone, or as a part
+ * between `/` or `\` separators (`..%2F..%2Fetc` decodes to `../../etc`, which a file system resolves just the same).
+ * @param {string} text - The decoded text
+ * @returns {boolean} Whether it has a `.` or `..` part
+ */
+function hasDotPart(text: string): boolean {
+	return DOT_PART.test(text);
+}
+
+/**
+ * Lower-cases the ASCII letters of a text, and only them: the length never changes, and no other letter folds into an ASCII one (as
+ * `ı`, `ſ` or the Kelvin sign would with full Unicode case mapping).
+ * @param {string} text - The text
+ * @returns {string} The folded text
+ */
+function foldCase(text: string): string {
+	return text.replace(/[A-Z]+/g, function (letters: string): string {
+		return letters.toLowerCase();
+	});
+}
+
+/**
+ * Builds a segment of a parsed route pattern.
+ * @param {string | undefined} name - The parameter name, or `undefined` for a static segment
+ * @param {boolean} optional - Whether the segment is optional
+ * @param {string} rawPrefix - The static text before the parameter (the whole static segment), as written
+ * @param {string} rawSuffix - The static text after the parameter, as written
+ * @returns {RouteToken} The segment
+ */
+function routeToken(name: string | undefined, optional: boolean, rawPrefix: string, rawSuffix: string): RouteToken {
+	const prefix = safeDecodeURIComponent(rawPrefix);
+	const suffix = safeDecodeURIComponent(rawSuffix);
+
+	return { name, optional, prefix, suffix, foldedPrefix: foldCase(prefix), foldedSuffix: foldCase(suffix), rawPrefix, rawSuffix };
+}
+
+/**
+ * Parses (or finds in the cache) a route pattern.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {string} pattern - The pattern
+ * @returns {RoutePattern} The parsed pattern
+ * @throws {TypeError} when `pattern` is not a string
+ * @throws {RangeError} when `pattern` is malformed
+ */
+function parsePattern(caller: string, pattern: string): RoutePattern {
+	if (typeof pattern !== 'string') throw new TypeError(`${caller}: \`pattern\` must be a string, got ${describe(pattern)}`);
+
+	const cached = PATTERNS.get(pattern);
+
+	if (cached !== undefined) {
+		// The pattern becomes the most recently used one.
+		PATTERNS.delete(pattern);
+		PATTERNS.set(pattern, cached);
+
+		return cached;
+	}
+
+	if (pattern[0] !== '/') invalidPattern(caller, pattern, "must start with '/'");
+
+	if (pattern.includes('#')) invalidPattern(caller, pattern, "must not contain '#'");
+
+	const trailing = pattern.length > 1 && pattern.endsWith('/');
+	const body = pattern.slice(1, trailing ? -1 : pattern.length);
+
+	if (trailing && body === '') invalidPattern(caller, pattern, 'has an empty segment');
+
+	const parts = body === '' ? [] : body.split('/');
+
+	if (parts.length > MAX_PATTERN_SEGMENTS) invalidPattern(caller, pattern, `must have at most ${MAX_PATTERN_SEGMENTS} segments`);
+
+	const tokens: RouteToken[] = [];
+	const names = new Set<string>();
+	let splat: RouteToken | undefined;
+	let required = 0;
+
+	for (const segment of parts) {
+		const optional = segment.endsWith('?');
+		const text = optional ? segment.slice(0, -1) : segment;
+		let token: RouteToken;
+
+		if (splat !== undefined) invalidPattern(caller, pattern, 'must end with its splat');
+
+		if (text === '') invalidPattern(caller, pattern, 'has an empty segment');
+
+		if (text.includes('?')) invalidPattern(caller, pattern, "can only have a '?' at the end of a segment");
+
+		if (text[0] === '*') {
+			const name = text.slice(1);
+
+			if (name !== '' && PARAM_NAME.exec(name)?.[0] !== name) invalidPattern(caller, pattern, `has an invalid splat name ${JSON.stringify(name)}`);
+
+			token = splat = routeToken(name || '*', optional, '', '');
+		} else {
+			const colon = text.indexOf(':');
+
+			if (text.includes('*')) invalidPattern(caller, pattern, "can only have a '*' at the start of a segment");
+
+			if (colon === -1) {
+				token = routeToken(undefined, optional, text, '');
+
+				if (hasDotPart(token.prefix)) invalidPattern(caller, pattern, 'has a dot segment');
+			} else {
+				const name = PARAM_NAME.exec(text.slice(colon + 1))?.[0];
+
+				if (name === undefined) invalidPattern(caller, pattern, 'has a parameter without a valid name');
+
+				const rawSuffix = text.slice(colon + 1 + name.length);
+
+				if (rawSuffix.includes(':')) invalidPattern(caller, pattern, 'has two parameters in one segment');
+
+				token = routeToken(name, optional, text.slice(0, colon), rawSuffix);
+			}
+		}
+
+		if (token.name !== undefined) {
+			if (names.has(token.name)) invalidPattern(caller, pattern, `has the parameter ${JSON.stringify(token.name)} twice`);
+
+			names.add(token.name);
+		}
+
+		if (token !== splat) {
+			tokens.push(token);
+
+			if (!optional) required++;
+		}
+	}
+
+	if (trailing && splat !== undefined) invalidPattern(caller, pattern, 'must end with its splat');
+
+	const parsed: RoutePattern = { tokens, splat, trailing, required };
+
+	// The least recently used pattern makes room: an app uses a bounded set of patterns, so this only matters for patterns built from data.
+	if (PATTERNS.size >= PATTERN_CACHE_SIZE) PATTERNS.delete(PATTERNS.keys().next().value as string);
+
+	PATTERNS.set(pattern, parsed);
+
+	return parsed;
+}
+
+/**
+ * Whether a decoded pathname segment matches a (non-splat) segment of a pattern. A parameter never matches empty text.
+ * @param {RouteToken} token - The pattern segment
+ * @param {string} segment - The decoded pathname segment
+ * @param {boolean} caseSensitive - Whether static text is compared with its case
+ * @returns {boolean} Whether it matches
+ */
+function fitsSegment(token: RouteToken, segment: string, caseSensitive: boolean): boolean {
+	const { prefix, suffix } = token;
+
+	if (token.name === undefined) return caseSensitive ? segment === prefix : foldCase(segment) === token.foldedPrefix;
+
+	if (segment.length <= prefix.length + suffix.length) return false;
+
+	return caseSensitive
+		? segment.startsWith(prefix) && segment.endsWith(suffix)
+		: foldCase(segment.slice(0, prefix.length)) === token.foldedPrefix && foldCase(segment.slice(segment.length - suffix.length)) === token.foldedSuffix;
+}
+
+/**
+ * Whether the rest of a pathname can start a splat: it is not empty, and does not start with a separator (`/files//etc` must not give
+ * the absolute `/etc`).
+ * @param {string | undefined} first - Its first decoded segment (`undefined` when there is none)
+ * @returns {boolean} Whether a splat can capture it
+ */
+function startsSplat(first: string | undefined): boolean {
+	return first !== undefined && first !== '' && first[0] !== '/' && first[0] !== '\\';
+}
+
+/**
+ * Matches decoded pathname segments against a parsed pattern. Optional segments are filled from the left: each one takes the next
+ * segment when the rest of the pattern can still match the rest of the pathname. Whether it can is memoized for each pair of
+ * positions, and a pattern segment consumes at most one pathname segment, so the work is O(pattern segments² + pattern segments ×
+ * pathname length) however the optional segments combine (no backtracking).
+ * @param {RoutePattern} parsed - The pattern
+ * @param {ReadonlyArray<string>} segments - The decoded pathname segments
+ * @param {boolean} caseSensitive - Whether static text is compared with its case
+ * @returns {Record<string, string> | null} The parameters (null prototype), or `null` when the pathname does not match
+ */
+function matchSegments(parsed: RoutePattern, segments: ReadonlyArray<string>, caseSensitive: boolean): Record<string, string> | null {
+	const { tokens, splat } = parsed;
+	const count = tokens.length;
+	const length = segments.length;
+	// `fits(index, position)`, for `position <= index` (each pattern segment consumes at most one pathname segment).
+	const memo: Array<boolean | undefined> = [];
+
+	/**
+	 * Whether the pattern segments from `index` on match the pathname segments from `position` on.
+	 * @param {number} index - The first pattern segment
+	 * @param {number} position - The first pathname segment
+	 * @returns {boolean} Whether they match
+	 */
+	function fits(index: number, position: number): boolean {
+		// The rest of the pathname goes to the splat (which needs some text unless it is optional), or there must be none left.
+		if (index === count) return splat === undefined ? position === length : position === length ? splat.optional : startsSplat(segments[position]);
+
+		const slot = index * (count + 1) + position;
+		let result = memo[slot];
+
+		if (result === undefined) {
+			const token = tokens[index];
+
+			result = memo[slot] =
+				(position < length && fitsSegment(token, segments[position], caseSensitive) && fits(index + 1, position + 1)) || (token.optional && fits(index + 1, position));
+		}
+
+		return result;
+	}
+
+	if (!fits(0, 0)) return null;
+
+	const params = Object.create(null) as Record<string, string>;
+	let position = 0;
+
+	for (let index = 0; index < count; index++) {
+		const token = tokens[index];
+		const segment = segments[position];
+
+		// Otherwise the segment is optional and skipped: `fits(index, position)` holds, so `fits(index + 1, position)` does.
+		if (position < length && fitsSegment(token, segment, caseSensitive) && fits(index + 1, position + 1)) {
+			if (token.name !== undefined) params[token.name] = segment.slice(token.prefix.length, segment.length - token.suffix.length);
+
+			position++;
+		}
+	}
+
+	if (splat !== undefined && position < length) params[splat.name as string] = segments.slice(position).join('/');
+
+	return params;
+}
+
+/**
+ * Matches a pathname against a route pattern and returns the parameters it captures, or `null` when it does not match.
+ *
+ * Pattern syntax (the pattern starts with `/`; its segments are separated by `/`):
+ * - `:name` captures a whole segment, or the part of a segment between static text (`/@:handle`, `/:file.json`, `/v:major`); at most
+ *   one parameter per segment. A name is an ASCII letter, `_` or `$`, followed by ASCII letters, digits, `_` or `$`.
+ * - `*name` (or `*`, captured as `'*'`) is a splat: the last segment, capturing the rest of the pathname (one or more segments, `/`
+ *   included).
+ * - A `?` at the end of a segment makes it optional, static or not (`/:lang?/docs`, `/docs?`, `/files/*path?`). Optional segments are
+ *   filled from the left.
+ * - Anything else is static text. Write a literal `:`, `*` or `?` percent-encoded (`%3A`, `%2A`, `%3F`).
+ *
+ * Matching works segment by segment, without building a regular expression, so nothing can make it backtrack: for a given pattern it
+ * takes time linear in the length of the pathname (and at worst quadratic in the number of optional segments of the pattern, which has at
+ * most 256 segments):
+ * - The query and fragment of `pathname` are ignored, and it must start with `/` (pass `url.pathname`, not a full URL).
+ * - Each pathname segment is percent-decoded with {@link safeDecodeURIComponent} (malformed escapes are kept as they are) before it is
+ *   compared, static text included (`/caf%C3%A9` matches `/café`); `%2F` inside a segment stays inside it (`/users/a%2Fb` gives `a/b`).
+ * - A parameter never matches an empty segment, so `/users//42` does not match `/users/:id`.
+ * - A pathname with a `.` or `..` segment never matches, also percent-encoded, and also as a part of a decoded segment between `/` or `\`
+ *   (`..%2F..%2Fetc`): it is not normalized, and a parameter holding `..` is a path traversal waiting to happen. Normalize it first
+ *   (`new URL(path, 'http://x').pathname`). A splat never starts with a separator (`/files//etc` does not give the absolute `/etc`).
+ * - Static text is compared without case by default, folding ASCII letters only; parameters keep their case.
+ * - A single trailing slash is ignored unless `strict` is set; a splat then gets no trailing slash, while with `strict` it keeps it.
+ *
+ * The result has a `null` prototype, so a parameter named `__proto__` or `constructor` is an ordinary own key. Optional parameters that
+ * matched nothing are absent. Only the own properties of `options` are read. Parsed patterns are cached (the 500 most recently used), and
+ * malformed ones throw rather than never matching.
+ * @template P - The pattern
+ * @param {P} pattern - The route pattern, e.g. `'/users/:id'`
+ * @param {string} pathname - The pathname to match (a query and a fragment are ignored)
+ * @param {MatchPathOptions} [options={}] - `caseSensitive` (default `false`) and `strict` (default `false`)
+ * @returns {PathParams<P> | null} The captured parameters, or `null`
+ * @throws {TypeError} when `pattern` or `pathname` is not a string, or `options` is not an object
+ * @throws {RangeError} when `pattern` is malformed (no leading `/`, an empty segment, a misplaced `*` or `?`, a parameter without a name,
+ *   two parameters in a segment, a repeated name, a dot segment, a `#`, or more than 256 segments)
+ * @example
+ * matchPath('/users/:id', '/users/42'); // => { id: '42' }
+ * matchPath('/users/:id/posts/:postId?', '/users/42/posts'); // => { id: '42' }
+ * matchPath('/files/*path', '/files/a/b%20c.txt?download=1'); // => { path: 'a/b c.txt' }
+ * matchPath('/@:handle/:file.json', '/@ada/notes.json'); // => { handle: 'ada', file: 'notes' }
+ * matchPath('/:lang?/docs', '/DOCS/'); // => {}
+ * matchPath('/users/:id', '/users/42/', { strict: true }); // => null
+ * matchPath('/files/*path', '/files/../etc/passwd'); // => null
+ * matchPath('/files/:name', '/files/..%2F..%2Fetc%2Fpasswd'); // => null
+ * matchPath('/users/:id', 'users/42'); // => null
+ * matchPath('/users/:id:x', '/users/1'); // throws RangeError
+ */
+export function matchPath<P extends string>(pattern: P, pathname: string, options: MatchPathOptions = {}): PathParams<P> | null {
+	const parsed = parsePattern('matchPath', pattern);
+
+	if (typeof pathname !== 'string') throw new TypeError(`matchPath: \`pathname\` must be a string, got ${describe(pathname)}`);
+
+	if (typeof options !== 'object' || options === null) throw new TypeError(`matchPath: \`options\` must be an object, got ${describe(options)}`);
+
+	// Own options only (read once each): a polluted `Object.prototype.strict` must not change how paths match.
+	const { caseSensitive, strict: strictOption } = Object.assign(Object.create(null) as object, options) as MatchPathOptions;
+	const strict = strictOption === true;
+	let path = pathname.slice(0, pathEnd(pathname));
+
+	if (path[0] !== '/') return null;
+
+	const trailing = path.length > 1 && path.endsWith('/');
+
+	// In strict mode, a trailing slash must match the pattern's (the root `/` matches either way), or belongs to a splat's text.
+	// Otherwise it is dropped.
+	if (strict && parsed.splat === undefined && trailing !== parsed.trailing && path !== '/') return null;
+
+	if (trailing && !(strict && parsed.splat !== undefined)) path = path.slice(0, -1);
+
+	const raw = path === '/' ? [] : path.slice(1).split('/');
+
+	// Too few or (without a splat) too many segments: nothing to decode.
+	if (raw.length < parsed.required || (parsed.splat === undefined && raw.length > parsed.tokens.length)) return null;
+
+	const segments: string[] = [];
+
+	for (let index = 0; index < raw.length; index++) {
+		const segment = safeDecodeURIComponent(raw[index]);
+
+		if (hasDotPart(segment)) return null;
+
+		segments.push(segment);
+	}
+
+	return matchSegments(parsed, segments, caseSensitive === true) as PathParams<P> | null;
+}
+
+/**
+ * Reads and checks a parameter value for the builder of {@link compilePath}.
+ * @param {object} params - The parameters
+ * @param {RouteToken} token - The pattern segment of the parameter
+ * @returns {string | undefined} The value as text, or `undefined` for an omitted optional parameter
+ * @throws {TypeError} when a required parameter is missing, or a value is not a string or a number
+ * @throws {RangeError} when a value is empty or not finite
+ */
+function paramText(params: object, token: RouteToken): string | undefined {
+	const name = token.name as string;
+	// Own properties only: a parameter named `constructor` or `toString` must not read `Object.prototype`.
+	const value: unknown = Object.hasOwn(params, name) ? (params as Record<string, unknown>)[name] : undefined;
+
+	if (value === undefined && token.optional) return undefined;
+
+	if (typeof value !== 'string' && typeof value !== 'number') throw new TypeError(`compilePath: \`params.${name}\` must be a string or a number, got ${describe(value)}`);
+
+	if (value === '' || (typeof value === 'number' && !Number.isFinite(value))) {
+		throw new RangeError(`compilePath: \`params.${name}\` must be a non-empty string or a finite number, got ${JSON.stringify(String(value))}`);
+	}
+
+	return String(value);
+}
+
+/**
+ * Percent-encodes a parameter for the builder of {@link compilePath}, with the static text around it.
+ * @param {RouteToken} token - The pattern segment of the parameter
+ * @param {string} text - The parameter text
+ * @returns {string} The segment
+ * @throws {RangeError} when the segment would hold a dot segment
+ */
+function encodeSegment(token: RouteToken, text: string): string {
+	// Browsers and servers resolve `.` and `..` even percent-encoded (`%2e%2e`), and `matchPath` rejects them inside a decoded segment.
+	if (hasDotPart(token.prefix + text + token.suffix)) {
+		throw new RangeError(`compilePath: \`params.${token.name as string}\` must not make a dot segment ('.' or '..'), got ${JSON.stringify(text)}`);
+	}
+
+	return token.rawPrefix + encodeComponent(text) + token.rawSuffix;
+}
+
+/**
+ * Compiles a route pattern (see {@link matchPath} for the syntax) into a function that builds pathnames from parameters, the inverse of
+ * {@link matchPath}:
+ * - Parameter values are strings or finite numbers, percent-encoded with `encodeURIComponent` (`/` becomes `%2F`, lone surrogates
+ *   U+FFFD); a splat's value is a sub-path: its `/` are kept and each of its segments is encoded.
+ * - A missing required parameter throws; an optional one (`undefined` or absent) leaves its whole segment out. Unknown keys are ignored,
+ *   and only own properties are read.
+ * - An empty value throws, and so does a value making a dot segment, or a `.` or `..` part between `/` or `\` (`../etc`), and a splat
+ *   starting with `/` or `\`: {@link matchPath} would never match them.
+ * - Static text (optional or not) is written as it appears in the pattern, and so is the pattern's trailing slash.
+ * - The pathname must match back to the same parameters (static text compared without case, as {@link matchPath} does by default),
+ *   or the builder throws: adjacent optional segments can take each other's text (`'/:a?/:b?'` with only `b`, `'/:a?/docs?'` with no `a`).
+ *
+ * So `matchPath(pattern, build(params))` always gives the parameters back as strings (lone surrogates as U+FFFD), except that a splat
+ * ending with `/` loses it unless `strict` is set. The pattern is parsed once, here: a malformed pattern throws at once.
+ * @template P - The pattern
+ * @param {P} pattern - The route pattern, e.g. `'/users/:id'`
+ * @returns {PathBuilder<P>} The pathname builder
+ * @throws {TypeError} when `pattern` is not a string; the builder: when `params` is not an object, a required parameter is missing, or a
+ *   value is not a string or a number
+ * @throws {RangeError} when `pattern` is malformed (see {@link matchPath}); the builder: when a value is empty or not finite, makes a
+ *   dot segment, starts a splat with a separator, or the pathname would match back to other parameters
+ * @example
+ * const userPath = compilePath('/users/:id/posts/:postId?');
+ * userPath({ id: 42 }); // => '/users/42/posts'
+ * userPath({ id: 'a/b', postId: 'x y' }); // => '/users/a%2Fb/posts/x%20y'
+ * compilePath('/files/*path')({ path: 'docs/read me.md' }); // => '/files/docs/read%20me.md'
+ * compilePath('/about')(); // => '/about'
+ * compilePath('/users/:id')({ id: '..' }); // throws RangeError
+ * compilePath('/users/:id')({} as never); // throws TypeError
+ * compilePath('/:a?/:b?')({ b: 'x' }); // throws RangeError // '/x' would match back as { a: 'x' }
+ */
+export function compilePath<P extends string>(pattern: P): PathBuilder<P> {
+	const parsed = parsePattern('compilePath', pattern);
+	const { tokens, splat, trailing } = parsed;
+
+	return function (params?: object): string {
+		if (params === undefined) params = {};
+		else if (typeof params !== 'object' || params === null) throw new TypeError(`compilePath: \`params\` must be an object, got ${describe(params)}`);
+
+		let path = '';
+		// The segments as `matchPath` decodes them, and the parameters it must read from them.
+		const segments: string[] = [];
+		const expected = Object.create(null) as Record<string, string>;
+
+		/**
+		 * Appends a built segment.
+		 * @param {string} segment - The segment, encoded
+		 * @returns {void}
+		 */
+		function append(segment: string): void {
+			path += '/' + segment;
+			segments.push(safeDecodeURIComponent(segment));
+		}
+
+		for (const token of tokens) {
+			const text = token.name === undefined ? '' : paramText(params, token);
+
+			if (text === undefined) continue;
+
+			append(token.name === undefined ? token.rawPrefix : encodeSegment(token, text));
+
+			if (token.name !== undefined) expected[token.name] = text.replace(LONE_SURROGATES, '\ufffd');
+		}
+
+		const rest = splat === undefined ? undefined : paramText(params, splat);
+
+		if (rest !== undefined) {
+			const name = (splat as RouteToken).name as string;
+
+			if (!startsSplat(rest)) throw new RangeError(`compilePath: \`params.${name}\` must not start with a separator, got ${JSON.stringify(rest)}`);
+
+			for (const part of rest.split('/')) append(encodeSegment(splat as RouteToken, part));
+
+			expected[name] = rest.replace(LONE_SURROGATES, '\ufffd');
+		}
+
+		const matched = matchSegments(parsed, segments, false);
+		const keys = Object.keys(expected);
+
+		if (
+			matched === null ||
+			Object.keys(matched).length !== keys.length ||
+			keys.some(function (key: string): boolean {
+				return matched[key] !== expected[key];
+			})
+		) {
+			throw new RangeError(
+				`compilePath: \`params\` must match back to themselves, but ${JSON.stringify(pattern)} reads ${JSON.stringify(path)} as ${JSON.stringify(matched)}`
+			);
+		}
+
+		return trailing ? path + '/' : path || '/';
+	} as PathBuilder<P>;
+}
