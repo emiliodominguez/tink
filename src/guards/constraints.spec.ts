@@ -264,3 +264,27 @@ describe('isDiscriminatedUnion', function () {
 		}).toThrow(new TypeError('isDiscriminatedUnion: `variants.b` must be a function, got string'));
 	});
 });
+
+describe('isDiscriminatedUnion (regressions)', function () {
+	it('should let exact variant shapes accept the discriminant, on the discriminated object only', function () {
+		const isCircle = isDiscriminatedUnion('type', { circle: isShape({ radius: isFiniteNumber }, { exact: true }) });
+		expect(isCircle({ type: 'circle', radius: 2 })).toBe(true);
+		expect(explain(isCircle, { type: 'circle', radius: 2 })).toEqual([]);
+		expect(isCircle({ type: 'circle', radius: 2, extra: 1 })).toBe(false);
+		expect(explain(isCircle, { type: 'circle', radius: 2, extra: 1 })).toEqual([{ message: 'Unknown property', path: ['extra'] }]);
+		// A nested exact shape still rejects a key of the same name.
+		const isNested = isDiscriminatedUnion('type', { a: isShape({ inner: isShape({ v: isInteger }, { exact: true }) }, { exact: true }) });
+		expect(isNested({ type: 'a', inner: { v: 1 } })).toBe(true);
+		expect(isNested({ type: 'a', inner: { v: 1, type: 'a' } })).toBe(false);
+		// Outside the union, the exact shape is unchanged.
+		expect(isShape({ radius: isFiniteNumber }, { exact: true })({ type: 'circle', radius: 2 })).toBe(false);
+	});
+
+	it('should type numeric-looking tags as strings', function () {
+		const isResponse = isDiscriminatedUnion('code', { 200: isShape({ body: isString }), 404: isShape({}) });
+		type Response = Infer<typeof isResponse>;
+		const ok: Response = { code: '200', body: 'x' };
+		const missing: Response = { code: '404' };
+		expect([isResponse(ok), isResponse(missing), isResponse({ code: 200, body: 'x' })]).toEqual([true, true, false]);
+	});
+});

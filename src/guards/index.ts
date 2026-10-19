@@ -179,9 +179,14 @@ export function isBigInt(value: unknown): value is bigint {
  * isPromise({ then: 1 }); // => false
  */
 export function isPromise(value: unknown): value is PromiseLike<unknown> {
-	if (value instanceof Promise) return true;
-	if (!isObject(value) && !isFunction(value)) return false;
-	return typeof (value as { then?: unknown }).then === 'function';
+	try {
+		if (value instanceof Promise) return true;
+		if (!isObject(value) && !isFunction(value)) return false;
+		return typeof (value as { then?: unknown }).then === 'function';
+	} catch {
+		// A revoked proxy throws on `instanceof` and on property reads.
+		return false;
+	}
 }
 
 /**
@@ -218,7 +223,12 @@ export function isRegExp(value: unknown): value is RegExp {
  * isError({ [Symbol.toStringTag]: 'Error' }); // => false
  */
 export function isError(value: unknown): value is Error {
-	return value instanceof Error || (isForeign(value) && getTag(value) === '[object Error]');
+	try {
+		return value instanceof Error || (isForeign(value) && getTag(value) === '[object Error]');
+	} catch {
+		// A revoked proxy throws on `instanceof`.
+		return false;
+	}
 }
 
 /**
@@ -417,8 +427,13 @@ export function isFalsy<T>(value: T): value is FalsyPart<T> {
  */
 export function isPlainObject(value: unknown): value is Record<PropertyKey, unknown> {
 	if (!isObject(value)) return false;
-	const prototype = Object.getPrototypeOf(value);
-	return prototype === null || prototype === Object.prototype;
+	try {
+		const prototype = Object.getPrototypeOf(value);
+		return prototype === null || prototype === Object.prototype;
+	} catch {
+		// A revoked proxy throws on `Object.getPrototypeOf`.
+		return false;
+	}
 }
 
 /**
@@ -1199,6 +1214,22 @@ export function isShape<S extends ShapeGuards>(shape: S, options?: IsShapeOption
 }
 
 /**
+ * While {@link isDiscriminatedUnion} runs a variant guard: the object being checked and its discriminant key. Exact shapes accept that key
+ * on that very object (only), since the union checks it and variants do not repeat it.
+ */
+let discriminated: { readonly object: object; readonly key: string } | undefined;
+
+/**
+ * Whether `key` of `value` is the discriminant of the object a discriminated union is checking (see {@link discriminated}).
+ * @param {object} value - The object an exact shape checks
+ * @param {string} key - An own enumerable key of `value`
+ * @returns {boolean} `true` for the discriminant of the discriminated object
+ */
+function isDiscriminant(value: object, key: string): boolean {
+	return discriminated !== undefined && discriminated.object === value && discriminated.key === key;
+}
+
+/**
  * Builds the guard behind {@link isShape} and the object patterns of {@link isMatching}.
  * @param {ReadonlyArray<PropertyKey>} keys - The checked keys
  * @param {ReadonlyArray<Guard<unknown>>} guards - The guard of each key
@@ -1231,7 +1262,7 @@ function shapeGuard(
 				if (hasOwn.call(value, key) ? !guards[index]((value as Record<PropertyKey, unknown>)[key]) : missingFails(index)) return false;
 			}
 
-			if (known !== undefined) for (const key in value) if (hasOwn.call(value, key) && !known.has(key)) return false;
+			if (known !== undefined) for (const key in value) if (hasOwn.call(value, key) && !known.has(key) && !isDiscriminant(value, key)) return false;
 
 			return true;
 		},
@@ -1257,7 +1288,7 @@ function shapeGuard(
 
 			if (known !== undefined) {
 				for (const key in value) {
-					if (hasOwn.call(value, key) && !known.has(key)) {
+					if (hasOwn.call(value, key) && !known.has(key) && !isDiscriminant(value, key)) {
 						issues.push({ message: 'Unknown property', path: [...path, key] });
 						passed = false;
 					}
@@ -1620,13 +1651,14 @@ export function isStringMatching(pattern: RegExp): (value: unknown) => value is 
  * @template V - The variant guards, by discriminant value
  */
 export type DiscriminatedUnionType<K extends string, V extends ShapeGuards> = {
-	[T in keyof V & string]: { [P in K]: T } & Infer<V[T]> extends infer O ? { [P in keyof O]: O[P] } : never;
-}[keyof V & string];
+	[T in keyof V & (string | number)]: { [P in K]: `${T}` } & Infer<V[T]> extends infer O ? { [P in keyof O]: O[P] } : never;
+}[keyof V & (string | number)];
 
 /**
  * Creates a guard for a discriminated (tagged) union (`z.discriminatedUnion()`): objects whose OWN string property `key` names one of
  * the `variants`, and that pass that variant's guard. Each variant guard checks the rest of the object; the discriminant is checked
- * once, and added to the narrowed type, so variants do not repeat it. Unlike {@link isUnion}, which tries every member in turn, the
+ * once, and added to the narrowed type, so variants do not repeat it (an `{ exact: true }` variant shape accepts it as a known key).
+ * Tags that look like numbers (`{ 200: …, 404: … }`) are the strings `'200'` and `'404'`. Unlike {@link isUnion}, which tries every member in turn, the
  * variant is looked up directly: checking stays fast with many variants, and {@link explain} reports the issues of the right variant
  * (or the allowed tags, when the discriminant is wrong). Tags are strings; inherited keys (`toString`, `__proto__`) never match.
  * @template K - The discriminant key
@@ -1675,13 +1707,34 @@ export function isDiscriminatedUnion<const K extends string, const V extends Sha
 		return hasOwn.call(value, key) ? lookup.get((value as Record<string, unknown>)[key]) : undefined;
 	}
 
+	/**
+	 * Runs `check` on the object with its discriminant allowed in exact shapes (see {@link discriminated}).
+	 * @param {object} value - The object
+	 * @param {() => boolean} check - The variant check
+	 * @returns {boolean} The result of `check`
+	 */
+	function withDiscriminant(value: object, check: () => boolean): boolean {
+		const previous = discriminated;
+		discriminated = { object: value, key };
+		try {
+			return check();
+		} finally {
+			discriminated = previous;
+		}
+	}
+
 	return explainable(
 		function isVariant(value: unknown): value is DiscriminatedUnionType<K, V> {
 			if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
 
 			const guard = variantOf(value);
 
-			return guard !== undefined && guard(value);
+			return (
+				guard !== undefined &&
+				withDiscriminant(value, function (): boolean {
+					return guard(value);
+				})
+			);
 		},
 		function explainVariant(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
 			if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -1692,7 +1745,11 @@ export function isDiscriminatedUnion<const K extends string, const V extends Sha
 
 			const guard = variantOf(value);
 
-			if (guard !== undefined) return collect(guard, value, path, issues);
+			if (guard !== undefined) {
+				return withDiscriminant(value, function (): boolean {
+					return collect(guard, value, path, issues);
+				});
+			}
 			issues.push(
 				hasOwn.call(value, key)
 					? { message: `${expected} (got ${typeName((value as Record<string, unknown>)[key])})`, path: [...path, key] }
@@ -1703,6 +1760,17 @@ export function isDiscriminatedUnion<const K extends string, const V extends Sha
 		}
 	);
 }
+
+/**
+ * The type an {@link isIntersection} guard narrows to: the intersection of the member types, taken member by member (going through their
+ * union would first simplify `number | 1` to `number`, or `{ a: string } | unknown` to `unknown`).
+ * @template G - The member guards
+ */
+export type IntersectionType<G extends ReadonlyArray<Guard<unknown>>> = G extends readonly [infer Head, ...infer Tail extends ReadonlyArray<Guard<unknown>>]
+	? Infer<Head> & IntersectionType<Tail>
+	: G extends readonly []
+		? unknown
+		: UnionToIntersection<Infer<G[number]>>;
 
 /**
  * Creates a guard that passes when EVERY one of `guards` passes, narrowing to the intersection of their types (`z.intersection()`).
@@ -1721,14 +1789,14 @@ export function isDiscriminatedUnion<const K extends string, const V extends Sha
  * isPerson({ name: 'Ada' }); // => false
  * explain(isPerson, 1); // => [{ message: 'Expected an object (got number)', path: [] }]
  */
-export function isIntersection<const G extends ReadonlyArray<Guard<unknown>>>(...guards: G): (value: unknown) => value is UnionToIntersection<Infer<G[number]>> {
+export function isIntersection<const G extends ReadonlyArray<Guard<unknown>>>(...guards: G): (value: unknown) => value is IntersectionType<G> {
 	if (guards.length === 0) throw new RangeError('isIntersection: expected at least one guard, got 0');
 	assertGuards('isIntersection', guards);
 
 	const members = guards.slice();
 
 	return explainable(
-		function isIntersectionMember(value: unknown): value is UnionToIntersection<Infer<G[number]>> {
+		function isIntersectionMember(value: unknown): value is IntersectionType<G> {
 			for (let index = 0; index < members.length; index++) if (!members[index](value)) return false;
 
 			return true;
@@ -1913,9 +1981,18 @@ export type PatternType<P> = P extends ((value: unknown) => value is infer T)
 		? unknown
 		: P extends Date
 			? Date
-			: P extends object
-				? { -readonly [K in keyof P]: PatternType<P[K]> }
-				: P;
+			: P extends IdentityPattern
+				? P
+				: P extends object
+					? { -readonly [K in keyof P]: PatternType<P[K]> }
+					: P;
+
+/**
+ * Built-in objects that a pattern of {@link isMatching} compares by identity, and whose type {@link PatternType} keeps as is. A class
+ * instance is compared by identity too, but its type cannot be told apart from a plain object pattern's: it narrows structurally (its
+ * methods to `unknown`), so annotate the result or use {@link isInstanceOf} for those.
+ */
+type IdentityPattern = RegExp | Map<unknown, unknown> | Set<unknown> | WeakMap<object, unknown> | WeakSet<object> | Promise<unknown> | Error | ArrayBuffer | ArrayBufferView;
 
 /**
  * Creates a guard checking that a value deeply matches a partial structural pattern, like ts-pattern's `isMatching`:
@@ -2081,6 +2158,16 @@ export type JsonObject = { [key: string]: JsonValue };
  */
 export type JsonValue = string | number | boolean | null | JsonArray | JsonObject;
 
+/**
+ * Whether `JSON.stringify` would call a `toJSON` method of `value` that walking its own enumerable keys does not reach (a non-enumerable
+ * or inherited one). An own enumerable `toJSON` is reported by the walk itself, as a function.
+ * @param {object} value - An array or a plain object
+ * @returns {boolean} `true` when such a method would replace `value` in the JSON text
+ */
+function hasHiddenToJSON(value: object): boolean {
+	return typeof (value as { toJSON?: unknown }).toJSON === 'function' && !Object.prototype.propertyIsEnumerable.call(value, 'toJSON');
+}
+
 /** Marks, on the stack of {@link walkJson}, the end of a container's children. */
 const EXIT = {};
 
@@ -2113,7 +2200,7 @@ function walkJson(root: unknown, path: PropertyKey[] | undefined, issues: Schema
 		if (typeof value === 'object' && value !== null) {
 			if (ancestors.has(value)) {
 				message = 'Circular reference';
-			} else if (Array.isArray(value) || isPlainObject(value)) {
+			} else if ((Array.isArray(value) || isPlainObject(value)) && !hasHiddenToJSON(value)) {
 				ancestors.add(value);
 				if (path !== undefined && !isRoot) path.push(key);
 				stack.push(value, EXIT);

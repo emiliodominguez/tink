@@ -5,6 +5,9 @@ import {
 	isArrayOf,
 	isDate,
 	isFalsy,
+	isPromise,
+	isPlainObject,
+	isError,
 	isFiniteNumber,
 	isInteger,
 	isIntersection,
@@ -766,5 +769,54 @@ describe('isJsonValue / isJsonObject / isJsonArray', function () {
 
 		expect(isJsonValue(value)).toBe(true);
 		assertNotPolluted();
+	});
+});
+
+describe('guards (regressions)', function () {
+	it('isIntersection intersects member types even when one contains another', function () {
+		const isOne = isIntersection(isFiniteNumber, isLiteral(1));
+		const one: Equal<Infer<typeof isOne>, 1> = true;
+		/**
+		 * A guard that narrows nothing.
+		 */
+		function isAnything(value: unknown): value is unknown {
+			return value !== Symbol.for('never');
+		}
+		const isNamed = isIntersection(isShape({ a: isString }), isAnything);
+		const named: Equal<Infer<typeof isNamed>, { a: string }> = true;
+		expect([one, named, isOne(1), isOne(2), isNamed({ a: 'x' })]).toEqual([true, true, true, false, true]);
+	});
+
+	it('PatternType keeps built-in objects compared by identity', function () {
+		const re = /a/;
+		const map = new Map<string, number>();
+		const isConfig = isMatching({ re, map });
+		const typed: Equal<PatternType<{ re: RegExp; map: Map<string, number> }>, { re: RegExp; map: Map<string, number> }> = true;
+		const value: unknown = { re, map };
+		expect(typed).toBe(true);
+		expect(isConfig(value) && value.re.test('a') && value.map.get('a') === undefined).toBe(true);
+	});
+
+	it('isError, isPromise and isPlainObject return false for a revoked proxy', function () {
+		const { proxy, revoke } = Proxy.revocable({}, {});
+		revoke();
+		expect([isError(proxy), isPromise(proxy), isPlainObject(proxy)]).toEqual([false, false, false]);
+	});
+
+	it('isJsonValue rejects objects whose toJSON the key walk would not reach', function () {
+		const hidden = { a: 1 };
+		Object.defineProperty(hidden, 'toJSON', {
+			value: function () {
+				return 5;
+			}
+		});
+		const inherited = Object.assign(Object.create(null) as object, { a: 1 });
+		Object.setPrototypeOf(inherited, {
+			toJSON: function () {
+				return 5;
+			}
+		});
+		expect([isJsonValue(hidden), isJsonValue(inherited), isJsonValue([hidden])]).toEqual([false, false, false]);
+		expect(explain(isJsonValue, { a: hidden })).toEqual([{ message: 'Expected a JSON value (got [object Object])', path: ['a'] }]);
 	});
 });
