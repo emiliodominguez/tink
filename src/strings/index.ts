@@ -381,7 +381,7 @@ export function replace(string: string, searchValue: string, replaceValue: strin
  * @param {string} [suffix='...'] - The suffix appended when the string is truncated
  * @returns {string} The truncated string, or the original one when it has at most `length` graphemes
  * @throws {RangeError} when `length` is negative or not an integer
- * @throws {TypeError} when `length` is not a number
+ * @throws {TypeError} when `length` is not a number, or `suffix` is not a string
  * @example
  * truncate('hello world', 5); // => 'hello...'
  * truncate('hello world', 5, '!'); // => 'hello!'
@@ -389,6 +389,7 @@ export function replace(string: string, searchValue: string, replaceValue: strin
  */
 export function truncate(string: string, length: number, suffix: string = '...'): string {
 	assertInteger('truncate', 'length', length);
+	if (typeof suffix !== 'string') throw new TypeError(`truncate: \`suffix\` must be a string, got ${describe(suffix)}`);
 
 	// A string never has more graphemes than UTF-16 code units.
 	if (string.length <= length) return string;
@@ -1210,7 +1211,7 @@ export interface WordWrapOptions {
  * @param {WordWrapOptions} [options={}] - `breakLongWords` (default `false`) and `newline` (default `'\n'`)
  * @returns {string} The wrapped text
  * @throws {RangeError} when `width` is less than 1, `NaN` or a non-integer finite number
- * @throws {TypeError} when `width` is not a number
+ * @throws {TypeError} when `width` is not a number, or `newline` is not a string
  * @example
  * wordWrap('The quick brown fox jumps', 10); // => 'The quick\nbrown fox\njumps'
  * wordWrap('abcdefghij xy', 4, { breakLongWords: true }); // => 'abcd\nefgh\nij\nxy'
@@ -1220,6 +1221,7 @@ export function wordWrap(string: string, width: number, options: WordWrapOptions
 	assertInteger('wordWrap', 'width', width, 1, true);
 
 	const { breakLongWords = false, newline = '\n' } = options;
+	if (typeof newline !== 'string') throw new TypeError(`wordWrap: \`newline\` must be a string, got ${describe(newline)}`);
 	const output: string[] = [];
 
 	for (const line of splitLines(string)) {
@@ -1281,7 +1283,7 @@ export interface MaskOptions {
  * @param {MaskOptions} [options={}] - `visibleStart` (default `0`), `visibleEnd` (default `4`) and `char` (default `'*'`)
  * @returns {string} The masked string
  * @throws {RangeError} when `visibleStart` or `visibleEnd` is not a non-negative integer, or `char` is not exactly one grapheme
- * @throws {TypeError} when `visibleStart` or `visibleEnd` is not a number
+ * @throws {TypeError} when `visibleStart` or `visibleEnd` is not a number, or `char` is not a string
  * @example
  * mask('4111111111111111'); // => '************1111'
  * mask('john.doe@mail.com', { visibleStart: 2, visibleEnd: 9, char: '•' }); // => 'jo••••••@mail.com'
@@ -1294,6 +1296,7 @@ export function mask(string: string, options: MaskOptions = {}): string {
 	assertInteger('mask', 'visibleStart', visibleStart);
 	assertInteger('mask', 'visibleEnd', visibleEnd);
 
+	if (typeof char !== 'string') throw new TypeError(`mask: \`char\` must be a string, got ${describe(char)}`);
 	if (graphemeLength(char) !== 1)
 		throw new RangeError(`mask: \`char\` must be exactly one grapheme, got ${JSON.stringify(char.length > 50 ? `${char.slice(0, 50)}…` : char)}`);
 

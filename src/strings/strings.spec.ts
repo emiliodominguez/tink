@@ -990,6 +990,21 @@ describe('String helpers', function () {
 	});
 
 	describe('mask', function () {
+		it('should reject a non-string char, suffix or newline with a TypeError, like pad', function () {
+			expect(function () {
+				helpers.mask('abcdef', { char: null as any });
+			}).toThrow(new TypeError('mask: `char` must be a string, got null'));
+			expect(function () {
+				helpers.mask('abcdef', { char: ['#'] as any });
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.truncate('hello', 2, null as any);
+			}).toThrow(new TypeError('truncate: `suffix` must be a string, got null'));
+			expect(function () {
+				helpers.wordWrap('a b', 1, { newline: null as any });
+			}).toThrow(new TypeError('wordWrap: `newline` must be a string, got null'));
+		});
+
 		it('should keep the last 4 characters visible by default', function () {
 			expect(helpers.mask('4111111111111111')).toBe('************1111');
 			expect(helpers.mask('12345')).toBe('*2345');
