@@ -56,6 +56,11 @@ describe('Math helpers', function () {
 	});
 
 	describe('round', function () {
+		it('should round values whose first kept digit is past the significant digits', function () {
+			expect(helpers.round(5e-7, 6)).toBe(0.000001);
+			expect(helpers.round(4e-7, 6)).toBe(0);
+		});
+
 		it('should round a number to a specified number of decimal places', function () {
 			expect(helpers.round(1.2345, 2)).toBe(1.23);
 			expect(helpers.round(1.2355, 2)).toBe(1.24);
@@ -1437,6 +1442,11 @@ describe('Math helpers', function () {
 	});
 
 	describe('roundToStep', function () {
+		it('should snap values with more digits than a double holds exactly, both ways', function () {
+			expect(helpers.roundToStep(9876543.223456789, 0.5)).toBe(9876543);
+			expect(helpers.roundToStep(9876543.323456788, 0.5)).toBe(9876543.5);
+		});
+
 		it('should snap to the nearest multiple of the step', function () {
 			expect(helpers.roundToStep(1.13, 0.25)).toBe(1.25);
 			expect(helpers.roundToStep(1.12, 0.25)).toBe(1);
