@@ -87,7 +87,7 @@ Whole module: **6.9 kB**
 
 ## async
 
-Whole module: **8.3 kB**
+Whole module: **8.4 kB**
 
 | Export                      | min + gzip |
 | --------------------------- | ---------: |
@@ -127,19 +127,19 @@ Whole module: **1.8 kB**
 
 ## color
 
-Whole module: **4.9 kB**
+Whole module: **5.0 kB**
 
 | Export                 | min + gzip |
 | ---------------------- | ---------: |
 | `contrastRatio`        |     2.8 kB |
 | `darken`               |     3.1 kB |
 | `getReadableTextColor` |     2.8 kB |
-| `hslToRgb`             |      848 B |
-| `inGamut`              |     1.1 kB |
+| `hslToRgb`             |      847 B |
+| `inGamut`              |     1.2 kB |
 | `lighten`              |     3.1 kB |
 | `meetsContrast`        |     2.9 kB |
-| `mix`                  |     3.2 kB |
-| `oklabToRgb`           |     1.6 kB |
+| `mix`                  |     3.3 kB |
+| `oklabToRgb`           |     1.7 kB |
 | `oklchToRgb`           |     1.7 kB |
 | `parseColor`           |     2.5 kB |
 | `parseHex`             |      662 B |
@@ -166,10 +166,10 @@ Whole module: **8.6 kB**
 | `addHours`              |      714 B |
 | `addMilliseconds`       |      700 B |
 | `addMinutes`            |      713 B |
-| `addMonths`             |      954 B |
+| `addMonths`             |      955 B |
 | `addSeconds`            |      712 B |
-| `addWeeks`              |      973 B |
-| `addYears`              |      971 B |
+| `addWeeks`              |      972 B |
+| `addYears`              |      970 B |
 | `clampDate`             |      601 B |
 | `compareAsc`            |      563 B |
 | `compareDesc`           |      572 B |
@@ -271,7 +271,7 @@ Whole module: **2.2 kB**
 | Export             | min + gzip |
 | ------------------ | ---------: |
 | `cssEase`          |      663 B |
-| `cssEaseIn`        |      664 B |
+| `cssEaseIn`        |      662 B |
 | `cssEaseInOut`     |      669 B |
 | `cssEaseOut`       |      665 B |
 | `cubicBezier`      |      632 B |
@@ -322,18 +322,18 @@ Whole module: **1.4 kB**
 
 ## encoding
 
-Whole module: **3.6 kB**
+Whole module: **3.7 kB**
 
 | Export       | min + gzip |
 | ------------ | ---------: |
 | `decodeUtf8` |     1.1 kB |
 | `encodeUtf8` |      721 B |
 | `fromBase64` |     1.3 kB |
-| `fromHex`    |      424 B |
+| `fromHex`    |      423 B |
 | `sha256`     |     1.7 kB |
 | `sha256Hex`  |     1.9 kB |
 | `toBase64`   |     1.4 kB |
-| `toHex`      |     1.1 kB |
+| `toHex`      |     1.2 kB |
 
 ## format
 
@@ -468,21 +468,21 @@ Whole module: **2.9 kB**
 
 | Export          | min + gzip |
 | --------------- | ---------: |
-| `chunk`         |      576 B |
-| `chunkAsync`    |      648 B |
+| `chunk`         |      577 B |
+| `chunkAsync`    |      649 B |
 | `concat`        |      419 B |
 | `count`         |      294 B |
-| `countItems`    |      472 B |
-| `cycle`         |      437 B |
+| `countItems`    |      473 B |
+| `cycle`         |      438 B |
 | `drop`          |      549 B |
 | `dropWhile`     |      475 B |
 | `enumerate`     |      417 B |
-| `every`         |      450 B |
+| `every`         |      451 B |
 | `filter`        |      461 B |
-| `filterAsync`   |      535 B |
-| `find`          |      446 B |
+| `filterAsync`   |      536 B |
+| `find`          |      447 B |
 | `first`         |      393 B |
-| `flatMap`       |      475 B |
+| `flatMap`       |      476 B |
 | `iterate`       |      231 B |
 | `last`          |      397 B |
 | `map`           |      451 B |
@@ -490,35 +490,35 @@ Whole module: **2.9 kB**
 | `mapConcurrent` |     1.4 kB |
 | `reduce`        |      528 B |
 | `repeatValue`   |      341 B |
-| `scan`          |      461 B |
-| `some`          |      449 B |
+| `scan`          |      462 B |
+| `some`          |      450 B |
 | `take`          |      562 B |
 | `takeAsync`     |      635 B |
 | `takeWhile`     |      467 B |
-| `tap`           |      451 B |
+| `tap`           |      452 B |
 | `toArray`       |      421 B |
 | `toArrayAsync`  |      490 B |
-| `unique`        |      498 B |
+| `unique`        |      499 B |
 | `windowed`      |      618 B |
 | `zip`           |      646 B |
 
 ## math
 
-Whole module: **6.2 kB**
+Whole module: **6.3 kB**
 
 | Export               | min + gzip |
 | -------------------- | ---------: |
 | `abs`                |       71 B |
-| `approximatelyEqual` |      320 B |
+| `approximatelyEqual` |      346 B |
 | `average`            |      270 B |
 | `ceil`               |      528 B |
 | `clamp`              |      267 B |
 | `cumulativeSum`      |      161 B |
 | `factorial`          |      308 B |
 | `floor`              |      534 B |
-| `formatBytes`        |      929 B |
+| `formatBytes`        |      955 B |
 | `gcd`                |      265 B |
-| `histogram`          |      929 B |
+| `histogram`          |      958 B |
 | `inRange`            |       89 B |
 | `inverseLerp`        |      135 B |
 | `isEven`             |       91 B |
@@ -537,7 +537,7 @@ Whole module: **6.2 kB**
 | `normalize`          |      400 B |
 | `nthRoot`            |      361 B |
 | `ordinal`            |      315 B |
-| `parseBytes`         |      617 B |
+| `parseBytes`         |      642 B |
 | `percentage`         |       86 B |
 | `percentile`         |      490 B |
 | `pow`                |       72 B |
@@ -560,15 +560,15 @@ Whole module: **6.2 kB**
 
 ## objects
 
-Whole module: **11.4 kB**
+Whole module: **11.5 kB**
 
 | Export              | min + gzip |
 | ------------------- | ---------: |
 | `JsonPatchError`    |      338 B |
-| `applyPatch`        |     3.9 kB |
+| `applyPatch`        |     4.0 kB |
 | `clone`             |     1.7 kB |
-| `compactObject`     |      571 B |
-| `createPatch`       |     2.5 kB |
+| `compactObject`     |      572 B |
+| `createPatch`       |     2.6 kB |
 | `deepClone`         |     1.7 kB |
 | `deepFreeze`        |      615 B |
 | `deepMerge`         |     1.2 kB |
@@ -576,13 +576,13 @@ Whole module: **11.4 kB**
 | `defaults`          |     1.2 kB |
 | `defaultsDeep`      |     1.2 kB |
 | `defaultsWith`      |     1.4 kB |
-| `deletePath`        |      694 B |
+| `deletePath`        |      693 B |
 | `deleteProperty`    |      289 B |
-| `diff`              |     2.0 kB |
+| `diff`              |     2.1 kB |
 | `evolve`            |     2.0 kB |
 | `findEntry`         |      437 B |
 | `findKey`           |      441 B |
-| `flattenObject`     |      845 B |
+| `flattenObject`     |      869 B |
 | `getPath`           |      554 B |
 | `getProperty`       |      485 B |
 | `getPropertyNames`  |      294 B |
@@ -591,9 +591,9 @@ Whole module: **11.4 kB**
 | `hash`              |     1.7 kB |
 | `invert`            |      486 B |
 | `isEmpty`           |      575 B |
-| `isEqual`           |     1.7 kB |
-| `isEqualWith`       |     1.8 kB |
-| `isMatch`           |     2.2 kB |
+| `isEqual`           |     1.8 kB |
+| `isEqualWith`       |     1.9 kB |
+| `isMatch`           |     2.3 kB |
 | `mapEntries`        |      600 B |
 | `mapKeys`           |      604 B |
 | `mapValues`         |      593 B |
@@ -603,11 +603,11 @@ Whole module: **11.4 kB**
 | `omitPath`          |     2.3 kB |
 | `pick`              |      560 B |
 | `pickBy`            |      547 B |
-| `replaceEqualDeep`  |     2.1 kB |
+| `replaceEqualDeep`  |     2.2 kB |
 | `setPath`           |     1.0 kB |
 | `setProperty`       |      348 B |
 | `shallowEqual`      |     1.0 kB |
-| `sortKeys`          |      999 B |
+| `sortKeys`          |     1016 B |
 | `stableStringify`   |     1.4 kB |
 | `toCamelCaseKeys`   |     1.7 kB |
 | `toKebabCaseKeys`   |     1.5 kB |
@@ -658,9 +658,9 @@ Whole module: **2.9 kB**
 
 | Export          | min + gzip |
 | --------------- | ---------: |
-| `createHistory` |     1.9 kB |
+| `createHistory` |     2.0 kB |
 | `createMachine` |     2.0 kB |
-| `createStore`   |      976 B |
+| `createStore`   |      974 B |
 
 ## strings
 
@@ -668,10 +668,10 @@ Whole module: **7.2 kB**
 
 | Export                | min + gzip |
 | --------------------- | ---------: |
-| `capitalize`          |      744 B |
-| `compareNatural`      |      745 B |
+| `capitalize`          |      742 B |
+| `compareNatural`      |      776 B |
 | `countSubString`      |      567 B |
-| `dedent`              |      896 B |
+| `dedent`              |      897 B |
 | `endsWith`            |      352 B |
 | `ensurePrefix`        |      365 B |
 | `ensureSuffix`        |      363 B |
@@ -722,9 +722,9 @@ Whole module: **7.2 kB**
 | `trimChars`           |     1.0 kB |
 | `trimEndChars`        |     1.0 kB |
 | `trimStartChars`      |     1.0 kB |
-| `truncate`            |      919 B |
-| `truncateMiddle`      |     1.3 kB |
-| `uncapitalize`        |      742 B |
+| `truncate`            |      918 B |
+| `truncateMiddle`      |     1.4 kB |
+| `uncapitalize`        |      744 B |
 | `unescapeHtml`        |      511 B |
 | `wordWrap`            |     1.1 kB |
 
@@ -739,17 +739,17 @@ Whole module: **4.7 kB**
 | `compilePath`            |     2.0 kB |
 | `getQueryParam`          |      348 B |
 | `isAbsoluteUrl`          |      310 B |
-| `isSafeUrl`              |      579 B |
+| `isSafeUrl`              |      621 B |
 | `joinUrl`                |      652 B |
 | `matchPath`              |     1.7 kB |
 | `parseFormData`          |      491 B |
 | `parseQueryString`       |      357 B |
 | `safeDecodeURIComponent` |      245 B |
-| `sanitizeUrl`            |      611 B |
+| `sanitizeUrl`            |      652 B |
 | `withBase`               |      399 B |
 | `withFragment`           |      352 B |
 | `withLeadingSlash`       |      275 B |
-| `withQuery`              |     1.3 kB |
+| `withQuery`              |     1.4 kB |
 | `withTrailingSlash`      |      277 B |
 | `withoutBase`            |      367 B |
 | `withoutFragment`        |      226 B |
@@ -759,26 +759,26 @@ Whole module: **4.7 kB**
 
 ## validate
 
-Whole module: **11.8 kB**
+Whole module: **11.9 kB**
 
 | Export                | min + gzip |
 | --------------------- | ---------: |
 | `arrayOf`             |     3.3 kB |
 | `asArray`             |     3.3 kB |
-| `asBigInt`            |      813 B |
+| `asBigInt`            |      812 B |
 | `asBoolean`           |      825 B |
 | `asDate`              |     1.9 kB |
 | `asInteger`           |      806 B |
 | `asJson`              |     3.8 kB |
 | `asList`              |     3.4 kB |
-| `asNumber`            |      823 B |
+| `asNumber`            |      822 B |
 | `blankAsUndefined`    |     3.2 kB |
 | `chain`               |     3.2 kB |
 | `check`               |     3.3 kB |
 | `compareSemver`       |      549 B |
 | `discriminatedUnion`  |     3.6 kB |
 | `exact`               |     3.3 kB |
-| `isBase64`            |      562 B |
+| `isBase64`            |      612 B |
 | `isCreditCardNumber`  |      379 B |
 | `isEmail`             |      294 B |
 | `isHexColor`          |      263 B |

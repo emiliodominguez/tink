@@ -22,6 +22,8 @@ import { retry } from 'tinkit/async';
 
 ESM, fully typed (TypeScript 5.7+), Node 20.19+ and modern browsers. Each module is a deep import, so your bundle only contains the helpers you call.
 
+> Node 20 reached end of life in April 2026. Its `Intl.Segmenter` takes quadratic time on long runs of combining marks, so the grapheme-aware string helpers (`stringWidth`, `truncateMiddle`, `reverse`, `padStart`, …) are slow on such untrusted text there; Node 22+ and current browsers segment in linear time.
+
 ## The edge cases
 
 Floats, `NaN`, emoji, daylight saving, `__proto__`: where utility functions usually break. What a popular implementation returns for each input, next to tink:

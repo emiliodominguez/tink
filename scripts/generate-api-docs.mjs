@@ -6,28 +6,28 @@ import ts from 'typescript';
 
 const MODULES = [
 	['arrays', 'Collection helpers: set algebra, grouping, chunking, sorting, sampling.'],
-	['objects', 'Shallow/deep cloning, merging, equality, path access and object reshaping.'],
+	['objects', 'Shallow/deep cloning, merging, equality, path access, object reshaping, structural sharing and JSON Patch (RFC 6902).'],
 	['guards', 'Runtime type predicates that narrow `unknown` values, composable into path-aware, Standard Schema-compatible validators.'],
-	['strings', 'Unicode-aware transformations, case conversion, escaping, templating and text metrics.'],
-	['url', 'Query-string building and parsing, URL joining and query merging, without URL object types.'],
-	['math', 'Precise arithmetic, statistics, number theory and random numbers.'],
+	['strings', 'Unicode-aware transformations, case conversion, escaping, templating, natural sorting and terminal text width.'],
+	['url', 'Typed route patterns (match and build), query-string building and parsing, URL joining and query merging.'],
+	['math', 'Precise arithmetic (exact sums), statistics, histograms, number theory and random numbers.'],
 	['functions', 'Function composition, currying, memoization and rate limiting.'],
-	['async', 'Promise utilities: retries, timeouts, polling, limiters, keyed Promise.all and async debounce.'],
-	['color', 'Hex/RGB/HSL conversion, mixing, lightening and WCAG contrast checks.'],
+	['async', 'Promise utilities: retries, timeouts, polling, limiters, request batching, keyed Promise.all and async debounce.'],
+	['color', 'Hex/RGB/HSL and OKLab/OKLCH conversion with CSS gamut mapping, perceptual mixing and WCAG contrast checks.'],
 	['search', 'Fuzzy matching and ranking with highlight ranges, for command palettes and filter-as-you-type UIs.'],
 	['easing', 'Animation easing curves, CSS-accurate cubic-bezier() and steps(), and an analytic spring.'],
 	['encoding', 'Buffer-free base64/base64url, hex and UTF-8 conversions with strict decoding, and a synchronous SHA-256.'],
 	['format', 'Deterministic, cached Intl formatting: numbers, currency, percent, compact, units, lists, dates, ordinals.'],
 	[
 		'validate',
-		'Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates, and zod-like parsing with coercion, defaults and transforms.'
+		'Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates, zod-like parsing with coercion, defaults and transforms, and typed environment variables.'
 	],
-	['date', 'DST-safe, non-mutating local-time date arithmetic, formatting and parsing.'],
+	['date', 'DST-safe, non-mutating date arithmetic, formatting and parsing, IANA time zones and calendar grids.'],
 	['iterables', 'Lazy, generator-based pipelines over any (async) iterable, with exact pull counts and early-exit cleanup.'],
 	['cache', 'O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock; plugs into memoize.'],
 	['emitter', 'Typed event emitter with wildcard listeners, waitFor and error isolation.'],
-	['store', 'Tiny state store compatible with React useSyncExternalStore, with derived selectors.'],
-	['random', 'Seeded deterministic PRNG plus cryptographically secure ids, UUIDs and bytes.'],
+	['store', 'Tiny state store compatible with React useSyncExternalStore, with derived selectors, typed state machines and undo/redo.'],
+	['random', 'Seeded deterministic PRNG plus cryptographically secure ids, UUIDs (v4, v7), ULIDs and bytes.'],
 	['decorators', 'Class decorators for TypeScript (legacy and TC39 standard) and Babel.']
 ];
 
@@ -43,7 +43,7 @@ function linkLabel(part) {
 }
 
 /**
- * Extracts the first sentence of a JSDoc comment, rendering `{@link X}` as inline code.
+ * Extracts the first sentence of a JSDoc comment (within its first paragraph), rendering `{@link X}` as inline code.
  * @param {ts.JSDoc | undefined} doc - The JSDoc node
  * @returns {string} The summary sentence
  */
@@ -57,10 +57,13 @@ function summarize(doc) {
 						return part.kind === ts.SyntaxKind.JSDocText ? part.text : '`' + linkLabel(part) + '`';
 					})
 					.join('');
+	// The summary never runs past the first paragraph (a table or a list may follow it).
 	const flat = text
+		.split(/\n\s*\n/)[0]
 		.replace(/\s*\n\s*/g, ' ')
 		.trim()
-		.replace(/:\s+-\s.*$/, '.');
+		.replace(/:\s+-\s.*$/, '.')
+		.replace(/:$/, '.');
 	const codeSpans = [];
 	const masked = flat.replace(/`[^`]*`/g, function (code) {
 		codeSpans.push(code);
@@ -154,7 +157,7 @@ const PRINCIPLES = `Key facts for code generation:
 - ESM only, zero dependencies, Node >= 20.19 or any modern browser/runtime. TypeScript types ship in the package.
 - Import from module entry points: \`import { debounce } from 'tinkit/functions'\` (the root entry exposes namespaces: \`import { functions } from 'tinkit'\`).
 - Helpers never mutate their inputs unless the name or docs say so (\`setPath\`, \`deletePath\`).
-- Invalid arguments throw \`TypeError\` (wrong type) or \`RangeError\` (invalid value) whose message names the function and the parameter (\`fn: param must be …, got …\`).
+- Invalid arguments throw \`TypeError\` (wrong type) or \`RangeError\` (invalid value) whose message names the function and the parameter (\`fn: param must be …, got …\`); decoders of malformed text (base64, hex, UUIDv7/ULID timestamps) throw \`SyntaxError\`.
 - Randomised helpers take an optional \`random\` generator last; the default is \`Math.random\`. Pass \`secureRandom\` (random module) for tokens, OTPs and lotteries.
 - Type guards compose into validators: \`isShape\`, \`isArrayOf\`, \`isUnion\`, \`isOptional\`…; \`explain\` lists issues with paths, \`ensure\` throws a \`ValidationError\`, \`toStandardSchema\` adapts any guard for tRPC, TanStack Form, Hono and other Standard Schema consumers.
 - To convert as well as check (environment variables, query strings, forms, API payloads), use \`parse\`/\`safeParse\` from \`tinkit/validate\` with a plain object of guards and parsers: \`parse({ PORT: withDefault(asInteger, 3000), DEBUG: withDefault(asBoolean, false), DATABASE_URL: isUrl }, process.env)\`. Unknown keys are stripped; \`asNumber\`, \`asInteger\`, \`asBoolean\` and \`asDate\` coerce strictly (\`''\` and \`'false'\` are not \`0\` and \`true\`); \`optional\`, \`withDefault\`, \`nullable\`, \`transform\`, \`chain\`, \`arrayOf\`, \`tuple\`, \`recordOf\`, \`union\`, \`discriminatedUnion\`, \`lazy\`, \`exact\` and \`partial\` compose; \`asArray\` (repeated query parameters), \`blankAsUndefined\` (empty form fields) and \`asJson\` (JSON strings) handle raw input; \`issuesByPath\` (guards) maps issues to form fields; every parser is a Standard Schema validator, and zod schemas can be nested.`;

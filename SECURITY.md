@@ -30,7 +30,8 @@ The helpers are designed to be safe on untrusted input (query strings, JSON bodi
 source, as `JSON.stringify` string literals, and no input value is ever evaluated. Where code generation is disallowed (a Content Security
 Policy without `'unsafe-eval'`, Cloudflare Workers) it falls back to a loop; the first attempt may still log a CSP violation report.
 
-Documented costs (for example the O(n·m) of `levenshtein` or `fuzzyMatch`) and `Math.random` defaults (pass `secureRandom` from the
+Documented costs (for example the O(n·m) of `levenshtein` or `fuzzyMatch`, or the quadratic `Intl.Segmenter` of Node 20 behind the grapheme-aware
+string helpers) and `Math.random` defaults (pass `secureRandom` from the
 `random` module where unpredictability matters) are not vulnerabilities, but unclear documentation about them is a welcome report.
 
 ## Supply chain

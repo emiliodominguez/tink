@@ -4,7 +4,7 @@ Key facts for code generation:
 - ESM only, zero dependencies, Node >= 20.19 or any modern browser/runtime. TypeScript types ship in the package.
 - Import from module entry points: `import { debounce } from 'tinkit/functions'` (the root entry exposes namespaces: `import { functions } from 'tinkit'`).
 - Helpers never mutate their inputs unless the name or docs say so (`setPath`, `deletePath`).
-- Invalid arguments throw `TypeError` (wrong type) or `RangeError` (invalid value) whose message names the function and the parameter (`fn: param must be …, got …`).
+- Invalid arguments throw `TypeError` (wrong type) or `RangeError` (invalid value) whose message names the function and the parameter (`fn: param must be …, got …`); decoders of malformed text (base64, hex, UUIDv7/ULID timestamps) throw `SyntaxError`.
 - Randomised helpers take an optional `random` generator last; the default is `Math.random`. Pass `secureRandom` (random module) for tokens, OTPs and lotteries.
 - Type guards compose into validators: `isShape`, `isArrayOf`, `isUnion`, `isOptional`…; `explain` lists issues with paths, `ensure` throws a `ValidationError`, `toStandardSchema` adapts any guard for tRPC, TanStack Form, Hono and other Standard Schema consumers.
 - To convert as well as check (environment variables, query strings, forms, API payloads), use `parse`/`safeParse` from `tinkit/validate` with a plain object of guards and parsers: `parse({ PORT: withDefault(asInteger, 3000), DEBUG: withDefault(asBoolean, false), DATABASE_URL: isUrl }, process.env)`. Unknown keys are stripped; `asNumber`, `asInteger`, `asBoolean` and `asDate` coerce strictly (`''` and `'false'` are not `0` and `true`); `optional`, `withDefault`, `nullable`, `transform`, `chain`, `arrayOf`, `tuple`, `recordOf`, `union`, `discriminatedUnion`, `lazy`, `exact` and `partial` compose; `asArray` (repeated query parameters), `blankAsUndefined` (empty form fields) and `asJson` (JSON strings) handle raw input; `issuesByPath` (guards) maps issues to form fields; every parser is a Standard Schema validator, and zod schemas can be nested.
@@ -89,7 +89,7 @@ Import: `import { … } from 'tinkit/arrays';`
 
 ## objects
 
-Shallow/deep cloning, merging, equality, path access and object reshaping.
+Shallow/deep cloning, merging, equality, path access, object reshaping, structural sharing and JSON Patch (RFC 6902).
 Import: `import { … } from 'tinkit/objects';`
 
 - `merge<T extends object, S extends object[]>(target: T, ...sources: S): MergeAll<T, S>` — Shallowly merges one or more source objects into a NEW object, left to right (later keys win, like `{ ...target, ...a, ...b }`).
@@ -132,9 +132,9 @@ Import: `import { … } from 'tinkit/objects';`
 - `hasPath(target: object, path: string): boolean` — Checks whether a dot-separated path exists in an object: it is `true` exactly when `getPath` resolves the path to a property (whose value may be `undefined`) rather than falling back to the default value.
 - `deletePath(target: object, path: string): boolean` — Deletes the property at a dot-separated path.
 - `diff(a: object, b: object): ObjectDiff` — Computes the structural differences between two trees of plain objects and arrays, as dot-separated paths (array elements use numeric segments: `'list.0'`).
-- `replaceEqualDeep<T>(prev: unknown, next: T): T` — Structural sharing, as TanStack Query applies it to refetched data: returns `next`, except that every part of it deeply equal (`isEqual`) to the part of `prev` at the same place is replaced by that part of `prev`, and `prev` itself is returned when everything is equal.
+- `replaceEqualDeep<T>(prev: unknown, next: T): T` — Structural sharing, as TanStack Query applies it to refetched data: returns `next`, except that every part of it deeply equal (`isEqual`) to the part of `prev` at the same place is replaced by that part of `prev`, and `prev` itself is returned when everything is equal (unless `next` is circular: see below).
 - `JsonPatchErrornew (message: string, index: number, operation: JsonPatchOperation)` — Error thrown by `applyPatch` when a well-formed operation cannot be applied to the document: a location that does not exist, an array index out of bounds, a value that cannot be walked into, a failed `test`, a `move` into its own child, or a `remove` of the whole document.
-- `createPatch(a: unknown, b: unknown): JsonPatchOperation[]` — Computes a JSON Patch (RFC 6902) that turns `a` into `b`: `applyPatch(a, createPatch(a, b))` is deeply equal to `b` for JSON values.
+- `createPatch(a: unknown, b: unknown): JsonPatchOperation[]` — Computes a JSON Patch (RFC 6902) that turns `a` into `b`: `applyPatch(a, createPatch(a, b))` is deeply equal to `b` for JSON values (up to `undefined` object members, see below).
 - `applyPatch<T>(document: T, operations: ReadonlyArray<JsonPatchOperation>): T` — Applies a JSON Patch (RFC 6902) to a document and returns the NEW document: the input is never modified, and the parts of it that the patch does not touch are shared with the result (only the plain objects and arrays on the changed paths are copied, once per call).
 - `findKey<T extends object, S extends T[keyof T]>(object: T, predicate: (value: T[keyof T], key: StringKeyOf<T>, object: T) => value is S): KeysMatching<T, S> | undefined` — Returns the first own enumerable string key (in `Object.keys` order) whose value satisfies `predicate`.
 - `findEntry<T extends object, S extends T[keyof T]>(object: T, predicate: (value: T[keyof T], key: StringKeyOf<T>, object: T) => value is S): [KeysMatching<T, S>, S] | undefined` — Returns the first `[key, value]` own enumerable string-keyed entry whose value satisfies a type-guard `predicate`, narrowed.
@@ -226,7 +226,7 @@ Import: `import { … } from 'tinkit/guards';`
 
 ## strings
 
-Unicode-aware transformations, case conversion, escaping, templating and text metrics.
+Unicode-aware transformations, case conversion, escaping, templating, natural sorting and terminal text width.
 Import: `import { … } from 'tinkit/strings';`
 
 - `reverse(string: string): string` — Reverses a string by user-perceived characters (grapheme clusters), so emoji, surrogate pairs and combining marks are kept intact.
@@ -291,7 +291,7 @@ Import: `import { … } from 'tinkit/strings';`
 
 ## url
 
-Query-string building and parsing, URL joining and query merging, without URL object types.
+Typed route patterns (match and build), query-string building and parsing, URL joining and query merging.
 Import: `import { … } from 'tinkit/url';`
 
 - `buildQueryString<P extends QueryParamsOf<P>>(input: P & NotAnArray<P>, options: BuildQueryStringOptions = {}): string` — Builds a query string (WITHOUT the leading `?`) from a record of parameters.
@@ -319,7 +319,7 @@ Import: `import { … } from 'tinkit/url';`
 
 ## math
 
-Precise arithmetic, statistics, number theory and random numbers.
+Precise arithmetic (exact sums), statistics, histograms, number theory and random numbers.
 Import: `import { … } from 'tinkit/math';`
 
 - `sum(numbers: ReadonlyArray<number>): number` — Calculates the sum of an array of numbers using Neumaier (improved Kahan–Babuška) compensated summation, which keeps the rounding error independent of the number of elements and makes the result (practically) independent of their order.
@@ -406,7 +406,7 @@ Import: `import { … } from 'tinkit/functions';`
 
 ## async
 
-Promise utilities: retries, timeouts, polling, limiters, keyed Promise.all and async debounce.
+Promise utilities: retries, timeouts, polling, limiters, request batching, keyed Promise.all and async debounce.
 Import: `import { … } from 'tinkit/async';`
 
 - `AbortErrornew (message = 'The operation was aborted.')` — Error used to reject operations cancelled through an abort signal that carries no `reason`.
@@ -436,7 +436,7 @@ Import: `import { … } from 'tinkit/async';`
 
 ## color
 
-Hex/RGB/HSL conversion, mixing, lightening and WCAG contrast checks.
+Hex/RGB/HSL and OKLab/OKLCH conversion with CSS gamut mapping, perceptual mixing and WCAG contrast checks.
 Import: `import { … } from 'tinkit/color';`
 
 - `parseHex(hex: string): Rgba` — Parses a CSS hex colour.
@@ -524,7 +524,7 @@ Buffer-free base64/base64url, hex and UTF-8 conversions with strict decoding, an
 Import: `import { … } from 'tinkit/encoding';`
 
 - `toBase64(data: string | BytesInput, options?: ToBase64Options): string` — Encodes binary data (or the UTF-8 encoding of a string) as base64 (RFC 4648 §4) or base64url (§5).
-- `fromBase64(text: string, options?: FromBase64Options): Uint8Array<ArrayBuffer>` — Decodes base64 (RFC 4648 §4) or base64url (§5) text, strictly: it accepts exactly the strings that the validate module's `isBase64` accepts with the same options.
+- `fromBase64(text: string, options?: FromBase64Options): Uint8Array<ArrayBuffer>` — Decodes base64 (RFC 4648 §4) or base64url (§5) text, strictly: it accepts exactly the strings that the validate module's `isBase64` accepts with the same (valid) options.
 - `toHex(data: string | BytesInput): string` — Encodes binary data (or the UTF-8 encoding of a string) as lowercase hexadecimal, two digits per byte.
 - `fromHex(text: string): Uint8Array<ArrayBuffer>` — Decodes hexadecimal text, two digits per byte, in either letter case.
 - `encodeUtf8(text: string, options?: EncodeUtf8Options): Uint8Array<ArrayBuffer>` — Encodes a string as UTF-8 bytes.
@@ -550,7 +550,7 @@ Import: `import { … } from 'tinkit/format';`
 
 ## validate
 
-Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates, and zod-like parsing with coercion, defaults and transforms.
+Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates, zod-like parsing with coercion, defaults and transforms, and typed environment variables.
 Import: `import { … } from 'tinkit/validate';`
 
 - `isEmail(value: unknown): value is string` — Checks whether a value is an email address, using the WHATWG HTML "valid email address" grammar (the one browsers apply to `<input type="email">`) plus the usual length limits: at most 64 characters before the `@`, 254 characters in total and 63 characters per domain label.
@@ -595,11 +595,11 @@ Import: `import { … } from 'tinkit/validate';`
 - `lazy<T>(getter: () => Schema): Parser<T>` — Creates a parser for recursive schemas (`z.lazy()`): `getter` returns the schema, and is called once, on first use, so the schema can refer to the parser being defined.
 - `blankAsUndefined<S extends Schema>(schema: S): Parser<SchemaOutput<S>>` — Creates a parser that treats blank strings (empty, or only whitespace) as missing: what an empty HTML form field sends.
 - `asJson<S extends Schema>(schema: S): Parser<SchemaOutput<S>>` — Creates a parser for strings holding JSON (an environment variable, a form field, a message payload): the text is parsed with `parseJson`, so `__proto__` and `constructor.prototype` keys are rejected, and the result is parsed with `schema`, whose issues are reported below the string's path.
-- `parseEnv<S extends ObjectSchema>(schema: S, env?: object, options: ParseEnvOptions = {}): SchemaOutput<S>` — Parses environment variables with an object schema and returns the typed result, or throws ONE `ValidationError` listing every missing or invalid variable, one per line, so that a misconfigured deployment fails at startup with the whole list instead of one variable per restart (or a crash much later, on first use): ```text Invalid environment variables: DATABASE_URL: Missing required variable PORT: Expected an integer or an integer string (got string) ``` No part of a value can reach the error (its message, `issues`, stack or anything else), since everything in it comes from fixed texts: the variable name; array indexes, but no object key (a JSON object's keys come from the value); and messages from a fixed list: this module's own (its `(got …)` part kept only when it names a type), range, length, pattern and allowed-values messages without their bounds (`Expected an integer in the allowed range`: a number in them may come from the value), and `Invalid value` for anything else, custom `withError` and `check` messages and those of other libraries (zod, valibot…) included, since they may quote the value.
+- `parseEnv<S extends ObjectSchema>(schema: S, env?: object, options: ParseEnvOptions = {}): SchemaOutput<S>` — Parses environment variables with an object schema and returns the typed result, or throws ONE `ValidationError` listing every missing or invalid variable, one per line, so that a misconfigured deployment fails at startup with the whole list instead of one variable per restart (or a crash much later, on first use).
 
 ## date
 
-DST-safe, non-mutating local-time date arithmetic, formatting and parsing.
+DST-safe, non-mutating date arithmetic, formatting and parsing, IANA time zones and calendar grids.
 Import: `import { … } from 'tinkit/date';`
 
 - `isValidDate(value: unknown): value is ValidDate` — Checks whether a value is a `Date` instance holding a valid time (i.e. not `new Date(NaN)`).
@@ -684,7 +684,7 @@ Import: `import { … } from 'tinkit/date';`
 - `getTimeZoneOffset(timeZone: string, date: DateInput = new Date()): number` — Returns the UTC offset of a time zone at an instant, in minutes EAST of UTC: `330` in India, `-300` in New York in winter and `-240` in summer.
 - `getZonedParts(date: DateInput, timeZone: string): ZonedDateTimeParts` — Returns the wall-clock fields of an instant in a time zone: what a clock on the wall there shows.
 - `fromZonedTime(fields: WallClockTime, timeZone: string, options: FromZonedTimeOptions = {}): Date` — Returns the instant at which the wall clock of a time zone shows the given date and time: the inverse of `getZonedParts` (date-fns-tz's `fromZonedTime`, Temporal's `ZonedDateTime.from`), e.g. "9:00 on March 10th in New York" as a `Date`.
-- `formatInTimeZone(date: DateInput, timeZone: string, pattern: string): string` — Formats an instant as read on the wall clock of a time zone, with the token language of `formatDate` (`YYYY`, `MM`, `DD`, `HH`, `mm`, `ss`, `SSS`, `A`… and `[literal]` text) plus two UTC offset tokens: \| Token \| Output \| \|-------\|--------\| \| `Z` \| `+05:30`, `-04:00`, `+00:00` \| \| `ZZ` \| `+0530`, `-0400`, `+0000` \| With `'YYYY-MM-DD[T]HH:mm:ss.SSSZ'`, the result is an RFC 3339 timestamp for the years 0-9999 and whole-minute offsets.
+- `formatInTimeZone(date: DateInput, timeZone: string, pattern: string): string` — Formats an instant as read on the wall clock of a time zone, with the tokens of `formatDate` plus the UTC offset tokens `Z` and `ZZ`.
 - `startOfDayInTimeZone(date: DateInput, timeZone: string): Date` — Returns the first instant of the calendar day that the wall clock of a time zone shows at `date`: normally its 00:00:00.000 there, but the end of the gap where midnight was skipped (in Havana, 2024-03-10 starts at 01:00; in Toronto, 1919-03-31 started at 00:30, the clocks having gone from 23:30 to 00:30, where date-fns-tz and Temporal's `'compatible'` midnight give 01:00) and the first midnight where it was repeated.
 - `endOfDayInTimeZone(date: DateInput, timeZone: string): Date` — Returns the last millisecond of the calendar day that the wall clock of a time zone shows at `date`: the instant before the next day starts there (normally 23:59:59.999).
 - `getCalendarMonth(year: number, monthIndex: number, options: CalendarMonthOptions = {}): Date[][]` — Returns the grid of a month as every date picker shows it: an array of weeks, each an array of 7 dates at the start of their LOCAL day (normally 00:00; where midnight was skipped, the end of the gap, like `startOfDay`: 01:00 in Havana or Beirut on the night the clocks go forward), from the week containing the 1st to the week containing the last day.
@@ -745,7 +745,7 @@ Import: `import { … } from 'tinkit/emitter';`
 
 ## store
 
-Tiny state store compatible with React useSyncExternalStore, with derived selectors.
+Tiny state store compatible with React useSyncExternalStore, with derived selectors, typed state machines and undo/redo.
 Import: `import { … } from 'tinkit/store';`
 
 - `createStore<S>(initialState: S, options: StoreOptions<S> = {}): Store<S>` — Creates a tiny synchronous state container, usable from React 18+ without any React dependency: `const state = useSyncExternalStore(store.subscribe, store.getState);` (methods can be passed unbound).
@@ -754,7 +754,7 @@ Import: `import { … } from 'tinkit/store';`
 
 ## random
 
-Seeded deterministic PRNG plus cryptographically secure ids, UUIDs and bytes.
+Seeded deterministic PRNG plus cryptographically secure ids, UUIDs (v4, v7), ULIDs and bytes.
 Import: `import { … } from 'tinkit/random';`
 
 - `createRandom(seed: number | string): SeededRandom` — Creates a deterministic, seedable pseudo-random generator (sfc32, seeded through the cyrb128 string hash).
