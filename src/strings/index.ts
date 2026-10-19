@@ -1,5 +1,6 @@
 import { assertInteger, assertNumber, describe, draw, readOption, show } from '../utils/assert.js';
 import type { RandomGenerator } from '../utils/index.js';
+import { DIACRITICS, NON_ASCII, transliterate } from '../utils/latin.js';
 import { isNumericString } from '../validate/index.js';
 
 /**
@@ -249,9 +250,6 @@ const UNICODE_WORD = new RegExp(
 /** The apostrophes removed by the word splitter. */
 const APOSTROPHES = /['’]/g;
 
-/** Any non-ASCII code unit. */
-const NON_ASCII = /[^\0-\x7f]/;
-
 /**
  * The words of ASCII text (without apostrophes), with the same rules as the Unicode path of {@link splitWords}, as a single match:
  * a run of capitals and digits that is a whole run of letters and digits (`HTTP2`, `A0B1`), the capitals before the last one of a run
@@ -385,33 +383,106 @@ export function replace(string: string, searchValue: string, replaceValue: strin
 }
 
 /**
+ * Options accepted by {@link truncate}.
+ */
+export interface TruncateOptions {
+	/** The suffix appended when the string is truncated (it is not counted in the length). Defaults to `'...'`. */
+	readonly suffix?: string;
+	/**
+	 * Keeps words whole, like the `separator` of lodash's `truncate`: the cut moves back to the start of the last occurrence (or RegExp
+	 * match) of the separator that starts at or before it, so `' '` cuts between words and `/,? +/` also drops a comma before the cut. An
+	 * occurrence that starts right at the cut keeps it there, and the hard cut is kept when the kept text holds none. Occurrences that
+	 * start inside a grapheme cluster are skipped. A RegExp is matched on a copy (its `lastIndex` is never used or changed).
+	 */
+	readonly separator?: string | RegExp;
+}
+
+/**
+ * Moves a cut back to the start of the last occurrence of a separator that starts at or before it, on a grapheme boundary.
+ * @param {string} string - The string being truncated
+ * @param {number} cut - The hard cut (a grapheme boundary)
+ * @param {string | RegExp} separator - The separator
+ * @param {ReadonlySet<number> | undefined} boundaries - The grapheme boundaries up to the cut (`undefined`: every position is one)
+ * @returns {number} The new cut, or `cut` when no occurrence qualifies
+ */
+function separatorCut(string: string, cut: number, separator: string | RegExp, boundaries: ReadonlySet<number> | undefined): number {
+	let found = -1;
+
+	if (typeof separator === 'string') {
+		found = string.lastIndexOf(separator, cut);
+		// From the cut backwards, to an occurrence on a grapheme boundary (position 0 always is one).
+		while (found > 0 && boundaries !== undefined && !boundaries.has(found)) found = string.lastIndexOf(separator, found - 1);
+	} else {
+		// The matches are found from the start, on the whole string, so that look-arounds see the text on both sides of the cut.
+		for (const match of string.matchAll(new RegExp(separator, separator.flags.replace(/[gy]/g, '') + 'g'))) {
+			if (match.index > cut) break;
+			if (boundaries === undefined || boundaries.has(match.index)) found = match.index;
+		}
+	}
+
+	return found === -1 ? cut : found;
+}
+
+/**
  * Truncates a string to `length` user-perceived characters (grapheme clusters) and appends a suffix when it was longer.
  * The cut never splits a surrogate pair, an emoji sequence or a base character from its combining marks.
  * The suffix is not counted in `length`.
+ *
+ * The third argument is the suffix, or an options object with the `suffix` and a `separator` that keeps words whole (see
+ * {@link TruncateOptions}). Cost: O(`length`), whatever the length of the string, except with a RegExp separator, which is matched from the start of
+ * the string up to its first match after the cut.
  * @param {string} string - The original string
  * @param {number} length - The maximum number of graphemes to keep (non-negative integer)
- * @param {string} [suffix='...'] - The suffix appended when the string is truncated
+ * @param {string | TruncateOptions} [options='...'] - The suffix appended when the string is truncated, or `{ suffix, separator }`
  * @returns {string} The truncated string, or the original one when it has at most `length` graphemes
  * @throws {RangeError} when `length` is negative or not an integer
- * @throws {TypeError} when `length` is not a number, or `suffix` is not a string
+ * @throws {TypeError} when `length` is not a number, the suffix is not a string, or `separator` is neither a string nor a RegExp
  * @example
  * truncate('hello world', 5); // => 'hello...'
  * truncate('hello world', 5, '!'); // => 'hello!'
  * truncate('👍🏽👍🏽👍🏽', 1); // => '👍🏽...'
+ * @example
+ * truncate('The quick brown fox', 12, { separator: ' ' }); // => 'The quick...'
+ * truncate('The quick brown fox', 9, { separator: ' ', suffix: '…' }); // => 'The quick…'
+ * truncate('hi-diddly-ho there, neighborino', 21, { separator: /,? +/ }); // => 'hi-diddly-ho there...'
  */
-export function truncate(string: string, length: number, suffix: string = '...'): string {
+export function truncate(string: string, length: number, options: string | TruncateOptions = '...'): string {
 	assertInteger('truncate', 'length', length);
+
+	let suffix: unknown = options;
+	let separator: unknown;
+
+	if (typeof options === 'object' && options !== null) {
+		suffix = readOption(options, 'suffix', '...');
+		separator = readOption(options, 'separator');
+		if (!(separator === undefined || typeof separator === 'string' || separator instanceof RegExp))
+			throw new TypeError(`truncate: \`separator\` must be a string or a RegExp, got ${describe(separator)}`);
+	}
+
 	if (typeof suffix !== 'string') throw new TypeError(`truncate: \`suffix\` must be a string, got ${describe(suffix)}`);
 
 	// A string never has more graphemes than UTF-16 code units.
 	if (string.length <= length) return string;
 
-	// When the first `length + 1` code units are graphemes on their own, the cut falls right after the first `length` of them.
-	if (isSimpleText(string.slice(0, length + 1))) return string.slice(0, length) + suffix;
+	let cut = length;
+	let boundaries: Set<number> | undefined;
 
-	const graphemes = splitGraphemes(string, length);
+	// When the first `length + 1` code units are graphemes on their own, the cut falls right after the first `length` of them, and every
+	// position before it is a grapheme boundary.
+	if (!isSimpleText(string.slice(0, length + 1))) {
+		const graphemes = splitGraphemes(string, length);
 
-	return graphemes.length > length ? graphemes.slice(0, length).join('') + suffix : string;
+		if (graphemes.length <= length) return string;
+
+		cut = 0;
+		boundaries = new Set([0]);
+
+		for (let index = 0; index < length; index++) boundaries.add((cut += graphemes[index].length));
+	}
+
+	if (separator !== undefined) cut = separatorCut(string, cut, separator as string | RegExp, boundaries);
+
+	return string.slice(0, cut) + suffix;
 }
 
 /**
@@ -549,9 +620,6 @@ export function toPascalCase(string: string): string {
 	return result;
 }
 
-/** The combining diacritical mark blocks (U+0300–036F, U+1AB0–1AFF, U+1DC0–1DFF, U+20D0–20FF, U+FE20–FE2F). */
-const DIACRITICS = /[\u0300-\u036f]|[\u1ab0-\u1aff]|[\u1dc0-\u1dff]|[\u20d0-\u20ff]|[\ufe20-\ufe2f]/g;
-
 /**
  * Removes diacritical marks (accents, umlauts, cedillas...) from a string: it is decomposed (NFD), the combining diacritical marks are stripped
  * and the result is recomposed (NFC). Only the combining diacritical mark blocks are removed, so scripts that use other combining marks are left intact.
@@ -568,38 +636,92 @@ export function removeDiacritics(string: string): string {
 }
 
 /**
- * Latin letters that have no Unicode decomposition, mapped to their usual ASCII transliteration for slugs.
+ * Options accepted by {@link toSlug}.
  */
-const SLUG_TRANSLITERATIONS: Readonly<Record<string, string>> = { ß: 'ss', æ: 'ae', œ: 'oe', ø: 'o', đ: 'd', ð: 'd', ł: 'l', þ: 'th', ı: 'i' };
+export interface SlugOptions {
+	/** The text between the words of the slug (it is not validated: pick one that is safe where the slug goes). Defaults to `'-'`. */
+	readonly separator?: string;
+	/** Lower-case the slug. When `false`, the letters keep their case (`ß` becomes `ss`, `ẞ` becomes `SS`). Defaults to `true`. */
+	readonly lowercase?: boolean;
+	/**
+	 * Texts replaced before anything else, as own `key: value` pairs such as `{ '&': ' and ', '%': ' percent ' }`: matched literally and
+	 * case-sensitively, longest key first, in a single pass (a replacement is never replaced again). Replacements then go through the
+	 * same folding as the rest of the text, so surround them with spaces to make them words of their own.
+	 */
+	readonly replacements?: Readonly<Record<string, string>>;
+}
 
-/** Matches the letters of {@link SLUG_TRANSLITERATIONS}. */
-const SLUG_LETTERS = /[ßæœøđðłþı]/g;
+/**
+ * Applies the `replacements` of {@link toSlug}.
+ * @param {string} string - The text
+ * @param {unknown} replacements - The replacements option
+ * @returns {string} The text with every key replaced by its value
+ * @throws {TypeError} when `replacements` is not an object or one of its values is not a string
+ * @throws {RangeError} when one of its keys is empty
+ */
+function replaceAllOf(string: string, replacements: unknown): string {
+	if (typeof replacements !== 'object' || replacements === null) throw new TypeError(`toSlug: \`replacements\` must be an object, got ${describe(replacements)}`);
+
+	const values = new Map<string, string>();
+
+	for (const [key, value] of Object.entries(replacements)) {
+		if (typeof value !== 'string') throw new TypeError(`toSlug: \`replacements\` values must be strings, got ${describe(value)}`);
+		if (key === '') throw new RangeError('toSlug: `replacements` keys must not be empty');
+		values.set(key, value);
+	}
+
+	if (values.size === 0) return string;
+
+	const keys = Array.from(values.keys()).sort(function (a: string, b: string): number {
+		return b.length - a.length;
+	});
+
+	return string.replace(new RegExp(keys.map(escapeRegExp).join('|'), 'g'), function (key: string): string {
+		return values.get(key) as string;
+	});
+}
 
 /**
  * Converts a string to a URL-friendly slug: compatibility-decomposed (NFKD), diacritics removed, a few common Latin letters transliterated
- * (`ß` → `ss`, `æ` → `ae`, `ø` → `o`...), lower-cased, every run of characters outside `[a-z0-9]` replaced by a single `-`,
- * and leading/trailing hyphens removed. The result always matches `/^([a-z0-9]+(-[a-z0-9]+)*)?$/`.
+ * (`ß` → `ss`, `æ` → `ae`, `ø` → `o`...), lower-cased, and the runs of `[a-z0-9]` joined with `-` (every other character separates
+ * words and is dropped). With the default options the result always matches `/^([a-z0-9]+(-[a-z0-9]+)*)?$/`.
+ *
+ * Options: `separator` (default `'-'`), `lowercase` (default `true`; when `false`, the runs of `[a-zA-Z0-9]` are kept as they are) and
+ * `replacements` (texts replaced first, such as `{ '&': ' and ' }`). The cost of `replacements` grows with the number of keys.
  * @param {string} string - The string to be converted to a slug
+ * @param {SlugOptions} [options={}] - `separator`, `lowercase` and `replacements`
  * @returns {string} The URL-friendly slug (possibly empty)
+ * @throws {TypeError} when `separator` is not a string, `replacements` is not an object or one of its values is not a string
+ * @throws {RangeError} when a key of `replacements` is empty
  * @example
  * toSlug('Café Society'); // => 'cafe-society'
  * toSlug('  --Hello__World!!  '); // => 'hello-world'
+ * toSlug('Straße & Café', { separator: '_', lowercase: false }); // => 'Strasse_Cafe'
+ * toSlug('Tom & Jerry: 100%', { replacements: { '&': ' and ', '%': ' percent' } }); // => 'tom-and-jerry-100-percent'
  */
-export function toSlug(string: string): string {
+export function toSlug(string: string, options: SlugOptions = {}): string {
+	const separator = readOption(options, 'separator', '-');
+	const lowercase = readOption(options, 'lowercase', true);
+	const replacements = readOption(options, 'replacements');
+
+	if (typeof separator !== 'string') throw new TypeError(`toSlug: \`separator\` must be a string, got ${describe(separator)}`);
+
+	const text = replacements === undefined ? string : replaceAllOf(string, replacements);
 	// NFKD output is already fully decomposed, and recomposing (NFC) after stripping the diacritics never changes the slug: no character
 	// with an ASCII letter or digit (or a transliterated letter) as its base composes with a mark outside the stripped blocks.
 	// ASCII text has no decomposition and no letter to transliterate (lower-casing it never leaves ASCII).
-	const folded = NON_ASCII.test(string)
-		? string
-				.normalize('NFKD')
-				.replace(DIACRITICS, '')
-				.toLowerCase()
-				.replace(SLUG_LETTERS, function (letter: string): string {
-					return SLUG_TRANSLITERATIONS[letter];
-				})
-		: string.toLowerCase();
+	let folded = text;
 
-	return folded.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+	if (NON_ASCII.test(text)) {
+		folded = text.normalize('NFKD').replace(DIACRITICS, '');
+		// Lower-cased before transliterating: only the lower-case letters can then be left.
+		if (lowercase) folded = folded.toLowerCase();
+		folded = transliterate(folded);
+	} else if (lowercase) {
+		folded = text.toLowerCase();
+	}
+
+	return (folded.match(lowercase ? /[a-z0-9]+/g : /[a-zA-Z0-9]+/g) ?? []).join(separator);
 }
 
 /**
@@ -2172,14 +2294,23 @@ function isWide(code: number): boolean {
 
 /**
  * An ANSI escape sequence, as terminals read them: a CSI sequence (`ESC [` or U+009B, parameter bytes, intermediate bytes and a final
- * byte, such as the colour code `ESC [ 3 1 m`), a control string (`ESC ]` for an OSC such as a hyperlink, or `ESC P`, `ESC X`, `ESC ^`,
- * `ESC _`, up to a BEL, `ESC \` or U+009C terminator, or up to the ESC, CAN or SUB that cancels it), or another escape (`ESC`,
- * intermediate bytes and a final byte, such as `ESC ( B`). A CSI sequence or a control string that the string ends inside is removed to
- * the end, since a terminal waits for the rest of it. Each pattern consumes characters that cannot start another one, so matching is linear.
+ * byte, such as the colour code `ESC [ 3 1 m`), a control string (an OSC such as a hyperlink, `ESC ]` or U+009D, or a DCS, SOS, PM or
+ * APC string: `ESC P`, `ESC X`, `ESC ^`, `ESC _` or U+0090, U+0098, U+009E, U+009F), up to a BEL, `ESC \` or U+009C terminator, or up to
+ * the ESC, CAN, SUB or C1 introducer that cancels it), or another escape (`ESC`, intermediate bytes and a final byte, such as `ESC ( B`).
+ * A CSI sequence or a control string that the string ends inside is removed to the end, since a terminal waits for the rest of it. Each
+ * pattern consumes characters that cannot start another one, so matching is linear.
  */
 const ANSI_SEQUENCE =
 	// eslint-disable-next-line no-control-regex -- escape sequences start with control characters
-	/(?:\x1b\[|\x9b)[\x30-\x3f]*[\x20-\x2f]*(?:[\x40-\x7e]|$)|\x1b[\]PX^_][^\x07\x18\x1a\x1b\x9c]*(?:\x07|\x1b\\|\x9c|(?=[\x18\x1a\x1b])|$)|\x1b[\x20-\x2f]*[\x30-\x7e]/g;
+	/(?:\x1b\[|\x9b)[\x30-\x3f]*[\x20-\x2f]*(?:[\x40-\x7e]|$)|(?:\x1b[\]PX^_]|[\x90\x98\x9d-\x9f])[^\x07\x18\x1a\x1b\x90\x98\x9b-\x9f]*(?:\x07|\x1b\\|\x9c|(?=[\x18\x1a\x1b\x90\x98\x9b\x9d-\x9f])|$)|\x1b[\x20-\x2f]*[\x30-\x7e]/g;
+
+/** A code unit that starts an {@link ANSI_SEQUENCE}: ESC, or a C1 CSI, DCS, SOS, OSC, PM or APC introducer. */
+// eslint-disable-next-line no-control-regex -- escape sequences start with control characters
+const ANSI_START = /[\x1b\x90\x98\x9b\x9d-\x9f]/;
+
+/** Every {@link ANSI_START} code unit. Global: only use it with `replace`, which resets its `lastIndex`. */
+// eslint-disable-next-line no-control-regex -- escape sequences start with control characters
+const ANSI_STARTS = /[\x1b\x90\x98\x9b\x9d-\x9f]/g;
 
 /** Printable ASCII only: one column per code unit. */
 const PRINTABLE_ASCII = /^[\x20-\x7e]*$/;
@@ -2321,7 +2452,7 @@ function graphemeWidth(grapheme: string): number {
 export function stringWidth(string: string): number {
 	assertString('stringWidth', 'string', string);
 
-	const text = string.includes('\x1b') || string.includes('\x9b') ? string.replace(ANSI_SEQUENCE, '') : string;
+	const text = ANSI_START.test(string) ? string.replace(ANSI_SEQUENCE, '') : string;
 
 	if (PRINTABLE_ASCII.test(text)) return text.length;
 
@@ -2337,4 +2468,458 @@ export function stringWidth(string: string): number {
 	}
 
 	return width;
+}
+
+/**
+ * Removes the ANSI escape sequences from a string (colours and styles, cursor movements, OSC 8 hyperlinks, window titles...), leaving
+ * the text a terminal would show, as `strip-ansi` does. Sequences are found by their ECMA-48 syntax, the same way {@link stringWidth}
+ * ignores them:
+ * - CSI sequences, introduced by `ESC [` or the C1 control U+009B (`'\x1b[1;31m'`, `'\x1b[2K'`, `'\x9b0m'`);
+ * - control strings, introduced by `ESC ]` (OSC), `ESC P` (DCS), `ESC X`, `ESC ^`, `ESC _` or their C1 forms (U+009D, U+0090,
+ *   U+0098, U+009E, U+009F), up to a BEL, `ESC \` or U+009C terminator: a hyperlink keeps only its text. As in terminals, an ESC, CAN,
+ *   SUB or another introducer cancels the string (CAN and SUB are kept, an ESC or introducer starts the next sequence);
+ * - other escapes: `ESC`, intermediate bytes and a final byte (`'\x1b(B'`, `'\x1b7'`, `'\x1bc'`).
+ *
+ * A CSI sequence or a control string that the text ends inside is removed to the end, since a terminal waits for the rest of it. Unlike
+ * `strip-ansi`, DCS, SOS, PM and APC strings are removed whole (`strip-ansi` only removes their introducer and terminator) and a CSI
+ * sequence is read by its syntax, so a malformed one such as `'\x1b[31\n'` loses only `ESC [` (a complete escape on its own).
+ *
+ * Then every ESC and C1 introducer left (U+001B, U+0090, U+0098, U+009B, U+009D–U+009F: one that starts no complete sequence, such as a
+ * lone `ESC` before another ESC) is removed too, so the output never holds one: removing a sequence can never splice a stray ESC onto
+ * the text after it into a working sequence (`'\x1b\x1b[0m]2;title\x07'` would otherwise give `'\x1b]2;title\x07'`, which sets the
+ * window title), and `stripAnsi(stripAnsi(text)) === stripAnsi(text)`. Other control characters (`\t`, `\n`, `\r`, BEL outside a control
+ * string, CAN, SUB, U+009C...) are kept. Linear time, and a string without ESC or C1 introducers is returned as it is.
+ * @param {string} string - The text to clean
+ * @returns {string} The text without escape sequences
+ * @throws {TypeError} when `string` is not a string
+ * @example
+ * stripAnsi('\x1b[1m\x1b[31mError:\x1b[39m\x1b[22m not found'); // => 'Error: not found'
+ * stripAnsi('\x1b]8;;https://example.com\x07docs\x1b]8;;\x07'); // => 'docs'
+ * stripAnsi('\x1b]8;;https://example.com\x1b\\docs\x1b]8;;\x1b\\'); // => 'docs'
+ * stripAnsi('plain text'); // => 'plain text'
+ * stripAnsi('\x1b\x1b[0m]2;title\x07after'); // => ']2;title\x07after' // the stray ESC is removed too
+ */
+export function stripAnsi(string: string): string {
+	assertString('stripAnsi', 'string', string);
+
+	return ANSI_START.test(string) ? string.replace(ANSI_SEQUENCE, '').replace(ANSI_STARTS, '') : string;
+}
+
+/**
+ * Whether a code unit is HTML white space (tab, line feed, form feed, carriage return or space).
+ * @param {number} code - The code unit (`NaN` past the end of a string)
+ * @returns {boolean} `true` for `\t`, `\n`, `\f`, `\r` and `' '`
+ */
+function isHtmlSpace(code: number): boolean {
+	return code === 32 || code === 9 || code === 10 || code === 12 || code === 13;
+}
+
+/**
+ * Whether a code unit is an ASCII letter (what a tag name starts with).
+ * @param {number} code - The code unit (`NaN` past the end of a string)
+ * @returns {boolean} `true` for `A`–`Z` and `a`–`z`
+ */
+function isAsciiLetter(code: number): boolean {
+	const lower = code | 32;
+
+	return lower >= 97 && lower <= 122;
+}
+
+/**
+ * Finds the end of a tag, as the HTML tokenizer does: past the tag name and the attributes (a quoted attribute value may hold `>`).
+ * @param {string} html - The HTML
+ * @param {number} index - The position of the first letter of the tag name
+ * @returns {number} The position after the closing `>`, or the length of `html` when the tag is not closed
+ */
+function tagEnd(html: string, index: number): number {
+	const length = html.length;
+	let code = html.charCodeAt(index);
+
+	// The tag name.
+	while (index < length && !(isHtmlSpace(code) || code === 47 || code === 62)) code = html.charCodeAt(++index);
+
+	for (;;) {
+		// Before an attribute name: white space and `/` are skipped.
+		while (isHtmlSpace(code) || code === 47) code = html.charCodeAt(++index);
+
+		if (index >= length) return length;
+		if (code === 62) return index + 1;
+
+		// A character of an attribute name (the first one may be `=`; the next ones are read by the next iterations, which stop where a
+		// name ends), then the white space after it: a `=` there starts the value.
+		code = html.charCodeAt(++index);
+		while (isHtmlSpace(code)) code = html.charCodeAt(++index);
+
+		if (code === 61) {
+			// The value: quoted (and then it may hold `>`), or unquoted, up to white space or `>`.
+			do code = html.charCodeAt(++index);
+			while (isHtmlSpace(code));
+
+			if (code === 34 || code === 39) {
+				index = html.indexOf(code === 34 ? '"' : "'", index + 1);
+				if (index === -1) return length;
+				code = html.charCodeAt(++index);
+			} else {
+				while (index < length && !(isHtmlSpace(code) || code === 62)) code = html.charCodeAt(++index);
+			}
+		}
+	}
+}
+
+/** The end tags that close the raw text elements whose content {@link stripHtml} removes (followed by what may end a tag name). */
+const RAW_TEXT_ENDS: Readonly<Record<string, RegExp>> = { script: /<\/script[\t\n\f\r />]/gi, style: /<\/style[\t\n\f\r />]/gi };
+
+/** A start tag (from its name, as a sticky match) of an element in {@link RAW_TEXT_ENDS}. */
+const RAW_TEXT_START = /(script|style)(?=[\t\n\f\r />])/iy;
+
+/** The end of a comment: `-->`, or `--!>` as browsers also accept. */
+const COMMENT_END = /--!?>/g;
+
+/**
+ * Finds the end of the markup that starts with a `<` (see {@link stripHtml}).
+ * @param {string} html - The HTML
+ * @param {number} open - The position of the `<`
+ * @returns {number} The position after the markup, or `open` itself when the `<` is text
+ */
+function markupEnd(html: string, open: number): number {
+	const next = html.charCodeAt(open + 1);
+
+	if (isAsciiLetter(next)) {
+		const end = tagEnd(html, open + 1);
+
+		RAW_TEXT_START.lastIndex = open + 1;
+
+		const raw = RAW_TEXT_START.exec(html);
+
+		if (raw === null) return end;
+
+		// A script or style element: its content is not markup, and is removed up to its end tag (or to the end of the text).
+		const closing = RAW_TEXT_ENDS[raw[1].toLowerCase()];
+
+		closing.lastIndex = end;
+
+		return closing.exec(html) === null ? html.length : tagEnd(html, closing.lastIndex - 1);
+	}
+
+	if (next === 33 && html.startsWith('--', open + 2)) {
+		// A comment; `<!-->` and `<!--->` are complete ones.
+		if (html.charCodeAt(open + 4) === 62) return open + 5;
+		if (html.startsWith('->', open + 4)) return open + 6;
+		COMMENT_END.lastIndex = open + 4;
+
+		return COMMENT_END.exec(html) === null ? html.length : COMMENT_END.lastIndex;
+	}
+
+	if (next === 47) {
+		const after = html.charCodeAt(open + 2);
+
+		// An end tag, `</` at the very end (text), or anything else up to `>` (a bogus comment, which drops `</>` too).
+		if (isAsciiLetter(after)) return tagEnd(html, open + 2);
+		if (Number.isNaN(after)) return open;
+	} else if (next !== 33 && next !== 63) {
+		// `<` before anything but a letter, `/`, `!` or `?` is text (`a < b`).
+		return open;
+	}
+
+	// `<!DOCTYPE ...>`, `<![CDATA[...]]>`, `<?xml ...?>` and other bogus comments end at the first `>`.
+	const end = html.indexOf('>', open + 2);
+
+	return end === -1 ? html.length : end + 1;
+}
+
+/**
+ * Extracts the text of an HTML fragment, for previews, search indexes, notifications or plain-text e-mails: tags, comments, doctypes and
+ * processing instructions are removed, the content of `<script>` and `<style>` elements is dropped, and `&lt;`, `&gt;`, `&quot;`,
+ * `&#39;`/`&apos;` and `&amp;` are decoded (see {@link unescapeHtml}; other entities, such as `&nbsp;`, are kept as they are). The text
+ * of the other elements, white space included, is kept as it is (like `textContent`, so `'<p>a</p><p>b</p>'` gives `'ab'`; see
+ * {@link normalizeWhitespace}).
+ *
+ * The markup is read the way browsers tokenize it, in one linear pass without regular expression backtracking: a `>` inside a quoted
+ * attribute value does not end the tag, a `<` that does not start a tag (`a < b`, `<3`) is text, a tag or comment left open at the end
+ * is removed to the end (as browsers drop it), and a script or style element without an end tag hides the rest of the text.
+ *
+ * NOT A SANITIZER: this is text extraction, not XSS protection. The output is plain text, and it is not safe to insert into HTML: decoding
+ * turns `'&lt;img src=x onerror=alert(1)&gt;'` into a real-looking tag, and even without entities, the text around a removed tag can
+ * recombine into one (`'<<b>img src=x onerror=alert(1)>'` gives `'<img src=x onerror=alert(1)>'`). Never insert the output as HTML:
+ * escape it (with {@link escapeHtml}) first, or set it as `textContent`; to keep some markup, use a DOM-based sanitizer such as DOMPurify.
+ * @param {string} html - The HTML to extract the text from
+ * @returns {string} The text
+ * @throws {TypeError} when `html` is not a string
+ * @example
+ * stripHtml('<p>Hello <b>world</b>!</p>'); // => 'Hello world!'
+ * stripHtml('Tom &amp; Jerry<script>alert("<b>")</script><!-- note -->'); // => 'Tom & Jerry'
+ * stripHtml('<a title="a > b" href="/x">link</a> 1 < 2'); // => 'link 1 < 2'
+ * stripHtml('&lt;b&gt;not a tag&lt;/b&gt;'); // => '<b>not a tag</b>' // plain text: escape it before inserting it into HTML
+ */
+export function stripHtml(html: string): string {
+	assertString('stripHtml', 'html', html);
+
+	let text = '';
+	// The start of the text not copied yet.
+	let start = 0;
+
+	for (let open = html.indexOf('<'); open !== -1;) {
+		const end = markupEnd(html, open);
+
+		if (end === open) {
+			open = html.indexOf('<', open + 1);
+		} else {
+			// Each run of text is decoded on its own: an entity never spans a tag.
+			text += unescapeHtml(html.slice(start, open));
+			start = end;
+			open = html.indexOf('<', end);
+		}
+	}
+
+	return text + unescapeHtml(html.slice(start));
+}
+
+/**
+ * Options accepted by {@link indent}.
+ */
+export interface IndentOptions {
+	/** The indentation unit, repeated `count` times (only used when `count` is a number). Defaults to `' '`. */
+	readonly indent?: string;
+	/** Also indent the lines that are empty or only hold white space. Defaults to `false`, so no trailing white space is created. */
+	readonly includeEmptyLines?: boolean;
+}
+
+/** Any character other than white space or a line terminator. */
+const NON_BLANK = /\S/;
+
+/**
+ * Indents every line of a string, the inverse of {@link dedent}: `count` repetitions of `options.indent` (a space by default), or the
+ * given string, are inserted at the start of each line. Lines are separated by `\n`, `\r\n` or `\r`, which are kept as they are. Lines
+ * that are empty or only hold white space are left alone unless `includeEmptyLines` is set (then the empty line after a final line break
+ * is indented too, as `indent-string` does).
+ * @param {string} string - The text to indent
+ * @param {number | string} count - How many times to repeat `options.indent` (a non-negative integer), or the indentation itself
+ * @param {IndentOptions} [options={}] - `indent` (default `' '`) and `includeEmptyLines` (default `false`)
+ * @returns {string} The indented text
+ * @throws {TypeError} when `string` or `options.indent` is not a string, or `count` is neither a number nor a string
+ * @throws {RangeError} when `count` is a number but not a non-negative integer
+ * @example
+ * indent('a\n\nb', 2); // => '  a\n\n  b'
+ * indent('a\r\nb', '\t'); // => '\ta\r\n\tb'
+ * indent('quote\n', 1, { indent: '> ', includeEmptyLines: true }); // => '> quote\n> '
+ * dedent(indent('if (x) {\n  y();\n}', 4)); // => 'if (x) {\n  y();\n}'
+ */
+export function indent(string: string, count: number | string, options: IndentOptions = {}): string {
+	assertString('indent', 'string', string);
+
+	let prefix: string;
+
+	if (typeof count === 'string') {
+		prefix = count;
+	} else {
+		if (typeof count !== 'number') throw new TypeError(`indent: \`count\` must be an integer >= 0 or a string, got ${describe(count)}`);
+		assertInteger('indent', 'count', count);
+
+		const unit = readOption(options, 'indent', ' ');
+
+		assertString('indent', 'indent', unit);
+		prefix = unit.repeat(count);
+	}
+
+	if (prefix === '') return string;
+
+	const includeEmptyLines = readOption(options, 'includeEmptyLines');
+	// The lines at even indices, their separators at odd ones.
+	const parts = string.split(/(\r\n|\r|\n)/);
+
+	for (let index = 0; index < parts.length; index += 2) if (includeEmptyLines || NON_BLANK.test(parts[index])) parts[index] = prefix + parts[index];
+
+	return parts.join('');
+}
+
+/**
+ * Splits a string at the first occurrence of a separator, like Rust's `split_once`: `key=value=x` gives `['key', 'value=x']`. The
+ * separator is matched literally; an empty separator matches at the start (`['', string]`), as `indexOf('')` does.
+ * @param {string} string - The string to split
+ * @param {string} separator - The separator
+ * @returns {[before: string, after: string] | undefined} The text before and after the separator, or `undefined` when it does not occur
+ * @throws {TypeError} when `string` or `separator` is not a string
+ * @example
+ * splitOnce('key=value=x', '='); // => ['key', 'value=x']
+ * splitOnce('no separator', '='); // => undefined
+ * const [name, value] = splitOnce('Content-Type: text/html', ': ') ?? ['', '']; // name is 'Content-Type', value 'text/html'
+ */
+export function splitOnce(string: string, separator: string): [before: string, after: string] | undefined {
+	assertString('splitOnce', 'string', string);
+	assertString('splitOnce', 'separator', separator);
+
+	const index = string.indexOf(separator);
+
+	return index === -1 ? undefined : [string.slice(0, index), string.slice(index + separator.length)];
+}
+
+/**
+ * Splits a string at the last occurrence of a separator, like Rust's `rsplit_once`: `archive.tar.gz` split at `.` gives
+ * `['archive.tar', 'gz']`. The separator is matched literally; an empty separator matches at the end (`[string, '']`), as
+ * `lastIndexOf('')` does.
+ * @param {string} string - The string to split
+ * @param {string} separator - The separator
+ * @returns {[before: string, after: string] | undefined} The text before and after the separator, or `undefined` when it does not occur
+ * @throws {TypeError} when `string` or `separator` is not a string
+ * @example
+ * splitLast('archive.tar.gz', '.'); // => ['archive.tar', 'gz']
+ * splitLast('src/strings/index.ts', '/'); // => ['src/strings', 'index.ts']
+ * splitLast('README', '.'); // => undefined
+ */
+export function splitLast(string: string, separator: string): [before: string, after: string] | undefined {
+	assertString('splitLast', 'string', string);
+	assertString('splitLast', 'separator', separator);
+
+	const index = string.lastIndexOf(separator);
+
+	return index === -1 ? undefined : [string.slice(0, index), string.slice(index + separator.length)];
+}
+
+/**
+ * Options accepted by {@link toSafeFilename}.
+ */
+export interface SafeFilenameOptions {
+	/** Replaces each run of invalid characters (it may be empty, and must not hold an invalid character itself). Defaults to `'_'`. */
+	readonly replacement?: string;
+	/** The maximum length of the name in UTF-8 bytes (an integer >= 1, or `Infinity`). Defaults to `255`. */
+	readonly maxLength?: number;
+}
+
+/**
+ * The characters {@link toSafeFilename} replaces: the ones Windows forbids (`< > : " / \ | ? *` and the C0 controls, which include NUL),
+ * the slash, backslash and colon lookalikes that Windows' "best-fit" conversion to an ANSI code page turns into real ones (`\u2215 \u2044 \uff0f \u29f8`,
+ * `\u2216 \uff3c \u29f9 \ufe68`, `\uff1a`), DEL and the C1 controls, the bidirectional controls that can disguise an extension (`'invoice\u202efdp.exe'`
+ * displays as `invoiceexe.pdf`), and lone surrogates (which no file system encoding can store).
+ */
+// eslint-disable-next-line no-control-regex -- control characters are what is removed
+const FILENAME_INVALID = /[<>:"/\\|?*\0-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\u2044\u2215\u2216\u29f8\u29f9\ufe68\uff0f\uff1a\uff3c\p{Cs}]+/gu;
+
+/**
+ * The Windows device names (case-insensitive), which cannot be file names even with an extension or spaces before it (`nul.txt`,
+ * `COM1 .log`): `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, and `COM` or `LPT` followed by a digit or `¹`, `²`, `³`.
+ */
+const WINDOWS_DEVICE = /^(?:con|prn|aux|nul|conin\$|conout\$|(?:com|lpt)[0-9¹²³])(?= *(?:\.|$))/i;
+
+/**
+ * Computes the length of a string in UTF-8 bytes (a lone surrogate counts as 2 bytes, as half a pair).
+ * @param {string} string - The string
+ * @returns {number} Its UTF-8 length
+ */
+function utf8Length(string: string): number {
+	let bytes = string.length;
+
+	for (let index = 0; index < string.length; index++) {
+		const code = string.charCodeAt(index);
+
+		// 1 byte per ASCII code unit, 2 for the others up to U+07FF and for each surrogate (4 per pair), 3 for the rest of the BMP.
+		if (code >= 0x80) bytes += code < 0x800 || (code >= 0xd800 && code <= 0xdfff) ? 1 : 2;
+	}
+
+	return bytes;
+}
+
+/**
+ * Keeps the longest run of whole graphemes from the start of a string that fits in a number of UTF-8 bytes.
+ * @param {string} string - The string
+ * @param {number} budget - The number of bytes
+ * @returns {string} The prefix (possibly empty)
+ */
+function fitBytes(string: string, budget: number): string {
+	if (utf8Length(string) <= budget) return string;
+
+	let fitted = '';
+	let used = 0;
+
+	// Every grapheme takes at least one byte, so the first `budget` graphemes are enough.
+	for (const grapheme of splitGraphemes(string, budget)) {
+		used += utf8Length(grapheme);
+		if (used > budget) break;
+		fitted += grapheme;
+	}
+
+	return fitted;
+}
+
+/**
+ * Removes the dots and spaces at the end of a string (which Windows drops from file names).
+ * @param {string} string - The string
+ * @returns {string} The string without them
+ */
+function trimDotsAndSpaces(string: string): string {
+	let end = string.length;
+
+	// A loop rather than `/[. ]+$/`, which backtracks quadratically over a long run of dots or spaces that does not reach the end.
+	while (end > 0 && (string[end - 1] === '.' || string[end - 1] === ' ')) end--;
+
+	return string.slice(0, end);
+}
+
+/**
+ * Turns any text (a title, a user-supplied name, a URL) into a file name that is valid on Windows, macOS and Linux, like `filenamify`:
+ * - each run of invalid characters (`< > : " / \ | ? *`, control characters, bidirectional controls and lone surrogates) becomes
+ *   `replacement` (`'_'` by default), so the result never holds a path separator. So does each run of the lookalikes of `/`, `\` and
+ *   `:` that Windows programs calling the ANSI APIs "best-fit" into real ones (the WorstFit attacks): U+2215 `∕`, U+2044 `⁄`,
+ *   U+FF0F `／`, U+29F8 `⧸`, U+2216 `∖`, U+FF3C `＼`, U+29F9 `⧹`, U+FE68 `﹨` and U+FF1A `：`. Currency signs such as `¥` and `₩` are
+ *   kept, as the legitimate characters they are, although the Japanese and Korean ANSI code pages map them to `\`: never pass the
+ *   names to ANSI APIs there;
+ * - dots and spaces at the end are removed (Windows drops them), so `'.'` and `'..'` cannot come out;
+ * - the name is cut to `maxLength` UTF-8 bytes (255 by default, the limit of most file systems; it also keeps the name within the
+ *   255 UTF-16 code units of NTFS), between grapheme clusters, keeping the extension (from the last `.`, when it holds no space and
+ *   is not the first character) when the name still has room for something before it;
+ * - a Windows device name gets a `_` after it (`con.txt` → `con_.txt`, `LPT1` → `LPT1_`; if the name is already `maxLength` bytes
+ *   long, its last letter becomes `_` instead), and a name that would be empty becomes `'_'`.
+ *
+ * The result is never empty, `.` or `..`, and holds no path separator. A leading dot is kept, so a dotfile name (`.htaccess`, `.env`)
+ * stays one: reject names starting with `.` yourself where an upload must not create a hidden or configuration file. Letters are not
+ * normalized or transliterated (see
+ * {@link toSlug} for ASCII-only names), so two inputs that differ in Unicode normalization give different names.
+ * @param {string} string - The text to turn into a file name
+ * @param {SafeFilenameOptions} [options={}] - `replacement` (default `'_'`) and `maxLength` (default `255`)
+ * @returns {string} A safe file name
+ * @throws {TypeError} when `string` or `replacement` is not a string, or `maxLength` is not a number
+ * @throws {RangeError} when `replacement` holds a character that is invalid in file names, or `maxLength` is not an integer >= 1 (or `Infinity`)
+ * @example
+ * toSafeFilename('Q1/Q2 report: "final"?.pdf'); // => 'Q1_Q2 report_ _final_.pdf'
+ * toSafeFilename('aux.txt'); // => 'aux_.txt'
+ * toSafeFilename('../etc/passwd', { replacement: '-' }); // => '..-etc-passwd'
+ * toSafeFilename('notes. . .'); // => 'notes'
+ * toSafeFilename('..'); // => '_'
+ * toSafeFilename('a'.repeat(300) + '.txt').length; // => 255
+ * toSafeFilename('crème brûlée.txt', { maxLength: 10 }); // => 'crème.txt'
+ * toSafeFilename('..∕..＼secret：x.txt'); // => '.._.._secret_x.txt'
+ */
+export function toSafeFilename(string: string, options: SafeFilenameOptions = {}): string {
+	assertString('toSafeFilename', 'string', string);
+
+	const replacement = readOption(options, 'replacement', '_');
+	const maxLength = readOption(options, 'maxLength', 255);
+
+	assertString('toSafeFilename', 'replacement', replacement);
+	if (replacement.search(FILENAME_INVALID) !== -1)
+		throw new RangeError(`toSafeFilename: \`replacement\` must not hold characters that are invalid in file names, got ${JSON.stringify(replacement)}`);
+	assertInteger('toSafeFilename', 'maxLength', maxLength, 1, true);
+
+	let name = trimDotsAndSpaces(
+		string.replace(FILENAME_INVALID, function (): string {
+			return replacement;
+		})
+	);
+	const dot = name.lastIndexOf('.');
+	const extension = dot > 0 && !name.includes(' ', dot) ? name.slice(dot) : '';
+	// The stem, cut to the room the extension leaves (`''` when there is no extension, or no room even for the first grapheme).
+	const stem = extension === '' ? '' : fitBytes(name.slice(0, dot), maxLength - utf8Length(extension));
+
+	name = stem === '' ? trimDotsAndSpaces(fitBytes(name, maxLength)) : stem + extension;
+
+	if (name === '') return '_';
+
+	const device = WINDOWS_DEVICE.exec(name);
+
+	if (device !== null) {
+		const end = device[0].length;
+
+		name = name.slice(0, utf8Length(name) < maxLength ? end : end - 1) + '_' + name.slice(end);
+	}
+
+	return name;
 }

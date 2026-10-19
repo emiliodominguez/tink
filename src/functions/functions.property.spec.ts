@@ -1,14 +1,23 @@
 import fc from 'fast-check';
+import { isMatching } from '../guards/index.js';
 import {
+	_,
 	allPass,
+	anyOf,
 	anyPass,
 	attempt,
+	capture,
+	captureAs,
 	compose,
+	composeAsync,
+	cons,
 	curry,
 	debounce,
 	defaultMemoizeKey,
 	flip,
 	match,
+	matcher,
+	matchWith,
 	memoize,
 	memoizeLast,
 	negate,
@@ -16,6 +25,7 @@ import {
 	partial,
 	partialRight,
 	pipe,
+	pipeAsync,
 	times
 } from '.';
 
@@ -409,7 +419,7 @@ describe('Functions helpers (properties)', function () {
 					});
 					expect(result).toHaveLength(n);
 					expect(seen).toEqual(
-						Array.from({ length: n }, function (_, i) {
+						Array.from({ length: n }, function (_unused, i) {
 							return i;
 						})
 					);
@@ -516,6 +526,248 @@ describe('round 11 helpers (properties)', function () {
 				});
 				expect(result[0]).toBe(tag);
 				expect(result[1]).toBe(value);
+			})
+		);
+	});
+});
+
+describe('pipeAsync / composeAsync (properties)', function () {
+	/** A step, synchronous or returning a promise of the same result. */
+	const step = fc.tuple(intFn, fc.boolean()).map(function ([fn, wrapped]): [IntFn, (x: number) => number | Promise<number>] {
+		return [
+			fn,
+			wrapped
+				? async function (x: number): Promise<number> {
+						return fn(x);
+					}
+				: fn
+		];
+	});
+
+	it('resolves to what pipe and compose return for the same steps, awaited or not', async function () {
+		await fc.assert(
+			fc.asyncProperty(fc.array(step, { maxLength: 8 }), smallInt, async function (steps, x) {
+				const plain = steps.map(function ([fn]) {
+					return fn;
+				});
+				const mixed = steps.map(function ([, fn]) {
+					return fn;
+				});
+				await expect(pipeAsync(...mixed)(x)).resolves.toBe(pipe(...plain)(x));
+				await expect(composeAsync(...mixed)(x)).resolves.toBe(compose(...plain)(x));
+				await expect(composeAsync(...mixed)(x)).resolves.toBe(await pipeAsync(...mixed.slice().reverse())(x));
+			})
+		);
+	});
+});
+
+describe('matchWith / matcher (properties)', function () {
+	/** A small pattern language: literals, `_`, guards, objects, tuples, or-patterns and cons patterns. */
+	type Pattern = unknown;
+
+	function isText(value: unknown): value is string {
+		return typeof value === 'string';
+	}
+
+	function isSmall(value: unknown): boolean {
+		return typeof value === 'number' && value < 2;
+	}
+
+	const leaf = fc.constantFrom<unknown>(1, 2, 'a', null, undefined, true, NaN, 0, _, isText, isSmall);
+	const { pattern } = fc.letrec<{ pattern: Pattern }>(function (tie) {
+		return {
+			pattern: fc.oneof(
+				{ depthSize: 'small', withCrossShrink: true },
+				leaf,
+				fc.dictionary(fc.constantFrom('a', 'b', 'c'), tie('pattern'), { maxKeys: 3 }),
+				fc.array(tie('pattern'), { maxLength: 3 }),
+				fc.array(tie('pattern'), { minLength: 1, maxLength: 3 }).map(function (alternatives) {
+					return { anyOf: alternatives };
+				}),
+				fc.tuple(tie('pattern'), fc.option(tie('pattern'), { nil: undefined })).map(function ([head, tail]) {
+					return { cons: [head, tail] };
+				})
+			)
+		};
+	});
+	const { value } = fc.letrec<{ value: unknown }>(function (tie) {
+		return {
+			value: fc.oneof(
+				{ depthSize: 'small', withCrossShrink: true },
+				fc.constantFrom<unknown>(1, 2, -0, 'a', 'b', null, undefined, true, false, NaN),
+				fc.dictionary(fc.constantFrom('a', 'b', 'c'), tie('value'), { maxKeys: 3 }),
+				fc.array(tie('value'), { maxLength: 4 })
+			)
+		};
+	});
+
+	/**
+	 * Builds the pattern for matchWith: `{ anyOf }` and `{ cons }` markers become the helpers (only at the top of a generated node).
+	 * @param {Pattern} node - The generated node
+	 * @returns {unknown} The pattern
+	 */
+	function build(node: Pattern): unknown {
+		if (Array.isArray(node)) return node.map(build);
+		if (typeof node !== 'object' || node === null) return node;
+		const record = node as Record<string, unknown>;
+		if (Object.keys(record).length === 1 && Array.isArray(record.anyOf)) return anyOf(...record.anyOf.map(build));
+		if (Object.keys(record).length === 1 && Array.isArray(record.cons)) {
+			const [head, tail] = record.cons as [unknown, unknown];
+			return tail === undefined ? cons(build(head)) : cons(build(head), build(tail));
+		}
+		return Object.fromEntries(
+			Object.entries(record).map(function ([key, inner]) {
+				return [key, build(inner)];
+			})
+		);
+	}
+
+	/**
+	 * The naive reference: an isMatching guard, the helpers spelled out as plain guards.
+	 * @param {Pattern} node - The generated node
+	 * @returns {(value: unknown) => boolean} The guard
+	 */
+	function reference(node: Pattern): (value: unknown) => boolean {
+		return isMatching(spell(node)) as (value: unknown) => boolean;
+	}
+
+	function spell(node: Pattern): unknown {
+		if (Array.isArray(node)) return node.map(spell);
+		if (typeof node !== 'object' || node === null) return node;
+		const record = node as Record<string, unknown>;
+		if (Object.keys(record).length === 1 && Array.isArray(record.anyOf)) {
+			const alternatives = record.anyOf.map(reference);
+			return function (candidate: unknown): boolean {
+				return alternatives.some(function (alternative) {
+					return alternative(candidate);
+				});
+			};
+		}
+		if (Object.keys(record).length === 1 && Array.isArray(record.cons)) {
+			const [head, tail] = record.cons as [unknown, unknown];
+			const isHead = reference(head);
+			const isTail = tail === undefined ? _ : reference(tail);
+			return function (candidate: unknown): boolean {
+				return Array.isArray(candidate) && candidate.length > 0 && isHead(candidate[0]) && isTail(candidate.slice(1));
+			};
+		}
+		return Object.fromEntries(
+			Object.entries(record).map(function ([key, inner]) {
+				return [key, spell(inner)];
+			})
+		);
+	}
+
+	it('runs the first case whose pattern matches, like a naive first-match over isMatching, one-shot or reused', function () {
+		fc.assert(
+			fc.property(fc.array(pattern, { minLength: 1, maxLength: 4 }), value, function (cases, candidate) {
+				const expected = cases.findIndex(function (node) {
+					return reference(node)(candidate);
+				});
+				let oneShot = matchWith(candidate);
+				let reused = matcher<unknown>();
+				cases.forEach(function (node, index) {
+					oneShot = oneShot.with(build(node), function () {
+						return index;
+					}) as typeof oneShot;
+					reused = reused.with(build(node), function () {
+						return index;
+					}) as typeof reused;
+				});
+				function none(): number {
+					return -1;
+				}
+				expect(oneShot.otherwise(none)).toBe(expected);
+				expect(reused.otherwise(none)(candidate)).toBe(expected);
+			})
+		);
+	});
+
+	it('anyOf matches the union of what its patterns match', function () {
+		fc.assert(
+			fc.property(pattern, pattern, value, function (first, second, candidate) {
+				const union = isMatching(anyOf(build(first), build(second)))(candidate);
+				expect(union).toBe(reference(first)(candidate) || reference(second)(candidate));
+				expect(
+					matchWith(candidate)
+						.with(anyOf(build(first), build(second)), function () {
+							return true;
+						})
+						.otherwise(function () {
+							return false;
+						})
+				).toBe(union);
+			})
+		);
+	});
+
+	it('a capture matches what its pattern matches and passes the value it matched', function () {
+		const nothing = Symbol('nothing');
+		fc.assert(
+			fc.property(pattern, value, function (node, candidate) {
+				const selected = matchWith({ key: candidate })
+					.with({ key: capture(build(node)) }, function (selection) {
+						return selection;
+					})
+					.otherwise(function () {
+						return nothing;
+					});
+				expect(selected).toBe(reference(node)(candidate) ? candidate : nothing);
+			})
+		);
+	});
+
+	it('exhaustive cases never throw for values of the declared type, and pick the case a reference picks', function () {
+		type Value = { kind: 'a' } | { kind: 'b'; flags: [boolean, boolean] } | { kind: 'c'; items: number[] };
+		const values = fc.oneof(
+			fc.constant<Value>({ kind: 'a' }),
+			fc.tuple(fc.boolean(), fc.boolean()).map(function (flags): Value {
+				return { kind: 'b', flags };
+			}),
+			fc.array(fc.integer(), { maxLength: 3 }).map(function (items): Value {
+				return { kind: 'c', items };
+			})
+		);
+		const describeValue = matcher<Value>()
+			.with({ kind: 'b', flags: [true, _] }, function () {
+				return 'b first';
+			})
+			.with({ kind: 'c', items: [] }, function () {
+				return 'c empty';
+			})
+			.with({ kind: 'b', flags: [false, captureAs('second')] }, function ({ second }) {
+				return `b second ${second}`;
+			})
+			.with({ kind: 'c', items: cons(captureAs('head')) }, function ({ head }) {
+				return `c head ${head}`;
+			})
+			.with({ kind: 'a' }, function () {
+				return 'a';
+			})
+			.exhaustive();
+		fc.assert(
+			fc.property(values, function (candidate) {
+				const expected =
+					candidate.kind === 'a'
+						? 'a'
+						: candidate.kind === 'b'
+							? candidate.flags[0]
+								? 'b first'
+								: `b second ${candidate.flags[1]}`
+							: candidate.items.length === 0
+								? 'c empty'
+								: `c head ${candidate.items[0]}`;
+				expect(describeValue(candidate)).toBe(expected);
+			})
+		);
+	});
+
+	it('cons matches non-empty arrays by head and tail', function () {
+		fc.assert(
+			fc.property(pattern, pattern, fc.array(value, { maxLength: 4 }), function (head, tail, list) {
+				// An `undefined` tail means any tail (no array is `undefined`).
+				const isTail = tail === undefined ? _ : reference(tail);
+				expect(cons(build(head), build(tail))(list)).toBe(list.length > 0 && reference(head)(list[0]) && isTail(list.slice(1)));
 			})
 		);
 	});

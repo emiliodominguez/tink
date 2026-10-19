@@ -1,5 +1,5 @@
 import { clamp, lerp, modulo, round } from '../math/index.js';
-import { assertNumber, describe, readOption, show } from '../utils/assert.js';
+import { assertInteger, assertNumber, describe, readOption, show } from '../utils/assert.js';
 
 /**
  * An sRGB colour with 8-bit channels (`0`–`255`). Values produced by this module are always integers in that range.
@@ -116,11 +116,13 @@ export interface MixOptions {
 }
 
 /**
- * Options accepted by {@link lighten} and {@link darken}.
+ * Options accepted by {@link lighten}, {@link darken}, {@link saturate}, {@link desaturate}, {@link grayscale}, {@link rotateHue} and
+ * {@link complement}.
  */
 export interface LightnessOptions {
 	/**
-	 * Whose lightness changes: HSL's (`'hsl'`), or OKLCH's (`'oklch'`), which tracks perceived lightness and keeps chroma and hue.
+	 * The model whose component changes: HSL (`'hsl'`), or OKLCH (`'oklch'`), which tracks perceived lightness, chroma and hue
+	 * separately (changing one keeps the other two, as seen).
 	 * @default 'hsl'
 	 */
 	space?: 'hsl' | 'oklch';
@@ -636,6 +638,35 @@ function isSpace(code: number): boolean {
 }
 
 /**
+ * Strips CSS white space (see {@link SPACE}) from both ends of a string: `String.prototype.trim` also strips no-break spaces, line
+ * separators, BOMs...
+ * @param {string} input - The string
+ * @returns {string} The string without leading and trailing CSS white space
+ * @example
+ * trimSpace('\t#fff \n'); // => '#fff'
+ */
+function trimSpace(input: string): string {
+	let start = 0;
+	let end = input.length;
+	while (start < end && isSpace(input.charCodeAt(start))) start++;
+	while (end > start && isSpace(input.charCodeAt(end - 1))) end--;
+	return input.slice(start, end);
+}
+
+/**
+ * Parses a CSS colour string as {@link parseColor} does, without throwing.
+ * @param {string} input - The string to parse
+ * @returns {Rgba | undefined} The colour, or `undefined` when `input` is not a supported CSS colour
+ * @example
+ * parseCssText(' transparent '); // => { r: 0, g: 0, b: 0, a: 0 }
+ * parseCssText('red'); // => undefined
+ */
+function parseCssText(input: string): Rgba | undefined {
+	const text = trimSpace(input);
+	return parseHexDigits(text) ?? (text.length === 11 && text.toLowerCase() === 'transparent' ? { r: 0, g: 0, b: 0, a: 0 } : parseCssFunction(text));
+}
+
+/**
  * Parses a CSS colour string for `caller`.
  * @param {string} caller - Name of the public function, used in the error message
  * @param {string} name - Name of the validated parameter
@@ -646,13 +677,7 @@ function isSpace(code: number): boolean {
  * parseCssColor('toRgba', 'input', 'transparent'); // => { r: 0, g: 0, b: 0, a: 0 }
  */
 function parseCssColor(caller: string, name: string, input: string): Rgba {
-	// Strip CSS white space only (`String.prototype.trim` also strips no-break spaces, line separators, BOMs...).
-	let start = 0;
-	let end = input.length;
-	while (start < end && isSpace(input.charCodeAt(start))) start++;
-	while (end > start && isSpace(input.charCodeAt(end - 1))) end--;
-	const text = input.slice(start, end);
-	const color = parseHexDigits(text) ?? (text.length === 11 && text.toLowerCase() === 'transparent' ? { r: 0, g: 0, b: 0, a: 0 } : parseCssFunction(text));
+	const color = parseCssText(input);
 	if (color === undefined) {
 		throw new TypeError(`${caller}: \`${name}\` must be a CSS colour (hex, rgb(), hsl(), oklab(), oklch() or 'transparent'), got ${quote(input)}`);
 	}
@@ -681,8 +706,10 @@ function parseCssColor(caller: string, name: string, input: string): Rgba {
  * The alpha is a number or a percentage. Out-of-range values are clamped as in CSS: channels to `[0, 255]`, saturation and
  * lightness to `[0%, 100%]`, alpha to `[0, 1]`; the hue wraps around. Channels are then rounded to integers (alpha is not rounded).
  * Numbers too large for a double (e.g. `1e999`) are rejected.
- * Named colours (`red`, `rebeccapurple`, ...), `currentcolor`, `calc()` and the other colour functions (`hwb()`, `lab()`, `lch()`,
- * `color()`, ...) are deliberately not supported, to keep the bundle small.
+ * Named colours (`red`, `rebeccapurple`, ...) are not accepted here, so that `parseColor` (and every helper taking a colour string)
+ * does not ship their table: parse them with the opt-in {@link parseNamedColor} (`parseNamedColor(s) ?? parseColor(s)`).
+ * `currentcolor`, `calc()` and the other colour functions (`hwb()`, `lab()`, `lch()`, `color()`, ...) are deliberately not supported,
+ * to keep the bundle small. {@link isCssColor} tells, without throwing, whether a value is a string `parseColor` accepts.
  * @param {string} input - The CSS colour string
  * @returns {Rgba} A new colour object with integer channels
  * @throws {TypeError} when `input` is not a string, or not one of the supported colour syntaxes
@@ -704,6 +731,143 @@ function parseCssColor(caller: string, name: string, input: string): Rgba {
 export function parseColor(input: string): Rgba {
 	if (typeof input !== 'string') throw new TypeError(`parseColor: \`input\` must be a string, got ${describe(input)}`);
 	return parseCssColor('parseColor', 'input', input);
+}
+
+/**
+ * Tells whether a value is a CSS colour string that {@link parseColor} accepts (so that `parseColor(value)` will not throw): hex
+ * (with or without `#`), `rgb()`, `rgba()`, `hsl()`, `hsla()`, `oklab()`, `oklch()` or `'transparent'`. Never throws. Named colours
+ * are not accepted (see {@link parseNamedColor}).
+ * @param {unknown} value - The value to test
+ * @returns {boolean} `true` when `value` is a string `parseColor` accepts
+ * @example
+ * isCssColor('#ff8000'); // => true
+ * isCssColor(' hsl(120deg 100% 25% / 50%) '); // => true
+ * isCssColor('rgb(1, 2)'); // => false
+ * isCssColor('red'); // => false // named colours: see parseNamedColor
+ * isCssColor({ r: 0, g: 0, b: 0 }); // => false
+ */
+export function isCssColor(value: unknown): value is string {
+	return typeof value === 'string' && parseCssText(value) !== undefined;
+}
+
+/**
+ * The CSS named colours, decoded on first use from a packed string (so that they cost nothing to the helpers that do not use them):
+ * name (lowercase) to `0xrrggbb`, in alphabetical order.
+ */
+let NAMED_COLORS: Map<string, number> | undefined;
+
+/**
+ * The OKLab coordinates of the named colours, in the table's order: computed on the first nearest-name lookup of {@link toColorName}.
+ */
+let NAMED_LABS: Array<[name: string, lab: ReturnType<typeof oklabOf>]> | undefined;
+
+/**
+ * Returns the table of the 148 CSS named colours (CSS Color 4 `<named-color>`, `transparent` excluded), decoding it on first use.
+ * @returns {Map<string, number>} Lowercase name to `0xrrggbb`, in alphabetical order
+ * @example
+ * namedColors().get('rebeccapurple'); // => 0x663399
+ */
+function namedColors(): Map<string, number> {
+	if (NAMED_COLORS === undefined) {
+		NAMED_COLORS = new Map();
+		// Each entry is a lowercase name followed by its six uppercase hex digits (disjoint alphabets, so the pattern is linear).
+		const packed =
+			'aliceblueF0F8FFantiquewhiteFAEBD7aqua00FFFFaquamarine7FFFD4azureF0FFFFbeigeF5F5DCbisqueFFE4C4black000000blanchedalmondFFEBCDblue0000FFblueviolet8A2BE2brownA52A2AburlywoodDEB887cadetblue5F9EA0chartreuse7FFF00chocolateD2691EcoralFF7F50cornflowerblue6495EDcornsilkFFF8DCcrimsonDC143Ccyan00FFFFdarkblue00008Bdarkcyan008B8BdarkgoldenrodB8860BdarkgrayA9A9A9darkgreen006400darkgreyA9A9A9darkkhakiBDB76Bdarkmagenta8B008Bdarkolivegreen556B2FdarkorangeFF8C00darkorchid9932CCdarkred8B0000darksalmonE9967Adarkseagreen8FBC8Fdarkslateblue483D8Bdarkslategray2F4F4Fdarkslategrey2F4F4Fdarkturquoise00CED1darkviolet9400D3deeppinkFF1493deepskyblue00BFFFdimgray696969dimgrey696969dodgerblue1E90FFfirebrickB22222floralwhiteFFFAF0forestgreen228B22fuchsiaFF00FFgainsboroDCDCDCghostwhiteF8F8FFgoldFFD700goldenrodDAA520gray808080green008000greenyellowADFF2Fgrey808080honeydewF0FFF0hotpinkFF69B4indianredCD5C5Cindigo4B0082ivoryFFFFF0khakiF0E68ClavenderE6E6FAlavenderblushFFF0F5lawngreen7CFC00lemonchiffonFFFACDlightblueADD8E6lightcoralF08080lightcyanE0FFFFlightgoldenrodyellowFAFAD2lightgrayD3D3D3lightgreen90EE90lightgreyD3D3D3lightpinkFFB6C1lightsalmonFFA07Alightseagreen20B2AAlightskyblue87CEFAlightslategray778899lightslategrey778899lightsteelblueB0C4DElightyellowFFFFE0lime00FF00limegreen32CD32linenFAF0E6magentaFF00FFmaroon800000mediumaquamarine66CDAAmediumblue0000CDmediumorchidBA55D3mediumpurple9370DBmediumseagreen3CB371mediumslateblue7B68EEmediumspringgreen00FA9Amediumturquoise48D1CCmediumvioletredC71585midnightblue191970mintcreamF5FFFAmistyroseFFE4E1moccasinFFE4B5navajowhiteFFDEADnavy000080oldlaceFDF5E6olive808000olivedrab6B8E23orangeFFA500orangeredFF4500orchidDA70D6palegoldenrodEEE8AApalegreen98FB98paleturquoiseAFEEEEpalevioletredDB7093papayawhipFFEFD5peachpuffFFDAB9peruCD853FpinkFFC0CBplumDDA0DDpowderblueB0E0E6purple800080rebeccapurple663399redFF0000rosybrownBC8F8Froyalblue4169E1saddlebrown8B4513salmonFA8072sandybrownF4A460seagreen2E8B57seashellFFF5EEsiennaA0522DsilverC0C0C0skyblue87CEEBslateblue6A5ACDslategray708090slategrey708090snowFFFAFAspringgreen00FF7Fsteelblue4682B4tanD2B48Cteal008080thistleD8BFD8tomatoFF6347turquoise40E0D0violetEE82EEwheatF5DEB3whiteFFFFFFwhitesmokeF5F5F5yellowFFFF00yellowgreen9ACD32';
+		for (const match of packed.matchAll(/([a-z]+)([\dA-F]{6})/g)) NAMED_COLORS.set(match[1], parseInt(match[2], 16));
+	}
+	return NAMED_COLORS;
+}
+
+/**
+ * Parses a CSS named colour (CSS Color 4: the 148 `<named-color>` keywords, such as `'red'` or `'rebeccapurple'`, and `'transparent'`).
+ * Names are ASCII case-insensitive, and CSS white space around them is ignored (as in {@link parseColor}). Returns `undefined` for any
+ * other string, so it chains with `parseColor`: `parseNamedColor(s) ?? parseColor(s)` parses every colour either one accepts.
+ *
+ * Opt-in on purpose: the table (about 1.1 kB gzipped) is only bundled with this function and {@link toColorName}, never with
+ * `parseColor` or the other helpers, and it is decoded on first use.
+ * @param {string} name - The colour name
+ * @returns {Rgba | undefined} A new colour object, or `undefined` when `name` is not a CSS colour name
+ * @throws {TypeError} when `name` is not a string
+ * @example
+ * parseNamedColor('rebeccapurple'); // => { r: 102, g: 51, b: 153, a: 1 }
+ * parseNamedColor(' DarkSlateGrey '); // => { r: 47, g: 79, b: 79, a: 1 }
+ * parseNamedColor('transparent'); // => { r: 0, g: 0, b: 0, a: 0 }
+ * parseNamedColor('#ff0000'); // => undefined
+ * const input = 'hsl(0 100% 50%)';
+ * parseNamedColor(input) ?? parseColor(input); // => { r: 255, g: 0, b: 0, a: 1 }
+ */
+export function parseNamedColor(name: string): Rgba | undefined {
+	if (typeof name !== 'string') throw new TypeError(`parseNamedColor: \`name\` must be a string, got ${describe(name)}`);
+	const text = trimSpace(name);
+	// ASCII letters only (without the `u` flag, `i` never matches non-ASCII letters such as the Kelvin sign with `k`).
+	if (text.length > 20 || !/^[a-z]+$/i.test(text)) return undefined;
+	const lower = text.toLowerCase();
+	if (lower === 'transparent') return { r: 0, g: 0, b: 0, a: 0 };
+	const value = namedColors().get(lower);
+	return value === undefined ? undefined : { r: value >> 16, g: (value >> 8) & 255, b: value & 255, a: 1 };
+}
+
+/**
+ * Options accepted by {@link toColorName}.
+ */
+export interface ColorNameOptions {
+	/**
+	 * `false` returns a name only for a colour that is exactly a named colour; `true` returns the perceptually closest named colour
+	 * (smallest OKLab distance, deltaEOK) whatever the colour, ignoring its alpha.
+	 * @default false
+	 */
+	nearest?: boolean;
+}
+
+/**
+ * Names a colour with its CSS named colour (see {@link parseNamedColor}).
+ *
+ * - By default the match is exact: the 8-bit channels must be those of a named colour and the colour opaque (`'transparent'` names
+ *   `{ r: 0, g: 0, b: 0, a: 0 }` only); any other colour gives `undefined`. So a name is only returned when it denotes the very same
+ *   colour, and `parseNamedColor(toColorName(c))` gives back `c`.
+ * - `{ nearest: true }` always returns a name: the closest named colour by OKLab distance, alpha ignored (`'transparent'` is never
+ *   returned). Useful to label a picked colour; the name may only be a rough description (the 148 names cover the gamut unevenly).
+ *
+ * Colours with several names (`aqua`/`cyan`, `fuchsia`/`magenta`, the `gray`/`grey` spellings) get the first one alphabetically.
+ * @param {ColorInput} color - The colour (see {@link toRgba}; colour names are not accepted as input, use `parseNamedColor` first)
+ * @param {ColorNameOptions} [options={}] - `nearest` (default `false`)
+ * @returns {string | undefined} The lowercase name, or `undefined` when there is no exact match
+ * @throws {TypeError} when `color` is invalid (see {@link toRgba})
+ * @throws {RangeError} when a channel is `NaN`
+ * @example
+ * toColorName('#663399'); // => 'rebeccapurple'
+ * toColorName({ r: 0, g: 255, b: 255 }); // => 'aqua'
+ * toColorName('#808080'); // => 'gray'
+ * toColorName('#ff0001'); // => undefined
+ * toColorName('#ff0001', { nearest: true }); // => 'red'
+ * toColorName('rgb(255 0 0 / 50%)'); // => undefined // translucent
+ * toColorName('transparent'); // => 'transparent'
+ */
+export function toColorName(color: ColorInput, options: ColorNameOptions = {}): string | undefined {
+	const rgba = toRgba(color);
+	const table = namedColors();
+	const value = (rgba.r << 16) | (rgba.g << 8) | rgba.b;
+	if (!readOption(options, 'nearest', false)) {
+		if (rgba.a < 1) return rgba.a === 0 && value === 0 ? 'transparent' : undefined;
+		for (const [name, packed] of table) if (packed === value) return name;
+		return undefined;
+	}
+	if (NAMED_LABS === undefined) {
+		NAMED_LABS = [];
+		for (const [name, packed] of table) NAMED_LABS.push([name, oklabOf({ r: packed >> 16, g: (packed >> 8) & 255, b: packed & 255 })]);
+	}
+	const lab = oklabOf(rgba);
+	let best = '';
+	let distance = Infinity;
+	for (const [name, other] of NAMED_LABS) {
+		const delta = Math.hypot(lab[0] - other[0], lab[1] - other[1], lab[2] - other[2]);
+		// Strictly closer: among equally close names (exact duplicates), the first alphabetically wins.
+		if (delta < distance) {
+			best = name;
+			distance = delta;
+		}
+	}
+	return best;
 }
 
 /**
@@ -857,13 +1021,102 @@ function hslOf(rgb: Rgb): Hsl {
 	if (delta === 0) return { h: 0, s: 0, l: lightness * 100 };
 
 	const saturation = delta / (1 - Math.abs(2 * lightness - 1));
-	let hue: number;
-	if (high === r) hue = (g - b) / delta;
-	else if (high === g) hue = (b - r) / delta + 2;
-	else hue = (r - g) / delta + 4;
+	// The saturation is positive, so it only needs capping.
+	return { h: hueOf(r, g, b, high, delta), s: Math.min(saturation * 100, 100), l: lightness * 100 };
+}
+
+/**
+ * Computes the hue shared by HSL and HSV (CSS Color 4 formula) from channels in `[0, 1]`.
+ * @param {number} r - Red, `[0, 1]`
+ * @param {number} g - Green, `[0, 1]`
+ * @param {number} b - Blue, `[0, 1]`
+ * @param {number} high - The largest channel
+ * @param {number} delta - The largest channel minus the smallest one
+ * @returns {number} The hue in `[0, 360)`; `0` for greys (`delta = 0`)
+ * @example
+ * hueOf(0, 0, 1, 1, 1); // => 240
+ */
+function hueOf(r: number, g: number, b: number, high: number, delta: number): number {
+	if (delta === 0) return 0;
+	const hue = high === r ? (g - b) / delta : high === g ? (b - r) / delta + 2 : (r - g) / delta + 4;
 	// `hue * 60` lies in `(-60, 300]` (and is never within rounding distance of `-0` or `-360`), so wrapping it into `[0, 360)`
-	// takes one addition; the saturation is positive, so it only needs capping.
-	return { h: hue < 0 ? hue * 60 + 360 : hue * 60, s: Math.min(saturation * 100, 100), l: lightness * 100 };
+	// takes one addition.
+	return hue < 0 ? hue * 60 + 360 : hue * 60;
+}
+
+/**
+ * A colour in the HSV (also called HSB) model, as colour pickers use it.
+ */
+export interface Hsv {
+	/** Hue in degrees, `[0, 360)`. */
+	h: number;
+	/** Saturation in percent, `0`–`100`. */
+	s: number;
+	/** Value (brightness) in percent, `0`–`100`. */
+	v: number;
+}
+
+/**
+ * Converts an RGB colour to HSV (HSB), the model of most colour pickers (a hue slider over a saturation/value square). The result is
+ * not rounded. Achromatic colours (greys) get hue `0` and saturation `0`; black also gets saturation `0`. Alpha is ignored.
+ * @param {ColorInput} color - The colour (channels are clamped and rounded first, see {@link toRgba})
+ * @returns {Hsv} Hue in `[0, 360)`, saturation and value in `[0, 100]`
+ * @throws {TypeError} when `color` is not a valid colour (see {@link toRgba})
+ * @throws {RangeError} when a channel is `NaN`
+ * @example
+ * rgbToHsv({ r: 255, g: 0, b: 0 }); // => { h: 0, s: 100, v: 100 }
+ * rgbToHsv('#336699'); // => { h: 210, s: 66.66666666666666, v: 60 }
+ * rgbToHsv('#000000'); // => { h: 0, s: 0, v: 0 }
+ */
+export function rgbToHsv(color: ColorInput): Hsv {
+	const rgba = toRgba(color);
+	const r = rgba.r / 255;
+	const g = rgba.g / 255;
+	const b = rgba.b / 255;
+	const high = Math.max(r, g, b);
+	const delta = high - Math.min(r, g, b);
+	return { h: hueOf(r, g, b, high, delta), s: high === 0 ? 0 : (delta / high) * 100, v: high * 100 };
+}
+
+/**
+ * Converts an HSV (HSB) colour to RGB, rounding channels to integers. The hue is normalized into `[0, 360)` (so `-120` and `600` both
+ * mean `240`); saturation and value are clamped to `[0, 100]`. Inverse of {@link rgbToHsv}: every 8-bit colour converts back exactly.
+ * @param {Hsv} hsv - The colour in HSV
+ * @returns {Rgb} The colour in RGB with integer channels in `[0, 255]`
+ * @throws {TypeError} when `hsv` is not an object or a component is not a number
+ * @throws {RangeError} when a component is `NaN` or the hue is infinite
+ * @example
+ * hsvToRgb({ h: 0, s: 100, v: 100 }); // => { r: 255, g: 0, b: 0 }
+ * hsvToRgb({ h: 210, s: 50, v: 60 }); // => { r: 77, g: 115, b: 153 }
+ * hsvToRgb({ h: -120, s: 100, v: 100 }); // => { r: 0, g: 0, b: 255 }
+ * hsvToRgb({ h: 120, s: 0, v: 50 }); // => { r: 128, g: 128, b: 128 }
+ */
+export function hsvToRgb(hsv: Hsv): Rgb {
+	if (typeof hsv !== 'object' || hsv === null) throw new TypeError(`hsvToRgb: \`hsv\` must be an { h, s, v } object, got ${describe(hsv)}`);
+	const hue = readChannel('hsvToRgb', 'hsv.h', hsv.h);
+	if (!Number.isFinite(hue)) throw new RangeError(`hsvToRgb: \`hsv.h\` must be finite, got ${hue}`);
+	const h = hue >= 0 && hue < 360 ? hue : modulo(hue, 360);
+	// A `-0` saturation or value is harmless: `toByte` never returns `-0`.
+	const s = clamp(readChannel('hsvToRgb', 'hsv.s', hsv.s), 0, 100) / 100;
+	const v = clamp(readChannel('hsvToRgb', 'hsv.v', hsv.v), 0, 100) / 100;
+	return { r: hsvChannel(5, h, s, v), g: hsvChannel(3, h, s, v), b: hsvChannel(1, h, s, v) };
+}
+
+/**
+ * Computes one RGB channel with the standard `hsvToRgb` formula.
+ * @param {number} offset - `5` for red, `3` for green, `1` for blue
+ * @param {number} h - The hue in `[0, 360)`
+ * @param {number} s - The saturation in `[0, 1]`
+ * @param {number} v - The value in `[0, 1]`
+ * @returns {number} The channel as an integer in `[0, 255]`
+ * @example
+ * hsvChannel(5, 0, 1, 1); // => 255
+ */
+function hsvChannel(offset: number, h: number, s: number, v: number): number {
+	// `offset + h / 60` lies in `[0, 11)`: one exact subtraction replaces the (slow, floating-point) `% 6`.
+	let k = offset + h / 60;
+	if (k >= 6) k -= 6;
+	return toByte((v - v * s * Math.max(0, Math.min(k, 4 - k, 1))) * 255);
 }
 
 /**
@@ -958,14 +1211,42 @@ function hslChannel(offset: number, h: number, l: number, chroma: number): numbe
  */
 export function mix(colorA: ColorInput, colorB: ColorInput, weight = 0.5, options: MixOptions = {}): Rgba {
 	assertNumber('mix', 'weight', weight, weight >= 0 && weight <= 1, 'a number in [0, 1]');
+	const [space, hue] = readMixOptions('mix', options);
+	return mixRgba(toRgba(colorA), toRgba(colorB), weight, space, hue);
+}
+
+/**
+ * Reads and validates the {@link MixOptions} for `caller`.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {MixOptions} options - The options
+ * @returns {[MixSpace, HueInterpolation]} The space and the hue interpolation method
+ * @throws {RangeError} when `space` or `hue` is unknown
+ * @example
+ * readMixOptions('mix', {}); // => ['srgb', 'shorter']
+ */
+function readMixOptions(caller: string, options: MixOptions): [MixSpace, HueInterpolation] {
 	const space = readOption(options, 'space', 'srgb');
 	const hue = readOption(options, 'hue', 'shorter');
-	if (space !== 'srgb' && space !== 'oklab' && space !== 'oklch') throw new RangeError(`mix: \`options.space\` must be 'srgb', 'oklab' or 'oklch', got ${show(space)}`);
+	if (space !== 'srgb' && space !== 'oklab' && space !== 'oklch')
+		throw new RangeError(`${caller}: \`options.space\` must be 'srgb', 'oklab' or 'oklch', got ${show(space)}`);
 	if (hue !== 'shorter' && hue !== 'longer' && hue !== 'increasing' && hue !== 'decreasing') {
-		throw new RangeError(`mix: \`options.hue\` must be 'shorter', 'longer', 'increasing' or 'decreasing', got ${show(hue)}`);
+		throw new RangeError(`${caller}: \`options.hue\` must be 'shorter', 'longer', 'increasing' or 'decreasing', got ${show(hue)}`);
 	}
-	const a = toRgba(colorA);
-	const b = toRgba(colorB);
+	return [space, hue];
+}
+
+/**
+ * Mixes two normalized colours, as {@link mix} does (the arguments are already validated).
+ * @param {Rgba} a - The colour at `weight = 0`, normalized by {@link toRgba}
+ * @param {Rgba} b - The colour at `weight = 1`, normalized by {@link toRgba}
+ * @param {number} weight - Proportion of `b`, in `[0, 1]`
+ * @param {MixSpace} space - The interpolation space
+ * @param {HueInterpolation} hue - The hue interpolation method
+ * @returns {Rgba} A new colour
+ * @example
+ * mixRgba({ r: 0, g: 0, b: 0, a: 1 }, { r: 255, g: 255, b: 255, a: 1 }, 0.5, 'srgb', 'shorter'); // => { r: 128, g: 128, b: 128, a: 1 }
+ */
+function mixRgba(a: Rgba, b: Rgba, weight: number, space: MixSpace, hue: HueInterpolation): Rgba {
 	// Clamp to the inputs: `(1 - w) * x + w * y` can overshoot max(x, y) by one ulp.
 	const alpha = clamp(lerp(a.a, b.a, weight), Math.min(a.a, b.a), Math.max(a.a, b.a)) + 0;
 	const target = { r: 0, g: 0, b: 0, a: alpha };
@@ -999,30 +1280,168 @@ export function mix(colorA: ColorInput, colorB: ColorInput, weight = 0.5, option
 }
 
 /**
- * Shifts the lightness of a colour by `delta` percentage points, keeping alpha: HSL lightness (clamped to `[0, 100]`, keeping hue and
- * saturation), or OKLCH lightness (`1` = `100` points, keeping chroma and hue, gamut mapped).
+ * Options accepted by {@link colorScale} and {@link colorSteps}: those of {@link mix} (`space`, `hue`), which interpolates each
+ * segment between two consecutive stops, plus the stop positions.
+ */
+export interface ColorScaleOptions extends MixOptions {
+	/**
+	 * Positions of the stops: one finite number per stop, strictly increasing (`[0, 0.2, 1]` puts the middle stop at `0.2`); or just
+	 * the two ends, the stops being spread evenly between them (`[0, 100]`). Positions outside it clamp to its ends.
+	 * @default [0, 1]
+	 */
+	domain?: readonly number[];
+}
+
+/**
+ * Builds the interpolating function of {@link colorScale} and {@link colorSteps}.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {readonly ColorInput[]} stops - The colours
+ * @param {ColorScaleOptions} options - `space`, `hue` and `domain`
+ * @returns {[(t: number) => Rgba, number, number]} The function (for a `t` other than `NaN`), and the ends of the domain
+ * @throws {TypeError} when `stops` or `domain` is not an array, a stop is invalid or a position is not a number
+ * @throws {RangeError} when `stops` is empty, `space` or `hue` is unknown, or `domain` is not as documented
+ * @example
+ * scaleOf('colorScale', ['#000', '#fff'], {})[0](0.5); // => { r: 128, g: 128, b: 128, a: 1 }
+ */
+function scaleOf(caller: string, stops: readonly ColorInput[], options: ColorScaleOptions): [(t: number) => Rgba, number, number] {
+	if (!Array.isArray(stops)) throw new TypeError(`${caller}: \`stops\` must be an array of colours, got ${describe(stops)}`);
+	if (stops.length === 0) throw new RangeError(`${caller}: \`stops\` must hold at least one colour, got an empty array`);
+	const [space, hue] = readMixOptions(caller, options);
+	const domain = readOption(options, 'domain');
+	// `Array.from`, not `map`: a hole is an invalid (`undefined`) stop, not a skipped one.
+	const colors = Array.from(stops, function (stop) {
+		return toRgba(stop);
+	});
+	const last = colors.length - 1;
+	let positions: readonly number[] = [0, 1];
+	if (domain !== undefined) {
+		if (!Array.isArray(domain)) throw new TypeError(`${caller}: \`options.domain\` must be an array of numbers, got ${describe(domain)}`);
+		if (domain.length !== 2 && domain.length !== colors.length) {
+			throw new RangeError(`${caller}: \`options.domain\` must hold 2 or ${colors.length} positions (one per stop), got ${domain.length}`);
+		}
+		for (let i = 0; i < domain.length; i++) {
+			const position: unknown = domain[i];
+			const valid = Number.isFinite(position) && (i === 0 || (position as number) > domain[i - 1]);
+			assertNumber(caller, `options.domain[${i}]`, position, valid, i === 0 ? 'a finite number' : `a finite number > options.domain[${i - 1}]`);
+		}
+		positions = domain.slice();
+	}
+	const start = positions[0];
+	// A single stop makes a constant scale: every `t` clamps to it.
+	const end = last === 0 ? start : positions[positions.length - 1];
+	if (positions.length !== colors.length) {
+		// Two ends for several stops (or the default): spread the stops evenly.
+		positions = colors.map(function (_, i) {
+			return lerp(start, end, i / last);
+		});
+	}
+
+	return [
+		function (t: number): Rgba {
+			if (t <= start) return { ...colors[0] };
+			if (t >= end) return { ...colors[last] };
+			// Binary search for the segment with `positions[low] <= t < positions[high]`.
+			let low = 0;
+			let high = last;
+			while (high - low > 1) {
+				const middle = (low + high) >> 1;
+				if (positions[middle] <= t) low = middle;
+				else high = middle;
+			}
+			// Rounding is monotonic, so the weight stays in [0, 1). A span too large for a double (a domain of [-1e308, 1e308]) is halved
+			// first: halving such large numbers is exact (unlike subnormal ones, which must not be halved).
+			const span = positions[high] - positions[low];
+			const weight = span === Infinity ? (t / 2 - positions[low] / 2) / (positions[high] / 2 - positions[low] / 2) : (t - positions[low]) / span;
+			return mixRgba(colors[low], colors[high], weight, space, hue);
+		},
+		start,
+		end
+	];
+}
+
+/**
+ * Creates a colour scale (a gradient as a function, like `chroma.scale` or culori's `interpolate`): `scale(t)` interpolates between
+ * the two stops around position `t`, with {@link mix} and its options (`space: 'oklab'` or `'oklch'` gives perceptually even
+ * gradients without the muddy midpoints of sRGB). The stops are at the `domain` positions: by default spread evenly over `[0, 1]`.
+ * A `t` outside the domain clamps to its ends. The stops are parsed once, when the scale is created; every call returns a new object.
+ * @param {readonly ColorInput[]} stops - The colours (at least one; a single one makes a constant scale)
+ * @param {ColorScaleOptions} [options={}] - `space` (default `'srgb'`), `hue` (default `'shorter'`) and `domain` (default `[0, 1]`)
+ * @returns {(t: number) => Rgba} The scale, which throws a `TypeError` when `t` is not a number and a `RangeError` when it is `NaN`
+ * @throws {TypeError} when `stops` or `domain` is not an array, a stop is invalid (see {@link toRgba}) or a position is not a number
+ * @throws {RangeError} when `stops` is empty, `space` or `hue` is unknown, or `domain` does not hold 2 or `stops.length` finite,
+ * strictly increasing positions
+ * @example
+ * const heat = colorScale(['#0000ff', '#ffffff', '#ff0000']);
+ * heat(0); // => { r: 0, g: 0, b: 255, a: 1 }
+ * heat(0.25); // => { r: 128, g: 128, b: 255, a: 1 }
+ * heat(0.5); // => { r: 255, g: 255, b: 255, a: 1 }
+ * heat(2); // => { r: 255, g: 0, b: 0, a: 1 } // clamped
+ * const temperature = colorScale(['#0000ff', '#ffffff', '#ff0000'], { domain: [-20, 0, 40] });
+ * temperature(20); // => { r: 255, g: 128, b: 128, a: 1 }
+ * colorScale(['#0000ff', '#ffff00'], { space: 'oklch' })(0.5); // => { r: 0, g: 189, b: 176, a: 1 }
+ * colorScale(['#000', '#fff'], { domain: [1, 0] }); // throws RangeError
+ */
+export function colorScale(stops: readonly ColorInput[], options: ColorScaleOptions = {}): (t: number) => Rgba {
+	const [at] = scaleOf('colorScale', stops, options);
+	return function (t: number): Rgba {
+		if (typeof t !== 'number' || t !== t) assertNumber('colorScale', 't', t, false, 'a number other than NaN');
+		return at(t);
+	};
+}
+
+/**
+ * Samples `count` evenly spaced colours from a colour scale (see {@link colorScale}), both ends of the domain included: a palette
+ * for a chart's series or a design system's shades. `count = 1` gives the first stop and `count = 0` an empty array.
+ * @param {readonly ColorInput[]} stops - The colours (at least one)
+ * @param {number} count - The number of colours, an integer `>= 0`
+ * @param {ColorScaleOptions} [options={}] - `space` (default `'srgb'`), `hue` (default `'shorter'`) and `domain` (default `[0, 1]`):
+ * the samples are evenly spaced over the domain, so uneven stop positions shape the palette
+ * @returns {Rgba[]} The colours, from the start of the domain to its end
+ * @throws {TypeError} when `stops` or `domain` is not an array, a stop is invalid (see {@link toRgba}), or `count` or a position is not
+ * a number
+ * @throws {RangeError} when `count` is not an integer `>= 0`, or as {@link colorScale}
+ * @example
+ * colorSteps(['#000000', '#ffffff'], 3); // => [{ r: 0, g: 0, b: 0, a: 1 }, { r: 128, g: 128, b: 128, a: 1 }, { r: 255, g: 255, b: 255, a: 1 }]
+ * colorSteps(['#000000', '#ffffff'], 3, { space: 'oklab' }).map(function (c) { return toHex(c); }); // => ['#000000', '#636363', '#ffffff']
+ * colorSteps(['#ff0000', '#0000ff'], 1); // => [{ r: 255, g: 0, b: 0, a: 1 }]
+ * colorSteps(['#ff0000'], 2.5); // throws RangeError
+ */
+export function colorSteps(stops: readonly ColorInput[], count: number, options: ColorScaleOptions = {}): Rgba[] {
+	assertInteger('colorSteps', 'count', count);
+	const [at, start, end] = scaleOf('colorSteps', stops, options);
+	const colors: Rgba[] = [];
+	for (let i = 0; i < count; i++) colors.push(at(lerp(start, end, count > 1 ? i / (count - 1) : 0)));
+	return colors;
+}
+
+/**
+ * Shifts the lightness, saturation and hue of a colour, keeping alpha. In HSL: lightness and saturation by percentage points (clamped
+ * to `[0, 100]`), the hue by degrees. In OKLCH: lightness by percentage points (`1` = `100` points), chroma by percentage points of
+ * CSS's `100% = 0.4` (a negative chroma counts as `0`), the hue by degrees; the result is gamut mapped.
  * @param {string} caller - Name of the public function, used in error messages
  * @param {ColorInput} color - The colour
- * @param {number} delta - Lightness change, in `[-100, 100]`
  * @param {LightnessOptions} options - `space`
+ * @param {number} lightness - Lightness change, in `[-100, 100]`
+ * @param {number} saturation - Saturation (chroma) change, in `[-100, 100]`
+ * @param {number} hue - Hue rotation in degrees (finite)
  * @returns {Rgba} The adjusted colour
  * @throws {RangeError} when `options.space` is unknown
  * @example
- * shiftLightness('lighten', '#808080', 10, {}); // lighter grey
+ * adjust('lighten', '#808080', {}, 10, 0, 0); // lighter grey
  */
-function shiftLightness(caller: string, color: ColorInput, delta: number, options: LightnessOptions): Rgba {
+function adjust(caller: string, color: ColorInput, options: LightnessOptions, lightness: number, saturation: number, hue: number): Rgba {
 	const space = readOption(options, 'space', 'hsl');
 	if (space !== 'hsl' && space !== 'oklch') throw new RangeError(`${caller}: \`options.space\` must be 'hsl' or 'oklch', got ${show(space)}`);
 	const rgba = toRgba(color);
 	// `toRgba` returns a fresh object: overwrite its channels, keeping its alpha.
 	if (space === 'oklch') {
-		// No shortcut is needed for `delta = 0`: the OKLab round trip is exact for every 8-bit colour.
+		// No shortcut is needed for null changes: the OKLCH round trip is exact for every 8-bit colour. A grey has chroma 0 and hue 0.
 		const lab = oklabOf(rgba);
-		return oklabToBytes(lab[0] + delta / 100, lab[1], lab[2], rgba);
+		return oklchToBytes(lab[0] + lightness / 100, Math.hypot(lab[1], lab[2]) + saturation * 0.004, Math.atan2(lab[2], lab[1]) * DEGREES + hue, rgba);
 	}
 	// Nor here: the HSL round trip is exact too.
 	const hsl = hslOf(rgba);
-	return hslValuesToRgb(hsl.h, hsl.s, hsl.l + delta, rgba);
+	return hslValuesToRgb(hsl.h + hue, hsl.s + saturation, hsl.l + lightness, rgba);
 }
 
 /**
@@ -1045,7 +1464,7 @@ function shiftLightness(caller: string, color: ColorInput, delta: number, option
  */
 export function lighten(color: ColorInput, amount: number, options: LightnessOptions = {}): Rgba {
 	assertNumber('lighten', 'amount', amount, amount >= 0 && amount <= 100, 'a number in [0, 100]');
-	return shiftLightness('lighten', color, amount, options);
+	return adjust('lighten', color, options, amount, 0, 0);
 }
 
 /**
@@ -1065,7 +1484,104 @@ export function lighten(color: ColorInput, amount: number, options: LightnessOpt
  */
 export function darken(color: ColorInput, amount: number, options: LightnessOptions = {}): Rgba {
 	assertNumber('darken', 'amount', amount, amount >= 0 && amount <= 100, 'a number in [0, 100]');
-	return shiftLightness('darken', color, -amount, options);
+	return adjust('darken', color, options, -amount, 0, 0);
+}
+
+/**
+ * Makes a colour more saturated by adding `amount` percentage points: to its HSL saturation by default (clamped at `100`, keeping hue
+ * and lightness, like Sass's `saturate`), or with `{ space: 'oklch' }` to its OKLCH chroma, where `100` points are `0.4` as in CSS
+ * percentages (keeping perceived lightness and hue, gamut mapped). Alpha is kept. A grey has no hue: it is tinted towards hue `0`
+ * (red in HSL, pink in OKLCH). `saturate(color, 0)` returns the (normalized) colour unchanged.
+ * @param {ColorInput} color - The colour
+ * @param {number} amount - Saturation points to add, in `[0, 100]`
+ * @param {LightnessOptions} [options={}] - `space`: `'hsl'` (default) or `'oklch'`
+ * @returns {Rgba} The more saturated colour
+ * @throws {TypeError} when `color` is invalid (see {@link toRgba}), or `amount` is not a number
+ * @throws {RangeError} when `amount` is not in `[0, 100]`, `options.space` is unknown, or a channel is `NaN`
+ * @example
+ * saturate('#996666', 20); // => { r: 179, g: 77, b: 77, a: 1 }
+ * saturate('#ff0000', 50); // => { r: 255, g: 0, b: 0, a: 1 } // already fully saturated
+ * saturate('#996666', 5, { space: 'oklch' }); // => { r: 162, g: 96, b: 97, a: 1 }
+ */
+export function saturate(color: ColorInput, amount: number, options: LightnessOptions = {}): Rgba {
+	assertNumber('saturate', 'amount', amount, amount >= 0 && amount <= 100, 'a number in [0, 100]');
+	return adjust('saturate', color, options, 0, amount, 0);
+}
+
+/**
+ * Makes a colour less saturated by subtracting `amount` percentage points: from its HSL saturation by default (clamped at `0`, grey,
+ * keeping hue and lightness, like Sass's `desaturate`), or with `{ space: 'oklch' }` from its OKLCH chroma (`100` points are `0.4`,
+ * clamped at `0`, keeping perceived lightness and hue). Alpha is kept. `desaturate(color, 0)` returns the (normalized) colour unchanged.
+ * @param {ColorInput} color - The colour
+ * @param {number} amount - Saturation points to subtract, in `[0, 100]`
+ * @param {LightnessOptions} [options={}] - `space`: `'hsl'` (default) or `'oklch'`
+ * @returns {Rgba} The less saturated colour
+ * @throws {TypeError} when `color` is invalid (see {@link toRgba}), or `amount` is not a number
+ * @throws {RangeError} when `amount` is not in `[0, 100]`, `options.space` is unknown, or a channel is `NaN`
+ * @example
+ * desaturate('#ff0000', 50); // => { r: 191, g: 64, b: 64, a: 1 }
+ * desaturate('#ff0000', 100); // => { r: 128, g: 128, b: 128, a: 1 }
+ * desaturate('#ff0000', 25, { space: 'oklch' }); // => { r: 215, g: 92, b: 77, a: 1 }
+ */
+export function desaturate(color: ColorInput, amount: number, options: LightnessOptions = {}): Rgba {
+	assertNumber('desaturate', 'amount', amount, amount >= 0 && amount <= 100, 'a number in [0, 100]');
+	return adjust('desaturate', color, options, 0, -amount, 0);
+}
+
+/**
+ * Turns a colour into the grey of the same lightness (same as `desaturate(color, 100, options)`): HSL lightness by default (Sass's
+ * `grayscale`: `#ff0000` and `#0000ff` both give `#808080`), or with `{ space: 'oklch' }` perceived lightness (chroma `0`, so yellow
+ * gives a light grey and blue a dark one, as they look). Alpha is kept.
+ * @param {ColorInput} color - The colour
+ * @param {LightnessOptions} [options={}] - `space`: `'hsl'` (default) or `'oklch'`
+ * @returns {Rgba} The grey
+ * @throws {TypeError} when `color` is invalid (see {@link toRgba})
+ * @throws {RangeError} when `options.space` is unknown, or a channel is `NaN`
+ * @example
+ * grayscale('#ff0000'); // => { r: 128, g: 128, b: 128, a: 1 }
+ * grayscale('#ffff00', { space: 'oklch' }); // => { r: 244, g: 244, b: 244, a: 1 }
+ * grayscale('#0000ff', { space: 'oklch' }); // => { r: 86, g: 86, b: 86, a: 1 }
+ */
+export function grayscale(color: ColorInput, options: LightnessOptions = {}): Rgba {
+	return adjust('grayscale', color, options, 0, -100, 0);
+}
+
+/**
+ * Rotates the hue of a colour by `degrees` (any finite angle, negative included; it wraps around): the HSL hue by default (keeping
+ * saturation and lightness), or with `{ space: 'oklch' }` the OKLCH hue (keeping perceived lightness and chroma, gamut mapped, so the
+ * rotated colours look equally light, which HSL does not guarantee). Greys are unchanged. Alpha is kept.
+ * @param {ColorInput} color - The colour
+ * @param {number} degrees - The rotation, in degrees
+ * @param {LightnessOptions} [options={}] - `space`: `'hsl'` (default) or `'oklch'`
+ * @returns {Rgba} The rotated colour
+ * @throws {TypeError} when `color` is invalid (see {@link toRgba}), or `degrees` is not a number
+ * @throws {RangeError} when `degrees` is not finite, `options.space` is unknown, or a channel is `NaN`
+ * @example
+ * rotateHue('#ff0000', 120); // => { r: 0, g: 255, b: 0, a: 1 }
+ * rotateHue('#ff0000', -120); // => { r: 0, g: 0, b: 255, a: 1 }
+ * rotateHue('#ff0000', 120, { space: 'oklch' }); // => { r: 0, g: 168, b: 54, a: 1 } // as light as the red
+ * rotateHue('#808080', 90); // => { r: 128, g: 128, b: 128, a: 1 }
+ */
+export function rotateHue(color: ColorInput, degrees: number, options: LightnessOptions = {}): Rgba {
+	assertNumber('rotateHue', 'degrees', degrees, Number.isFinite(degrees), 'a finite number');
+	return adjust('rotateHue', color, options, 0, 0, degrees);
+}
+
+/**
+ * Returns the complementary colour: the hue rotated by 180° (see {@link rotateHue}), in HSL by default (as Sass's `complement`) or in
+ * OKLCH with `{ space: 'oklch' }` (the perceptual opposite, as light as the colour). Greys are unchanged. Alpha is kept.
+ * @param {ColorInput} color - The colour
+ * @param {LightnessOptions} [options={}] - `space`: `'hsl'` (default) or `'oklch'`
+ * @returns {Rgba} The complementary colour
+ * @throws {TypeError} when `color` is invalid (see {@link toRgba})
+ * @throws {RangeError} when `options.space` is unknown, or a channel is `NaN`
+ * @example
+ * complement('#ff0000'); // => { r: 0, g: 255, b: 255, a: 1 }
+ * complement('#336699'); // => { r: 153, g: 102, b: 51, a: 1 }
+ * complement({ r: 255, g: 0, b: 0, a: 0.5 }, { space: 'oklch' }); // => { r: 0, g: 156, b: 178, a: 0.5 }
+ */
+export function complement(color: ColorInput, options: LightnessOptions = {}): Rgba {
+	return adjust('complement', color, options, 0, 0, 180);
 }
 
 /**

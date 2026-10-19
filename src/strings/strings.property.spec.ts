@@ -1314,3 +1314,413 @@ describe('String helpers (property-based, new helpers)', function () {
 		});
 	});
 });
+
+/** The pattern of `ansi-regex` 6.4 (used by `strip-ansi` 7), as a reference for the sequences both read the same way. */
+// eslint-disable-next-line no-control-regex -- escape sequences start with control characters
+const ANSI_REGEX_REFERENCE = /(?:\x1b\]|\x9d)[^\x07\x1b\x9c\x9d]*(?:\x07|\x1b\\|\x9c)|[\x1b\x9b][[\]()#;?]*(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]/g;
+
+/** Text without escape sequences: no ESC, no C0 or C1 controls. */
+const plainText = fc
+	.string({ unit: fc.oneof(fc.constantFrom('a', 'Z', ' ', '9', ';', '[', ']', '\\', 'm', 'é', '古', '😀'), fc.string({ minLength: 1, maxLength: 1 })) })
+	.map(function (text) {
+		// eslint-disable-next-line no-control-regex -- removes the control characters from the generated text
+		return text.replace(/[\x00-\x1f\x7f-\x9f]/g, '');
+	});
+
+/** Well-formed escape sequences that `strip-ansi` removes whole too: SGR and other CSI sequences, OSC strings (hyperlinks, titles) with each terminator. */
+const escapeSequence = fc.oneof(
+	fc.array(fc.nat(255), { maxLength: 5 }).map(function (params) {
+		return `\x1b[${params.join(';')}m`;
+	}),
+	fc.tuple(fc.constantFrom('\x1b[', '\x9b'), fc.constantFrom('', '?', '1', '12;3', '?25'), fc.constantFrom('A', 'B', 'H', 'J', 'K', 'h', 'l', 'm')).map(function (parts) {
+		return parts.join('');
+	}),
+	fc
+		.tuple(
+			fc.constantFrom('\x1b]', '\x9d'),
+			fc.constantFrom('8;;', '8;id=1;', '0;', '2;'),
+			fc.string({ unit: fc.constantFrom('h', 't', 'p', ':', '/', '.', 'x', '?', '=', '&', ' ', 'é'), maxLength: 12 }),
+			fc.constantFrom('\x07', '\x1b\\', '\x9c')
+		)
+		.map(function (parts) {
+			return parts.join('');
+		})
+);
+
+describe('String helpers (property-based, text cleanup)', function () {
+	describe('stripAnsi', function () {
+		it('removes every inserted sequence and nothing else', function () {
+			fc.assert(
+				fc.property(fc.array(fc.tuple(plainText, fc.array(escapeSequence, { maxLength: 3 })), { maxLength: 6 }), function (pieces) {
+					const text = pieces
+						.map(function ([plain, codes]) {
+							return codes.join('') + plain;
+						})
+						.join('');
+					const expected = pieces
+						.map(function ([plain]) {
+							return plain;
+						})
+						.join('');
+					expect(helpers.stripAnsi(text)).toBe(expected);
+					expect(helpers.stripAnsi(text)).toBe(text.replace(ANSI_REGEX_REFERENCE, ''));
+				})
+			);
+		});
+
+		it('only removes characters, and leaves text without ESC or C1 introducers alone', function () {
+			fc.assert(
+				fc.property(
+					fc.string({ unit: fc.constantFrom('\x1b', '\x9b', '\x9d', '\x9c', '\x90', '\x07', '[', ']', '\\', ';', '1', 'm', 'a', 'P', '\x18', '古') }),
+					function (text) {
+						const stripped = helpers.stripAnsi(text);
+						// A subsequence of the input.
+						let index = 0;
+						for (const char of stripped) index = text.indexOf(char, index) + 1;
+						expect(index).toBeGreaterThan(stripped === '' ? -1 : 0);
+						expect(stripped.length).toBeLessThanOrEqual(text.length);
+						// eslint-disable-next-line no-control-regex -- the introducers
+						if (!/[\x1b\x90\x98\x9b\x9d-\x9f]/.test(text)) expect(stripped).toBe(text);
+					}
+				)
+			);
+		});
+
+		it('never outputs an ESC or C1 introducer, so stripping twice changes nothing', function () {
+			/** Fragments of sequences, stray introducers and terminators, mixed with any text. */
+			const fragment = fc.oneof(
+				fc.constantFrom('\x1b', '\x1b[', '\x1b]', '\x1bP', '\x1b\\', '\x9b', '\x9d', '\x90', '\x98', '\x9e', '\x9f', '\x9c', '\x07', '\x18', '\x1a'),
+				fc.constantFrom('[', ']', '0', '31', ';', 'm', '2;', '52;c;', '(B', 'a', ' '),
+				escapeSequence,
+				fc.string({ unit: 'binary', maxLength: 3 })
+			);
+			fc.assert(
+				fc.property(fc.array(fragment, { maxLength: 12 }), function (fragments) {
+					const stripped = helpers.stripAnsi(fragments.join(''));
+					// eslint-disable-next-line no-control-regex -- the introducers
+					expect(/[\x1b\x90\x98\x9b\x9d-\x9f]/.test(stripped)).toBe(false);
+					expect(helpers.stripAnsi(stripped)).toBe(stripped);
+				})
+			);
+		});
+
+		it('is the identity on text without ESC or C1 introducers', function () {
+			fc.assert(
+				fc.property(fc.string({ unit: 'binary' }), function (text) {
+					// eslint-disable-next-line no-control-regex -- the introducers
+					const plain = text.replace(/[\x1b\x90\x98\x9b\x9d-\x9f]/g, '');
+					expect(helpers.stripAnsi(plain)).toBe(plain);
+				})
+			);
+		});
+	});
+
+	describe('stripHtml', function () {
+		it('returns any text escaped with escapeHtml', function () {
+			fc.assert(
+				fc.property(fc.string({ unit: 'grapheme' }), function (text) {
+					expect(helpers.stripHtml(helpers.escapeHtml(text))).toBe(text);
+				})
+			);
+		});
+
+		/** An attribute value, with the characters that must not end a tag. */
+		const attributeValue = fc.string({ unit: fc.constantFrom('a', ' ', '<', '>', '/', '=', '-', "'", '"'), maxLength: 6 });
+		/** A piece of markup that holds no text. */
+		const markup = fc.oneof(
+			fc
+				.tuple(
+					fc.constantFrom('a', 'span', 'DIV', 'b', 'x-y'),
+					fc.array(fc.tuple(fc.constantFrom('id', 'title', 'data-x', 'on-click'), attributeValue, fc.constantFrom('"', "'", '')), { maxLength: 3 }),
+					fc.constantFrom('>', '/>', ' >', '\n>')
+				)
+				.map(function ([name, attributes, close]) {
+					return (
+						`<${name}` +
+						attributes
+							.map(function ([key, value, quote]) {
+								// An unquoted value cannot hold white space, quotes, `=`, `<` or `>`.
+								const written = quote === '' ? value.replace(/[\s'"=<>]/g, '') || 'v' : value.split(quote).join('');
+								return ` ${key}=${quote}${written}${quote}`;
+							})
+							.join('') +
+						close
+					);
+				}),
+			fc.constantFrom('a', 'span', 'DIV').map(function (name) {
+				return `</${name}>`;
+			}),
+			fc.string({ unit: fc.constantFrom('a', ' ', '<', '>', '-', '!'), maxLength: 8 }).map(function (content) {
+				// A comment ends at the first `-->` or `--!>`: a space before every `>` keeps the content from holding one.
+				return `<!-- ${content.replace(/>/g, ' >')} -->`;
+			}),
+			fc.constantFrom('<!-->', '<!--->', '<!DOCTYPE html>', '<?xml version="1.0"?>', '<![CDATA[x]]>', '</>', '<br/>'),
+			fc.tuple(fc.constantFrom('script', 'STYLE'), fc.string({ unit: fc.constantFrom('a', '<', '>', '=', 'b', ' ', '"', 's'), maxLength: 10 })).map(function ([
+				name,
+				content
+			]) {
+				// Without `/`, the content cannot hold an end tag.
+				return `<${name}>${content}</${name.toLowerCase()}>`;
+			})
+		);
+
+		it('keeps exactly the (escaped) text between generated markup', function () {
+			fc.assert(
+				fc.property(fc.array(fc.tuple(fc.string({ maxLength: 6 }), markup), { maxLength: 8 }), fc.string({ maxLength: 6 }), function (pieces, last) {
+					const html = pieces
+						.map(function ([text, tag]) {
+							return helpers.escapeHtml(text) + tag;
+						})
+						.join('');
+					const expected = pieces
+						.map(function ([text]) {
+							return text;
+						})
+						.join('');
+					expect(helpers.stripHtml(html + helpers.escapeHtml(last))).toBe(expected + last);
+				})
+			);
+		});
+
+		it('never grows the text, and keeps text without markup', function () {
+			fc.assert(
+				fc.property(
+					fc.string({ unit: fc.constantFrom('<', '>', '/', '!', '-', '?', '"', "'", '=', ' ', 'a', 's', 'c', 'r', 'i', 'p', 't', '&', ';') }),
+					function (html) {
+						const text = helpers.stripHtml(html);
+						expect(text.length).toBeLessThanOrEqual(html.length);
+						if (!/[<&]/.test(html)) expect(text).toBe(html);
+					}
+				)
+			);
+		});
+	});
+
+	describe('indent', function () {
+		it('prefixes every non-blank line and keeps the line breaks', function () {
+			fc.assert(
+				fc.property(
+					fc.string({ unit: fc.constantFrom('a', ' ', '\t', '\n', '\r', 'é', '\u2028') }),
+					fc.oneof(fc.nat(4), fc.constantFrom('', '\t', '> ')),
+					fc.boolean(),
+					function (text, count, includeEmptyLines) {
+						const prefix = typeof count === 'string' ? count : ' '.repeat(count);
+						const lines = helpers.splitLines(text);
+						const indented = helpers.splitLines(helpers.indent(text, count, { includeEmptyLines }));
+						expect(indented).toHaveLength(lines.length);
+						lines.forEach(function (line, index) {
+							expect(indented[index]).toBe(includeEmptyLines || line.trim() !== '' ? prefix + line : line);
+						});
+						// eslint-disable-next-line no-control-regex -- only the separators are compared
+						expect(helpers.indent(text, count, { includeEmptyLines }).replace(/[^\r\n]/g, '')).toBe(text.replace(/[^\r\n]/g, ''));
+					}
+				)
+			);
+		});
+
+		it('is undone by dedent for text whose first and last lines are not blank', function () {
+			fc.assert(
+				fc.property(
+					fc
+						.array(fc.oneof(fc.constant(''), fc.stringMatching(/^[a-z(][a-z ()]{0,6}$/), fc.stringMatching(/^ {1,3}[a-z][a-z ]{0,4}$/)), {
+							minLength: 1,
+							maxLength: 6
+						})
+						.filter(function (lines) {
+							return /^[a-z(]/.test(lines[0]) && lines[lines.length - 1].trim() !== '';
+						}),
+					fc.integer({ min: 1, max: 4 }),
+					function (lines, count) {
+						const text = lines.join('\n');
+						expect(helpers.dedent(helpers.indent(text, count))).toBe(text);
+					}
+				)
+			);
+		});
+	});
+
+	describe('splitOnce / splitLast', function () {
+		it('split around the first and last occurrence, and join back', function () {
+			fc.assert(
+				fc.property(
+					fc.string({ unit: fc.constantFrom('a', 'b', '=', '😀') }),
+					fc.string({ unit: fc.constantFrom('a', '=', '😀'), maxLength: 2 }),
+					function (text, sep) {
+						const first = helpers.splitOnce(text, sep);
+						const last = helpers.splitLast(text, sep);
+						expect(first === undefined).toBe(!text.includes(sep));
+						expect(last === undefined).toBe(!text.includes(sep));
+						if (first !== undefined && last !== undefined) {
+							expect(first.join(sep)).toBe(text);
+							expect(last.join(sep)).toBe(text);
+							// The empty separator occurs everywhere: at the start for splitOnce, at the end for splitLast.
+							expect(first[0].includes(sep)).toBe(sep === '');
+							expect(last[1].includes(sep)).toBe(sep === '');
+							expect(first[0].length).toBeLessThanOrEqual(last[0].length);
+						}
+					}
+				)
+			);
+		});
+	});
+
+	describe('toSafeFilename', function () {
+		/** The characters a safe name never holds (the separator lookalikes of Windows best-fit conversions included). */
+		// eslint-disable-next-line no-control-regex -- the forbidden characters
+		const FORBIDDEN = /[<>:"/\\|?*\x00-\x1f\x7f-\x9f؜‎‏‪-‮⁦-⁩⁄∕∖⧸⧹﹨／：＼]|\p{Cs}/u;
+
+		/** Text with every kind of character the helper treats specially. */
+		const anyName = fc.string({
+			unit: fc.oneof(
+				fc.constantFrom(
+					'a',
+					'Z',
+					'.',
+					' ',
+					'/',
+					'\\',
+					':',
+					'*',
+					'?',
+					'"',
+					'<',
+					'>',
+					'|',
+					'\0',
+					'\x1f',
+					'\x85',
+					'∕',
+					'／',
+					'＼',
+					'﹨',
+					'：',
+					'¥',
+					'\u202e',
+					'é',
+					'e\u0301',
+					'日',
+					'😀',
+					'👍🏽',
+					'\ud800',
+					'con',
+					'NUL',
+					'com1',
+					'lpt\u00b9',
+					'conin$'
+				),
+				fc.string({ minLength: 1, maxLength: 1 })
+			),
+			maxLength: 30
+		});
+
+		it('always returns a valid, non-empty name within maxLength UTF-8 bytes', function () {
+			fc.assert(
+				fc.property(
+					anyName,
+					fc.constantFrom('_', '', '-', 'x.y', ' '),
+					fc.oneof(fc.integer({ min: 1, max: 40 }), fc.constant(255)),
+					function (name, replacement, maxLength) {
+						const safe = helpers.toSafeFilename(name, { replacement, maxLength });
+						expect(safe).not.toBe('');
+						expect(safe).not.toBe('.');
+						expect(safe).not.toBe('..');
+						expect(FORBIDDEN.test(safe)).toBe(false);
+						expect(/[. ]$/.test(safe)).toBe(false);
+						expect(/^(con|prn|aux|nul|conin\$|conout\$|(com|lpt)[0-9¹²³]) *(\.|$)/i.test(safe)).toBe(false);
+						expect(new TextEncoder().encode(safe).length).toBeLessThanOrEqual(maxLength);
+					}
+				)
+			);
+		});
+
+		it('only changes what it must: a valid name within the limit is returned as it is', function () {
+			fc.assert(
+				fc.property(fc.stringMatching(/^[a-zA-Z0-9_-][a-zA-Z0-9 ._-]{0,20}[a-zA-Z0-9_-]$/), function (name) {
+					fc.pre(!/^(con|prn|aux|nul|(com|lpt)[0-9]) *(\.|$)/i.test(name));
+					expect(helpers.toSafeFilename(name)).toBe(name);
+				})
+			);
+		});
+
+		it('cuts between graphemes, keeping the extension when there is room (vs a reference)', function () {
+			const encoder = new TextEncoder();
+			function bytes(text: string): number {
+				return encoder.encode(text).length;
+			}
+			function fit(text: string, budget: number): string {
+				let fitted = '';
+				for (const grapheme of graphemes(text)) {
+					if (bytes(fitted + grapheme) > budget) break;
+					fitted += grapheme;
+				}
+				return fitted;
+			}
+			fc.assert(
+				fc.property(
+					fc.string({ unit: 'grapheme', minLength: 1, maxLength: 20 }),
+					fc.stringMatching(/^[a-z]{1,4}$/),
+					fc.integer({ min: 1, max: 40 }),
+					function (stem, extension, maxLength) {
+						// The characters the helper replaces or trims.
+						fc.pre(!FORBIDDEN.test(stem) && !/[ .]/.test(stem) && !/^(con|prn|aux|nul|com|lpt)/i.test(stem));
+						const name = `${stem}.${extension}`;
+						const room = maxLength - extension.length - 1;
+						const kept = room > 0 ? fit(stem, room) : '';
+						const expected = bytes(name) <= maxLength ? name : kept !== '' ? `${kept}.${extension}` : fit(name, maxLength).replace(/\.$/, '') || '_';
+						expect(helpers.toSafeFilename(name, { maxLength })).toBe(expected);
+					}
+				)
+			);
+		});
+	});
+
+	describe('toSlug options', function () {
+		it('only joins the words differently with a custom separator', function () {
+			fc.assert(
+				fc.property(fc.string({ unit: 'grapheme', maxLength: 20 }), fc.constantFrom('_', '', '--', '.'), function (text, joiner) {
+					expect(helpers.toSlug(text, { separator: joiner })).toBe(helpers.toSlug(text).split('-').join(joiner));
+				})
+			);
+		});
+
+		it('keeps the case of the same letters with lowercase: false', function () {
+			fc.assert(
+				fc.property(fc.string({ unit: fc.constantFrom('a', 'B', 'é', 'Ö', 'ß', 'ẞ', 'Æ', 'œ', ' ', '-', '1', '日', 'İ', 'Σ'), maxLength: 12 }), function (text) {
+					const slug = helpers.toSlug(text, { lowercase: false });
+					expect(slug).toMatch(/^([a-zA-Z0-9]+(-[a-zA-Z0-9]+)*)?$/);
+					expect(slug.toLowerCase()).toBe(helpers.toSlug(text));
+				})
+			);
+		});
+	});
+
+	describe('truncate with a separator', function () {
+		it('cuts at the last occurrence that starts on a grapheme boundary at or before the hard cut (vs a reference)', function () {
+			fc.assert(
+				fc.property(
+					fc.string({ unit: fc.constantFrom('a', 'b', ' ', '-', 'é', 'e\u0301', '👍🏽', '\u0301'), maxLength: 16 }),
+					fc.nat(12),
+					fc.constantFrom(' ', '-', ' -', '\u0301'),
+					function (text, length, sep) {
+						const hard = helpers.truncate(text, length, '');
+						const soft = helpers.truncate(text, length, { separator: sep, suffix: '' });
+						let expected = hard;
+						if (hard !== text) {
+							let boundary = 0;
+							let last = -1;
+							for (const grapheme of [''].concat(graphemes(text))) {
+								boundary += grapheme.length;
+								if (boundary > hard.length) break;
+								if (text.startsWith(sep, boundary)) last = boundary;
+							}
+							if (last !== -1) expected = text.slice(0, last);
+						}
+						expect(soft).toBe(expected);
+						expect(helpers.truncate(text, length, { separator: new RegExp(sep), suffix: '' })).toBe(expected);
+						expect(helpers.truncate(text, length, { separator: sep, suffix: '~' })).toBe(hard === text ? text : expected + '~');
+					}
+				)
+			);
+		});
+	});
+});

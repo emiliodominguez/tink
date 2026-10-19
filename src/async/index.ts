@@ -1,7 +1,7 @@
 import { createLRUCache, createPriorityQueue } from '../cache/index.js';
 import { debounce, defaultMemoizeKey, noop, type MemoizeCache, type Result } from '../functions/index.js';
 import { isError } from '../guards/index.js';
-import { assertDelay, assertFunction, assertInteger, assertNumber, describe, draw, MAX_TIMEOUT } from '../utils/assert.js';
+import { assertDelay, assertFunction, assertInteger, assertNumber, describe, draw, MAX_TIMEOUT, readOption } from '../utils/assert.js';
 import { assertOptionalSignal, detach, reasonOf } from '../utils/signal.js';
 import type { AbortSignalLike, AnyFunction, RandomGenerator } from '../utils/index.js';
 
@@ -1311,6 +1311,430 @@ export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
 		},
 		clearQueue(): void {
 			drop(new AbortError('The call was removed from the rate limiter queue.'));
+		}
+	};
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// createSemaphore / createMutex / createKeyedMutex
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Gives back what {@link Semaphore.acquire} (or a mutex's `acquire`) obtained. Only the first call has an effect, so calling it twice
+ * (in a `finally` block and an error handler, say) can never release permits held by someone else.
+ */
+export type Release = () => void;
+
+/**
+ * Options accepted by {@link Semaphore.acquire} and {@link Semaphore.run}.
+ */
+export interface SemaphoreAcquireOptions {
+	/** Number of permits taken at once (an integer between `1` and the semaphore's `permits`). Defaults to `1`. */
+	weight?: number;
+	/**
+	 * Aborting it while the request waits removes the request from the queue at once and rejects it with the signal's `reason` (or an
+	 * {@link AbortError}). An already-aborted signal rejects even when permits are available. Once granted, the signal has no effect.
+	 */
+	signal?: AbortSignalLike | null;
+	/**
+	 * Longest wait in milliseconds (`0` to `2^31 - 1`, or `Infinity`, the default): the request then leaves the queue and rejects with a
+	 * {@link TimeoutError}. Permits available straight away are granted without starting a timer.
+	 */
+	timeout?: number;
+}
+
+/**
+ * A counting semaphore as returned by {@link createSemaphore}. Its methods do not depend on `this`, so they can be passed around.
+ */
+export interface Semaphore {
+	/**
+	 * Resolves with a {@link Release} function once `weight` permits are granted: immediately when they are available and nobody waits,
+	 * otherwise in FIFO order. Rejects instead when `signal` aborts or `timeout` expires first.
+	 * @throws {TypeError} (as a rejection) when `weight` or `timeout` is not a number, or `signal` is not a signal
+	 * @throws {RangeError} (as a rejection) when `weight` is not an integer between 1 and `permits`, or `timeout` is not a valid delay
+	 */
+	acquire(options?: SemaphoreAcquireOptions): Promise<Release>;
+	/**
+	 * Takes `weight` permits (default `1`) synchronously when they are available and nobody waits (it never jumps the queue), and returns
+	 * their {@link Release} function; returns `undefined` otherwise.
+	 * @throws {TypeError} when `weight` is not a number
+	 * @throws {RangeError} when `weight` is not an integer between 1 and `permits`
+	 */
+	tryAcquire(weight?: number): Release | undefined;
+	/**
+	 * Acquires (see {@link Semaphore.acquire}), calls `fn()`, and releases once its result settles, also when it throws synchronously or
+	 * rejects. Settles like `fn()`; `fn` is not called when the acquisition fails.
+	 * @throws {TypeError} (as a rejection) when `fn` is not a function, or for invalid options (see `acquire`)
+	 */
+	run<T>(fn: () => PromiseLike<T> | T, options?: SemaphoreAcquireOptions): Promise<T>;
+	/** Number of permits not currently held. */
+	readonly available: number;
+	/** Number of requests waiting for permits. */
+	readonly pending: number;
+}
+
+/**
+ * Options accepted by {@link Mutex.acquire}, {@link Mutex.run} and the {@link KeyedMutex} methods: those of a semaphore, without `weight`.
+ */
+export type MutexAcquireOptions = Omit<SemaphoreAcquireOptions, 'weight'>;
+
+/**
+ * A mutual-exclusion lock as returned by {@link createMutex}: a {@link Semaphore} with one permit, plus `isLocked`.
+ */
+export interface Mutex {
+	/** Resolves with the {@link Release} function once the lock is held (see {@link Semaphore.acquire}). */
+	acquire(options?: MutexAcquireOptions): Promise<Release>;
+	/** Takes the lock synchronously when it is free and nobody waits, and returns its {@link Release} function; `undefined` otherwise. */
+	tryAcquire(): Release | undefined;
+	/** Runs `fn()` while holding the lock, which is released once its result settles (see {@link Semaphore.run}). */
+	run<T>(fn: () => PromiseLike<T> | T, options?: MutexAcquireOptions): Promise<T>;
+	/** Whether the lock is held. */
+	readonly isLocked: boolean;
+	/** Number of requests waiting for the lock. */
+	readonly pending: number;
+}
+
+/**
+ * One lock per key, as returned by {@link createKeyedMutex}. Keys are compared like `Map` keys (SameValueZero).
+ * @template K - The key type
+ */
+export interface KeyedMutex<K> {
+	/** Resolves with the {@link Release} function once the lock of `key` is held (see {@link Semaphore.acquire}). */
+	acquire(key: K, options?: MutexAcquireOptions): Promise<Release>;
+	/** Takes the lock of `key` synchronously when it is free and nobody waits for it, and returns its {@link Release} function; `undefined` otherwise. */
+	tryAcquire(key: K): Release | undefined;
+	/** Runs `fn()` while holding the lock of `key`, which is released once its result settles (see {@link Semaphore.run}). */
+	run<T>(key: K, fn: () => PromiseLike<T> | T, options?: MutexAcquireOptions): Promise<T>;
+	/** Whether the lock of `key` is held. */
+	isLocked(key: K): boolean;
+	/** Number of keys whose lock is held (only those have any state). */
+	readonly size: number;
+}
+
+/**
+ * A request waiting for permits.
+ */
+interface SemaphoreWaiter {
+	readonly weight: number;
+	/** Hands over the permits (already taken) and settles the request. */
+	readonly grant: (release: Release) => void;
+}
+
+/**
+ * The semaphore behind {@link createSemaphore}, {@link createMutex} and {@link createKeyedMutex}.
+ * @param {string} name - Prefix of the error messages (`'Semaphore'`, `'Mutex'`…)
+ * @param {number} permits - Number of permits
+ * @param {() => void} [onIdle] - Called each time every permit is back and nobody waits any more
+ * @returns {Semaphore} The semaphore
+ */
+function semaphore(name: string, permits: number, onIdle: () => void = noop): Semaphore {
+	let available = permits;
+	// The waiting requests in FIFO order: a `Set` keeps insertion order and removes an aborted request in O(1).
+	const waiters = new Set<SemaphoreWaiter>();
+
+	/**
+	 * Throws unless `weight` is an integer between 1 and `permits` (a larger request could never be granted).
+	 * @param {string} caller - Name of the method, used in the error message
+	 * @param {number} weight - The value to validate
+	 * @returns {void}
+	 */
+	function assertWeight(caller: string, weight: number): void {
+		if (!(Number.isInteger(weight) && weight >= 1 && weight <= permits)) assertNumber(caller, 'weight', weight, false, `an integer between 1 and ${permits}`);
+	}
+
+	/**
+	 * Takes `weight` permits and creates the function that gives them back.
+	 * @param {number} weight - Number of permits
+	 * @returns {Release} The idempotent release function
+	 */
+	function lease(weight: number): Release {
+		let held = true;
+
+		available -= weight;
+
+		return function release(): void {
+			if (!held) return;
+			held = false;
+			available += weight;
+			dispatch();
+		};
+	}
+
+	/**
+	 * Grants permits to the waiting requests, in order, for as long as the first one fits (a heavy request is never overtaken, so it cannot
+	 * starve), then reports idleness.
+	 * @returns {void}
+	 */
+	function dispatch(): void {
+		for (const waiter of waiters) {
+			if (waiter.weight > available) break;
+			// `grant` removes the waiter (deleting the current entry of a `Set` during iteration is safe).
+			waiter.grant(lease(waiter.weight));
+		}
+		// Every permit is back only when nobody waits (the first waiter would fit).
+		if (available === permits) onIdle();
+	}
+
+	/**
+	 * Requests permits (see {@link Semaphore.acquire}).
+	 * @param {string} caller - Name of the public method, used in error messages
+	 * @param {SemaphoreAcquireOptions} options - The options
+	 * @returns {Promise<Release>} Resolves with the release function
+	 */
+	function acquire(caller: string, options: SemaphoreAcquireOptions): Promise<Release> {
+		return new Promise<Release>(function (resolve, reject) {
+			const weight = readOption(options, 'weight', 1);
+			const signal = readOption(options, 'signal');
+			const timeout = readOption(options, 'timeout', Infinity);
+
+			assertWeight(caller, weight);
+			assertDelay(caller, 'timeout', timeout, true);
+			assertOptionalSignal(caller, 'signal', signal);
+			if (signal?.aborted) throw abortReason(signal);
+
+			if (waiters.size === 0 && weight <= available) {
+				resolve(lease(weight));
+				return;
+			}
+
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const waiter: SemaphoreWaiter = {
+				weight,
+				grant: function (release: Release): void {
+					leave();
+					resolve(release);
+				}
+			};
+
+			/**
+			 * Removes the request from the queue and releases its timer and abort listener.
+			 * @returns {void}
+			 */
+			function leave(): void {
+				waiters.delete(waiter);
+				clearTimeout(timer);
+				detach(signal, onAbort);
+			}
+
+			/**
+			 * Rejects the request; the requests behind it may fit now.
+			 * @param {unknown} reason - The rejection reason
+			 * @returns {void}
+			 */
+			function fail(reason: unknown): void {
+				leave();
+				reject(reason);
+				dispatch();
+			}
+
+			/**
+			 * Abort listener.
+			 * @returns {void}
+			 */
+			function onAbort(): void {
+				fail(abortReason(signal as AbortSignalLike));
+			}
+
+			// The listener first: when adding it throws, the request is not queued and no timer is left behind. `leave` removes it.
+			signal?.addEventListener('abort', onAbort);
+			waiters.add(waiter);
+			if (timeout !== Infinity) {
+				timer = setTimeout(function () {
+					fail(new TimeoutError(`${caller}: timed out after ${timeout} ms`));
+				}, timeout);
+			}
+		});
+	}
+
+	return {
+		acquire(options: SemaphoreAcquireOptions = {}): Promise<Release> {
+			return acquire(`${name}.acquire`, options);
+		},
+		tryAcquire(weight = 1): Release | undefined {
+			assertWeight(`${name}.tryAcquire`, weight);
+			return waiters.size === 0 && weight <= available ? lease(weight) : undefined;
+		},
+		run<T>(fn: () => PromiseLike<T> | T, options: SemaphoreAcquireOptions = {}): Promise<T> {
+			const caller = `${name}.run`;
+
+			if (typeof fn !== 'function') return Promise.reject(new TypeError(`${caller}: \`fn\` must be a function, got ${describe(fn)}`));
+
+			return acquire(caller, options).then(function (release) {
+				const result = invoke(fn, undefined, []) as Promise<T>;
+
+				result.then(release, release);
+
+				return result;
+			});
+		},
+		get available(): number {
+			return available;
+		},
+		get pending(): number {
+			return waiters.size;
+		}
+	};
+}
+
+/**
+ * Creates a counting semaphore: at most `permits` permits are held at once (like the slots of {@link createLimiter}, but held
+ * explicitly, across any number of steps, until released).
+ * - **Fair:** requests are granted in FIFO order, and `tryAcquire` never jumps the queue. A released permit goes straight to the first
+ *   waiter, so nothing can barge in between.
+ * - **Weighted:** `acquire({ weight })` takes several permits at once (for a memory or bandwidth budget); a heavy request at the head of
+ *   the queue is never overtaken by lighter ones, so it cannot starve.
+ * - **Cancellable:** a request whose `signal` aborts or whose `timeout` expires leaves the queue at once (`pending` drops immediately)
+ *   without taking permits or leaving a listener or timer behind, and the requests behind it are served if they now fit.
+ * - **Leak-proof:** each grant has its own {@link Release} function, and calling it again does nothing, so permits are never released
+ *   twice. `run(fn)` releases whatever `fn` does, including throwing synchronously.
+ * @param {number} permits - Number of permits (an integer >= 1, or `Infinity`)
+ * @returns {Semaphore} The semaphore, with `acquire`, `tryAcquire`, `run`, `available` and `pending`
+ * @throws {TypeError} when `permits` is not a number
+ * @throws {RangeError} when `permits` is not an integer >= 1 or `Infinity`
+ * @example
+ * const pool = createSemaphore(2);
+ * let running = 0;
+ * let peak = 0;
+ * async function download(id: number): Promise<number> { running++; peak = Math.max(peak, running); await sleep(5); running--; return id; }
+ * await Promise.all([1, 2, 3, 4].map(function (id) { return pool.run(function () { return download(id); }); })); // => [1, 2, 3, 4]
+ * peak; // => 2
+ * @example
+ * const budget = createSemaphore(10); // say, megabytes of memory
+ * const big = await budget.acquire({ weight: 8 });
+ * const small = budget.acquire({ weight: 4 }); // waits: only 2 are left
+ * budget.pending; // => 1
+ * big();
+ * big(); // does nothing: already released
+ * const release = await small;
+ * budget.available; // => 6
+ * release();
+ * @example
+ * const semaphore = createSemaphore(1);
+ * const release = semaphore.tryAcquire();
+ * semaphore.tryAcquire(); // => undefined
+ * await semaphore.acquire({ timeout: 10 }); // throws TimeoutError
+ * semaphore.pending; // => 0
+ * release?.();
+ */
+export function createSemaphore(permits: number): Semaphore {
+	assertInteger('createSemaphore', 'permits', permits, 1, true);
+
+	return semaphore('Semaphore', permits);
+}
+
+/**
+ * Creates a promise-based mutex (mutual-exclusion lock): a {@link createSemaphore} semaphore with a single permit, with the same
+ * guarantees (FIFO, cancellation through `signal` and `timeout` without leaks, idempotent release) and method names, plus `isLocked`.
+ * Coming from `async-mutex`: `acquire()` resolves with the release function there too, `runExclusive(fn)` is `run(fn)`, `isLocked()`
+ * is the `isLocked` property, and `tryAcquire()` returns `undefined` instead of throwing when the lock is taken.
+ * @returns {Mutex} The mutex, with `acquire`, `tryAcquire`, `run`, `isLocked` and `pending`
+ * @example
+ * const mutex = createMutex();
+ * const log: string[] = [];
+ * async function save(name: string): Promise<void> { log.push(`start ${name}`); await sleep(5); log.push(`end ${name}`); }
+ * await Promise.all([mutex.run(function () { return save('a'); }), mutex.run(function () { return save('b'); })]);
+ * log; // => ['start a', 'end a', 'start b', 'end b']
+ * @example
+ * const mutex = createMutex();
+ * const release = await mutex.acquire();
+ * mutex.isLocked; // => true
+ * try {
+ *   // critical section
+ * } finally {
+ *   release();
+ * }
+ * mutex.isLocked; // => false
+ */
+export function createMutex(): Mutex {
+	const lock = semaphore('Mutex', 1);
+
+	return {
+		acquire: lock.acquire,
+		tryAcquire: lock.tryAcquire,
+		run: lock.run,
+		get isLocked(): boolean {
+			return lock.available === 0;
+		},
+		get pending(): number {
+			return lock.pending;
+		}
+	};
+}
+
+/**
+ * Creates one mutex per key, to serialize work per user, per document or per file while different keys proceed in parallel. Each lock
+ * behaves like {@link createMutex} (FIFO, `signal` and `timeout`, idempotent release).
+ *
+ * A key only has state while its lock is held: the state is deleted as soon as the last holder releases with nobody waiting, so locking
+ * an unbounded number of keys (one per request id, say) does not grow memory.
+ * @template K - The key type
+ * @returns {KeyedMutex<K>} The keyed mutex, with `acquire`, `tryAcquire`, `run`, `isLocked` and `size`
+ * @example
+ * const locks = createKeyedMutex<string>();
+ * const log: string[] = [];
+ * async function charge(user: string, amount: number): Promise<void> { log.push(`${user} +${amount}`); await sleep(5); }
+ * const work = Promise.all([
+ *   locks.run('ada', function () { return charge('ada', 1); }),
+ *   locks.run('ada', function () { return charge('ada', 2); }), // waits for the first one
+ *   locks.run('bob', function () { return charge('bob', 3); }) // another key: runs at once
+ * ]);
+ * locks.size; // => 2
+ * await work;
+ * log; // => ['ada +1', 'bob +3', 'ada +2']
+ * locks.size; // => 0 // idle keys are forgotten
+ */
+export function createKeyedMutex<K = unknown>(): KeyedMutex<K> {
+	const locks = new Map<K, Semaphore>();
+
+	/**
+	 * The lock of `key`, created on first use; it deletes itself once idle.
+	 * @param {K} key - The key
+	 * @returns {Semaphore} The lock
+	 */
+	function lockOf(key: K): Semaphore {
+		let lock = locks.get(key);
+
+		if (lock === undefined) {
+			lock = semaphore('KeyedMutex', 1, function () {
+				locks.delete(key);
+			});
+			locks.set(key, lock);
+		}
+
+		return lock;
+	}
+
+	/**
+	 * Forgets a lock left free by a request that failed at once (invalid options, aborted signal), and returns the request's promise.
+	 * @template T - The resolved value type
+	 * @param {K} key - The key
+	 * @param {Semaphore} lock - Its lock
+	 * @param {Promise<T>} request - The promise to return
+	 * @returns {Promise<T>} `request`
+	 */
+	function tidy<T>(key: K, lock: Semaphore, request: Promise<T>): Promise<T> {
+		if (lock.available === 1) locks.delete(key);
+		return request;
+	}
+
+	return {
+		acquire(key: K, options?: MutexAcquireOptions): Promise<Release> {
+			const lock = lockOf(key);
+			return tidy(key, lock, lock.acquire(options));
+		},
+		tryAcquire(key: K): Release | undefined {
+			// A free key gets a lock and takes it, a held one keeps its lock: nothing to tidy.
+			return lockOf(key).tryAcquire();
+		},
+		run<T>(key: K, fn: () => PromiseLike<T> | T, options?: MutexAcquireOptions): Promise<T> {
+			const lock = lockOf(key);
+			return tidy(key, lock, lock.run(fn, options));
+		},
+		isLocked(key: K): boolean {
+			return locks.has(key);
+		},
+		get size(): number {
+			return locks.size;
 		}
 	};
 }
@@ -2680,4 +3104,405 @@ export function abortable<T>(promise: PromiseLike<T> | T, signal: AbortSignalLik
 export function throwIfAborted(signal: AbortSignalLike | null | undefined): void {
 	assertOptionalSignal('throwIfAborted', 'signal', signal);
 	if (signal?.aborted) throw abortReason(signal);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// waitForEvent / reduceAsync / minDelay
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * The platform's `Event` type when the consumer's TypeScript environment declares one (DOM or Node typings), and `unknown` otherwise:
+ * what {@link waitForEvent} resolves with for an {@link EventTargetLike} by default.
+ */
+export type PlatformEvent = typeof globalThis extends { Event: { prototype: infer E } } ? E : unknown;
+
+/**
+ * An object with DOM-style `addEventListener` and `removeEventListener` methods: an `EventTarget` such as a DOM element, `window`, a
+ * `WebSocket`, a worker, an `AbortSignal` or Node's `EventTarget`.
+ */
+export interface EventTargetLike {
+	addEventListener(type: string, listener: never): void;
+	removeEventListener(type: string, listener: never): void;
+}
+
+/**
+ * A Node.js-style event emitter: one with `on` and `off` methods (Node's `EventEmitter`, `createEmitter` from the emitter module, mitt…),
+ * or with `addListener` and `removeListener`.
+ */
+export type EventEmitterLike =
+	| { on(type: never, listener: never): unknown; off(type: never, listener: never): unknown }
+	| { addListener(type: never, listener: never): unknown; removeListener(type: never, listener: never): unknown };
+
+/**
+ * Options accepted by {@link waitForEvent}.
+ * @template T - The event (or first listener argument) type
+ */
+export interface WaitForEventOptions<T> {
+	/** Stops waiting, rejecting with the signal's `reason` (or an {@link AbortError}). */
+	signal?: AbortSignalLike | null;
+	/** Time limit in ms (`0` to `2^31 - 1`, or `Infinity`, the default), after which the promise rejects with a {@link TimeoutError}. */
+	timeout?: number;
+	/** Only events for which this returns a truthy value resolve the promise. If it throws, the promise rejects with that error. */
+	filter?(event: T): boolean;
+	/** Event types that reject the promise with their event (or first listener argument), such as `['error']`. Defaults to none. */
+	rejectOn?: ReadonlyArray<string | symbol>;
+}
+
+/**
+ * Throws a `TypeError` unless `value` is a string or a symbol.
+ * @param {string} name - Name of the validated parameter
+ * @param {unknown} value - The value to validate
+ * @returns {void}
+ */
+function assertEventType(name: string, value: unknown): void {
+	if (typeof value !== 'string' && typeof value !== 'symbol') throw new TypeError(`waitForEvent: \`${name}\` must be a string or a symbol, got ${describe(value)}`);
+}
+
+/**
+ * Waits for the next `type` event of a DOM `EventTarget` (resolving with the `Event`) or of a Node-style emitter (resolving with the first
+ * argument the listeners receive), like `events.once` or `p-event`, with the cleanup done right:
+ * - `filter` skips the events it does not accept; `rejectOn: ['error']` rejects with the first `error` event instead of waiting forever.
+ * - `timeout` rejects with a {@link TimeoutError}, `signal` with its `reason`.
+ * - However it settles, every listener it added (to `target` and to `signal`) is removed and its timer cleared, so waiting in a loop leaks
+ *   nothing. Listeners are added with `addEventListener` when `target` has it, otherwise with `on` (removed with `off`), otherwise with
+ *   `addListener` (removed with `removeListener`); `once` is never used, so that filtered-out events do not unsubscribe.
+ * @template E - The event type for an `EventTarget` (defaults to the platform's `Event`)
+ * @param {EventTargetLike} target - The event target
+ * @param {string} type - The event type to wait for
+ * @param {WaitForEventOptions<E>} [options] - `signal`, `timeout`, `filter` and `rejectOn`
+ * @returns {Promise<E>} The first accepted event
+ * @throws {TypeError} (as a rejection) when `target` has no supported listener methods, `type` or an entry of `rejectOn` is neither a
+ *   string nor a symbol, `filter` is not a function, `rejectOn` is not an array, `timeout` is not a number or `signal` is not a signal
+ * @throws {RangeError} (as a rejection) when `timeout` is neither a number between `0` and `2^31 - 1` nor `Infinity`
+ * @throws {TimeoutError} (as a rejection) when no accepted event arrives within `timeout` ms
+ * @throws {unknown} (as a rejection) the event of a `rejectOn` type, the error thrown by `filter`, or the abort reason of `signal`
+ * @example
+ * const target = new EventTarget();
+ * setTimeout(function () { target.dispatchEvent(new Event('ready')); }, 10);
+ * const event = await waitForEvent(target, 'ready', { timeout: 1000 });
+ * event.type; // => 'ready'
+ * @example
+ * import { EventEmitter } from 'node:events';
+ * const socket = new EventEmitter();
+ * setTimeout(function () { socket.emit('message', 'ping'); socket.emit('message', 'hello'); }, 10);
+ * await waitForEvent<string>(socket, 'message', { filter: function (text) { return text !== 'ping'; } }); // => 'hello'
+ * setTimeout(function () { socket.emit('error', new Error('connection reset')); }, 10);
+ * await waitForEvent(socket, 'message', { rejectOn: ['error'] }); // throws Error
+ * socket.listenerCount('message') + socket.listenerCount('error'); // => 0
+ */
+export function waitForEvent<E = PlatformEvent>(target: EventTargetLike, type: string, options?: WaitForEventOptions<E>): Promise<E>;
+/**
+ * Waits for the next `type` event of a Node-style emitter (see the first overload).
+ * @template T - The type of the first listener argument
+ * @param {EventEmitterLike} target - The emitter
+ * @param {string | symbol} type - The event type to wait for
+ * @param {WaitForEventOptions<T>} [options] - `signal`, `timeout`, `filter` and `rejectOn`
+ * @returns {Promise<T>} The first argument of the first accepted event
+ * @example
+ * import { createEmitter } from 'tinkit/emitter';
+ * const events = createEmitter<{ saved: { id: number } }>();
+ * setTimeout(function () { events.emit('saved', { id: 7 }); }, 10);
+ * await waitForEvent<{ id: number }>(events, 'saved'); // => { id: 7 }
+ */
+export function waitForEvent<T = unknown>(target: EventEmitterLike, type: string | symbol, options?: WaitForEventOptions<T>): Promise<T>;
+/**
+ * Waits for the next `type` event of `target` (see the first overload).
+ * @param {EventTargetLike | EventEmitterLike} target - The event target or emitter
+ * @param {string | symbol} type - The event type to wait for
+ * @param {WaitForEventOptions<unknown>} [options] - `signal`, `timeout`, `filter` and `rejectOn`
+ * @returns {Promise<unknown>} The first accepted event
+ */
+export function waitForEvent(target: EventTargetLike | EventEmitterLike, type: string | symbol, options: WaitForEventOptions<unknown> = {}): Promise<unknown> {
+	return new Promise<unknown>(function (resolve, reject) {
+		const signal = readOption(options, 'signal');
+		const timeout = readOption(options, 'timeout', Infinity);
+		const filter = readOption(options, 'filter');
+		const rejectOn = readOption(options, 'rejectOn', []);
+		const methods = target as unknown as Record<string, unknown>;
+		let add: unknown;
+		let remove: unknown;
+
+		if ((typeof target === 'object' && target !== null) || typeof target === 'function') {
+			for (const [adder, remover] of [
+				['addEventListener', 'removeEventListener'],
+				['on', 'off'],
+				['addListener', 'removeListener']
+			]) {
+				add = methods[adder];
+				remove = methods[remover];
+				if (typeof add === 'function' && typeof remove === 'function') break;
+			}
+		}
+		if (typeof add !== 'function' || typeof remove !== 'function') {
+			throw new TypeError(`waitForEvent: \`target\` must be an EventTarget or an event emitter, got ${describe(target)}`);
+		}
+		assertEventType('type', type);
+		assertDelay('waitForEvent', 'timeout', timeout, true);
+		if (filter !== undefined) assertFunction('waitForEvent', 'filter', filter);
+		if (!Array.isArray(rejectOn)) throw new TypeError(`waitForEvent: \`rejectOn\` must be an array, got ${describe(rejectOn)}`);
+		rejectOn.forEach(function (rejectType: unknown, index) {
+			assertEventType(`rejectOn[${index}]`, rejectType);
+		});
+		assertOptionalSignal('waitForEvent', 'signal', signal);
+		if (signal?.aborted) throw abortReason(signal);
+
+		const added: Array<[unknown, (value: unknown) => void]> = [];
+		let done = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+
+		/**
+		 * Removes the listeners added to `target` so far (each one once, also when another removal throws).
+		 * @returns {void}
+		 */
+		function unlisten(): void {
+			for (const pair of added.splice(0)) {
+				try {
+					Reflect.apply(remove as AnyFunction, target, pair);
+				} catch {
+					// The other listeners must still be removed.
+				}
+			}
+		}
+
+		/**
+		 * Settles the promise and releases the listeners, the timer and the abort listener.
+		 * @param {(value: never) => void} settle - `resolve` or `reject`
+		 * @param {unknown} value - The value or reason
+		 * @returns {void}
+		 */
+		function finish(settle: (value: never) => void, value: unknown): void {
+			done = true;
+			unlisten();
+			clearTimeout(timer);
+			detach(signal, onAbort);
+			settle(value as never);
+		}
+
+		/**
+		 * Abort listener.
+		 * @returns {void}
+		 */
+		function onAbort(): void {
+			finish(reject, abortReason(signal as AbortSignalLike));
+		}
+
+		/**
+		 * Listener of `type`: settles with the first accepted event.
+		 * @param {unknown} event - The event, or the first listener argument
+		 * @returns {void}
+		 */
+		function onEvent(event: unknown): void {
+			let accepted: boolean;
+
+			try {
+				accepted = filter === undefined || filter(event);
+			} catch (error) {
+				finish(reject, error);
+				return;
+			}
+
+			if (accepted) finish(resolve, event);
+		}
+
+		/**
+		 * Listener of the `rejectOn` types.
+		 * @param {unknown} event - The event, or the first listener argument
+		 * @returns {void}
+		 */
+		function onReject(event: unknown): void {
+			finish(reject, event);
+		}
+
+		// The abort listener first: when adding it throws, nothing else is left behind. `finish` removes it.
+		signal?.addEventListener('abort', onAbort);
+
+		try {
+			for (const pair of [
+				[type, onEvent],
+				...rejectOn.map(function (rejectType) {
+					return [rejectType, onReject];
+				})
+			] as Array<[unknown, (value: unknown) => void]>) {
+				Reflect.apply(add, target, pair);
+				added.push(pair);
+				// A listener called while being added (an emitter replaying its last event) has settled the promise.
+				if (done) {
+					unlisten();
+					return;
+				}
+			}
+		} catch (error) {
+			finish(reject, error);
+			return;
+		}
+
+		if (timeout !== Infinity) {
+			timer = setTimeout(function () {
+				finish(reject, new TimeoutError(`waitForEvent: no \`${String(type)}\` event within ${timeout} ms`));
+			}, timeout);
+		}
+	});
+}
+
+/**
+ * Options accepted by {@link reduceAsync}.
+ */
+export interface ReduceAsyncOptions {
+	/**
+	 * Aborting it stops the reduction: no further item is read or reduced, a running `reducer` or a pending read of the next item stops
+	 * being awaited (neither is interrupted), the iterator is closed, and the promise rejects with the signal's `reason` (or an
+	 * {@link AbortError}). When the abort comes during a read, the close is requested without waiting for it: an async generator only runs
+	 * it once that read settles.
+	 */
+	signal?: AbortSignalLike | null;
+}
+
+/**
+ * Reduces a sync or async iterable with an async `reducer`, one item at a time, in order: each item is read only after the previous step
+ * has settled, so lazy and infinite sources (async generators, paginated APIs, streams) are consumed on demand. Promises among the items
+ * of a sync iterable, and `initial`, are awaited. The iterator is closed when the reduction stops early (a throwing `reducer`, an abort).
+ * @template T - The item type
+ * @template A - The accumulator type
+ * @param {Iterable<T> | AsyncIterable<T>} items - The items
+ * @param {(accumulator: A, item: Awaited<T>, index: number) => PromiseLike<A> | A} reducer - Called with the accumulator, the item and its index
+ * @param {PromiseLike<A> | A} initial - The initial accumulator
+ * @param {ReduceAsyncOptions} [options] - An optional `signal`
+ * @returns {Promise<A>} The final accumulator
+ * @throws {TypeError} (as a rejection) when `items` is not iterable, `reducer` is not a function or `signal` is not a signal
+ * @throws {unknown} (as a rejection) the first error thrown or rejected by `reducer` or by the iterable, or the abort reason of `signal`
+ * @example
+ * async function* pages(): AsyncGenerator<number[]> { yield [1, 2]; yield [3]; }
+ * await reduceAsync(pages(), async function (total, page) { await sleep(1); return total + page.length; }, 0); // => 3
+ * await reduceAsync([Promise.resolve('a'), 'b'], function (text, letter, index) { return text + letter + index; }, ''); // => 'a0b1'
+ */
+export async function reduceAsync<T, A>(
+	items: Iterable<T> | AsyncIterable<T>,
+	reducer: (accumulator: A, item: Awaited<T>, index: number) => PromiseLike<A> | A,
+	initial: PromiseLike<A> | A,
+	options: ReduceAsyncOptions = {}
+): Promise<A> {
+	const signal = readOption(options, 'signal');
+	const source = items as Partial<Iterable<T> & AsyncIterable<T>> | null | undefined;
+
+	if (source === null || source === undefined || (typeof source[Symbol.asyncIterator] !== 'function' && typeof source[Symbol.iterator] !== 'function')) {
+		throw new TypeError(`reduceAsync: \`items\` must be an iterable or an async iterable, got ${describe(items)}`);
+	}
+	assertFunction('reduceAsync', 'reducer', reducer);
+	assertOptionalSignal('reduceAsync', 'signal', signal);
+
+	let accumulator = await abortable(initial, signal);
+	let index = 0;
+	// Iterated by hand rather than with `for await`, so that an abort also interrupts the wait for the next item (an idle source would
+	// otherwise keep the reduction pending forever). A sync iterable is wrapped like `for await` does: its values are awaited.
+	const iterator: AsyncIterator<T> =
+		typeof source[Symbol.asyncIterator] === 'function'
+			? (source as AsyncIterable<T>)[Symbol.asyncIterator]()
+			: (async function* (): AsyncGenerator<T> {
+					yield* source as Iterable<T>;
+				})();
+
+	for (;;) {
+		let step: IteratorResult<T>;
+		try {
+			step = await abortable(iterator.next(), signal);
+		} catch (error) {
+			// `return` would be queued behind the pending `next`, which may never settle: request the close without waiting for it.
+			if (signal?.aborted) void closeIterator(iterator);
+			throw error;
+		}
+		// Aborted while the last item was being read.
+		if (signal?.aborted) {
+			if (step.done !== true) await closeIterator(iterator);
+			throw abortReason(signal);
+		}
+		if (step.done === true) return accumulator;
+		try {
+			accumulator = await abortable(reducer(accumulator, step.value as Awaited<T>, index++), signal);
+		} catch (error) {
+			await closeIterator(iterator);
+			throw error;
+		}
+	}
+}
+
+/**
+ * Closes an iterator that is abandoned early, like `for await` does on a `break` or a throw: calls its `return` method, if any, and
+ * ignores a failure to close (the reason the loop stopped is the error that matters).
+ * @param {AsyncIterator<unknown>} iterator - The iterator to close
+ * @returns {Promise<void>} Settles once the iterator is closed
+ */
+async function closeIterator(iterator: AsyncIterator<unknown>): Promise<void> {
+	try {
+		await iterator.return?.();
+	} catch {
+		// Ignored, as by `for await`.
+	}
+}
+
+/**
+ * Options accepted by {@link minDelay}.
+ */
+export interface MinDelayOptions {
+	/** When `true` (the default), a rejection is held back until `ms` have passed too; with `false`, it comes through at once. */
+	delayRejection?: boolean;
+}
+
+/**
+ * Settles like `promise`, but no earlier than `ms` milliseconds after the call (like `p-min-delay`): a loading indicator shown while
+ * waiting then stays up long enough to be read, instead of flickering when the response is fast. A slower `promise` is not delayed
+ * further. The timer is cleared when a rejection comes through early (`delayRejection: false`).
+ * @template T - The resolved value type
+ * @param {PromiseLike<T> | T} promise - The promise (or value) to wait for
+ * @param {number} ms - The minimum delay in milliseconds (`0` to `2^31 - 1`)
+ * @param {MinDelayOptions} [options] - `delayRejection` (default `true`)
+ * @returns {Promise<T>} A promise settling like `promise`, at the earliest `ms` milliseconds from now
+ * @throws {TypeError} (as a rejection) when `ms` is not a number
+ * @throws {RangeError} (as a rejection) when `ms` is negative, `NaN` or larger than `2^31 - 1`
+ * @throws {unknown} (as a rejection) the rejection of `promise`
+ * @example
+ * const start = Date.now();
+ * await minDelay(Promise.resolve('cached'), 50); // => 'cached'
+ * Date.now() - start >= 49; // => true
+ * @example
+ * const start = Date.now();
+ * await minDelay(Promise.reject(new Error('offline')), 50, { delayRejection: false }); // throws Error
+ * Date.now() - start < 49; // => true
+ */
+export function minDelay<T>(promise: PromiseLike<T> | T, ms: number, options: MinDelayOptions = {}): Promise<T> {
+	return new Promise<T>(function (resolve, reject) {
+		const settled = Promise.resolve(promise);
+		let delayRejection: boolean;
+
+		try {
+			assertDelay('minDelay', 'ms', ms);
+			delayRejection = readOption(options, 'delayRejection', true);
+		} catch (error) {
+			// The argument error wins, but `promise` may still reject: handle it so it does not surface as an unhandled rejection.
+			settled.catch(noop);
+			throw error;
+		}
+
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const elapsed = new Promise<void>(function (done) {
+			timer = setTimeout(done, ms);
+		});
+
+		settled.then(
+			function (value) {
+				elapsed.then(function () {
+					resolve(value);
+				});
+			},
+			function (error: unknown) {
+				if (delayRejection) {
+					elapsed.then(function () {
+						reject(error);
+					});
+				} else {
+					clearTimeout(timer);
+					reject(error);
+				}
+			}
+		);
+	});
 }

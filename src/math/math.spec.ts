@@ -2529,3 +2529,382 @@ describe('Math helpers under prototype pollution', function () {
 		}
 	});
 });
+
+describe('extent', function () {
+	it('finds the smallest and largest values in one pass', function () {
+		expect(helpers.extent([3, 1, 4, 1, 5])).toEqual([1, 5]);
+		expect(helpers.extent([-2])).toEqual([-2, -2]);
+		expect(helpers.extent([Infinity, -Infinity, 0])).toEqual([-Infinity, Infinity]);
+		expect(helpers.extent([Infinity])).toEqual([Infinity, Infinity]);
+	});
+
+	it('reads any iterable once, including a generator', function () {
+		function* values(): Generator<number> {
+			yield 5;
+			yield -1;
+			yield 2;
+		}
+		expect(helpers.extent(values())).toEqual([-1, 5]);
+		expect(helpers.extent(new Set([7]))).toEqual([7, 7]);
+	});
+
+	it('is undefined for no numbers, and [NaN, NaN] when one is NaN', function () {
+		expect(helpers.extent([])).toBeUndefined();
+		expect(helpers.extent([1, NaN, 2])).toEqual([NaN, NaN]);
+		expect(helpers.extent(['x'] as never)).toEqual([NaN, NaN]);
+	});
+
+	it('orders -0 before 0, like min and max', function () {
+		const [low, high] = helpers.extent([0, -0]) as [number, number];
+		expect(Object.is(low, -0) && Object.is(high, 0)).toBe(true);
+		const [low2, high2] = helpers.extent([-0, 0]) as [number, number];
+		expect(Object.is(low2, -0) && Object.is(high2, 0)).toBe(true);
+		const [low3, high3] = helpers.extent([-0]) as [number, number];
+		expect(Object.is(low3, -0) && Object.is(high3, -0)).toBe(true);
+	});
+
+	it('converts elements with unary +', function () {
+		expect(helpers.extent(['10', '9'] as never)).toEqual([9, 10]);
+	});
+});
+
+describe('wrap', function () {
+	it('wraps values cyclically into [minimum, maximum)', function () {
+		expect(helpers.wrap(370, 0, 360)).toBe(10);
+		expect(helpers.wrap(-10, 0, 360)).toBe(350);
+		expect(helpers.wrap(720, 0, 360)).toBe(0);
+		expect(helpers.wrap(360, 0, 360)).toBe(0);
+		expect(helpers.wrap(190, -180, 180)).toBe(-170);
+		expect(helpers.wrap(-180, -180, 180)).toBe(-180);
+		expect(helpers.wrap(180, -180, 180)).toBe(-180);
+		expect(helpers.wrap(-1, 0, 5)).toBe(4);
+		expect(helpers.wrap(-6, 0, 5)).toBe(4);
+		expect(helpers.wrap(5.5, 0, 1)).toBe(0.5);
+		expect(helpers.wrap(2.75, 0.5, 1.5)).toBe(0.75);
+	});
+
+	it('returns a value in range as is, -0 included', function () {
+		expect(helpers.wrap(0.1, 0, 1)).toBe(0.1);
+		expect(helpers.wrap(-0, 0, 1)).toBe(-0);
+		expect(helpers.wrap(1e-300, 0, 1)).toBe(1e-300);
+	});
+
+	it('is exact for integers, even far from the range', function () {
+		expect(helpers.wrap(2 ** 53 - 1, 0, 7)).toBe((2 ** 53 - 1) % 7);
+		expect(helpers.wrap(-(2 ** 53) + 1, 0, 10)).toBe(9);
+		expect(helpers.wrap(1e300, 0, 1024)).toBe(0);
+	});
+
+	it('returns minimum when the result rounds up to maximum', function () {
+		// The exact result, 3 - 2 ** -52, rounds to 3.
+		expect(helpers.wrap(1 - 2 ** -52, 1, 3)).toBe(1);
+		expect(helpers.wrap(-1e-20, 0, 1)).toBe(0);
+	});
+
+	it('does not overflow when the span or the distance to minimum exceeds Number.MAX_VALUE', function () {
+		expect(helpers.wrap(1.7e308, -1e308, 1e308)).toBeCloseTo(-0.3e308, -300);
+		expect(helpers.wrap(-1.7e308, -1e308, 1e308)).toBeCloseTo(0.3e308, -300);
+		expect(helpers.wrap(1e308, -1e308, -0.9e308)).toBeGreaterThanOrEqual(-1e308);
+		expect(helpers.wrap(1e308, -1e308, -0.9e308)).toBeLessThan(-0.9e308);
+		expect(helpers.wrap(Number.MAX_VALUE, -Number.MAX_VALUE, Number.MAX_VALUE)).toBe(-Number.MAX_VALUE);
+	});
+
+	it('gives NaN for a value that is not finite', function () {
+		expect(helpers.wrap(NaN, 0, 1)).toBeNaN();
+		expect(helpers.wrap(Infinity, 0, 1)).toBeNaN();
+		expect(helpers.wrap(-Infinity, 0, 1)).toBeNaN();
+		expect(helpers.wrap(Infinity, -1e308, 1e308)).toBeNaN();
+	});
+
+	it('rejects bounds that are not finite or not in increasing order', function () {
+		expect(function () {
+			helpers.wrap(1, 3, 3);
+		}).toThrow(new RangeError('wrap: `minimum` must be less than `maximum`, got 3 and 3'));
+		expect(function () {
+			helpers.wrap(1, 4, 3);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.wrap(1, NaN, 3);
+		}).toThrow(new RangeError('wrap: `minimum` must be a finite number, got NaN'));
+		expect(function () {
+			helpers.wrap(1, 0, Infinity);
+		}).toThrow(new RangeError('wrap: `maximum` must be a finite number, got Infinity'));
+		expect(function () {
+			helpers.wrap(1, '0' as never, 3);
+		}).toThrow(new TypeError('wrap: `minimum` must be a finite number, got string'));
+	});
+});
+
+describe('allocate', function () {
+	it('splits an amount by the largest remainder method', function () {
+		expect(helpers.allocate(100, [1, 1, 1])).toEqual([34, 33, 33]);
+		expect(helpers.allocate(1000, [70, 20, 10])).toEqual([700, 200, 100]);
+		expect(helpers.allocate(5, [0.5, 0.25, 0.25])).toEqual([3, 1, 1]);
+		expect(helpers.allocate(10, [1, 0, 2])).toEqual([3, 0, 7]);
+		expect(helpers.allocate(7, [1])).toEqual([7]);
+		expect(helpers.allocate(0, [1, 2])).toEqual([0, 0]);
+		// Quotas 1.2, 1.2, 1.6: the unit left goes to the largest remainder, not to the first share.
+		expect(helpers.allocate(4, [3, 3, 4])).toEqual([1, 1, 2]);
+		expect(helpers.allocate(6, [2, 2, 1])).toEqual([3, 2, 1]);
+	});
+
+	it('breaks ties in favour of the earlier index', function () {
+		expect(helpers.allocate(2, [1, 1, 1])).toEqual([1, 1, 0]);
+		expect(helpers.allocate(1, [1, 2, 1])).toEqual([0, 1, 0]);
+		expect(helpers.allocate(1, [2, 1, 1, 2])).toEqual([1, 0, 0, 0]);
+	});
+
+	it('reads the ratios as the exact fractions their doubles hold', function () {
+		expect(helpers.allocate(100, [0.1, 0.1, 0.1])).toEqual(helpers.allocate(100, [1, 1, 1]));
+		// With the doubles 0.1, 0.2 and 0.3 (whose sum is not that of 1, 2 and 3 tenths), the first quota is just above 1/2 and the last one
+		// just below 3/2: the unit left goes to the first share by its remainder, not by the tie rule.
+		expect(helpers.allocate(3, [0.1, 0.2, 0.3])).toEqual([1, 1, 1]);
+		expect(helpers.allocate(3, [1, 2, 3])).toEqual([1, 1, 1]);
+		expect(helpers.allocate(10, [Number.MIN_VALUE, Number.MAX_VALUE])).toEqual([0, 10]);
+		expect(helpers.allocate(2, [Number.MIN_VALUE, Number.MIN_VALUE])).toEqual([1, 1]);
+	});
+
+	it('splits a negative amount like its absolute value, negated', function () {
+		expect(helpers.allocate(-100, [1, 1, 1])).toEqual([-34, -33, -33]);
+		expect(helpers.allocate(-10, [1, 0, 2])).toEqual([-3, 0, -7]);
+		expect(Object.is(helpers.allocate(-10, [1, 0, 2])[1], 0)).toBe(true);
+	});
+
+	it('handles bigint totals and ratios', function () {
+		expect(helpers.allocate(10n ** 20n, [1, 2])).toEqual([33333333333333333333n, 66666666666666666667n]);
+		expect(helpers.allocate(-5n, [1n, 1n])).toEqual([-3n, -2n]);
+		expect(helpers.allocate(100, [1n, 1n, 1n])).toEqual([34, 33, 33]);
+		expect(helpers.allocate(100, [1n, 0.5, 2 ** 70])).toEqual([0, 0, 100]);
+		expect(helpers.allocate(Number.MAX_SAFE_INTEGER, [1, 1])).toEqual([4503599627370496, 4503599627370495]);
+	});
+
+	it('rejects a total that is not a safe integer or a bigint', function () {
+		for (const total of [1.5, NaN, Infinity, 2 ** 53]) {
+			expect(function () {
+				helpers.allocate(total, [1]);
+			}).toThrow(new RangeError(`allocate: \`total\` must be a safe integer or a bigint, got ${total}`));
+		}
+		expect(function () {
+			helpers.allocate('5' as never, [1]);
+		}).toThrow(new TypeError('allocate: `total` must be a safe integer or a bigint, got string'));
+	});
+
+	it('rejects ratios that are not an array of finite non-negative numbers or bigints, or all zero', function () {
+		expect(function () {
+			helpers.allocate(5, 'ab' as never);
+		}).toThrow(new TypeError('allocate: `ratios` must be an array, got string'));
+		expect(function () {
+			helpers.allocate(5, [1, '1'] as never);
+		}).toThrow(new TypeError('allocate: `ratios[1]` must be a finite number >= 0 or a bigint >= 0, got string'));
+		expect(function () {
+			helpers.allocate(5, [{ valueOf: Number }] as never);
+		}).toThrow(new TypeError('allocate: `ratios[0]` must be a finite number >= 0 or a bigint >= 0, got object'));
+		for (const ratio of [-1, NaN, Infinity, -Infinity]) {
+			expect(function () {
+				helpers.allocate(5, [1, ratio]);
+			}).toThrow(new RangeError(`allocate: \`ratios[1]\` must be a finite number >= 0 or a bigint >= 0, got ${ratio}`));
+		}
+		expect(function () {
+			helpers.allocate(5, [1, -1n]);
+		}).toThrow(new RangeError('allocate: `ratios[1]` must be a finite number >= 0 or a bigint >= 0, got -1'));
+		for (const ratios of [[], [0], [0, 0n, -0]]) {
+			expect(function () {
+				helpers.allocate(5, ratios);
+			}).toThrow(new RangeError('allocate: `ratios` must contain a ratio > 0'));
+		}
+	});
+
+	it('reads each ratio once', function () {
+		let reads = 0;
+		const ratios = new Proxy([1, 1], {
+			get(target, key, receiver) {
+				if (key === '0') reads++;
+				return Reflect.get(target, key, receiver);
+			}
+		});
+		expect(helpers.allocate(3, ratios)).toEqual([2, 1]);
+		expect(reads).toBe(1);
+	});
+});
+
+describe('covariance', function () {
+	it('computes the population covariance, or the sample one', function () {
+		expect(helpers.covariance([1, 2, 3, 4], [2, 4, 6, 8])).toBe(2.5);
+		expect(helpers.covariance([1, 2, 3, 4], [2, 4, 6, 8], { sample: true })).toBe(10 / 3);
+		expect(helpers.covariance([1, 2, 3], [3, 2, 1])).toBe(-2 / 3);
+		expect(helpers.covariance([5], [7])).toBe(0);
+		expect(helpers.covariance([1, 2, 3, 4], [5, 5, 5, 5])).toBe(0);
+		expect(helpers.covariance(['1', '2'] as never, [2, 4])).toBe(0.5);
+	});
+
+	it('is NaN for no pairs, a sample of one pair, or values that are not finite', function () {
+		expect(helpers.covariance([], [])).toBeNaN();
+		expect(helpers.covariance([1], [2], { sample: true })).toBeNaN();
+		expect(helpers.covariance([1, NaN], [1, 2])).toBeNaN();
+		expect(helpers.covariance([1, Infinity], [1, 2])).toBeNaN();
+		expect(helpers.covariance([1, 2], [-Infinity, 2])).toBeNaN();
+	});
+
+	it('stays accurate far from zero (two passes, no cancellation)', function () {
+		const offset = 1e9;
+		expect(helpers.covariance([offset + 1, offset + 2, offset + 3], [offset + 2, offset + 4, offset + 6])).toBe(4 / 3);
+		expect(helpers.covariance([1e15 + 1, 1e15 + 3], [1, 3])).toBe(1);
+	});
+
+	it('does not overflow before the result does', function () {
+		const xs = [1e154, -1e154, 0];
+		expect(helpers.covariance(xs, xs)).toBeCloseTo(helpers.variance(xs), -300);
+		expect(Number.isFinite(helpers.covariance(xs, xs))).toBe(true);
+		expect(helpers.covariance([1e200, -1e200], [1e200, -1e200])).toBe(Infinity);
+		expect(helpers.covariance([1e200, -1e200], [-1e200, 1e200])).toBe(-Infinity);
+		expect(helpers.covariance([1e200, -1e200], [1, -1])).toBe(1e200);
+		expect(helpers.covariance([Number.MAX_VALUE, -Number.MAX_VALUE], [1, -1])).toBe(Number.MAX_VALUE);
+		expect(helpers.covariance([1e-200, -1e-200], [1e200, -1e200])).toBe(1);
+		expect(helpers.covariance([1e200, -1e200], [1e-200, -1e-200])).toBe(1);
+		expect(helpers.covariance([1e-170, -1e-170], [1e-170, -1e-170])).toBe(0);
+		expect(helpers.covariance([2 ** -1000, -(2 ** -1000)], [2 ** -60, -(2 ** -60)])).toBe(2 ** -1060);
+		expect(helpers.covariance([1e300, -1e300, 1e300, -1e300], [1, 1, -1, -1])).toBe(0);
+	});
+
+	it('equals variance for a sample paired with itself', function () {
+		const xs = [2, 4, 4, 4, 5, 5, 7, 9];
+		expect(helpers.covariance(xs, xs)).toBe(helpers.variance(xs));
+		expect(helpers.covariance(xs, xs, { sample: true })).toBe(helpers.variance(xs, { sample: true }));
+	});
+
+	it('rejects samples of different lengths', function () {
+		expect(function () {
+			helpers.covariance([1, 2], [1]);
+		}).toThrow(new RangeError('covariance: `xs` and `ys` must have the same length, got 2 and 1'));
+	});
+
+	it('ignores a sample option inherited from a polluted Object.prototype', function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		proto.sample = true;
+		try {
+			expect(helpers.covariance([1, 2, 3, 4], [2, 4, 6, 8])).toBe(2.5);
+			expect(helpers.covariance([1, 2, 3, 4], [2, 4, 6, 8], {})).toBe(2.5);
+		} finally {
+			delete proto.sample;
+		}
+	});
+});
+
+describe('correlation', function () {
+	it('computes the Pearson correlation coefficient', function () {
+		expect(helpers.correlation([1, 2, 3, 4], [2, 4, 6, 8])).toBe(1);
+		expect(helpers.correlation([1, 2, 3], [3, 2, 1])).toBe(-1);
+		expect(helpers.correlation([1, 2, 3, 4], [1, 3, 2, 4])).toBe(0.8);
+		expect(helpers.correlation([1, 2, 3, 4], [1, -1, -1, 1])).toBe(0);
+		expect(helpers.correlation([0.1, 0.2, 0.3], [10, 20, 30])).toBeCloseTo(1, 15);
+	});
+
+	it('is NaN when undefined: fewer than 2 pairs, a constant sample, values that are not finite', function () {
+		expect(helpers.correlation([], [])).toBeNaN();
+		expect(helpers.correlation([1], [1])).toBeNaN();
+		expect(helpers.correlation([1, 2, 3], [5, 5, 5])).toBeNaN();
+		expect(helpers.correlation([5, 5], [1, 2])).toBeNaN();
+		expect(helpers.correlation([1, NaN], [1, 2])).toBeNaN();
+	});
+
+	it('neither overflows nor underflows', function () {
+		expect(helpers.correlation([1e200, -1e200, 0], [1, -1, 0])).toBe(1);
+		expect(helpers.correlation([Number.MAX_VALUE, -Number.MAX_VALUE], [-1, 1])).toBe(-1);
+		expect(helpers.correlation([1e-160, 2e-160, 3e-160], [3, 2, 1])).toBe(-1);
+		expect(helpers.correlation([1e-300, 0, 0], [5e-324, 0, 0])).toBe(1);
+		expect(helpers.correlation([3e-170, 1e-170, 2e-170], [3e170, 1e170, 2e170])).toBeCloseTo(1, 15);
+	});
+
+	it('rejects samples of different lengths', function () {
+		expect(function () {
+			helpers.correlation([1], [1, 2]);
+		}).toThrow(new RangeError('correlation: `xs` and `ys` must have the same length, got 1 and 2'));
+	});
+});
+
+describe('linearRegression', function () {
+	it('fits the least-squares line', function () {
+		const line = helpers.linearRegression([1, 2, 3, 4], [3, 5, 7, 9]);
+		expect([line.slope, line.intercept, line.r2]).toEqual([2, 1, 1]);
+		expect(line.predict(10)).toBe(21);
+		expect(line.predict(0)).toBe(1);
+		const noisy = helpers.linearRegression([1, 2, 3], [2, 1, 3]);
+		expect(noisy.slope).toBe(0.5);
+		expect(noisy.intercept).toBe(1);
+		expect(noisy.r2).toBe(0.25);
+		expect(helpers.linearRegression([0, 1], [5, 5])).toMatchObject({ slope: 0, intercept: 5, r2: 1 });
+	});
+
+	it('stays accurate for data far from zero, such as timestamps', function () {
+		const start = Date.UTC(2024, 0, 1);
+		const line = helpers.linearRegression([start, start + 1000, start + 2000], [10, 12, 14]);
+		expect(line.slope).toBe(0.002);
+		expect(line.predict(start + 3000)).toBe(16);
+		expect(line.r2).toBe(1);
+	});
+
+	it('gives NaN fields for values that are not finite', function () {
+		const line = helpers.linearRegression([1, 2, NaN], [1, 2, 3]);
+		expect([line.slope, line.intercept, line.r2]).toEqual([NaN, NaN, NaN]);
+		const flat = helpers.linearRegression([1, 2, NaN], [3, 3, 3]);
+		expect(flat.r2).toBeNaN();
+	});
+
+	it('handles values whose squares overflow or underflow', function () {
+		expect(helpers.linearRegression([1e-170, 2e-170, 4e-170], [1, 2, 4]).slope).toBe(1e170);
+		expect(helpers.linearRegression([1, 2, 4], [1e-170, 2e-170, 4e-170]).slope).toBe(1e-170);
+		const line = helpers.linearRegression([1e200, -1e200, 0], [2e200, -2e200, 0]);
+		expect(line.slope).toBe(2);
+		expect(line.intercept).toBe(0);
+		expect(line.r2).toBe(1);
+	});
+
+	it('rejects fewer than 2 points, equal xs and samples of different lengths', function () {
+		expect(function () {
+			helpers.linearRegression([1], [1]);
+		}).toThrow(new RangeError('linearRegression: `xs` and `ys` must hold at least 2 points, got 1'));
+		expect(function () {
+			helpers.linearRegression([], []);
+		}).toThrow(new RangeError('linearRegression: `xs` and `ys` must hold at least 2 points, got 0'));
+		expect(function () {
+			helpers.linearRegression([3, 3], [1, 2]);
+		}).toThrow(new RangeError('linearRegression: `xs` must not all be equal (the line would be vertical)'));
+		expect(function () {
+			helpers.linearRegression([1, 2], [1]);
+		}).toThrow(new RangeError('linearRegression: `xs` and `ys` must have the same length, got 2 and 1'));
+	});
+});
+
+describe('interquartileRange', function () {
+	it('is the difference between the third and first quartiles', function () {
+		expect(helpers.interquartileRange([1, 2, 3, 4, 5, 6, 7, 8])).toBe(3.5);
+		expect(helpers.interquartileRange([8, 1, 7, 2, 6, 3, 5, 4])).toBe(3.5);
+		expect(helpers.interquartileRange([7, 7, 7])).toBe(0);
+		expect(helpers.interquartileRange([5])).toBe(0);
+	});
+
+	it('is NaN for no numbers or a NaN', function () {
+		expect(helpers.interquartileRange([])).toBeNaN();
+		expect(helpers.interquartileRange([1, NaN])).toBeNaN();
+	});
+});
+
+describe('zScore', function () {
+	it('measures the distance from the mean in standard deviations', function () {
+		expect(helpers.zScore(130, 100, 15)).toBe(2);
+		expect(helpers.zScore(85, 100, 15)).toBe(-1);
+		expect(helpers.zScore(100, 100, 15)).toBe(0);
+	});
+
+	it('rejects a standard deviation that is not positive', function () {
+		expect(function () {
+			helpers.zScore(1, 0, 0);
+		}).toThrow(new RangeError('zScore: `deviation` must be a number > 0, got 0'));
+		expect(function () {
+			helpers.zScore(1, 0, NaN);
+		}).toThrow(new RangeError('zScore: `deviation` must be a number > 0, got NaN'));
+		expect(function () {
+			helpers.zScore(1, 0, '1' as never);
+		}).toThrow(new TypeError('zScore: `deviation` must be a number > 0, got string'));
+	});
+});

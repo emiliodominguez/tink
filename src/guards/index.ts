@@ -1,5 +1,5 @@
 import { assertFunction, assertNumber, describe as typeName } from '../utils/assert.js';
-import type { AnyFunction, Primitive, UnionToIntersection } from '../utils/index.js';
+import type { AnyFunction, NonEmptyArray, Primitive, UnionToIntersection } from '../utils/index.js';
 import { generate } from '../utils/jit.js';
 import { hold, isTooDeep, PENDING, release, scope } from '../utils/memo.js';
 import { guardScore, scored } from '../utils/score.js';
@@ -690,7 +690,7 @@ export function isNonEmptyString(value: unknown): value is string {
 }
 
 /**
- * Checks whether a (mutable) array has at least one element, narrowing it to a non-empty tuple `[T, ...T[]]` so that
+ * Checks whether a (mutable) array has at least one element, narrowing it to a `NonEmptyArray<T>` (`[T, ...T[]]`) so that
  * `value[0]` is typed `T` (not `T | undefined` under `noUncheckedIndexedAccess`). `null`/`undefined` give `false`.
  * Sparse arrays count by `length`, like `Array#length`.
  * @template T - The element type
@@ -700,7 +700,7 @@ export function isNonEmptyString(value: unknown): value is string {
  * const list: number[] = [1, 2];
  * if (isNonEmptyArray(list)) list[0].toFixed(); // list: [number, ...number[]]
  */
-export function isNonEmptyArray<T>(value: T[] | null | undefined): value is [T, ...T[]];
+export function isNonEmptyArray<T>(value: T[] | null | undefined): value is NonEmptyArray<T>;
 /**
  * Checks whether a readonly array has at least one element, narrowing it to `readonly [T, ...T[]]`.
  * @template T - The element type
@@ -948,6 +948,346 @@ export function isArrayBuffer(value: unknown): value is ArrayBuffer {
 	// No `instanceof` fast path: some hosts (e.g. Jest's node environment) expose another realm's `ArrayBuffer` as the global one.
 	try {
 		return typeof value === 'object' && value !== null && (arrayBufferByteLengthGetter.call(value as ArrayBuffer), true);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * The kind of a function, told by the `Symbol.toStringTag` that its PROTOTYPE owns: `%AsyncFunction.prototype%`,
+ * `%GeneratorFunction.prototype%` and `%AsyncGeneratorFunction.prototype%` own one (in every realm), so a plain function cannot fake
+ * its kind by defining the tag on itself; it would have to swap its prototype.
+ * @param {AnyFunction} value - The function
+ * @returns {'function' | 'asyncfunction' | 'generatorfunction' | 'asyncgeneratorfunction'} Its kind
+ */
+function functionKind(value: AnyFunction): 'function' | 'asyncfunction' | 'generatorfunction' | 'asyncgeneratorfunction' {
+	try {
+		const prototype: object | null = Object.getPrototypeOf(value);
+		const tag: unknown = prototype === null ? undefined : Object.getOwnPropertyDescriptor(prototype, Symbol.toStringTag)?.value;
+		return tag === 'AsyncFunction'
+			? 'asyncfunction'
+			: tag === 'GeneratorFunction'
+				? 'generatorfunction'
+				: tag === 'AsyncGeneratorFunction'
+					? 'asyncgeneratorfunction'
+					: 'function';
+	} catch {
+		// A revoked proxy.
+		return 'function';
+	}
+}
+
+/**
+ * Checks whether a value is an `async` function (an `async function`, async arrow or async method, bound or not). Async GENERATOR
+ * functions are not: they return async iterators, not promises. Neither is a plain function returning a promise, nor an async function
+ * transpiled to a generator or a state machine (it is a plain function by then): the check cannot call the function to find out.
+ * The tag of the function's prototype is checked, so async functions of other realms are recognised while a plain function defining
+ * `Symbol.toStringTag = 'AsyncFunction'` on itself is rejected.
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether the value is an async function
+ * @example
+ * isAsyncFunction(async function () {}); // => true
+ * isAsyncFunction(function () { return Promise.resolve(); }); // => false
+ * isAsyncFunction(async function* () {}); // => false
+ */
+export function isAsyncFunction(value: unknown): value is (...args: never[]) => Promise<unknown> {
+	return typeof value === 'function' && functionKind(value as AnyFunction) === 'asyncfunction';
+}
+
+/**
+ * Checks whether a value is a generator function (`function*`, bound or not). Async generator functions (`async function*`) are not.
+ * Recognised like {@link isAsyncFunction}, by the tag of the function's prototype (so in any realm).
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether the value is a generator function
+ * @example
+ * isGeneratorFunction(function* () {}); // => true
+ * isGeneratorFunction(function () {}); // => false
+ * isGeneratorFunction(async function* () {}); // => false
+ */
+export function isGeneratorFunction(value: unknown): value is (...args: never[]) => Generator<unknown, unknown, unknown> {
+	return typeof value === 'function' && functionKind(value as AnyFunction) === 'generatorfunction';
+}
+
+/**
+ * Checks whether a value can be used as a property key as it is: a string, a number or a symbol (other values would be converted to
+ * strings first).
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether the value is a string, a number or a symbol
+ * @example
+ * isPropertyKey('id'); // => true
+ * isPropertyKey(0); // => true
+ * isPropertyKey(Symbol.iterator); // => true
+ * isPropertyKey(null); // => false
+ */
+export function isPropertyKey(value: unknown): value is PropertyKey {
+	return typeof value === 'string' || typeof value === 'number' || typeof value === 'symbol';
+}
+
+/**
+ * Checks whether a value is array-like, as lodash's `isArrayLike`: not `null`, `undefined` or a function, with a `length` that is an
+ * integer in `[0, Number.MAX_SAFE_INTEGER]`. Strings, arrays, typed arrays, `arguments` and `NodeList`s are; so is any object with such a
+ * `length` (`{ length: 0 }`). The `length` is read once; a getter that throws, or a revoked proxy, gives `false`.
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether the value is array-like
+ * @example
+ * isArrayLike([1, 2]); // => true
+ * isArrayLike('abc'); // => true
+ * isArrayLike({ length: 2, 0: 'a', 1: 'b' }); // => true
+ * isArrayLike({ length: -1 }); // => false
+ * isArrayLike(function (a: number) { return a; }); // => false
+ */
+export function isArrayLike(value: unknown): value is ArrayLike<unknown> {
+	if (value == null || typeof value === 'function') return false;
+	try {
+		const length = (value as { length?: unknown }).length;
+		return Number.isSafeInteger(length) && (length as number) >= 0;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * The `Blob` type of the environment: the DOM's (or Node's) `Blob` when those types are loaded, otherwise its structural core, so that
+ * the declarations compile without them.
+ */
+export type BlobLike = typeof globalThis extends { Blob: { prototype: infer B } }
+	? B
+	: {
+			readonly size: number;
+			readonly type: string;
+			arrayBuffer(): Promise<ArrayBuffer>;
+			text(): Promise<string>;
+			slice(start?: number, end?: number, contentType?: string): BlobLike;
+		};
+
+/**
+ * Checks whether a value is a `Blob` (a `File` too), with a brand check: blobs of other realms pass, while objects that merely inherit
+ * from `Blob.prototype` or fake its properties fail. `false` in runtimes without `Blob`.
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether the value is a Blob
+ * @example
+ * isBlob(new Blob(['text'])); // => true
+ * isBlob({ size: 4, type: '' }); // => false
+ */
+export function isBlob(value: unknown): value is BlobLike {
+	try {
+		const BlobConstructor = (globalThis as { Blob?: unknown }).Blob;
+		if (typeof BlobConstructor !== 'function' || !(value instanceof BlobConstructor || isForeign(value))) return false;
+		// The `size` getter throws for anything without the Blob internal slot.
+		const sizeGetter = (Object.getOwnPropertyDescriptor(BlobConstructor.prototype, 'size') as PropertyDescriptor).get as (this: unknown) => number;
+		return (sizeGetter.call(value), true);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * The type names returned by {@link getType}: the `typeof` names of the primitives (`null` apart), the kinds of functions, and the
+ * built-in object types told apart by brand checks; `'object'` for any other object.
+ */
+export type TypeName =
+	| 'undefined'
+	| 'null'
+	| 'boolean'
+	| 'number'
+	| 'bigint'
+	| 'string'
+	| 'symbol'
+	| 'function'
+	| 'asyncfunction'
+	| 'generatorfunction'
+	| 'asyncgeneratorfunction'
+	| 'array'
+	| 'date'
+	| 'regexp'
+	| 'error'
+	| 'map'
+	| 'set'
+	| 'weakmap'
+	| 'weakset'
+	| 'promise'
+	| 'arraybuffer'
+	| 'dataview'
+	| 'int8array'
+	| 'uint8array'
+	| 'uint8clampedarray'
+	| 'int16array'
+	| 'uint16array'
+	| 'int32array'
+	| 'uint32array'
+	| 'float16array'
+	| 'float32array'
+	| 'float64array'
+	| 'bigint64array'
+	| 'biguint64array'
+	| 'object';
+
+/**
+ * Returns a precise, lowercase name for the type of any value, as a {@link TypeName}:
+ * - primitives: `'undefined'`, `'null'` (not `'object'`), `'boolean'`, `'number'` (`NaN` too), `'bigint'`, `'string'`, `'symbol'`;
+ * - functions: `'asyncfunction'`, `'generatorfunction'`, `'asyncgeneratorfunction'`, else `'function'` (classes and bound functions too);
+ * - objects: `'array'`, `'date'`, `'regexp'`, `'error'`, `'map'`, `'set'`, `'weakmap'`, `'weakset'`, `'promise'`, `'arraybuffer'`,
+ *   `'dataview'` and the typed arrays (`'uint8array'`, `'float64array'`, …, `'float16array'` where the runtime has it), else
+ *   `'object'`: plain and null-prototype objects, class instances, boxed primitives (`new Number(1)`), `SharedArrayBuffer`s, iterators.
+ *
+ * It is not fooled by `Symbol.toStringTag`: arrays, dates, regexps, maps, sets, weak collections, buffers and typed arrays are told
+ * apart by brand checks (as the guards of this module do, so values of other realms are recognised), functions by the tag their
+ * prototype owns (see {@link isAsyncFunction}). Errors
+ * and promises have no brand check: they are recognised by `instanceof`, and values of other realms (or with a `null` prototype) by
+ * their tag, so only such a value faking the tag can be misnamed. A thenable that is not a native promise is an `'object'`; a proxy is
+ * named after its target when that is an array or a function, and `'object'` otherwise.
+ * @param {unknown} value - The value to inspect
+ * @returns {TypeName} Its type name
+ * @example
+ * getType(null); // => 'null'
+ * getType([]); // => 'array'
+ * getType(new Date()); // => 'date'
+ * getType(new Uint8Array(1)); // => 'uint8array'
+ * getType(async function () {}); // => 'asyncfunction'
+ * getType({ [Symbol.toStringTag]: 'Date' }); // => 'object'
+ * getType(new Number(1)); // => 'object'
+ */
+export function getType(value: unknown): TypeName {
+	if (value === null) return 'null';
+	const type = typeof value;
+	if (type === 'function') return functionKind(value as AnyFunction);
+	if (type !== 'object') return type as TypeName;
+	try {
+		if (Array.isArray(value)) return 'array';
+	} catch {
+		// A revoked proxy.
+		return 'object';
+	}
+	if (ArrayBuffer.isView(value)) return ((typedArrayTagGetter.call(value) ?? 'DataView') as string).toLowerCase() as TypeName;
+	return isDate(value)
+		? 'date'
+		: isRegExp(value)
+			? 'regexp'
+			: isMap(value)
+				? 'map'
+				: isSet(value)
+					? 'set'
+					: isWeakMap(value)
+						? 'weakmap'
+						: isWeakSet(value)
+							? 'weakset'
+							: isArrayBuffer(value)
+								? 'arraybuffer'
+								: isError(value)
+									? 'error'
+									: isNativePromise(value)
+										? 'promise'
+										: 'object';
+}
+
+/**
+ * Whether a value is a native promise (of any realm), as opposed to any thenable: `instanceof Promise`, or the `'[object Promise]'` tag
+ * for objects of other realms and with a `null` prototype.
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether the value is a native promise
+ */
+function isNativePromise(value: unknown): boolean {
+	try {
+		return value instanceof Promise || (isForeign(value) && getTag(value) === '[object Promise]');
+	} catch {
+		// A revoked proxy, or a throwing `Symbol.toStringTag` getter.
+		return false;
+	}
+}
+
+/**
+ * Reads a property of a global object without throwing.
+ * @param {string} name - The global's name, e.g. `'process'`
+ * @returns {unknown} Its value, `undefined` when it is missing or reading it throws
+ */
+function readGlobal(name: string): unknown {
+	try {
+		return (globalThis as Record<string, unknown>)[name];
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Reads `process.versions[name]` without throwing.
+ * @param {string} name - The version key, e.g. `'node'`
+ * @returns {unknown} Its value, `undefined` when anything on the way is missing or throws
+ */
+function processVersion(name: string): unknown {
+	try {
+		return (readGlobal('process') as { versions?: Record<string, unknown> } | undefined)?.versions?.[name];
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Checks whether the code runs in Node.js: `process.versions.node` is a string, and the runtime is neither Bun nor Deno (both also set
+ * it). The browser shims of `process` that bundlers inject (`process/browser`, webpack 4, browserify) have no `versions.node`, so they
+ * do not count. A test environment that simulates a DOM in Node (jsdom, happy-dom) is still Node. Never throws, even for a hostile
+ * `process` global.
+ * @returns {boolean} Whether the runtime is Node.js
+ * @example
+ * // doctest: skip
+ * isNode(); // true in Node.js, false in browsers, Deno and Bun
+ */
+export function isNode(): boolean {
+	return typeof processVersion('node') === 'string' && !isBun() && !isDeno();
+}
+
+/**
+ * Checks whether the code runs in Deno: the global `Deno` is an object whose `version.deno` is a string. Never throws.
+ * @returns {boolean} Whether the runtime is Deno
+ * @example
+ * // doctest: skip
+ * isDeno(); // true in Deno (and its workers)
+ */
+export function isDeno(): boolean {
+	try {
+		return typeof (readGlobal('Deno') as { version?: { deno?: unknown } } | undefined)?.version?.deno === 'string';
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Checks whether the code runs in Bun: `process.versions.bun` is a string. Never throws.
+ * @returns {boolean} Whether the runtime is Bun
+ * @example
+ * // doctest: skip
+ * isBun(); // true in Bun
+ */
+export function isBun(): boolean {
+	return typeof processVersion('bun') === 'string';
+}
+
+/**
+ * Checks whether the code runs on the main thread of a browser: `window` is the global object, `document` is an object, and the runtime
+ * is not a server runtime (`process.versions.node` is not a string and there is no `Deno`). So jsdom or happy-dom simulating a DOM in
+ * Node, Bun or Deno is NOT a browser, nor is an Electron renderer with Node integration; a browser page with a bundler's `process` shim
+ * is. Web workers are not (see {@link isWebWorker}). Never throws.
+ * @returns {boolean} Whether the runtime is a browser's main thread
+ * @example
+ * // doctest: skip
+ * isBrowser(); // true in a browser tab, false in Node (even with jsdom), Deno, Bun and web workers
+ */
+export function isBrowser(): boolean {
+	const document = readGlobal('document');
+	return readGlobal('window') === globalThis && typeof document === 'object' && document !== null && typeof processVersion('node') !== 'string' && !isDeno();
+}
+
+/**
+ * Checks whether the code runs in a web worker: the global object is an instance of `WorkerGlobalScope`, which covers dedicated, shared
+ * and service workers (Deno's workers too). Node's `worker_threads` are not web workers. Never throws.
+ * @returns {boolean} Whether the runtime is a web worker
+ * @example
+ * // doctest: skip
+ * isWebWorker(); // true inside a dedicated, shared or service worker
+ */
+export function isWebWorker(): boolean {
+	try {
+		const WorkerGlobalScope = readGlobal('WorkerGlobalScope');
+		return typeof WorkerGlobalScope === 'function' && globalThis instanceof WorkerGlobalScope;
 	} catch {
 		return false;
 	}

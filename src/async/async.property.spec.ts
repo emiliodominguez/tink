@@ -5,18 +5,26 @@ import {
 	attemptAsync,
 	createBatcher,
 	createDeferred,
+	createKeyedMutex,
 	createLimiter,
+	createMutex,
 	createQueue,
 	createRateLimiter,
+	createSemaphore,
 	debounceAsync,
 	filterWithConcurrency,
 	mapSettledWithConcurrency,
 	mapWithConcurrency,
 	memoizeAsync,
+	minDelay,
 	promiseAllObject,
+	reduceAsync,
 	retry,
-	sequence
+	sequence,
+	waitForEvent
 } from '.';
+import { EventEmitter } from 'node:events';
+import { createEmitter } from '../emitter/index.js';
 import type { AbortSignalLike } from '../utils/index.js';
 
 /**
@@ -670,6 +678,403 @@ describe('createBatcher (properties)', function () {
 						);
 					});
 					for (const signal of signals) expect(signal.listeners.size).toBe(0);
+				}
+			)
+		);
+	});
+});
+
+describe('Async helpers (properties: locks, events, reduceAsync, minDelay)', function () {
+	afterEach(function () {
+		jest.clearAllTimers();
+		jest.useRealTimers();
+	});
+
+	type SemaphoreCommand =
+		| { kind: 'acquire'; weight: number; abortable: boolean }
+		| { kind: 'try'; weight: number }
+		| { kind: 'release'; pick: number; twice: boolean }
+		| { kind: 'abort'; pick: number };
+
+	/**
+	 * Commands for a semaphore of up to `maxPermits` permits (weights are clamped to the actual permits).
+	 */
+	function semaphoreCommands(maxPermits: number): fc.Arbitrary<SemaphoreCommand[]> {
+		const weight = fc.integer({ min: 1, max: maxPermits });
+		return fc.array(
+			fc.oneof(
+				fc.record({ kind: fc.constant('acquire' as const), weight, abortable: fc.boolean() }),
+				fc.record({ kind: fc.constant('try' as const), weight }),
+				fc.record({ kind: fc.constant('release' as const), pick: fc.nat(), twice: fc.boolean() }),
+				fc.record({ kind: fc.constant('abort' as const), pick: fc.nat() })
+			),
+			{ maxLength: 40 }
+		);
+	}
+
+	it('createSemaphore matches a FIFO model, conserves permits and leaks no listener under any acquire / abort / release interleaving', async function () {
+		await fc.assert(
+			fc.asyncProperty(fc.integer({ min: 1, max: 5 }), semaphoreCommands(5), async function (permits, commands) {
+				const semaphore = createSemaphore(permits);
+				// The model: holders by request id, and the FIFO queue of waiting requests.
+				const held = new Map<number, number>();
+				const queue: Array<{ id: number; weight: number; signal?: CountingSignal }> = [];
+				const releases = new Map<number, () => void>();
+				const signals: CountingSignal[] = [];
+				const modelGrants: number[] = [];
+				const actualGrants: number[] = [];
+				let modelAvailable = permits;
+				let nextId = 0;
+
+				function modelDispatch(): void {
+					while (queue.length > 0 && queue[0].weight <= modelAvailable) {
+						const request = queue.shift() as { id: number; weight: number };
+						modelAvailable -= request.weight;
+						held.set(request.id, request.weight);
+						modelGrants.push(request.id);
+					}
+				}
+
+				function check(): void {
+					let holding = 0;
+					for (const weight of held.values()) holding += weight;
+					expect(semaphore.available).toBe(modelAvailable);
+					expect(semaphore.available + holding).toBe(permits);
+					expect(semaphore.pending).toBe(queue.length);
+				}
+
+				for (const command of commands) {
+					if (command.kind === 'acquire') {
+						const id = nextId++;
+						const weight = Math.min(command.weight, permits);
+						const signal = command.abortable ? new CountingSignal() : undefined;
+						if (signal) signals.push(signal);
+						semaphore.acquire({ weight, signal }).then(
+							function (release) {
+								actualGrants.push(id);
+								releases.set(id, release);
+							},
+							function () {
+								// Aborted: checked through the model.
+							}
+						);
+						if (queue.length === 0 && weight <= modelAvailable) {
+							modelAvailable -= weight;
+							held.set(id, weight);
+							modelGrants.push(id);
+						} else {
+							queue.push({ id, weight, signal });
+						}
+					} else if (command.kind === 'try') {
+						const weight = Math.min(command.weight, permits);
+						const release = semaphore.tryAcquire(weight);
+						const expected = queue.length === 0 && weight <= modelAvailable;
+						expect(release !== undefined).toBe(expected);
+						if (release) {
+							const id = nextId++;
+							modelAvailable -= weight;
+							held.set(id, weight);
+							releases.set(id, release);
+						}
+					} else if (command.kind === 'release') {
+						const ids = Array.from(releases.keys());
+						if (ids.length > 0) {
+							const id = ids[command.pick % ids.length];
+							const release = releases.get(id) as () => void;
+							release();
+							if (command.twice) release();
+							releases.delete(id);
+							modelAvailable += held.get(id) as number;
+							held.delete(id);
+							modelDispatch();
+						}
+					} else {
+						const cancellable = queue.filter(function (request) {
+							return request.signal !== undefined;
+						});
+						if (cancellable.length > 0) {
+							const request = cancellable[command.pick % cancellable.length];
+							(request.signal as CountingSignal).abort(new Error('aborted'));
+							queue.splice(queue.indexOf(request), 1);
+							modelDispatch();
+						}
+					}
+					check();
+					await yieldTicks(3);
+				}
+
+				// Drain: abort what can be aborted, release every holder (including those granted while draining).
+				for (const request of queue.slice()) {
+					if (request.signal) {
+						request.signal.abort(new Error('aborted'));
+						queue.splice(queue.indexOf(request), 1);
+						modelDispatch();
+					}
+				}
+				while (releases.size > 0) {
+					for (const [id, release] of Array.from(releases)) {
+						release();
+						releases.delete(id);
+						modelAvailable += held.get(id) as number;
+						held.delete(id);
+						modelDispatch();
+						check();
+					}
+					await yieldTicks(3);
+				}
+
+				check();
+				expect(semaphore.available).toBe(permits);
+				expect(semaphore.pending).toBe(0);
+				expect(actualGrants).toEqual(modelGrants);
+				for (const signal of signals) expect(signal.listeners.size).toBe(0);
+			})
+		);
+	});
+
+	it('createSemaphore.run never holds more than `permits` weighted permits at once and runs every task', async function () {
+		await fc.assert(
+			fc.asyncProperty(
+				fc.integer({ min: 1, max: 6 }),
+				fc.array(fc.record({ weight: fc.integer({ min: 1, max: 6 }), ticks: fc.integer({ min: 0, max: 4 }), fails: fc.boolean() }), { maxLength: 25 }),
+				async function (permits, tasks) {
+					const semaphore = createSemaphore(permits);
+					let inUse = 0;
+					let peak = 0;
+					const outcomes = await Promise.allSettled(
+						tasks.map(function (task, index) {
+							const weight = Math.min(task.weight, permits);
+							return semaphore.run(
+								async function () {
+									inUse += weight;
+									peak = Math.max(peak, inUse);
+									expect(inUse).toBeLessThanOrEqual(permits);
+									await yieldTicks(task.ticks);
+									inUse -= weight;
+									if (task.fails) throw new Error(`task ${index}`);
+									return index;
+								},
+								{ weight }
+							);
+						})
+					);
+					expect(
+						outcomes.map(function (outcome) {
+							return outcome.status === 'fulfilled' ? outcome.value : (outcome.reason as Error).message;
+						})
+					).toEqual(
+						tasks.map(function (task, index) {
+							return task.fails ? `task ${index}` : index;
+						})
+					);
+					expect(peak).toBeLessThanOrEqual(permits);
+					expect(semaphore.available).toBe(permits);
+				}
+			)
+		);
+	});
+
+	it('createMutex.run never overlaps and starts tasks in call order, whatever they throw', async function () {
+		await fc.assert(
+			fc.asyncProperty(
+				fc.array(fc.record({ ticks: fc.integer({ min: 0, max: 4 }), outcome: fc.constantFrom('value', 'reject', 'throw') }), { maxLength: 20 }),
+				async function (tasks) {
+					const mutex = createMutex();
+					const started: number[] = [];
+					let inside = 0;
+					await Promise.allSettled(
+						tasks.map(function (task, index) {
+							return mutex.run(function () {
+								started.push(index);
+								expect(mutex.isLocked).toBe(true);
+								inside++;
+								expect(inside).toBe(1);
+								if (task.outcome === 'throw') {
+									inside--;
+									throw new Error('sync');
+								}
+								return yieldTicks(task.ticks).then(function () {
+									inside--;
+									if (task.outcome === 'reject') throw new Error('async');
+									return index;
+								});
+							});
+						})
+					);
+					expect(started).toEqual(
+						tasks.map(function (_, index) {
+							return index;
+						})
+					);
+					expect(mutex.isLocked).toBe(false);
+					expect(mutex.pending).toBe(0);
+				}
+			)
+		);
+	});
+
+	it('createKeyedMutex serializes each key in call order, overlaps different keys, and forgets every key once idle', async function () {
+		await fc.assert(
+			fc.asyncProperty(
+				fc.array(fc.record({ key: fc.constantFrom('a', 'b', 'c', 1, NaN), ticks: fc.integer({ min: 0, max: 4 }) }), { maxLength: 25 }),
+				async function (tasks) {
+					const locks = createKeyedMutex<string | number>();
+					const inside = new Map<string | number, number>();
+					const started = new Map<string | number, number[]>();
+					await Promise.all(
+						tasks.map(function (task, index) {
+							return locks.run(task.key, async function () {
+								expect(inside.get(task.key) ?? 0).toBe(0);
+								inside.set(task.key, 1);
+								started.set(task.key, [...(started.get(task.key) ?? []), index]);
+								expect(locks.isLocked(task.key)).toBe(true);
+								await yieldTicks(task.ticks);
+								inside.set(task.key, 0);
+							});
+						})
+					);
+					for (const [key, order] of started) {
+						expect(order).toEqual(
+							tasks
+								.map(function (task, index) {
+									return Object.is(task.key, key) ? index : -1;
+								})
+								.filter(function (index) {
+									return index >= 0;
+								})
+						);
+					}
+					expect(locks.size).toBe(0);
+				}
+			)
+		);
+	});
+
+	it('waitForEvent settles like the first accepted or rejecting event, and always removes its listeners', async function () {
+		const event = fc.record({ type: fc.constantFrom('data', 'error', 'close', 'other'), value: fc.integer({ min: 0, max: 9 }) });
+		await fc.assert(
+			fc.asyncProperty(
+				fc.array(event, { maxLength: 12 }),
+				fc.subarray(['error', 'close']),
+				fc.integer({ min: 0, max: 10 }),
+				fc.constantFrom('node', 'tinkit', 'dom'),
+				async function (events, rejectOn, threshold, kind) {
+					const node = new EventEmitter();
+					// Node throws when 'error' is emitted with no listener: keep one of our own.
+					function ignore(): void {}
+					node.on('error', ignore);
+					const tinkit = createEmitter<Record<string, number>>();
+					const dom = new EventTarget();
+					let listeners = 0;
+					const addEventListener = dom.addEventListener.bind(dom);
+					const removeEventListener = dom.removeEventListener.bind(dom);
+					dom.addEventListener = function (type: string, listener: EventListener) {
+						listeners++;
+						addEventListener(type, listener);
+					};
+					dom.removeEventListener = function (type: string, listener: EventListener) {
+						listeners--;
+						removeEventListener(type, listener);
+					};
+					const target = kind === 'node' ? node : kind === 'tinkit' ? tinkit : dom;
+					const controller = new AbortController();
+					function filter(received: unknown): boolean {
+						const value = received instanceof CustomEvent ? (received.detail as number) : (received as number);
+						return value >= threshold;
+					}
+					const waiting = waitForEvent(target as EventEmitter, 'data', { filter, rejectOn, signal: controller.signal });
+					const outcome = waiting.then(
+						function (value) {
+							return { status: 'resolved', value: value instanceof CustomEvent ? value.detail : value };
+						},
+						function (reason: unknown) {
+							return { status: 'rejected', value: reason instanceof CustomEvent ? reason.detail : reason };
+						}
+					);
+
+					for (const { type, value } of events) {
+						if (kind === 'node') node.emit(type, value);
+						else if (kind === 'tinkit') tinkit.emit(type, value);
+						else dom.dispatchEvent(new CustomEvent(type, { detail: value }));
+					}
+					controller.abort('none');
+
+					const first = events.find(function ({ type, value }) {
+						return (type === 'data' && value >= threshold) || rejectOn.includes(type);
+					});
+					const expected =
+						first === undefined ? { status: 'rejected', value: 'none' } : { status: first.type === 'data' ? 'resolved' : 'rejected', value: first.value };
+					expect(await outcome).toEqual(expected);
+					expect(node.eventNames()).toEqual(['error']);
+					expect(node.listeners('error')).toEqual([ignore]);
+					expect(tinkit.listenerCount()).toBe(0);
+					expect(listeners).toBe(0);
+				}
+			)
+		);
+	});
+
+	it('reduceAsync equals Array.prototype.reduce, for sync, promise and async iterables', async function () {
+		await fc.assert(
+			fc.asyncProperty(fc.array(fc.integer()), fc.constantFrom('array', 'promises', 'async'), async function (values, kind) {
+				async function* asyncValues(): AsyncGenerator<number> {
+					for (const value of values) {
+						await Promise.resolve();
+						yield value;
+					}
+				}
+				const items = kind === 'array' ? values : kind === 'promises' ? values.map(Promise.resolve, Promise) : asyncValues();
+				function step(accumulator: string, value: number, index: number): string {
+					return `${accumulator}|${index}:${value}`;
+				}
+				const result = await reduceAsync(
+					items as AsyncIterable<number>,
+					async function (accumulator: string, value, index) {
+						await Promise.resolve();
+						return step(accumulator, value, index);
+					},
+					'>'
+				);
+				expect(result).toBe(values.reduce(step, '>'));
+			})
+		);
+	});
+
+	it('minDelay settles at max(ms, the time the promise takes), or at once for an early rejection with delayRejection: false', async function () {
+		await fc.assert(
+			fc.asyncProperty(
+				fc.integer({ min: 0, max: 50 }),
+				fc.integer({ min: 0, max: 80 }),
+				fc.boolean(),
+				fc.option(fc.boolean(), { nil: undefined }),
+				async function (ms, takes, fails, delayRejection) {
+					jest.useFakeTimers({ now: 0 });
+					try {
+						const promise = new Promise<string>(function (resolve, reject) {
+							setTimeout(function () {
+								if (fails) reject(new Error('failed'));
+								else resolve('done');
+							}, takes);
+						});
+						let settledAt = -1;
+						let outcome: unknown;
+						minDelay(promise, ms, delayRejection === undefined ? {} : { delayRejection }).then(
+							function (value) {
+								settledAt = Date.now();
+								outcome = value;
+							},
+							function (error: Error) {
+								settledAt = Date.now();
+								outcome = error.message;
+							}
+						);
+						for (let t = 0; t <= 100 && settledAt < 0; t++) await jest.advanceTimersByTimeAsync(t === 0 ? 0 : 1);
+						expect(outcome).toBe(fails ? 'failed' : 'done');
+						expect(settledAt).toBe(fails && delayRejection === false ? takes : Math.max(ms, takes));
+					} finally {
+						jest.clearAllTimers();
+						jest.useRealTimers();
+					}
 				}
 			)
 		);

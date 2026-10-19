@@ -6,10 +6,11 @@ import { chunk } from 'tinkit/arrays';
 import { TimeoutError, AbortError, withTimeout, retry } from 'tinkit/async';
 import { addMonths, formatDate } from 'tinkit/date';
 import { memoize as memoizeMethod } from 'tinkit/decorators';
+import { deserializeError, serializeError } from 'tinkit/errors';
 import { debounce, curry } from 'tinkit/functions';
 import { isPlainObject } from 'tinkit/guards';
 import { round, sum } from 'tinkit/math';
-import { deepClone, deepMerge, isEqual } from 'tinkit/objects';
+import { deepClone, deepMerge, isEqual, safeStringify } from 'tinkit/objects';
 import { toKebabCase, reverse } from 'tinkit/strings';
 
 assert.deepEqual(Object.keys(root).sort(), [
@@ -22,6 +23,7 @@ assert.deepEqual(Object.keys(root).sort(), [
 	'easing',
 	'emitter',
 	'encoding',
+	'errors',
 	'format',
 	'functions',
 	'guards',
@@ -55,6 +57,9 @@ const copy = deepClone(cyclic);
 assert.ok(copy !== cyclic && copy.self === copy && isEqual(copy, cyclic));
 assert.equal(deepMerge({}, JSON.parse('{"__proto__": {"polluted": true}}')).polluted, undefined);
 assert.equal({}.polluted, undefined);
+assert.equal(safeStringify(cyclic), '{"list":[1,2],"self":"[Circular]"}');
+const rebuilt = deserializeError(JSON.parse(JSON.stringify(serializeError(new TypeError('outer', { cause: new RangeError('inner') })))));
+assert.ok(rebuilt instanceof TypeError && rebuilt.cause instanceof RangeError && rebuilt.cause.message === 'inner');
 
 assert.equal(new TimeoutError().name, 'TimeoutError');
 assert.equal(new AbortError().name, 'AbortError');

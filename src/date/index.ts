@@ -27,7 +27,7 @@
  */
 
 import { isDate } from '../guards/index.js';
-import { assertInteger as assertCount, assertNumber, describe, show } from '../utils/assert.js';
+import { assertInteger as assertCount, assertNumber, describe, readOption, show } from '../utils/assert.js';
 
 /**
  * A value that can be interpreted as a date: a `Date` instance or a millisecond timestamp.
@@ -104,19 +104,59 @@ export type IntervalUnit = 'year' | 'quarter' | 'month' | 'week' | 'day' | 'hour
 export type RoundingMode = 'round' | 'floor' | 'ceil';
 
 /**
- * A time interval for {@link intervalsOverlap}. `start` must not be after `end`.
+ * A time interval for {@link intervalsOverlap}, {@link mergeIntervals}, {@link findGaps}… `start` must not be after `end`. The
+ * functions that return intervals return `Interval<Date>`s of new dates.
+ * @template D - The type of the bounds
  */
-export interface Interval {
-	start: DateInput;
-	end: DateInput;
+export interface Interval<D extends DateInput = DateInput> {
+	start: D;
+	end: D;
 }
 
 /**
- * Options for {@link intervalsOverlap}.
+ * Options for {@link intervalsOverlap}, {@link intersectIntervals} and {@link mergeIntervals}.
  */
 export interface IntervalsOverlapOptions {
-	/** `true` to treat both intervals as closed (`[start, end]`, so touching intervals overlap); default `false`: half-open `[start, end)`. */
+	/** `true` to treat the intervals as closed (`[start, end]`, so touching intervals overlap); default `false`: half-open `[start, end)`. */
 	inclusive?: boolean;
+}
+
+/**
+ * Options for {@link findGaps}.
+ */
+export interface FindGapsOptions {
+	/** The shortest gap to return, in milliseconds (a number `>= 0`, default `0`: every non-empty gap). */
+	minDuration?: number;
+}
+
+/**
+ * Options for {@link addBusinessDays}, {@link diffInBusinessDays} and {@link isBusinessDay}.
+ */
+export interface BusinessDayOptions {
+	/** Days that are not business days, compared by LOCAL calendar day (the time of day is ignored; default: none). */
+	holidays?: Iterable<DateInput>;
+	/** The days of the week that are not business days (default `[0, 6]`: Saturday and Sunday; `[5, 6]` for Friday-Saturday weekends). */
+	weekend?: ReadonlyArray<WeekdayIndex>;
+}
+
+/**
+ * The calendar fields that {@link setParts} sets, named and numbered like a {@link WallClockTime}: `month` counts from 1.
+ */
+export interface DateParts {
+	/** The year: any integer (`0` is 1 BC; `99` is the year 99, not 1999). */
+	year?: number;
+	/** The month, `1` (January) to `12` (December). */
+	month?: number;
+	/** The day of the month, `1` to the number of days of the month. */
+	day?: number;
+	/** The hour, `0` to `23`. */
+	hour?: number;
+	/** The minute, `0` to `59`. */
+	minute?: number;
+	/** The second, `0` to `59`. */
+	second?: number;
+	/** The millisecond, `0` to `999`. */
+	millisecond?: number;
 }
 
 /**
@@ -200,9 +240,20 @@ const MS_PER_DAY = 24 * MS_PER_HOUR;
 const DAYS_PER_WEEK = 7;
 
 /**
- * Epoch day number (days since 1970-01-01) of a Monday (1970-01-05), used as an anchor for weekday arithmetic.
+ * Epoch day number (days since 1970-01-01) of a Sunday (1970-01-04), used as an anchor for weekday arithmetic.
  */
-const EPOCH_MONDAY = 4;
+const EPOCH_SUNDAY = 3;
+
+/**
+ * A business-day calendar: the bit mask of the weekend days (bit `n` for weekday `n`), the number of business days per week, and the
+ * sorted epoch days of the holidays that fall on other days (when any).
+ */
+type BusinessCalendar = readonly [weekend: number, perWeek: number, holidays: Float64Array | undefined];
+
+/**
+ * The default business-day calendar: Saturday and Sunday off, no holidays.
+ */
+const WEEKEND_CALENDAR: BusinessCalendar = [0b1000001, 5, undefined];
 
 const DAYS_PER_MONTH: ReadonlyArray<number> = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
@@ -608,17 +659,142 @@ function toDayStart(date: Date): Date {
 }
 
 /**
- * Number of weekdays (Monday-Friday) from an arbitrary fixed origin up to and including an epoch day, so that
- * `weekdaysThrough(b) - weekdaysThrough(a)` counts the weekdays in `(a, b]`.
+ * Number of business days of a calendar from an arbitrary fixed origin up to and including an epoch day, so that
+ * `businessDaysThrough(c, b) - businessDaysThrough(c, a)` counts the business days in `(a, b]`. O(log holidays).
+ * @param {BusinessCalendar} calendar - The business-day calendar
  * @param {number} day - An epoch day number
- * @returns {number} The cumulative weekday count
+ * @returns {number} The cumulative business-day count
  * @example
- * weekdaysThrough(4) - weekdaysThrough(3); // => 1 // 1970-01-05 was a Monday
+ * businessDaysThrough(WEEKEND_CALENDAR, 4) - businessDaysThrough(WEEKEND_CALENDAR, 3); // => 1 // 1970-01-05 was a Monday
  */
-function weekdaysThrough(day: number): number {
-	const sinceMonday = day - EPOCH_MONDAY;
+function businessDaysThrough(calendar: BusinessCalendar, day: number): number {
+	const sinceSunday = day - EPOCH_SUNDAY;
+	// The business days of the current week up to `day`: the bits of the weekdays 0 to `day`'s that the weekend mask does not have.
+	let bits = ~calendar[0] & ((2 << mod(sinceSunday, DAYS_PER_WEEK)) - 1);
 
-	return Math.floor(sinceMonday / DAYS_PER_WEEK) * 5 + Math.min(mod(sinceMonday, DAYS_PER_WEEK) + 1, 5);
+	// Population count of a 7-bit value.
+	bits -= (bits >> 1) & 0x55;
+	bits = (bits & 0x33) + ((bits >> 2) & 0x33);
+
+	return Math.floor(sinceSunday / DAYS_PER_WEEK) * calendar[1] + ((bits + (bits >> 4)) & 0x0f) - holidaysThrough(calendar, day);
+}
+
+/**
+ * Returns the epoch day of the `count`-th business day of a calendar, counted like {@link businessDaysThrough}: the first day on which
+ * it reaches `count`. Without holidays, a closed form; with holidays, the closed form is re-applied with the holidays found before its
+ * result until that number stops growing (each round skips the holidays that the previous one jumped over).
+ * @param {BusinessCalendar} calendar - The business-day calendar
+ * @param {number} count - The cumulative business-day count to reach
+ * @returns {number} The epoch day of that business day
+ * @example
+ * nthBusinessDay(WEEKEND_CALENDAR, businessDaysThrough(WEEKEND_CALENDAR, 1) + 1); // => 4 // 1970-01-02 (Friday) → 01-05 (Monday)
+ */
+function nthBusinessDay(calendar: BusinessCalendar, count: number): number {
+	const [weekend, perWeek] = calendar;
+	let skipped = 0;
+
+	for (;;) {
+		const target = count + skipped;
+		const weeks = Math.floor((target - 1) / perWeek);
+		let left = target - weeks * perWeek;
+		let weekday = 0;
+
+		// `left` is between 1 and `perWeek`: the business day it designates is in this week.
+		while ((left -= (~weekend >> weekday) & 1) > 0) weekday++;
+
+		const day = EPOCH_SUNDAY + weeks * DAYS_PER_WEEK + weekday;
+		const holidays = holidaysThrough(calendar, day);
+
+		if (holidays === skipped) return day;
+		skipped = holidays;
+	}
+}
+
+/**
+ * Returns the number of holidays of a calendar on or before an epoch day (binary search).
+ * @param {BusinessCalendar} calendar - The business-day calendar
+ * @param {number} day - An epoch day number
+ * @returns {number} The number of holidays `<= day`
+ */
+function holidaysThrough(calendar: BusinessCalendar, day: number): number {
+	const holidays = calendar[2];
+	let low = 0;
+	let high = holidays === undefined ? 0 : holidays.length;
+
+	while (low < high) {
+		const middle = (low + high) >>> 1;
+
+		if ((holidays as Float64Array)[middle] <= day) low = middle + 1;
+		else high = middle;
+	}
+
+	return low;
+}
+
+/**
+ * Checks whether an epoch day is a business day of a calendar.
+ * @param {BusinessCalendar} calendar - The business-day calendar
+ * @param {number} day - An epoch day number
+ * @returns {boolean} `true` when the day is neither a weekend day nor a holiday
+ */
+function isBusinessEpochDay(calendar: BusinessCalendar, day: number): boolean {
+	// 1970-01-01 (epoch day 0) was a Thursday (weekday 4).
+	return ((calendar[0] >> mod(day + 4, DAYS_PER_WEEK)) & 1) === 0 && holidaysThrough(calendar, day) === holidaysThrough(calendar, day - 1);
+}
+
+/**
+ * Validates {@link BusinessDayOptions} and builds their calendar. O(h log h) for `h` holidays; without them, O(1) and allocation-free.
+ * @param {string} caller - Name of the public function, used in the error messages
+ * @param {BusinessDayOptions | undefined} options - The options
+ * @returns {BusinessCalendar} The calendar
+ * @throws {TypeError} when `options` is not an object, `weekend` is not an array of numbers, `holidays` is not an iterable, or a holiday
+ * is neither a `Date` nor a number
+ * @throws {RangeError} when a weekend day is not an integer between 0 and 6, every day is a weekend day, or a holiday is invalid
+ */
+function businessCalendar(caller: string, options: BusinessDayOptions | undefined): BusinessCalendar {
+	if (options === undefined) return WEEKEND_CALENDAR;
+	assertOptions(caller, options);
+
+	const weekendDays = readOption(options, 'weekend');
+	const holidayDates = readOption(options, 'holidays');
+
+	if (weekendDays === undefined && holidayDates === undefined) return WEEKEND_CALENDAR;
+
+	let weekend = WEEKEND_CALENDAR[0];
+
+	if (weekendDays !== undefined) {
+		if (!Array.isArray(weekendDays)) throw new TypeError(`${caller}: \`weekend\` must be an array of weekday indices, got ${describe(weekendDays)}`);
+		weekend = 0;
+		// An index loop, unlike `forEach`, also visits the holes of a sparse array.
+		for (let i = 0; i < weekendDays.length; i++) {
+			assertWeekday(caller, weekendDays[i], `weekend[${i}]`);
+			weekend |= 1 << weekendDays[i];
+		}
+		if (weekend === 0b1111111) throw new RangeError(`${caller}: \`weekend\` must leave at least one business day in the week`);
+	}
+
+	let holidays: Float64Array | undefined;
+
+	if (holidayDates !== undefined) {
+		if (typeof holidayDates !== 'object' || holidayDates === null || typeof (holidayDates as Partial<Iterable<DateInput>>)[Symbol.iterator] !== 'function')
+			throw new TypeError(`${caller}: \`holidays\` must be an iterable of dates, got ${describe(holidayDates)}`);
+
+		const days = new Set<number>();
+
+		for (const holiday of holidayDates) {
+			const day = epochDay(toValidDate(holiday));
+
+			// A holiday on a weekend day changes nothing: only keep the others, so that every kept one removes a business day.
+			if (((weekend >> mod(day + 4, DAYS_PER_WEEK)) & 1) === 0) days.add(day);
+		}
+		holidays = Float64Array.from(days).sort();
+	}
+
+	let perWeek = 7;
+
+	for (let weekday = 0; weekday < DAYS_PER_WEEK; weekday++) perWeek -= (weekend >> weekday) & 1;
+
+	return [weekend, perWeek, holidays];
 }
 
 /**
@@ -1413,6 +1589,147 @@ export function maxDate(dates: Iterable<DateInput>): Date | undefined {
 }
 
 /**
+ * Returns a copy of the date closest to `target` (absolute time; date-fns' `closestTo`). On a tie, the first one wins.
+ * @param {DateInput} target - The date to compare against
+ * @param {Iterable<DateInput>} dates - The candidates
+ * @returns {Date | undefined} A new `Date` equal to the closest candidate, or `undefined` when `dates` is empty
+ * @throws {TypeError} when a date argument is neither a `Date` nor a number
+ * @throws {RangeError} when `target` or any candidate is invalid
+ * @example
+ * closestTo(new Date(2024, 0, 10), [new Date(2024, 0, 1), new Date(2024, 0, 12), new Date(2024, 0, 9)]); // => new Date(2024, 0, 9)
+ * closestTo(new Date(2024, 0, 10), [new Date(2024, 0, 9), new Date(2024, 0, 11)]); // => new Date(2024, 0, 9) // tie: the first one
+ * closestTo(new Date(), []); // => undefined
+ */
+export function closestTo(target: DateInput, dates: Iterable<DateInput>): Date | undefined {
+	const time = timeOf(target);
+	let closest = NaN;
+	let distance = Infinity;
+
+	for (const date of dates) {
+		const candidate = timeOf(date);
+
+		if (Math.abs(candidate - time) < distance) {
+			closest = candidate;
+			distance = Math.abs(candidate - time);
+		}
+	}
+
+	return distance === Infinity ? undefined : new Date(closest);
+}
+
+/**
+ * Returns the date of a Unix timestamp, in SECONDS since 1970-01-01T00:00:00Z (`date +%s`, JWT `exp`/`iat` claims, most APIs).
+ * Fractions of a second are kept to the millisecond as written (`1.001` is 1001 ms, although `1.001 * 1000` is `1000.9999999999999` in
+ * floating point), and finer fractions are truncated toward zero, like the `Date` constructor does (`1.0019` is 1001 ms).
+ * @param {number} seconds - The finite number of seconds since the epoch (may be fractional or negative)
+ * @returns {Date} A new date
+ * @throws {TypeError} when `seconds` is not a number
+ * @throws {RangeError} when `seconds` is not finite or the result is out of range
+ * @example
+ * fromUnixTime(1_700_000_000).toISOString(); // => '2023-11-14T22:13:20.000Z'
+ * fromUnixTime(1.5).getTime(); // => 1500
+ * fromUnixTime(1.001).getTime(); // => 1001
+ */
+export function fromUnixTime(seconds: number): Date {
+	assertNumber('fromUnixTime', 'seconds', seconds, Number.isFinite(seconds), 'a finite number');
+
+	const ms = seconds * MS_PER_SECOND;
+	// A product within a few ulps of an integer is that integer: the milliseconds as written, which the rounding of the decimal fraction
+	// left just below it (truncating `1000.9999999999999` would lose one).
+	const whole = Math.round(ms);
+	return ensureInRange(new Date(Math.abs(ms - whole) <= Math.abs(ms) * 4 * Number.EPSILON ? whole : ms));
+}
+
+/**
+ * Returns the Unix timestamp of a date: the whole number of SECONDS since 1970-01-01T00:00:00Z, rounded DOWN, so that it is the second
+ * the instant is in, also before 1970 (`getUnixTime(-1)` is `-1`; date-fns truncates toward zero and gives `0`). Hence
+ * `fromUnixTime(getUnixTime(date)) <= date`, and `getUnixTime(fromUnixTime(s)) === s` for every integer `s`.
+ * @param {DateInput} date - The date
+ * @returns {number} The integer number of seconds
+ * @throws {TypeError} when `date` is neither a `Date` nor a number
+ * @throws {RangeError} when `date` is invalid
+ * @example
+ * getUnixTime(new Date(Date.UTC(2023, 10, 14, 22, 13, 20, 999))); // => 1_700_000_000
+ * getUnixTime(-1); // => -1
+ */
+export function getUnixTime(date: DateInput): number {
+	return Math.floor(timeOf(date) / MS_PER_SECOND);
+}
+
+/**
+ * Returns a copy of a date with some of its LOCAL calendar fields replaced (date-fns' `set`, Temporal's `PlainDateTime#with`); the
+ * fields that are not given keep their values. The fields are named and numbered like a {@link WallClockTime}, so `month` counts
+ * from 1 (`{ month: 2 }` is February), unlike date-fns' 0-based `month`.
+ *
+ * Overflow: every given field must be in its range (no rolling over: `{ hour: 24 }` and `{ month: 2, day: 30 }` throw). The day of the
+ * month that is KEPT is clamped to the last day of the new month, as date-fns' `set` does when the month changes: January 31st with
+ * `{ month: 2 }` gives February 28th or 29th, and February 29th with `{ year: 2023 }` gives February 28th (date-fns gives March 1st
+ * there). The new date and time are set in a single wall-clock conversion: a time skipped by a DST change moves forward by the length of
+ * the gap, a repeated one takes its first occurrence; fields equal to the current ones return the same instant.
+ * @param {DateInput} date - The date to start from
+ * @param {DateParts} parts - `year`, `month` (1-12), `day`, `hour`, `minute`, `second` and `millisecond`, each optional (a value
+ * inherited from a polluted `Object.prototype` is ignored, and so are unknown fields)
+ * @returns {Date} A new date
+ * @throws {TypeError} when `date` is neither a `Date` nor a number, `parts` is not an object, or a field is not a number
+ * @throws {RangeError} when `date` is invalid, a field is not an integer in its range, or the result is out of range
+ * @example
+ * setParts(new Date(2024, 4, 15, 9, 30), { hour: 14, minute: 0 }); // => new Date(2024, 4, 15, 14, 0)
+ * setParts(new Date(2024, 0, 31, 9), { month: 2 }); // => new Date(2024, 1, 29, 9) // clamped to the end of February
+ * setParts(new Date(2024, 1, 29), { year: 2023 }); // => new Date(2023, 1, 28)
+ * setParts(new Date(2024, 0, 31), { month: 2, day: 30 }); // throws RangeError
+ */
+export function setParts(date: DateInput, parts: DateParts): Date {
+	const result = toValidDate(date);
+
+	if (typeof parts !== 'object' || parts === null) throw new TypeError(`setParts: \`parts\` must be an object, got ${describe(parts)}`);
+
+	const year = readOption(parts, 'year', result.getFullYear());
+
+	assertInteger('setParts', 'parts.year', year);
+
+	const month = partField(parts, 'month', 1, 12, result.getMonth() + 1);
+	const days = daysInMonth(year, month - 1);
+	const day = partField(parts, 'day', 1, days, Math.min(result.getDate(), days));
+	const hour = partField(parts, 'hour', 0, 23, result.getHours());
+	const minute = partField(parts, 'minute', 0, 59, result.getMinutes());
+	const second = partField(parts, 'second', 0, 59, result.getSeconds());
+	const millisecond = partField(parts, 'millisecond', 0, 999, result.getMilliseconds());
+
+	const wall = daysFromCivil(year, month - 1, day) * MS_PER_DAY + hour * MS_PER_HOUR + minute * MS_PER_MINUTE + second * MS_PER_SECOND + millisecond;
+
+	// Re-setting the same wall-clock time would move an instant in a repeated (fall-back) hour to its first occurrence.
+	if (wall === result.getTime() + localOffset(result)) return result;
+
+	// A template showing the new time of day (2000-01-01 had no change of UTC offset anywhere), moved to the new day by `setFullYear` (which,
+	// unlike the constructor, does not remap the years 0-99): a single wall-clock conversion, so that no intermediate time can fall into a
+	// DST gap and move to another day.
+	const moved = new Date(2000, 0, 1, hour, minute, second, millisecond);
+
+	moved.setFullYear(year, month - 1, day);
+
+	return ensureInRange(moved);
+}
+
+/**
+ * Reads a field of a {@link DateParts} with {@link readOption}: it must be an integer between `min` and `max`.
+ * @param {DateParts} parts - The fields
+ * @param {string} name - The field
+ * @param {number} min - The smallest valid value
+ * @param {number} max - The largest valid value
+ * @param {number} current - The value of a missing field
+ * @returns {number} The value
+ * @throws {TypeError} when the field is not a number
+ * @throws {RangeError} when the field is not an integer between `min` and `max`
+ */
+function partField(parts: DateParts, name: keyof DateParts, min: number, max: number, current: number): number {
+	const value = readOption(parts, name, current);
+
+	assertNumber('setParts', `parts.${name}`, value, Number.isInteger(value) && value >= min && value <= max, `an integer between ${min} and ${max}`);
+
+	return value;
+}
+
+/**
  * Formats a date (local time) with a token pattern. No locale data is used.
  *
  * | Token | Output | Token | Output |
@@ -1823,92 +2140,107 @@ export function getAge(birthDate: DateInput, now: DateInput = new Date()): numbe
 }
 
 /**
- * Adds a number of business days (Monday-Friday, local time; no holidays), skipping Saturdays and Sundays. The time
+ * Adds a number of business days (local time), skipping the weekend days (by default Saturday and Sunday) and the `holidays`. The time
  * of day is preserved like in {@link addDays}.
  *
- * Weekend start: when `date` falls on a weekend, the first business day in the direction of travel counts as the
- * first step (Saturday + 1 → Monday, Sunday - 1 → Friday), so for any non-zero `amount` the result is always a
- * weekday. An `amount` of `0` returns a copy of `date` unchanged, even on a weekend.
+ * Non-business start: when `date` falls on a weekend day or a holiday, the first business day in the direction of travel counts as
+ * the first step (Saturday + 1 → Monday, Sunday - 1 → Friday), so for any non-zero `amount` the result is always a business day. An
+ * `amount` of `0` returns a copy of `date` unchanged, even on a weekend. Hence `diffInBusinessDays(addBusinessDays(d, n, o), d, o) === n`
+ * for every business day `d`.
+ *
+ * Cost: O(1) without holidays, whatever the amount (no day-by-day walk); O(h log h) with `h` holidays, which are read and sorted on
+ * every call.
  * @param {DateInput} date - The date to start from
  * @param {number} amount - The integer number of business days to add (negative to subtract)
+ * @param {BusinessDayOptions} [options] - `holidays`: dates that are not business days (compared by local calendar day); `weekend`: the
+ * weekdays that are not business days (default `[0, 6]`)
  * @returns {Date} A new date
- * @throws {TypeError} when a date argument is neither a `Date` nor a number, or `amount` is not a number
- * @throws {RangeError} when `date` is invalid, `amount` is not an integer, or the result is out of range
+ * @throws {TypeError} when a date argument or a holiday is neither a `Date` nor a number, `amount` is not a number, `options` is not an
+ * object, `holidays` is not an iterable, or `weekend` is not an array of numbers
+ * @throws {RangeError} when `date` or a holiday is invalid, `amount` is not an integer, a weekend day is not an integer between 0 and 6,
+ * `weekend` holds all seven days, or the result is out of range
  * @example
  * addBusinessDays(new Date(2024, 4, 17, 9), 1); // => new Date(2024, 4, 20, 9) // Friday → Monday
  * addBusinessDays(new Date(2024, 4, 20), -1); // => new Date(2024, 4, 17) // Monday → Friday
  * addBusinessDays(new Date(2024, 4, 18), 1); // => new Date(2024, 4, 20) // Saturday → Monday
+ * addBusinessDays(new Date(2024, 11, 24), 1, { holidays: [new Date(2024, 11, 25)] }); // => new Date(2024, 11, 26) // skips Christmas
+ * addBusinessDays(new Date(2024, 4, 16), 1, { weekend: [5, 6] }); // => new Date(2024, 4, 19) // Thursday → Sunday
  */
-export function addBusinessDays(date: DateInput, amount: number): Date {
+export function addBusinessDays(date: DateInput, amount: number, options?: BusinessDayOptions): Date {
 	assertInteger('addBusinessDays', 'amount', amount);
 
+	const calendar = businessCalendar('addBusinessDays', options);
 	const start = toValidDate(date);
 
 	if (amount === 0) return start;
 
-	const sign = Math.sign(amount);
-	let weekday = start.getDay();
-	let remaining = Math.abs(amount);
-	let offset = 0;
-
-	if (weekday === 0 || weekday === 6) {
-		// Step onto the nearest weekday in the direction of travel; that counts as one business day.
-		const target = sign > 0 ? 1 : 5;
-
-		offset = sign > 0 ? mod(target - weekday, DAYS_PER_WEEK) : 0 - mod(weekday - target, DAYS_PER_WEEK);
-		weekday = target;
-		remaining -= 1;
-	}
-
-	// Five business days from a weekday are always exactly one calendar week.
-	offset += sign * Math.trunc(remaining / 5) * DAYS_PER_WEEK;
-	remaining %= 5;
-
-	while (remaining > 0) {
-		offset += sign;
-		weekday = mod(weekday + sign, DAYS_PER_WEEK);
-		if (weekday !== 0 && weekday !== 6) remaining -= 1;
-	}
-
+	const day = epochDay(start);
+	// The first day on which the running count of business days reaches the target: counted after `day` going forward, and from the
+	// day before going backward (so that the result's own business day is the last one counted).
+	const target = amount > 0 ? businessDaysThrough(calendar, day) + amount : businessDaysThrough(calendar, day - 1) + amount + 1;
+	let offset = nthBusinessDay(calendar, target) - day;
 	let result = addDays(start, offset);
 
 	// Only where a whole calendar day was skipped (Samoa's December 30th, 2011): the target day does not exist, `addDays` lands on the
-	// next one, which can be a weekend day. Keep going in the direction of travel to the next weekday.
-	while (isWeekendDay(result)) {
-		offset += sign;
-		result = addDays(start, offset);
+	// next one (whose weekday differs), which can be a weekend day. Keep going in the direction of travel to the next business day.
+	if (result.getDay() !== mod(day + offset + 4, DAYS_PER_WEEK)) {
+		while (!isBusinessEpochDay(calendar, epochDay(result))) {
+			offset += Math.sign(amount);
+			result = addDays(start, offset);
+		}
 	}
 
 	return result;
 }
 
 /**
- * Checks whether a date falls on a Saturday or a Sunday (local time).
- * @param {Date} date - A valid date
- * @returns {boolean} `true` on weekends
- */
-function isWeekendDay(date: Date): boolean {
-	const day = date.getDay();
-	return day === 0 || day === 6;
-}
-
-/**
- * Returns the signed number of business days (Monday-Friday, local calendar days; the time of day is ignored) between
- * two dates: for `later >= earlier` it counts the weekdays AFTER `earlier`'s day up to and INCLUDING `later`'s day;
- * for `later < earlier` it is `-diffInBusinessDays(earlier, later)`. Hence, for a weekday `d`,
- * `diffInBusinessDays(addBusinessDays(d, n), d) === n`.
+ * Returns the signed number of business days (local calendar days; the time of day is ignored) between two dates: for
+ * `later >= earlier` it counts the business days AFTER `earlier`'s day up to and INCLUDING `later`'s day; for `later < earlier` it is
+ * `-diffInBusinessDays(earlier, later)`. Business days are the days that are neither weekend days (by default Saturday and Sunday) nor
+ * `holidays`. Hence, for a business day `d`, `diffInBusinessDays(addBusinessDays(d, n, o), d, o) === n`.
+ *
+ * Cost: O(1) without holidays; O(h log h) with `h` holidays, which are read and sorted on every call.
  * @param {DateInput} later - The later date
  * @param {DateInput} earlier - The earlier date
+ * @param {BusinessDayOptions} [options] - `holidays`: dates that are not business days (compared by local calendar day); `weekend`: the
+ * weekdays that are not business days (default `[0, 6]`)
  * @returns {number} The number of business days
- * @throws {TypeError} when a date argument is neither a `Date` nor a number
- * @throws {RangeError} when either date is invalid
+ * @throws {TypeError} when a date argument or a holiday is neither a `Date` nor a number, `options` is not an object, `holidays` is not
+ * an iterable, or `weekend` is not an array of numbers
+ * @throws {RangeError} when a date or a holiday is invalid, a weekend day is not an integer between 0 and 6, or `weekend` holds all seven
+ * days
  * @example
  * diffInBusinessDays(new Date(2024, 4, 20), new Date(2024, 4, 17)); // => 1 // Fri → Mon
  * diffInBusinessDays(new Date(2024, 4, 31), new Date(2024, 4, 1)); // => 22
  * diffInBusinessDays(new Date(2024, 4, 17), new Date(2024, 4, 20)); // => -1
+ * diffInBusinessDays(new Date(2024, 4, 31), new Date(2024, 4, 1), { holidays: [new Date(2024, 4, 27)] }); // => 21
  */
-export function diffInBusinessDays(later: DateInput, earlier: DateInput): number {
-	return weekdaysThrough(epochDay(toValidDate(later))) - weekdaysThrough(epochDay(toValidDate(earlier)));
+export function diffInBusinessDays(later: DateInput, earlier: DateInput, options?: BusinessDayOptions): number {
+	const calendar = businessCalendar('diffInBusinessDays', options);
+
+	return businessDaysThrough(calendar, epochDay(toValidDate(later))) - businessDaysThrough(calendar, epochDay(toValidDate(earlier)));
+}
+
+/**
+ * Checks whether a date is a business day: neither a weekend day (by default Saturday or Sunday) nor one of the `holidays`, which are
+ * compared by LOCAL calendar day.
+ * @param {DateInput} date - The date
+ * @param {BusinessDayOptions} [options] - `holidays`: dates that are not business days; `weekend`: the weekdays that are not business
+ * days (default `[0, 6]`)
+ * @returns {boolean} `true` on business days
+ * @throws {TypeError} when `date` or a holiday is neither a `Date` nor a number, `options` is not an object, `holidays` is not an
+ * iterable, or `weekend` is not an array of numbers
+ * @throws {RangeError} when `date` or a holiday is invalid, a weekend day is not an integer between 0 and 6, or `weekend` holds all seven
+ * days
+ * @example
+ * isBusinessDay(new Date(2024, 4, 17)); // => true // a Friday
+ * isBusinessDay(new Date(2024, 4, 17), { weekend: [5, 6] }); // => false
+ * isBusinessDay(new Date(2024, 11, 25, 15), { holidays: [new Date(2024, 11, 25)] }); // => false
+ */
+export function isBusinessDay(date: DateInput, options?: BusinessDayOptions): boolean {
+	const calendar = businessCalendar('isBusinessDay', options);
+
+	return isBusinessEpochDay(calendar, epochDay(toValidDate(date)));
 }
 
 /**
@@ -2677,24 +3009,107 @@ export function previousWeekday(date: DateInput, weekday: WeekdayIndex): Date {
 }
 
 /**
- * Returns the start and end timestamps of an {@link Interval}, validated.
+ * Returns the start and end timestamps of an {@link Interval}, validated (its own or class-defined `start` and `end`, read once; a value
+ * inherited from a polluted `Object.prototype` is ignored).
+ * @param {string} caller - Name of the public function, used in the error messages
  * @param {string} name - The parameter name, used in the error messages
  * @param {Interval} interval - The interval
  * @returns {[number, number]} `[start, end]` in milliseconds
  * @throws {TypeError} when `interval` is not an object, or a bound is neither a `Date` nor a number
  * @throws {RangeError} when a bound is invalid or `start` is after `end`
  * @example
- * intervalBounds('a', { start: 1, end: 2 }); // => [1, 2]
+ * intervalBounds('intervalsOverlap', 'a', { start: 1, end: 2 }); // => [1, 2]
  */
-function intervalBounds(name: string, interval: Interval): [number, number] {
-	if (typeof interval !== 'object' || interval === null) throw new TypeError(`intervalsOverlap: \`${name}\` must be an interval object, got ${describe(interval)}`);
+function intervalBounds(caller: string, name: string, interval: Interval): [number, number] {
+	if (typeof interval !== 'object' || interval === null) throw new TypeError(`${caller}: \`${name}\` must be an interval object, got ${describe(interval)}`);
 
-	const start = timeOf(interval.start);
-	const end = timeOf(interval.end);
+	const start = timeOf(readOption(interval, 'start') as DateInput);
+	const end = timeOf(readOption(interval, 'end') as DateInput);
 
-	if (start > end) throw new RangeError(`intervalsOverlap: \`${name}.start\` must not be after \`${name}.end\``);
+	if (start > end) throw new RangeError(`${caller}: \`${name}.start\` must not be after \`${name}.end\``);
 
 	return [start, end];
+}
+
+/**
+ * Validates every interval of an iterable and returns their bounds, sorted by start (O(n log n)).
+ * @param {string} caller - Name of the public function, used in the error messages
+ * @param {string} name - The parameter name, used in the error messages
+ * @param {Iterable<Interval>} intervals - The intervals
+ * @param {boolean} keepEmpty - Whether to keep the empty intervals (`start === end`)
+ * @returns {Array<[number, number]>} A new array of `[start, end]` timestamps
+ * @throws {TypeError} when `intervals` is not an iterable object, an interval is not an object, or a bound is neither a `Date` nor a number
+ * @throws {RangeError} when a bound is invalid or an interval's `start` is after its `end`
+ */
+function sortedBounds(caller: string, name: string, intervals: Iterable<Interval>, keepEmpty: boolean): Array<[number, number]> {
+	if (typeof intervals !== 'object' || intervals === null || typeof (intervals as Partial<Iterable<Interval>>)[Symbol.iterator] !== 'function')
+		throw new TypeError(`${caller}: \`${name}\` must be an iterable of intervals, got ${describe(intervals)}`);
+
+	const bounds: Array<[number, number]> = [];
+	let index = 0;
+
+	for (const interval of intervals) {
+		const pair = intervalBounds(caller, `${name}[${index++}]`, interval);
+
+		if (keepEmpty || pair[0] < pair[1]) bounds.push(pair);
+	}
+
+	return bounds.sort(function (a: [number, number], b: [number, number]): number {
+		return a[0] - b[0];
+	});
+}
+
+/**
+ * Coalesces bounds sorted by start into disjoint ones, in a single pass: those that overlap (or touch, when `inclusive`) are merged.
+ * @param {Array<[number, number]>} bounds - `[start, end]` timestamps sorted by start, which are mutated
+ * @param {boolean} inclusive - Whether touching bounds are merged
+ * @returns {Array<[number, number]>} A new array of disjoint bounds, sorted
+ */
+function coalesce(bounds: Array<[number, number]>, inclusive: boolean): Array<[number, number]> {
+	const merged: Array<[number, number]> = [];
+
+	for (const pair of bounds) {
+		const last = merged[merged.length - 1];
+
+		if (last !== undefined && (inclusive ? pair[0] <= last[1] : pair[0] < last[1])) last[1] = Math.max(last[1], pair[1]);
+		else merged.push(pair);
+	}
+
+	return merged;
+}
+
+/**
+ * Creates an interval of new dates.
+ * @param {number} start - The start timestamp
+ * @param {number} end - The end timestamp
+ * @returns {Interval<Date>} The interval
+ */
+function toInterval(start: number, end: number): Interval<Date> {
+	return { start: new Date(start), end: new Date(end) };
+}
+
+/**
+ * The parts of `from` that no interval of `remove` covers, as half-open intervals of at least `minimum` milliseconds.
+ * @param {string} caller - Name of the public function, used in the error messages
+ * @param {string[]} names - The names of the two parameters, used in the error messages
+ * @param {Interval} from - The interval to subtract from
+ * @param {Iterable<Interval>} remove - The intervals to subtract
+ * @param {number} minimum - The shortest piece to return, in milliseconds (at least 1)
+ * @returns {Array<Interval<Date>>} A new array of new intervals, sorted
+ */
+function difference(caller: string, names: [string, string], from: Interval, remove: Iterable<Interval>, minimum: number): Array<Interval<Date>> {
+	const [start, end] = intervalBounds(caller, names[0], from);
+	const pieces: Array<Interval<Date>> = [];
+	let cursor = start;
+
+	for (const [removeStart, removeEnd] of coalesce(sortedBounds(caller, names[1], remove, false), false)) {
+		if (removeStart >= end) break;
+		if (removeStart - cursor >= minimum) pieces.push(toInterval(cursor, removeStart));
+		cursor = Math.max(cursor, removeEnd);
+	}
+	if (end - cursor >= minimum) pieces.push(toInterval(cursor, end));
+
+	return pieces;
 }
 
 /**
@@ -2720,10 +3135,115 @@ function intervalBounds(name: string, interval: Interval): [number, number] {
 export function intervalsOverlap(a: Interval, b: Interval, options: IntervalsOverlapOptions = {}): boolean {
 	assertOptions('intervalsOverlap', options);
 
-	const [aStart, aEnd] = intervalBounds('a', a);
-	const [bStart, bEnd] = intervalBounds('b', b);
+	const [aStart, aEnd] = intervalBounds('intervalsOverlap', 'a', a);
+	const [bStart, bEnd] = intervalBounds('intervalsOverlap', 'b', b);
 
-	return options.inclusive === true ? aStart <= bEnd && bStart <= aEnd : Math.max(aStart, bStart) < Math.min(aEnd, bEnd);
+	return readOption(options, 'inclusive') === true ? aStart <= bEnd && bStart <= aEnd : Math.max(aStart, bStart) < Math.min(aEnd, bEnd);
+}
+
+/**
+ * Returns the intersection of two time intervals: the instants they share, or `undefined` when they share none (exactly when
+ * {@link intervalsOverlap} with the same options is `false`). Half-open by default, so touching intervals do not intersect; with
+ * `{ inclusive: true }` they intersect in a zero-length interval.
+ * @param {Interval} a - The first interval
+ * @param {Interval} b - The second interval
+ * @param {IntervalsOverlapOptions} [options={}] - `inclusive`: treat both intervals as closed (default `false`)
+ * @returns {Interval<Date> | undefined} A new interval of new dates, or `undefined`
+ * @throws {TypeError} when an interval or `options` is not an object, or a bound is neither a `Date` nor a number
+ * @throws {RangeError} when a bound is invalid or an interval's `start` is after its `end`
+ * @example
+ * const meeting = { start: new Date(2024, 0, 1, 9), end: new Date(2024, 0, 1, 12) };
+ * intersectIntervals(meeting, { start: new Date(2024, 0, 1, 11), end: new Date(2024, 0, 1, 14) }); // => { start: new Date(2024, 0, 1, 11), end: new Date(2024, 0, 1, 12) }
+ * intersectIntervals(meeting, { start: new Date(2024, 0, 1, 12), end: new Date(2024, 0, 1, 14) }); // => undefined
+ * intersectIntervals(meeting, { start: new Date(2024, 0, 1, 12), end: new Date(2024, 0, 1, 14) }, { inclusive: true }); // => { start: new Date(2024, 0, 1, 12), end: new Date(2024, 0, 1, 12) }
+ */
+export function intersectIntervals(a: Interval, b: Interval, options: IntervalsOverlapOptions = {}): Interval<Date> | undefined {
+	assertOptions('intersectIntervals', options);
+
+	const inclusive = readOption(options, 'inclusive') === true;
+	const [aStart, aEnd] = intervalBounds('intersectIntervals', 'a', a);
+	const [bStart, bEnd] = intervalBounds('intersectIntervals', 'b', b);
+	const start = Math.max(aStart, bStart);
+	const end = Math.min(aEnd, bEnd);
+
+	return (inclusive ? start <= end : start < end) ? toInterval(start, end) : undefined;
+}
+
+/**
+ * Merges time intervals into the fewest disjoint ones that cover exactly the same instants, sorted by start (Luxon's
+ * `Interval.merge`): the busy time of a calendar, the booked slots of a resource. O(n log n).
+ *
+ * Half-open by default, like {@link intervalsOverlap}: intervals that overlap are merged, intervals that only touch (one ends when the
+ * next starts) are kept apart, and empty intervals (`start === end`) are dropped, since they cover no instant. With
+ * `{ inclusive: true }` the intervals are closed: touching ones are merged too, and a zero-length interval is kept (merged into a
+ * neighbour it touches). Either way, no two results overlap in the sense of {@link intervalsOverlap} with the same options.
+ * @param {Iterable<Interval>} intervals - The intervals, in any order
+ * @param {IntervalsOverlapOptions} [options={}] - `inclusive`: treat the intervals as closed, merging touching ones (default `false`)
+ * @returns {Array<Interval<Date>>} A new array of new intervals of new dates, sorted by start
+ * @throws {TypeError} when `intervals` is not an iterable object, an interval or `options` is not an object, or a bound is neither a
+ * `Date` nor a number
+ * @throws {RangeError} when a bound is invalid or an interval's `start` is after its `end`
+ * @example
+ * const at = function (hour) { return new Date(2024, 0, 1, hour); };
+ * mergeIntervals([{ start: at(13), end: at(15) }, { start: at(9), end: at(11) }, { start: at(10), end: at(12) }]); // => [{ start: at(9), end: at(12) }, { start: at(13), end: at(15) }]
+ * mergeIntervals([{ start: at(9), end: at(12) }, { start: at(12), end: at(14) }]).length; // => 2 // they only touch
+ * mergeIntervals([{ start: at(9), end: at(12) }, { start: at(12), end: at(14) }], { inclusive: true }); // => [{ start: at(9), end: at(14) }]
+ */
+export function mergeIntervals(intervals: Iterable<Interval>, options: IntervalsOverlapOptions = {}): Array<Interval<Date>> {
+	assertOptions('mergeIntervals', options);
+
+	const inclusive = readOption(options, 'inclusive') === true;
+
+	return coalesce(sortedBounds('mergeIntervals', 'intervals', intervals, inclusive), inclusive).map(function ([start, end]: [number, number]): Interval<Date> {
+		return toInterval(start, end);
+	});
+}
+
+/**
+ * Removes time intervals from another one: returns the parts of `from` that no interval of `remove` covers, as half-open
+ * `[start, end)` intervals sorted by start (no empty ones). Intervals of `remove` may overlap each other or extend past `from`.
+ * O(n log n).
+ * @param {Interval} from - The interval to subtract from
+ * @param {Iterable<Interval>} remove - The intervals to subtract, in any order
+ * @returns {Array<Interval<Date>>} A new array of new intervals of new dates
+ * @throws {TypeError} when `from` or an interval is not an object, `remove` is not an iterable object, or a bound is neither a `Date`
+ * nor a number
+ * @throws {RangeError} when a bound is invalid or an interval's `start` is after its `end`
+ * @example
+ * const at = function (hour) { return new Date(2024, 0, 1, hour); };
+ * subtractIntervals({ start: at(9), end: at(17) }, [{ start: at(12), end: at(13) }]); // => [{ start: at(9), end: at(12) }, { start: at(13), end: at(17) }]
+ * subtractIntervals({ start: at(9), end: at(17) }, [{ start: at(8), end: at(18) }]); // => []
+ */
+export function subtractIntervals(from: Interval, remove: Iterable<Interval>): Array<Interval<Date>> {
+	return difference('subtractIntervals', ['from', 'remove'], from, remove, 1);
+}
+
+/**
+ * Finds the free slots of a schedule: the gaps that the `busy` intervals leave within `within`, as half-open `[start, end)` intervals
+ * sorted by start, optionally only those lasting at least `minDuration` milliseconds (booking pages, "find a time" pickers). Busy
+ * intervals may overlap each other or extend past `within`; the gaps and the busy time inside `within` exactly cover `within`.
+ * O(n log n).
+ * @param {Interval} within - The time to search, such as working hours
+ * @param {Iterable<Interval>} busy - The busy intervals, in any order
+ * @param {FindGapsOptions} [options={}] - `minDuration`: the shortest gap to return, in milliseconds (default `0`)
+ * @returns {Array<Interval<Date>>} A new array of new intervals of new dates
+ * @throws {TypeError} when `within`, an interval or `options` is not an object, `busy` is not an iterable object, a bound is neither a
+ * `Date` nor a number, or `minDuration` is not a number
+ * @throws {RangeError} when a bound is invalid, an interval's `start` is after its `end`, or `minDuration` is negative or `NaN`
+ * @example
+ * const at = function (hour, minute = 0) { return new Date(2024, 0, 1, hour, minute); };
+ * const busy = [{ start: at(10), end: at(11) }, { start: at(11, 30), end: at(12) }];
+ * findGaps({ start: at(9), end: at(13) }, busy); // => [{ start: at(9), end: at(10) }, { start: at(11), end: at(11, 30) }, { start: at(12), end: at(13) }]
+ * findGaps({ start: at(9), end: at(13) }, busy, { minDuration: 60 * 60_000 }); // => [{ start: at(9), end: at(10) }, { start: at(12), end: at(13) }]
+ */
+export function findGaps(within: Interval, busy: Iterable<Interval>, options: FindGapsOptions = {}): Array<Interval<Date>> {
+	assertOptions('findGaps', options);
+
+	const minDuration = readOption(options, 'minDuration', 0);
+
+	assertNumber('findGaps', 'minDuration', minDuration, minDuration >= 0, 'a number >= 0');
+
+	return difference('findGaps', ['within', 'busy'], within, busy, Math.max(minDuration, 1));
 }
 
 /**

@@ -1246,7 +1246,7 @@ describe('Math helpers (property-based, new aggregates)', function () {
 					fc.oneof(
 						fc.record({ bins: fc.integer({ min: 1, max: 12 }) }),
 						fc.record({
-							thresholds: fc.uniqueArray(value, { maxLength: 6 }).map(function (list) {
+							thresholds: fc.uniqueArray(value, { maxLength: 6, comparator: 'SameValueZero' }).map(function (list) {
 								return list.sort(function (a, b) {
 									return a - b;
 								});
@@ -1290,6 +1290,307 @@ describe('Math helpers (property-based, new aggregates)', function () {
 						).toEqual(counts);
 					}
 				)
+			);
+		});
+	});
+});
+
+describe('New math helpers (property-based)', function () {
+	describe('extent', function () {
+		it('should equal [min, max] on non-empty arrays (signed zeros and NaN included)', function () {
+			const element = fc.oneof(fc.double(), fc.constantFrom(0, -0, NaN, Infinity, -Infinity));
+			fc.assert(
+				fc.property(fc.array(element, { minLength: 1, maxLength: 30 }), function (numbers) {
+					expect(helpers.extent(numbers)).toEqual([helpers.min(numbers), helpers.max(numbers)]);
+					const [low, high] = helpers.extent(numbers) as [number, number];
+					expect(Object.is(low, helpers.min(numbers)) && Object.is(high, helpers.max(numbers))).toBe(true);
+				})
+			);
+		});
+	});
+
+	describe('wrap', function () {
+		const bound = fc.integer({ min: -1000, max: 1000 });
+
+		it('should equal the naive Euclidean wrap on integers', function () {
+			fc.assert(
+				fc.property(fc.integer({ min: -1e9, max: 1e9 }), bound, bound, function (value, a, b) {
+					fc.pre(a !== b);
+					const [low, high] = a < b ? [a, b] : [b, a];
+					const span = high - low;
+					expect(helpers.wrap(value, low, high)).toBe(low + ((((value - low) % span) + span) % span));
+				})
+			);
+		});
+
+		it('should land in [minimum, maximum), be idempotent, and keep in-range values', function () {
+			const real = fc.double({ min: -1e12, max: 1e12, noNaN: true });
+			fc.assert(
+				fc.property(real, real, real, function (value, a, b) {
+					fc.pre(a !== b);
+					const [low, high] = a < b ? [a, b] : [b, a];
+					const wrapped = helpers.wrap(value, low, high);
+					expect(wrapped >= low && wrapped < high).toBe(true);
+					expect(helpers.wrap(wrapped, low, high)).toBe(wrapped);
+					if (value >= low && value < high) expect(wrapped).toBe(value);
+				})
+			);
+		});
+
+		it('should be periodic: shifting the value by whole spans does not change the result (exact for integers)', function () {
+			fc.assert(
+				fc.property(
+					fc.integer({ min: -1e6, max: 1e6 }),
+					bound,
+					fc.integer({ min: 1, max: 1000 }),
+					fc.integer({ min: -1000, max: 1000 }),
+					function (value, low, span, turns) {
+						expect(helpers.wrap(value + turns * span, low, low + span)).toBe(helpers.wrap(value, low, low + span));
+					}
+				)
+			);
+		});
+	});
+
+	describe('allocate', function () {
+		const ratios = fc.array(fc.nat({ max: 1000 }), { minLength: 1, maxLength: 12 }).filter(function (list) {
+			return list.some(function (ratio) {
+				return ratio > 0;
+			});
+		});
+		const total = fc.integer({ min: -1_000_000, max: 1_000_000 });
+
+		/**
+		 * The largest remainder method on integer ratios, in exact rational arithmetic (a reference).
+		 * @param {number} amount - The total
+		 * @param {number[]} weights - Integer ratios
+		 * @returns {number[]} The shares
+		 */
+		function hamilton(amount: number, weights: number[]): number[] {
+			const sign = amount < 0 ? -1n : 1n;
+			const magnitude = BigInt(Math.abs(amount));
+			const denominator = weights.reduce(function (sum, weight) {
+				return sum + BigInt(weight);
+			}, 0n);
+			const shares = weights.map(function (weight) {
+				return (magnitude * BigInt(weight)) / denominator;
+			});
+			let left =
+				magnitude -
+				shares.reduce(function (sum, share) {
+					return sum + share;
+				}, 0n);
+			const order = weights
+				.map(function (weight, index) {
+					return { index, remainder: (magnitude * BigInt(weight)) % denominator };
+				})
+				.sort(function (a, b) {
+					return a.remainder === b.remainder ? a.index - b.index : a.remainder > b.remainder ? -1 : 1;
+				});
+			for (const { index } of order) {
+				if (left === 0n) break;
+				shares[index] += 1n;
+				left--;
+			}
+			return shares.map(function (share) {
+				return Number(sign * share) + 0;
+			});
+		}
+
+		it('should add up to the total exactly, each share within 1 of its exact quota', function () {
+			fc.assert(
+				fc.property(total, ratios, function (amount, weights) {
+					const shares = helpers.allocate(amount, weights);
+					const denominator = BigInt(
+						weights.reduce(function (a, b) {
+							return a + b;
+						}, 0)
+					);
+					expect(shares.length).toBe(weights.length);
+					expect(helpers.sum(shares)).toBe(amount);
+					shares.forEach(function (share, i) {
+						// |share - amount * weight / denominator| < 1, in exact integers.
+						const difference = BigInt(share) * denominator - BigInt(amount) * BigInt(weights[i]);
+						expect(difference < denominator && difference > -denominator).toBe(true);
+						if (weights[i] === 0) expect(share).toBe(0);
+					});
+				})
+			);
+		});
+
+		it('should match a reference implementation of the largest remainder method', function () {
+			fc.assert(
+				fc.property(total, ratios, function (amount, weights) {
+					expect(helpers.allocate(amount, weights)).toEqual(hamilton(amount, weights));
+				})
+			);
+		});
+
+		it('should be symmetric in the sign of the total, agree with bigint totals, and depend only on the proportions', function () {
+			fc.assert(
+				fc.property(total, ratios, fc.constantFrom(0.5, 2, 3, 0.125, 1e-10), function (amount, weights, factor) {
+					const shares = helpers.allocate(amount, weights);
+					expect(helpers.allocate(-amount, weights)).toEqual(
+						shares.map(function (share) {
+							return -share + 0;
+						})
+					);
+					expect(helpers.allocate(BigInt(amount), weights)).toEqual(shares.map(BigInt));
+					expect(helpers.allocate(amount, weights.map(BigInt))).toEqual(shares);
+					// Scaling by a power of two is exact, so the shares cannot change.
+					if (factor === 0.5 || factor === 2 || factor === 0.125) {
+						expect(
+							helpers.allocate(
+								amount,
+								weights.map(function (weight) {
+									return weight * factor;
+								})
+							)
+						).toEqual(shares);
+					}
+				})
+			);
+		});
+
+		it('should add up to the total for any finite double ratios', function () {
+			const anyRatios = fc.array(fc.double({ min: 0, noNaN: true, noDefaultInfinity: true }), { minLength: 1, maxLength: 8 }).filter(function (list) {
+				return list.some(function (ratio) {
+					return ratio > 0;
+				});
+			});
+			fc.assert(
+				fc.property(fc.maxSafeInteger(), anyRatios, function (amount, weights) {
+					const shares = helpers.allocate(amount, weights);
+					expect(helpers.sumPrecise(shares)).toBe(amount);
+				})
+			);
+		});
+	});
+
+	describe('covariance, correlation and linearRegression', function () {
+		const pairs = fc.array(fc.tuple(finiteDouble, finiteDouble), { minLength: 2, maxLength: 40 });
+		// Sixteenths: values for which the textbook formulas neither underflow nor overflow.
+		const sixteenth = fc.integer({ min: -1e6, max: 1e6 }).map(function (n) {
+			return n / 16;
+		});
+		const moderatePairs = fc.array(fc.tuple(sixteenth, sixteenth), { minLength: 2, maxLength: 40 });
+
+		function first(pair: [number, number]): number {
+			return pair[0];
+		}
+
+		function second(pair: [number, number]): number {
+			return pair[1];
+		}
+
+		/**
+		 * The textbook two-pass formulas (simple-statistics), as a reference.
+		 * @param {number[]} xs - The first sample
+		 * @param {number[]} ys - The second sample
+		 * @returns {{ covariance: number, correlation: number, slope: number }} The reference statistics
+		 */
+		function reference(xs: number[], ys: number[]): { covariance: number; correlation: number; slope: number } {
+			const n = xs.length;
+			const meanX = helpers.sumPrecise(xs) / n;
+			const meanY = helpers.sumPrecise(ys) / n;
+			let sxy = 0;
+			let sxx = 0;
+			let syy = 0;
+			for (let i = 0; i < n; i++) {
+				sxy += (xs[i] - meanX) * (ys[i] - meanY);
+				sxx += (xs[i] - meanX) ** 2;
+				syy += (ys[i] - meanY) ** 2;
+			}
+			return { covariance: sxy / n, correlation: sxy / Math.sqrt(sxx * syy), slope: sxy / sxx };
+		}
+
+		it('should match the textbook formulas on moderate data', function () {
+			fc.assert(
+				fc.property(moderatePairs, function (list) {
+					const xs = list.map(first);
+					const ys = list.map(second);
+					const expected = reference(xs, ys);
+					const scale = Math.max(1, Math.abs(expected.covariance));
+					expect(Math.abs(helpers.covariance(xs, ys) - expected.covariance)).toBeLessThanOrEqual(scale * 1e-9);
+					fc.pre(Number.isFinite(expected.correlation) && Math.abs(expected.slope) < 1e9);
+					expect(helpers.correlation(xs, ys)).toBeCloseTo(expected.correlation, 9);
+					const line = helpers.linearRegression(xs, ys);
+					expect(Math.abs(line.slope - expected.slope)).toBeLessThanOrEqual(Math.max(1, Math.abs(expected.slope)) * 1e-9);
+					expect(line.r2).toBeCloseTo(expected.correlation ** 2, 9);
+				})
+			);
+		});
+
+		it('should keep the correlation in [-1, 1] and r2 in [0, 1], symmetric, with r2 the square of the correlation', function () {
+			fc.assert(
+				fc.property(pairs, function (list) {
+					const xs = list.map(first);
+					const ys = list.map(second);
+					const r = helpers.correlation(xs, ys);
+					fc.pre(!Number.isNaN(r));
+					expect(r >= -1 && r <= 1).toBe(true);
+					expect(helpers.correlation(ys, xs)).toBe(r);
+					expect(helpers.covariance(xs, ys)).toBe(helpers.covariance(ys, xs));
+					const { r2 } = helpers.linearRegression(xs, ys);
+					expect(r2 >= 0 && r2 <= 1).toBe(true);
+					expect(r2).toBeCloseTo(r * r, 12);
+				})
+			);
+		});
+
+		it('should recover an exact integer line, whatever the offset of the xs', function () {
+			fc.assert(
+				fc.property(
+					fc.uniqueArray(fc.integer({ min: -1000, max: 1000 }), { minLength: 2, maxLength: 20 }),
+					fc.integer({ min: -100, max: 100 }),
+					fc.integer({ min: -1000, max: 1000 }),
+					fc.integer({ min: -(2 ** 40), max: 2 ** 40 }),
+					function (offsets, slope, intercept, origin) {
+						const xs = offsets.map(function (offset) {
+							return origin + offset;
+						});
+						const ys = xs.map(function (x) {
+							return slope * (x - origin) + intercept;
+						});
+						const line = helpers.linearRegression(xs, ys);
+						// Exact when the means are (dyadic); otherwise the slope is within a few ulps, and a prediction within the rounding of the
+						// mean of the xs (an ulp of the origin), however far the xs are from zero.
+						expect(Math.abs(line.slope - slope)).toBeLessThanOrEqual(1e-12 * Math.max(1, Math.abs(slope)));
+						expect(Math.abs(line.predict(origin) - intercept)).toBeLessThanOrEqual((1 + Math.abs(slope)) * Math.abs(origin) * 2 ** -51 + 1e-9);
+						if (slope === 0) {
+							expect(line.r2).toBe(1);
+							expect(helpers.correlation(xs, ys)).toBeNaN();
+						} else {
+							expect(Math.abs(line.r2 - 1)).toBeLessThanOrEqual(1e-12);
+							expect(Math.abs(helpers.correlation(xs, ys) - Math.sign(slope))).toBeLessThanOrEqual(1e-12);
+						}
+					}
+				)
+			);
+		});
+
+		it('should be invariant under positive affine changes of either sample (correlation)', function () {
+			fc.assert(
+				fc.property(moderatePairs, fc.integer({ min: 1, max: 1000 }), fc.integer({ min: -1000, max: 1000 }), function (list, scale, shift) {
+					const xs = list.map(first);
+					const ys = list.map(second);
+					const r = helpers.correlation(xs, ys);
+					fc.pre(Number.isFinite(r));
+					const moved = xs.map(function (x) {
+						return x * scale + shift;
+					});
+					expect(helpers.correlation(moved, ys)).toBeCloseTo(r, 8);
+				})
+			);
+		});
+	});
+
+	describe('interquartileRange', function () {
+		it('should equal quantile(0.75) - quantile(0.25)', function () {
+			fc.assert(
+				fc.property(finiteArray, function (numbers) {
+					expect(helpers.interquartileRange(numbers)).toBe(helpers.quantile(numbers, 0.75) - helpers.quantile(numbers, 0.25));
+				})
 			);
 		});
 	});

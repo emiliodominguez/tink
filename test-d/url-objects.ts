@@ -1,5 +1,5 @@
-import { compilePath, matchPath } from 'tinkit/url';
-import type { PathParams, PathBuilder, MatchPathOptions } from 'tinkit/url';
+import { compilePath, matchPath, normalizeUrl, parseCookie, serializeCookie, tryParseUrl } from 'tinkit/url';
+import type { PathParams, PathBuilder, MatchPathOptions, NormalizeUrlOptions, SerializeCookieOptions, UrlObject } from 'tinkit/url';
 import { applyPatch, createPatch, JsonPatchError, replaceEqualDeep } from 'tinkit/objects';
 import type { JsonPatchOperation } from 'tinkit/objects';
 
@@ -99,3 +99,14 @@ const userLink: string = routeLink('user', { id: 1 });
 declare const maybePage: string | undefined;
 const pageLink: string = compilePath('/docs/:page?')({ page: maybePage });
 void [noArguments, homeLink, userLink, pageLink];
+
+// Cookies, normalizeUrl and tryParseUrl in a type environment without a global `URL` (UrlObject falls back to a structural type).
+const cookies: Record<string, string> = parseCookie('a=1');
+const setCookie: string = serializeCookie('a', 'b', { sameSite: 'lax', priority: 'high', maxAge: 60, expires: new Date(0) } satisfies SerializeCookieOptions);
+// @ts-expect-error sameSite is lowercase
+serializeCookie('a', 'b', { sameSite: 'Lax' });
+const normalized: string = normalizeUrl('https://x/', { removeQueryParams: ['a', /^utm_/] } satisfies NormalizeUrlOptions);
+const parsedUrl: UrlObject | undefined = tryParseUrl('https://x/', 'https://y/');
+const parsedPath: string | undefined = parsedUrl?.pathname;
+const reparsed: string = normalizeUrl(parsedUrl as UrlObject) + String(tryParseUrl(parsedUrl as UrlObject)?.searchParams.get('q'));
+void [cookies, setCookie, normalized, parsedPath, reparsed];

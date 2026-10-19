@@ -2841,3 +2841,695 @@ describe('deterministic coverage of size-dependent paths', function () {
 		).toEqual([500, 0, 501]);
 	});
 });
+
+describe('Arrays helpers (comparators, trees, updates and paging)', function () {
+	describe('compareBy', function () {
+		it('sorts like sortBy in both directions, with missing keys last', function () {
+			const invalid = new Date(NaN);
+			// Wrapped: `sort` itself moves `undefined` items to the end without calling the comparator.
+			const keys = [3, 'b', null, 1n, new Date(5), NaN, undefined, 'a', invalid, -1].map(function (k) {
+				return { k };
+			});
+			for (const order of ['asc', 'desc'] as const) {
+				const sorted = keys.slice().sort(
+					helpers.compareBy(function (key) {
+						return key.k;
+					}, order)
+				);
+				expect(sorted).toStrictEqual(
+					helpers.sortBy(
+						keys,
+						function (key) {
+							return key.k;
+						},
+						order
+					)
+				);
+			}
+			expect(
+				[2, null, 1].sort(
+					helpers.compareBy(function (n) {
+						return n;
+					}, 'desc')
+				)
+			).toStrictEqual([2, 1, null]);
+		});
+
+		it('returns -1, 0 or 1, and never -0', function () {
+			const byValue = helpers.compareBy(function (n: number) {
+				return n;
+			});
+			const descending = helpers.compareBy(function (n: number) {
+				return n;
+			}, 'desc');
+			expect([byValue(1, 2), byValue(2, 1), byValue(2, 2), byValue(NaN, 1), byValue(1, NaN), byValue(NaN, NaN)]).toStrictEqual([-1, 1, 0, 1, -1, 0]);
+			expect([descending(1, 2), descending(2, 1), descending(2, 2), descending(NaN, 1), descending(1, NaN)]).toStrictEqual([1, -1, 0, 1, -1]);
+			expect(Object.is(descending(2, 2), 0)).toBe(true);
+		});
+
+		it('infers the item type from the array it sorts', function () {
+			const people = [
+				{ name: 'bo', age: 30 },
+				{ name: 'al', age: 25 }
+			];
+			const sorted = people.slice().sort(
+				helpers.compareBy(function (person) {
+					return person.age;
+				})
+			);
+			const name: string = sorted[0].name;
+			expect(name).toBe('al');
+			// @ts-expect-error a boolean is not a sort key
+			helpers.compareBy(function (person: { age: number }) {
+				return person.age > 1;
+			});
+		});
+
+		it('validates its arguments eagerly', function () {
+			expect(function () {
+				helpers.compareBy(1 as any);
+			}).toThrow(new TypeError('compareBy: `selector` must be a function, got number'));
+			expect(function () {
+				helpers.compareBy(function (n: number) {
+					return n;
+				}, 'up' as any);
+			}).toThrow(new RangeError("compareBy: `order` must be 'asc' or 'desc', got up"));
+		});
+	});
+
+	describe('combineComparators and reverseComparator', function () {
+		const byLength = helpers.compareBy(function (s: string) {
+			return s.length;
+		});
+		const alphabetical = helpers.compareBy(function (s: string) {
+			return s;
+		});
+
+		it('breaks ties with the following comparators', function () {
+			expect(['ccc', 'b', 'aa', 'a', 'bb'].sort(helpers.combineComparators(byLength, alphabetical))).toStrictEqual(['a', 'b', 'aa', 'bb', 'ccc']);
+			expect(['ccc', 'b', 'aa', 'a', 'bb'].sort(helpers.combineComparators(byLength, helpers.reverseComparator(alphabetical)))).toStrictEqual([
+				'b',
+				'a',
+				'bb',
+				'aa',
+				'ccc'
+			]);
+		});
+
+		it('returns the first non-zero result, treats NaN as a tie, and ties every pair without comparators', function () {
+			const calls: string[] = [];
+			function first(): number {
+				calls.push('first');
+				return 0;
+			}
+			function nan(): number {
+				calls.push('nan');
+				return NaN;
+			}
+			function second(): number {
+				calls.push('second');
+				return -5;
+			}
+			function third(): number {
+				calls.push('third');
+				return 1;
+			}
+			expect(helpers.combineComparators(first, nan, second, third)(1, 2)).toBe(-5);
+			expect(calls).toStrictEqual(['first', 'nan', 'second']);
+			expect(helpers.combineComparators(first, nan)(1, 2)).toBe(0);
+			expect(helpers.combineComparators()(1, 2)).toBe(0);
+		});
+
+		it('keeps its own copy of the comparators', function () {
+			const comparators = [byLength];
+			const combined = helpers.combineComparators(...comparators);
+			comparators.push(alphabetical);
+			expect(combined('b', 'a')).toBe(0);
+		});
+
+		it('reverseComparator swaps the arguments', function () {
+			const reversed = helpers.reverseComparator(function (a: number, b: number) {
+				return a - b;
+			});
+			expect(reversed(1, 3)).toBe(2);
+			expect([1, 3, 2].sort(reversed)).toStrictEqual([3, 2, 1]);
+		});
+
+		it('validates the comparators', function () {
+			expect(function () {
+				helpers.combineComparators(byLength, 1 as any);
+			}).toThrow(new TypeError('combineComparators: `comparators[1]` must be a function, got number'));
+			expect(function () {
+				helpers.reverseComparator(null as any);
+			}).toThrow(new TypeError('reverseComparator: `compare` must be a function, got null'));
+		});
+	});
+
+	describe('toTree', function () {
+		type Row = { id: number; parentId: number | null; name: string };
+		const rows: Row[] = [
+			{ id: 3, parentId: 1, name: 'c' },
+			{ id: 1, parentId: null, name: 'a' },
+			{ id: 4, parentId: 3, name: 'd' },
+			{ id: 2, parentId: 1, name: 'b' },
+			{ id: 5, parentId: null, name: 'e' }
+		];
+
+		it('nests the items under their parents, keeping the input order among siblings and roots', function () {
+			expect(helpers.toTree(rows)).toStrictEqual([
+				{
+					id: 1,
+					parentId: null,
+					name: 'a',
+					children: [
+						{ id: 3, parentId: 1, name: 'c', children: [{ id: 4, parentId: 3, name: 'd', children: [] }] },
+						{ id: 2, parentId: 1, name: 'b', children: [] }
+					]
+				},
+				{ id: 5, parentId: null, name: 'e', children: [] }
+			]);
+			expect(helpers.toTree([])).toStrictEqual([]);
+		});
+
+		it('builds shallow copies and never mutates the items', function () {
+			const items = [
+				{ id: 1, parentId: undefined, tags: ['x'], children: 'old' },
+				{ id: 2, parentId: 1, tags: [], children: 'old' }
+			];
+			const snapshot = JSON.stringify(items);
+			const [root] = helpers.toTree(items);
+			expect(JSON.stringify(items)).toBe(snapshot);
+			expect(root).not.toBe(items[0]);
+			expect(root.tags).toBe(items[0].tags);
+			expect(root.children[0]).not.toBe(items[1]);
+			expect(root.children[0].children).toStrictEqual([]);
+		});
+
+		it('infers the node type', function () {
+			const [root] = helpers.toTree(rows);
+			const name: string = root.children[0].children[0].name;
+			expect(name).toBe('d');
+			const [other] = helpers.toTree(rows, { childrenKey: 'items' });
+			const otherName: string = other.items[0].name;
+			expect(otherName).toBe('c');
+			// @ts-expect-error the children are under `items`
+			expect(other.children).toBeUndefined();
+			expect(function () {
+				// @ts-expect-error `uid` is not a property of the rows
+				helpers.toTree(rows, { id: 'uid' });
+			}).toThrow(RangeError);
+		});
+
+		it('reads ids with property names or functions, compared with SameValueZero', function () {
+			const items = [
+				{ key: 'a/b', label: 'b' },
+				{ key: 'a', label: 'a' },
+				{ key: 'a/b/c', label: 'c' }
+			];
+			const tree = helpers.toTree(items, {
+				id: 'key',
+				parentId: function (item) {
+					const slash = item.key.lastIndexOf('/');
+					return slash === -1 ? null : item.key.slice(0, slash);
+				}
+			});
+			expect(
+				helpers.flattenTree(tree).map(function (node) {
+					return node.label;
+				})
+			).toStrictEqual(['a', 'b', 'c']);
+			const numeric = helpers.toTree<{ 0: number; 1: unknown }>(
+				[
+					{ 0: NaN, 1: null },
+					{ 0: 0, 1: NaN },
+					{ 0: 1, 1: -0 },
+					{ 0: 2, 1: '1' }
+				],
+				{ id: 0, parentId: 1 }
+			);
+			expect(numeric).toStrictEqual([
+				{ 0: NaN, 1: null, children: [{ 0: 0, 1: NaN, children: [{ 0: 1, 1: -0, children: [] }] }] },
+				// '1' is not the id 1: an orphan, made a root.
+				{ 0: 2, 1: '1', children: [] }
+			]);
+		});
+
+		it('makes orphans roots by default, or drops them with their descendants, or throws', function () {
+			const items = [
+				{ id: 1, parentId: null },
+				{ id: 2, parentId: 9 },
+				{ id: 3, parentId: 2 },
+				{ id: 4, parentId: 1 }
+			];
+			expect(helpers.toTree(items)).toStrictEqual([
+				{ id: 1, parentId: null, children: [{ id: 4, parentId: 1, children: [] }] },
+				{ id: 2, parentId: 9, children: [{ id: 3, parentId: 2, children: [] }] }
+			]);
+			expect(helpers.toTree(items, { orphans: 'root' })).toStrictEqual(helpers.toTree(items));
+			expect(helpers.toTree(items, { orphans: 'drop' })).toStrictEqual([{ id: 1, parentId: null, children: [{ id: 4, parentId: 1, children: [] }] }]);
+			expect(function () {
+				helpers.toTree(items, { orphans: 'throw' });
+			}).toThrow(new RangeError('toTree: the parent of `items[1]` must be one of the items, got parent id 9'));
+			expect(helpers.toTree(items.slice(0, 1), { orphans: 'throw' })).toHaveLength(1);
+			// A missing or undefined parent id makes a root, not an orphan.
+			expect(helpers.toTree([{ id: 1 }, { id: 2, parentId: undefined }], { orphans: 'throw' })).toStrictEqual([
+				{ id: 1, children: [] },
+				{ id: 2, parentId: undefined, children: [] }
+			]);
+		});
+
+		it('rejects duplicate ids', function () {
+			expect(function () {
+				helpers.toTree([{ id: 1 }, { id: 2 }, { id: 1 }]);
+			}).toThrow(new RangeError('toTree: ids must be unique, got 1 twice'));
+			expect(function () {
+				helpers.toTree([{ id: 0 }, { id: -0 }]);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.toTree([{ name: 'a' }, { name: 'b' }] as Array<{ name: string; id?: number }>);
+			}).toThrow(new RangeError('toTree: ids must be unique, got undefined twice'));
+		});
+
+		it('rejects parent references that form a cycle, wherever the walk starts', function () {
+			expect(function () {
+				helpers.toTree([{ id: 1, parentId: 1 }]);
+			}).toThrow(new RangeError('toTree: the parent ids must not form a cycle, got one through id 1'));
+			expect(function () {
+				helpers.toTree([
+					{ id: 1, parentId: null },
+					{ id: 2, parentId: 3 },
+					{ id: 3, parentId: 2 }
+				]);
+			}).toThrow(new RangeError('toTree: the parent ids must not form a cycle, got one through id 2'));
+			// A chain leading into a cycle (walked first), then the cycle itself.
+			const tail = [
+				{ id: 'a', parentId: 'b' },
+				{ id: 'b', parentId: 'c' },
+				{ id: 'c', parentId: 'd' },
+				{ id: 'd', parentId: 'e' },
+				{ id: 'e', parentId: 'c' },
+				{ id: 'f', parentId: null }
+			];
+			expect(function () {
+				helpers.toTree(tail);
+			}).toThrow(new RangeError('toTree: the parent ids must not form a cycle, got one through id c'));
+			// Walks that reach an item stamped by an earlier walk stop there.
+			expect(
+				helpers.flattenTree(
+					helpers.toTree([
+						{ id: 'leaf', parentId: 'mid' },
+						{ id: 'other', parentId: 'mid' },
+						{ id: 'mid', parentId: 'root' },
+						{ id: 'root', parentId: null }
+					])
+				)
+			).toHaveLength(4);
+		});
+
+		it('builds very deep trees in linear time without recursion', function () {
+			const length = 100_000;
+			const items = Array.from({ length }, function (_, i) {
+				return { id: i, parentId: i === 0 ? null : i - 1 };
+			}).reverse();
+			const start = performance.now();
+			const forest = helpers.toTree(items);
+			const flat = helpers.flattenTree(forest);
+			expect(performance.now() - start).toBeLessThan(2000);
+			expect(flat).toHaveLength(length);
+			expect(flat[length - 1].id).toBe(length - 1);
+			expect(helpers.flattenTree(forest, { order: 'breadth-first' })).toStrictEqual(flat);
+		});
+
+		it('ignores ids and parent ids inherited from a polluted Object.prototype', function () {
+			const polluted = Object.prototype as Record<string, unknown>;
+			polluted.parentId = 1;
+			polluted.uid = 7;
+			try {
+				const items = [{ id: 1 }, { id: 2 }] as Array<{ id: number; parentId?: number; uid?: number }>;
+				expect(helpers.toTree(items)).toStrictEqual([
+					{ id: 1, children: [] },
+					{ id: 2, children: [] }
+				]);
+				expect(function () {
+					helpers.toTree(items, { id: 'uid' });
+				}).toThrow(new RangeError('toTree: ids must be unique, got undefined twice'));
+			} finally {
+				delete polluted.parentId;
+				delete polluted.uid;
+			}
+		});
+
+		it('copies own `__proto__` keys as data and never sets a prototype', function () {
+			const items = JSON.parse('[{ "id": 1, "__proto__": { "polluted": true } }]') as Array<{ id: number }>;
+			const [node] = helpers.toTree(items);
+			expect(Object.getPrototypeOf(node)).toBe(Object.prototype);
+			expect(Object.keys(node)).toStrictEqual(['id', '__proto__', 'children']);
+			expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+		});
+
+		it('reads class and symbol keys', function () {
+			const parent = Symbol('parent');
+			class Item {
+				constructor(readonly code: string) {}
+				get [parent](): string | null {
+					return this.code.length > 1 ? this.code.slice(0, -1) : null;
+				}
+			}
+			const tree = helpers.toTree([new Item('ab'), new Item('a')], { id: 'code', parentId: parent });
+			expect(tree).toStrictEqual([{ code: 'a', children: [{ code: 'ab', children: [] }] }]);
+		});
+
+		it('validates its options', function () {
+			expect(function () {
+				helpers.toTree(rows, { id: {} as any });
+			}).toThrow(new TypeError('toTree: `options.id` must be a property key or a function, got object'));
+			expect(function () {
+				helpers.toTree(rows, { parentId: null as any });
+			}).toThrow(new TypeError('toTree: `options.parentId` must be a property key or a function, got null'));
+			expect(function () {
+				helpers.toTree(rows, { id: '__proto__' as any });
+			}).toThrow(new RangeError("toTree: `options.id` must not be '__proto__', got __proto__"));
+			expect(function () {
+				helpers.toTree(rows, { childrenKey: 1 as any });
+			}).toThrow(new TypeError('toTree: `options.childrenKey` must be a string, got number'));
+			expect(function () {
+				helpers.toTree(rows, { childrenKey: '__proto__' });
+			}).toThrow(new RangeError("toTree: `options.childrenKey` must not be '__proto__', got __proto__"));
+			expect(function () {
+				helpers.toTree(rows, { orphans: 'keep' as any });
+			}).toThrow(new RangeError("toTree: `options.orphans` must be 'root', 'drop' or 'throw', got keep"));
+			expect(function () {
+				helpers.toTree(rows, null as any);
+			}).toThrow(TypeError);
+		});
+	});
+
+	describe('flattenTree', function () {
+		type Node = { id: number; children?: Node[] | null };
+		const forest: Node[] = [
+			{
+				id: 1,
+				children: [
+					{ id: 2, children: [{ id: 4 }, { id: 5, children: null }] },
+					{ id: 3, children: [{ id: 6 }] }
+				]
+			},
+			{ id: 7, children: [] }
+		];
+		function ids(nodes: Node[]): number[] {
+			return nodes.map(function (node) {
+				return node.id;
+			});
+		}
+
+		it('lists the nodes depth-first (pre-order) or breadth-first, returning the nodes themselves', function () {
+			expect(ids(helpers.flattenTree(forest))).toStrictEqual([1, 2, 4, 5, 3, 6, 7]);
+			expect(ids(helpers.flattenTree(forest, { order: 'depth-first' }))).toStrictEqual([1, 2, 4, 5, 3, 6, 7]);
+			expect(ids(helpers.flattenTree(forest, { order: 'breadth-first' }))).toStrictEqual([1, 7, 2, 3, 4, 5, 6]);
+			expect(helpers.flattenTree(forest)[0]).toBe(forest[0]);
+			expect(helpers.flattenTree([])).toStrictEqual([]);
+		});
+
+		it('reads the children under a custom key', function () {
+			const menu = [{ label: 'File', items: [{ label: 'Open' }, { label: 'Recent', items: [{ label: 'a.txt' }] }] }];
+			expect(
+				helpers.flattenTree(menu, { childrenKey: 'items' }).map(function (entry) {
+					return entry.label;
+				})
+			).toStrictEqual(['File', 'Open', 'Recent', 'a.txt']);
+		});
+
+		it('lists a node shared by several parents each time, but rejects a node inside its own subtree', function () {
+			const shared: Node = { id: 9, children: [{ id: 10 }] };
+			const dag: Node[] = [{ id: 1, children: [shared, { id: 2, children: [shared] }] }, shared];
+			expect(ids(helpers.flattenTree(dag))).toStrictEqual([1, 9, 10, 2, 9, 10, 9, 10]);
+			expect(ids(helpers.flattenTree(dag, { order: 'breadth-first' }))).toStrictEqual([1, 9, 9, 2, 10, 10, 9, 10]);
+			const loop: Node = { id: 1, children: [] };
+			loop.children = [{ id: 2 }, { id: 3, children: [loop] }];
+			expect(function () {
+				helpers.flattenTree([loop]);
+			}).toThrow(new TypeError('flattenTree: cannot flatten a circular tree'));
+			const self: Node = { id: 1 };
+			self.children = [self];
+			expect(function () {
+				helpers.flattenTree([self], { order: 'breadth-first' });
+			}).toThrow(TypeError);
+		});
+
+		it('is the inverse of toTree', function () {
+			const rows = [
+				{ id: 'b', parentId: 'a' },
+				{ id: 'a', parentId: null },
+				{ id: 'c', parentId: 'b' },
+				{ id: 'd', parentId: null }
+			];
+			const tree = helpers.toTree(rows);
+			expect(helpers.toTree(helpers.flattenTree(tree))).toStrictEqual(tree);
+		});
+
+		it('rejects children that are not arrays', function () {
+			expect(function () {
+				helpers.flattenTree([{ id: 1, children: 'abc' }]);
+			}).toThrow(new TypeError('flattenTree: `children` must be an array, got string'));
+			expect(function () {
+				helpers.flattenTree([{ id: 1, kids: {} }], { childrenKey: 'kids' });
+			}).toThrow(new TypeError('flattenTree: `kids` must be an array, got object'));
+		});
+
+		it('ignores children inherited from a polluted Object.prototype', function () {
+			const polluted = Object.prototype as Record<string, unknown>;
+			polluted.children = [{ id: 666 }];
+			try {
+				expect(ids(helpers.flattenTree([{ id: 1 }, { id: 2 }]))).toStrictEqual([1, 2]);
+			} finally {
+				delete polluted.children;
+			}
+		});
+
+		it('validates its options', function () {
+			expect(function () {
+				helpers.flattenTree(forest, { order: 'post-order' as any });
+			}).toThrow(new RangeError("flattenTree: `options.order` must be 'depth-first' or 'breadth-first', got post-order"));
+			expect(function () {
+				helpers.flattenTree(forest, { childrenKey: Symbol('kids') as any });
+			}).toThrow(new TypeError('flattenTree: `options.childrenKey` must be a string, got symbol'));
+			expect(function () {
+				helpers.flattenTree(forest, { childrenKey: '__proto__' });
+			}).toThrow(new RangeError("flattenTree: `options.childrenKey` must not be '__proto__', got __proto__"));
+		});
+	});
+
+	describe('upsert', function () {
+		const users = [
+			{ id: 1, name: 'Al' },
+			{ id: 2, name: 'Bo' },
+			{ id: 2, name: 'Bo (copy)' }
+		];
+		function byId(user: { id: number }): number {
+			return user.id;
+		}
+
+		it('replaces the first match only, or appends', function () {
+			expect(helpers.upsert(users, { id: 2, name: 'Bob' }, byId)).toStrictEqual([
+				{ id: 1, name: 'Al' },
+				{ id: 2, name: 'Bob' },
+				{ id: 2, name: 'Bo (copy)' }
+			]);
+			expect(helpers.upsert(users, { id: 3, name: 'Cy' }, byId)).toHaveLength(4);
+			expect(users).toHaveLength(3);
+			expect(users[1].name).toBe('Bo');
+			expect(helpers.upsert([], 1)).toStrictEqual([1]);
+		});
+
+		it('uses SameValueZero without a key function', function () {
+			expect(helpers.upsert([1, NaN, 2], NaN)).toStrictEqual([1, NaN, 2]);
+			const replaced = helpers.upsert([1, 0, 2], -0);
+			expect(Object.is(replaced[1], -0)).toBe(true);
+			expect(helpers.upsert(['1'], 1 as unknown as string)).toStrictEqual(['1', 1]);
+		});
+
+		it('returns a copy even when the item replaces itself', function () {
+			const array = [1, 2];
+			const result = helpers.upsert(array, 2);
+			expect(result).toStrictEqual([1, 2]);
+			expect(result).not.toBe(array);
+		});
+
+		it('validates keyFn', function () {
+			expect(function () {
+				helpers.upsert([1], 1, 'id' as any);
+			}).toThrow(new TypeError('upsert: `keyFn` must be a function, got string'));
+		});
+	});
+
+	describe('filterMap', function () {
+		it('drops null and undefined results only', function () {
+			const results = [0, '', false, NaN, null, undefined, 'x'];
+			expect(
+				helpers.filterMap(results, function (value) {
+					return value;
+				})
+			).toStrictEqual([0, '', false, NaN, 'x']);
+			expect(
+				helpers.filterMap(['a', 'b', 'c'], function (value, index) {
+					return index === 1 ? undefined : value + index;
+				})
+			).toStrictEqual(['a0', 'c2']);
+		});
+
+		it('types the result without null and undefined', function () {
+			const numbers: number[] = helpers.filterMap(['1', 'x'], function (text) {
+				return /^\d$/.test(text) ? Number(text) : null;
+			});
+			expect(numbers).toStrictEqual([1]);
+		});
+
+		it('validates fn', function () {
+			expect(function () {
+				helpers.filterMap([1], undefined as any);
+			}).toThrow(new TypeError('filterMap: `fn` must be a function, got undefined'));
+		});
+	});
+
+	describe('duplicates', function () {
+		it('reports each repeated value once, in order of first occurrence', function () {
+			expect(helpers.duplicates([3, 1, 3, 2, 1, 3])).toStrictEqual([3, 1]);
+			expect(helpers.duplicates([1, 2, 2, 1])).toStrictEqual([1, 2]);
+			expect(helpers.duplicates([1, 2, 3])).toStrictEqual([]);
+			expect(helpers.duplicates([])).toStrictEqual([]);
+			expect(helpers.duplicates([NaN, NaN, undefined, undefined])).toStrictEqual([NaN, undefined]);
+			const zeros = helpers.duplicates([-0, 0]);
+			expect(zeros).toHaveLength(1);
+			expect(Object.is(zeros[0], -0)).toBe(true);
+		});
+
+		it('compares the keys keyFn returns, and returns the first item of each', function () {
+			const people = [
+				{ name: 'a', team: 'x' },
+				{ name: 'b', team: 'y' },
+				{ name: 'c', team: 'x' }
+			];
+			const indices: number[] = [];
+			expect(
+				helpers.duplicates(people, function (person, index) {
+					indices.push(index);
+					return person.team;
+				})
+			).toStrictEqual([people[0]]);
+			expect(indices).toStrictEqual([0, 1, 2]);
+		});
+
+		it('validates keyFn', function () {
+			expect(function () {
+				helpers.duplicates([1], 1 as any);
+			}).toThrow(new TypeError('duplicates: `keyFn` must be a function, got number'));
+		});
+	});
+
+	describe('associate', function () {
+		it('builds an object from pairs, the last value winning', function () {
+			const result = helpers.associate(['a', 'bb', 'cc'], function (text, index) {
+				return [text.length, index];
+			});
+			expect(result).toStrictEqual(Object.assign(Object.create(null), { 1: 0, 2: 2 }));
+			const typed: number | undefined = result[2];
+			expect(typed).toBe(2);
+			const symbol = Symbol('s');
+			expect(
+				helpers.associate([symbol], function (key) {
+					return [key, true];
+				})[symbol]
+			).toBe(true);
+		});
+
+		it('stores __proto__ and constructor keys safely', function () {
+			const result = helpers.associate(['__proto__', 'constructor'], function (key) {
+				return [key, { polluted: true }];
+			});
+			expect(Object.getPrototypeOf(result)).toBeNull();
+			expect(Object.keys(result)).toStrictEqual(['__proto__', 'constructor']);
+			expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+		});
+
+		it('rejects a function that does not return a pair', function () {
+			expect(function () {
+				helpers.associate([1], function () {
+					return 'ab' as unknown as [string, number];
+				});
+			}).toThrow(new TypeError('associate: `fn` must return a [key, value] pair, got string'));
+			expect(function () {
+				helpers.associate([1], null as any);
+			}).toThrow(new TypeError('associate: `fn` must be a function, got null'));
+		});
+	});
+
+	describe('paginate', function () {
+		const letters = ['a', 'b', 'c', 'd', 'e'];
+
+		it('returns the items of a page with the pager metadata', function () {
+			expect(helpers.paginate(letters, 1, 2)).toStrictEqual({ items: ['a', 'b'], page: 1, pageSize: 2, pageCount: 3, total: 5, hasPrevious: false, hasNext: true });
+			expect(helpers.paginate(letters, 3, 2)).toStrictEqual({ items: ['e'], page: 3, pageSize: 2, pageCount: 3, total: 5, hasPrevious: true, hasNext: false });
+			expect(helpers.paginate(letters, 1, 5)).toStrictEqual({ items: letters, page: 1, pageSize: 5, pageCount: 1, total: 5, hasPrevious: false, hasNext: false });
+			expect(helpers.paginate(letters, 1, 5).items).not.toBe(letters);
+		});
+
+		it('gives an empty page past the last one, without clamping', function () {
+			expect(helpers.paginate(letters, 4, 2)).toStrictEqual({ items: [], page: 4, pageSize: 2, pageCount: 3, total: 5, hasPrevious: true, hasNext: false });
+			expect(helpers.paginate([], 1, 10)).toStrictEqual({ items: [], page: 1, pageSize: 10, pageCount: 0, total: 0, hasPrevious: false, hasNext: false });
+			expect(helpers.paginate(letters, Number.MAX_SAFE_INTEGER, 2).items).toStrictEqual([]);
+		});
+
+		it('pages through long arrays', function () {
+			const numbers = Array.from({ length: 95 }, function (_, i) {
+				return i;
+			});
+			const page = helpers.paginate(numbers, 2, 40);
+			expect(page.items).toStrictEqual(numbers.slice(40, 80));
+			expect(page.pageCount).toBe(3);
+		});
+
+		it('validates page and pageSize', function () {
+			expect(function () {
+				helpers.paginate(letters, 0, 2);
+			}).toThrow(new RangeError('paginate: `page` must be an integer >= 1, got 0'));
+			expect(function () {
+				helpers.paginate(letters, 1.5, 2);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.paginate(letters, '1' as any, 2);
+			}).toThrow(new TypeError('paginate: `page` must be an integer >= 1, got string'));
+			expect(function () {
+				helpers.paginate(letters, 1, 0);
+			}).toThrow(new RangeError('paginate: `pageSize` must be an integer >= 1, got 0'));
+			expect(function () {
+				helpers.paginate(letters, 1, Infinity);
+			}).toThrow(RangeError);
+		});
+	});
+
+	describe('splitAt', function () {
+		it('splits at an index, counting negative indices from the end and clamping out-of-range ones', function () {
+			expect(helpers.splitAt([1, 2, 3, 4], 1)).toStrictEqual([[1], [2, 3, 4]]);
+			expect(helpers.splitAt([1, 2, 3, 4], 0)).toStrictEqual([[], [1, 2, 3, 4]]);
+			expect(helpers.splitAt([1, 2, 3, 4], -0)).toStrictEqual([[], [1, 2, 3, 4]]);
+			expect(helpers.splitAt([1, 2, 3, 4], 4)).toStrictEqual([[1, 2, 3, 4], []]);
+			expect(helpers.splitAt([1, 2, 3, 4], -1)).toStrictEqual([[1, 2, 3], [4]]);
+			expect(helpers.splitAt([1, 2, 3, 4], -4)).toStrictEqual([[], [1, 2, 3, 4]]);
+			expect(helpers.splitAt([1, 2], 5)).toStrictEqual([[1, 2], []]);
+			expect(helpers.splitAt([1, 2], -5)).toStrictEqual([[], [1, 2]]);
+			expect(helpers.splitAt([], 0)).toStrictEqual([[], []]);
+		});
+
+		it('validates index', function () {
+			expect(function () {
+				helpers.splitAt([1], 0.5);
+			}).toThrow(new RangeError('splitAt: `index` must be an integer, got 0.5'));
+			expect(function () {
+				helpers.splitAt([1], Infinity);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.splitAt([1], '1' as any);
+			}).toThrow(new TypeError('splitAt: `index` must be an integer, got string'));
+		});
+	});
+});

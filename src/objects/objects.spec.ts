@@ -4480,3 +4480,299 @@ describe('JSON Patch and symbol keys', function () {
 		expect(helpers.applyPatch({ x: { a: 1, [symbol]: 1 } }, [{ op: 'test', path: '/x', value: { a: 1 } }])).toEqual({ x: { a: 1, [symbol]: 1 } });
 	});
 });
+
+describe('safeStringify', function () {
+	function revoked(): object {
+		const { proxy, revoke } = Proxy.revocable({}, {});
+		revoke();
+		return proxy;
+	}
+
+	it('matches JSON.stringify on what JSON.stringify handles', function () {
+		const values: unknown[] = [
+			null,
+			true,
+			0,
+			-0,
+			1e21,
+			'a"b\n ',
+			'\ud800',
+			[],
+			{},
+			[1, 'a', null, [true]],
+			{ a: 1, b: { c: [1, { d: null }] }, 2: 'two', '': 'empty' },
+			new Date(0),
+			new Date(NaN),
+			{
+				toJSON: function (key: string) {
+					return `key:${key}`;
+				}
+			},
+			[NaN, Infinity, -Infinity, undefined, function () {}, Symbol('s')],
+			{ u: undefined, f: function () {}, s: Symbol('s'), [Symbol('k')]: 1 },
+			new Number(1),
+			new String('s'),
+			new Boolean(false),
+			Object(Symbol('boxed')),
+			Object.create(null),
+			Object.create({ inherited: 1 }),
+			new Uint8Array([1, 2]),
+			/re/g
+		];
+		for (const value of values) {
+			expect(helpers.safeStringify(value)).toBe(JSON.stringify(value));
+			for (const space of [2, '\t', 0, -1, 20, '0123456789abc', NaN, Infinity, 2.9]) {
+				expect(helpers.safeStringify(value, { space })).toBe(JSON.stringify(value, undefined, space));
+			}
+		}
+	});
+
+	it('returns undefined where JSON.stringify does', function () {
+		expect(helpers.safeStringify(undefined)).toBeUndefined();
+		expect(helpers.safeStringify(function () {})).toBeUndefined();
+		expect(helpers.safeStringify(Symbol('s'))).toBeUndefined();
+		expect(helpers.safeStringify({ toJSON: function () {} })).toBeUndefined();
+		expect(helpers.safeStringify(1, { replacer: function () {} })).toBeUndefined();
+	});
+
+	it('marks circular references, but not repeated siblings', function () {
+		const node: Record<string, unknown> = { id: 1 };
+		node.self = node;
+		node.list = [node, { back: node }];
+		expect(helpers.safeStringify(node)).toBe('{"id":1,"self":"[Circular]","list":["[Circular]",{"back":"[Circular]"}]}');
+		const shared = { x: 1 };
+		expect(helpers.safeStringify({ a: shared, b: [shared, shared] })).toBe('{"a":{"x":1},"b":[{"x":1},{"x":1}]}');
+		const map = new Map<string, unknown>();
+		map.set('me', map);
+		expect(helpers.safeStringify(map)).toBe('[["me","[Circular]"]]');
+	});
+
+	it('writes bigints as strings, unless toJSON or the replacer says otherwise', function () {
+		expect(helpers.safeStringify({ big: 12345678901234567890n, list: [1n], boxed: Object(2n) })).toBe('{"big":"12345678901234567890","list":["1"],"boxed":"2"}');
+		function replacer(_key: string, value: unknown): unknown {
+			return typeof value === 'bigint' ? Number(value) : value;
+		}
+		expect(helpers.safeStringify({ big: 10n }, { replacer })).toBe('{"big":10}');
+		const prototype = BigInt.prototype as unknown as { toJSON?: () => string };
+		prototype.toJSON = function (this: bigint) {
+			return `${this}n`;
+		};
+		try {
+			expect(helpers.safeStringify([10n])).toBe('["10n"]');
+		} finally {
+			delete prototype.toJSON;
+		}
+	});
+
+	it('writes maps as entries and sets as values', function () {
+		expect(
+			helpers.safeStringify(
+				new Map<unknown, unknown>([
+					['a', 1],
+					[{ k: 1 }, new Set([1, 2])]
+				])
+			)
+		).toBe('[["a",1],[{"k":1},[1,2]]]');
+		expect(helpers.safeStringify({ set: new Set(['x']) })).toBe('{"set":["x"]}');
+		expect(new Map(JSON.parse(helpers.safeStringify(new Map([['k', 'v']])) as string))).toEqual(new Map([['k', 'v']]));
+	});
+
+	it('writes errors with their name, message, stack, code, cause and properties', function () {
+		const cause = new TypeError('inner');
+		const error = Object.assign(new Error('outer', { cause }), { code: 'E_OUTER', status: 500 });
+		expect(JSON.parse(helpers.safeStringify({ error }) as string)).toEqual({
+			error: {
+				name: 'Error',
+				message: 'outer',
+				stack: error.stack,
+				code: 'E_OUTER',
+				cause: { name: 'TypeError', message: 'inner', stack: cause.stack },
+				status: 500
+			}
+		});
+		const foreign = vm.runInNewContext('new RangeError("foreign")');
+		expect(JSON.parse(helpers.safeStringify(foreign) as string)).toMatchObject({ name: 'RangeError', message: 'foreign' });
+		const custom = Object.assign(new Error('custom'), {
+			toJSON: function () {
+				return 'custom JSON';
+			}
+		});
+		expect(helpers.safeStringify(custom)).toBe('"custom JSON"');
+	});
+
+	it('marks values whose getters, toJSON, replacer or proxy traps throw', function () {
+		const value = {
+			ok: 1,
+			get getter(): never {
+				throw new Error('getter');
+			},
+			toJSONThrows: {
+				toJSON(): never {
+					throw 'plain string';
+				}
+			},
+			numberThrown: {
+				toJSON(): never {
+					throw 42;
+				}
+			},
+			proxy: revoked(),
+			trap: new Proxy(
+				{},
+				{
+					ownKeys(): never {
+						throw new Error('ownKeys');
+					}
+				}
+			)
+		};
+		expect(JSON.parse(helpers.safeStringify(value) as string)).toEqual({
+			ok: 1,
+			getter: '[Throws: getter]',
+			toJSONThrows: '[Throws: plain string]',
+			numberThrown: '[Throws]',
+			proxy: expect.stringMatching(/^\[Throws: /),
+			trap: '[Throws: ownKeys]'
+		});
+		function replacer(key: string, member: unknown): unknown {
+			if (key === 'bad') throw new Error('replacer');
+			return member;
+		}
+		expect(helpers.safeStringify({ bad: 1, good: 2 }, { replacer })).toBe('{"bad":"[Throws: replacer]","good":2}');
+		expect(helpers.safeStringify(revoked())).toMatch(/^"\[Throws: /);
+	});
+
+	it('only reads own properties', function () {
+		const prototype = Array.prototype as unknown as Record<number, unknown>;
+		prototype[1] = 'polluted';
+		try {
+			const sparse = [0];
+			sparse[2] = 2;
+			expect(helpers.safeStringify(sparse)).toBe('[0,null,2]');
+		} finally {
+			delete prototype[1];
+		}
+		expect(helpers.safeStringify(Object.create({ a: 1 }), { replacer: ['a'] })).toBe('{}');
+	});
+
+	it('applies a replacer function as JSON.stringify does', function () {
+		const calls: Array<[unknown, string, unknown]> = [];
+		const root = { a: [1, { b: 2 }] };
+		function replacer(this: unknown, key: string, value: unknown): unknown {
+			calls.push([this, key, value]);
+			return typeof value === 'number' ? value * 10 : value;
+		}
+		expect(helpers.safeStringify(root, { replacer })).toBe(JSON.stringify(root, replacer));
+		expect(calls[0]).toEqual([{ '': root }, '', root]);
+		expect(calls[1]).toEqual([root, 'a', root.a]);
+		expect(calls[2]).toEqual([root.a, '0', 1]);
+	});
+
+	it('applies a replacer list as JSON.stringify does (own properties only)', function () {
+		const value = { b: 1, a: { a: 2, c: 3 }, 1: 'one', c: [{ a: 4, z: 5 }] };
+		const list = ['a', 1, 'c', 'a', true as never, 'missing'];
+		expect(helpers.safeStringify(value, { replacer: list })).toBe(JSON.stringify(value, list as Array<string | number>));
+		expect(helpers.safeStringify(value, { replacer: list, sortKeys: true })).toBe('{"1":"one","a":{"a":2,"c":3},"c":[{"a":4}]}');
+	});
+
+	it('sorts keys with sortKeys', function () {
+		expect(helpers.safeStringify({ b: 1, a: { d: 1, c: 2 }, 10: 0, 2: 0 }, { sortKeys: true })).toBe('{"10":0,"2":0,"a":{"c":2,"d":1},"b":1}');
+		const value = { b: [{ y: 1, x: 2 }], a: new Map([['k', { d: 1, c: 2 }]]) };
+		expect(helpers.safeStringify(value, { sortKeys: true })).toBe('{"a":[["k",{"c":2,"d":1}]],"b":[{"x":2,"y":1}]}');
+		expect(helpers.safeStringify({ b: 1, a: 2 }, { sortKeys: false })).toBe('{"b":1,"a":2}');
+		const error = Object.assign(new Error('x'), { code: 'E' });
+		expect(Object.keys(JSON.parse(helpers.safeStringify(error, { sortKeys: true }) as string))).toEqual(['code', 'message', 'name', 'stack']);
+	});
+
+	it('limits the depth', function () {
+		const value = { a: { b: { c: [1] } }, list: [[1]] };
+		expect(helpers.safeStringify(value, { maxDepth: 0 })).toBe('{"a":"[Object]","list":"[Array]"}');
+		expect(helpers.safeStringify(value, { maxDepth: 1 })).toBe('{"a":{"b":"[Object]"},"list":["[Array]"]}');
+		expect(helpers.safeStringify(value, { maxDepth: 3 })).toBe(JSON.stringify(value));
+		expect(helpers.safeStringify([], { maxDepth: 0 })).toBe('[]');
+	});
+
+	it('caps the nesting at 1000 levels, whatever maxDepth asks for', function () {
+		let deep: unknown[] = [];
+		for (let index = 0; index < 200_000; index++) deep = [deep];
+		const capped = '['.repeat(1001) + '"[Array]"' + ']'.repeat(1001);
+		expect(helpers.safeStringify(deep)).toBe(capped);
+		expect(helpers.safeStringify(deep, { maxDepth: 5000 })).toBe(capped);
+		expect(helpers.safeStringify(deep, { maxDepth: 1000, sortKeys: true })).toBe(capped);
+		expect(helpers.safeStringify(deep, { maxDepth: 999 })).toBe('['.repeat(1000) + '"[Array]"' + ']'.repeat(1000));
+		// 1002 nested objects: the innermost, at depth 1001, is cut; 1001 fit.
+		let exact: unknown = 1;
+		for (let index = 0; index < 1002; index++) exact = { a: exact };
+		expect(helpers.safeStringify(exact)).toBe(JSON.stringify(exact).replace('{"a":1}', '"[Object]"'));
+		let fits: unknown = 1;
+		for (let index = 0; index < 1001; index++) fits = { a: fits };
+		expect(helpers.safeStringify(fits)).toBe(JSON.stringify(fits));
+	});
+
+	it('never overflows the stack on deep values, even once the walker is optimized (regression)', function () {
+		// The walker used to build trees deeper than `JSON.stringify` (or the recursive `sortKeys` writer) could write once V8 had
+		// optimized it (smaller frames): the 16th call or so threw a `RangeError`, the first one with `sortKeys`.
+		const deep = JSON.parse('{"a":'.repeat(8000) + '1' + '}'.repeat(8000));
+		const deeper = JSON.parse('{"a":'.repeat(20_000) + '1' + '}'.repeat(20_000));
+		let text = '';
+		for (let index = 0; index < 100; index++) {
+			text = helpers.safeStringify(deep) as string;
+			expect(helpers.safeStringify(deeper, { sortKeys: true, space: index % 2 })).toContain('"[Object]"');
+		}
+		expect(text).toBe('{"a":'.repeat(1001) + '"[Object]"' + '}'.repeat(1001));
+	});
+
+	it('writes dangerous keys as plain own properties', function () {
+		const value = JSON.parse('{"__proto__":{"polluted":true},"toString":1}');
+		expect(helpers.safeStringify(value)).toBe('{"__proto__":{"polluted":true},"toString":1}');
+		expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+	});
+
+	it('never lets a polluted toJSON reach its own output', function () {
+		const objectPrototype = Object.prototype as Record<string, unknown>;
+		const arrayPrototype = Array.prototype as unknown as Record<string, unknown>;
+		function hijack(): string {
+			return 'hijacked';
+		}
+		Object.defineProperty(objectPrototype, 'toJSON', { value: hijack, configurable: true, writable: true });
+		Object.defineProperty(arrayPrototype, 'toJSON', { value: hijack, configurable: true, writable: true });
+		try {
+			// Neither the value's objects nor the converted tree honour a `toJSON` inherited from `Object.prototype`.
+			expect(helpers.safeStringify({ a: [1], when: new Date(0) })).toBe('{"a":[1],"when":"1970-01-01T00:00:00.000Z"}');
+			const plain = Object.assign(Object.create(null), { a: Object.setPrototypeOf([1], null) });
+			expect(helpers.safeStringify(plain)).toBe('{"a":[1]}');
+			expect(helpers.safeStringify(plain, { space: 1 })).toBe('{\n "a": [\n  1\n ]\n}');
+			expect(helpers.safeStringify(new Map([['k', 1]]))).toBe('[["k",1]]');
+		} finally {
+			delete objectPrototype.toJSON;
+			delete arrayPrototype.toJSON;
+		}
+	});
+
+	it('validates its options', function () {
+		expect(function () {
+			helpers.safeStringify({}, { replacer: 'a' as never });
+		}).toThrow(new TypeError('safeStringify: `replacer` must be a function or an array, got string'));
+		expect(function () {
+			helpers.safeStringify({}, { space: null as never });
+		}).toThrow(new TypeError('safeStringify: `space` must be a number or a string, got null'));
+		expect(function () {
+			helpers.safeStringify({}, { maxDepth: -1 });
+		}).toThrow(new RangeError('safeStringify: `maxDepth` must be an integer >= 0 or Infinity, got -1'));
+		expect(function () {
+			helpers.safeStringify({}, null as never);
+		}).toThrow(TypeError);
+	});
+
+	it('ignores options inherited from a polluted Object.prototype', function () {
+		const prototype = Object.prototype as Record<string, unknown>;
+		prototype.sortKeys = true;
+		prototype.space = 4;
+		try {
+			expect(helpers.safeStringify({ b: 1, a: 2 }, {})).toBe('{"b":1,"a":2}');
+		} finally {
+			delete prototype.sortKeys;
+			delete prototype.space;
+		}
+	});
+});

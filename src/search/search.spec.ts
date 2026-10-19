@@ -451,3 +451,160 @@ describe('fuzzySearch options types', function () {
 		).toEqual(['abc']);
 	});
 });
+
+describe('fuzzyMatch / fuzzySearch with ignoreDiacritics', function () {
+	const options = { ignoreDiacritics: true };
+
+	it('is off by default, and only true turns it on', function () {
+		expect(helpers.fuzzyMatch('cafe', 'Café')).toBeUndefined();
+		expect(helpers.fuzzyMatch('cafe', 'Café', { ignoreDiacritics: 1 as never })).toBeUndefined();
+		expect(helpers.fuzzyMatch('cafe', 'Café', options)).toEqual({ score: 90, ranges: [[0, 4]] });
+		expect(helpers.fuzzyMatch('café', 'Cafe', options)).toEqual({ score: 90, ranges: [[0, 4]] });
+	});
+
+	it('matches precomposed and decomposed accents alike, highlighting a combining accent with its letter', function () {
+		expect(helpers.fuzzyMatch('cafe', 'Cafe\u0301 noir', options)).toEqual({ score: 90, ranges: [[0, 5]] });
+		expect(helpers.fuzzyMatch('e', 'e\u0301\u0323x', options)?.ranges).toEqual([[0, 3]]);
+		expect(helpers.fuzzyMatch('aa', 'a\u0301a\u0301', options)?.ranges).toEqual([[0, 4]]);
+		expect(helpers.fuzzyMatch('ab', 'a\u0301xb', options)?.ranges).toEqual([
+			[0, 2],
+			[3, 4]
+		]);
+		expect(helpers.fuzzyMatch('Créme', 'creme', options)?.score).toBe(helpers.fuzzyMatch('Creme', 'creme', options)?.score);
+		// A combining accent at the very start has no letter to join: it is never highlighted.
+		expect(helpers.fuzzyMatch('e', '\u0301e\u0301x', options)?.ranges).toEqual([[1, 3]]);
+		// A query made only of combining accents is empty.
+		expect(helpers.fuzzyMatch('\u0301\u0300', 'abc', options)).toEqual({ score: 0, ranges: [] });
+	});
+
+	it('keeps a code point that would fold to more than 3 characters as it is (regression)', function () {
+		// `'ﷺ'` decomposes to an 18-character phrase: the alignment used to be sized on it (331 ms and +796 MB for this call).
+		const started = Date.now();
+		const result = helpers.fuzzyMatch('ﷺ'.repeat(900), 'ﷺ'.repeat(920), options);
+		expect(Date.now() - started).toBeLessThan(250);
+		expect(result).toEqual(helpers.fuzzyMatch('ﷺ'.repeat(900), 'ﷺ'.repeat(920)));
+		expect(helpers.fuzzyMatch('ﷺ', 'xﷺ', options)?.ranges).toEqual([[1, 2]]);
+		expect(helpers.fuzzyMatch('صلى', 'ﷺ', options)).toBeUndefined();
+		expect(helpers.fuzzyMatch('am', '㏂', options)).toBeUndefined();
+		expect(helpers.fuzzyMatch('㏂', 'x㏂', options)?.ranges).toEqual([[1, 2]]);
+		// Foldings of up to 3 characters still apply.
+		expect(helpers.fuzzyMatch('ffi', 'ﬃ', options)?.ranges).toEqual([[0, 1]]);
+		expect(helpers.fuzzyMatch('ﬃ', 'office', options)?.ranges).toEqual([[1, 4]]);
+		expect(helpers.fuzzyMatch('mhz', '㎒', options)?.ranges).toEqual([[0, 1]]);
+	});
+
+	it('spells letters without a decomposition in ASCII, and highlights them whole', function () {
+		expect(helpers.fuzzyMatch('strasse', 'Straße', options)?.ranges).toEqual([[0, 6]]);
+		expect(helpers.fuzzyMatch('ss', 'ß', options)).toEqual({ score: 47, ranges: [[0, 1]] });
+		expect(helpers.fuzzyMatch('s', 'ß', options)?.ranges).toEqual([[0, 1]]);
+		expect(helpers.fuzzyMatch('ß', 'ss', options)?.ranges).toEqual([[0, 2]]);
+		expect(helpers.fuzzyMatch('ß', 'strasse', options)?.ranges).toEqual([
+			[0, 1],
+			[4, 5]
+		]);
+		expect(helpers.fuzzyMatch('lodz', 'Łódź', options)?.ranges).toEqual([[0, 4]]);
+		expect(helpers.fuzzyMatch('aero', 'Ærø', options)?.ranges).toEqual([[0, 3]]);
+		expect(helpers.fuzzyMatch('thor', 'Þór', options)?.ranges).toEqual([[0, 3]]);
+		expect(helpers.fuzzyMatch('i', 'ı', options)?.ranges).toEqual([[0, 1]]);
+		expect(helpers.fuzzyMatch('oeuvre', 'œuvre', options)?.ranges).toEqual([[0, 5]]);
+		expect(helpers.fuzzyMatch('ddlth', 'đðłþ', options)?.ranges).toEqual([[0, 4]]);
+		expect(helpers.fuzzyMatch('DDLTHO', 'ĐÐŁÞØ', { ignoreDiacritics: true, caseSensitive: true })?.ranges).toEqual([[0, 5]]);
+		expect(helpers.fuzzyMatch('DD', 'Đð', { ignoreDiacritics: true, caseSensitive: true })).toBeUndefined();
+		expect(helpers.fuzzyMatch('SS', 'ẞ', { ignoreDiacritics: true, caseSensitive: true })?.ranges).toEqual([[0, 1]]);
+		expect(helpers.fuzzyMatch('OEO', 'Œø', { ignoreDiacritics: true, caseSensitive: true })).toBeUndefined();
+		expect(helpers.fuzzyMatch('OEo', 'Œø', { ignoreDiacritics: true, caseSensitive: true })?.ranges).toEqual([[0, 2]]);
+	});
+
+	it('folds compatibility characters: ligatures, full-width forms, Hangul syllables', function () {
+		expect(helpers.fuzzyMatch('file', '\ufb01le', options)?.ranges).toEqual([[0, 3]]);
+		expect(helpers.fuzzyMatch('fi', '\ufb01', options)).toEqual({ score: 47, ranges: [[0, 1]] });
+		expect(helpers.fuzzyMatch('ab', '\uff21\uff42', options)?.ranges).toEqual([[0, 2]]);
+		expect(helpers.fuzzyMatch('\ud558', '\ud55c\uad6d', options)?.ranges).toEqual([[0, 1]]);
+		expect(helpers.fuzzyMatch('i', '\u0130stanbul', options)?.ranges).toEqual([[0, 1]]);
+		expect(helpers.fuzzyMatch('12', '\u00bd', options)?.ranges).toEqual([[0, 1]]);
+		expect(helpers.fuzzyMatch('a😀', 'á😀', options)?.ranges).toEqual([[0, 3]]);
+	});
+
+	it('finds camelCase humps after accented lower-case letters', function () {
+		expect(helpers.fuzzyMatch('b', 'aéB')!.score).toBe(helpers.fuzzyMatch('b', 'aeB')!.score);
+		expect(helpers.fuzzyMatch('b', 'aéB', options)!.score).toBe(helpers.fuzzyMatch('b', 'aeB', options)!.score);
+	});
+
+	it('keeps case sensitivity, and gives the exact-case bonus with the accents removed', function () {
+		expect(helpers.fuzzyMatch('CAFE', 'café', { ignoreDiacritics: true, caseSensitive: true })).toBeUndefined();
+		expect(helpers.fuzzyMatch('Cafe', 'Café', { ignoreDiacritics: true, caseSensitive: true })?.ranges).toEqual([[0, 4]]);
+		expect(helpers.fuzzyMatch('E', 'É', options)!.score).toBe(helpers.fuzzyMatch('E', 'E', options)!.score);
+		expect(helpers.fuzzyMatch('e', 'É', options)!.score).toBe(helpers.fuzzyMatch('e', 'E', options)!.score);
+	});
+
+	it('scores a target the same in NFC and NFD', function () {
+		const text = 'Crème Brûlée à Málaga';
+		for (const query of ['creme', 'brulee', 'cbm', 'Créme', 'aga', 'MA']) {
+			const composed = helpers.fuzzyMatch(query, text, options);
+			const decomposed = helpers.fuzzyMatch(query, text.normalize('NFD'), options);
+			expect(decomposed?.score).toBe(composed?.score);
+		}
+	});
+
+	it('does not reject a query longer than the target, nor an ASCII query against accented text', function () {
+		expect(helpers.fuzzyMatch('ffi', '\ufb03', options)?.ranges).toEqual([[0, 1]]);
+		expect(helpers.fuzzyMatch('ffix', '\ufb03', options)).toBeUndefined();
+		expect(helpers.fuzzyMatch('xyz', 'abc', options)).toBeUndefined();
+		expect(helpers.fuzzyMatch('abc', 'xaxbxc', options)?.ranges).toEqual([
+			[1, 2],
+			[3, 4],
+			[5, 6]
+		]);
+		expect(helpers.fuzzyMatch('ae', 'æ', options)?.ranges).toEqual([[0, 1]]);
+		expect(helpers.fuzzyMatch('ae', 'a', options)).toBeUndefined();
+		// Surrogate pairs and U+FFFF are read as single code points.
+		expect(helpers.fuzzyMatch('\ude00', '😀', options)).toBeUndefined();
+		expect(helpers.fuzzyMatch('a', '\uffffa', options)?.ranges).toEqual([[1, 2]]);
+	});
+
+	it('aligns long folded targets, and keeps the matrix cap', function () {
+		const long = 'ß'.repeat(200) + 'x';
+		expect(helpers.fuzzyMatch('sx', long, options)?.ranges).toEqual([[199, 201]]);
+		expect(helpers.fuzzyMatch('ssx', long, options)?.ranges).toEqual([[199, 201]]);
+		expect(function () {
+			helpers.fuzzyMatch('s'.repeat(1_000), 'ß'.repeat(140_000), options);
+		}).toThrow(RangeError);
+	});
+
+	it('folds many distinct characters (its cache is bounded)', function () {
+		let text = '';
+		for (let code = 0x4e00; code < 0x4e00 + 5_000; code++) text += String.fromCharCode(code);
+		expect(helpers.fuzzyMatch('\u4e00\u6187', text + 'é', options)?.ranges).toEqual([
+			[0, 1],
+			[4999, 5000]
+		]);
+		expect(helpers.fuzzyMatch('\u4e01', text, options)?.ranges).toEqual([[1, 2]]);
+	});
+
+	it('is passed through by fuzzySearch', function () {
+		expect(
+			helpers.fuzzySearch(['Málaga', 'Zürich', 'Łódź'], 'lodz', options).map(function (result) {
+				return result.item;
+			})
+		).toEqual(['Łódź']);
+		expect(helpers.fuzzySearch(['Zürich'], 'zur')).toEqual([]);
+		const results = helpers.fuzzySearch([{ name: 'Crème brûlée' }], 'creme', {
+			ignoreDiacritics: true,
+			key: function (item) {
+				return item.name;
+			}
+		});
+		expect(results).toEqual([{ item: { name: 'Crème brûlée' }, key: 'Crème brûlée', score: 112, ranges: [[0, 5]] }]);
+	});
+
+	it('ignores an ignoreDiacritics inherited from a polluted Object.prototype', function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		proto.ignoreDiacritics = true;
+		try {
+			expect(helpers.fuzzyMatch('cafe', 'Café')).toBeUndefined();
+			expect(helpers.fuzzySearch(['Café'], 'cafe')).toEqual([]);
+		} finally {
+			delete proto.ignoreDiacritics;
+		}
+	});
+});

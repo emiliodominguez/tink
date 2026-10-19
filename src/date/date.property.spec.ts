@@ -1167,3 +1167,230 @@ describe('Time zone helpers (properties)', function () {
 		);
 	});
 });
+
+describe('Scheduling helpers (properties)', function () {
+	/**
+	 * Intervals with integer bounds in [0, 40] (possibly empty), as timestamps.
+	 */
+	const intervalArb = fc.tuple(fc.integer({ min: 0, max: 40 }), fc.integer({ min: 0, max: 40 })).map(function ([x, y]) {
+		return { start: Math.min(x, y), end: Math.max(x, y) };
+	});
+	const intervalsArb = fc.array(intervalArb, { maxLength: 12 });
+
+	/**
+	 * Whether an interval contains the instant `t`, half-open or closed.
+	 */
+	function contains(interval: helpers.Interval, t: number, inclusive: boolean): boolean {
+		const start = +interval.start;
+		const end = +interval.end;
+		return inclusive ? start <= t && t <= end : start <= t && t < end;
+	}
+
+	/**
+	 * Whether any interval contains the instant `t`.
+	 */
+	function covered(intervals: helpers.Interval[], t: number, inclusive: boolean): boolean {
+		return intervals.some(function (interval) {
+			return contains(interval, t, inclusive);
+		});
+	}
+
+	it('mergeIntervals: sorted, disjoint, covering exactly the same instants, and idempotent', function () {
+		fc.assert(
+			fc.property(intervalsArb, fc.boolean(), function (intervals, inclusive) {
+				const merged = helpers.mergeIntervals(intervals, { inclusive });
+
+				for (let i = 1; i < merged.length; i++) {
+					// Strictly apart when closed; apart or touching when half-open (touching ones are only merged when closed).
+					expect(merged[i].start.getTime()).toBeGreaterThan(merged[i - 1].end.getTime() - (inclusive ? 0 : 1));
+					expect(helpers.intervalsOverlap(merged[i - 1], merged[i], { inclusive })).toBe(false);
+				}
+				merged.forEach(function (interval) {
+					expect(interval.start.getTime()).toBeLessThanOrEqual(interval.end.getTime());
+					if (!inclusive) expect(interval.start.getTime()).toBeLessThan(interval.end.getTime());
+				});
+				for (let t = -1; t <= 41; t++) expect(covered(merged, t, inclusive)).toBe(covered(intervals, t, inclusive));
+				expect(helpers.mergeIntervals(merged, { inclusive })).toEqual(merged);
+			})
+		);
+	});
+
+	it('intersectIntervals: defined exactly when intervalsOverlap, holding exactly the shared instants', function () {
+		fc.assert(
+			fc.property(intervalArb, intervalArb, fc.boolean(), function (a, b, inclusive) {
+				const shared = helpers.intersectIntervals(a, b, { inclusive });
+
+				expect(shared !== undefined).toBe(helpers.intervalsOverlap(a, b, { inclusive }));
+				expect(helpers.intersectIntervals(b, a, { inclusive })).toEqual(shared);
+				for (let t = -1; t <= 41; t++) {
+					expect(shared !== undefined && contains(shared, t, inclusive)).toBe(contains(a, t, inclusive) && contains(b, t, inclusive));
+				}
+			})
+		);
+	});
+
+	it('findGaps: the gaps and the busy time inside `within` partition `within`', function () {
+		fc.assert(
+			fc.property(intervalArb, intervalsArb, fc.integer({ min: 0, max: 10 }), function (within, busy, minDuration) {
+				const gaps = helpers.findGaps(within, busy);
+
+				expect(helpers.subtractIntervals(within, busy)).toEqual(gaps);
+				for (let i = 0; i < gaps.length; i++) {
+					expect(gaps[i].start.getTime()).toBeLessThan(gaps[i].end.getTime());
+					if (i > 0) expect(gaps[i].start.getTime()).toBeGreaterThan(gaps[i - 1].end.getTime());
+				}
+				for (let t = -1; t <= 41; t++) {
+					const inGap = covered(gaps, t, false);
+					const inBusy = covered(busy, t, false);
+
+					// Every instant of `within` is either free or busy, never both; nothing outside `within` is free.
+					expect(inGap).toBe(contains(within, t, false) && !inBusy);
+				}
+				expect(helpers.findGaps(within, busy, { minDuration })).toEqual(
+					gaps.filter(function (gap) {
+						return gap.end.getTime() - gap.start.getTime() >= minDuration;
+					})
+				);
+			})
+		);
+	});
+
+	describe('business days with options', function () {
+		// No whole calendar day is skipped in these years in the zones the suite runs in (Samoa skipped 2011-12-30).
+		const businessDateArb = fc.date({ min: new Date(1950, 0, 1), max: new Date(2010, 0, 1), noInvalidDate: true });
+		const weekendArb = fc.uniqueArray(weekdayArb, { maxLength: 6 });
+		const holidayOffsetsArb = fc.array(fc.integer({ min: -120, max: 120 }), { maxLength: 40 });
+
+		/**
+		 * Naive reference: walks one calendar day at a time with `isBusinessDay`.
+		 */
+		function naiveAdd(date: Date, amount: number, options: helpers.BusinessDayOptions): Date {
+			const sign = amount < 0 ? -1 : 1;
+			let remaining = Math.abs(amount);
+			let offset = 0;
+
+			while (remaining > 0) {
+				offset += sign;
+				if (helpers.isBusinessDay(helpers.addDays(date, offset), options)) remaining--;
+			}
+
+			return helpers.addDays(date, offset);
+		}
+
+		/**
+		 * Holidays at the given day offsets from `date`, at various times of day.
+		 */
+		function holidaysAround(date: Date, offsets: number[]): Date[] {
+			return offsets.map(function (offset, i) {
+				return helpers.setParts(helpers.addDays(date, offset), { hour: i % 24 });
+			});
+		}
+
+		it('addBusinessDays matches a naive day-by-day walk, and diffInBusinessDays inverts it', function () {
+			fc.assert(
+				fc.property(businessDateArb, fc.integer({ min: -60, max: 60 }), weekendArb, holidayOffsetsArb, function (date, n, weekend, offsets) {
+					const options = { weekend, holidays: holidaysAround(date, offsets) };
+					const result = helpers.addBusinessDays(date, n, options);
+
+					expect(result.getTime()).toBe(naiveAdd(date, n, options).getTime());
+					if (n !== 0) expect(helpers.isBusinessDay(result, options)).toBe(true);
+					if (helpers.isBusinessDay(date, options)) expect(helpers.diffInBusinessDays(result, date, options)).toBe(n);
+				})
+			);
+		});
+
+		it('diffInBusinessDays counts the business days in (earlier, later], antisymmetrically', function () {
+			fc.assert(
+				fc.property(businessDateArb, fc.integer({ min: 0, max: 90 }), weekendArb, holidayOffsetsArb, function (earlier, span, weekend, offsets) {
+					const options = { weekend, holidays: holidaysAround(earlier, offsets) };
+					const later = helpers.addDays(earlier, span);
+					let count = 0;
+
+					for (let offset = 1; offset <= span; offset++) {
+						if (helpers.isBusinessDay(helpers.addDays(earlier, offset), options)) count++;
+					}
+
+					expect(helpers.diffInBusinessDays(later, earlier, options)).toBe(count);
+					expect(helpers.diffInBusinessDays(earlier, later, options)).toBe(0 - count);
+				})
+			);
+		});
+	});
+
+	it('setParts: the given fields are set, the others kept (the day clamped), and the current fields give back the instant', function () {
+		const partsArb = fc.record(
+			{
+				year: fc.integer({ min: 1900, max: 2200 }),
+				month: fc.integer({ min: 1, max: 12 }),
+				day: fc.integer({ min: 1, max: 28 }),
+				hour: fc.integer({ min: 0, max: 23 }),
+				minute: fc.integer({ min: 0, max: 59 }),
+				second: fc.integer({ min: 0, max: 59 }),
+				millisecond: fc.integer({ min: 0, max: 999 })
+			},
+			{ requiredKeys: [] }
+		);
+		fc.assert(
+			fc.property(dateArb, partsArb, function (date, fields) {
+				const current = {
+					year: date.getFullYear(),
+					month: date.getMonth() + 1,
+					day: date.getDate(),
+					hour: date.getHours(),
+					minute: date.getMinutes(),
+					second: date.getSeconds(),
+					millisecond: date.getMilliseconds()
+				};
+
+				expect(helpers.setParts(date, current).getTime()).toBe(date.getTime());
+
+				const result = helpers.setParts(date, fields);
+				const expected = { ...current, ...fields };
+
+				if (fields.day === undefined) expected.day = Math.min(current.day, helpers.daysInMonth(expected.year, expected.month - 1));
+
+				const actual = {
+					year: result.getFullYear(),
+					month: result.getMonth() + 1,
+					day: result.getDate(),
+					hour: result.getHours(),
+					minute: result.getMinutes(),
+					second: result.getSeconds(),
+					millisecond: result.getMilliseconds()
+				};
+
+				// Skip the rare wall-clock times that a DST change skipped.
+				fc.pre(actual.hour === expected.hour && actual.minute === expected.minute && actual.day === expected.day);
+				expect(actual).toEqual(expected);
+				expect(helpers.setParts(result, fields).getTime()).toBe(result.getTime());
+			})
+		);
+	});
+
+	it('closestTo returns a candidate at the smallest distance, the first such one', function () {
+		fc.assert(
+			fc.property(fc.integer({ min: -1000, max: 1000 }), fc.array(fc.integer({ min: -1000, max: 1000 })), function (target, dates) {
+				let best: number | undefined;
+
+				dates.forEach(function (date) {
+					if (best === undefined || Math.abs(date - target) < Math.abs(best - target)) best = date;
+				});
+
+				expect(helpers.closestTo(target, dates)).toEqual(best === undefined ? undefined : new Date(best));
+			})
+		);
+	});
+
+	it('getUnixTime and fromUnixTime round-trip whole seconds, and getUnixTime is the second an instant is in', function () {
+		fc.assert(
+			fc.property(fc.integer({ min: -8.64e12, max: 8.64e12 }), fc.integer({ min: -8.64e15, max: 8.64e15 }), function (seconds, time) {
+				expect(helpers.getUnixTime(helpers.fromUnixTime(seconds))).toBe(seconds);
+
+				const start = helpers.fromUnixTime(helpers.getUnixTime(time)).getTime();
+
+				expect(start).toBeLessThanOrEqual(time);
+				expect(time - start).toBeLessThan(1000);
+			})
+		);
+	});
+});

@@ -1,6 +1,6 @@
 import { assertFunction, assertInteger, assertNumber, describe, MAX_TIMEOUT } from '../utils/assert.js';
-import { AssertionError, isDate, isPlainObject } from '../guards/index.js';
-import type { AnyFunction } from '../utils/index.js';
+import { AssertionError, isDate, isMatching, isPlainObject, type PatternType } from '../guards/index.js';
+import type { AnyFunction, Primitive } from '../utils/index.js';
 
 /**
  * A function whose `this` and arguments are all `unknown`. Used internally to invoke user callbacks after their public types have been checked.
@@ -1647,4 +1647,1426 @@ export function match<T extends object, K extends keyof T, H extends MatchHandle
 	assertFunction('match', `handlers.${own === undefined ? '_' : tag}`, handler);
 
 	return (handler as (value: T) => unknown)(value) as MatchResult<H>;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// matchWith / matcher: patterns
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** The brand carrying a pattern helper's kind and type arguments, for the types below only: it never exists at runtime. */
+declare const patternHelper: unique symbol;
+
+/**
+ * The type-level description of a pattern helper ({@link capture}, {@link active}, {@link anyOf}, {@link cons}).
+ * @template K - The helper's kind and type arguments
+ */
+interface PatternHelper<K> {
+	/** The helper's kind and type arguments. */
+	readonly [patternHelper]: K;
+}
+
+/**
+ * A pattern created by {@link capture} or {@link captureAs}: it matches what `P` matches, and binds the matched value (or, when `P` is an
+ * {@link active} pattern, the value it extracted) to `Name`, or anonymously when `Name` is `undefined`. Called directly, it tests a value
+ * as {@link isMatching} would test `P` (outside {@link matchWith} and {@link matcher}, a capture binds nothing).
+ *
+ * The pattern types are intersections, not interfaces: TypeScript skips an argument holding a call to a generic function that returns a
+ * plain function type while it infers a call's type parameters (to infer higher-order functions), which would lose a case's pattern type
+ * when its handler is not an inline function.
+ * @template Name - The capture's name, `undefined` for an anonymous capture
+ * @template P - The captured pattern
+ */
+export type CapturePattern<Name extends string | undefined, P> = PatternHelper<['capture', Name, P]> & ((value: unknown) => value is PatternType<P>);
+
+/**
+ * A pattern created by {@link active}: it matches the values for which its function returns something other than `undefined`, and binds
+ * that result. It narrows to the function's parameter type `A`, but never counts toward exhaustiveness.
+ * @template A - The parameter type of the function
+ * @template R - The return type of the function (`undefined` for no match)
+ */
+export type ActivePattern<A, R> = PatternHelper<['active', R]> & ((value: unknown) => value is A);
+
+/**
+ * A pattern created by {@link anyOf}: it matches what any of the patterns `P` matches (the first that does binds its captures).
+ * @template P - The alternative patterns
+ */
+export type AnyOfPattern<P extends readonly unknown[]> = PatternHelper<['anyOf', P]> & ((value: unknown) => value is PatternType<P[number]>);
+
+/**
+ * A pattern created by {@link cons}: it matches non-empty arrays whose first element matches `H` and whose other elements, as a new
+ * array, match `T`.
+ * @template H - The pattern of the first element
+ * @template T - The pattern of the array of the other elements
+ */
+export type ConsPattern<H, T> = PatternHelper<['cons', H, T]> &
+	((value: unknown) => value is [PatternType<H>, ...(PatternType<T> extends readonly unknown[] ? PatternType<T> : unknown[])]);
+
+/** The kind of a {@link capture} or {@link captureAs} pattern. */
+const CAPTURE = 0;
+/** The kind of an {@link active} pattern. */
+const ACTIVE = 1;
+/** The kind of an {@link anyOf} pattern. */
+const ANY_OF = 2;
+/** The kind of a {@link cons} pattern. */
+const CONS = 3;
+
+/** A pattern helper, as the matcher sees it. */
+interface PatternRecord {
+	/** {@link CAPTURE}, {@link ACTIVE}, {@link ANY_OF} or {@link CONS}. */
+	readonly kind: number;
+	/** The nested patterns: the captured pattern, the alternatives, or the head and tail patterns (none for an active pattern). */
+	readonly patterns: ReadonlyArray<unknown>;
+	/** The name of a capture (`undefined` when anonymous). */
+	readonly name?: string;
+	/** Whether a capture binds the value its active pattern extracts, instead of the value it matches. */
+	readonly absorbs?: boolean;
+	/** The function of an active pattern. */
+	readonly extract?: (value: unknown) => unknown;
+}
+
+/** The key under which the function standing for a pattern helper holds its record (private: no other code can create helpers). */
+const HELPER = Symbol('pattern helper');
+
+/**
+ * The record of a pattern helper.
+ * @param {unknown} pattern - A pattern
+ * @returns {PatternRecord | undefined} Its record, when it is a pattern helper
+ */
+function helperOf(pattern: unknown): PatternRecord | undefined {
+	return typeof pattern === 'function' ? (pattern as { [HELPER]?: PatternRecord })[HELPER] : undefined;
+}
+
+/** The selection of a case whose pattern captures nothing: its handler receives the matched value only. */
+const NO_SELECTION = {};
+
+/** `Object.prototype.hasOwnProperty`, captured before any user code runs. */
+const hasOwn = Object.prototype.hasOwnProperty;
+
+/**
+ * Whether `Array.prototype` (or `Object.prototype`) has an enumerable property, which the holes of an array would then read: array
+ * elements are then read as own properties only, like {@link isMatching} does.
+ * @returns {boolean} Whether array elements must be read as own properties
+ */
+function isArrayPrototypePolluted(): boolean {
+	for (const key in Array.prototype) return typeof key === 'string';
+
+	return false;
+}
+
+/**
+ * Reads an element of an array as a pattern of {@link isMatching} does: a hole reads `undefined`, even when a polluted prototype defines it.
+ * @param {unknown[]} array - The array
+ * @param {number} index - The index
+ * @param {boolean} direct - Whether the prototypes are known to be clean (see {@link isArrayPrototypePolluted})
+ * @returns {unknown} The element
+ */
+function elementOf(array: unknown[], index: number, direct: boolean): unknown {
+	return direct || hasOwn.call(array, index) ? array[index] : undefined;
+}
+
+/**
+ * Reads the prototype of an object.
+ * @param {object} value - The object
+ * @returns {object | null | undefined} Its prototype, or `undefined` for a revoked proxy (which is not a plain object)
+ */
+function prototypeOf(value: object): object | null | undefined {
+	try {
+		return Object.getPrototypeOf(value) as object | null;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The own enumerable keys of a plain-object pattern, strings then symbols, which {@link isMatching} checks.
+ * @param {object} pattern - The pattern
+ * @returns {PropertyKey[]} The keys
+ */
+function patternKeys(pattern: object): PropertyKey[] {
+	const keys: PropertyKey[] = Object.keys(pattern);
+
+	for (const symbol of Object.getOwnPropertySymbols(pattern)) if (Object.prototype.propertyIsEnumerable.call(pattern, symbol)) keys.push(symbol);
+
+	return keys;
+}
+
+/**
+ * Throws the error of a pattern that contains itself.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @returns {never} Never returns
+ * @throws {TypeError} always
+ */
+function circularPattern(caller: string): never {
+	throw new TypeError(`${caller}: \`pattern\` must be acyclic, got a circular reference`);
+}
+
+/**
+ * Creates the function standing for a pattern helper in patterns. Called directly (as a guard, e.g. by {@link isMatching} or inside
+ * another guard), it tests a value and binds nothing.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {PatternRecord} record - The helper
+ * @returns {AnyFunction} The pattern
+ */
+function register(caller: string, record: PatternRecord): AnyFunction {
+	/**
+	 * Tests a value against the helper.
+	 * @param {unknown} value - The value
+	 * @returns {boolean} Whether it matches
+	 */
+	function pattern(value: unknown): boolean {
+		return testHelper(caller, record, value, undefined, 0);
+	}
+
+	(pattern as { [HELPER]?: PatternRecord })[HELPER] = record;
+
+	return pattern;
+}
+
+/**
+ * How deep {@link test} goes into a pattern before checking that it is acyclic: only a cycle (matched against an equally deep value)
+ * makes a pattern this deep, and checking at that depth only keeps acyclic patterns free of the cost.
+ */
+const CYCLE_CHECK_DEPTH = 64;
+
+/**
+ * Tests a value against a pattern, with the semantics of {@link isMatching} but without compiling it (see {@link matchWith}), and records
+ * what its helpers capture in `log`.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {unknown} pattern - The pattern
+ * @param {unknown} value - The value
+ * @param {unknown[] | undefined} log - The captures so far, as pairs of a name (`undefined` when anonymous) and a value; `undefined` to bind nothing
+ * @param {number} depth - How many objects and arrays of the pattern enclose this one
+ * @returns {boolean} Whether `value` matches
+ * @throws {TypeError} when the test follows a cycle of the pattern
+ */
+function test(caller: string, pattern: unknown, value: unknown, log: unknown[] | undefined, depth: number): boolean {
+	if (typeof pattern === 'function') {
+		const record = helperOf(pattern);
+
+		return record === undefined ? Boolean(pattern(value)) : testHelper(caller, record, value, log, depth);
+	}
+	if (typeof pattern !== 'object' || pattern === null) return sameValueZero(value, pattern);
+
+	const array = Array.isArray(pattern);
+
+	// The checks of `isMatching` (`isDate`, then `isPlainObject`), with one prototype read for the usual object literal, which is neither
+	// a date nor anything but plain (only an object without prototype, or of another realm, can be a date without inheriting from `Date`).
+	if (!array) {
+		const prototype = prototypeOf(pattern);
+
+		if (prototype !== Object.prototype) {
+			if (isDate(pattern)) return isDate(value) && sameValueZero(Date.prototype.getTime.call(value), Date.prototype.getTime.call(pattern));
+			// Other objects (maps, class instances…) are compared by identity.
+			if (prototype !== null) return value === pattern;
+		}
+	}
+	if (array ? !Array.isArray(value) || value.length !== pattern.length : typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+	if (depth === CYCLE_CHECK_DEPTH) scan(caller, pattern, [], []);
+	if (array) {
+		const direct = !isArrayPrototypePolluted();
+
+		for (let index = 0; index < pattern.length; index++) if (!test(caller, pattern[index], elementOf(value as unknown[], index, direct), log, depth + 1)) return false;
+
+		return true;
+	}
+	// `for…in` visits the own enumerable string keys in the order of `Object.keys` (and inherited ones, skipped), without allocating them.
+	for (const key in pattern) if (hasOwn.call(pattern, key) && !testProperty(caller, pattern, key, value as object, log, depth)) return false;
+	const symbols = Object.getOwnPropertySymbols(pattern);
+
+	for (let index = 0; index < symbols.length; index++) {
+		if (Object.prototype.propertyIsEnumerable.call(pattern, symbols[index]) && !testProperty(caller, pattern, symbols[index], value as object, log, depth)) return false;
+	}
+
+	return true;
+}
+
+/**
+ * Tests a property of an object against the pattern of that key (see {@link test}).
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {object} pattern - The object pattern
+ * @param {PropertyKey} key - The key
+ * @param {object} value - The object
+ * @param {unknown[] | undefined} log - The captures so far, or `undefined` to bind nothing
+ * @param {number} depth - The depth of the object pattern
+ * @returns {boolean} Whether the property matches
+ */
+function testProperty(caller: string, pattern: object, key: PropertyKey, value: object, log: unknown[] | undefined, depth: number): boolean {
+	const inner = (pattern as Record<PropertyKey, unknown>)[key];
+
+	// A missing (or inherited) property fails, except for a function pattern, which is called with `undefined`.
+	return hasOwn.call(value, key)
+		? test(caller, inner, (value as Record<PropertyKey, unknown>)[key], log, depth + 1)
+		: typeof inner === 'function' && test(caller, inner, undefined, log, depth + 1);
+}
+
+/**
+ * Tests a value against a pattern helper (see {@link test}).
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {PatternRecord} record - The helper
+ * @param {unknown} value - The value
+ * @param {unknown[] | undefined} log - The captures so far, or `undefined` to bind nothing
+ * @param {number} depth - How many objects and arrays of the pattern enclose this one
+ * @returns {boolean} Whether `value` matches
+ */
+function testHelper(caller: string, record: PatternRecord, value: unknown, log: unknown[] | undefined, depth: number): boolean {
+	const patterns = record.patterns;
+
+	if (record.kind === ACTIVE) {
+		// Called once: its result is both the test and the captured value.
+		const result = (record.extract as (value: unknown) => unknown)(value);
+
+		if (result === undefined) return false;
+		log?.push(undefined, result);
+
+		return true;
+	}
+	if (record.kind === ANY_OF) {
+		const mark = log?.length;
+
+		for (let index = 0; index < patterns.length; index++) {
+			if (test(caller, patterns[index], value, log, depth)) return true;
+			// Forget what a failed alternative captured before failing.
+			if (log !== undefined) log.length = mark as number;
+		}
+
+		return false;
+	}
+	if (record.kind === CONS) {
+		if (!Array.isArray(value) || value.length === 0) return false;
+
+		const direct = !isArrayPrototypePolluted();
+
+		if (!test(caller, patterns[0], elementOf(value, 0, direct), log, depth)) return false;
+		if (patterns[1] === _) return true;
+
+		// A new dense array, as a pattern of `isMatching` reads the elements.
+		const tail = new Array<unknown>(value.length - 1);
+
+		for (let index = 1; index < value.length; index++) tail[index - 1] = elementOf(value, index, direct);
+
+		return test(caller, patterns[1], tail, log, depth);
+	}
+
+	if (!test(caller, patterns[0], value, log, depth)) return false;
+	// A capture of an active pattern names the value that pattern extracted (its entry is the last one), instead of the matched value.
+	if (log !== undefined) {
+		if (record.absorbs) log[log.length - 2] = record.name;
+		else log.push(record.name, value);
+	}
+
+	return true;
+}
+
+/**
+ * Lists what a pattern captures, in `log` (pairs of a name and `undefined`), as {@link test} would on a match, and checks that it is acyclic.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {unknown} pattern - The pattern
+ * @param {unknown[]} log - Receives the captures
+ * @param {unknown[]} ancestors - The object patterns around this one
+ * @returns {boolean} Whether the pattern contains a pattern helper
+ * @throws {TypeError} when the pattern contains itself
+ */
+function scan(caller: string, pattern: unknown, log: unknown[], ancestors: unknown[]): boolean {
+	if (typeof pattern === 'function') {
+		const record = helperOf(pattern);
+
+		if (record === undefined) return false;
+		if (record.kind === ACTIVE) log.push(undefined, undefined);
+		// The alternatives of `anyOf` capture the same names, so only the first one's are listed (the others are still checked for cycles).
+		for (let index = 0; index < record.patterns.length; index++) scan(caller, record.patterns[index], record.kind === ANY_OF && index > 0 ? [] : log, ancestors);
+		if (record.absorbs) log[log.length - 2] = record.name;
+		else if (record.kind === CAPTURE) log.push(record.name, undefined);
+
+		return true;
+	}
+
+	const array = Array.isArray(pattern);
+
+	if (!array && !isPlainObject(pattern)) return false;
+	if (ancestors.includes(pattern)) circularPattern(caller);
+	ancestors.push(pattern);
+
+	let found = false;
+
+	if (array) for (let index = 0; index < pattern.length; index++) found = scan(caller, pattern[index], log, ancestors) || found;
+	else for (const key of patternKeys(pattern)) found = scan(caller, (pattern as Record<PropertyKey, unknown>)[key], log, ancestors) || found;
+	ancestors.pop();
+
+	return found;
+}
+
+/**
+ * Builds the selection a handler receives from the captures of a match: nothing, the value of the anonymous capture, or an object (with
+ * no prototype) of the named ones.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {unknown[]} log - The captures, as pairs of a name (`undefined` when anonymous) and a value
+ * @returns {unknown} The selection, or {@link NO_SELECTION}
+ * @throws {TypeError} when the captures mix anonymous and named ones, or repeat one
+ */
+function select(caller: string, log: unknown[]): unknown {
+	if (log.length === 0) return NO_SELECTION;
+	if (log[0] === undefined) {
+		if (log.length > 2) {
+			throw new TypeError(
+				`${caller}: \`pattern\` must capture ${log[2] === undefined ? 'at most one anonymous value, got several' : 'either one anonymous value or named values, got both'}`
+			);
+		}
+
+		return log[1];
+	}
+
+	const selection: Record<string, unknown> = Object.create(null);
+
+	for (let index = 0; index < log.length; index += 2) {
+		const name = log[index] as string | undefined;
+
+		if (name === undefined) throw new TypeError(`${caller}: \`pattern\` must capture either one anonymous value or named values, got both`);
+		if (hasOwn.call(selection, name)) throw new TypeError(`${caller}: \`pattern\` must capture each name once, got ${JSON.stringify(name)} twice`);
+		selection[name] = log[index + 1];
+	}
+
+	return selection;
+}
+
+/**
+ * Calls a handler (or `when` guard) of a case with its selection, if any, and the matched value.
+ * @param {unknown} fn - The handler
+ * @param {unknown} selection - The selection, or {@link NO_SELECTION}
+ * @param {unknown} value - The matched value
+ * @returns {unknown} What the handler returns
+ */
+function callCase(fn: unknown, selection: unknown, value: unknown): unknown {
+	return selection === NO_SELECTION ? (fn as UnknownFunction)(value) : (fn as UnknownFunction)(selection, value);
+}
+
+/**
+ * The wildcard pattern: matches any value, including `undefined` for a property that is missing (like every function in a pattern of
+ * {@link isMatching}). A case whose pattern is `_` handles every remaining value, so it ends an exhaustive {@link matchWith}.
+ * @param {unknown} _value - The value
+ * @returns {boolean} Always `true`
+ * @example
+ * import { isMatching } from 'tinkit/guards';
+ * _(undefined); // => true
+ * isMatching({ id: _ })({}); // => true // the property may be missing
+ * isMatching([_, 'end'])(['anything', 'end']); // => true
+ */
+export function _(_value: unknown): _value is unknown {
+	return true;
+}
+
+/**
+ * Creates a pattern that matches what `pattern` matches (anything, by default) and passes the matched value to the handler, F#'s `as`:
+ * a case whose pattern holds an anonymous capture calls its handler (and `when` guard) with the captured value first and the whole
+ * matched value second. Use {@link captureAs} to name captures. A capture of an {@link active} pattern binds the value it extracted.
+ *
+ * Captures bind when they are part of a case's pattern (in its objects and arrays, or in {@link anyOf}, {@link cons} and other captures);
+ * inside another guard (`isArrayOf(capture())`) or {@link isMatching}, a capture only tests its pattern. A pattern captures either one
+ * anonymous value or named values: mixing them, or capturing several anonymous values (or a name twice), is a compile error, and throws a
+ * `TypeError` when the case matches ({@link matcher}: when the case is added).
+ * @template P - The captured pattern
+ * @param {P} [pattern] - The pattern to capture (a value, a guard, or plain objects and arrays of those); omitted, it matches anything
+ * @returns {CapturePattern<undefined, P>} The pattern
+ * @example
+ * type Event = { type: 'move'; to: { x: number; y: number } } | { type: 'quit' };
+ * function describeEvent(event: Event): string {
+ *   return matchWith(event)
+ *     .with({ type: 'move', to: capture() }, function (to) { return `move to ${to.x},${to.y}`; })
+ *     .with({ type: 'quit' }, function () { return 'quit'; })
+ *     .exhaustive();
+ * }
+ * describeEvent({ type: 'move', to: { x: 1, y: 2 } }); // => 'move to 1,2'
+ */
+export function capture(): CapturePattern<undefined, typeof _>;
+export function capture<const P>(pattern: P): CapturePattern<undefined, P>;
+/**
+ * Implementation of {@link capture} (see the first overload for the full documentation).
+ * @param {...unknown} pattern - The captured pattern, if any
+ * @returns {AnyFunction} The pattern
+ */
+export function capture(...pattern: unknown[]): AnyFunction {
+	return capturing('capture', undefined, pattern);
+}
+
+/**
+ * Creates a pattern that matches what `pattern` matches (anything, by default) and passes the matched value to the handler under `name`:
+ * a case whose pattern holds named captures calls its handler (and `when` guard) with an object of the captured values (without a
+ * prototype, so any name is safe) first and the whole matched value second. See {@link capture} for where captures bind.
+ * @template N - The name
+ * @template P - The captured pattern
+ * @param {N} name - The name of the captured value
+ * @param {P} [pattern] - The pattern to capture; omitted, it matches anything
+ * @returns {CapturePattern<N, P>} The pattern
+ * @throws {TypeError} when `name` is not a string
+ * @example
+ * type Line = { from: { x: number; y: number }; to: { x: number; y: number } };
+ * const length = matcher<Line>()
+ *   .with({ from: captureAs('a'), to: captureAs('b') }, function ({ a, b }) { return Math.hypot(b.x - a.x, b.y - a.y); })
+ *   .exhaustive();
+ * length({ from: { x: 0, y: 0 }, to: { x: 3, y: 4 } }); // => 5
+ */
+export function captureAs<const N extends string>(name: N): CapturePattern<N, typeof _>;
+export function captureAs<const N extends string, const P>(name: N, pattern: P): CapturePattern<N, P>;
+/**
+ * Implementation of {@link captureAs} (see the first overload for the full documentation).
+ * @param {string} name - The name of the captured value
+ * @param {...unknown} pattern - The captured pattern, if any
+ * @returns {AnyFunction} The pattern
+ * @throws {TypeError} when `name` is not a string
+ */
+export function captureAs(name: string, ...pattern: unknown[]): AnyFunction {
+	if (typeof name !== 'string') throw new TypeError(`captureAs: \`name\` must be a string, got ${describe(name)}`);
+
+	return capturing('captureAs', name, pattern);
+}
+
+/**
+ * Creates a capture pattern (see {@link capture}).
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {string | undefined} name - The capture's name, `undefined` when anonymous
+ * @param {unknown[]} pattern - The captured pattern, or nothing for the wildcard
+ * @returns {AnyFunction} The pattern
+ */
+function capturing(caller: string, name: string | undefined, pattern: unknown[]): AnyFunction {
+	const inner = pattern.length === 0 ? _ : pattern[0];
+
+	return register(caller, { kind: CAPTURE, patterns: [inner], name, absorbs: helperOf(inner)?.kind === ACTIVE });
+}
+
+/**
+ * Creates an active pattern, F#'s `| Int n ->`: it matches the values for which `extract` returns something other than `undefined`, and
+ * binds that result like an anonymous {@link capture} (wrap it in {@link captureAs} to name it). `extract` is called once per test, so
+ * testing and extracting never compute twice. An active pattern is partial: it never makes a {@link matchWith} exhaustive.
+ * @template A - The parameter type of `extract`, which the pattern narrows to
+ * @template R - The return type of `extract` (`undefined` meaning no match)
+ * @param {(value: A) => R} extract - Called with the value at the pattern's position (whatever it is: check its type when it may vary)
+ * @returns {ActivePattern<A, R>} The pattern
+ * @throws {TypeError} when `extract` is not a function
+ * @example
+ * function toInteger(text: string): number | undefined {
+ *   return /^-?\d+$/.test(text) ? Number(text) : undefined;
+ * }
+ * function parse(input: string): number | string {
+ *   return matchWith(input)
+ *     .with(active(toInteger), function (n) { return n * 2; })
+ *     .otherwise(function (text) { return text.toUpperCase(); });
+ * }
+ * parse('21'); // => 42
+ * parse('abc'); // => 'ABC'
+ */
+export function active<A, R>(extract: (value: A) => R): ActivePattern<A, R> {
+	assertFunction('active', 'extract', extract);
+
+	return register('active', { kind: ACTIVE, patterns: [], extract: extract as (value: unknown) => unknown }) as unknown as ActivePattern<A, R>;
+}
+
+/**
+ * Creates an or-pattern, F#'s `| A | B ->`: it matches what any of `patterns` matches, trying them in order, and narrows to the union of
+ * their types. Like F#, every alternative must capture the same names (or all one anonymous value, or nothing): the alternative that
+ * matched binds them. Named after JSON Schema's `anyOf`; unlike `isOneOf` (a set of values) and `isUnion` (guards), it takes any patterns.
+ * @template P - The alternative patterns
+ * @param {...P} patterns - The alternatives (at least one)
+ * @returns {AnyOfPattern<P>} The pattern
+ * @throws {RangeError} when no pattern is given
+ * @throws {TypeError} when the alternatives capture different names, or one contains itself
+ * @example
+ * import { isMatching } from 'tinkit/guards';
+ * const isCopy = isMatching(anyOf({ key: 'c', ctrl: true }, { key: 'Insert', ctrl: true }));
+ * isCopy({ key: 'Insert', ctrl: true }); // => true
+ * matchWith('b' as 'a' | 'b' | 'c').with(anyOf('a', 'b'), function () { return 1; }).with('c', function () { return 2; }).exhaustive(); // => 1
+ */
+export function anyOf<const P extends readonly unknown[]>(...patterns: P): AnyOfPattern<P> {
+	if (patterns.length === 0) throw new RangeError('anyOf: expected at least one pattern, got 0');
+
+	let expected = '';
+
+	for (let index = 0; index < patterns.length; index++) {
+		const log: unknown[] = [];
+
+		scan('anyOf', patterns[index], log, []);
+
+		const names: string[] = [];
+
+		for (let entry = 0; entry < log.length; entry += 2) names.push(log[entry] === undefined ? 'an anonymous value' : JSON.stringify(log[entry]));
+
+		const captured = names.length === 0 ? 'nothing' : names.sort().join(', ');
+
+		if (index === 0) expected = captured;
+		else if (captured !== expected) throw new TypeError(`anyOf: \`patterns[${index}]\` must capture what \`patterns[0]\` captures (${expected}), got ${captured}`);
+	}
+
+	return register('anyOf', { kind: ANY_OF, patterns }) as unknown as AnyOfPattern<P>;
+}
+
+/**
+ * Creates a list pattern, F#'s `head :: tail`: it matches non-empty arrays whose first element matches `head` and whose other elements,
+ * as a new array, match `tail` (anything, by default). Combine with `[]` (the empty array) for exhaustive recursion over arrays. The tail
+ * is a copy, so matching it costs O(n): for long arrays, prefer index loops.
+ * @template H - The pattern of the first element
+ * @template T - The pattern of the other elements
+ * @param {H} head - The pattern of the first element
+ * @param {T} [tail] - The pattern of the array of the other elements; omitted (or `undefined`), it matches any array
+ * @returns {ConsPattern<H, T>} The pattern
+ * @example
+ * const sum: (list: number[]) => number = matcher<number[]>()
+ *   .with([], function () { return 0; })
+ *   .with(cons(captureAs('head'), captureAs('tail')), function ({ head, tail }) { return head + sum(tail); })
+ *   .exhaustive();
+ * sum([1, 2, 3]); // => 6
+ * matchWith(['cmd', '--help']).with(cons('cmd'), function () { return 'command'; }).otherwise(function () { return 'other'; }); // => 'command'
+ */
+export function cons<const H>(head: H): ConsPattern<H, typeof _>;
+export function cons<const H, const T>(head: H, tail: T): ConsPattern<H, T>;
+/**
+ * Implementation of {@link cons} (see the first overload for the full documentation).
+ * @param {unknown} head - The pattern of the first element
+ * @param {unknown} [tail] - The pattern of the other elements
+ * @returns {AnyFunction} The pattern
+ */
+export function cons(head: unknown, tail?: unknown): AnyFunction {
+	// The tail is always an array, so `undefined` (which no array matches) means "any tail".
+	return register('cons', { kind: CONS, patterns: [head, tail === undefined ? _ : tail] });
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// matchWith / matcher: types
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * The members of `V` narrowed to those a value of type `T` may be: each member assignable to `T` is kept, an array narrowed by a tuple
+ * becomes a tuple of its elements, the others are intersected with `T` (members with a conflicting discriminant reduce to `never`).
+ * @template V - The values
+ * @template T - The type of the pattern
+ */
+type Narrow<V, T> = V extends unknown
+	? V extends T
+		? V
+		: V extends readonly unknown[]
+			? T extends readonly unknown[]
+				? number extends V['length']
+					? { [K in keyof T]: Narrow<V[number], T[K]> }
+					: V & T
+				: V & T
+			: V & T
+	: never;
+
+/**
+ * The value of each member of `V` at key `K`, as a pattern reads it: `undefined` when an object lacks the key (or may, for an index
+ * signature); an element, for an array.
+ * @template V - The values
+ * @template K - The key
+ */
+type PartOf<V, K> = V extends readonly unknown[]
+	? K extends keyof V
+		? V[K]
+		: V[number]
+	: V extends unknown
+		? K extends keyof V
+			? V[K] | (string extends keyof V ? undefined : number extends keyof V ? undefined : never)
+			: undefined
+		: never;
+
+/**
+ * Whether a value of type `M` always has the property `K` (not optional, not from an index signature).
+ * @template M - The value type
+ * @template K - The key
+ */
+type IsPresent<M, K> = M extends Record<K & PropertyKey, unknown> ? true : false;
+
+/**
+ * `M` with the property `K` (an element, for a tuple) of type `X`.
+ * @template M - The object or tuple type
+ * @template K - The key
+ * @template X - The new property type
+ */
+type Replace<M, K, X> = { [I in keyof M]: I extends K ? X : M[I] };
+
+/**
+ * Whether a primitive pattern type stands for an unknown value of a wide type (`string`, `number`…), which covers none of its values.
+ * @template P - The pattern type
+ */
+type IsWide<P> = string extends P ? true : number extends P ? true : bigint extends P ? true : symbol extends P ? true : false;
+
+/**
+ * The values of `M` that a case with pattern `P` may leave unhandled: the members that `P` matches entirely are removed (and products,
+ * objects and tuples, lose the part `P` matches entirely); every other member is kept, so the result is never too small.
+ * @template M - The remaining values
+ * @template P - The pattern
+ */
+type Subtract<M, P> = M extends unknown ? SubtractMember<M, P> : never;
+
+/**
+ * {@link Subtract} for one member `M` (`P` is distributed: a union-typed pattern is one of its members, so only what all of them cover goes).
+ * @template M - A remaining member
+ * @template P - The pattern
+ */
+type SubtractMember<M, P> =
+	P extends PatternHelper<infer K>
+		? SubtractHelper<M, K>
+		: P extends ((value: unknown) => value is infer T)
+			? [M] extends [T]
+				? never
+				: M
+			: P extends AnyFunction | Date
+				? M
+				: P extends readonly unknown[]
+					? SubtractTuple<M, P>
+					: P extends object
+						? M extends AnyFunction | readonly unknown[]
+							? M
+							: M extends object
+								? // A member the pattern cannot match (a conflicting discriminant) is kept as is, cheaply.
+									[M & PatternType<P>] extends [never]
+									? M
+									: SubtractShape<M, P>
+								: M
+						: [M] extends [P]
+							? IsWide<P> extends true
+								? M
+								: never
+							: M;
+
+/**
+ * {@link Subtract} for a pattern helper: a capture removes what its pattern removes, `anyOf` what its alternatives remove, an active pattern nothing.
+ * @template M - A remaining member
+ * @template K - The helper's kind and type arguments
+ */
+type SubtractHelper<M, K> = K extends ['capture', unknown, infer Q]
+	? Subtract<M, Q>
+	: K extends ['anyOf', infer Ps]
+		? SubtractAll<M, Ps>
+		: K extends ['cons', infer H, infer T]
+			? SubtractCons<M, H, T>
+			: M;
+
+/**
+ * {@link Subtract} for each pattern of `Ps`, in turn.
+ * @template M - The remaining values
+ * @template Ps - The patterns
+ */
+type SubtractAll<M, Ps> = Ps extends readonly [infer A, ...infer Rest] ? SubtractAll<Subtract<M, A>, Rest> : M;
+
+/**
+ * The part of an object `M` that a plain-object pattern `P` leaves: `M` itself when a key of `P` removes nothing from `M` (the pattern then
+ * covers no whole slice of `M`), otherwise the union, over the keys, of `M` with that key restricted to what the pattern leaves of it.
+ * @template M - A remaining object member
+ * @template P - The pattern
+ * @template X - What the pattern leaves of each key
+ */
+type SubtractShape<M, P, X = { [K in keyof P]-?: SubtractKey<M, K, P[K]> }> = true extends { [K in keyof X]-?: [PartOf<M, K>] extends [X[K]] ? true : never }[keyof X]
+	? M
+	: { [K in keyof X]-?: [X[K]] extends [never] ? never : Replace<M, K, X[K]> }[keyof X];
+
+/**
+ * What the pattern `Q` of key `K` leaves of `M[K]`: a function pattern sees `undefined` for a missing key, any other pattern needs the
+ * key, so it removes nothing from an optional one.
+ * @template M - A remaining object member
+ * @template K - The key
+ * @template Q - The pattern of the key
+ */
+type SubtractKey<M, K, Q> = Q extends AnyFunction ? Subtract<PartOf<M, K>, Q> : IsPresent<M, K> extends true ? Subtract<M[K & keyof M], Q> : PartOf<M, K>;
+
+/**
+ * The part of an array `M` that a tuple pattern `P` leaves: the empty tuple removes the empty array from `T[]` (leaving `[T, ...T[]]`);
+ * tuples of the same length are subtracted element by element, like objects.
+ * @template M - A remaining member
+ * @template P - The tuple pattern
+ */
+type SubtractTuple<M, P extends readonly unknown[]> = M extends readonly unknown[]
+	? number extends M['length']
+		? P extends readonly []
+			? [] extends M
+				? [M[number], ...M]
+				: M
+			: M
+		: number extends P['length']
+			? M
+			: M['length'] extends P['length']
+				? SubtractElements<M, P>
+				: M
+	: M;
+
+/**
+ * {@link SubtractShape} for the elements of a tuple.
+ * @template M - A remaining tuple member
+ * @template P - The tuple pattern, of the same length
+ * @template X - What the pattern leaves of each element
+ */
+type SubtractElements<
+	M extends readonly unknown[],
+	P extends readonly unknown[],
+	X extends readonly unknown[] = { [K in keyof P]: Subtract<M[K & keyof M], P[K]> }
+> = true extends { [K in keyof X]: [M[K & keyof M]] extends [X[K]] ? true : never }[number]
+	? M
+	: { [K in keyof X]: [X[K]] extends [never] ? never : Replace<M, K, X[K]> }[number];
+
+/**
+ * The part of an array `M` that a {@link cons} pattern leaves: a non-empty array loses the arrays whose head and tail it matches, `T[]`
+ * keeps the empty array when it matches every head and tail.
+ * @template M - A remaining member
+ * @template H - The head pattern
+ * @template T - The tail pattern
+ */
+type SubtractCons<M, H, T> = M extends readonly [infer A, ...infer Rest extends readonly unknown[]]
+	? ConsBranches<M, A, Rest, Subtract<A, H>, Subtract<Rest, T>>
+	: M extends readonly unknown[]
+		? number extends M['length']
+			? [Subtract<M[number], H> | Subtract<M[number][], T>] extends [never]
+				? [] extends M
+					? []
+					: never
+				: M
+			: M
+		: M;
+
+/**
+ * {@link SubtractShape} for the head and tail of a non-empty array.
+ * @template M - The array
+ * @template A - Its head
+ * @template Rest - Its tail
+ * @template XA - What the head pattern leaves of `A`
+ * @template XR - What the tail pattern leaves of `Rest`
+ */
+type ConsBranches<M, A, Rest extends readonly unknown[], XA, XR> = [A] extends [XA]
+	? M
+	: [Rest] extends [XR]
+		? M
+		: ([XA] extends [never] ? never : [XA, ...Rest]) | (XR extends readonly unknown[] ? [A, ...XR] : never);
+
+/**
+ * What a pattern `P` captures from values of type `V`: a union of `[name, type]` pairs, the name `undefined` for anonymous captures.
+ * @template P - The pattern
+ * @template V - The matched values
+ */
+type Entries<P, V> =
+	P extends PatternHelper<infer K>
+		? HelperEntries<K, V>
+		: P extends AnyFunction | Date
+			? never
+			: P extends readonly unknown[]
+				? { [I in keyof P]: P[I] extends Primitive ? never : Entries<P[I], PartOf<V, I>> }[number]
+				: P extends object
+					? { [K in keyof P]-?: P[K] extends Primitive ? never : Entries<P[K], PartOf<V, K>> }[keyof P]
+					: never;
+
+/**
+ * {@link Entries} of a pattern helper.
+ * @template K - The helper's kind and type arguments
+ * @template V - The matched values
+ */
+type HelperEntries<K, V> = K extends ['capture', infer N, infer Q]
+	? Q extends PatternHelper<['active', infer R]>
+		? [N, Exclude<R, undefined>]
+		: [N, Narrow<V, PatternType<Q>>] | Entries<Q, Narrow<V, PatternType<Q>>>
+	: K extends ['active', infer R]
+		? [undefined, Exclude<R, undefined>]
+		: K extends ['anyOf', infer Ps extends readonly unknown[]]
+			? AlternativeEntries<Ps[number], V>
+			: K extends ['cons', infer H, infer T]
+				?
+						| Entries<H, V extends readonly [infer A, ...unknown[]] ? A : V extends readonly (infer E)[] ? E : never>
+						| Entries<T, V extends readonly [unknown, ...infer R] ? R : V extends readonly (infer E)[] ? E[] : never>
+				: never;
+
+/**
+ * {@link Entries} of each alternative `A` of an `anyOf`, matched against the values it narrows to.
+ * @template A - The alternatives
+ * @template V - The matched values
+ */
+type AlternativeEntries<A, V> = A extends unknown ? Entries<A, Narrow<V, PatternType<A>>> : never;
+
+/**
+ * The type a handler (or `when` guard) must have for the captures `E` and the matched values `V`.
+ * @template E - The captures (see {@link Entries})
+ * @template V - The matched values
+ */
+type Handler<E, V> = [E] extends [never]
+	? (value: V) => unknown
+	: [E] extends [[undefined, infer S]]
+		? (selection: S, value: V) => unknown
+		: [E] extends [[string, unknown]]
+			? (selections: Selections<E>, value: V) => unknown
+			: MixedCapturesError;
+
+/**
+ * The object of named captures a handler receives.
+ * @template E - The captures (see {@link Entries}), all named
+ */
+type Selections<E> = { [N in E extends [infer Name extends string, unknown] ? Name : never]: E extends [N, infer T] ? T : never };
+
+/**
+ * The type a handler (or `when` guard) of a case with pattern `P` must have while the values `Remaining` are unhandled (a pattern typed
+ * `any` captures nothing). Handlers are typed by a constraint, not inferred into: TypeScript would explore every branch of these
+ * conditional types while inferring.
+ * @template P - The pattern
+ * @template Remaining - The unhandled values
+ */
+type CaseHandler<P, Remaining> = 0 extends 1 & P ? (value: Remaining) => unknown : Handler<Entries<P, Narrow<Remaining, PatternType<P>>>, Narrow<Remaining, PatternType<P>>>;
+
+/**
+ * The return type of a handler.
+ * @template H - The handler
+ */
+type ResultOf<H> = H extends (...args: never[]) => infer R ? R : never;
+
+/**
+ * The values left unhandled after a case with pattern `P` (see {@link Subtract}); a pattern typed `any` removes nothing.
+ * @template Remaining - The unhandled values
+ * @template P - The pattern
+ */
+type Remove<Remaining, P> = 0 extends 1 & P ? Remaining : Subtract<Remaining, P>;
+
+/** The (impossible) handler type of a pattern that captures both an anonymous value and named values. */
+interface MixedCapturesError {
+	/** Explains the error. */
+	readonly 'a pattern must capture either one anonymous value or named values': never;
+}
+
+/**
+ * The type of `exhaustive` when some values are unhandled: calling it is a compile error naming them.
+ * @template Remaining - The unhandled values
+ */
+export interface NonExhaustiveError<Remaining> {
+	/** The values no case handles. */
+	readonly unhandled: Remaining;
+}
+
+/**
+ * The builder returned by {@link matchWith}.
+ * @template Remaining - The values no case handles yet
+ * @template Out - The union of the handlers' return types
+ */
+export interface MatchBuilder<Remaining, Out> {
+	/**
+	 * Adds a case: when the value matches `pattern` (as {@link isMatching} defines it) and no earlier case matched, `handler` is called
+	 * with the value (preceded by the captures, if `pattern` has any).
+	 * @template P - The pattern
+	 * @template H - The handler (its type is checked against the pattern: see {@link CaseHandler})
+	 * @param {P} pattern - The pattern
+	 * @param {Function} handler - Receives the captures (if any) and the value narrowed to the pattern
+	 * @returns {MatchBuilder} The builder, with the values `pattern` handles entirely removed from `Remaining`
+	 */
+	with<const P, H extends CaseHandler<P, Remaining>>(pattern: P, handler: H): MatchBuilder<Remove<Remaining, P>, Out | ResultOf<H>>;
+	/**
+	 * Adds a guarded case, F#'s `when`: the case only matches when `when`, called like the handler, returns a truthy value. A guarded case
+	 * removes nothing from `Remaining`.
+	 * @template P - The pattern
+	 * @template H - The handler (its type is checked against the pattern: see {@link CaseHandler})
+	 * @param {P} pattern - The pattern
+	 * @param {Function} when - The guard, receiving what the handler receives
+	 * @param {Function} handler - Receives the captures (if any) and the value narrowed to the pattern
+	 * @returns {MatchBuilder} The builder
+	 */
+	with<const P, H extends CaseHandler<P, Remaining>>(pattern: P, when: NoInfer<CaseHandler<P, Remaining>>, handler: H): MatchBuilder<Remaining, Out | ResultOf<H>>;
+	/**
+	 * Ends the match with a fallback for the values no case matched.
+	 * @template R - The fallback's return type
+	 * @param {(value: Remaining) => R} handler - Receives the unmatched value
+	 * @returns {Out | R} The result of the matching case's handler, or of `handler`
+	 */
+	otherwise<R>(handler: (value: Remaining) => R): Out | R;
+	/**
+	 * Ends a match that handles every value of its type (a compile error, {@link NonExhaustiveError}, names the unhandled values otherwise).
+	 * Throws an `AssertionError` when no case matched at runtime (data that does not match its type).
+	 */
+	readonly exhaustive: [Remaining] extends [never] ? () => Out : NonExhaustiveError<Remaining>;
+}
+
+/**
+ * The builder returned by {@link matcher}: like {@link MatchBuilder}, but its terminals return the matching function.
+ * @template In - The type of the matched values
+ * @template Remaining - The values no case handles yet
+ * @template Out - The union of the handlers' return types
+ */
+export interface MatcherBuilder<In, Remaining, Out> {
+	/**
+	 * Adds a case (see {@link MatchBuilder}): `pattern` is compiled now.
+	 * @template P - The pattern
+	 * @template H - The handler (its type is checked against the pattern: see {@link CaseHandler})
+	 * @param {P} pattern - The pattern
+	 * @param {Function} handler - Receives the captures (if any) and the value narrowed to the pattern
+	 * @returns {MatcherBuilder} A new builder, with the values `pattern` handles entirely removed from `Remaining`
+	 */
+	with<const P, H extends CaseHandler<P, Remaining>>(pattern: P, handler: H): MatcherBuilder<In, Remove<Remaining, P>, Out | ResultOf<H>>;
+	/**
+	 * Adds a guarded case (see {@link MatchBuilder}).
+	 * @template P - The pattern
+	 * @template H - The handler (its type is checked against the pattern: see {@link CaseHandler})
+	 * @param {P} pattern - The pattern
+	 * @param {Function} when - The guard, receiving what the handler receives
+	 * @param {Function} handler - Receives the captures (if any) and the value narrowed to the pattern
+	 * @returns {MatcherBuilder} A new builder
+	 */
+	with<const P, H extends CaseHandler<P, Remaining>>(pattern: P, when: NoInfer<CaseHandler<P, Remaining>>, handler: H): MatcherBuilder<In, Remaining, Out | ResultOf<H>>;
+	/**
+	 * Ends the cases with a fallback for the values no case matches.
+	 * @template R - The fallback's return type
+	 * @param {(value: Remaining) => R} handler - Receives the unmatched value
+	 * @returns {(value: In) => Out | R} The matching function
+	 */
+	otherwise<R>(handler: (value: Remaining) => R): (value: In) => Out | R;
+	/** Ends cases that handle every value of `In` (see {@link MatchBuilder}); the returned function throws an `AssertionError` when no case matches. */
+	readonly exhaustive: [Remaining] extends [never] ? () => (value: In) => Out : NonExhaustiveError<Remaining>;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// matchWith / matcher
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Validates the functions of a case and returns its handler and `when` guard.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {unknown[]} functions - The functions after the pattern: the handler, or the `when` guard and the handler
+ * @returns {AnyFunction | undefined} The `when` guard, if any (the handler is the last function)
+ * @throws {TypeError} when one of them is not a function
+ */
+function caseGuard(caller: string, functions: unknown[]): AnyFunction | undefined {
+	const guarded = functions.length > 1;
+
+	if (guarded) assertFunction(caller, 'when', functions[0]);
+	assertFunction(caller, 'handler', caseHandler(functions));
+
+	return guarded ? (functions[0] as AnyFunction) : undefined;
+}
+
+/**
+ * The handler among the functions of a case: the first, or the second after a `when` guard.
+ * @param {unknown[]} functions - The functions after the pattern
+ * @returns {unknown} The handler
+ */
+function caseHandler(functions: unknown[]): unknown {
+	return functions[functions.length > 1 ? 1 : 0];
+}
+
+/**
+ * The state of a {@link matchWith} expression. Never changes: until a case matches, `with` returns the same state; the match returns a
+ * new, matched state.
+ */
+class MatchState {
+	/** The matched value. */
+	readonly value: unknown;
+	/** The handler of the case that matched, if any. */
+	readonly handler: AnyFunction | undefined;
+	/** The selection of the case that matched. */
+	readonly selection: unknown;
+	/** Scratch space for the captures of each case, created on the first test. */
+	log: unknown[] | undefined;
+
+	/**
+	 * Creates a state.
+	 * @param {unknown} value - The matched value
+	 * @param {AnyFunction} [handler] - The handler of the case that matched
+	 * @param {unknown} [selection] - Its selection
+	 */
+	constructor(value: unknown, handler?: AnyFunction, selection?: unknown) {
+		this.value = value;
+		this.handler = handler;
+		this.selection = selection;
+		// Assigned here, so that creating the log later does not change the object's shape.
+		this.log = undefined;
+	}
+
+	/**
+	 * Adds a case (see {@link MatchBuilder}).
+	 * @param {unknown} pattern - The pattern
+	 * @param {...unknown} functions - The handler, or the `when` guard and the handler
+	 * @returns {MatchState} The state after the case
+	 */
+	with(pattern: unknown, ...functions: unknown[]): MatchState {
+		const when = caseGuard('matchWith', functions);
+
+		// Once a case matched, later patterns are neither tested nor read.
+		if (this.handler !== undefined) return this;
+
+		const log = this.log ?? (this.log = []);
+
+		// Only truncated when needed: setting `length` costs more than the rest of a simple test.
+		if (log.length !== 0) log.length = 0;
+		if (!test('matchWith', pattern, this.value, log, 0)) return this;
+
+		const selection = select('matchWith', log);
+
+		return when !== undefined && !callCase(when, selection, this.value) ? this : new MatchState(this.value, caseHandler(functions) as AnyFunction, selection);
+	}
+
+	/**
+	 * Ends the match with a fallback (see {@link MatchBuilder}).
+	 * @param {unknown} handler - The fallback
+	 * @returns {unknown} The result of the matching case's handler, or of `handler`
+	 * @throws {TypeError} when `handler` is not a function
+	 */
+	otherwise(handler: unknown): unknown {
+		assertFunction('matchWith', 'handler', handler);
+
+		return this.handler === undefined ? (handler as UnknownFunction)(this.value) : callCase(this.handler, this.selection, this.value);
+	}
+
+	/**
+	 * Ends an exhaustive match (see {@link MatchBuilder}).
+	 * @returns {unknown} The result of the matching case's handler
+	 * @throws {AssertionError} when no case matched
+	 */
+	exhaustive(): unknown {
+		if (this.handler === undefined) throw new AssertionError(`matchWith: no pattern matched the value (got ${describe(this.value)})`);
+
+		return callCase(this.handler, this.selection, this.value);
+	}
+}
+
+/**
+ * Pattern matching in the style of F# and ts-pattern, with the patterns of {@link isMatching}: `matchWith(value).with(pattern, handler)…`
+ * tries the cases in order and calls the handler of the first one whose pattern matches. Patterns mean what they mean for `isMatching`:
+ * plain objects match partially, by own properties; arrays are tuples of the same length; functions are guards (so any guard of the
+ * guards module works); dates match by time; other values by SameValueZero. {@link _} matches anything, {@link capture} and
+ * {@link captureAs} pass parts of the value to the handler, {@link active} extracts values, {@link anyOf} gives alternatives and
+ * {@link cons} splits arrays into head and tail. A third argument makes a guarded case, F#'s `when`: `with(pattern, when, handler)`.
+ *
+ * Each handler receives the value narrowed to its pattern. `exhaustive()` ends the match and is a compile error, naming the unhandled
+ * values ({@link NonExhaustiveError}), until the cases handle every value of the input type (rules below); at runtime it throws an
+ * `AssertionError` (with the value's type only, never its content) when no case matched. `otherwise(handler)` ends the match with a fallback.
+ *
+ * The value is tested eagerly, as the cases are added, without compiling the patterns (for reuse, {@link matcher} compiles them once);
+ * once a case matched, the later ones are not tested. The handler runs when `exhaustive` or `otherwise` is called.
+ *
+ * Exhaustiveness rules: a case removes from the remaining type what its pattern matches entirely: union members (`boolean` is
+ * `true | false`) equal to a literal, assignable to a guard's type predicate (guards are trusted, like TypeScript trusts them), or matched by
+ * `_`; for objects and tuples, the part matched key by key, recursively, splitting a member into what each key leaves (so `[true, _]` and
+ * `[false, _]` handle `[boolean, boolean]`, and `{ kind: 'a', payload: { type: 'x' } }` one variant of a nested union). Guarded cases,
+ * {@link active} patterns, guards without a type predicate, dates, identity-compared objects and patterns of a wide type (a `string`
+ * variable) remove nothing; `[]` and `cons(_, _)` together handle arrays. The remaining type only ever errs on the large side: a match it
+ * cannot prove exhaustive needs `otherwise` (or a final `_` case).
+ * @template T - The type of the value
+ * @param {T} value - The value to match
+ * @returns {MatchBuilder<T, never>} The builder
+ * @throws {AssertionError} from `exhaustive()`, when no case matched
+ * @throws {TypeError} from `with` and `otherwise`, when a handler or guard is not a function, or the captures of the matching case mix
+ * anonymous and named captures (or repeat one); from `with`, when the test reaches a cycle of the pattern
+ * @example
+ * import { isString } from 'tinkit/guards';
+ * type Event = { type: 'click'; x: number; button: number } | { type: 'key'; key: string };
+ * function label(event: Event): string {
+ *   return matchWith(event)
+ *     .with({ type: 'click', button: 0 }, function () { return 'left click'; })
+ *     .with({ type: 'click' }, function (click) { return click.x > 100; }, function () { return 'click on the right'; })
+ *     .with({ type: 'click' }, function (click) { return `click at ${click.x}`; })
+ *     .with({ type: 'key', key: isString }, function (key) { return `key ${key.key}`; })
+ *     .exhaustive();
+ * }
+ * label({ type: 'click', x: 10, button: 0 }); // => 'left click'
+ * label({ type: 'click', x: 200, button: 2 }); // => 'click on the right'
+ * label({ type: 'click', x: 10, button: 2 }); // => 'click at 10'
+ * label({ type: 'key', key: 'Enter' }); // => 'key Enter'
+ * label({ type: 'scroll' } as unknown as Event); // throws AssertionError
+ * @example
+ * function both(flags: [boolean, boolean]): string {
+ *   return matchWith(flags)
+ *     .with([true, true], function () { return 'both'; })
+ *     .with([false, _], function () { return 'not the first'; })
+ *     .with([_, false], function () { return 'only the first'; })
+ *     .exhaustive();
+ * }
+ * both([true, false]); // => 'only the first'
+ */
+export function matchWith<T>(value: T): MatchBuilder<T, never> {
+	return new MatchState(value) as unknown as MatchBuilder<T, never>;
+}
+
+/** A case of a {@link matcher}, compiled. */
+interface MatcherCase {
+	/** The compiled pattern, when it holds no pattern helper. */
+	readonly guard: ((value: unknown) => boolean) | undefined;
+	/** Otherwise, the pattern, with its parts without helpers compiled. */
+	readonly pattern: unknown;
+	/** Whether the pattern captures something. */
+	readonly captures: boolean;
+	/** The `when` guard, if any. */
+	readonly when: AnyFunction | undefined;
+	/** The handler. */
+	readonly handler: AnyFunction;
+}
+
+/**
+ * Compiles the parts of a pattern that hold no pattern helper with {@link isMatching}, so that only the structure leading to helpers is
+ * interpreted. The result is a copy: later changes to the pattern do not affect it.
+ * @param {unknown} pattern - An acyclic pattern
+ * @returns {unknown} The prepared pattern
+ */
+function prepare(pattern: unknown): unknown {
+	if (typeof pattern === 'function') {
+		const record = helperOf(pattern);
+
+		if (record === undefined || record.kind === ACTIVE) return pattern;
+
+		return register('matcher', { ...record, patterns: record.patterns.map(prepare) });
+	}
+	if (!scan('matcher', pattern, [], [])) return isDate(pattern) || Array.isArray(pattern) || isPlainObject(pattern) ? isMatching(pattern) : pattern;
+	if (Array.isArray(pattern)) {
+		const copy: unknown[] = [];
+
+		for (let index = 0; index < pattern.length; index++) copy.push(prepare(pattern[index]));
+
+		return copy;
+	}
+
+	const copy = {};
+
+	// Defined, so that a `__proto__` key is copied as a key (a copy without prototype would make `isDate` take its slow path).
+	for (const key of patternKeys(pattern as object)) {
+		Object.defineProperty(copy, key, { value: prepare((pattern as Record<PropertyKey, unknown>)[key]), enumerable: true, writable: true, configurable: true });
+	}
+
+	return copy;
+}
+
+/**
+ * The state of a {@link matcher}: its compiled cases. Never changes: `with` returns a new state.
+ */
+class MatcherState {
+	/** The cases, in order. */
+	readonly cases: ReadonlyArray<MatcherCase>;
+
+	/**
+	 * Creates a state.
+	 * @param {ReadonlyArray<MatcherCase>} cases - The cases
+	 */
+	constructor(cases: ReadonlyArray<MatcherCase>) {
+		this.cases = cases;
+	}
+
+	/**
+	 * Adds a case, compiling its pattern (see {@link MatcherBuilder}).
+	 * @param {unknown} pattern - The pattern
+	 * @param {...unknown} functions - The handler, or the `when` guard and the handler
+	 * @returns {MatcherState} The new state
+	 * @throws {TypeError} when a function is not one, or the pattern is circular or captures both anonymous and named values (or a name twice)
+	 */
+	with(pattern: unknown, ...functions: unknown[]): MatcherState {
+		const when = caseGuard('matcher', functions);
+		const log: unknown[] = [];
+		const helpers = scan('matcher', pattern, log, []);
+
+		// Fails as matching would, but now.
+		select('matcher', log);
+
+		return new MatcherState([
+			...this.cases,
+			{
+				guard: helpers ? undefined : (isMatching(pattern) as (value: unknown) => boolean),
+				pattern: helpers ? prepare(pattern) : undefined,
+				captures: log.length > 0,
+				when,
+				handler: caseHandler(functions) as AnyFunction
+			}
+		]);
+	}
+
+	/**
+	 * Ends the cases with a fallback (see {@link MatcherBuilder}).
+	 * @param {unknown} handler - The fallback
+	 * @returns {(value: unknown) => unknown} The matching function
+	 * @throws {TypeError} when `handler` is not a function
+	 */
+	otherwise(handler: unknown): (value: unknown) => unknown {
+		assertFunction('matcher', 'handler', handler);
+
+		return matching(this.cases, handler as UnknownFunction);
+	}
+
+	/**
+	 * Ends exhaustive cases (see {@link MatcherBuilder}).
+	 * @returns {(value: unknown) => unknown} The matching function
+	 */
+	exhaustive(): (value: unknown) => unknown {
+		return matching(this.cases, undefined);
+	}
+}
+
+/**
+ * Creates the function that runs the cases of a {@link matcher}.
+ * @param {ReadonlyArray<MatcherCase>} cases - The cases
+ * @param {UnknownFunction | undefined} fallback - The `otherwise` handler, if any
+ * @returns {(value: unknown) => unknown} The matching function
+ */
+function matching(cases: ReadonlyArray<MatcherCase>, fallback: UnknownFunction | undefined): (value: unknown) => unknown {
+	return function matched(value: unknown): unknown {
+		for (let index = 0; index < cases.length; index++) {
+			const current = cases[index];
+			const log = current.captures ? [] : undefined;
+
+			if (current.guard === undefined ? test('matcher', current.pattern, value, log, 0) : current.guard(value)) {
+				const selection = log === undefined ? NO_SELECTION : select('matcher', log);
+
+				if (current.when === undefined || callCase(current.when, selection, value)) return callCase(current.handler, selection, value);
+			}
+		}
+		if (fallback === undefined) throw new AssertionError(`matcher: no pattern matched the value (got ${describe(value)})`);
+
+		return fallback(value);
+	};
+}
+
+/**
+ * Builds a reusable matching function, F#'s `function` keyword: the cases of {@link matchWith}, whose patterns are compiled once (with
+ * {@link isMatching}, so later changes to them do not matter), ending with `exhaustive()` or `otherwise(handler)`, which return a function
+ * of the value. Errors in the cases (a handler that is not a function, a circular pattern, captures mixing anonymous and named ones) throw
+ * as the cases are added. Each `with` returns a new builder, so a common prefix of cases can be shared.
+ * @template T - The type of the matched values
+ * @returns {MatcherBuilder<T, T, never>} The builder
+ * @example
+ * type Shape = { kind: 'circle'; radius: number } | { kind: 'rect'; width: number; height: number };
+ * const area = matcher<Shape>()
+ *   .with({ kind: 'circle' }, function (circle) { return Math.round(Math.PI * circle.radius ** 2); })
+ *   .with({ kind: 'rect' }, function (rect) { return rect.width * rect.height; })
+ *   .exhaustive();
+ * area({ kind: 'rect', width: 2, height: 3 }); // => 6
+ * [{ kind: 'circle', radius: 1 } as Shape].map(area); // => [3]
+ * @example
+ * const sign = matcher<number>()
+ *   .with(0, function () { return 'zero'; })
+ *   .with(isFinite, function (n) { return n > 0; }, function () { return 'positive'; })
+ *   .otherwise(function () { return 'negative or NaN'; });
+ * sign(5); // => 'positive'
+ * sign(-5); // => 'negative or NaN'
+ */
+export function matcher<T>(): MatcherBuilder<T, T, never> {
+	return new MatcherState([]) as unknown as MatcherBuilder<T, T, never>;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// pipeAsync / composeAsync
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Composes functions from left to right like {@link pipe}, but any step may return a promise (or another thenable): each step
+ * receives the AWAITED result of the previous one, the steps run one after the other, and the composed function always returns a
+ * promise, which rejects when a step throws or rejects (later steps are then not called). The first function may take any number of
+ * arguments; the others receive a single value. `this` is forwarded to every function. With no functions, the result resolves to its
+ * first argument (awaited).
+ * @template A - The parameter types of the first function
+ * @template R - The awaited return type of the pipeline
+ * @param {...Function} fns - The functions to chain
+ * @returns {Function} The piped function, returning a promise
+ * @throws {TypeError} when one of `fns` is not a function
+ * @example
+ * async function fetchUser(id: number): Promise<{ id: number; name: string }> { return { id, name: 'Ada' }; }
+ * function greet(user: { name: string }): string { return `Hello, ${user.name}`; }
+ * await pipeAsync(fetchUser, greet)(1); // => 'Hello, Ada'
+ * await pipeAsync()(Promise.resolve(5)); // => 5
+ */
+export function pipeAsync(): <T>(value: T) => Promise<Awaited<T>>;
+export function pipeAsync<A extends unknown[], R>(f1: (...args: A) => R): (...args: A) => Promise<Awaited<R>>;
+export function pipeAsync<A extends unknown[], R1, R>(f1: (...args: A) => R1, f2: (value: Awaited<R1>) => R): (...args: A) => Promise<Awaited<R>>;
+export function pipeAsync<A extends unknown[], R1, R2, R>(
+	f1: (...args: A) => R1,
+	f2: (value: Awaited<R1>) => R2,
+	f3: (value: Awaited<R2>) => R
+): (...args: A) => Promise<Awaited<R>>;
+export function pipeAsync<A extends unknown[], R1, R2, R3, R>(
+	f1: (...args: A) => R1,
+	f2: (value: Awaited<R1>) => R2,
+	f3: (value: Awaited<R2>) => R3,
+	f4: (value: Awaited<R3>) => R
+): (...args: A) => Promise<Awaited<R>>;
+export function pipeAsync<A extends unknown[], R1, R2, R3, R4, R>(
+	f1: (...args: A) => R1,
+	f2: (value: Awaited<R1>) => R2,
+	f3: (value: Awaited<R2>) => R3,
+	f4: (value: Awaited<R3>) => R4,
+	f5: (value: Awaited<R4>) => R
+): (...args: A) => Promise<Awaited<R>>;
+export function pipeAsync<A extends unknown[], R1, R2, R3, R4, R5, R>(
+	f1: (...args: A) => R1,
+	f2: (value: Awaited<R1>) => R2,
+	f3: (value: Awaited<R2>) => R3,
+	f4: (value: Awaited<R3>) => R4,
+	f5: (value: Awaited<R4>) => R5,
+	f6: (value: Awaited<R5>) => R
+): (...args: A) => Promise<Awaited<R>>;
+export function pipeAsync<R = unknown, F extends AnyFunction[] = AnyFunction[]>(...fns: UncheckedChain<F>): (...args: unknown[]) => Promise<R>;
+/**
+ * Implementation of {@link pipeAsync} (see the first overload for the full documentation).
+ * @param {...AnyFunction} fns - The functions to chain, applied left to right
+ * @returns {(...args: unknown[]) => Promise<unknown>} The piped function
+ * @throws {TypeError} when one of `fns` is not a function
+ */
+export function pipeAsync(...fns: AnyFunction[]): (...args: unknown[]) => Promise<unknown> {
+	assertFunctions('pipeAsync', fns);
+	// `fns` is a fresh rest array: no one else can change it.
+	return chainAsync(fns as unknown as UnknownFunction[]);
+}
+
+/**
+ * Composes functions from right to left like {@link compose}, but any step may return a promise (or another thenable):
+ * `composeAsync(f, g, h)(...args)` awaits `h(...args)`, passes the value to `g`, awaits the result, and so on, always returning a
+ * promise (see {@link pipeAsync}). The rightmost function may take any number of arguments; the others receive a single value.
+ * `this` is forwarded to every function. With no functions, the result resolves to its first argument (awaited).
+ * @template A - The parameter types of the rightmost function
+ * @template R - The awaited return type of the composition
+ * @param {...Function} fns - The functions to compose
+ * @returns {Function} The composed function, returning a promise
+ * @throws {TypeError} when one of `fns` is not a function
+ * @example
+ * async function double(x: number): Promise<number> { return x * 2; }
+ * function inc(x: number): number { return x + 1; }
+ * await composeAsync(double, inc)(3); // => 8
+ */
+export function composeAsync(): <T>(value: T) => Promise<Awaited<T>>;
+export function composeAsync<A extends unknown[], R>(f1: (...args: A) => R): (...args: A) => Promise<Awaited<R>>;
+export function composeAsync<A extends unknown[], R1, R>(f2: (value: Awaited<R1>) => R, f1: (...args: A) => R1): (...args: A) => Promise<Awaited<R>>;
+export function composeAsync<A extends unknown[], R1, R2, R>(
+	f3: (value: Awaited<R2>) => R,
+	f2: (value: Awaited<R1>) => R2,
+	f1: (...args: A) => R1
+): (...args: A) => Promise<Awaited<R>>;
+export function composeAsync<A extends unknown[], R1, R2, R3, R>(
+	f4: (value: Awaited<R3>) => R,
+	f3: (value: Awaited<R2>) => R3,
+	f2: (value: Awaited<R1>) => R2,
+	f1: (...args: A) => R1
+): (...args: A) => Promise<Awaited<R>>;
+export function composeAsync<A extends unknown[], R1, R2, R3, R4, R>(
+	f5: (value: Awaited<R4>) => R,
+	f4: (value: Awaited<R3>) => R4,
+	f3: (value: Awaited<R2>) => R3,
+	f2: (value: Awaited<R1>) => R2,
+	f1: (...args: A) => R1
+): (...args: A) => Promise<Awaited<R>>;
+export function composeAsync<A extends unknown[], R1, R2, R3, R4, R5, R>(
+	f6: (value: Awaited<R5>) => R,
+	f5: (value: Awaited<R4>) => R5,
+	f4: (value: Awaited<R3>) => R4,
+	f3: (value: Awaited<R2>) => R3,
+	f2: (value: Awaited<R1>) => R2,
+	f1: (...args: A) => R1
+): (...args: A) => Promise<Awaited<R>>;
+export function composeAsync<R = unknown, F extends AnyFunction[] = AnyFunction[]>(...fns: UncheckedChain<F>): (...args: unknown[]) => Promise<R>;
+/**
+ * Implementation of {@link composeAsync} (see the first overload for the full documentation).
+ * @param {...AnyFunction} fns - The functions to compose, applied right to left
+ * @returns {(...args: unknown[]) => Promise<unknown>} The composed function
+ * @throws {TypeError} when one of `fns` is not a function
+ */
+export function composeAsync(...fns: AnyFunction[]): (...args: unknown[]) => Promise<unknown> {
+	assertFunctions('composeAsync', fns);
+	// `fns` is a fresh rest array, so it can be reversed in place.
+	return chainAsync(fns.reverse() as unknown as UnknownFunction[]);
+}
+
+/**
+ * Creates the function that calls each of `fns` in order with the awaited previous result (see {@link pipeAsync}).
+ * @param {UnknownFunction[]} fns - The validated functions, owned by the returned function
+ * @returns {(...args: unknown[]) => Promise<unknown>} The chained function
+ */
+function chainAsync(fns: UnknownFunction[]): (...args: unknown[]) => Promise<unknown> {
+	// An async function: a step that throws synchronously rejects the returned promise instead of throwing.
+	return async function piped(this: unknown, ...args: unknown[]): Promise<unknown> {
+		if (fns.length === 0) return args[0];
+
+		let result = await fns[0].apply(this, args);
+
+		for (let i = 1; i < fns.length; i++) {
+			result = await fns[i].call(this, result);
+		}
+
+		return result;
+	};
 }

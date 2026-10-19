@@ -1001,3 +1001,397 @@ describe('guards', function () {
 		});
 	});
 });
+
+describe('function kinds and small guards', function () {
+	const foreignFunctions = vm.runInNewContext(`({
+		plain: function () {},
+		async: async function () {},
+		generator: function* () {},
+		asyncGenerator: async function* () {}
+	})`);
+
+	function revokedFunction(): unknown {
+		const { proxy, revoke } = Proxy.revocable(function () {}, {});
+		revoke();
+		return proxy;
+	}
+
+	describe('isAsyncFunction', function () {
+		it('accepts async functions, arrows and methods, bound or from other realms', function () {
+			expect(guards.isAsyncFunction(async function () {})).toBe(true);
+			expect(guards.isAsyncFunction(Function('return async () => undefined')())).toBe(true);
+			expect(guards.isAsyncFunction({ async method() {} }.method)).toBe(true);
+			expect(guards.isAsyncFunction(async function () {}.bind(null))).toBe(true);
+			expect(guards.isAsyncFunction(foreignFunctions.async)).toBe(true);
+		});
+
+		it('rejects other functions, fakes and non-functions', function () {
+			expect(
+				guards.isAsyncFunction(function () {
+					return Promise.resolve();
+				})
+			).toBe(false);
+			expect(guards.isAsyncFunction(async function* () {})).toBe(false);
+			expect(guards.isAsyncFunction(function* () {})).toBe(false);
+			expect(guards.isAsyncFunction(class {})).toBe(false);
+			expect(guards.isAsyncFunction(foreignFunctions.plain)).toBe(false);
+			expect(guards.isAsyncFunction(foreignFunctions.asyncGenerator)).toBe(false);
+			expect(guards.isAsyncFunction(Object.assign(function () {}, { [Symbol.toStringTag]: 'AsyncFunction' }))).toBe(false);
+			expect(guards.isAsyncFunction(Object.setPrototypeOf(function () {}, null))).toBe(false);
+			expect(guards.isAsyncFunction(Object.setPrototypeOf(async function () {}, Function.prototype))).toBe(false);
+			expect(guards.isAsyncFunction({ [Symbol.toStringTag]: 'AsyncFunction' })).toBe(false);
+			expect(guards.isAsyncFunction(Promise.resolve())).toBe(false);
+			expect(guards.isAsyncFunction(revokedFunction())).toBe(false);
+		});
+	});
+
+	describe('isGeneratorFunction', function () {
+		it('accepts generator functions, bound or from other realms', function () {
+			expect(guards.isGeneratorFunction(function* () {})).toBe(true);
+			expect(guards.isGeneratorFunction({ *method() {} }.method)).toBe(true);
+			expect(guards.isGeneratorFunction(function* () {}.bind(null))).toBe(true);
+			expect(guards.isGeneratorFunction(foreignFunctions.generator)).toBe(true);
+		});
+
+		it('rejects other functions, fakes and non-functions', function () {
+			expect(guards.isGeneratorFunction(async function* () {})).toBe(false);
+			expect(guards.isGeneratorFunction(async function () {})).toBe(false);
+			expect(guards.isGeneratorFunction(function () {})).toBe(false);
+			expect(guards.isGeneratorFunction(foreignFunctions.async)).toBe(false);
+			expect(guards.isGeneratorFunction(Object.assign(function () {}, { [Symbol.toStringTag]: 'GeneratorFunction' }))).toBe(false);
+			expect(guards.isGeneratorFunction((function* () {})())).toBe(false);
+			expect(guards.isGeneratorFunction(null)).toBe(false);
+		});
+	});
+
+	describe('isPropertyKey', function () {
+		it('accepts strings, numbers and symbols only', function () {
+			for (const key of ['', 'a', 0, -1.5, NaN, Symbol('s'), Symbol.iterator]) expect(guards.isPropertyKey(key)).toBe(true);
+			for (const other of [null, undefined, true, 1n, {}, [], function () {}, new String('a')]) expect(guards.isPropertyKey(other)).toBe(false);
+		});
+	});
+
+	describe('isArrayLike', function () {
+		it('accepts values with a valid length', function () {
+			expect(guards.isArrayLike([])).toBe(true);
+			expect(guards.isArrayLike('')).toBe(true);
+			expect(guards.isArrayLike('abc')).toBe(true);
+			expect(guards.isArrayLike(new Uint8Array(2))).toBe(true);
+			expect(guards.isArrayLike({ length: 0 })).toBe(true);
+			expect(guards.isArrayLike({ length: Number.MAX_SAFE_INTEGER })).toBe(true);
+			expect(
+				guards.isArrayLike(
+					(function (..._args: unknown[]) {
+						// eslint-disable-next-line prefer-rest-params
+						return arguments;
+					})(1, 2)
+				)
+			).toBe(true);
+			expect(guards.isArrayLike(new String('ab'))).toBe(true);
+		});
+
+		it('rejects functions, nullish values and invalid lengths', function () {
+			expect(
+				guards.isArrayLike(function (a: number) {
+					return a;
+				})
+			).toBe(false);
+			expect(guards.isArrayLike(null)).toBe(false);
+			expect(guards.isArrayLike(undefined)).toBe(false);
+			expect(guards.isArrayLike(1)).toBe(false);
+			expect(guards.isArrayLike({})).toBe(false);
+			for (const length of [-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '1', 1n, null]) expect(guards.isArrayLike({ length })).toBe(false);
+			expect(guards.isArrayLike(new Map())).toBe(false);
+		});
+
+		it('never throws', function () {
+			const throwing = {
+				get length(): number {
+					throw new Error('length');
+				}
+			};
+			expect(guards.isArrayLike(throwing)).toBe(false);
+			const { proxy, revoke } = Proxy.revocable([], {});
+			revoke();
+			expect(guards.isArrayLike(proxy)).toBe(false);
+		});
+	});
+
+	describe('isBlob', function () {
+		it('accepts blobs and files', function () {
+			expect(guards.isBlob(new Blob(['text']))).toBe(true);
+			expect(guards.isBlob(new File(['text'], 'a.txt'))).toBe(true);
+		});
+
+		it('rejects fakes and other values', function () {
+			expect(guards.isBlob({ size: 4, type: '', [Symbol.toStringTag]: 'Blob' })).toBe(false);
+			expect(guards.isBlob(Object.create(Blob.prototype))).toBe(false);
+			expect(guards.isBlob(Object.create(null))).toBe(false);
+			expect(guards.isBlob(new Uint8Array(1))).toBe(false);
+			expect(guards.isBlob(null)).toBe(false);
+			expect(guards.isBlob('blob')).toBe(false);
+		});
+
+		it('is false without a Blob global', function () {
+			const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'Blob') as PropertyDescriptor;
+			const blob = new Blob(['x']);
+			delete (globalThis as { Blob?: unknown }).Blob;
+			try {
+				expect(guards.isBlob(blob)).toBe(false);
+			} finally {
+				Object.defineProperty(globalThis, 'Blob', descriptor);
+			}
+		});
+	});
+});
+
+describe('getType', function () {
+	const other = vm.runInNewContext(`({
+		array: [1],
+		date: new Date(0),
+		regexp: /a/,
+		error: new Error('x'),
+		map: new Map(),
+		set: new Set(),
+		promise: Promise.resolve(),
+		buffer: new ArrayBuffer(1),
+		bytes: new Uint8Array(1),
+		object: {},
+		async: async function () {}
+	})`);
+
+	it('names primitives', function () {
+		expect(guards.getType(undefined)).toBe('undefined');
+		expect(guards.getType(null)).toBe('null');
+		expect(guards.getType(true)).toBe('boolean');
+		expect(guards.getType(NaN)).toBe('number');
+		expect(guards.getType(1n)).toBe('bigint');
+		expect(guards.getType('')).toBe('string');
+		expect(guards.getType(Symbol('s'))).toBe('symbol');
+	});
+
+	it('names function kinds', function () {
+		expect(guards.getType(function () {})).toBe('function');
+		expect(guards.getType(class {})).toBe('function');
+		expect(guards.getType(Math.max.bind(null))).toBe('function');
+		expect(guards.getType(async function () {})).toBe('asyncfunction');
+		expect(guards.getType(function* () {})).toBe('generatorfunction');
+		expect(guards.getType(async function* () {})).toBe('asyncgeneratorfunction');
+		expect(guards.getType(other.async)).toBe('asyncfunction');
+		expect(guards.getType(vm.runInNewContext('(function* () {})'))).toBe('generatorfunction');
+		expect(guards.getType(vm.runInNewContext('(async function* () {})'))).toBe('asyncgeneratorfunction');
+		expect(guards.getType(vm.runInNewContext('(function () {})'))).toBe('function');
+	});
+
+	it('names built-in objects by brand, in any realm', function () {
+		const cases: Array<[unknown, guards.TypeName]> = [
+			[[], 'array'],
+			[new Date(), 'date'],
+			[/a/, 'regexp'],
+			[new TypeError('x'), 'error'],
+			[new Map(), 'map'],
+			[new Set(), 'set'],
+			[new WeakMap(), 'weakmap'],
+			[new WeakSet(), 'weakset'],
+			[Promise.resolve(), 'promise'],
+			[new ArrayBuffer(1), 'arraybuffer'],
+			[new DataView(new ArrayBuffer(1)), 'dataview'],
+			[new Int8Array(1), 'int8array'],
+			[new Uint8Array(1), 'uint8array'],
+			[new Uint8ClampedArray(1), 'uint8clampedarray'],
+			[new Int16Array(1), 'int16array'],
+			[new Uint16Array(1), 'uint16array'],
+			[new Int32Array(1), 'int32array'],
+			[new Uint32Array(1), 'uint32array'],
+			[new Float32Array(1), 'float32array'],
+			[new Float64Array(1), 'float64array'],
+			[new BigInt64Array(1), 'bigint64array'],
+			[new BigUint64Array(1), 'biguint64array'],
+			[{}, 'object'],
+			[Object.create(null), 'object'],
+			[new (class Point {})(), 'object'],
+			[new Number(1), 'object'],
+			[new SharedArrayBuffer(1), 'object'],
+			[[1][Symbol.iterator](), 'object'],
+			[{ then: function () {} }, 'object'],
+			[other.array, 'array'],
+			[other.date, 'date'],
+			[other.regexp, 'regexp'],
+			[other.error, 'error'],
+			[other.map, 'map'],
+			[other.set, 'set'],
+			[other.promise, 'promise'],
+			[other.buffer, 'arraybuffer'],
+			[other.bytes, 'uint8array'],
+			[other.object, 'object']
+		];
+		for (const [index, [value, name]] of cases.entries()) expect({ index, type: guards.getType(value) }).toEqual({ index, type: name });
+		const Float16 = (globalThis as { Float16Array?: new (length: number) => unknown }).Float16Array;
+		if (Float16) expect(guards.getType(new Float16(1))).toBe('float16array');
+	});
+
+	it('is not fooled by Symbol.toStringTag or borrowed prototypes', function () {
+		for (const tag of ['Array', 'Date', 'RegExp', 'Error', 'Map', 'Set', 'Promise', 'ArrayBuffer', 'Uint8Array', 'Null']) {
+			expect(guards.getType({ [Symbol.toStringTag]: tag })).toBe('object');
+		}
+		expect(guards.getType(Object.create(Date.prototype))).toBe('object');
+		expect(guards.getType(Object.create(Map.prototype))).toBe('object');
+		const fakeDate = new Date(0);
+		Object.defineProperty(fakeDate, Symbol.toStringTag, { value: 'Map' });
+		expect(guards.getType(fakeDate)).toBe('date');
+		const fakeBytes = new Uint8Array(1);
+		Object.defineProperty(fakeBytes, Symbol.toStringTag, { value: 'Float64Array' });
+		expect(guards.getType(fakeBytes)).toBe('uint8array');
+	});
+
+	it('names proxies after arrays and functions, and survives revoked ones', function () {
+		expect(guards.getType(new Proxy([], {}))).toBe('array');
+		expect(guards.getType(new Proxy(new Map(), {}))).toBe('object');
+		expect(guards.getType(new Proxy(async function () {}, {}))).toBe('asyncfunction');
+		const { proxy, revoke } = Proxy.revocable({}, {});
+		revoke();
+		expect(guards.getType(proxy)).toBe('object');
+		const tagThrows = new Proxy(Object.create(null), {
+			get(): never {
+				throw new Error('get');
+			}
+		});
+		expect(guards.getType(tagThrows)).toBe('object');
+	});
+});
+
+describe('runtime detection', function () {
+	const realm = globalThis as unknown as Record<string, unknown>;
+
+	/**
+	 * Runs `fn` with the given globals replaced (`undefined` deletes one), restoring them afterwards.
+	 */
+	function withGlobals<T>(globals: Record<string, unknown>, fn: () => T): T {
+		const saved = new Map<string, PropertyDescriptor | undefined>();
+		for (const [name, value] of Object.entries(globals)) {
+			saved.set(name, Object.getOwnPropertyDescriptor(realm, name));
+			if (value === undefined) delete realm[name];
+			else Object.defineProperty(realm, name, { value, configurable: true, writable: true });
+		}
+		try {
+			return fn();
+		} finally {
+			for (const [name, descriptor] of saved) {
+				if (descriptor) Object.defineProperty(realm, name, descriptor);
+				else delete realm[name];
+			}
+		}
+	}
+
+	function detect(): Record<string, boolean> {
+		return { node: guards.isNode(), deno: guards.isDeno(), bun: guards.isBun(), browser: guards.isBrowser(), worker: guards.isWebWorker() };
+	}
+
+	const none = { node: false, deno: false, bun: false, browser: false, worker: false };
+	const documentStub = { nodeType: 9 };
+
+	it('detects Node (the test runner)', function () {
+		expect(detect()).toEqual({ ...none, node: true });
+	});
+
+	it('detects Bun and Deno, which are not Node', function () {
+		withGlobals({ process: { versions: { node: '22.0.0', bun: '1.2.0' } } }, function () {
+			expect(detect()).toEqual({ ...none, bun: true });
+		});
+		withGlobals({ Deno: { version: { deno: '2.0.0' } }, process: { versions: { node: '20.11.1' } } }, function () {
+			expect(detect()).toEqual({ ...none, deno: true });
+		});
+		withGlobals({ Deno: { version: { deno: '2.0.0' } }, process: undefined }, function () {
+			expect(detect()).toEqual({ ...none, deno: true });
+		});
+	});
+
+	it('detects a browser main thread, even with a bundler process shim', function () {
+		withGlobals({ window: globalThis, document: documentStub, process: undefined }, function () {
+			expect(detect()).toEqual({ ...none, browser: true });
+		});
+		withGlobals({ window: globalThis, document: documentStub, process: { browser: true, env: {}, versions: {} } }, function () {
+			expect(detect()).toEqual({ ...none, browser: true });
+		});
+	});
+
+	it('does not take jsdom, happy-dom or SSR stubs for a browser', function () {
+		withGlobals({ window: globalThis, document: documentStub }, function () {
+			expect(detect()).toEqual({ ...none, node: true });
+		});
+		withGlobals({ window: {}, document: documentStub, process: undefined }, function () {
+			expect(detect()).toEqual(none);
+		});
+		withGlobals({ window: globalThis, document: null, process: undefined }, function () {
+			expect(detect()).toEqual(none);
+		});
+		withGlobals({ window: globalThis, document: documentStub, process: undefined, Deno: { version: { deno: '1.40.0' } } }, function () {
+			expect(detect()).toEqual({ ...none, deno: true });
+		});
+	});
+
+	it('detects web workers', function () {
+		class WorkerGlobalScope {}
+		Object.setPrototypeOf(realm, WorkerGlobalScope.prototype);
+		try {
+			withGlobals({ WorkerGlobalScope, process: undefined }, function () {
+				expect(detect()).toEqual({ ...none, worker: true });
+			});
+		} finally {
+			Object.setPrototypeOf(realm, Object.prototype);
+		}
+		withGlobals({ WorkerGlobalScope: class {} }, function () {
+			expect(guards.isWebWorker()).toBe(false);
+		});
+		withGlobals({ WorkerGlobalScope: {} }, function () {
+			expect(guards.isWebWorker()).toBe(false);
+		});
+	});
+
+	it('ignores fake runtime globals', function () {
+		withGlobals({ process: { versions: { node: 22 } }, Deno: { version: '2' } }, function () {
+			expect(detect()).toEqual(none);
+		});
+		withGlobals({ process: { versions: null }, Deno: null }, function () {
+			expect(detect()).toEqual(none);
+		});
+	});
+
+	it('never throws for hostile globals', function () {
+		const hostile = {
+			get version(): never {
+				throw new Error('version');
+			}
+		};
+		const scope = Object.defineProperty(function () {}, Symbol.hasInstance, {
+			value: function (): never {
+				throw new Error('hasInstance');
+			}
+		});
+		// Detected first, checked after the globals are restored: the test runner itself needs a working `process`.
+		const versions = {
+			get versions(): never {
+				throw new Error('versions');
+			}
+		};
+		const hostileGlobals = withGlobals({ process: versions, Deno: hostile, WorkerGlobalScope: scope }, detect);
+		// A global whose getter throws (defined on the global object's prototype: Node's `vm` contexts ignore accessors defined on the
+		// global object itself).
+		const prototype = Object.getPrototypeOf(realm);
+		const throwing = {
+			configurable: true,
+			get: function (): never {
+				throw new Error('getter');
+			}
+		};
+		Object.setPrototypeOf(realm, Object.create(prototype, { Deno: throwing, WorkerGlobalScope: throwing, document: throwing }));
+		let throwingGetter: Record<string, boolean>;
+		try {
+			throwingGetter = withGlobals({ Deno: undefined, process: undefined }, detect);
+		} finally {
+			Object.setPrototypeOf(realm, prototype);
+		}
+		expect(hostileGlobals).toEqual(none);
+		expect(throwingGetter).toEqual(none);
+	});
+});

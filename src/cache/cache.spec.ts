@@ -1,5 +1,7 @@
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import { memoize, type MemoizeCache } from '../functions/index.js';
-import { createLRUCache, createPriorityQueue, type LRUCache, type LRUEvictionReason, type PriorityQueue } from '.';
+import { createDeque, createLRUCache, createPriorityQueue, type Deque, type LRUCache, type LRUEvictionReason, type PriorityQueue } from '.';
 
 function fakeClock(start = 0) {
 	const clock = {
@@ -775,5 +777,322 @@ describe('createPriorityQueue', function () {
 		expect([...queue]).toEqual([]);
 		queue.push(3);
 		expect(queue.pop()).toBe(3);
+	});
+});
+
+describe('LRUCache.getOrSet', function () {
+	it('returns a live value without calling the factory, and marks it most recently used', function () {
+		const cache = createLRUCache<string, number>({ max: 2 });
+		cache.set('a', 1).set('b', 2);
+		const factory = jest.fn(function (): number {
+			return 99;
+		});
+		expect(cache.getOrSet('a', factory)).toBe(1);
+		expect(factory).not.toHaveBeenCalled();
+		cache.set('c', 3);
+		expect([...cache.keys()]).toEqual(['c', 'a']);
+	});
+
+	it('calls the factory with the key on a miss, stores and returns its result', function () {
+		const events: unknown[] = [];
+		const cache = createLRUCache<string, number>({
+			max: 1,
+			onEvict(key, value, reason) {
+				events.push([key, value, reason]);
+			}
+		});
+		cache.set('old', 0);
+		expect(
+			cache.getOrSet('abc', function (key) {
+				return key.length;
+			})
+		).toBe(3);
+		expect(cache.get('abc')).toBe(3);
+		expect(events).toEqual([['old', 0, 'capacity']]);
+	});
+
+	it('treats a stored undefined as a hit', function () {
+		const cache = createLRUCache<string, number | undefined>({ max: 2 });
+		cache.set('u', undefined);
+		const factory = jest.fn(function (): number {
+			return 1;
+		});
+		expect(cache.getOrSet('u', factory)).toBeUndefined();
+		expect(factory).not.toHaveBeenCalled();
+	});
+
+	it('respects TTLs: recomputes expired entries, applies the given TTL, restarts it with updateAgeOnGet', function () {
+		const clock = fakeClock();
+		const events: unknown[] = [];
+		const cache = createLRUCache<string, number>({
+			max: 10,
+			ttl: 100,
+			now: clock.now,
+			updateAgeOnGet: true,
+			onEvict(key, value, reason) {
+				events.push([key, value, reason]);
+			}
+		});
+		let next = 0;
+		function factory(): number {
+			return ++next;
+		}
+		expect(cache.getOrSet('k', factory, { ttl: 10 })).toBe(1);
+		clock.advance(9);
+		expect(cache.getOrSet('k', factory)).toBe(1);
+		clock.advance(9);
+		// Restarted by the previous hit (updateAgeOnGet).
+		expect(cache.getOrSet('k', factory)).toBe(1);
+		clock.advance(10);
+		expect(cache.getOrSet('k', factory)).toBe(2);
+		expect(events).toEqual([['k', 1, 'expired']]);
+		clock.advance(99);
+		expect(cache.getOrSet('k', factory)).toBe(2);
+		clock.advance(100);
+		expect(cache.peek('k')).toBeUndefined();
+	});
+
+	it('stores nothing when the factory throws, and validates before calling it', function () {
+		const cache = createLRUCache<string, number>({ max: 2 });
+		expect(function () {
+			cache.getOrSet('k', function (): number {
+				throw new Error('boom');
+			});
+		}).toThrow('boom');
+		expect(cache.has('k')).toBe(false);
+		const factory = jest.fn(function (): number {
+			return 1;
+		});
+		expect(function () {
+			cache.getOrSet('k', factory, { ttl: 0 });
+		}).toThrow(new RangeError('LRUCache.getOrSet: `ttl` must be a number > 0 or Infinity, got 0'));
+		expect(factory).not.toHaveBeenCalled();
+		expect(function () {
+			cache.getOrSet('k', 'nope' as never);
+		}).toThrow(new TypeError('LRUCache.getOrSet: `factory` must be a function, got string'));
+	});
+
+	it('stores the factory result over anything the factory stored itself', function () {
+		const events: unknown[] = [];
+		const cache = createLRUCache<string, number>({
+			max: 3,
+			onEvict(key, value, reason) {
+				events.push([key, value, reason]);
+			}
+		});
+		expect(
+			cache.getOrSet('k', function (): number {
+				cache.set('k', 1);
+				return 2;
+			})
+		).toBe(2);
+		expect(cache.get('k')).toBe(2);
+		expect(events).toEqual([['k', 1, 'replaced']]);
+	});
+
+	it('shares one in-flight promise between concurrent callers', async function () {
+		const cache = createLRUCache<string, Promise<string>>({ max: 10 });
+		let calls = 0;
+		function load(key: string): Promise<string> {
+			calls++;
+			return Promise.resolve(key.toUpperCase());
+		}
+		const [a, b] = await Promise.all([cache.getOrSet('x', load), cache.getOrSet('x', load)]);
+		expect([a, b, calls]).toEqual(['X', 'X', 1]);
+	});
+});
+
+describe('createDeque', function () {
+	it('pushes, pops and peeks at both ends', function () {
+		const deque: Deque<number> = createDeque<number>();
+		expect(deque.size).toBe(0);
+		expect(deque.capacity).toBe(Infinity);
+		expect([deque.popBack(), deque.popFront(), deque.peekBack(), deque.peekFront(), deque.at(0)]).toEqual([undefined, undefined, undefined, undefined, undefined]);
+		expect(deque.pushBack(2)).toBe(1);
+		expect(deque.pushFront(1)).toBe(2);
+		expect(deque.pushBack(3)).toBe(3);
+		expect([...deque]).toEqual([1, 2, 3]);
+		expect([deque.peekFront(), deque.peekBack()]).toEqual([1, 3]);
+		expect([deque.at(0), deque.at(2), deque.at(3), deque.at(-1), deque.at(-3), deque.at(-4)]).toEqual([1, 3, undefined, 3, 1, undefined]);
+		expect(deque.popFront()).toBe(1);
+		expect(deque.popBack()).toBe(3);
+		expect(deque.popBack()).toBe(2);
+		expect(deque.size).toBe(0);
+	});
+
+	it('takes initial values from any iterable, null or undefined', function () {
+		expect([...createDeque('abc')]).toEqual(['a', 'b', 'c']);
+		expect([...createDeque(new Set([1, 2]))]).toEqual([1, 2]);
+		expect([...createDeque(null)]).toEqual([]);
+		expect([...createDeque(undefined)]).toEqual([]);
+		expect([
+			...createDeque(
+				(function* () {
+					yield 1;
+					yield 2;
+				})()
+			)
+		]).toEqual([1, 2]);
+	});
+
+	it('grows and shrinks its ring across many wraps', function () {
+		const deque = createDeque<number>();
+		const model: number[] = [];
+		for (let round = 0; round < 3; round++) {
+			for (let i = 0; i < 1000; i++) {
+				if (i % 2) {
+					deque.pushBack(i);
+					model.push(i);
+				} else {
+					deque.pushFront(i);
+					model.unshift(i);
+				}
+			}
+			expect([...deque]).toEqual(model);
+			for (let i = 0; i < 990; i++) {
+				expect(i % 3 ? deque.popFront() : deque.popBack()).toBe(i % 3 ? model.shift() : model.pop());
+			}
+			expect([...deque]).toEqual(model);
+		}
+	});
+
+	it('drops the value at the other end when full (a ring buffer)', function () {
+		const deque = createDeque([1, 2, 3, 4, 5], { capacity: 3 });
+		expect([...deque]).toEqual([3, 4, 5]);
+		expect(deque.capacity).toBe(3);
+		expect(deque.pushBack(6)).toBe(3);
+		expect([...deque]).toEqual([4, 5, 6]);
+		expect(deque.pushFront(0)).toBe(3);
+		expect([...deque]).toEqual([0, 4, 5]);
+		const one = createDeque<string>(null, { capacity: 1 });
+		one.pushBack('a');
+		one.pushFront('b');
+		expect([...one]).toEqual(['b']);
+		one.pushBack('c');
+		expect([one.peekFront(), one.peekBack(), one.size]).toEqual(['c', 'c', 1]);
+		const large = createDeque<number>(null, { capacity: 20 });
+		for (let i = 0; i < 100; i++) large.pushBack(i);
+		expect([...large]).toEqual(
+			Array.from({ length: 20 }, function (_, i) {
+				return 80 + i;
+			})
+		);
+	});
+
+	it('clears, and iterates over a snapshot', function () {
+		const deque = createDeque([1, 2, 3]);
+		const seen: number[] = [];
+		for (const value of deque) {
+			seen.push(value);
+			deque.pushBack(value * 10);
+		}
+		expect(seen).toEqual([1, 2, 3]);
+		expect(deque.size).toBe(6);
+		deque.clear();
+		expect([deque.size, [...deque], deque.popFront()]).toEqual([0, [], undefined]);
+		deque.pushFront(7);
+		expect([...deque]).toEqual([7]);
+	});
+
+	it('releases removed and dropped values', async function () {
+		setFlagsFromString('--expose-gc');
+		const gc = runInNewContext('gc') as () => void;
+		const bounded = createDeque<object>(null, { capacity: 2 });
+		const unbounded = createDeque<object>();
+		const grown = createDeque<object>();
+		const refs: Array<WeakRef<object>> = [];
+		(function () {
+			const values = [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }];
+			// Growing the ring from the front must not leave a stale copy of a value in the new ring (popping the front value, without
+			// shrinking the ring, must release it).
+			const first = { id: 10 };
+			grown.pushBack(first);
+			for (let i = 11; i < 18; i++) grown.pushBack({ id: i });
+			grown.pushFront({ id: 9 });
+			grown.popFront();
+			grown.popFront();
+			refs.push(new WeakRef(first));
+			refs.push(
+				...values.map(function (value) {
+					return new WeakRef(value);
+				})
+			);
+			// 1 dropped by capacity from the back, 2 by a pushFront from the front... then both popped.
+			bounded.pushBack(values[0]);
+			bounded.pushBack(values[1]);
+			bounded.pushBack(values[2]);
+			bounded.pushFront(values[3]);
+			bounded.popFront();
+			bounded.popBack();
+			unbounded.pushFront(values[4]);
+			unbounded.popBack();
+		})();
+		await new Promise(function (resolve) {
+			setTimeout(resolve, 0);
+		});
+		gc();
+		expect(refs).toHaveLength(6);
+		expect(
+			refs.filter(function (ref) {
+				return ref.deref() !== undefined;
+			})
+		).toEqual([]);
+		expect([bounded.size, unbounded.size, grown.size]).toEqual([0, 0, 7]);
+	});
+
+	it('never reads a polluted Array.prototype', function () {
+		const proto = Array.prototype as unknown as Record<number, unknown>;
+		proto[0] = 'polluted';
+		proto[5] = 'polluted';
+		try {
+			const deque = createDeque<number>();
+			expect([deque.peekFront(), deque.peekBack(), deque.popFront(), deque.popBack(), deque.at(0)]).toEqual([undefined, undefined, undefined, undefined, undefined]);
+		} finally {
+			delete proto[0];
+			delete proto[5];
+		}
+	});
+
+	it('validates its arguments, ignoring a polluted Object.prototype', function () {
+		expect(function () {
+			createDeque(5 as never);
+		}).toThrow(new TypeError('createDeque: `values` must be an iterable, got number'));
+		expect(function () {
+			createDeque({} as never);
+		}).toThrow(new TypeError('createDeque: `values` must be an iterable, got object'));
+		expect(function () {
+			createDeque([], { capacity: 0 });
+		}).toThrow(new RangeError('createDeque: `options.capacity` must be an integer >= 1 or Infinity, got 0'));
+		expect(function () {
+			createDeque([], { capacity: 1.5 });
+		}).toThrow(RangeError);
+		expect(function () {
+			createDeque([], { capacity: '3' as never });
+		}).toThrow(TypeError);
+		const deque = createDeque([1]);
+		expect(function () {
+			deque.at(0.5);
+		}).toThrow(new RangeError('Deque.at: `index` must be an integer, got 0.5'));
+		expect(function () {
+			deque.at('0' as never);
+		}).toThrow(new TypeError('Deque.at: `index` must be an integer, got string'));
+		expect(function () {
+			deque.at(NaN);
+		}).toThrow(RangeError);
+		const proto = Object.prototype as Record<string, unknown>;
+		proto.capacity = 1;
+		try {
+			expect(createDeque([1, 2, 3]).size).toBe(3);
+		} finally {
+			delete proto.capacity;
+		}
+	});
+
+	it('shares the size getter shape with the other structures', function () {
+		const deque = createDeque([1, 2]);
+		expect(Object.keys(deque)).toContain('size');
+		expect(Object.getOwnPropertyDescriptor(deque, 'size')).toEqual(Object.getOwnPropertyDescriptor(createLRUCache({ max: 1 }), 'size'));
+		expect(Object.getOwnPropertyDescriptor(deque, 'size')?.configurable).toBe(true);
+		expect({ ...deque }.size).toBe(2);
 	});
 });

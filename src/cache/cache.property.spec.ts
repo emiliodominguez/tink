@@ -1,6 +1,6 @@
 import fc from 'fast-check';
 import { memoize } from '../functions/index.js';
-import { createLRUCache, createPriorityQueue, type LRUCache, type LRUEvictionReason } from '.';
+import { createDeque, createLRUCache, createPriorityQueue, type LRUCache, type LRUEvictionReason } from '.';
 
 type Key = number;
 type Value = number;
@@ -120,6 +120,26 @@ const commandArbs = [
 		return command(`set(${key}, ${value}, ttl=${String(ttl)})`, function (model, real) {
 			modelSet(model, key, value, ttl);
 			expect(real.cache.set(key, value, ttl === undefined ? undefined : { ttl })).toBe(real.cache);
+		});
+	}),
+	fc.tuple(keyArb, valueArb, ttlArb).map(function ([key, value, ttl]) {
+		return command(`getOrSet(${key}, ${value}, ttl=${String(ttl)})`, function (model, real) {
+			const live = modelLookup(model, key) !== undefined;
+			let expected = value;
+			if (live) expected = modelGet(model, key) as Value;
+			else modelSet(model, key, value, ttl);
+			let calls = 0;
+			const result = real.cache.getOrSet(
+				key,
+				function (received) {
+					calls++;
+					expect(received).toBe(key);
+					return value;
+				},
+				ttl === undefined ? undefined : { ttl }
+			);
+			expect(result).toBe(expected);
+			expect(calls).toBe(live ? 0 : 1);
 		});
 	}),
 	keyArb.map(function (key) {
@@ -311,6 +331,76 @@ describe('createPriorityQueue (properties)', function () {
 						expect(queue.peek()).toBe(model.slice().sort(byPriority)[0]);
 						expect([...queue]).toEqual(model.slice().sort(byPriority));
 					}
+				}
+			)
+		);
+	});
+});
+
+describe('createDeque (properties)', function () {
+	type DequeOp =
+		| { op: 'pushBack' | 'pushFront'; value: number }
+		| { op: 'popBack' | 'popFront' | 'peekBack' | 'peekFront' | 'clear' | 'iterate' }
+		| { op: 'at'; index: number };
+
+	const dequeOpArb: fc.Arbitrary<DequeOp> = fc.oneof(
+		{ arbitrary: fc.record({ op: fc.constantFrom('pushBack' as const, 'pushFront' as const), value: fc.integer() }), weight: 6 },
+		{ arbitrary: fc.record({ op: fc.constantFrom('popBack' as const, 'popFront' as const) }), weight: 4 },
+		{ arbitrary: fc.record({ op: fc.constantFrom('peekBack' as const, 'peekFront' as const, 'iterate' as const) }), weight: 2 },
+		{ arbitrary: fc.record({ op: fc.constant('clear' as const) }), weight: 1 },
+		{ arbitrary: fc.record({ op: fc.constant('at' as const), index: fc.integer({ min: -40, max: 40 }) }), weight: 2 }
+	);
+
+	it('behaves like an array model under any sequence of operations, bounded or not', function () {
+		fc.assert(
+			fc.property(
+				fc.array(fc.integer(), { maxLength: 20 }),
+				fc.option(fc.integer({ min: 1, max: 12 }), { nil: undefined }),
+				fc.array(dequeOpArb, { maxLength: 300 }),
+				function (initial, capacity, ops) {
+					const deque = createDeque(initial, capacity === undefined ? {} : { capacity });
+					const limit = capacity ?? Infinity;
+					// Reference model: an array from front to back, trimmed like the deque.
+					let model = initial.slice(Math.max(0, initial.length - limit));
+					expect([...deque]).toEqual(model);
+					for (const step of ops) {
+						switch (step.op) {
+							case 'pushBack':
+								model.push(step.value);
+								if (model.length > limit) model.shift();
+								expect(deque.pushBack(step.value)).toBe(model.length);
+								break;
+							case 'pushFront':
+								model.unshift(step.value);
+								if (model.length > limit) model.pop();
+								expect(deque.pushFront(step.value)).toBe(model.length);
+								break;
+							case 'popBack':
+								expect(deque.popBack()).toBe(model.pop());
+								break;
+							case 'popFront':
+								expect(deque.popFront()).toBe(model.shift());
+								break;
+							case 'peekBack':
+								expect(deque.peekBack()).toBe(model[model.length - 1]);
+								break;
+							case 'peekFront':
+								expect(deque.peekFront()).toBe(model[0]);
+								break;
+							case 'clear':
+								model = [];
+								deque.clear();
+								break;
+							case 'at':
+								expect(deque.at(step.index)).toBe(model.at(step.index));
+								break;
+							default:
+								expect([...deque]).toEqual(model);
+						}
+						expect(deque.size).toBe(model.length);
+						expect(deque.size).toBeLessThanOrEqual(limit);
+					}
+					expect([...deque]).toEqual(model);
 				}
 			)
 		);

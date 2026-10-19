@@ -2048,4 +2048,492 @@ describe('String helpers under prototype pollution', function () {
 			for (const key of ['ellipsis', 'position', 'ignoreCase', 'visibleEnd', 'char', 'breakLongWords', 'case']) delete polluted[key];
 		}
 	});
+
+	it('read the options of the text helpers as own properties only', function () {
+		const polluted = Object.prototype as Record<string, unknown>;
+		Object.assign(polluted, { suffix: '<EVIL>', separator: 'x', lowercase: false, replacements: { a: 'b' }, indent: '#', includeEmptyLines: true, replacement: '' });
+		polluted.maxLength = 3;
+		try {
+			expect(helpers.truncate('hello world', 7, {})).toBe('hello w...');
+			expect(helpers.toSlug('A b')).toBe('a-b');
+			expect(helpers.toSlug('A b', {})).toBe('a-b');
+			expect(helpers.indent('a\n\nb', 1)).toBe(' a\n\n b');
+			expect(helpers.toSafeFilename('a/b.txt')).toBe('a_b.txt');
+		} finally {
+			for (const key of ['suffix', 'separator', 'lowercase', 'replacements', 'indent', 'includeEmptyLines', 'replacement', 'maxLength']) delete polluted[key];
+		}
+	});
+});
+
+describe('truncate with options', function () {
+	it('takes the suffix from an options object, and keeps every other suffix argument as before', function () {
+		expect(helpers.truncate('hello world', 5, {})).toBe('hello...');
+		expect(helpers.truncate('hello world', 5, { suffix: '…' })).toBe('hello…');
+		expect(helpers.truncate('hello', 5, { separator: ' ' })).toBe('hello');
+		expect(function () {
+			helpers.truncate('hello', 2, { suffix: 1 as never });
+		}).toThrow(new TypeError('truncate: `suffix` must be a string, got number'));
+		expect(function () {
+			helpers.truncate('hello', 2, 1 as never);
+		}).toThrow(new TypeError('truncate: `suffix` must be a string, got number'));
+		expect(function () {
+			helpers.truncate('hello', 2, { separator: 1 as never });
+		}).toThrow(new TypeError('truncate: `separator` must be a string or a RegExp, got number'));
+		expect(function () {
+			helpers.truncate('hello', 2, { separator: null as never });
+		}).toThrow(new TypeError('truncate: `separator` must be a string or a RegExp, got null'));
+	});
+
+	it('moves the cut back to the last separator, like lodash', function () {
+		expect(helpers.truncate('hello world foo', 8, { separator: ' ' })).toBe('hello...');
+		// The separator starts right at the cut: the kept text ends with a whole word.
+		expect(helpers.truncate('hello world', 5, { separator: ' ' })).toBe('hello...');
+		// No separator in the kept text: the hard cut stays.
+		expect(helpers.truncate('helloworld', 5, { separator: ' ' })).toBe('hello...');
+		// Two spaces: a string separator cuts before the last one, a RegExp before the whole run.
+		expect(helpers.truncate('hello  world', 7, { separator: ' ' })).toBe('hello ...');
+		expect(helpers.truncate('hello  world', 7, { separator: / +/ })).toBe('hello...');
+		expect(helpers.truncate(' leading', 4, { separator: ' ' })).toBe('...');
+		// An occurrence that straddles the cut counts from its start.
+		expect(helpers.truncate('one - two', 5, { separator: ' - ' })).toBe('one...');
+		expect(helpers.truncate('abc', 2, { separator: '' })).toBe('ab...');
+	});
+
+	it('matches a RegExp separator on a copy, with look-arounds across the cut', function () {
+		const separator = /,? +/g;
+		separator.lastIndex = 5;
+		expect(helpers.truncate('hi-diddly-ho there, neighborino', 24, { separator })).toBe('hi-diddly-ho there...');
+		expect(separator.lastIndex).toBe(5);
+		expect(helpers.truncate('a b c d', 4, { separator: /\s(?=d)/y })).toBe('a b ...');
+		expect(helpers.truncate('a b c d', 5, { separator: /\s(?=d)/ })).toBe('a b c...');
+		expect(helpers.truncate('one two', 5, { separator: /\b/ })).toBe('one ...');
+		expect(helpers.truncate('aaaa', 2, { separator: /x*/ })).toBe('aa...');
+		expect(helpers.truncate('abc def', 2, { separator: /\s/u })).toBe('ab...');
+	});
+
+	it('never cuts at a separator inside a grapheme cluster', function () {
+		expect(helpers.truncate('e\u0301e\u0301 e\u0301e\u0301', 4, { separator: ' ' })).toBe('e\u0301e\u0301...');
+		// A ZWJ is a separator here, but only between graphemes.
+		expect(helpers.truncate('a\u200db 👨\u200d👩\u200d👧x', 3, { separator: '\u200d' })).toBe('a\u200db ...');
+		expect(helpers.truncate('x\u0301 y\u0301z', 3, { separator: '\u0301' })).toBe('x\u0301 y\u0301...');
+		expect(helpers.truncate('ab\u0301cd e', 3, { separator: /\u0301/ })).toBe('ab\u0301c...');
+		expect(helpers.truncate('👍🏽 👍🏽👍🏽', 3, { separator: /\s/ })).toBe('👍🏽...');
+		expect(helpers.truncate(' e\u0301e\u0301e\u0301', 2, { separator: /\s/ })).toBe('...');
+	});
+});
+
+describe('toSlug options', function () {
+	it('keeps its default output', function () {
+		expect(helpers.toSlug('Straße Æon Øre Łódź', {})).toBe('strasse-aeon-ore-lodz');
+		expect(helpers.toSlug('ẞ Œ Þ', {})).toBe('ss-oe-th');
+	});
+
+	it('joins the words with a custom separator', function () {
+		expect(helpers.toSlug('Hello, World!', { separator: '_' })).toBe('hello_world');
+		expect(helpers.toSlug('Hello World', { separator: '' })).toBe('helloworld');
+		expect(helpers.toSlug('  a  b  ', { separator: ' -- ' })).toBe('a -- b');
+		expect(function () {
+			helpers.toSlug('x', { separator: 1 as never });
+		}).toThrow(new TypeError('toSlug: `separator` must be a string, got number'));
+	});
+
+	it('keeps the case of letters when lowercase is false', function () {
+		expect(helpers.toSlug('Hello World', { lowercase: false })).toBe('Hello-World');
+		expect(helpers.toSlug('Æon Þór ẞ Œuvre Ørsted Đ Ð Łódź straße', { lowercase: false })).toBe('AEon-THor-SS-OEuvre-Orsted-D-D-Lodz-strasse');
+	});
+
+	it('applies replacements first, longest key first, in a single pass', function () {
+		expect(helpers.toSlug('Tom & Jerry', { replacements: { '&': ' and ' } })).toBe('tom-and-jerry');
+		expect(helpers.toSlug('C++ & C#', { replacements: { '+': ' plus ', '++': ' plus plus ', '#': ' sharp', '&': ' ' } })).toBe('c-plus-plus-c-sharp');
+		expect(helpers.toSlug('a->b-c', { replacements: { '-': ' minus ', '->': ' to ' } })).toBe('a-to-b-minus-c');
+		expect(helpers.toSlug('ab', { replacements: { a: 'b', b: 'c' } })).toBe('bc');
+		expect(helpers.toSlug('1€', { replacements: { '€': ' euros' } })).toBe('1-euros');
+		expect(helpers.toSlug('a.b', { replacements: { '.': ' dot ' } })).toBe('a-dot-b');
+		expect(helpers.toSlug('a-b', { replacements: {} })).toBe('a-b');
+		expect(helpers.toSlug('a__proto__b', { replacements: JSON.parse('{"__proto__": "-"}') })).toBe('a-b');
+	});
+
+	it('validates the replacements', function () {
+		expect(function () {
+			helpers.toSlug('x', { replacements: 'x' as never });
+		}).toThrow(new TypeError('toSlug: `replacements` must be an object, got string'));
+		expect(function () {
+			helpers.toSlug('x', { replacements: null as never });
+		}).toThrow(new TypeError('toSlug: `replacements` must be an object, got null'));
+		expect(function () {
+			helpers.toSlug('x', { replacements: { x: 1 } as never });
+		}).toThrow(new TypeError('toSlug: `replacements` values must be strings, got number'));
+		expect(function () {
+			helpers.toSlug('x', { replacements: { '': 'y' } });
+		}).toThrow(new RangeError('toSlug: `replacements` keys must not be empty'));
+	});
+});
+
+describe('stripAnsi', function () {
+	it('removes colours, styles and cursor movements', function () {
+		expect(helpers.stripAnsi('\x1b[0m\x1b[4m\x1b[42m\x1b[31mfoo\x1b[39m\x1b[49m\x1b[24mfoo\x1b[0m')).toBe('foofoo');
+		expect(helpers.stripAnsi('\x1b[00;38;5;244m\x1b[m\x1b[00;38;5;33mfoo\x1b[0m')).toBe('foo');
+		expect(helpers.stripAnsi('\x1b[0;33;49;3;9;4mbar\x1b[0m')).toBe('bar');
+		expect(helpers.stripAnsi('\x1b[38:2:255:0:0mrgb\x1b[4:3m~\x1b[0m')).toBe('rgb~');
+		expect(helpers.stripAnsi('\x1b[?25l\x1b[2J\x1b[H\x1b[=3h\x1b[>c\x1b[<u ok')).toBe(' ok');
+		expect(helpers.stripAnsi('\x9b31mred\x9b0m')).toBe('red');
+		expect(helpers.stripAnsi('\x1b(B\x1b#8\x1b=\x1b>\x1b7\x1b8\x1bc\x1bN\x1bO done')).toBe(' done');
+	});
+
+	it('removes OSC strings with any terminator, keeping the text of hyperlinks', function () {
+		expect(helpers.stripAnsi('\x1b]8;;https://github.com\x07click\x1b]8;;\x07')).toBe('click');
+		expect(helpers.stripAnsi('\x1b]8;;https://github.com\x1b\\click\x1b]8;;\x1b\\')).toBe('click');
+		expect(helpers.stripAnsi('\x9d8;;https://github.com\x9cclick\x9d8;;\x07')).toBe('click');
+		expect(helpers.stripAnsi('\x1b]0;window title\x07text')).toBe('text');
+		expect(helpers.stripAnsi('\x1b]8;id=1;https://a.b/c?d=e&f=g\x1b\\link\x1b]8;;\x1b\\ tail')).toBe('link tail');
+	});
+
+	it('removes DCS, SOS, PM and APC strings whole', function () {
+		expect(helpers.stripAnsi('\x1bP1$r0m\x1b\\after')).toBe('after');
+		expect(helpers.stripAnsi('\x90q#0\x9c|\x98sos\x9c|\x9epm\x9c|\x9fapc\x07|\x1bXs\x1b\\|\x1b^p\x1b\\|\x1b_a\x1b\\')).toBe('||||||');
+	});
+
+	it('cancels a control string at ESC, CAN, SUB or another introducer', function () {
+		expect(helpers.stripAnsi('\x1b]0;title\x1b[31mX')).toBe('X');
+		expect(helpers.stripAnsi('\x1b]0;title\x18Y')).toBe('\x18Y');
+		expect(helpers.stripAnsi('\x1b]0;title\x1aY')).toBe('\x1aY');
+		expect(helpers.stripAnsi('\x1b]0;title\x9b1mZ')).toBe('Z');
+		expect(helpers.stripAnsi('\x1b]0;a\x9d0;b\x07c')).toBe('c');
+	});
+
+	it('removes a sequence left open at the end, and keeps the other control characters', function () {
+		expect(helpers.stripAnsi('unterminated \x1b]8;;https://x')).toBe('unterminated ');
+		expect(helpers.stripAnsi('a\x1b[31')).toBe('a');
+		expect(helpers.stripAnsi('a\x1b')).toBe('a');
+		expect(helpers.stripAnsi('\x1b[31\nx')).toBe('31\nx');
+		expect(helpers.stripAnsi('a\tb\r\n\x07c\x85\x9c\x18\x1a')).toBe('a\tb\r\n\x07c\x85\x9c\x18\x1a');
+	});
+
+	it('removes stray introducers, so that removing a sequence never splices a new one together (regression)', function () {
+		// A lone ESC before a removed sequence used to be kept and joined to the text after it: a window title or clipboard write (OSC 52).
+		expect(helpers.stripAnsi('\x1b\x1b[0m]2;pwned\x07after')).toBe(']2;pwned\x07after');
+		expect(helpers.stripAnsi('\x1b\x1b[m]52;c;aGk=\x07')).toBe(']52;c;aGk=\x07');
+		expect(helpers.stripAnsi('\x1b\x9b0m[31mred')).toBe('[31mred');
+		expect(helpers.stripAnsi('\x1b\x1b\x1b[1m[2m]0;t\x07')).toBe('[2m]0;t\x07');
+		expect(helpers.stripAnsi('\x9b\x90\x98\x9d\x9e\x9f')).toBe('');
+		expect(helpers.stripAnsi('x\x1b')).toBe('x');
+	});
+
+	it('leaves stringWidth unchanged on stray introducers', function () {
+		expect(helpers.stringWidth('\x1b\x1b[0m]2;pwned\x07after')).toBe(13);
+		expect(helpers.stringWidth('a\x1b')).toBe(1);
+	});
+
+	it('returns plain text unchanged, validates its argument and stays linear', function () {
+		expect(helpers.stripAnsi('plain')).toBe('plain');
+		expect(helpers.stripAnsi('')).toBe('');
+		expect(function () {
+			helpers.stripAnsi(1 as never);
+		}).toThrow(new TypeError('stripAnsi: `string` must be a string, got number'));
+		const started = Date.now();
+		expect(helpers.stripAnsi('\x1b]'.repeat(50_000))).toBe('');
+		expect(helpers.stripAnsi('\x1b[' + '1;'.repeat(50_000) + '\x00z')).toBe('1;'.repeat(50_000) + '\x00z');
+		expect(helpers.stripAnsi('\x1b]0;' + 'x'.repeat(100_000) + '\x07z')).toBe('z');
+		expect(helpers.stripAnsi('\x9d'.repeat(50_000) + 'z')).toBe('');
+		expect(Date.now() - started).toBeLessThan(1000);
+	});
+
+	it('agrees with stringWidth', function () {
+		expect(helpers.stringWidth('\x9d0;title\x07古')).toBe(2);
+		expect(helpers.stringWidth(helpers.stripAnsi('\x1b[1m古\x1b[0m'))).toBe(2);
+	});
+});
+
+describe('stripHtml', function () {
+	it('extracts the text of elements and decodes the basic entities', function () {
+		expect(helpers.stripHtml('<p>Hello <b>world</b>!</p>')).toBe('Hello world!');
+		expect(helpers.stripHtml('<p>a</p><p>b</p>')).toBe('ab');
+		expect(helpers.stripHtml('Tom &amp; Jerry &lt;3 &nbsp;&#169;')).toBe('Tom & Jerry <3 &nbsp;&#169;');
+		expect(helpers.stripHtml('&lt;b&gt;not a tag&lt;/b&gt;')).toBe('<b>not a tag</b>');
+		expect(helpers.stripHtml('plain')).toBe('plain');
+		expect(helpers.stripHtml('')).toBe('');
+	});
+
+	it('decodes each run of text on its own', function () {
+		expect(helpers.stripHtml('&am<b></b>p;')).toBe('&amp;');
+		expect(helpers.stripHtml('&amp;lt;<i>x</i>')).toBe('&lt;x');
+	});
+
+	it('drops comments, doctypes, CDATA and processing instructions', function () {
+		expect(helpers.stripHtml('<!DOCTYPE html><?xml version="1.0"?>a<!-- b -->c<![CDATA[d]]>e')).toBe('ace');
+		expect(helpers.stripHtml('a<!-->b<!--->c<!---->d<!-- x --!>e')).toBe('abcde');
+		expect(helpers.stripHtml('a<!-- -- > still a comment -->b')).toBe('ab');
+		expect(helpers.stripHtml('a<!x>b<!>c<?>d')).toBe('abcd');
+		expect(helpers.stripHtml('a<!-- open')).toBe('a');
+		expect(helpers.stripHtml('a<!DOCTYPE')).toBe('a');
+	});
+
+	it('removes the content of script and style elements, up to their own end tag', function () {
+		expect(helpers.stripHtml('a<script>if (a < b) document.write("<b>x</b>")</script>b')).toBe('ab');
+		expect(helpers.stripHtml('a<STYLE type="text/css">p > b { }</style >b<Script/>c</SCRIPT\tx>d')).toBe('abd');
+		expect(helpers.stripHtml('<script>a</style>b</scripts>c</script>d')).toBe('d');
+		expect(helpers.stripHtml('a<script>never closed</b>')).toBe('a');
+		expect(helpers.stripHtml('a<script')).toBe('a');
+		expect(helpers.stripHtml('a<scripts>b</scripts>c<styles>d')).toBe('abcd');
+		expect(helpers.stripHtml('a<script>x</script')).toBe('a');
+	});
+
+	it('reads attributes like the HTML tokenizer', function () {
+		expect(helpers.stripHtml('<a title="a > b" data-x=\'c > d\' href=/x>link</a> 1 < 2')).toBe('link 1 < 2');
+		expect(helpers.stripHtml('<a b = "x>y" c=d>e</a>')).toBe('e');
+		expect(helpers.stripHtml('<a b="x"c=\'>\'/>e')).toBe('e');
+		expect(helpers.stripHtml('<a ="x>y">')).toBe('y">');
+		expect(helpers.stripHtml('<a b c=>d')).toBe('d');
+		expect(helpers.stripHtml('<a b=c/>d')).toBe('d');
+		expect(helpers.stripHtml('<br/>a<img src=x onerror=alert(1)//>b')).toBe('ab');
+		// Not a sanitizer (documented): the text around a removed tag can recombine into a tag.
+		expect(helpers.stripHtml('<<b>img src=x onerror=alert(1)>')).toBe('<img src=x onerror=alert(1)>');
+		expect(helpers.stripHtml('<a\n\thref\f=\r"x">y</a\n>')).toBe('y');
+		expect(helpers.stripHtml('</a b="c>d">e')).toBe('e');
+		for (const space of ['\t', '\n', '\f', '\r', ' ']) expect(helpers.stripHtml(`<a${space}b="x>y">z`)).toBe('z');
+		expect(helpers.stripHtml('<z>a<Z>b')).toBe('ab');
+		// `/` ends a tag name and an attribute name; a `=` after it starts another name, not a value.
+		expect(helpers.stripHtml('<br/x="a>b">c')).toBe('c');
+		expect(helpers.stripHtml('<x a/="y>z">w')).toBe('z">w');
+		expect(helpers.stripHtml('<a /="x>y">z')).toBe('y">z');
+		// An unquoted value holds `=` and quotes.
+		expect(helpers.stripHtml('<a x=b="c>d">e')).toBe('d">e');
+	});
+
+	it('treats a < that starts no markup as text', function () {
+		expect(helpers.stripHtml('a < b <3 <= c <')).toBe('a < b <3 <= c <');
+		expect(helpers.stripHtml('a <{b} <~ <@ <[ <` < -- b')).toBe('a <{b} <~ <@ <[ <` < -- b');
+		expect(helpers.stripHtml('x</')).toBe('x</');
+		expect(helpers.stripHtml('x</>y</ z>w</1>v')).toBe('xywv');
+	});
+
+	it('drops a tag left open at the end, as browsers do', function () {
+		expect(helpers.stripHtml('a <b c="unterminated>d')).toBe('a ');
+		expect(helpers.stripHtml("a <b c='x")).toBe('a ');
+		expect(helpers.stripHtml('a <b c=')).toBe('a ');
+		expect(helpers.stripHtml('a <b c')).toBe('a ');
+		expect(helpers.stripHtml('a <b c ')).toBe('a ');
+		expect(helpers.stripHtml('a <b')).toBe('a ');
+		expect(helpers.stripHtml('a </b')).toBe('a ');
+	});
+
+	it('validates its argument and runs in linear time on hostile markup', function () {
+		expect(function () {
+			helpers.stripHtml(null as never);
+		}).toThrow(new TypeError('stripHtml: `html` must be a string, got null'));
+		const started = Date.now();
+		expect(helpers.stripHtml('<'.repeat(100_000))).toBe('<'.repeat(100_000));
+		expect(helpers.stripHtml('<a b="'.repeat(20_000))).toBe('');
+		expect(helpers.stripHtml('<a '.repeat(30_000) + '>x')).toBe('x');
+		expect(helpers.stripHtml('<a b=c '.repeat(20_000) + '>x')).toBe('x');
+		expect(helpers.stripHtml('<script>' + '</scrip'.repeat(20_000))).toBe('');
+		expect(helpers.stripHtml('<!--'.repeat(30_000))).toBe('');
+		expect(helpers.stripHtml('<!-'.repeat(30_000))).toBe('');
+		expect(helpers.stripHtml('</'.repeat(30_000) + 'x')).toBe('');
+		expect(Date.now() - started).toBeLessThan(1000);
+	});
+});
+
+describe('indent', function () {
+	it('indents every non-blank line by count units', function () {
+		expect(helpers.indent('a\n\nb', 2)).toBe('  a\n\n  b');
+		expect(helpers.indent('a\n \n\tb\r\nc\rd\n', 2)).toBe('  a\n \n  \tb\r\n  c\r  d\n');
+		expect(helpers.indent('a', 0)).toBe('a');
+		expect(helpers.indent('', 3)).toBe('');
+		expect(helpers.indent('a\nb', 2, { indent: '\t' })).toBe('\t\ta\n\t\tb');
+		expect(helpers.indent('a\u2028b', 1)).toBe(' a\u2028b');
+	});
+
+	it('takes the indentation itself as a string', function () {
+		expect(helpers.indent('a\r\nb', '\t')).toBe('\ta\r\n\tb');
+		expect(helpers.indent('a\nb', '> ', { indent: 'ignored' as never })).toBe('> a\n> b');
+		expect(helpers.indent('a', '')).toBe('a');
+	});
+
+	it('indents blank lines too with includeEmptyLines', function () {
+		expect(helpers.indent('a\n\n \nb\n', 1, { includeEmptyLines: true })).toBe(' a\n \n  \n b\n ');
+		expect(helpers.indent('', '#', { includeEmptyLines: true })).toBe('#');
+	});
+
+	it('is undone by dedent', function () {
+		expect(helpers.dedent(helpers.indent('if (x) {\n  y();\n}', 4))).toBe('if (x) {\n  y();\n}');
+	});
+
+	it('validates its arguments', function () {
+		expect(function () {
+			helpers.indent(1 as never, 1);
+		}).toThrow(new TypeError('indent: `string` must be a string, got number'));
+		expect(function () {
+			helpers.indent('a', null as never);
+		}).toThrow(new TypeError('indent: `count` must be an integer >= 0 or a string, got null'));
+		expect(function () {
+			helpers.indent('a', -1);
+		}).toThrow(new RangeError('indent: `count` must be an integer >= 0, got -1'));
+		expect(function () {
+			helpers.indent('a', 1.5);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.indent('a', 2, { indent: 2 as never });
+		}).toThrow(new TypeError('indent: `indent` must be a string, got number'));
+	});
+});
+
+describe('splitOnce / splitLast', function () {
+	it('splits at the first or last occurrence', function () {
+		expect(helpers.splitOnce('key=value=x', '=')).toEqual(['key', 'value=x']);
+		expect(helpers.splitLast('key=value=x', '=')).toEqual(['key=value', 'x']);
+		expect(helpers.splitOnce('a::b::c', '::')).toEqual(['a', 'b::c']);
+		expect(helpers.splitLast('a::b::c', '::')).toEqual(['a::b', 'c']);
+		expect(helpers.splitOnce('=x', '=')).toEqual(['', 'x']);
+		expect(helpers.splitLast('x=', '=')).toEqual(['x', '']);
+		expect(helpers.splitOnce('aaa', 'aa')).toEqual(['', 'a']);
+		expect(helpers.splitLast('aaa', 'aa')).toEqual(['a', '']);
+	});
+
+	it('returns undefined when the separator does not occur', function () {
+		expect(helpers.splitOnce('abc', '=')).toBeUndefined();
+		expect(helpers.splitLast('abc', '=')).toBeUndefined();
+		expect(helpers.splitOnce('', '=')).toBeUndefined();
+	});
+
+	it('matches an empty separator at the start or the end', function () {
+		expect(helpers.splitOnce('abc', '')).toEqual(['', 'abc']);
+		expect(helpers.splitLast('abc', '')).toEqual(['abc', '']);
+	});
+
+	it('validates its arguments', function () {
+		expect(function () {
+			helpers.splitOnce(null as never, '=');
+		}).toThrow(new TypeError('splitOnce: `string` must be a string, got null'));
+		expect(function () {
+			helpers.splitOnce('a', /=/ as never);
+		}).toThrow(new TypeError('splitOnce: `separator` must be a string, got object'));
+		expect(function () {
+			helpers.splitLast(1 as never, '=');
+		}).toThrow(new TypeError('splitLast: `string` must be a string, got number'));
+		expect(function () {
+			helpers.splitLast('a', undefined as never);
+		}).toThrow(new TypeError('splitLast: `separator` must be a string, got undefined'));
+	});
+});
+
+describe('toSafeFilename', function () {
+	it('replaces each run of invalid characters', function () {
+		expect(helpers.toSafeFilename('Q1/Q2 report: "final"?.pdf')).toBe('Q1_Q2 report_ _final_.pdf');
+		expect(helpers.toSafeFilename('a<>:"/\\|?*b')).toBe('a_b');
+		expect(helpers.toSafeFilename('a\x00b\x1fc\x7fd\x9fe')).toBe('a_b_c_d_e');
+		expect(helpers.toSafeFilename('invoice\u202efdp.exe')).toBe('invoice_fdp.exe');
+		expect(helpers.toSafeFilename('a\u2066b\u200fc\u061cd')).toBe('a_b_c_d');
+		expect(helpers.toSafeFilename('a\ud800b\udc00c😀')).toBe('a_b_c😀');
+		expect(helpers.toSafeFilename('../etc/passwd', { replacement: '-' })).toBe('..-etc-passwd');
+		expect(helpers.toSafeFilename('<script>', { replacement: '' })).toBe('script');
+		expect(helpers.toSafeFilename('a/b', { replacement: '$&' })).toBe('a$&b');
+		expect(helpers.toSafeFilename('Crème brûlée 🍮.txt')).toBe('Crème brûlée 🍮.txt');
+	});
+
+	it('replaces the separator lookalikes that Windows best-fit conversions turn into real ones (regression)', function () {
+		expect(helpers.toSafeFilename('a∕b／c⧸d⁄e＼f')).toBe('a_b_c_d_e_f');
+		expect(helpers.toSafeFilename('a∕b⁄c／d⧸e∖f＼g⧹h﹨i：j')).toBe('a_b_c_d_e_f_g_h_i_j');
+		expect(helpers.toSafeFilename('..∕..∕win.ini')).toBe('.._.._win.ini');
+		expect(helpers.toSafeFilename('C：＼x', { replacement: '' })).toBe('Cx');
+		expect(function () {
+			helpers.toSafeFilename('a', { replacement: '／' });
+		}).toThrow(RangeError);
+		// Legitimate characters that some ANSI code pages also map to `\` are kept.
+		expect(helpers.toSafeFilename('¥100 ₩200.txt')).toBe('¥100 ₩200.txt');
+		expect(helpers.toSafeFilename('.htaccess')).toBe('.htaccess');
+	});
+
+	it('removes dots and spaces at the end, and never returns an empty name, . or ..', function () {
+		expect(helpers.toSafeFilename('notes. . .')).toBe('notes');
+		expect(helpers.toSafeFilename('.')).toBe('_');
+		expect(helpers.toSafeFilename('..')).toBe('_');
+		expect(helpers.toSafeFilename('')).toBe('_');
+		expect(helpers.toSafeFilename('   ')).toBe('_');
+		expect(helpers.toSafeFilename('///', { replacement: '' })).toBe('_');
+		expect(helpers.toSafeFilename('a?', { replacement: '.' })).toBe('a');
+		expect(helpers.toSafeFilename('.bashrc')).toBe('.bashrc');
+		expect(helpers.toSafeFilename(' leading')).toBe(' leading');
+	});
+
+	it('escapes the Windows device names, with or without an extension', function () {
+		expect(helpers.toSafeFilename('con')).toBe('con_');
+		expect(helpers.toSafeFilename('aux.txt')).toBe('aux_.txt');
+		expect(helpers.toSafeFilename('NUL.tar.gz')).toBe('NUL_.tar.gz');
+		expect(helpers.toSafeFilename('CON .txt')).toBe('CON_ .txt');
+		expect(helpers.toSafeFilename('con.')).toBe('con_');
+		expect(helpers.toSafeFilename('Com1')).toBe('Com1_');
+		expect(helpers.toSafeFilename('lpt9.log')).toBe('lpt9_.log');
+		expect(helpers.toSafeFilename('COM0')).toBe('COM0_');
+		expect(helpers.toSafeFilename('com¹')).toBe('com¹_');
+		expect(helpers.toSafeFilename('LPT³.x')).toBe('LPT³_.x');
+		expect(helpers.toSafeFilename('conin$')).toBe('conin$_');
+		expect(helpers.toSafeFilename('CONOUT$.txt')).toBe('CONOUT$_.txt');
+		expect(helpers.toSafeFilename('prn?', { replacement: '' })).toBe('prn_');
+		expect(helpers.toSafeFilename('?', { replacement: 'con' })).toBe('con_');
+		for (const name of ['console', 'com10', 'com', 'lpt', 'auxx.txt', 'xcon', 'con_', 'con-1.txt', 'nul x.txt']) expect(helpers.toSafeFilename(name)).toBe(name);
+	});
+
+	it('changes the last letter of a device name that already fills maxLength', function () {
+		expect(helpers.toSafeFilename('con', { maxLength: 3 })).toBe('co_');
+		expect(helpers.toSafeFilename('com¹', { maxLength: 5 })).toBe('com_');
+		expect(helpers.toSafeFilename('com¹', { maxLength: 4 })).toBe('com');
+		expect(helpers.toSafeFilename('nul.txt', { maxLength: 7 })).toBe('nu_.txt');
+		expect(helpers.toSafeFilename('nul.txt', { maxLength: 8 })).toBe('nul_.txt');
+	});
+
+	it('cuts the name to maxLength UTF-8 bytes between graphemes, keeping the extension', function () {
+		expect(helpers.toSafeFilename('a'.repeat(300) + '.txt')).toBe('a'.repeat(251) + '.txt');
+		expect(helpers.toSafeFilename('a'.repeat(300))).toBe('a'.repeat(255));
+		expect(helpers.toSafeFilename('é'.repeat(200) + '.md')).toBe('é'.repeat(126) + '.md');
+		expect(helpers.toSafeFilename('日'.repeat(100) + '.md')).toBe('日'.repeat(84) + '.md');
+		expect(helpers.toSafeFilename('😀'.repeat(100))).toBe('😀'.repeat(63));
+		expect(helpers.toSafeFilename('👍🏽'.repeat(10) + '.txt', { maxLength: 20 })).toBe('👍🏽👍🏽.txt');
+		expect(helpers.toSafeFilename('e\u0301'.repeat(10), { maxLength: 7 })).toBe('e\u0301e\u0301');
+		expect(helpers.toSafeFilename('crème brûlée.txt', { maxLength: 10 })).toBe('crème.txt');
+		expect(helpers.toSafeFilename('abc. def.txt', { maxLength: 8 })).toBe('abc..txt');
+		expect(helpers.toSafeFilename('abc.txt', { maxLength: 4 })).toBe('abc');
+		expect(helpers.toSafeFilename('abcdefgh.verylongext', { maxLength: 8 })).toBe('abcdefgh');
+		expect(helpers.toSafeFilename('Chapter 1. The end', { maxLength: 12 })).toBe('Chapter 1. T');
+		expect(helpers.toSafeFilename('👨\u200d👩\u200d👧.txt', { maxLength: 8 })).toBe('_');
+		expect(helpers.toSafeFilename('👨\u200d👩\u200d👧', { maxLength: 17 })).toBe('_');
+		expect(helpers.toSafeFilename('👨\u200d👩\u200d👧', { maxLength: 18 })).toBe('👨\u200d👩\u200d👧');
+		expect(helpers.toSafeFilename('x'.repeat(1000), { maxLength: Infinity })).toBe('x'.repeat(1000));
+		expect(helpers.toSafeFilename('ab', { maxLength: 1 })).toBe('a');
+		// 3 bytes from U+0800, 4 for a surrogate pair (U+10000 is D800 DC00, U+103FF is D800 DFFF).
+		expect(helpers.toSafeFilename('\u07ff'.repeat(4), { maxLength: 7 })).toBe('\u07ff'.repeat(3));
+		expect(helpers.toSafeFilename('\u0800'.repeat(4), { maxLength: 7 })).toBe('\u0800'.repeat(2));
+		expect(helpers.toSafeFilename('\u{10000}'.repeat(3), { maxLength: 9 })).toBe('\u{10000}'.repeat(2));
+		expect(helpers.toSafeFilename('\u{103ff}'.repeat(3), { maxLength: 9 })).toBe('\u{103ff}'.repeat(2));
+	});
+
+	it('validates its arguments', function () {
+		expect(function () {
+			helpers.toSafeFilename(1 as never);
+		}).toThrow(new TypeError('toSafeFilename: `string` must be a string, got number'));
+		expect(function () {
+			helpers.toSafeFilename('a', { replacement: 1 as never });
+		}).toThrow(new TypeError('toSafeFilename: `replacement` must be a string, got number'));
+		expect(function () {
+			helpers.toSafeFilename('a', { replacement: '/' });
+		}).toThrow(new RangeError('toSafeFilename: `replacement` must not hold characters that are invalid in file names, got "/"'));
+		expect(function () {
+			helpers.toSafeFilename('a', { replacement: 'x\u202e' });
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.toSafeFilename('a', { maxLength: 0 });
+		}).toThrow(new RangeError('toSafeFilename: `maxLength` must be an integer >= 1 or Infinity, got 0'));
+		expect(function () {
+			helpers.toSafeFilename('a', { maxLength: '9' as never });
+		}).toThrow(TypeError);
+	});
+
+	it('runs in linear time on hostile input', function () {
+		const started = Date.now();
+		expect(helpers.toSafeFilename('.'.repeat(100_000) + 'x')).toBe('.'.repeat(254) + 'x');
+		expect(helpers.toSafeFilename('x' + ' .'.repeat(100_000))).toBe('x');
+		expect(helpers.toSafeFilename('/'.repeat(100_000))).toBe('_');
+		expect(helpers.toSafeFilename('é'.repeat(100_000) + '.txt').length).toBe(125 + 4);
+		expect(Date.now() - started).toBeLessThan(1000);
+	});
 });

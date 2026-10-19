@@ -56,3 +56,10 @@
 - 1302: myersDiff `offset = ceil((N + M) / 2) + 1` → `ceil((N + M) * 2) + 1` — only over-allocates the diagonal buffers.
 - 1341: middleSnake `odd = delta % 2 !== 0` → `false` — overlap is then detected in the backward pass of the same round; any path has del + ins ≡ delta (mod 2), so the found snake is still on a minimal path. The script stays minimal (which minimal script is returned is documented as unspecified); the forward check only saves a half round.
 - 1388: compare suffix stripping `while (…)` → `while (false)` — the middle-snake search still produces a minimal script (choice among minimal scripts is unspecified); stripping the common suffix is a speed optimisation.
+- 2713: combineComparators `typeof comparators[i] !== 'function'` → `true` — `assertFunction` repeats the check; the guard only avoids formatting the `comparators[i]` name for valid elements.
+- 2713: `'function'` → `""` — same as above.
+- 2880: toTree cycle walk `i < length` → `i <= length` — the extra walk starts at index `length`, whose stamp is `undefined` (not `0`), so it stamps nothing and finds no cycle.
+- 2882: `while (j >= 0 && stamps[j] === 0)` → `while (true && …)` — a negative `j` (root, dropped orphan) reads `stamps[-1]` / `stamps[-2]`, which are `undefined`, so the walk stops anyway. The guard keeps those reads off the prototype chain (a polluted `Array.prototype[-1]`).
+- 2886: `if (j >= 0 && stamps[j] === i + 1)` → `if (true && …)` — same: `stamps[-1]` is `undefined`, never `i + 1`.
+- 2938: flattenTree `positions = []` → `["Stryker was here"]` — `positions` is popped exactly as often as `lists`, which ends empty first; the extra bottom entry is never read.
+- 2956: flattenTree `if (nodeChildren.length === 0) continue` → `if (false)` — an empty children array is then entered and left at once (the node is added to and removed from the ancestors): same output, only slower (every leaf built by `toTree` has `[]`).

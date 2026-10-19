@@ -5,25 +5,34 @@ import {
 	attemptAsync,
 	createBatcher,
 	createDeferred,
+	createKeyedMutex,
 	createLimiter,
+	createMutex,
 	createQueue,
 	createRateLimiter,
+	createSemaphore,
 	debounceAsync,
 	filterWithConcurrency,
 	mapSettledWithConcurrency,
 	mapWithConcurrency,
 	memoizeAsync,
+	minDelay,
 	pollUntil,
 	promiseAllObject,
 	promiseAllSettledObject,
+	reduceAsync,
 	retry,
 	sequence,
 	sleep,
 	throwIfAborted,
 	TimeoutError,
 	timeoutSignal,
-	withTimeout
+	waitForEvent,
+	withTimeout,
+	type Release
 } from '.';
+import { EventEmitter } from 'node:events';
+import { createEmitter } from '../emitter/index.js';
 import { createLRUCache } from '../cache/index.js';
 import type { AbortSignalLike } from '../utils/index.js';
 
@@ -3900,6 +3909,1075 @@ describe('createBatcher', function () {
 			await expect(batcher.loadMany([1, 2, 3], { signal: controller.signal })).rejects.toThrow('aborted by key 2');
 			await nextTurn();
 			expect(calls).toEqual([]);
+		});
+	});
+});
+
+describe('Async helpers (locks, events, reduceAsync, minDelay)', function () {
+	function constant<T>(value: T): () => T {
+		return function () {
+			return value;
+		};
+	}
+
+	afterEach(function () {
+		jest.clearAllTimers();
+		jest.useRealTimers();
+	});
+
+	describe('createSemaphore', function () {
+		it('validates permits', function () {
+			expect(function () {
+				createSemaphore('2' as any);
+			}).toThrow(new TypeError('createSemaphore: `permits` must be an integer >= 1 or Infinity, got string'));
+			for (const permits of [0, -1, 1.5, NaN, -Infinity]) {
+				expect(function () {
+					createSemaphore(permits);
+				}).toThrow(RangeError);
+			}
+			expect(function () {
+				createSemaphore(0);
+			}).toThrow('createSemaphore: `permits` must be an integer >= 1 or Infinity, got 0');
+			expect(createSemaphore(Infinity).available).toBe(Infinity);
+		});
+
+		it('grants available permits at once and counts them', async function () {
+			const semaphore = createSemaphore(3);
+			expect(semaphore.available).toBe(3);
+			const first = await semaphore.acquire();
+			const second = await semaphore.acquire({ weight: 2 });
+			expect(semaphore.available).toBe(0);
+			expect(semaphore.pending).toBe(0);
+			first();
+			expect(semaphore.available).toBe(1);
+			second();
+			expect(semaphore.available).toBe(3);
+		});
+
+		it('ignores a second call of the same release function', async function () {
+			const semaphore = createSemaphore(2);
+			const a = await semaphore.acquire();
+			const b = await semaphore.acquire();
+			a();
+			a();
+			a();
+			expect(semaphore.available).toBe(1);
+			// The extra calls did not hand b's permit to anybody.
+			const waiting = semaphore.acquire({ weight: 2 });
+			expect(semaphore.pending).toBe(1);
+			b();
+			b();
+			const both = await waiting;
+			expect(semaphore.available).toBe(0);
+			both();
+			expect(semaphore.available).toBe(2);
+		});
+
+		it('grants waiting requests in FIFO order, handing a released permit straight to the first waiter', async function () {
+			const semaphore = createSemaphore(1);
+			const order: number[] = [];
+			const release = semaphore.tryAcquire() as Release;
+			const requests = [1, 2, 3].map(function (n) {
+				return semaphore.acquire().then(function (done) {
+					order.push(n);
+					return done;
+				});
+			});
+			expect(semaphore.pending).toBe(3);
+			release();
+			// The permit already belongs to request 1: nothing can take it in between.
+			expect(semaphore.available).toBe(0);
+			expect(semaphore.pending).toBe(2);
+			expect(semaphore.tryAcquire()).toBeUndefined();
+			(await requests[0])();
+			(await requests[1])();
+			(await requests[2])();
+			expect(order).toEqual([1, 2, 3]);
+			expect(semaphore.available).toBe(1);
+		});
+
+		it('never lets tryAcquire jump the queue', async function () {
+			const semaphore = createSemaphore(3);
+			const big = semaphore.tryAcquire(2) as Release;
+			const waiting = semaphore.acquire({ weight: 2 });
+			expect(semaphore.available).toBe(1);
+			expect(semaphore.tryAcquire()).toBeUndefined();
+			big();
+			const release = await waiting;
+			expect(semaphore.tryAcquire()).toBeInstanceOf(Function);
+			expect(semaphore.available).toBe(0);
+			release();
+		});
+
+		it('does not let lighter requests overtake a heavy one at the head of the queue', async function () {
+			const semaphore = createSemaphore(4);
+			const order: string[] = [];
+			const holder = semaphore.tryAcquire(3) as Release;
+			const heavy = semaphore.acquire({ weight: 4 }).then(function (release) {
+				order.push('heavy');
+				return release;
+			});
+			const light = semaphore.acquire({ weight: 1 }).then(function (release) {
+				order.push('light');
+				return release;
+			});
+			await Promise.resolve();
+			expect(order).toEqual([]);
+			expect(semaphore.pending).toBe(2);
+			holder();
+			(await heavy)();
+			(await light)();
+			expect(order).toEqual(['heavy', 'light']);
+		});
+
+		it('serves the requests behind an aborted head request that now fit', async function () {
+			const semaphore = createSemaphore(4);
+			const holder = semaphore.tryAcquire(3) as Release;
+			const controller = new AbortController();
+			const heavy = semaphore.acquire({ weight: 4, signal: controller.signal });
+			const light = semaphore.acquire({ weight: 1 });
+			expect(semaphore.pending).toBe(2);
+			controller.abort('changed my mind');
+			expect(semaphore.pending).toBe(0);
+			await expect(heavy).rejects.toBe('changed my mind');
+			const release = await light;
+			expect(semaphore.available).toBe(0);
+			release();
+			holder();
+			expect(semaphore.available).toBe(4);
+		});
+
+		it('removes an aborted waiter at once, with its listener, and keeps the permits', async function () {
+			const semaphore = createSemaphore(1);
+			const holder = semaphore.tryAcquire() as Release;
+			const signal = new CountingSignal();
+			const waiting = semaphore.acquire({ signal });
+			expect(signal.listenerCount).toBe(1);
+			signal.abort();
+			expect(semaphore.pending).toBe(0);
+			expect(signal.listenerCount).toBe(0);
+			await expect(waiting).rejects.toBeInstanceOf(AbortError);
+			expect(semaphore.available).toBe(0);
+			holder();
+			expect(semaphore.available).toBe(1);
+		});
+
+		it('rejects an already-aborted request even when permits are available', async function () {
+			const semaphore = createSemaphore(2);
+			const controller = new AbortController();
+			controller.abort(new TimeoutError('too late'));
+			await expect(semaphore.acquire({ signal: controller.signal })).rejects.toThrow('too late');
+			await expect(semaphore.run(jest.fn(), { signal: controller.signal })).rejects.toBeInstanceOf(TimeoutError);
+			expect(semaphore.available).toBe(2);
+		});
+
+		it('removes the abort listener and the timer once a waiter is granted, and ignores a later abort', async function () {
+			jest.useFakeTimers();
+			const semaphore = createSemaphore(1);
+			const holder = semaphore.tryAcquire() as Release;
+			const signal = new CountingSignal();
+			const waiting = semaphore.acquire({ signal, timeout: 1000 });
+			expect(jest.getTimerCount()).toBe(1);
+			holder();
+			expect(signal.listenerCount).toBe(0);
+			expect(jest.getTimerCount()).toBe(0);
+			signal.abort();
+			const release = await waiting;
+			expect(semaphore.available).toBe(0);
+			release();
+			expect(semaphore.available).toBe(1);
+		});
+
+		it('rejects with a TimeoutError once timeout expires, leaving the queue and the permits unchanged', async function () {
+			jest.useFakeTimers();
+			const semaphore = createSemaphore(1);
+			const holder = semaphore.tryAcquire() as Release;
+			const signal = new CountingSignal();
+			const waiting = semaphore.acquire({ timeout: 100, signal });
+			const outcome = waiting.catch(function (error: unknown) {
+				return error;
+			});
+			await jest.advanceTimersByTimeAsync(99);
+			expect(semaphore.pending).toBe(1);
+			await jest.advanceTimersByTimeAsync(1);
+			const error = await outcome;
+			expect(error).toBeInstanceOf(TimeoutError);
+			expect((error as Error).message).toBe('Semaphore.acquire: timed out after 100 ms');
+			expect(semaphore.pending).toBe(0);
+			expect(signal.listenerCount).toBe(0);
+			holder();
+			expect(semaphore.available).toBe(1);
+		});
+
+		it('starts no timer for a waiting request without timeout', async function () {
+			jest.useFakeTimers();
+			const semaphore = createSemaphore(1);
+			const release = semaphore.tryAcquire() as Release;
+			const waiting = semaphore.acquire();
+			expect(jest.getTimerCount()).toBe(0);
+			release();
+			(await waiting)();
+		});
+
+		it('starts no timer for a request granted at once, and times out a zero timeout after a tick', async function () {
+			jest.useFakeTimers();
+			const semaphore = createSemaphore(1);
+			const release = await semaphore.acquire({ timeout: 0 });
+			expect(jest.getTimerCount()).toBe(0);
+			const waiting = semaphore.acquire({ timeout: 0 });
+			const outcome = expect(waiting).rejects.toThrow('Semaphore.acquire: timed out after 0 ms');
+			await jest.advanceTimersByTimeAsync(0);
+			await outcome;
+			release();
+		});
+
+		it('rejects invalid acquire options', async function () {
+			const semaphore = createSemaphore(2);
+			await expect(semaphore.acquire({ weight: 3 })).rejects.toThrow(new RangeError('Semaphore.acquire: `weight` must be an integer between 1 and 2, got 3'));
+			await expect(semaphore.acquire({ weight: 0 })).rejects.toThrow(RangeError);
+			await expect(semaphore.acquire({ weight: 1.5 })).rejects.toThrow(RangeError);
+			await expect(semaphore.acquire({ weight: '1' as any })).rejects.toThrow(
+				new TypeError('Semaphore.acquire: `weight` must be an integer between 1 and 2, got string')
+			);
+			await expect(semaphore.acquire({ timeout: -1 })).rejects.toThrow(RangeError);
+			await expect(semaphore.acquire({ timeout: '1' as any })).rejects.toThrow(TypeError);
+			await expect(semaphore.acquire({ signal: {} as any })).rejects.toThrow('Semaphore.acquire: `signal` must be an AbortSignal, null or undefined, got object');
+			await expect(semaphore.acquire(null as any)).rejects.toThrow(TypeError);
+			await expect(semaphore.run(jest.fn(), { weight: 5 })).rejects.toThrow('Semaphore.run: `weight` must be an integer between 1 and 2, got 5');
+			expect(semaphore.available).toBe(2);
+		});
+
+		it('validates the weight of tryAcquire', function () {
+			const semaphore = createSemaphore(2);
+			expect(function () {
+				semaphore.tryAcquire(3);
+			}).toThrow(new RangeError('Semaphore.tryAcquire: `weight` must be an integer between 1 and 2, got 3'));
+			expect(function () {
+				semaphore.tryAcquire(null as any);
+			}).toThrow(TypeError);
+			expect(semaphore.available).toBe(2);
+		});
+
+		it('ignores options inherited from a polluted Object.prototype', async function () {
+			const semaphore = createSemaphore(2);
+			Object.defineProperty(Object.prototype, 'weight', { value: 99, configurable: true });
+			try {
+				const release = await semaphore.acquire({});
+				expect(semaphore.available).toBe(1);
+				release();
+			} finally {
+				delete (Object.prototype as any).weight;
+			}
+		});
+
+		it('does not queue a request whose signal cannot take a listener', async function () {
+			jest.useFakeTimers();
+			const semaphore = createSemaphore(1);
+			const holder = semaphore.tryAcquire() as Release;
+			const signal = {
+				aborted: false,
+				addEventListener(): void {
+					throw new Error('no listeners');
+				},
+				removeEventListener(): void {}
+			};
+			await expect(semaphore.acquire({ signal, timeout: 50 })).rejects.toThrow('no listeners');
+			expect(semaphore.pending).toBe(0);
+			expect(jest.getTimerCount()).toBe(0);
+			holder();
+			expect(semaphore.available).toBe(1);
+		});
+
+		it('works with Infinity permits', async function () {
+			const semaphore = createSemaphore(Infinity);
+			const releases = await Promise.all(
+				[1, 2, 3].map(function (weight) {
+					return semaphore.acquire({ weight });
+				})
+			);
+			expect(semaphore.available).toBe(Infinity);
+			for (const release of releases) release();
+			expect(semaphore.pending).toBe(0);
+		});
+
+		it('has methods that do not depend on this', async function () {
+			const { acquire, tryAcquire, run } = createSemaphore(1);
+			const release = await acquire();
+			expect(tryAcquire()).toBeUndefined();
+			release();
+			await expect(run(constant(5))).resolves.toBe(5);
+		});
+
+		describe('run', function () {
+			it('holds a permit while fn runs and releases it when fn resolves', async function () {
+				const semaphore = createSemaphore(1);
+				const gate = createDeferred<string>();
+				const running = semaphore.run(function () {
+					return gate.promise;
+				});
+				await Promise.resolve();
+				expect(semaphore.available).toBe(0);
+				gate.resolve('done');
+				await expect(running).resolves.toBe('done');
+				expect(semaphore.available).toBe(1);
+			});
+
+			it('releases when fn rejects or throws synchronously', async function () {
+				const semaphore = createSemaphore(1);
+				const error = new Error('nope');
+				await expect(
+					semaphore.run(function () {
+						return Promise.reject(error);
+					})
+				).rejects.toBe(error);
+				expect(semaphore.available).toBe(1);
+				await expect(
+					semaphore.run(function (): number {
+						throw error;
+					})
+				).rejects.toBe(error);
+				expect(semaphore.available).toBe(1);
+			});
+
+			it('releases before the caller resumes', async function () {
+				const semaphore = createSemaphore(1);
+				await semaphore.run(constant(1));
+				expect(semaphore.available).toBe(1);
+			});
+
+			it('takes `weight` permits and honours timeout, without calling fn when the acquisition fails', async function () {
+				jest.useFakeTimers();
+				const semaphore = createSemaphore(2);
+				const holder = semaphore.tryAcquire() as Release;
+				const fn = jest.fn(constant(1));
+				const outcome = expect(semaphore.run(fn, { weight: 2, timeout: 10 })).rejects.toThrow('Semaphore.run: timed out after 10 ms');
+				await jest.advanceTimersByTimeAsync(10);
+				await outcome;
+				expect(fn).not.toHaveBeenCalled();
+				holder();
+				expect(semaphore.available).toBe(2);
+			});
+
+			it('rejects a non-function fn', async function () {
+				const semaphore = createSemaphore(1);
+				await expect(semaphore.run('task' as any)).rejects.toThrow(new TypeError('Semaphore.run: `fn` must be a function, got string'));
+				expect(semaphore.available).toBe(1);
+			});
+		});
+	});
+
+	describe('createMutex', function () {
+		it('serializes run calls in FIFO order', async function () {
+			const mutex = createMutex();
+			const log: string[] = [];
+			async function step(name: string): Promise<string> {
+				log.push(`start ${name}`);
+				await Promise.resolve();
+				await Promise.resolve();
+				log.push(`end ${name}`);
+				return name;
+			}
+			const results = await Promise.all(
+				['a', 'b', 'c'].map(function (name) {
+					return mutex.run(function () {
+						return step(name);
+					});
+				})
+			);
+			expect(results).toEqual(['a', 'b', 'c']);
+			expect(log).toEqual(['start a', 'end a', 'start b', 'end b', 'start c', 'end c']);
+		});
+
+		it('reports isLocked and pending', async function () {
+			const mutex = createMutex();
+			expect(mutex.isLocked).toBe(false);
+			const release = (await mutex.acquire()) as Release;
+			expect(mutex.isLocked).toBe(true);
+			expect(mutex.tryAcquire()).toBeUndefined();
+			const waiting = mutex.acquire();
+			expect(mutex.pending).toBe(1);
+			release();
+			release();
+			expect(mutex.isLocked).toBe(true);
+			expect(mutex.pending).toBe(0);
+			(await waiting)();
+			expect(mutex.isLocked).toBe(false);
+			const again = mutex.tryAcquire() as Release;
+			expect(mutex.isLocked).toBe(true);
+			again();
+		});
+
+		it('names itself in error messages and has no weight', async function () {
+			jest.useFakeTimers();
+			const mutex = createMutex();
+			const release = mutex.tryAcquire() as Release;
+			const outcome = expect(mutex.acquire({ timeout: 5 })).rejects.toThrow('Mutex.acquire: timed out after 5 ms');
+			await jest.advanceTimersByTimeAsync(5);
+			await outcome;
+			await expect(mutex.run('x' as any)).rejects.toThrow('Mutex.run: `fn` must be a function, got string');
+			expect(function () {
+				(mutex.tryAcquire as (weight: number) => unknown)(2);
+			}).toThrow('Mutex.tryAcquire: `weight` must be an integer between 1 and 1, got 2');
+			release();
+		});
+	});
+
+	describe('createKeyedMutex', function () {
+		it('serializes per key and runs different keys in parallel', async function () {
+			const locks = createKeyedMutex<string>();
+			const log: string[] = [];
+			const gates = { a1: createDeferred<void>(), a2: createDeferred<void>(), b1: createDeferred<void>() };
+			function task(name: keyof typeof gates): () => Promise<void> {
+				return function () {
+					log.push(name);
+					return gates[name].promise;
+				};
+			}
+			const work = [locks.run('a', task('a1')), locks.run('a', task('a2')), locks.run('b', task('b1'))];
+			await Promise.resolve();
+			expect(log).toEqual(['a1', 'b1']);
+			expect(locks.size).toBe(2);
+			expect(locks.isLocked('a')).toBe(true);
+			expect(locks.isLocked('c')).toBe(false);
+			gates.b1.resolve();
+			await work[2];
+			expect(locks.isLocked('b')).toBe(false);
+			expect(locks.size).toBe(1);
+			gates.a1.resolve();
+			await work[0];
+			await Promise.resolve();
+			expect(log).toEqual(['a1', 'b1', 'a2']);
+			expect(locks.size).toBe(1);
+			gates.a2.resolve();
+			await work[1];
+			expect(locks.size).toBe(0);
+		});
+
+		it('forgets a key as soon as it is idle, so many keys do not grow memory', async function () {
+			const locks = createKeyedMutex<number>();
+			for (let id = 0; id < 1000; id++) {
+				const release = await locks.acquire(id);
+				expect(locks.size).toBe(1);
+				release();
+				expect(locks.size).toBe(0);
+			}
+			for (let id = 0; id < 100; id++) (locks.tryAcquire(id) as Release)();
+			expect(locks.size).toBe(0);
+		});
+
+		it('keeps the key while it is held, even when a waiter gives up', async function () {
+			const locks = createKeyedMutex<string>();
+			const release = locks.tryAcquire('doc') as Release;
+			const controller = new AbortController();
+			const waiting = locks.acquire('doc', { signal: controller.signal });
+			controller.abort();
+			await expect(waiting).rejects.toHaveProperty('name', 'AbortError');
+			expect(locks.isLocked('doc')).toBe(true);
+			expect(locks.tryAcquire('doc')).toBeUndefined();
+			release();
+			expect(locks.size).toBe(0);
+		});
+
+		it('leaves no state behind for requests that fail at once', async function () {
+			const locks = createKeyedMutex<string>();
+			const controller = new AbortController();
+			controller.abort();
+			const aborted = locks.acquire('a', { signal: controller.signal });
+			expect(locks.size).toBe(0);
+			await expect(aborted).rejects.toHaveProperty('name', 'AbortError');
+			const invalid = locks.run('b', 'nope' as any);
+			expect(locks.size).toBe(0);
+			await expect(invalid).rejects.toThrow('KeyedMutex.run: `fn` must be a function, got string');
+			await expect(locks.acquire('c', { timeout: -1 })).rejects.toThrow('KeyedMutex.acquire: `timeout` must be Infinity or a number between 0 and 2147483647, got -1');
+			expect(locks.size).toBe(0);
+		});
+
+		it('hands a key over to its next waiter, then forgets it after a timeout of the last one', async function () {
+			jest.useFakeTimers();
+			const locks = createKeyedMutex<string>();
+			const first = locks.tryAcquire('k') as Release;
+			const second = locks.acquire('k');
+			const third = locks.acquire('k', { timeout: 10 });
+			first();
+			const releaseSecond = await second;
+			expect(locks.isLocked('k')).toBe(true);
+			const outcome = expect(third).rejects.toBeInstanceOf(TimeoutError);
+			await jest.advanceTimersByTimeAsync(10);
+			await outcome;
+			expect(locks.size).toBe(1);
+			releaseSecond();
+			expect(locks.size).toBe(0);
+		});
+
+		it('compares keys like a Map (NaN, objects by identity)', async function () {
+			const locks = createKeyedMutex<unknown>();
+			const release = locks.tryAcquire(NaN) as Release;
+			expect(locks.tryAcquire(NaN)).toBeUndefined();
+			const key = {};
+			const other = locks.tryAcquire(key) as Release;
+			const another = locks.tryAcquire({}) as Release;
+			expect(locks.size).toBe(3);
+			release();
+			other();
+			another();
+			expect(locks.size).toBe(0);
+		});
+
+		it('ignores a release called again after the key was forgotten and reused', async function () {
+			const locks = createKeyedMutex<string>();
+			const old = locks.tryAcquire('k') as Release;
+			old();
+			const current = locks.tryAcquire('k') as Release;
+			old();
+			expect(locks.isLocked('k')).toBe(true);
+			expect(locks.tryAcquire('k')).toBeUndefined();
+			current();
+			expect(locks.size).toBe(0);
+		});
+	});
+
+	describe('waitForEvent', function () {
+		it('resolves with the Event of an EventTarget and removes its listener', async function () {
+			const target = new EventTarget();
+			const remove = jest.spyOn(target, 'removeEventListener');
+			const waiting = waitForEvent(target, 'ready');
+			const event = new Event('ready');
+			target.dispatchEvent(event);
+			await expect(waiting).resolves.toBe(event);
+			expect(remove).toHaveBeenCalledTimes(1);
+		});
+
+		it('resolves with the first argument of a Node emitter and removes every listener', async function () {
+			const emitter = new EventEmitter();
+			const waiting = waitForEvent<number>(emitter, 'data', { rejectOn: ['error', 'close'] });
+			const listening = emitter.listenerCount('data') + emitter.listenerCount('error') + emitter.listenerCount('close');
+			emitter.emit('data', 1, 2, 3);
+			await expect(waiting).resolves.toBe(1);
+			expect(listening).toBe(3);
+			expect(emitter.eventNames()).toEqual([]);
+		});
+
+		it('works with symbols and with emitters only offering addListener / removeListener', async function () {
+			const listeners = new Map<unknown, (value: unknown) => void>();
+			const emitter = {
+				addListener(type: unknown, listener: (value: unknown) => void): void {
+					listeners.set(type, listener);
+				},
+				removeListener(type: unknown): void {
+					listeners.delete(type);
+				}
+			};
+			const type = Symbol('ready');
+			const waiting = waitForEvent(emitter, type);
+			(listeners.get(type) as (value: unknown) => void)('go');
+			await expect(waiting).resolves.toBe('go');
+			expect(listeners.size).toBe(0);
+		});
+
+		it('works with createEmitter', async function () {
+			const events = createEmitter<{ saved: { id: number }; failed: Error }>();
+			const waiting = waitForEvent<{ id: number }>(events, 'saved', {
+				filter: function (payload) {
+					return payload.id > 1;
+				},
+				rejectOn: ['failed']
+			});
+			events.emit('saved', { id: 1 });
+			events.emit('saved', { id: 2 });
+			await expect(waiting).resolves.toEqual({ id: 2 });
+			expect(events.listenerCount()).toBe(0);
+			const failing = waitForEvent(events, 'saved', { rejectOn: ['failed'] });
+			events.emit('failed', new Error('disk full'));
+			await expect(failing).rejects.toThrow('disk full');
+			expect(events.listenerCount()).toBe(0);
+		});
+
+		it('prefers addEventListener over on', async function () {
+			const target = new EventTarget() as EventTarget & { on: () => void; off: () => void };
+			target.on = jest.fn();
+			target.off = jest.fn();
+			const waiting = waitForEvent(target, 'x');
+			target.dispatchEvent(new Event('x'));
+			await waiting;
+			expect(target.on).not.toHaveBeenCalled();
+		});
+
+		it('only uses a complete pair of methods', async function () {
+			for (const partial of [{ addEventListener: jest.fn() }, { removeEventListener: jest.fn() }]) {
+				const emitter = Object.assign(new EventEmitter(), partial);
+				const waiting = waitForEvent(emitter, 'x');
+				emitter.emit('x', 'via on');
+				await expect(waiting).resolves.toBe('via on');
+				expect(emitter.listenerCount('x')).toBe(0);
+			}
+		});
+
+		it('skips the events filter rejects, and rejects with the error filter throws', async function () {
+			const emitter = new EventEmitter();
+			const waiting = waitForEvent<number>(emitter, 'n', {
+				filter: function (n) {
+					return n > 2;
+				}
+			});
+			emitter.emit('n', 1);
+			emitter.emit('n', 2);
+			emitter.emit('n', 3);
+			await expect(waiting).resolves.toBe(3);
+			const error = new Error('bad filter');
+			const failing = waitForEvent(emitter, 'n', {
+				filter: function () {
+					throw error;
+				}
+			});
+			emitter.emit('n', 1);
+			await expect(failing).rejects.toBe(error);
+			expect(emitter.listenerCount('n')).toBe(0);
+		});
+
+		it('rejects with the event of a rejectOn type (an emitted error then no longer throws)', async function () {
+			const emitter = new EventEmitter();
+			const error = new Error('connection reset');
+			const waiting = waitForEvent(emitter, 'open', { rejectOn: ['error'] });
+			const outcome = expect(waiting).rejects.toBe(error);
+			emitter.emit('error', error);
+			await outcome;
+			expect(emitter.listenerCount('open') + emitter.listenerCount('error')).toBe(0);
+		});
+
+		it('rejects with a TimeoutError after timeout, removing the listeners', async function () {
+			jest.useFakeTimers();
+			const emitter = new EventEmitter();
+			const signal = new CountingSignal();
+			const waiting = waitForEvent(emitter, 'never', { timeout: 100, signal, rejectOn: ['error'] });
+			const outcome = expect(waiting).rejects.toThrow(new TimeoutError('waitForEvent: no `never` event within 100 ms'));
+			await jest.advanceTimersByTimeAsync(100);
+			await outcome;
+			expect(emitter.eventNames()).toEqual([]);
+			expect(signal.listenerCount).toBe(0);
+		});
+
+		it('starts no timer without timeout', async function () {
+			jest.useFakeTimers();
+			const emitter = new EventEmitter();
+			const waiting = waitForEvent(emitter, 'x');
+			const timers = jest.getTimerCount();
+			emitter.emit('x', 1);
+			await expect(waiting).resolves.toBe(1);
+			expect(timers).toBe(0);
+		});
+
+		it('clears the timer when the event comes first', async function () {
+			jest.useFakeTimers();
+			const emitter = new EventEmitter();
+			const waiting = waitForEvent(emitter, 'x', { timeout: 100 });
+			// Checked once the promise is awaited: a failing assertion must not leave its rejection unhandled.
+			const timers = jest.getTimerCount();
+			emitter.emit('x', 'value');
+			await expect(waiting).resolves.toBe('value');
+			expect(timers).toBe(1);
+			expect(jest.getTimerCount()).toBe(0);
+		});
+
+		it('rejects with the abort reason, before or while waiting', async function () {
+			const emitter = new EventEmitter();
+			const controller = new AbortController();
+			const waiting = waitForEvent(emitter, 'x', { signal: controller.signal });
+			controller.abort('stop');
+			await expect(waiting).rejects.toBe('stop');
+			expect(emitter.listenerCount('x')).toBe(0);
+			await expect(waitForEvent(emitter, 'x', { signal: controller.signal })).rejects.toBe('stop');
+			expect(emitter.listenerCount('x')).toBe(0);
+			const signal = new CountingSignal();
+			const pending = waitForEvent(emitter, 'x', { signal });
+			signal.abort();
+			await expect(pending).rejects.toBeInstanceOf(AbortError);
+		});
+
+		it('handles a listener called while it is being added', async function () {
+			const removed: unknown[] = [];
+			const emitter = {
+				on(type: string, listener: (value: unknown) => void): void {
+					if (type === 'ready') listener('replayed');
+				},
+				off(type: string): void {
+					removed.push(type);
+				}
+			};
+			const added = jest.spyOn(emitter, 'on');
+			await expect(waitForEvent(emitter, 'ready', { rejectOn: ['error'], timeout: 1000 })).resolves.toBe('replayed');
+			expect(added).toHaveBeenCalledTimes(1);
+			expect(removed).toEqual(['ready']);
+		});
+
+		it('removes the listeners already added when adding one throws', async function () {
+			const emitter = new EventEmitter();
+			const on = emitter.on.bind(emitter);
+			emitter.on = function (type: string | symbol, listener: (...args: any[]) => void) {
+				if (type === 'error') throw new Error('cannot listen');
+				return on(type, listener);
+			};
+			const signal = new CountingSignal();
+			await expect(waitForEvent(emitter, 'data', { rejectOn: ['error'], signal })).rejects.toThrow('cannot listen');
+			expect(emitter.listenerCount('data')).toBe(0);
+			expect(signal.listenerCount).toBe(0);
+		});
+
+		it('removes every listener even when a removal throws', async function () {
+			const emitter = new EventEmitter();
+			const off = emitter.off.bind(emitter);
+			emitter.off = function (type: string | symbol, listener: (...args: any[]) => void) {
+				off(type, listener);
+				if (type === 'data') throw new Error('cannot remove');
+				return emitter;
+			};
+			const waiting = waitForEvent(emitter, 'data', { rejectOn: ['error', 'close'] });
+			emitter.emit('data', 1);
+			await expect(waiting).resolves.toBe(1);
+			expect(emitter.eventNames()).toEqual([]);
+		});
+
+		it('validates its arguments', async function () {
+			const emitter = new EventEmitter();
+			for (const target of [null, undefined, 42, {}, { on(): void {} }, { addEventListener(): void {} }, { addListener(): void {} }, { removeListener(): void {} }]) {
+				await expect(waitForEvent(target as any, 'x')).rejects.toThrow(
+					`waitForEvent: \`target\` must be an EventTarget or an event emitter, got ${target === null ? 'null' : typeof target}`
+				);
+			}
+			await expect(waitForEvent(Object.assign(function () {}, { on(): void {}, off(): void {} }) as any, 1 as any)).rejects.toThrow(
+				new TypeError('waitForEvent: `type` must be a string or a symbol, got number')
+			);
+			await expect(waitForEvent(emitter, 'x', { timeout: -1 })).rejects.toThrow(
+				new RangeError('waitForEvent: `timeout` must be Infinity or a number between 0 and 2147483647, got -1')
+			);
+			await expect(waitForEvent(emitter, 'x', { filter: 1 as any })).rejects.toThrow('waitForEvent: `filter` must be a function, got number');
+			await expect(waitForEvent(emitter, 'x', { rejectOn: 'error' as any })).rejects.toThrow('waitForEvent: `rejectOn` must be an array, got string');
+			await expect(waitForEvent(emitter, 'x', { rejectOn: ['error', null as any] })).rejects.toThrow(
+				'waitForEvent: `rejectOn[1]` must be a string or a symbol, got null'
+			);
+			await expect(waitForEvent(emitter, 'x', { signal: 'no' as any })).rejects.toThrow('waitForEvent: `signal` must be an AbortSignal, null or undefined, got string');
+			await expect(waitForEvent(emitter, 'x', null as any)).rejects.toThrow(TypeError);
+			expect(emitter.eventNames()).toEqual([]);
+		});
+	});
+
+	describe('reduceAsync', function () {
+		it('reduces arrays, sync iterables of promises and async iterables in order', async function () {
+			await expect(
+				reduceAsync(
+					[1, 2, 3],
+					function (sum, n) {
+						return sum + n;
+					},
+					0
+				)
+			).resolves.toBe(6);
+			await expect(
+				reduceAsync(
+					[Promise.resolve('a'), 'b'],
+					async function (text, letter, index) {
+						await Promise.resolve();
+						return `${text}${letter}${index}`;
+					},
+					Promise.resolve('>')
+				)
+			).resolves.toBe('>a0b1');
+			async function* numbers(): AsyncGenerator<number> {
+				yield 1;
+				yield 2;
+			}
+			await expect(
+				reduceAsync(
+					numbers(),
+					function (list: number[], n) {
+						return [...list, n];
+					},
+					[]
+				)
+			).resolves.toEqual([1, 2]);
+			await expect(reduceAsync(new Set<number>(), jest.fn(), 'empty')).resolves.toBe('empty');
+		});
+
+		it('reads each item only after the previous step settled', async function () {
+			const log: string[] = [];
+			function* items(): Generator<number> {
+				log.push('read 1');
+				yield 1;
+				log.push('read 2');
+				yield 2;
+			}
+			await reduceAsync(
+				items(),
+				async function (_acc: number, n) {
+					log.push(`start ${n}`);
+					await Promise.resolve();
+					log.push(`end ${n}`);
+					return n;
+				},
+				0
+			);
+			expect(log).toEqual(['read 1', 'start 1', 'end 1', 'read 2', 'start 2', 'end 2']);
+		});
+
+		it('rejects with the reducer error and closes the iterator', async function () {
+			let closed = false;
+			async function* items(): AsyncGenerator<number> {
+				try {
+					yield 1;
+					yield 2;
+				} finally {
+					closed = true;
+				}
+			}
+			const error = new Error('bad item');
+			await expect(
+				reduceAsync(
+					items(),
+					function () {
+						throw error;
+					},
+					0
+				)
+			).rejects.toBe(error);
+			expect(closed).toBe(true);
+		});
+
+		it('stops at once when the signal aborts during a step, closing the iterator', async function () {
+			let closed = false;
+			function* items(): Generator<number> {
+				try {
+					yield 1;
+					yield 2;
+				} finally {
+					closed = true;
+				}
+			}
+			const controller = new AbortController();
+			const reducer = jest.fn(function () {
+				controller.abort('stop');
+				return new Promise<number>(function () {});
+			});
+			await expect(reduceAsync(items(), reducer, 0, { signal: controller.signal })).rejects.toBe('stop');
+			expect(reducer).toHaveBeenCalledTimes(1);
+			expect(closed).toBe(true);
+		});
+
+		it('stops waiting for an item that never comes when the signal aborts, and asks the source to close', async function () {
+			const controller = new AbortController();
+			const returned = jest.fn(function () {
+				return Promise.resolve({ done: true as const, value: undefined });
+			});
+			const idle: AsyncIterable<number> = {
+				[Symbol.asyncIterator]: function () {
+					let calls = 0;
+					return {
+						next: function () {
+							return calls++ === 0 ? Promise.resolve({ done: false as const, value: 1 }) : new Promise<IteratorResult<number>>(function () {});
+						},
+						return: returned
+					};
+				}
+			};
+			let reduced!: () => void;
+			const firstReduced = new Promise<void>(function (resolve) {
+				reduced = resolve;
+			});
+			const reducer = jest.fn(function (sum: number, n: number) {
+				reduced();
+				return sum + n;
+			});
+			const pending = reduceAsync(idle, reducer, 0, { signal: controller.signal });
+			await firstReduced;
+			await Promise.resolve();
+			controller.abort('gave up');
+			await expect(pending).rejects.toBe('gave up');
+			expect(reducer).toHaveBeenCalledTimes(1);
+			expect(returned).toHaveBeenCalledTimes(1);
+		});
+
+		it('closes the source when the signal aborts just after an item was read, without reducing it', async function () {
+			const controller = new AbortController();
+			const returned = jest.fn(function () {
+				return Promise.resolve({ done: true as const, value: undefined });
+			});
+			const source: AsyncIterable<number> = {
+				[Symbol.asyncIterator]: function () {
+					return {
+						next: function () {
+							const read = Promise.resolve({ done: false as const, value: 1 });
+							// Two ticks later: after the read settled, before `reduceAsync` resumes.
+							read.then(function () {}).then(function () {
+								controller.abort('late');
+							});
+							return read;
+						},
+						return: returned
+					};
+				}
+			};
+			const reducer = jest.fn();
+			await expect(reduceAsync(source, reducer, 0, { signal: controller.signal })).rejects.toBe('late');
+			expect(reducer).not.toHaveBeenCalled();
+			expect(returned).toHaveBeenCalledTimes(1);
+
+			// The same late abort on the read that ends the source: the reduction still rejects, and a finished source is not closed.
+			const ending = new AbortController();
+			const endReturned = jest.fn();
+			const finished: AsyncIterable<number> = {
+				[Symbol.asyncIterator]: function () {
+					return {
+						next: function () {
+							const read = Promise.resolve({ done: true as const, value: undefined });
+							read.then(function () {}).then(function () {
+								ending.abort('late end');
+							});
+							return read;
+						},
+						return: endReturned
+					};
+				}
+			};
+			await expect(reduceAsync(finished, reducer, 0, { signal: ending.signal })).rejects.toBe('late end');
+			expect(endReturned).not.toHaveBeenCalled();
+		});
+
+		it('ignores a source whose return method fails, and does not close a source that failed itself', async function () {
+			const failing = {
+				[Symbol.asyncIterator]: function () {
+					return {
+						next: function () {
+							return Promise.resolve({ done: false as const, value: 1 });
+						},
+						return: function () {
+							throw new Error('cannot close');
+						}
+					};
+				}
+			};
+			const error = new Error('reducer failed');
+			await expect(
+				reduceAsync(
+					failing,
+					function () {
+						throw error;
+					},
+					0
+				)
+			).rejects.toBe(error);
+			const returned = jest.fn();
+			const broken = {
+				[Symbol.asyncIterator]: function () {
+					return {
+						next: function () {
+							return Promise.reject(new Error('read failed'));
+						},
+						return: returned
+					};
+				}
+			};
+			await expect(reduceAsync(broken, jest.fn(), 0)).rejects.toThrow('read failed');
+			expect(returned).not.toHaveBeenCalled();
+		});
+
+		it('rejects without calling the reducer when the signal is already aborted', async function () {
+			const controller = new AbortController();
+			controller.abort();
+			const reducer = jest.fn();
+			await expect(reduceAsync([1], reducer, 0, { signal: controller.signal })).rejects.toHaveProperty('name', 'AbortError');
+			expect(reducer).not.toHaveBeenCalled();
+		});
+
+		it('notices an abort that happens while reading an item', async function () {
+			const controller = new AbortController();
+			async function* items(): AsyncGenerator<number> {
+				yield 1;
+				controller.abort('while reading');
+				yield 2;
+			}
+			const reducer = jest.fn(function (sum: number, n: number) {
+				return sum + n;
+			});
+			await expect(reduceAsync(items(), reducer, 0, { signal: controller.signal })).rejects.toBe('while reading');
+			expect(reducer).toHaveBeenCalledTimes(1);
+			const last = new AbortController();
+			async function* finishing(): AsyncGenerator<number> {
+				yield 1;
+				last.abort('after the last item');
+			}
+			await expect(reduceAsync(finishing(), reducer, 0, { signal: last.signal })).rejects.toBe('after the last item');
+		});
+
+		it('validates its arguments', async function () {
+			await expect(reduceAsync(null as any, jest.fn(), 0)).rejects.toThrow(new TypeError('reduceAsync: `items` must be an iterable or an async iterable, got null'));
+			await expect(reduceAsync(undefined as any, jest.fn(), 0)).rejects.toThrow('reduceAsync: `items` must be an iterable or an async iterable, got undefined');
+			await expect(reduceAsync(42 as any, jest.fn(), 0)).rejects.toThrow('reduceAsync: `items` must be an iterable or an async iterable, got number');
+			await expect(reduceAsync([1], 'add' as any, 0)).rejects.toThrow('reduceAsync: `reducer` must be a function, got string');
+			await expect(reduceAsync([1], jest.fn(), 0, { signal: 1 as any })).rejects.toThrow('reduceAsync: `signal` must be an AbortSignal, null or undefined, got number');
+			await expect(reduceAsync([1], jest.fn(), 0, null as any)).rejects.toThrow(TypeError);
+		});
+	});
+
+	describe('minDelay', function () {
+		it('resolves no earlier than ms, with the value', async function () {
+			jest.useFakeTimers();
+			const delayed = minDelay(Promise.resolve('fast'), 100);
+			await jest.advanceTimersByTimeAsync(99);
+			expect(await stateOf(delayed)).toBe('pending');
+			await jest.advanceTimersByTimeAsync(1);
+			await expect(delayed).resolves.toBe('fast');
+			const value = minDelay(7, 0);
+			await jest.advanceTimersByTimeAsync(0);
+			await expect(value).resolves.toBe(7);
+		});
+
+		it('does not delay a slower promise any further', async function () {
+			jest.useFakeTimers();
+			const slow = new Promise<string>(function (resolve) {
+				setTimeout(resolve, 300, 'slow');
+			});
+			const delayed = minDelay(slow, 100);
+			await jest.advanceTimersByTimeAsync(299);
+			expect(await stateOf(delayed)).toBe('pending');
+			await jest.advanceTimersByTimeAsync(1);
+			await expect(delayed).resolves.toBe('slow');
+		});
+
+		it('delays rejections by default', async function () {
+			jest.useFakeTimers();
+			const error = new Error('offline');
+			const delayed = minDelay(Promise.reject(error), 100);
+			const outcome = expect(delayed).rejects.toBe(error);
+			await jest.advanceTimersByTimeAsync(99);
+			expect(await stateOf(delayed)).toBe('pending');
+			await jest.advanceTimersByTimeAsync(1);
+			await outcome;
+		});
+
+		it('passes rejections through at once with delayRejection: false, clearing the timer', async function () {
+			jest.useFakeTimers();
+			const error = new Error('offline');
+			await expect(minDelay(Promise.reject(error), 100, { delayRejection: false })).rejects.toBe(error);
+			expect(jest.getTimerCount()).toBe(0);
+			const delayed = minDelay(Promise.resolve(1), 100, { delayRejection: false });
+			await jest.advanceTimersByTimeAsync(99);
+			expect(await stateOf(delayed)).toBe('pending');
+			await jest.advanceTimersByTimeAsync(1);
+			await expect(delayed).resolves.toBe(1);
+		});
+
+		it('validates its arguments, handling the rejection of the promise', async function () {
+			const unhandled = jest.fn();
+			process.on('unhandledRejection', unhandled);
+			try {
+				await expect(minDelay(Promise.reject(new Error('ignored')), -1)).rejects.toThrow(
+					new RangeError('minDelay: `ms` must be a number between 0 and 2147483647, got -1')
+				);
+				await expect(minDelay(Promise.reject(new Error('ignored')), '5' as any)).rejects.toThrow(TypeError);
+				await expect(minDelay(Promise.reject(new Error('ignored')), 5, null as any)).rejects.toThrow(TypeError);
+				await new Promise(setImmediate);
+				expect(unhandled).not.toHaveBeenCalled();
+			} finally {
+				process.off('unhandledRejection', unhandled);
+			}
 		});
 	});
 });

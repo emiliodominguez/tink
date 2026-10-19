@@ -1203,3 +1203,262 @@ describe('Arrays properties (ordering, slicing, set algebra, combinatorics)', fu
 		);
 	});
 });
+
+describe('Arrays helpers (properties of comparators, trees, updates and paging)', function () {
+	/** Sort keys of every kind, including the unorderable ones. */
+	const sortKey = fc.oneof(
+		fc.integer({ min: -5, max: 5 }),
+		fc.constantFrom('a', 'b', 'B', ''),
+		fc.bigInt({ min: -3n, max: 3n }),
+		fc.constantFrom(NaN, null, undefined, new Date(NaN), new Date(0), new Date(3))
+	);
+	const order = fc.constantFrom<'asc' | 'desc'>('asc', 'desc');
+
+	/** The position of the row with the given id. */
+	function positionOf(rows: ReadonlyArray<{ id: number }>, id: number): number {
+		return rows.findIndex(function (row) {
+			return row.id === id;
+		});
+	}
+
+	/** Same-value-zero membership count, the reference for `duplicates`. */
+	function countOf<T>(values: T[], value: T): number {
+		return values.filter(function (other) {
+			return other === value || (other !== other && value !== value);
+		}).length;
+	}
+
+	it('sorting with compareBy and combineComparators equals sortBy and orderBy', function () {
+		fc.assert(
+			fc.property(fc.array(fc.tuple(sortKey, sortKey), { maxLength: 40 }), order, order, function (pairs, first, second) {
+				const rows = pairs.map(function ([a, b], index) {
+					return { a, b, index };
+				});
+				function selectA(row: (typeof rows)[number]): helpers.SortKey {
+					return row.a as helpers.SortKey;
+				}
+				function selectB(row: (typeof rows)[number]): helpers.SortKey {
+					return row.b as helpers.SortKey;
+				}
+				expect(rows.slice().sort(helpers.compareBy(selectA, first))).toStrictEqual(helpers.sortBy(rows, selectA, first));
+				expect(rows.slice().sort(helpers.combineComparators(helpers.compareBy(selectA, first), helpers.compareBy(selectB, second)))).toStrictEqual(
+					helpers.orderBy(rows, [selectA, selectB], [first, second])
+				);
+			})
+		);
+	});
+
+	it('compareBy is a total order (antisymmetric and transitive) and reverseComparator flips it', function () {
+		fc.assert(
+			fc.property(sortKey, sortKey, sortKey, order, function (x, y, z, direction) {
+				const compare = helpers.compareBy(function (key: unknown) {
+					return key as helpers.SortKey;
+				}, direction);
+				const reversed = helpers.reverseComparator(compare);
+				expect(Math.sign(compare(x, y))).toBe(-Math.sign(compare(y, x)) || 0);
+				expect(reversed(x, y)).toBe(compare(y, x));
+				if (compare(x, y) <= 0 && compare(y, z) <= 0) expect(compare(x, z)).toBeLessThanOrEqual(0);
+			})
+		);
+	});
+
+	/** A forest as a shuffled list of `{ id, parentId }` rows: each row's parent is an earlier row or none. */
+	const forestRows = fc.array(fc.option(fc.nat(), { nil: null }), { maxLength: 40 }).chain(function (parents) {
+		const rows = parents.map(function (parent, id) {
+			return { id, parentId: parent === null || id === 0 ? null : parent % id, label: `n${id}` };
+		});
+		return fc.shuffledSubarray(rows, { minLength: rows.length, maxLength: rows.length });
+	});
+
+	it('toTree links every item under its parent once, in input order, and flattenTree inverts it', function () {
+		fc.assert(
+			fc.property(forestRows, function (rows) {
+				const forest = helpers.toTree(rows);
+				const flat = helpers.flattenTree(forest);
+				const breadth = helpers.flattenTree(forest, { order: 'breadth-first' });
+				expect(flat).toHaveLength(rows.length);
+				expect(breadth).toHaveLength(rows.length);
+				expect(
+					new Set(
+						flat.map(function (node) {
+							return node.id;
+						})
+					).size
+				).toBe(rows.length);
+				// Children are the items naming the node as their parent, in input order; roots have no parent.
+				for (const node of flat) {
+					expect(node.children).toStrictEqual(
+						flat
+							.filter(function (child) {
+								return child.parentId === node.id;
+							})
+							.sort(function (a, b) {
+								return positionOf(rows, a.id) - positionOf(rows, b.id);
+							})
+					);
+				}
+				expect(
+					forest.map(function (root) {
+						return root.id;
+					})
+				).toStrictEqual(
+					rows
+						.filter(function (row) {
+							return row.parentId === null;
+						})
+						.map(function (row) {
+							return row.id;
+						})
+				);
+				expect(helpers.toTree(flat)).toStrictEqual(forest);
+				expect(helpers.toTree(breadth)).toStrictEqual(forest);
+				// The items are untouched, and every node is a copy.
+				for (const row of rows) expect(Object.keys(row)).toStrictEqual(['id', 'parentId', 'label']);
+			})
+		);
+	});
+
+	it('breadth-first order lists the depth-first order level by level', function () {
+		fc.assert(
+			fc.property(forestRows, function (rows) {
+				const forest = helpers.toTree(rows);
+				const depths = new Map<number, number>();
+				const pending: Array<[(typeof forest)[number], number]> = forest.map(function (root) {
+					return [root, 0];
+				});
+				// Naive breadth-first reference: a queue.
+				const queue: number[] = [];
+				for (let i = 0; i < pending.length; i++) {
+					const [node, depth] = pending[i];
+					depths.set(node.id, depth);
+					queue.push(node.id);
+					for (const child of node.children) pending.push([child, depth + 1]);
+				}
+				expect(
+					helpers.flattenTree(forest, { order: 'breadth-first' }).map(function (node) {
+						return node.id;
+					})
+				).toStrictEqual(queue);
+			})
+		);
+	});
+
+	it('toTree throws exactly when the parent references form a cycle', function () {
+		fc.assert(
+			fc.property(fc.array(fc.option(fc.nat({ max: 30 }), { nil: null }), { maxLength: 25 }), function (parents) {
+				const rows = parents.map(function (parent, id) {
+					return { id, parentId: parent === null ? null : parent % parents.length };
+				});
+				// Naive reference: follow every chain of parents for at most n steps.
+				const cyclic = rows.some(function (row) {
+					let current: number | null = row.parentId;
+					for (let step = 0; step < rows.length && current !== null; step++) {
+						if (current === row.id) return true;
+						current = rows[current].parentId;
+					}
+					return false;
+				});
+				if (cyclic) {
+					expect(function () {
+						helpers.toTree(rows);
+					}).toThrow(/must not form a cycle/);
+				} else {
+					expect(helpers.flattenTree(helpers.toTree(rows))).toHaveLength(rows.length);
+				}
+			})
+		);
+	});
+
+	it('upsert replaces the first match or appends, like findIndex then with/concat', function () {
+		fc.assert(
+			fc.property(smallInts, smallInt, function (values, value) {
+				const index = values.indexOf(value);
+				const expected = index === -1 ? values.concat([value]) : values.slice(0, index).concat([value], values.slice(index + 1));
+				expect(helpers.upsert(values, value)).toStrictEqual(expected);
+				const records = values.map(function (v, i) {
+					return { key: v, i };
+				});
+				const record = { key: value, i: -1 };
+				const keyed = helpers.upsert(records, record, function (r) {
+					return r.key;
+				});
+				expect(keyed[index === -1 ? records.length : index]).toBe(record);
+				expect(keyed).toHaveLength(records.length + (index === -1 ? 1 : 0));
+			})
+		);
+	});
+
+	it('filterMap equals map followed by a filter of nullish results', function () {
+		fc.assert(
+			fc.property(fc.array(fc.oneof(fc.integer(), fc.constantFrom(null, undefined, 0, '', false, NaN))), function (values) {
+				function fn(value: unknown, index: number): unknown {
+					return typeof value === 'number' && value > 100 ? index : value;
+				}
+				expect(helpers.filterMap(values, fn)).toStrictEqual(
+					values.map(fn).filter(function (result) {
+						return result !== null && result !== undefined;
+					})
+				);
+			})
+		);
+	});
+
+	it('duplicates are the unique values occurring more than once, in first-occurrence order', function () {
+		fc.assert(
+			fc.property(fc.array(fc.oneof(smallInt, fc.constantFrom(NaN, -0, 'a'))), function (values) {
+				const expected = helpers.unique(values).filter(function (value) {
+					return countOf(values, value) > 1;
+				});
+				expect(helpers.duplicates(values)).toStrictEqual(expected);
+				expect(
+					helpers.duplicates(values, function (value) {
+						return value;
+					})
+				).toStrictEqual(expected);
+			})
+		);
+	});
+
+	it('associate equals Object.fromEntries on a null-prototype object', function () {
+		fc.assert(
+			fc.property(fc.array(fc.tuple(fc.constantFrom('a', 'b', '__proto__', 'constructor', '1'), fc.integer())), function (pairs) {
+				const result = helpers.associate(pairs, function (pair) {
+					return pair;
+				});
+				expect(Object.getPrototypeOf(result)).toBeNull();
+				expect(Object.entries(result)).toStrictEqual(Object.entries(Object.assign(Object.create(null), Object.fromEntries(pairs))));
+			})
+		);
+	});
+
+	it('the pages of paginate concatenate back to the array, and pages past the last one are empty', function () {
+		fc.assert(
+			fc.property(smallInts, fc.integer({ min: 1, max: 12 }), fc.integer({ min: 1, max: 40 }), function (values, pageSize, page) {
+				const { pageCount, total } = helpers.paginate(values, 1, pageSize);
+				const pages = Array.from({ length: pageCount }, function (_, i) {
+					return helpers.paginate(values, i + 1, pageSize);
+				});
+				expect(
+					pages.flatMap(function (p) {
+						return p.items;
+					})
+				).toStrictEqual(values);
+				expect(total).toBe(values.length);
+				const current = helpers.paginate(values, page, pageSize);
+				expect(current.items).toStrictEqual(values.slice((page - 1) * pageSize, page * pageSize));
+				expect(current.hasNext).toBe(page < pageCount);
+				expect(current.hasPrevious).toBe(page > 1);
+				if (page <= pageCount) expect(current.items.length).toBeGreaterThan(0);
+				else expect(current.items).toStrictEqual([]);
+			})
+		);
+	});
+
+	it('splitAt(array, i) equals [array.slice(0, i), array.slice(i)]', function () {
+		fc.assert(
+			fc.property(smallInts, fc.integer({ min: -40, max: 40 }), function (values, index) {
+				expect(helpers.splitAt(values, index)).toStrictEqual([values.slice(0, index), values.slice(index)]);
+			})
+		);
+	});
+});

@@ -3337,3 +3337,578 @@ describe('Date helpers under prototype pollution', function () {
 		expect(read()).toEqual(expected);
 	});
 });
+
+describe('Date helpers (scheduling round)', function () {
+	/**
+	 * A date on 2024-01-01 at `hour` (fractional hours allowed).
+	 */
+	function at(hour: number): Date {
+		return new Date(2024, 0, 1, 0, hour * 60);
+	}
+
+	/**
+	 * An interval from `start` to `end` o'clock on 2024-01-01.
+	 */
+	function span(start: number, end: number): helpers.Interval<Date> {
+		return { start: at(start), end: at(end) };
+	}
+
+	/**
+	 * The hours of intervals returned on 2024-01-01, for compact assertions.
+	 */
+	function hours(intervals: Array<helpers.Interval<Date>>): number[][] {
+		return intervals.map(function (interval) {
+			return [interval.start, interval.end].map(function (date) {
+				return (date.getTime() - at(0).getTime()) / 3_600_000;
+			});
+		});
+	}
+
+	/**
+	 * Runs `fn` with `key` set on `Object.prototype`.
+	 */
+	function polluted(key: string, value: unknown, fn: () => void): void {
+		(Object.prototype as Record<string, unknown>)[key] = value;
+		try {
+			fn();
+		} finally {
+			delete (Object.prototype as Record<string, unknown>)[key];
+		}
+	}
+
+	describe('intersectIntervals', function () {
+		it('returns the shared part, or undefined', function () {
+			expect(hours([helpers.intersectIntervals(span(9, 12), span(11, 14)) as helpers.Interval<Date>])).toEqual([[11, 12]]);
+			expect(hours([helpers.intersectIntervals(span(11, 14), span(9, 12)) as helpers.Interval<Date>])).toEqual([[11, 12]]);
+			expect(hours([helpers.intersectIntervals(span(9, 17), span(11, 12)) as helpers.Interval<Date>])).toEqual([[11, 12]]);
+			expect(helpers.intersectIntervals(span(9, 12), span(12, 14))).toBeUndefined();
+			expect(helpers.intersectIntervals(span(9, 10), span(11, 12))).toBeUndefined();
+			expect(helpers.intersectIntervals(span(10, 10), span(9, 12))).toBeUndefined();
+		});
+
+		it('treats intervals as closed with `inclusive`', function () {
+			const options = { inclusive: true };
+			expect(hours([helpers.intersectIntervals(span(9, 12), span(12, 14), options) as helpers.Interval<Date>])).toEqual([[12, 12]]);
+			expect(hours([helpers.intersectIntervals(span(10, 10), span(9, 12), options) as helpers.Interval<Date>])).toEqual([[10, 10]]);
+			expect(helpers.intersectIntervals(span(9, 10), span(11, 12), options)).toBeUndefined();
+		});
+
+		it('returns new dates, accepts timestamps and validates its arguments', function () {
+			const a = span(9, 12);
+			const result = helpers.intersectIntervals(a, a) as helpers.Interval<Date>;
+			expect(result.start).not.toBe(a.start);
+			expect(result.start.getTime()).toBe(a.start.getTime());
+			expect(helpers.intersectIntervals({ start: 0, end: 10 }, { start: 5, end: 20 })).toEqual({ start: new Date(5), end: new Date(10) });
+			expect(function () {
+				helpers.intersectIntervals({ start: 2, end: 1 }, { start: 1, end: 2 });
+			}).toThrow(new RangeError('intersectIntervals: `a.start` must not be after `a.end`'));
+			expect(function () {
+				helpers.intersectIntervals({ start: 1, end: 2 }, 5 as any);
+			}).toThrow(new TypeError('intersectIntervals: `b` must be an interval object, got number'));
+			expect(function () {
+				helpers.intersectIntervals({ start: 1, end: 2 }, { start: 1, end: 2 }, null as any);
+			}).toThrow(new TypeError('intersectIntervals: `options` must be an object, got null'));
+			expect(function () {
+				helpers.intersectIntervals({ start: 1, end: INVALID }, { start: 1, end: 2 });
+			}).toThrow(new RangeError('Invalid date'));
+		});
+	});
+
+	describe('mergeIntervals', function () {
+		it('sorts and merges overlapping intervals, keeping touching ones apart by default', function () {
+			expect(hours(helpers.mergeIntervals([span(13, 15), span(9, 11), span(10, 12)]))).toEqual([
+				[9, 12],
+				[13, 15]
+			]);
+			expect(hours(helpers.mergeIntervals([span(9, 17), span(10, 11), span(12, 13)]))).toEqual([[9, 17]]);
+			expect(hours(helpers.mergeIntervals([span(9, 10), span(9.5, 11), span(10.5, 12), span(12, 13)]))).toEqual([
+				[9, 12],
+				[12, 13]
+			]);
+			expect(hours(helpers.mergeIntervals([span(14, 15), span(9, 10)]))).toEqual([
+				[9, 10],
+				[14, 15]
+			]);
+			expect(helpers.mergeIntervals([])).toEqual([]);
+		});
+
+		it('drops empty intervals by default, and keeps them (merged into what they touch) with `inclusive`', function () {
+			expect(hours(helpers.mergeIntervals([span(10, 10), span(9, 9), span(11, 12)]))).toEqual([[11, 12]]);
+			expect(hours(helpers.mergeIntervals([span(12, 12), span(9, 12), span(12, 14), span(16, 16)], { inclusive: true }))).toEqual([
+				[9, 14],
+				[16, 16]
+			]);
+			expect(hours(helpers.mergeIntervals([span(9, 12), span(12, 14)], { inclusive: true }))).toEqual([[9, 14]]);
+			expect(hours(helpers.mergeIntervals([span(9, 9), span(9, 9)], { inclusive: true }))).toEqual([[9, 9]]);
+		});
+
+		it('accepts any iterable, returns new dates and does not mutate its input', function () {
+			const input = [span(9, 12), span(10, 13)];
+			const snapshot = hours(input);
+			const result = helpers.mergeIntervals(new Set(input));
+			expect(hours(result)).toEqual([[9, 13]]);
+			expect(result[0].start).not.toBe(input[0].start);
+			expect(hours(input)).toEqual(snapshot);
+			expect(
+				hours(
+					helpers.mergeIntervals(
+						(function* () {
+							yield span(1, 2);
+						})()
+					)
+				)
+			).toEqual([[1, 2]]);
+		});
+
+		it('validates the intervals and the options', function () {
+			expect(function () {
+				helpers.mergeIntervals(null as any);
+			}).toThrow(new TypeError('mergeIntervals: `intervals` must be an iterable of intervals, got null'));
+			expect(function () {
+				helpers.mergeIntervals('ab' as any);
+			}).toThrow(new TypeError('mergeIntervals: `intervals` must be an iterable of intervals, got string'));
+			expect(function () {
+				helpers.mergeIntervals({} as any);
+			}).toThrow(new TypeError('mergeIntervals: `intervals` must be an iterable of intervals, got object'));
+			expect(function () {
+				helpers.mergeIntervals([span(1, 2), null as any]);
+			}).toThrow(new TypeError('mergeIntervals: `intervals[1]` must be an interval object, got null'));
+			expect(function () {
+				helpers.mergeIntervals([span(1, 2), span(3, 4), span(6, 5)]);
+			}).toThrow(new RangeError('mergeIntervals: `intervals[2].start` must not be after `intervals[2].end`'));
+			expect(function () {
+				helpers.mergeIntervals([{ start: '2024' as any, end: 1 }]);
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.mergeIntervals([], 'inclusive' as any);
+			}).toThrow(new TypeError('mergeIntervals: `options` must be an object, got string'));
+		});
+	});
+
+	describe('subtractIntervals / findGaps', function () {
+		it('subtractIntervals removes every part covered by an interval', function () {
+			expect(hours(helpers.subtractIntervals(span(9, 17), [span(12, 13)]))).toEqual([
+				[9, 12],
+				[13, 17]
+			]);
+			expect(hours(helpers.subtractIntervals(span(9, 17), [span(8, 10), span(16, 18)]))).toEqual([[10, 16]]);
+			expect(hours(helpers.subtractIntervals(span(9, 17), [span(8, 18)]))).toEqual([]);
+			expect(hours(helpers.subtractIntervals(span(9, 17), [span(14, 15), span(10, 12), span(11, 13), span(13, 14)]))).toEqual([
+				[9, 10],
+				[15, 17]
+			]);
+			expect(hours(helpers.subtractIntervals(span(9, 17), [span(1, 2), span(18, 19), span(17, 20), span(5, 9)]))).toEqual([[9, 17]]);
+			expect(hours(helpers.subtractIntervals(span(9, 17), []))).toEqual([[9, 17]]);
+			expect(hours(helpers.subtractIntervals(span(9, 17), [span(12, 12)]))).toEqual([[9, 17]]);
+			expect(hours(helpers.subtractIntervals(span(9, 9), [span(1, 2)]))).toEqual([]);
+		});
+
+		it('findGaps returns the free slots, optionally only the long enough ones', function () {
+			const busy = [span(10, 11), span(11.5, 12), span(12, 12.5), span(15, 16)];
+			expect(hours(helpers.findGaps(span(9, 17), busy))).toEqual([
+				[9, 10],
+				[11, 11.5],
+				[12.5, 15],
+				[16, 17]
+			]);
+			expect(hours(helpers.findGaps(span(9, 17), busy, { minDuration: 3_600_000 }))).toEqual([
+				[9, 10],
+				[12.5, 15],
+				[16, 17]
+			]);
+			expect(hours(helpers.findGaps(span(9, 17), busy, { minDuration: 3_600_001 }))).toEqual([[12.5, 15]]);
+			expect(hours(helpers.findGaps(span(9, 17), busy, { minDuration: 0 }))).toHaveLength(4);
+			expect(helpers.findGaps(span(9, 17), busy, { minDuration: Infinity })).toEqual([]);
+			expect(helpers.findGaps({ start: 0, end: 10 }, [{ start: 1, end: 9 }])).toEqual([
+				{ start: new Date(0), end: new Date(1) },
+				{ start: new Date(9), end: new Date(10) }
+			]);
+		});
+
+		it('validates the intervals and the options', function () {
+			expect(function () {
+				helpers.subtractIntervals(null as any, []);
+			}).toThrow(new TypeError('subtractIntervals: `from` must be an interval object, got null'));
+			expect(function () {
+				helpers.subtractIntervals(span(1, 2), [span(3, 2)]);
+			}).toThrow(new RangeError('subtractIntervals: `remove[0].start` must not be after `remove[0].end`'));
+			expect(function () {
+				helpers.subtractIntervals(span(1, 2), 5 as any);
+			}).toThrow(new TypeError('subtractIntervals: `remove` must be an iterable of intervals, got number'));
+			expect(function () {
+				helpers.findGaps(span(2, 1), []);
+			}).toThrow(new RangeError('findGaps: `within.start` must not be after `within.end`'));
+			expect(function () {
+				helpers.findGaps(span(1, 2), [undefined as any]);
+			}).toThrow(new TypeError('findGaps: `busy[0]` must be an interval object, got undefined'));
+			expect(function () {
+				helpers.findGaps(span(1, 2), [], { minDuration: -1 });
+			}).toThrow(new RangeError('findGaps: `minDuration` must be a number >= 0, got -1'));
+			expect(function () {
+				helpers.findGaps(span(1, 2), [], { minDuration: NaN });
+			}).toThrow(new RangeError('findGaps: `minDuration` must be a number >= 0, got NaN'));
+			expect(function () {
+				helpers.findGaps(span(1, 2), [], { minDuration: '5' as any });
+			}).toThrow(new TypeError('findGaps: `minDuration` must be a number >= 0, got string'));
+			expect(function () {
+				helpers.findGaps(span(1, 2), [], null as any);
+			}).toThrow(new TypeError('findGaps: `options` must be an object, got null'));
+		});
+	});
+
+	describe('addBusinessDays / diffInBusinessDays / isBusinessDay with options', function () {
+		// 2024-12-23 is a Monday; Christmas is on Wednesday the 25th, Boxing Day on Thursday the 26th.
+		const christmas = [new Date(2024, 11, 25), new Date(2024, 11, 26, 18)];
+
+		it('skips holidays, compared by local calendar day', function () {
+			expect(parts(helpers.addBusinessDays(new Date(2024, 11, 24, 9), 1, { holidays: christmas }))).toEqual([2024, 11, 27, 9, 0, 0, 0]);
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 11, 24), 2, { holidays: christmas }))).toEqual([2024, 11, 30]);
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 11, 27), -1, { holidays: christmas }))).toEqual([2024, 11, 24]);
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 11, 30), -4, { holidays: christmas }))).toEqual([2024, 11, 20]);
+			// Starting on a holiday: the next business day in the direction of travel is the first step.
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 11, 25), 1, { holidays: christmas }))).toEqual([2024, 11, 27]);
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 11, 25), -1, { holidays: christmas }))).toEqual([2024, 11, 24]);
+			expect(parts(helpers.addBusinessDays(new Date(2024, 11, 25, 7), 0, { holidays: christmas }))).toEqual([2024, 11, 25, 7, 0, 0, 0]);
+			// A holiday on a weekend day changes nothing.
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 11, 27), 1, { holidays: [new Date(2024, 11, 28), new Date(2024, 11, 29)] }))).toEqual([2024, 11, 30]);
+		});
+
+		it('crosses long runs of holidays and repeated ones', function () {
+			const holidays: number[] = [];
+			for (let day = 1; day <= 60; day++) holidays.push(new Date(2024, 0, day, 12).getTime(), new Date(2024, 0, day).getTime());
+			expect(ymd(helpers.addBusinessDays(new Date(2023, 11, 29), 1, { holidays }))).toEqual([2024, 2, 1]);
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 2, 1), -1, { holidays }))).toEqual([2023, 11, 29]);
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 2, 1), -2, { holidays: new Set(holidays) }))).toEqual([2023, 11, 28]);
+			expect(helpers.diffInBusinessDays(new Date(2024, 2, 1), new Date(2023, 11, 29), { holidays })).toBe(1);
+			expect(helpers.diffInBusinessDays(new Date(2023, 11, 29), new Date(2024, 2, 1), { holidays })).toBe(-1);
+		});
+
+		it('supports other weekends', function () {
+			// 2024-05-16 is a Thursday.
+			const fridaySaturday = { weekend: [5, 6] as helpers.WeekdayIndex[] };
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 4, 16), 1, fridaySaturday))).toEqual([2024, 4, 19]);
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 4, 19), -1, fridaySaturday))).toEqual([2024, 4, 16]);
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 4, 17), 1, fridaySaturday))).toEqual([2024, 4, 19]);
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 4, 16), 5, fridaySaturday))).toEqual([2024, 4, 23]);
+			expect(helpers.diffInBusinessDays(new Date(2024, 4, 19), new Date(2024, 4, 16), fridaySaturday)).toBe(1);
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 4, 16), 3, { weekend: [] }))).toEqual([2024, 4, 19]);
+			expect(helpers.diffInBusinessDays(new Date(2024, 4, 31), new Date(2024, 4, 1), { weekend: [] })).toBe(30);
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 4, 18), 1, { weekend: [0, 0] }))).toEqual([2024, 4, 20]);
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 4, 18), 13, { weekend: [0, 1, 2, 3, 4, 5] }))).toEqual([2024, 7, 17]);
+			expect(helpers.diffInBusinessDays(new Date(2024, 7, 17), new Date(2024, 4, 18), { weekend: [0, 1, 2, 3, 4, 5] })).toBe(13);
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 4, 16), 2, { weekend: [5, 6], holidays: [new Date(2024, 4, 19), new Date(2024, 4, 17)] }))).toEqual([
+				2024, 4, 21
+			]);
+		});
+
+		it('isBusinessDay', function () {
+			expect(helpers.isBusinessDay(new Date(2024, 4, 17))).toBe(true);
+			expect(helpers.isBusinessDay(new Date(2024, 4, 18))).toBe(false);
+			expect(helpers.isBusinessDay(new Date(2024, 4, 19).getTime())).toBe(false);
+			expect(helpers.isBusinessDay(new Date(2024, 4, 17), { weekend: [5, 6] })).toBe(false);
+			expect(helpers.isBusinessDay(new Date(2024, 4, 19), { weekend: [5, 6] })).toBe(true);
+			expect(helpers.isBusinessDay(new Date(2024, 11, 26, 1), { holidays: christmas })).toBe(false);
+			expect(helpers.isBusinessDay(new Date(2024, 11, 27, 1), { holidays: christmas })).toBe(true);
+			expect(helpers.isBusinessDay(new Date(2024, 11, 24, 23, 59), { holidays: christmas })).toBe(true);
+			expect(helpers.isBusinessDay(new Date(2024, 11, 24), {})).toBe(true);
+			expect(function () {
+				helpers.isBusinessDay(INVALID);
+			}).toThrow(new RangeError('Invalid date'));
+		});
+
+		it('keeps the default calendar for empty options and inherited ones', function () {
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 4, 17), 1, {}))).toEqual([2024, 4, 20]);
+			expect(ymd(helpers.addBusinessDays(new Date(2024, 4, 17), 1, { holidays: undefined, weekend: undefined }))).toEqual([2024, 4, 20]);
+			polluted('weekend', [5, 6], function () {
+				expect(helpers.isBusinessDay(new Date(2024, 4, 17), {})).toBe(true);
+			});
+			polluted('holidays', [new Date(2024, 4, 17)], function () {
+				expect(helpers.isBusinessDay(new Date(2024, 4, 17), {})).toBe(true);
+				expect(helpers.diffInBusinessDays(new Date(2024, 4, 20), new Date(2024, 4, 16), {})).toBe(2);
+			});
+		});
+
+		it('validates the options', function () {
+			const monday = new Date(2024, 4, 13);
+			const cases: Array<[() => unknown, Error]> = [
+				[
+					function () {
+						return helpers.addBusinessDays(monday, 1, null as any);
+					},
+					new TypeError('addBusinessDays: `options` must be an object, got null')
+				],
+				[
+					function () {
+						return helpers.diffInBusinessDays(monday, monday, { weekend: 6 as any });
+					},
+					new TypeError('diffInBusinessDays: `weekend` must be an array of weekday indices, got number')
+				],
+				[
+					function () {
+						return helpers.isBusinessDay(monday, { weekend: [7 as any] });
+					},
+					new RangeError('isBusinessDay: `weekend[0]` must be an integer between 0 and 6, got 7')
+				],
+				[
+					function () {
+						return helpers.isBusinessDay(monday, { weekend: [0, '6' as any] });
+					},
+					new TypeError('isBusinessDay: `weekend[1]` must be an integer between 0 and 6, got string')
+				],
+				[
+					function () {
+						const sparse: helpers.WeekdayIndex[] = [0];
+						sparse[2] = 6;
+						return helpers.isBusinessDay(monday, { weekend: sparse });
+					},
+					new TypeError('isBusinessDay: `weekend[1]` must be an integer between 0 and 6, got undefined')
+				],
+				[
+					function () {
+						return helpers.addBusinessDays(monday, 1, { weekend: [0, 1, 2, 3, 4, 5, 6, 6] });
+					},
+					new RangeError('addBusinessDays: `weekend` must leave at least one business day in the week')
+				],
+				[
+					function () {
+						return helpers.addBusinessDays(monday, 1, { holidays: 5 as any });
+					},
+					new TypeError('addBusinessDays: `holidays` must be an iterable of dates, got number')
+				],
+				[
+					function () {
+						return helpers.addBusinessDays(monday, 1, { holidays: '2024-05-14' as any });
+					},
+					new TypeError('addBusinessDays: `holidays` must be an iterable of dates, got string')
+				],
+				[
+					function () {
+						return helpers.addBusinessDays(monday, 1, { holidays: null as any });
+					},
+					new TypeError('addBusinessDays: `holidays` must be an iterable of dates, got null')
+				],
+				[
+					function () {
+						return helpers.addBusinessDays(monday, 1, { holidays: {} as any });
+					},
+					new TypeError('addBusinessDays: `holidays` must be an iterable of dates, got object')
+				],
+				[
+					function () {
+						return helpers.addBusinessDays(monday, 1, { holidays: [INVALID] });
+					},
+					new RangeError('Invalid date')
+				],
+				[
+					function () {
+						return helpers.addBusinessDays(monday, 1, { holidays: ['2024-05-14' as any] });
+					},
+					new TypeError('Expected a Date or a timestamp number')
+				],
+				[
+					function () {
+						return helpers.addBusinessDays(monday, 1e15, { holidays: [monday] });
+					},
+					new RangeError('Resulting date is out of range')
+				],
+				[
+					function () {
+						return helpers.addBusinessDays(monday, -1e15, { weekend: [5, 6] });
+					},
+					new RangeError('Resulting date is out of range')
+				]
+			];
+			cases.forEach(function ([fn, error]) {
+				expect(fn).toThrow(error);
+			});
+		});
+	});
+
+	describe('setParts', function () {
+		it('replaces the given local fields and keeps the others', function () {
+			const date = new Date(2024, 4, 15, 9, 30, 45, 123);
+			expect(parts(helpers.setParts(date, { hour: 14, minute: 0 }))).toEqual([2024, 4, 15, 14, 0, 45, 123]);
+			expect(parts(helpers.setParts(date, { year: 2020, month: 1, day: 2 }))).toEqual([2020, 0, 2, 9, 30, 45, 123]);
+			expect(parts(helpers.setParts(date, { second: 0, millisecond: 999 }))).toEqual([2024, 4, 15, 9, 30, 0, 999]);
+			expect(parts(helpers.setParts(date.getTime(), { month: 12, day: 31, hour: 23, minute: 59 }))).toEqual([2024, 11, 31, 23, 59, 45, 123]);
+			expect(parts(date)).toEqual([2024, 4, 15, 9, 30, 45, 123]);
+			expect(helpers.setParts(date, {})).not.toBe(date);
+			expect(helpers.setParts(date, {}).getTime()).toBe(date.getTime());
+			expect(helpers.setParts(date, { hour: 9, unknown: 1 } as helpers.DateParts).getTime()).toBe(date.getTime());
+		});
+
+		it('clamps the kept day of the month to the new month, and rejects a day the month does not have', function () {
+			expect(parts(helpers.setParts(new Date(2024, 0, 31, 9), { month: 2 }))).toEqual([2024, 1, 29, 9, 0, 0, 0]);
+			expect(parts(helpers.setParts(new Date(2023, 0, 31, 9), { month: 4 }))).toEqual([2023, 3, 30, 9, 0, 0, 0]);
+			expect(ymd(helpers.setParts(new Date(2024, 1, 29), { year: 2023 }))).toEqual([2023, 1, 28]);
+			expect(ymd(helpers.setParts(new Date(2024, 1, 29), { year: 2028 }))).toEqual([2028, 1, 29]);
+			expect(ymd(helpers.setParts(new Date(2024, 0, 31), { month: 2, day: 29 }))).toEqual([2024, 1, 29]);
+			expect(function () {
+				helpers.setParts(new Date(2024, 0, 31), { month: 2, day: 30 });
+			}).toThrow(new RangeError('setParts: `parts.day` must be an integer between 1 and 29, got 30'));
+			expect(function () {
+				helpers.setParts(new Date(2023, 1, 1), { day: 29 });
+			}).toThrow(new RangeError('setParts: `parts.day` must be an integer between 1 and 28, got 29'));
+		});
+
+		it('does not remap the years 0-99, and rejects out-of-range results', function () {
+			expect(helpers.setParts(new Date(2024, 4, 15), { year: 50 }).getFullYear()).toBe(50);
+			expect(helpers.setParts(new Date(2024, 4, 15), { year: -1 }).getFullYear()).toBe(-1);
+			expect(function () {
+				helpers.setParts(new Date(2024, 4, 15), { year: 300_000 });
+			}).toThrow(new RangeError('Resulting date is out of range'));
+			expect(function () {
+				helpers.setParts(new Date(2024, 4, 15), { year: 1e300 });
+			}).toThrow(new RangeError('Resulting date is out of range'));
+		});
+
+		it('validates every field', function () {
+			const date = new Date(2024, 4, 15);
+			const cases: Array<[helpers.DateParts, Error]> = [
+				[{ year: 2024.5 }, new RangeError('setParts: `parts.year` must be an integer, got 2024.5')],
+				[{ year: '2024' as any }, new TypeError('setParts: `parts.year` must be an integer, got string')],
+				[{ month: 0 }, new RangeError('setParts: `parts.month` must be an integer between 1 and 12, got 0')],
+				[{ month: 13 }, new RangeError('setParts: `parts.month` must be an integer between 1 and 12, got 13')],
+				[{ day: 0 }, new RangeError('setParts: `parts.day` must be an integer between 1 and 31, got 0')],
+				[{ hour: 24 }, new RangeError('setParts: `parts.hour` must be an integer between 0 and 23, got 24')],
+				[{ hour: -1 }, new RangeError('setParts: `parts.hour` must be an integer between 0 and 23, got -1')],
+				[{ minute: 60 }, new RangeError('setParts: `parts.minute` must be an integer between 0 and 59, got 60')],
+				[{ second: 1.5 }, new RangeError('setParts: `parts.second` must be an integer between 0 and 59, got 1.5')],
+				[{ millisecond: 1000 }, new RangeError('setParts: `parts.millisecond` must be an integer between 0 and 999, got 1000')],
+				[{ hour: null as any }, new TypeError('setParts: `parts.hour` must be an integer between 0 and 23, got null')]
+			];
+			cases.forEach(function ([fields, error]) {
+				expect(function () {
+					helpers.setParts(date, fields);
+				}).toThrow(error);
+			});
+			expect(function () {
+				helpers.setParts(date, null as any);
+			}).toThrow(new TypeError('setParts: `parts` must be an object, got null'));
+			expect(function () {
+				helpers.setParts(INVALID, {});
+			}).toThrow(new RangeError('Invalid date'));
+		});
+
+		it('ignores inherited fields', function () {
+			polluted('hour', 5, function () {
+				expect(parts(helpers.setParts(new Date(2024, 4, 15, 9), { minute: 1 }))).toEqual([2024, 4, 15, 9, 1, 0, 0]);
+			});
+		});
+
+		it('moves a skipped time forward, and keeps the instant when nothing changes in a repeated hour', function () {
+			withTimeZone('America/New_York', function () {
+				// 2024-03-10 02:00 → 03:00; 2024-11-03 02:00 → 01:00.
+				expect(helpers.setParts(new Date(2024, 2, 10, 9), { hour: 2, minute: 30 }).getTime()).toBe(Date.UTC(2024, 2, 10, 7, 30));
+				const second = Date.UTC(2024, 10, 3, 6, 30);
+				expect(helpers.setParts(second, {}).getTime()).toBe(second);
+				expect(helpers.setParts(second, { hour: 1, minute: 30 }).getTime()).toBe(second);
+				expect(helpers.setParts(second, { minute: 45 }).getTime()).toBe(Date.UTC(2024, 10, 3, 5, 45));
+				// From a day with a different offset, in a single conversion.
+				expect(helpers.setParts(new Date(2024, 6, 4, 23, 30), { month: 3, day: 10, hour: 0 }).getTime()).toBe(Date.UTC(2024, 2, 10, 5, 30));
+			});
+			withTimeZone('Pacific/Apia', function () {
+				// Samoa skipped December 30th, 2011.
+				expect(parts(helpers.setParts(new Date(2011, 11, 29, 10), { day: 30 }))).toEqual([2011, 11, 31, 10, 0, 0, 0]);
+			});
+		});
+	});
+
+	describe('closestTo', function () {
+		it('returns a copy of the closest date, the first one on a tie', function () {
+			const target = new Date(2024, 0, 10);
+			const candidates = [new Date(2024, 0, 1), new Date(2024, 0, 12), new Date(2024, 0, 9), new Date(2024, 0, 11)];
+			const result = helpers.closestTo(target, candidates) as Date;
+			expect(ymd(result)).toEqual([2024, 0, 9]);
+			expect(result).not.toBe(candidates[2]);
+			expect(helpers.closestTo(target, [new Date(2024, 0, 11), new Date(2024, 0, 9)])).toEqual(new Date(2024, 0, 11));
+			expect(helpers.closestTo(10, new Set([3, 25, 12]))).toEqual(new Date(12));
+			expect(helpers.closestTo(10, [10])).toEqual(new Date(10));
+			expect(helpers.closestTo(target, [])).toBeUndefined();
+		});
+
+		it('validates the dates', function () {
+			expect(function () {
+				helpers.closestTo(0, [1, INVALID]);
+			}).toThrow(new RangeError('Invalid date'));
+			expect(function () {
+				helpers.closestTo(INVALID, []);
+			}).toThrow(new RangeError('Invalid date'));
+		});
+	});
+
+	describe('fromUnixTime / getUnixTime', function () {
+		it('converts seconds since the epoch', function () {
+			expect(helpers.fromUnixTime(0).getTime()).toBe(0);
+			expect(helpers.fromUnixTime(-1.5).getTime()).toBe(-1500);
+			expect(helpers.fromUnixTime(0.0015).getTime()).toBe(1);
+			expect(helpers.fromUnixTime(8.64e12).getTime()).toBe(8.64e15);
+			expect(helpers.getUnixTime(new Date(1999))).toBe(1);
+		});
+
+		it('keeps the milliseconds as written, although the decimal fraction is rounded below them', function () {
+			// `1.001 * 1000` is `1000.9999999999999`: truncating it would lose a millisecond.
+			expect(helpers.fromUnixTime(1.001).getTime()).toBe(1001);
+			expect(helpers.fromUnixTime(-1.001).getTime()).toBe(-1001);
+			for (const base of [0, 1, 59, 1_700_000_000, -86_400]) {
+				for (let ms = 0; ms < 1000; ms++) {
+					const written = Number(`${base}.${String(ms).padStart(3, '0')}`);
+					expect(helpers.fromUnixTime(written).getTime()).toBe(base * 1000 + (base < 0 ? -ms : ms));
+				}
+			}
+			// A real fraction of a millisecond is still truncated toward zero.
+			expect(helpers.fromUnixTime(1.0019).getTime()).toBe(1001);
+			expect(helpers.fromUnixTime(1.0009999).getTime()).toBe(1000);
+			expect(helpers.fromUnixTime(-1.0019).getTime()).toBe(-1001);
+			expect(helpers.getUnixTime(2000)).toBe(2);
+			expect(Object.is(helpers.getUnixTime(999), 0)).toBe(true);
+			expect(Object.is(helpers.getUnixTime(-0), 0)).toBe(true);
+			expect(helpers.getUnixTime(-1)).toBe(-1);
+			expect(helpers.getUnixTime(-1000)).toBe(-1);
+			expect(helpers.getUnixTime(-1001)).toBe(-2);
+		});
+
+		it('validates its arguments', function () {
+			expect(function () {
+				helpers.fromUnixTime('1' as any);
+			}).toThrow(new TypeError('fromUnixTime: `seconds` must be a finite number, got string'));
+			expect(function () {
+				helpers.fromUnixTime(NaN);
+			}).toThrow(new RangeError('fromUnixTime: `seconds` must be a finite number, got NaN'));
+			expect(function () {
+				helpers.fromUnixTime(Infinity);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.fromUnixTime(8.64e12 + 1);
+			}).toThrow(new RangeError('Resulting date is out of range'));
+			expect(function () {
+				helpers.getUnixTime(INVALID);
+			}).toThrow(new RangeError('Invalid date'));
+		});
+	});
+
+	it('intervalsOverlap and the interval helpers ignore inherited bounds and options', function () {
+		polluted('inclusive', true, function () {
+			expect(helpers.intervalsOverlap(span(9, 12), span(12, 14), {})).toBe(false);
+			expect(helpers.intersectIntervals(span(9, 12), span(12, 14))).toBeUndefined();
+			expect(helpers.mergeIntervals([span(9, 12), span(12, 14)])).toHaveLength(2);
+		});
+		polluted('minDuration', 1e12, function () {
+			expect(helpers.findGaps(span(9, 17), [span(10, 11)])).toHaveLength(2);
+		});
+		polluted('start', 0, function () {
+			expect(function () {
+				helpers.mergeIntervals([{ end: 5 } as any]);
+			}).toThrow(new TypeError('Expected a Date or a timestamp number'));
+		});
+		class Slot {
+			get start(): number {
+				return 1;
+			}
+			get end(): number {
+				return 3;
+			}
+		}
+		expect(helpers.mergeIntervals([new Slot(), { start: 2, end: 4 }])).toEqual([{ start: new Date(1), end: new Date(4) }]);
+	});
+});

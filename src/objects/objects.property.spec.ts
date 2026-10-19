@@ -1182,3 +1182,72 @@ describe('structural sharing and JSON Patch (properties)', function () {
 		);
 	});
 });
+
+describe('safeStringify (properties)', function () {
+	const space = fc.option(fc.oneof(fc.integer({ min: -2, max: 12 }), fc.string({ maxLength: 12 })), { nil: undefined });
+
+	it('equals JSON.stringify on JSON values, whatever the space', function () {
+		fc.assert(
+			fc.property(fc.jsonValue(), space, function (value, gap) {
+				expect(helpers.safeStringify(value, { space: gap })).toBe(JSON.stringify(value, undefined, gap));
+			})
+		);
+	});
+
+	it('writes a shared (non-circular) value in full each time, as JSON.stringify does', function () {
+		fc.assert(
+			fc.property(fc.jsonValue(), function (value) {
+				const shared = { a: value, b: [value, { c: value }] };
+				expect(helpers.safeStringify(shared)).toBe(JSON.stringify(shared));
+			})
+		);
+	});
+
+	it('with sortKeys, equals stableStringify on JSON values', function () {
+		fc.assert(
+			fc.property(fc.jsonValue(), function (value) {
+				const parsed = JSON.parse(JSON.stringify(value));
+				expect(helpers.safeStringify(value, { sortKeys: true })).toBe(helpers.stableStringify(parsed));
+			})
+		);
+	});
+
+	it('never throws and always writes valid JSON, even for cyclic values', function () {
+		fc.assert(
+			fc.property(anyValue, fc.array(fc.nat(), { maxLength: 3 }), fc.option(fc.nat(4), { nil: undefined }), function (value, links, maxDepth) {
+				// Link some containers of the value back to the value itself.
+				const containers: object[] = [];
+				(function collect(node: unknown): void {
+					if (typeof node === 'object' && node !== null && containers.length < 20 && !containers.includes(node)) {
+						containers.push(node);
+						for (const key of Object.keys(node)) collect((node as Record<string, unknown>)[key]);
+					}
+				})(value);
+				for (const link of links) {
+					const container = containers[link % Math.max(containers.length, 1)];
+					if (container !== undefined && Object.isExtensible(container) && !ArrayBuffer.isView(container)) {
+						Object.defineProperty(container, `cycle${link}`, { value, enumerable: true, configurable: true });
+					}
+				}
+				const text = helpers.safeStringify(value, { maxDepth });
+				if (text !== undefined) expect(typeof JSON.parse(text)).not.toBe('undefined');
+				else expect(value === undefined || typeof value === 'function' || typeof value === 'symbol').toBe(true);
+			})
+		);
+	});
+
+	it('round-trips maps and sets of JSON values through their entries and values', function () {
+		fc.assert(
+			fc.property(fc.array(fc.tuple(fc.string(), fc.jsonValue())), function (entries) {
+				const map = new Map(entries);
+				expect(JSON.parse(helpers.safeStringify(map) as string)).toEqual(JSON.parse(JSON.stringify([...map])));
+				const set = new Set(
+					entries.map(function ([key]) {
+						return key;
+					})
+				);
+				expect(JSON.parse(helpers.safeStringify(set) as string)).toEqual([...set]);
+			})
+		);
+	});
+});

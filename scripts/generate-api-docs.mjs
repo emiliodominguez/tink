@@ -5,28 +5,32 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import ts from 'typescript';
 
 const MODULES = [
-	['arrays', 'Collection helpers: set algebra, grouping, chunking, sorting, sampling.'],
+	['arrays', 'Collection helpers: set algebra, grouping, chunking, sorting and comparators, sampling, pagination and id/parentId trees.'],
 	['objects', 'Shallow/deep cloning, merging, equality, path access, object reshaping, structural sharing and JSON Patch (RFC 6902).'],
-	['guards', 'Runtime type predicates that narrow `unknown` values, composable into path-aware, Standard Schema-compatible validators.'],
-	['strings', 'Unicode-aware transformations, case conversion, escaping, templating, natural sorting and terminal text width.'],
-	['url', 'Typed route patterns (match and build), query-string building and parsing, URL joining and query merging.'],
-	['math', 'Precise arithmetic (exact sums), statistics, histograms, number theory and random numbers.'],
+	['guards', 'Runtime type predicates that narrow `unknown` values, composable into path-aware, Standard Schema-compatible validators, plus runtime detection.'],
+	['strings', 'Unicode-aware transformations, case conversion, escaping, templating, natural sorting, terminal text width, ANSI/HTML stripping and safe file names.'],
+	['url', 'Typed route patterns (match and build), query-string building and parsing, URL joining, normalization and cookies.'],
+	['math', 'Precise arithmetic (exact sums, lossless allocation), statistics, regression, histograms, number theory and random numbers.'],
 	['functions', 'Function composition, currying, memoization and rate limiting.'],
-	['async', 'Promise utilities: retries, timeouts, polling, limiters, request batching, keyed Promise.all and async debounce.'],
-	['color', 'Hex/RGB/HSL and OKLab/OKLCH conversion with CSS gamut mapping, perceptual mixing and WCAG contrast checks.'],
-	['search', 'Fuzzy matching and ranking with highlight ranges, for command palettes and filter-as-you-type UIs.'],
+	['async', 'Promise utilities: retries, timeouts, polling, limiters, semaphores and mutexes, request batching, event waiting, keyed Promise.all and async debounce.'],
+	['color', 'Hex/RGB/HSL/HSV and OKLab/OKLCH conversion with CSS gamut mapping, perceptual mixing and scales, opt-in named colours and WCAG contrast checks.'],
+	['search', 'Fuzzy matching and ranking with highlight ranges and optional accent folding, for command palettes and filter-as-you-type UIs.'],
 	['easing', 'Animation easing curves, CSS-accurate cubic-bezier() and steps(), and an analytic spring.'],
-	['encoding', 'Buffer-free base64/base64url, hex and UTF-8 conversions with strict decoding, and a synchronous SHA-256.'],
-	['format', 'Deterministic, cached Intl formatting: numbers, currency, percent, compact, units, lists, dates, ordinals.'],
+	[
+		'encoding',
+		'Buffer-free base64/base64url, base32, hex and UTF-8 conversions with strict decoding, RFC 4180 CSV, JWT decoding, constant-time comparison and a synchronous SHA-256.'
+	],
+	['errors', 'Never-throwing error normalization (toError, getErrorMessage) and cycle-safe error serialization that round-trips through JSON.'],
+	['format', 'Deterministic, cached Intl formatting (numbers, currency, percent, compact, units, lists, dates, ordinals) and strict locale-aware number parsing.'],
 	[
 		'validate',
 		'Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates, zod-like parsing with coercion, defaults and transforms, and typed environment variables.'
 	],
-	['date', 'DST-safe, non-mutating date arithmetic, formatting and parsing, IANA time zones and calendar grids.'],
+	['date', 'DST-safe, non-mutating date arithmetic, formatting and parsing, IANA time zones, calendar grids, interval sets and business days with holidays.'],
 	['iterables', 'Lazy, generator-based pipelines over any (async) iterable, with exact pull counts and early-exit cleanup.'],
-	['cache', 'O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock; plugs into memoize.'],
+	['cache', 'O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock (plugs into memoize), a ring-buffer deque and a priority queue.'],
 	['emitter', 'Typed event emitter with wildcard listeners, waitFor and error isolation.'],
-	['store', 'Tiny state store compatible with React useSyncExternalStore, with derived selectors, typed state machines and undo/redo.'],
+	['store', 'Tiny state store compatible with React useSyncExternalStore, with derived and computed stores, persistence, typed state machines and undo/redo.'],
 	['random', 'Seeded deterministic PRNG plus cryptographically secure ids, UUIDs (v4, v7), ULIDs and bytes.'],
 	['decorators', 'Class decorators for TypeScript (legacy and TC39 standard) and Babel.']
 ];
@@ -128,6 +132,31 @@ function listExports(name) {
 	return rows;
 }
 
+/**
+ * Lists the exported type aliases and interfaces of `src/utils/types.ts` (the `tinkit/utils` entry point), in source order.
+ * @returns {Array<{ name: string; summary: string }>} The types
+ */
+function listTypes() {
+	const file = 'src/utils/types.ts';
+	const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.ES2022, true);
+	return source.statements
+		.filter(function (statement) {
+			return (
+				(ts.isTypeAliasDeclaration(statement) || ts.isInterfaceDeclaration(statement)) &&
+				(ts.getModifiers(statement) || []).some(function (modifier) {
+					return modifier.kind === ts.SyntaxKind.ExportKeyword;
+				})
+			);
+		})
+		.map(function (statement) {
+			return { name: statement.name.text, summary: summarize(statement.jsDoc && statement.jsDoc[0]) };
+		});
+}
+
+const TYPES = listTypes();
+const TYPES_DESCRIPTION =
+	'Type-only utilities (type-fest style, no runtime code): deep partial/required/writable, key reshaping, branded types, exclusive-key constraints, type predicates and `Jsonify`. Also importable from the package root.';
+
 const EXPORTS = new Map(
 	MODULES.map(function ([name]) {
 		return [name, listExports(name)];
@@ -143,11 +172,18 @@ const sections = MODULES.map(function ([name, description]) {
 	return `## ${name}\n\n${description}\n\n\`\`\`ts\nimport { … } from 'tinkit/${name}';\n\`\`\`\n\n| Export | Description |\n| --- | --- |\n${rows}\n`;
 });
 
-const toc = MODULES.map(function ([name]) {
-	return `[\`${name}\`](#${name})`;
-}).join(' · ');
+const typesSection = `## types\n\n${TYPES_DESCRIPTION}\n\n\`\`\`ts\nimport type { … } from 'tinkit/utils';\n\`\`\`\n\n| Type | Description |\n| --- | --- |\n${TYPES.map(
+	function (row) {
+		return `| \`${row.name}\` | ${row.summary} |`;
+	}
+).join('\n')}\n`;
 
-const output = `# API reference\n\n> Generated from the JSDoc in \`src/*/index.ts\` by \`yarn docs:api\` — do not edit by hand.\n> Every function documents its parameters, return value, thrown errors and examples in its JSDoc, so your editor shows the full details on hover.\n> For a browsable HTML version run \`yarn docs\` (TypeDoc, output in \`docs/reference\`).\n\n${toc}\n\n${sections.join('\n')}`;
+const toc =
+	MODULES.map(function ([name]) {
+		return `[\`${name}\`](#${name})`;
+	}).join(' · ') + ' · [`types`](#types)';
+
+const output = `# API reference\n\n> Generated from the JSDoc in \`src/*/index.ts\` by \`yarn docs:api\` — do not edit by hand.\n> Every function documents its parameters, return value, thrown errors and examples in its JSDoc, so your editor shows the full details on hover.\n> For a browsable HTML version run \`yarn docs\` (TypeDoc, output in \`docs/reference\`).\n\n${toc}\n\n${sections.join('\n')}\n${typesSection}`;
 
 mkdirSync('docs', { recursive: true });
 writeFileSync('docs/API.md', output);
@@ -166,7 +202,7 @@ const llms = `# tink (tinkit)
 
 > Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities (${MODULES.length} modules, ${[...EXPORTS.values()].reduce(function (total, rows) {
 	return total + rows.length;
-}, 0)} exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, encoding, fuzzy search, caches, emitters and stores. Property-tested and mutation-tested.
+}, 0)} exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, encoding, error serialization, fuzzy search, caches, emitters and stores. Property-tested and mutation-tested.
 
 ${PRINCIPLES}
 
@@ -175,6 +211,7 @@ ${PRINCIPLES}
 ${MODULES.map(function ([name, description]) {
 	return `- [${name}](${REPO}/docs/API.md#${name}): ${description} Import from \`tinkit/${name}\`.`;
 }).join('\n')}
+- [types](${REPO}/docs/API.md#types): ${TYPES_DESCRIPTION} Import from \`tinkit/utils\`.
 
 ## Docs
 
@@ -196,6 +233,15 @@ ${MODULES.map(function ([name, description]) {
 		})
 		.join('\n')}`;
 }).join('\n\n')}
+
+## types
+
+${TYPES_DESCRIPTION}
+Import: \`import type { … } from 'tinkit/utils';\`
+
+${TYPES.map(function (row) {
+	return `- \`${row.name}\`${row.summary ? ` — ${row.summary}` : ''}`;
+}).join('\n')}
 `;
 
 writeFileSync('llms.txt', llms);

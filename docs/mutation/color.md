@@ -11,3 +11,11 @@
 - 508: `hue < 360` → `hue <= 360` — h = 360 gives k = offset + 12, reduced by the `k >= 12` step to the same k as h = 0.
 - 530: `k >= 12` → `k > 12` — k = 12 and k = 0 give the same channel (`max(-1, min(k - 3, 9 - k, 1))` is -1 for both).
 - 711: `ratio >= threshold` → `>` — an exhaustive search over all 2^24 luminances found no colour pair whose ratio is exactly 3, 4.5 or 7, so equality never happens.
+- 651, 652: `start < end` → `true` / `<=`, `end > start` → `true` / `>=` (`trimmed`) — the two trim loops can only meet inside a run of spaces; once `start` reaches `end` the other loop's character test fails on the same spaces (or on the end of the string, where `charCodeAt` is `NaN`), so the bounds check only stops a loop one step earlier.
+- 666: `text.length === 11` → `true` — a fast path: `toLowerCase` cannot turn a string of another length into `'transparent'` (no character outside ASCII lower-cases to one of its letters).
+- 766: `NAMED_COLORS === undefined` → `true` — decodes the named-colour table on every call instead of once; same table.
+- 798: `text.length > 20` → `false` (`parseNamedColor`) — the longest colour name has 20 letters, so a longer string is not in the table and the lookup returns `undefined` anyway.
+- 851: `let best = ''` → `"Stryker was here!"` (`toColorName` with `nearest`) — the table is never empty, so the first entry always replaces the initial value (its distance is below `Infinity`).
+- 1090: `hue >= 0 && hue < 360` → `true` / `false`, `>=` → `>`, `<` → `<=` (`rgbToHsv`/`hsvToRgb` hue normalization) — the condition is a fast path around `modulo(hue, 360)`, which returns the same value for a hue already in `[0, 360)`; at exactly `0` and `360` both branches give `0`.
+- 1110: `k >= 6` → `k > 6` (`hsvChannel`) — k = 6 and k = 0 give the same channel (`max(0, min(k, 4 - k, 1))` is 0 for both).
+- 1333, 1334, 1340: `t <= start` → `<`, `t >= end` → `>`, `positions[middle] <= t` → `<` (`colorScale`) — at a stop position the other branch mixes with a weight of exactly 0 or 1, and `mix` returns that stop unchanged in every space and hue mode (checked on 480,000 random pairs).

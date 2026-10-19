@@ -2,10 +2,13 @@ import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import { isEqual } from '../objects/index.js';
 import {
+	computed,
 	createHistory,
 	createMachine,
 	createStore,
+	persistStore,
 	type HistorySource,
+	type PersistStorage,
 	type MachineSnapshot,
 	type ReadonlyStore,
 	type StateConfig,
@@ -2353,5 +2356,880 @@ describe('createHistory', function () {
 			];
 			for (const [fn, error] of cases) expect(fn).toThrow(error);
 		});
+	});
+});
+
+/**
+ * Wraps a store, counting its live subscriptions.
+ */
+function spied<S>(store: ReadonlyStore<S>): ReadonlyStore<S> & { live(): number } {
+	let live = 0;
+	return {
+		getState: store.getState,
+		select: store.select,
+		subscribe(listener: () => void): Unsubscribe {
+			const unsubscribe = store.subscribe(listener);
+			live++;
+			let active = true;
+			return function (): void {
+				if (!active) return;
+				active = false;
+				live--;
+				unsubscribe();
+			};
+		},
+		live(): number {
+			return live;
+		}
+	};
+}
+
+describe('computed', function () {
+	it('combines several stores, in order, and recomputes only when a source state changes', function () {
+		const a = createStore(2);
+		const b = createStore('x');
+		const compute = jest.fn(function (n: number, s: string): string {
+			return s.repeat(n);
+		});
+		const view = computed([a, b], compute);
+		expect(compute).not.toHaveBeenCalled();
+		expect(view.getState()).toBe('xx');
+		expect(view.getState()).toBe('xx');
+		expect(compute).toHaveBeenCalledTimes(1);
+		b.setState('y');
+		expect(view.getState()).toBe('yy');
+		a.setState(3);
+		expect(view.getState()).toBe('yyy');
+		expect(compute).toHaveBeenCalledTimes(3);
+		expect(compute).toHaveBeenLastCalledWith(3, 'y');
+	});
+
+	it('accepts a single store, and an empty array (a constant)', function () {
+		const a = createStore({ n: 1 });
+		const n = computed(a, function (state) {
+			return state.n * 10;
+		});
+		expect(n.getState()).toBe(10);
+		const constant = computed([], function () {
+			return { fixed: true };
+		});
+		expect(constant.getState()).toBe(constant.getState());
+		const seen: unknown[] = [];
+		const unsubscribe = constant.subscribe(function () {
+			seen.push(1);
+		});
+		unsubscribe();
+		expect(seen).toEqual([]);
+	});
+
+	it('keeps the same reference while the result is equal, and notifies only on changes', function () {
+		const list = createStore([1, 2, 3]);
+		const threshold = createStore(2);
+		const above = computed(
+			[list, threshold],
+			function (items, min) {
+				return items.filter(function (item) {
+					return item > min;
+				});
+			},
+			{ equals: isEqual }
+		);
+		const first = above.getState();
+		const seen: number[][] = [];
+		above.subscribe(function () {
+			seen.push(above.getState());
+		});
+		list.setState([1, 2, 3, 0]);
+		expect(above.getState()).toBe(first);
+		threshold.setState(1);
+		expect(seen).toEqual([[2, 3]]);
+		list.setState([5]);
+		expect(seen).toEqual([[2, 3], [5]]);
+	});
+
+	it('subscribes to its sources only while it has subscribers', function () {
+		const a = spied(createStore(1));
+		const b = spied(createStore(2));
+		const sum = computed([a, b], function (x, y) {
+			return x + y;
+		});
+		expect(sum.getState()).toBe(3);
+		expect(a.live() + b.live()).toBe(0);
+		const stop1 = sum.subscribe(function () {});
+		const stop2 = sum.subscribe(function () {});
+		expect([a.live(), b.live()]).toEqual([1, 1]);
+		stop1();
+		stop1();
+		expect([a.live(), b.live()]).toEqual([1, 1]);
+		stop2();
+		expect([a.live(), b.live()]).toEqual([0, 0]);
+		const stop3 = sum.subscribe(function () {});
+		expect([a.live(), b.live()]).toEqual([1, 1]);
+		stop3();
+		expect([a.live(), b.live()]).toEqual([0, 0]);
+	});
+
+	it('is glitch-free on a diamond: one recomputation and one notification per change', function () {
+		const root = createStore(1);
+		const doubled = root.select(function (n) {
+			return n * 2;
+		});
+		const tripled = computed(root, function (n) {
+			return n * 3;
+		});
+		const compute = jest.fn(function (x: number, y: number): string {
+			return `${x}:${y}`;
+		});
+		const both = computed([doubled, tripled], compute);
+		const seen: string[] = [];
+		both.subscribe(function () {
+			seen.push(both.getState());
+		});
+		expect(compute).toHaveBeenCalledTimes(1);
+		root.setState(2);
+		expect(seen).toEqual(['4:6']);
+		expect(compute).toHaveBeenCalledTimes(2);
+		root.setState(5);
+		expect(seen).toEqual(['4:6', '10:15']);
+		expect(compute).toHaveBeenCalledTimes(3);
+	});
+
+	it('never shows an inconsistent combination, whatever the subscription order', function () {
+		const root = createStore(1);
+		const doubled = root.select(function (n) {
+			return n * 2;
+		});
+		const inconsistent: number[] = [];
+		const check = computed([root, doubled], function (n, d) {
+			if (d !== n * 2) inconsistent.push(n);
+			return n + d;
+		});
+		const nested = computed([doubled, check, root], function (d, c, n) {
+			if (c !== n * 3 || d !== n * 2) inconsistent.push(n);
+			return c;
+		});
+		const seen: number[] = [];
+		root.subscribe(function () {
+			seen.push(nested.getState());
+		});
+		nested.subscribe(function () {
+			seen.push(nested.getState());
+		});
+		for (let i = 2; i < 6; i++) root.setState(i);
+		expect(inconsistent).toEqual([]);
+		expect(seen).toEqual([6, 6, 9, 9, 12, 12, 15, 15]);
+	});
+
+	it('supports select, machines and histories as sources', function () {
+		const machine = createMachine({ initial: 'off', states: { off: { on: { TOGGLE: 'on' } }, on: { on: { TOGGLE: 'off' } } } });
+		const text = createStore('');
+		const history = createHistory(text);
+		const status = computed([machine, history], function (snapshot, h) {
+			return `${snapshot.value}/${h.undoCount}`;
+		});
+		const length = status.select(function (s) {
+			return s.length;
+		});
+		const seen: string[] = [];
+		length.subscribe(function () {
+			seen.push(status.getState());
+		});
+		machine.send('TOGGLE');
+		text.setState('a');
+		expect(status.getState()).toBe('on/1');
+		expect(seen).toEqual(['on/0']);
+	});
+
+	it('propagates compute errors and recomputes on the next read', function () {
+		const source = createStore(0);
+		let fail = true;
+		const view = computed(source, function (n) {
+			if (fail) throw new Error('boom');
+			return n;
+		});
+		expect(view.getState).toThrow('boom');
+		fail = false;
+		expect(view.getState()).toBe(0);
+		fail = true;
+		view.subscribe(function () {});
+		expect(function () {
+			source.setState(1);
+		}).toThrow('boom');
+		fail = false;
+		expect(view.getState()).toBe(1);
+	});
+
+	it('copies the stores array', function () {
+		const a = createStore(1);
+		const stores = [a];
+		const view = computed(stores, function (n) {
+			return n;
+		});
+		stores[0] = createStore(5);
+		expect(view.getState()).toBe(1);
+	});
+
+	it('rolls back the source subscriptions when one fails', function () {
+		const good = spied(createStore(1));
+		const bad = {
+			getState(): number {
+				return 2;
+			},
+			subscribe(): Unsubscribe {
+				return 'nope' as never;
+			}
+		} as unknown as ReadonlyStore<number>;
+		const view = computed([good, bad], function (x, y) {
+			return x + y;
+		});
+		expect(function () {
+			view.subscribe(function () {});
+		}).toThrow(new TypeError("computed: a source store's `subscribe` must return a function, got string"));
+		expect(good.live()).toBe(0);
+		const throwing = {
+			getState: bad.getState,
+			subscribe: jest.fn(bad.subscribe).mockImplementation(function () {
+				throw new Error('closed');
+			})
+		} as unknown as ReadonlyStore<number>;
+		expect(function () {
+			computed([good, throwing], function (x, y) {
+				return x + y;
+			}).subscribe(function () {});
+		}).toThrow('closed');
+		expect(good.live()).toBe(0);
+	});
+
+	it('validates its arguments and ignores a polluted Object.prototype', function () {
+		const store = createStore(1);
+		expect(function () {
+			computed(null as never, function () {});
+		}).toThrow(new TypeError('computed: `stores` must be a store (an object with getState and subscribe methods), got null'));
+		expect(function () {
+			computed({ getState() {} } as never, function () {});
+		}).toThrow(TypeError);
+		expect(function () {
+			computed([{ subscribe() {} }] as never, function () {});
+		}).toThrow(new TypeError('computed: `stores[0]` must be a store (an object with getState and subscribe methods), got object'));
+		expect(function () {
+			computed([store, 5] as never, function () {});
+		}).toThrow(new TypeError('computed: `stores[1]` must be a store (an object with getState and subscribe methods), got number'));
+		expect(function () {
+			computed(store, 'x' as never);
+		}).toThrow(new TypeError('computed: `compute` must be a function, got string'));
+		expect(function () {
+			computed(
+				store,
+				function (n) {
+					return n;
+				},
+				{ equals: 1 as never }
+			);
+		}).toThrow(new TypeError('computed: `options.equals` must be a function, got number'));
+		expect(function () {
+			computed(store, function (n) {
+				return n;
+			}).select('x' as never);
+		}).toThrow(new TypeError('select: `selector` must be a function, got string'));
+		const proto = Object.prototype as Record<string, unknown>;
+		proto.equals = function (): boolean {
+			return true;
+		};
+		try {
+			const view = computed(store, function (n) {
+				return n;
+			});
+			view.getState();
+			store.setState(2);
+			expect(view.getState()).toBe(2);
+		} finally {
+			delete proto.equals;
+		}
+	});
+});
+
+/**
+ * An in-memory storage recording its calls.
+ */
+function memoryStorage(entries: Record<string, string> = {}): PersistStorage & { data: Map<string, string>; calls: string[] } {
+	const data = new Map(Object.entries(entries));
+	const calls: string[] = [];
+	return {
+		data,
+		calls,
+		getItem(key: string): string | null {
+			calls.push(`get ${key}`);
+			return data.get(key) ?? null;
+		},
+		setItem(key: string, value: string): void {
+			calls.push(`set ${key}`);
+			data.set(key, value);
+		},
+		removeItem(key: string): void {
+			calls.push(`remove ${key}`);
+			data.delete(key);
+		}
+	};
+}
+
+describe('persistStore', function () {
+	it('hydrates synchronously, merging the persisted state into the current one', function () {
+		const storage = memoryStorage({ prefs: JSON.stringify({ state: { theme: 'dark', removed: 1 }, version: 0 }) });
+		const store = createStore({ theme: 'light', size: 14 });
+		const seen: unknown[] = [];
+		store.subscribe(function () {
+			seen.push(store.getState());
+		});
+		persistStore(store, { key: 'prefs', storage });
+		expect(store.getState()).toEqual({ theme: 'dark', size: 14, removed: 1 });
+		expect(seen).toHaveLength(1);
+		expect(storage.calls).toEqual(['get prefs']);
+	});
+
+	it('keeps the state and writes nothing when the key is missing, until the state changes', function () {
+		const storage = memoryStorage();
+		const store = createStore({ n: 0 });
+		const before = store.getState();
+		persistStore(store, { key: 'k', storage });
+		expect(store.getState()).toBe(before);
+		expect(storage.calls).toEqual(['get k']);
+		store.setState({ n: 1 });
+		expect(storage.data.get('k')).toBe('{"state":{"n":1},"version":0}');
+	});
+
+	it('treats undefined from getItem as missing', function () {
+		const store = createStore(1);
+		const onError = jest.fn();
+		persistStore(store, {
+			key: 'k',
+			storage: {
+				getItem(): undefined {
+					return undefined;
+				},
+				setItem(): void {},
+				removeItem(): void {}
+			},
+			onError
+		});
+		expect(store.getState()).toBe(1);
+		expect(onError).not.toHaveBeenCalled();
+	});
+
+	it('replaces non-object states, and stores function-valued states as values', function () {
+		const store = createStore<number | (() => number)>(1);
+		persistStore(store, { key: 'k', storage: memoryStorage({ k: '{"state":5,"version":0}' }) });
+		expect(store.getState()).toBe(5);
+		/** A function-valued state. */
+		function fn(): number {
+			return 7;
+		}
+		const fnStore = createStore<unknown>(0);
+		persistStore(fnStore, {
+			key: 'k',
+			storage: memoryStorage({ k: '{"state":0,"version":0}' }),
+			merge(): unknown {
+				return fn;
+			}
+		});
+		expect(fnStore.getState()).toBe(fn);
+	});
+
+	it('skips writes whose text the storage already holds', function () {
+		const storage = memoryStorage({ k: '{"state":{"a":1},"version":0}' });
+		const store = createStore({ a: 1 });
+		persistStore(store, { key: 'k', storage });
+		store.setState({ a: 1 });
+		store.setState({ a: 2 });
+		store.setState({ a: 2 });
+		store.setState({ a: 2, b: undefined } as { a: number });
+		expect(storage.calls).toEqual(['get k', 'set k']);
+		expect(storage.data.get('k')).toBe('{"state":{"a":2},"version":0}');
+	});
+
+	it('persists the partialized state, and removes the key when it is undefined', function () {
+		const storage = memoryStorage();
+		const store = createStore({ token: '', remember: false });
+		persistStore(store, {
+			key: 'auth',
+			storage,
+			partialize(state) {
+				return state.remember ? { token: state.token } : undefined;
+			}
+		});
+		store.setState({ token: 'a', remember: false });
+		expect(storage.calls).toEqual(['get auth']);
+		store.setState({ token: 'a', remember: true });
+		expect(storage.data.get('auth')).toBe('{"state":{"token":"a"},"version":0}');
+		store.setState({ token: 'b', remember: false });
+		expect(storage.data.has('auth')).toBe(false);
+		expect(storage.calls).toEqual(['get auth', 'set auth', 'remove auth']);
+	});
+
+	it('migrates states of another version, and reports them without migrate', function () {
+		const stored = JSON.stringify({ state: { count: '3' }, version: 1 });
+		const migrated = createStore({ count: 0 });
+		const migrate = jest.fn(function (persisted: unknown, version: number) {
+			return { count: Number((persisted as { count: string }).count) + version };
+		});
+		const storage = memoryStorage({ c: stored });
+		persistStore(migrated, { key: 'c', storage, version: 2, migrate });
+		expect(migrate).toHaveBeenCalledWith({ count: '3' }, 1);
+		expect(migrated.getState()).toEqual({ count: 4 });
+		// Written back at once in the current version, so the next load does not migrate again.
+		expect(storage.calls).toEqual(['get c', 'set c']);
+		expect(storage.data.get('c')).toBe('{"state":{"count":4},"version":2}');
+		const reloaded = createStore({ count: 0 });
+		persistStore(reloaded, { key: 'c', storage, version: 2 });
+		expect(reloaded.getState()).toEqual({ count: 4 });
+		expect(migrate).toHaveBeenCalledTimes(1);
+		migrated.setState({ count: 5 });
+		expect(storage.data.get('c')).toBe('{"state":{"count":5},"version":2}');
+
+		const unmigrated = createStore({ count: 0 });
+		const onError = jest.fn();
+		persistStore(unmigrated, { key: 'c', storage: memoryStorage({ c: stored }), version: 2, onError });
+		expect(unmigrated.getState()).toEqual({ count: 0 });
+		expect(onError).toHaveBeenCalledWith(new RangeError('persistStore: the stored state has version 1, not 2, and no `migrate` was given'));
+	});
+
+	it('never throws on bad storage: reports to onError and keeps the state', function () {
+		const cases: Array<[PersistStorage, unknown]> = [
+			[memoryStorage({ k: '{not json' }), SyntaxError],
+			[memoryStorage({ k: '5' }), new TypeError('persistStore: the stored value must be a { state, version } object, got number')],
+			[memoryStorage({ k: 'null' }), new TypeError('persistStore: the stored value must be a { state, version } object, got null')],
+			[memoryStorage({ k: '{"version":0}' }), new TypeError('persistStore: the stored value must be a { state, version } object, got object')],
+			[memoryStorage({ k: '{"state":{},"version":"0"}' }), new TypeError('persistStore: the stored value must be a { state, version } object, got object')],
+			[memoryStorage({ k: '{"state":{},"__proto__":{"version":0}}' }), new TypeError('persistStore: the stored value must be a { state, version } object, got object')],
+			[memoryStorage({ k: '{"state":[1],"version":0}' }), new TypeError('persistStore: the persisted state must be a plain object like the current one, got object')],
+			[memoryStorage({ k: '{"state":"x","version":0}' }), TypeError],
+			[
+				{
+					getItem(): string {
+						throw new Error('SecurityError');
+					},
+					setItem(): void {},
+					removeItem(): void {}
+				},
+				Error
+			],
+			[
+				{
+					getItem(): number {
+						return 5;
+					},
+					setItem(): void {},
+					removeItem(): void {}
+				} as unknown as PersistStorage,
+				new TypeError('persistStore: `storage.getItem` must return a string or null, got number')
+			]
+		];
+		for (const [storage, expected] of cases) {
+			const store = createStore({ a: 1 });
+			const before = store.getState();
+			const errors: unknown[] = [];
+			expect(function () {
+				persistStore(store, {
+					key: 'k',
+					storage,
+					onError(error) {
+						errors.push(error);
+					}
+				});
+			}).not.toThrow();
+			expect(store.getState()).toBe(before);
+			expect(errors).toHaveLength(1);
+			if (typeof expected === 'function') expect(errors[0]).toBeInstanceOf(expected);
+			else expect(errors[0]).toEqual(expected);
+		}
+		// Without onError, errors are ignored.
+		expect(function () {
+			persistStore(createStore(1), { key: 'k', storage: memoryStorage({ k: '{' }) });
+		}).not.toThrow();
+	});
+
+	it('reports failing migrate, merge, serialize and setItem calls, and retries on the next change', function () {
+		const errors: unknown[] = [];
+		/** Collects the reported errors. */
+		function onError(error: unknown): void {
+			errors.push(error);
+		}
+		const store = createStore({ a: 1 });
+		persistStore(store, {
+			key: 'k',
+			storage: memoryStorage({ k: '{"state":{"a":2},"version":0}' }),
+			version: 1,
+			migrate(): never {
+				throw new Error('migrate');
+			},
+			onError
+		});
+		persistStore(store, {
+			key: 'k',
+			storage: memoryStorage({ k: '{"state":{"a":2},"version":0}' }),
+			merge(): never {
+				throw new Error('merge');
+			},
+			onError
+		});
+		expect(store.getState()).toEqual({ a: 1 });
+		expect(errors).toEqual([new Error('migrate'), new Error('merge')]);
+
+		let full = true;
+		const storage = memoryStorage();
+		const quota = createStore(0);
+		persistStore(quota, {
+			key: 'q',
+			storage: {
+				getItem: storage.getItem,
+				removeItem: storage.removeItem,
+				setItem(key: string, value: string): void {
+					if (full) throw new Error('QuotaExceededError');
+					storage.setItem(key, value);
+				}
+			},
+			onError
+		});
+		expect(function () {
+			quota.setState(1);
+		}).not.toThrow();
+		expect(errors[2]).toEqual(new Error('QuotaExceededError'));
+		full = false;
+		quota.setState(2);
+		expect(storage.data.get('q')).toBe('{"state":2,"version":0}');
+
+		const bigints = createStore<unknown>(0);
+		persistStore(bigints, { key: 'b', storage: memoryStorage(), onError });
+		bigints.setState(1n);
+		expect(errors[3]).toBeInstanceOf(TypeError);
+		persistStore(bigints, {
+			key: 'b',
+			storage: memoryStorage(),
+			serialize(): string {
+				return 5 as never;
+			},
+			onError
+		});
+		bigints.setState(2);
+		expect(errors[4]).toEqual(new TypeError('persistStore: `serialize` must return a string, got number'));
+	});
+
+	it('uses custom serialize and deserialize functions', function () {
+		const storage = memoryStorage({ k: 'state=7;version=0' });
+		const store = createStore(0);
+		persistStore(store, {
+			key: 'k',
+			storage,
+			serialize(value) {
+				return `state=${value.state};version=${value.version}`;
+			},
+			deserialize(text) {
+				const [state, version] = text.split(';').map(function (part) {
+					return Number(part.split('=')[1]);
+				});
+				return { state, version };
+			}
+		});
+		expect(store.getState()).toBe(7);
+		store.setState(8);
+		expect(storage.data.get('k')).toBe('state=8;version=0');
+	});
+
+	it('drops __proto__ keys and constructor.prototype objects from stored data', function () {
+		const text = '{"state":{"__proto__":{"polluted":true},"nested":{"__proto__":{"polluted":true},"ok":1},"constructor":{"prototype":{"polluted":true}}},"version":0}';
+		const store = createStore<Record<string, unknown>>({ initial: true });
+		persistStore(store, { key: 'k', storage: memoryStorage({ k: text }) });
+		const state = store.getState();
+		expect(Object.hasOwn(state, '__proto__')).toBe(false);
+		expect(Object.getPrototypeOf(state)).toBe(Object.prototype);
+		expect(Object.hasOwn(state.nested as object, '__proto__')).toBe(false);
+		expect(state.nested).toEqual({ ok: 1 });
+		expect(state.initial).toBe(true);
+		// `constructor: { prototype }` would let a naive deep merge of the state write to `Object.prototype`.
+		expect(Object.hasOwn(state, 'constructor')).toBe(false);
+		// A plain `constructor` value (no `prototype` key) is ordinary data and stays.
+		const named = createStore<Record<string, unknown>>({});
+		persistStore(named, { key: 'k', storage: memoryStorage({ k: '{"state":{"constructor":{"name":"Ada"}},"version":0}' }) });
+		expect(named.getState().constructor).toEqual({ name: 'Ada' });
+		const copy = Object.assign({}, state, state.nested);
+		expect((copy as Record<string, unknown>).polluted).toBeUndefined();
+		expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+
+		// A custom deserialize keeping an own __proto__ key: the default merge still skips it.
+		const raw = createStore<Record<string, unknown>>({});
+		persistStore(raw, {
+			key: 'k',
+			storage: memoryStorage({ k: '{"state":{"__proto__":{"polluted":true},"a":1},"version":0}' }),
+			deserialize: JSON.parse
+		});
+		expect(raw.getState()).toEqual({ a: 1 });
+		expect(Object.hasOwn(raw.getState(), '__proto__')).toBe(false);
+		expect(Object.getPrototypeOf(raw.getState())).toBe(Object.prototype);
+	});
+
+	it('debounces writes, writing every change made meanwhile at once, and flushes on dispose', function () {
+		jest.useFakeTimers();
+		try {
+			const storage = memoryStorage();
+			const store = createStore(0);
+			const stop = persistStore(store, { key: 'k', storage, debounce: 100 });
+			store.setState(1);
+			store.setState(2);
+			expect(jest.getTimerCount()).toBe(1);
+			jest.advanceTimersByTime(99);
+			expect(storage.data.has('k')).toBe(false);
+			store.setState(3);
+			jest.advanceTimersByTime(1);
+			expect(storage.data.get('k')).toBe('{"state":3,"version":0}');
+			store.setState(4);
+			store.setState(3);
+			jest.advanceTimersByTime(100);
+			expect(storage.calls).toEqual(['get k', 'set k']);
+			store.setState(5);
+			stop();
+			expect(storage.data.get('k')).toBe('{"state":5,"version":0}');
+			stop();
+			store.setState(6);
+			jest.advanceTimersByTime(1000);
+			expect(storage.data.get('k')).toBe('{"state":5,"version":0}');
+			expect(jest.getTimerCount()).toBe(0);
+		} finally {
+			jest.useRealTimers();
+		}
+	});
+
+	it('unsubscribes once, however often it is disposed', function () {
+		const store = createStore(0);
+		const unsubscribe = jest.fn();
+		const stop = persistStore(
+			{
+				getState: store.getState,
+				setState: store.setState,
+				subscribe(): Unsubscribe {
+					return unsubscribe;
+				}
+			},
+			{ key: 'k', storage: memoryStorage() }
+		);
+		stop();
+		stop();
+		expect(unsubscribe).toHaveBeenCalledTimes(1);
+	});
+
+	it('stops writing once disposed', function () {
+		const storage = memoryStorage();
+		const store = createStore(0);
+		const stop = persistStore(store, { key: 'k', storage });
+		stop();
+		store.setState(1);
+		expect(storage.calls).toEqual(['get k']);
+	});
+
+	it('defaults to globalThis.localStorage when it is usable, and does nothing otherwise', function () {
+		const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+		const storage = memoryStorage({ k: '{"state":9,"version":0}' });
+		try {
+			Object.defineProperty(globalThis, 'localStorage', { value: storage, configurable: true, writable: true });
+			const store = createStore(0);
+			persistStore(store, { key: 'k' });
+			expect(store.getState()).toBe(9);
+			store.setState(10);
+			expect(storage.data.get('k')).toBe('{"state":10,"version":0}');
+
+			Object.defineProperty(globalThis, 'localStorage', { value: undefined, configurable: true, writable: true });
+			const none = createStore(0);
+			const onError = jest.fn();
+			const subscribe = jest.fn(none.subscribe);
+			const stop = persistStore({ getState: none.getState, setState: none.setState, subscribe }, { key: 'k', storage: undefined, onError });
+			none.setState(1);
+			expect(stop()).toBeUndefined();
+			// Nothing to persist to: no subscription, and nothing reported.
+			expect(subscribe).not.toHaveBeenCalled();
+			expect(onError).not.toHaveBeenCalled();
+
+			for (const value of [{ getItem() {}, setItem() {} }, { setItem() {}, removeItem() {} }, { getItem() {}, removeItem() {} }, 5, null]) {
+				Object.defineProperty(globalThis, 'localStorage', { value, configurable: true, writable: true });
+				const unusable = createStore(0);
+				const unusableError = jest.fn();
+				persistStore(unusable, { key: 'k', onError: unusableError });
+				unusable.setState(1);
+				expect(unusableError).not.toHaveBeenCalled();
+			}
+
+			// Jest's global proxy swallows errors thrown by a global getter: throw from the storage's own getter instead.
+			Object.defineProperty(globalThis, 'localStorage', {
+				value: {
+					get getItem(): never {
+						throw new Error('SecurityError');
+					}
+				},
+				configurable: true,
+				writable: true
+			});
+			const blocked = createStore(0);
+			expect(function () {
+				persistStore(blocked, { key: 'k' })();
+			}).not.toThrow();
+		} finally {
+			if (descriptor) Object.defineProperty(globalThis, 'localStorage', descriptor);
+			else delete (globalThis as { localStorage?: unknown }).localStorage;
+		}
+	});
+
+	it('validates its arguments, ignoring a polluted Object.prototype', function () {
+		const store = createStore(0);
+		const storage = memoryStorage();
+		const cases: Array<[() => unknown, Error]> = [
+			[
+				function () {
+					return persistStore(null as never, { key: 'k', storage });
+				},
+				new TypeError('persistStore: `store` must be a store, got null')
+			],
+			[
+				function () {
+					return persistStore({ getState: store.getState, subscribe: store.subscribe } as never, { key: 'k', storage });
+				},
+				new TypeError('persistStore: `store.setState` must be a function, got undefined')
+			],
+			[
+				function () {
+					return persistStore({ setState: store.setState, subscribe: store.subscribe } as never, { key: 'k', storage });
+				},
+				new TypeError('persistStore: `store.getState` must be a function, got undefined')
+			],
+			[
+				function () {
+					return persistStore({ getState: store.getState, setState: store.setState } as never, { key: 'k', storage });
+				},
+				new TypeError('persistStore: `store.subscribe` must be a function, got undefined')
+			],
+			[
+				function () {
+					return persistStore(store, null as never);
+				},
+				new TypeError('persistStore: `options` must be an object, got null')
+			],
+			[
+				function () {
+					return persistStore(store, {} as never);
+				},
+				new TypeError('persistStore: `options.key` must be a string, got undefined')
+			],
+			[
+				function () {
+					return persistStore(store, { key: 'k', storage, version: -1 });
+				},
+				new RangeError('persistStore: `options.version` must be an integer >= 0, got -1')
+			],
+			[
+				function () {
+					return persistStore(store, { key: 'k', storage, version: 1.5 });
+				},
+				new RangeError('persistStore: `options.version` must be an integer >= 0, got 1.5')
+			],
+			[
+				function () {
+					return persistStore(store, { key: 'k', storage, debounce: -1 });
+				},
+				new RangeError('persistStore: `options.debounce` must be a number between 0 and 2147483647, got -1')
+			],
+			[
+				function () {
+					return persistStore(store, { key: 'k', storage: { getItem() {} } as never });
+				},
+				new TypeError('persistStore: `options.storage` must have getItem, setItem and removeItem methods, got object')
+			],
+			[
+				function () {
+					return persistStore(store, { key: 'k', storage: { getItem() {}, setItem() {} } as never });
+				},
+				new TypeError('persistStore: `options.storage` must have getItem, setItem and removeItem methods, got object')
+			],
+			[
+				function () {
+					return persistStore(store, { key: 'k', storage: { setItem() {}, removeItem() {} } as never });
+				},
+				new TypeError('persistStore: `options.storage` must have getItem, setItem and removeItem methods, got object')
+			],
+			[
+				function () {
+					return persistStore(store, { key: 'k', storage: { getItem() {}, removeItem() {} } as never });
+				},
+				new TypeError('persistStore: `options.storage` must have getItem, setItem and removeItem methods, got object')
+			],
+			[
+				function () {
+					return persistStore(store, { key: 'k', storage: null as never });
+				},
+				new TypeError('persistStore: `options.storage` must have getItem, setItem and removeItem methods, got null')
+			],
+			[
+				function () {
+					return persistStore(store, { key: 'k', storage, serialize: 1 as never });
+				},
+				new TypeError('persistStore: `options.serialize` must be a function, got number')
+			],
+			[
+				function () {
+					return persistStore(store, { key: 'k', storage, deserialize: 1 as never });
+				},
+				new TypeError('persistStore: `options.deserialize` must be a function, got number')
+			],
+			[
+				function () {
+					return persistStore(store, { key: 'k', storage, migrate: 1 as never });
+				},
+				new TypeError('persistStore: `options.migrate` must be a function, got number')
+			],
+			[
+				function () {
+					return persistStore(store, { key: 'k', storage, partialize: 1 as never });
+				},
+				new TypeError('persistStore: `options.partialize` must be a function, got number')
+			],
+			[
+				function () {
+					return persistStore(store, { key: 'k', storage, merge: 1 as never });
+				},
+				new TypeError('persistStore: `options.merge` must be a function, got number')
+			],
+			[
+				function () {
+					return persistStore(store, { key: 'k', storage, onError: 1 as never });
+				},
+				new TypeError('persistStore: `options.onError` must be a function, got number')
+			],
+			[
+				function () {
+					return persistStore(
+						{
+							getState: store.getState,
+							setState: store.setState,
+							subscribe(): Unsubscribe {
+								return undefined as never;
+							}
+						},
+						{ key: 'k', storage }
+					);
+				},
+				new TypeError('persistStore: `store.subscribe()` must be a function, got undefined')
+			]
+		];
+		for (const [fn, error] of cases) expect(fn).toThrow(error);
+
+		const proto = Object.prototype as Record<string, unknown>;
+		proto.version = 3;
+		proto.partialize = function (): string {
+			return 'polluted';
+		};
+		try {
+			const polluted = memoryStorage();
+			persistStore(store, { key: 'p', storage: polluted });
+			store.setState(1);
+			expect(polluted.data.get('p')).toBe('{"state":1,"version":0}');
+		} finally {
+			delete proto.version;
+			delete proto.partialize;
+		}
 	});
 });

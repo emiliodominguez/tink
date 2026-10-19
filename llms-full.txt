@@ -11,7 +11,7 @@ Key facts for code generation:
 
 ## arrays
 
-Collection helpers: set algebra, grouping, chunking, sorting, sampling.
+Collection helpers: set algebra, grouping, chunking, sorting and comparators, sampling, pagination and id/parentId trees.
 Import: `import { … } from 'tinkit/arrays';`
 
 - `contains<T>(array: ReadonlyArray<T>, value: T): boolean` — Check if an array contains a value, using SameValueZero equality (so `NaN` is found and `0` matches `-0`).
@@ -86,6 +86,17 @@ Import: `import { … } from 'tinkit/arrays';`
 - `combinations<T>(array: ReadonlyArray<T>, k: number): T[][]` — Return every combination of `k` items of an array (subsets of `k` POSITIONS, items in input order), in lexicographic order of positions, like Python's `itertools.combinations`.
 - `permutations<T>(array: ReadonlyArray<T>, k = array.length): T[][]` — Return every arrangement of `k` items of an array (ordered selections of `k` distinct POSITIONS), in lexicographic order of positions, like Python's `itertools.permutations`.
 - `powerSet<T>(array: ReadonlyArray<T>): T[][]` — Return every subset of an array (`2 ** length` of them, items in input order), in binary-counting order: item `i` is in subset `m` when bit `i` of `m` is set, so `[]` comes first and the whole array last.
+- `compareBy<T>(selector: (item: T) => SortKey | null | undefined, order: SortOrder = 'asc'): Comparator<T>` — Create a `Comparator` for `Array.prototype.sort` / `toSorted` (or `sortedIndex`, `binarySearch`...) that orders items by the key `selector` returns, with exactly the ordering rules of `sortBy` and `orderBy`: numbers and bigints numerically and before strings, strings by UTF-16 code units, `Date`s by timestamp, and `NaN`, invalid `Date`s, `null` and `undefined` keys after every other key in BOTH directions (equal to each other).
+- `combineComparators<T>(...comparators: Array<Comparator<T>>): Comparator<T>` — Combine comparators into one that compares by the first, then breaks ties with the second, and so on: the first non-zero result wins (a `NaN` result counts as a tie, as `Array.prototype.sort` treats it).
+- `reverseComparator<T>(compare: Comparator<T>): Comparator<T>` — Reverse a comparator: the result orders items the opposite way (`reverseComparator(c)(a, b)` is `c(b, a)`).
+- `toTree<T extends object, C extends string = 'children'>(items: ReadonlyArray<T>, options: ToTreeOptions<T, C> = {}): Array<TreeNode<T, C>>` — Build a forest from a flat list of items that reference their parent by id (an adjacency list, as rows of a database table or a CMS export): each item becomes a node, a SHALLOW COPY of the item with the array of its children added under `childrenKey` (the items themselves are never mutated).
+- `flattenTree<N extends object>(roots: ReadonlyArray<N>, options: FlattenTreeOptions = {}): N[]` — List every node of a forest (an array of root nodes, each holding its children under `childrenKey`), the inverse of `toTree`: `toTree(flattenTree(forest))` rebuilds the forest.
+- `upsert<T>(array: ReadonlyArray<T>, item: T, keyFn?: (item: T) => unknown): T[]` — Return a copy of an array where the FIRST item matching `item` is replaced by `item`, or with `item` appended when none matches: the "insert or update" of a list held in state (save a record, merge a server response).
+- `filterMap<T, R>(array: ReadonlyArray<T>, fn: (item: T, index: number) => R): Array<NonNullable<R>>` — Map an array and drop the `null` and `undefined` results, in one pass (Kotlin's `mapNotNull`, Swift's `compactMap`): return `undefined` (or nothing, or `null`) from `fn` to skip an item.
+- `duplicates<T>(array: ReadonlyArray<T>, keyFn?: (item: T, index: number) => unknown): T[]` — Return the items that occur more than once (by SameValueZero, or by the key `keyFn` returns), each reported ONCE: the first item with each repeated key, in order of first occurrence.
+- `associate<T, K extends PropertyKey, V>(array: ReadonlyArray<T>, fn: (item: T, index: number) => readonly [K, V]): Partial<Record<K, V>>` — Build an object from the `[key, value]` pairs `fn` returns for each item (remeda's `mapToObj`, radash's `objectify`, Kotlin's `associate`); when several items give the same key, the last one wins.
+- `paginate<T>(array: ReadonlyArray<T>, page: number, pageSize: number): Page<T>` — Return one page of an array with the metadata a pager needs.
+- `splitAt<T>(array: ReadonlyArray<T>, index: number): [T[], T[]]` — Split an array in two at `index`: the items before it, and the items from it on.
 
 ## objects
 
@@ -147,10 +158,11 @@ Import: `import { … } from 'tinkit/objects';`
 - `toKebabCaseKeys<T>(value: T): KebabCaseKeys<T>` — Deeply renames the keys of plain objects (also inside arrays) to kebab-case with `strings/toKebabCase`; same rules as `toCamelCaseKeys`.
 - `stableStringify(value: unknown): string` — Serializes a value into a DETERMINISTIC string: two values give the same string exactly when they hold the same data, whatever the insertion order of their keys or `Map`/`Set` entries, which makes the result usable as a cache key, a memoization key or the input of `hash`.
 - `hash(value: unknown, seed: number = 0): number` — Hashes a value: the 53-bit cyrb53 hash of its `stableStringify` encoding, so equal data gives equal hashes whatever the key order.
+- `safeStringify(value: unknown, options: SafeStringifyOptions = {}): string | undefined` — `JSON.stringify` that never throws on the value: it gives the same text for everything `JSON.stringify` handles (same `toJSON`, replacer and `space` semantics), and a useful one where `JSON.stringify` throws or loses data.
 
 ## guards
 
-Runtime type predicates that narrow `unknown` values, composable into path-aware, Standard Schema-compatible validators.
+Runtime type predicates that narrow `unknown` values, composable into path-aware, Standard Schema-compatible validators, plus runtime detection.
 Import: `import { … } from 'tinkit/guards';`
 
 - `isObject(value: unknown): value is object` — Checks whether a value is a non-null object (`typeof value === 'object'`).
@@ -187,7 +199,7 @@ Import: `import { … } from 'tinkit/guards';`
 - `isNonNegativeInteger(value: unknown): value is number` — Checks whether a value is an integer greater than or equal to zero (an index or a count).
 - `isSafeInteger(value: unknown): value is number` — Checks whether a value is a safe integer: an integer in `[-(2^53 - 1), 2^53 - 1]`, the range where every integer is exactly representable (so `n + 1 !== n`).
 - `isNonEmptyString(value: unknown): value is string` — Checks whether a value is a primitive string with at least one UTF-16 code unit.
-- `isNonEmptyArray<T>(value: T[] | null | undefined): value is [T, ...T[]]` — Checks whether a (mutable) array has at least one element, narrowing it to a non-empty tuple `[T, ...T[]]` so that `value[0]` is typed `T` (not `T \| undefined` under `noUncheckedIndexedAccess`).
+- `isNonEmptyArray<T>(value: T[] | null | undefined): value is NonEmptyArray<T>` — Checks whether a (mutable) array has at least one element, narrowing it to a `NonEmptyArray<T>` (`[T, ...T[]]`) so that `value[0]` is typed `T` (not `T \| undefined` under `noUncheckedIndexedAccess`).
 - `isKeyOf<T extends object>(object: T, key: unknown): key is T extends unknown ? keyof T : never` — Checks whether `key` is an OWN property key of `object` (string, number or symbol; enumerable or not), narrowing `key` to `keyof T`.
 - `isOneOf<const T extends ReadonlyArray<unknown>>(values: T): (value: unknown) => value is T[number]` — Creates a guard that checks membership in a fixed list of values (compared with SameValueZero, like `Array#includes`, so `NaN` matches `NaN` and `0` matches `-0`), narrowing to the union of the list's element types.
 - `isInstanceOf<T>(constructor: abstract new (...args: never[]) => T): (value: unknown) => value is T` — Creates a guard that checks `value instanceof constructor` (so it honours `Symbol.hasInstance` and the prototype chain; it does not recognise instances from other realms).
@@ -195,6 +207,17 @@ Import: `import { … } from 'tinkit/guards';`
 - `isRecordOf<T>(guard: Guard<T>): (value: unknown) => value is Record<PropertyKey, T>` — Creates a guard that checks that a value is a plain object (see `isPlainObject`) whose own enumerable property values (string AND symbol keys) all pass `guard`.
 - `isTypedArray(value: unknown): value is TypedArray` — Checks whether a value is one of the eleven built-in typed arrays (`Uint8Array`, `Float64Array`, `BigInt64Array`…), including subclasses and instances from other realms.
 - `isArrayBuffer(value: unknown): value is ArrayBuffer` — Checks whether a value is a genuine `ArrayBuffer` (brand check: cross-realm instances and detached buffers pass; `SharedArrayBuffer`, typed arrays and objects that merely inherit from `ArrayBuffer.prototype` fail).
+- `isAsyncFunction(value: unknown): value is (...args: never[]) => Promise<unknown>` — Checks whether a value is an `async` function (an `async function`, async arrow or async method, bound or not).
+- `isGeneratorFunction(value: unknown): value is (...args: never[]) => Generator<unknown, unknown, unknown>` — Checks whether a value is a generator function (`function*`, bound or not).
+- `isPropertyKey(value: unknown): value is PropertyKey` — Checks whether a value can be used as a property key as it is: a string, a number or a symbol (other values would be converted to strings first).
+- `isArrayLike(value: unknown): value is ArrayLike<unknown>` — Checks whether a value is array-like, as lodash's `isArrayLike`: not `null`, `undefined` or a function, with a `length` that is an integer in `[0, Number.MAX_SAFE_INTEGER]`.
+- `isBlob(value: unknown): value is BlobLike` — Checks whether a value is a `Blob` (a `File` too), with a brand check: blobs of other realms pass, while objects that merely inherit from `Blob.prototype` or fake its properties fail.
+- `getType(value: unknown): TypeName` — Returns a precise, lowercase name for the type of any value, as a `TypeName`.
+- `isNode(): boolean` — Checks whether the code runs in Node.js: `process.versions.node` is a string, and the runtime is neither Bun nor Deno (both also set it).
+- `isDeno(): boolean` — Checks whether the code runs in Deno: the global `Deno` is an object whose `version.deno` is a string.
+- `isBun(): boolean` — Checks whether the code runs in Bun: `process.versions.bun` is a string.
+- `isBrowser(): boolean` — Checks whether the code runs on the main thread of a browser: `window` is the global object, `document` is an object, and the runtime is not a server runtime (`process.versions.node` is not a string and there is no `Deno`).
+- `isWebWorker(): boolean` — Checks whether the code runs in a web worker: the global object is an instance of `WorkerGlobalScope`, which covers dedicated, shared and service workers (Deno's workers too).
 - `AssertionErrornew (message = 'Assertion failed')` — Error thrown by `assert`, `assertDefined` and `assertNever`.
 - `assert(condition: unknown, message?: string): asserts condition` — Asserts that a condition is truthy; TypeScript then narrows `condition` (and anything derived from it) after the call.
 - `assertDefined<T>(value: T, message?: string): asserts value is NonNullable<T>` — Asserts that a value is neither `null` nor `undefined`, narrowing it to `NonNullable<T>` after the call.
@@ -226,7 +249,7 @@ Import: `import { … } from 'tinkit/guards';`
 
 ## strings
 
-Unicode-aware transformations, case conversion, escaping, templating, natural sorting and terminal text width.
+Unicode-aware transformations, case conversion, escaping, templating, natural sorting, terminal text width, ANSI/HTML stripping and safe file names.
 Import: `import { … } from 'tinkit/strings';`
 
 - `reverse(string: string): string` — Reverses a string by user-perceived characters (grapheme clusters), so emoji, surrogate pairs and combining marks are kept intact.
@@ -235,7 +258,7 @@ Import: `import { … } from 'tinkit/strings';`
 - `substring(string: string, start: number, end: number): string` — Extracts a substring from a string based on start and end indices (UTF-16 code units, like `String.prototype.substring`).
 - `includes(string: string, subString: string): boolean` — Checks if a string contains a specified substring (case-sensitive).
 - `replace(string: string, searchValue: string, replaceValue: string): string` — Replaces all occurrences of a substring with a replacement string.
-- `truncate(string: string, length: number, suffix: string = '...'): string` — Truncates a string to `length` user-perceived characters (grapheme clusters) and appends a suffix when it was longer.
+- `truncate(string: string, length: number, options: string | TruncateOptions = '...'): string` — Truncates a string to `length` user-perceived characters (grapheme clusters) and appends a suffix when it was longer.
 - `repeat(string: string, times: number): string` — Repeats a string a specified number of times (wraps `String.prototype.repeat`).
 - `trim(string: string): string` — Removes whitespace (and line terminators) from both ends of a string.
 - `toTitleCase(string: string): string` — Converts a string to title case: in every whitespace-separated word the first letter is upper-cased and everything else is lower-cased.
@@ -245,7 +268,7 @@ Import: `import { … } from 'tinkit/strings';`
 - `toCamelCase(string: string): string` — Converts a string to camelCase, using the same word detection as `toSnakeCase`.
 - `toPascalCase(string: string): string` — Converts a string to PascalCase, using the same word detection as `toSnakeCase`.
 - `removeDiacritics(string: string): string` — Removes diacritical marks (accents, umlauts, cedillas...) from a string: it is decomposed (NFD), the combining diacritical marks are stripped and the result is recomposed (NFC).
-- `toSlug(string: string): string` — Converts a string to a URL-friendly slug: compatibility-decomposed (NFKD), diacritics removed, a few common Latin letters transliterated (`ß` → `ss`, `æ` → `ae`, `ø` → `o`...), lower-cased, every run of characters outside `[a-z0-9]` replaced by a single `-`, and leading/trailing hyphens removed.
+- `toSlug(string: string, options: SlugOptions = {}): string` — Converts a string to a URL-friendly slug: compatibility-decomposed (NFKD), diacritics removed, a few common Latin letters transliterated (`ß` → `ss`, `æ` → `ae`, `ø` → `o`...), lower-cased, and the runs of `[a-z0-9]` joined with `-` (every other character separates words and is dropped).
 - `toBoolean(string: string): boolean` — Converts a string to a boolean, which is handy for environment variables and query parameters.
 - `toNumber(string: string): number` — Converts a string holding a finite decimal number to that number, ignoring surrounding whitespace: the trimmed string must satisfy `isNumericString` from the validate module (optional sign, digits with an optional fraction, optional exponent), so the result is either a finite number or `NaN`, never `±Infinity`.
 - `startsWith(string: string, subString: string): boolean` — Checks if a string starts with a given substring (case-sensitive).
@@ -288,10 +311,16 @@ Import: `import { … } from 'tinkit/strings';`
 - `compareNatural(a: string, b: string, options?: CompareNaturalOptions): number` — Compares two strings in natural order, for `Array.prototype.sort`: runs of digits compare by their numeric value, so `'file2'` sorts before `'file10'` and `'v1.9'` before `'v1.10'`, and everything else compares by UTF-16 code units, like `<` (or case-insensitively, with `ignoreCase`).
 - `truncateMiddle(string: string, length: number, options: TruncateMiddleOptions = {}): string` — Shortens a string by removing its middle, so both ends stay visible (paths, URLs, identifiers, hashes): when the string is longer than `length` user-perceived characters (grapheme clusters), it keeps `length` of them, half from the start and half from the end by default, with the ellipsis between.
 - `stringWidth(string: string): number` — Computes how many columns a string takes up in a monospace terminal, for aligning tables, progress bars and other command-line output.
+- `stripAnsi(string: string): string` — Removes the ANSI escape sequences from a string (colours and styles, cursor movements, OSC 8 hyperlinks, window titles...), leaving the text a terminal would show, as `strip-ansi` does.
+- `stripHtml(html: string): string` — Extracts the text of an HTML fragment, for previews, search indexes, notifications or plain-text e-mails: tags, comments, doctypes and processing instructions are removed, the content of `<script>` and `<style>` elements is dropped, and `&lt;`, `&gt;`, `&quot;`, `&#39;`/`&apos;` and `&amp;` are decoded (see `unescapeHtml`; other entities, such as `&nbsp;`, are kept as they are).
+- `indent(string: string, count: number | string, options: IndentOptions = {}): string` — Indents every line of a string, the inverse of `dedent`: `count` repetitions of `options.indent` (a space by default), or the given string, are inserted at the start of each line.
+- `splitOnce(string: string, separator: string): [before: string, after: string] | undefined` — Splits a string at the first occurrence of a separator, like Rust's `split_once`: `key=value=x` gives `['key', 'value=x']`.
+- `splitLast(string: string, separator: string): [before: string, after: string] | undefined` — Splits a string at the last occurrence of a separator, like Rust's `rsplit_once`: `archive.tar.gz` split at `.` gives `['archive.tar', 'gz']`.
+- `toSafeFilename(string: string, options: SafeFilenameOptions = {}): string` — Turns any text (a title, a user-supplied name, a URL) into a file name that is valid on Windows, macOS and Linux, like `filenamify`.
 
 ## url
 
-Typed route patterns (match and build), query-string building and parsing, URL joining and query merging.
+Typed route patterns (match and build), query-string building and parsing, URL joining, normalization and cookies.
 Import: `import { … } from 'tinkit/url';`
 
 - `buildQueryString<P extends QueryParamsOf<P>>(input: P & NotAnArray<P>, options: BuildQueryStringOptions = {}): string` — Builds a query string (WITHOUT the leading `?`) from a record of parameters.
@@ -316,10 +345,14 @@ Import: `import { … } from 'tinkit/url';`
 - `withoutQuery(url: string): string` — Removes the query (`?...`) of a URL string and keeps its fragment (a `?` inside the fragment is not a query).
 - `matchPath<P extends string>(pattern: P, pathname: string, options: MatchPathOptions = {}): PathParams<P> | null` — Matches a pathname against a route pattern and returns the parameters it captures, or `null` when it does not match.
 - `compilePath<P extends string>(pattern: P): PathBuilder<P>` — Compiles a route pattern (see `matchPath` for the syntax) into a function that builds pathnames from parameters, the inverse of `matchPath`.
+- `parseCookie(header: string): Record<string, string>` — Parses a `Cookie` request header (`'a=1; b=2'`) into a record of cookie values, like the `cookie` package's `parse`: names and values are trimmed of spaces and tabs, a value wrapped in double quotes loses them, and values are decoded with `safeDecodeURIComponent` (so a malformed escape is kept as it is, where `cookie` keeps the whole value undecoded).
+- `serializeCookie(name: string, value: string, options: SerializeCookieOptions = {}): string` — Builds a `Set-Cookie` header value (`'name=value; Path=/; HttpOnly'`) like the `cookie` package's `serialize`, with the attributes in the same order.
+- `normalizeUrl(url: string | UrlObject, options: NormalizeUrlOptions = {}): string` — Normalizes an absolute URL so that equivalent spellings compare equal (for cache keys, deduplication or canonical links), like `normalize-url` and ufo's `normalizeURL`.
+- `tryParseUrl(input: string | UrlObject, base?: string | UrlObject): UrlObject | undefined` — Parses a URL, returning `undefined` instead of throwing when it is invalid: the `URL.parse` of newer runtimes (Node 22, 2024 browsers), which it uses when available, for every runtime this library supports.
 
 ## math
 
-Precise arithmetic (exact sums), statistics, histograms, number theory and random numbers.
+Precise arithmetic (exact sums, lossless allocation), statistics, regression, histograms, number theory and random numbers.
 Import: `import { … } from 'tinkit/math';`
 
 - `sum(numbers: ReadonlyArray<number>): number` — Calculates the sum of an array of numbers using Neumaier (improved Kahan–Babuška) compensated summation, which keeps the rounding error independent of the number of elements and makes the result (practically) independent of their order.
@@ -328,6 +361,7 @@ Import: `import { … } from 'tinkit/math';`
 - `factorial(number: number): number` — Calculates the factorial of a non-negative integer, iteratively (in doubles: from `27!` on, the rounding of each product can leave the result a few units in the last place away from the correctly rounded `n!`, while keeping `factorial(n + 1) === (n + 1) * factorial(n)`).
 - `max(numbers: ReadonlyArray<number>): number` — Finds the maximum value in an array of numbers, with the same semantics as `Math.max` (`-Infinity` for an empty array, `NaN` if any element is `NaN`, `0` preferred over `-0`), but without spreading the array, so it works on arrays of any length.
 - `min(numbers: ReadonlyArray<number>): number` — Finds the minimum value in an array of numbers, with the same semantics as `Math.min` (`Infinity` for an empty array, `NaN` if any element is `NaN`, `-0` preferred over `0`), but without spreading the array, so it works on arrays of any length.
+- `extent(numbers: Iterable<number>): [number, number] | undefined` — Finds the smallest and the largest value of some numbers in a single pass, with the semantics of `min` and `max`: elements are converted once with unary `+`, any `NaN` makes both bounds `NaN`, and `-0` is smaller than `0`.
 - `abs(number: number): number` — Finds the absolute value of a number.
 - `sqrt(number: number): number` — Finds the square root of a number.
 - `pow(base: number, exponent: number): number` — Raises a base to an exponent.
@@ -341,6 +375,7 @@ Import: `import { … } from 'tinkit/math';`
 - `toRadians(degrees: number): number` — Converts degrees to radians.
 - `toDegrees(radians: number): number` — Converts radians to degrees.
 - `clamp(value: number, minimum: number, maximum: number): number` — Restricts a value to the inclusive range `[minimum, maximum]`.
+- `wrap(value: number, minimum: number, maximum: number): number` — Wraps a value cyclically into the half-open range `[minimum, maximum)`, for angles (`wrap(370, 0, 360) === 10`), carousel or ring-buffer indices (`wrap(-1, 0, 5) === 4`) and other periodic quantities: the result is the value of the range congruent to `value` modulo `maximum - minimum` (the Euclidean remainder, shifted to `minimum`).
 - `lerp(start: number, end: number, t: number): number` — Linear interpolation between `start` and `end`.
 - `inverseLerp(start: number, end: number, value: number): number` — Inverse of `lerp`: the factor `t` for which `lerp(start, end, t) === value`.
 - `mapRange(value: number, inMin: number, inMax: number, outMin: number, outMax: number): number` — Linearly maps a value from the range `[inMin, inMax]` to `[outMin, outMax]` (not clamped).
@@ -350,6 +385,9 @@ Import: `import { … } from 'tinkit/math';`
 - `mode(numbers: ReadonlyArray<number>): number[]` — Finds the most frequent value(s) of an array of numbers.
 - `variance(numbers: ReadonlyArray<number>, options: VarianceOptions = {}): number` — Computes the variance of an array of numbers using Welford's numerically stable online algorithm.
 - `standardDeviation(numbers: ReadonlyArray<number>, options: VarianceOptions = {}): number` — Computes the standard deviation (square root of `variance`) of an array of numbers.
+- `covariance(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>, options: VarianceOptions = {}): number` — Computes the covariance of two paired samples: how they vary together, `Σ(x - x̄)(y - ȳ) / n`.
+- `correlation(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): number` — Computes the Pearson correlation coefficient of two paired samples: their covariance divided by the product of their standard deviations, from `-1` (perfectly opposite linear relation) through `0` (no linear relation) to `1` (perfectly linear).
+- `linearRegression(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): LinearRegression` — Fits a straight line through paired samples by ordinary least squares (simple linear regression of `ys` on `xs`), as simple-statistics' `linearRegression` and `rSquared`, or Excel's `SLOPE`, `INTERCEPT` and `RSQ`, do.
 - `gcd(a: number, b: number): number` — Greatest common divisor of two integers (Euclid's algorithm).
 - `lcm(a: number, b: number): number` — Least common multiple of two integers.
 - `isPrime(number: number): boolean` — Checks whether a number is a prime.
@@ -358,10 +396,13 @@ Import: `import { … } from 'tinkit/math';`
 - `percentage(value: number, total: number): number` — Expresses `value` as a percentage of `total` (`value / total * 100`).
 - `quantile(numbers: ReadonlyArray<number>, q: number): number` — Computes the `q`-quantile of an array of numbers by linear interpolation between closest ranks (R type 7, the default of R, NumPy and Excel's `PERCENTILE.INC`): with the values sorted ascending, `h = (n - 1) * q` and the result interpolates between the values at ranks `floor(h)` and `ceil(h)`.
 - `percentile(numbers: ReadonlyArray<number>, p: number): number` — Computes the `p`-th percentile of an array of numbers: `quantile(numbers, p / 100)` (linear interpolation, same semantics as Excel's `PERCENTILE.INC`).
+- `interquartileRange(numbers: ReadonlyArray<number>): number` — Computes the interquartile range of an array of numbers, the spread of their middle half: `quantile(numbers, 0.75) - quantile(numbers, 0.25)`, with the same interpolation as `quantile` (R type 7, Excel's `QUARTILE.INC`), but sorting only once.
+- `zScore(value: number, mean: number, deviation: number): number` — Computes the standard score of a value: how many standard deviations it lies above (positive) or below (negative) the mean, `(value - mean) / standardDeviation`.
 - `cumulativeSum(numbers: Iterable<number>): number[]` — Computes the running totals of a sequence of numbers using the same compensated (Neumaier) summation as `sum`, so the last element is exactly `sum(numbers)` and rounding errors do not accumulate along the sequence.
 - `approximatelyEqual(a: number, b: number, options?: ApproximatelyEqualOptions): boolean` — Checks whether two numbers are close to each other, with the semantics of Python's `math.isclose`: `\|a - b\| <= max(relative * max(\|a\|, \|b\|), absolute)`.
 - `weightedAverage(values: ReadonlyArray<number>, weights: ReadonlyArray<number>): number` — Computes the weighted arithmetic mean `Σ(value × weight) / Σ(weight)`, using the compensated `sum`.
 - `normalize(numbers: ReadonlyArray<number>): number[]` — Min–max normalization: linearly rescales the numbers so the smallest becomes `0` and the largest `1`.
+- `allocate(total: number, ratios: ReadonlyArray<number | bigint>): number[]` — Splits an integer amount (cents, items, seats) in proportion to some ratios, without losing or creating a single unit: the shares always add up to exactly `total`.
 - `formatBytes(bytes: number, options: FormatBytesOptions = {}): string` — Formats a byte count as a human-readable string, using SI units (`kB`, `MB`, …, powers of `1000`) by default, or IEC binary units (`KiB`, `MiB`, …, powers of `1024`) with `{ base: 1024 }`.
 - `parseBytes(value: string, options: ParseBytesOptions = {}): number` — Parses a human-readable byte size into a number of bytes: the strict inverse of `formatBytes`.
 - `ordinal(n: number): string` — Converts an integer to its English ordinal string (`1st`, `2nd`, `3rd`, `4th`, `11th`, `12th`, `13th`, `21st`, `112th`, …).
@@ -403,10 +444,20 @@ Import: `import { … } from 'tinkit/functions';`
 - `shallowEqualArgs(next: ReadonlyArray<unknown>, previous: ReadonlyArray<unknown>): boolean` — Compares two argument lists element-wise with SameValueZero (`===`, except that `NaN` equals `NaN`).
 - `memoizeLast<F extends AnyFunction>(fn: F, isEqual: (next: Parameters<F>, previous: Parameters<F>) => boolean = shallowEqualArgs): MemoizedLast<F>` — Creates a function that remembers only its latest call: when called again with equal arguments (and the same `this`), it returns the cached result without invoking `fn`; otherwise it invokes `fn` and replaces the cache.
 - `match<T extends object, K extends keyof T, H extends MatchHandlers<T, K>>(value: T, key: K, handlers: H): MatchResult<H>` — Exhaustive pattern matching on a discriminated union: calls the handler named after `value[key]` (the "tag") with `value`, and returns its result.
+- `_(_value: unknown): _value is unknown` — The wildcard pattern: matches any value, including `undefined` for a property that is missing (like every function in a pattern of `isMatching`).
+- `capture(): CapturePattern<undefined, typeof _>` — Creates a pattern that matches what `pattern` matches (anything, by default) and passes the matched value to the handler, F#'s `as`: a case whose pattern holds an anonymous capture calls its handler (and `when` guard) with the captured value first and the whole matched value second.
+- `captureAs<const N extends string>(name: N): CapturePattern<N, typeof _>` — Creates a pattern that matches what `pattern` matches (anything, by default) and passes the matched value to the handler under `name`: a case whose pattern holds named captures calls its handler (and `when` guard) with an object of the captured values (without a prototype, so any name is safe) first and the whole matched value second.
+- `active<A, R>(extract: (value: A) => R): ActivePattern<A, R>` — Creates an active pattern, F#'s `\| Int n ->`: it matches the values for which `extract` returns something other than `undefined`, and binds that result like an anonymous `capture` (wrap it in `captureAs` to name it).
+- `anyOf<const P extends readonly unknown[]>(...patterns: P): AnyOfPattern<P>` — Creates an or-pattern, F#'s `\| A \| B ->`: it matches what any of `patterns` matches, trying them in order, and narrows to the union of their types.
+- `cons<const H>(head: H): ConsPattern<H, typeof _>` — Creates a list pattern, F#'s `head :: tail`: it matches non-empty arrays whose first element matches `head` and whose other elements, as a new array, match `tail` (anything, by default).
+- `matchWith<T>(value: T): MatchBuilder<T, never>` — Pattern matching in the style of F# and ts-pattern, with the patterns of `isMatching`: `matchWith(value).with(pattern, handler)…` tries the cases in order and calls the handler of the first one whose pattern matches.
+- `matcher<T>(): MatcherBuilder<T, T, never>` — Builds a reusable matching function, F#'s `function` keyword: the cases of `matchWith`, whose patterns are compiled once (with `isMatching`, so later changes to them do not matter), ending with `exhaustive()` or `otherwise(handler)`, which return a function of the value.
+- `pipeAsync(): <T>(value: T) => Promise<Awaited<T>>` — Composes functions from left to right like `pipe`, but any step may return a promise (or another thenable): each step receives the AWAITED result of the previous one, the steps run one after the other, and the composed function always returns a promise, which rejects when a step throws or rejects (later steps are then not called).
+- `composeAsync(): <T>(value: T) => Promise<Awaited<T>>` — Composes functions from right to left like `compose`, but any step may return a promise (or another thenable): `composeAsync(f, g, h)(...args)` awaits `h(...args)`, passes the value to `g`, awaits the result, and so on, always returning a promise (see `pipeAsync`).
 
 ## async
 
-Promise utilities: retries, timeouts, polling, limiters, request batching, keyed Promise.all and async debounce.
+Promise utilities: retries, timeouts, polling, limiters, semaphores and mutexes, request batching, event waiting, keyed Promise.all and async debounce.
 Import: `import { … } from 'tinkit/async';`
 
 - `AbortErrornew (message = 'The operation was aborted.')` — Error used to reject operations cancelled through an abort signal that carries no `reason`.
@@ -422,6 +473,9 @@ Import: `import { … } from 'tinkit/async';`
 - `createLimiter(concurrency: number, options: LimiterOptions = {}): Limiter` — Creates a limiter that runs at most `concurrency` tasks at the same time, starting waiting tasks in FIFO order (like `p-limit`).
 - `createQueue<S extends AbortSignalLike = never>(options: QueueOptions<S> = {}): Queue<S>` — Creates a task queue that runs at most `concurrency` tasks at the same time, starting the waiting task with the highest `priority` first and tasks of equal priority in FIFO order (a stable binary heap, so `add` and every start are O(log n)).
 - `createRateLimiter(options: RateLimiterOptions): RateLimiter` — Creates a rate limiter that starts at most `limit` calls within any window of `interval` milliseconds.
+- `createSemaphore(permits: number): Semaphore` — Creates a counting semaphore: at most `permits` permits are held at once (like the slots of `createLimiter`, but held explicitly, across any number of steps, until released).
+- `createMutex(): Mutex` — Creates a promise-based mutex (mutual-exclusion lock): a `createSemaphore` semaphore with a single permit, with the same guarantees (FIFO, cancellation through `signal` and `timeout` without leaks, idempotent release) and method names, plus `isLocked`.
+- `createKeyedMutex<K = unknown>(): KeyedMutex<K>` — Creates one mutex per key, to serialize work per user, per document or per file while different keys proceed in parallel.
 - `pollUntil<T>(check: () => T | PromiseLike<T>, options: PollOptions = {}): Promise<Truthy<Awaited<T>>>` — Calls `check` immediately and then every `interval` ms (waiting for async checks to settle in between, so checks never overlap) until it returns (or resolves to) a truthy value, and resolves with that value.
 - `promiseAllObject<T extends object>(obj: T): Promise<{ -readonly [K in keyof T]: Awaited<T[K]> }>` — Like `Promise.all`, but for an object of promises (or values): resolves with an object with the same keys and the awaited values.
 - `promiseAllSettledObject<T extends object>(obj: T): Promise<{ -readonly [K in keyof T]: PromiseSettledResult<Awaited<T[K]>> }>` — Like `Promise.allSettled`, but for an object of promises (or values): resolves with an object with the same keys and a `PromiseSettledResult` for each value.
@@ -433,23 +487,38 @@ Import: `import { … } from 'tinkit/async';`
 - `anySignal(signals: Iterable<AbortSignalLike | null | undefined>): PlatformAbortSignal` — Combines abort signals: returns a new `AbortSignal` that aborts as soon as any of the inputs aborts, with that input's `reason` (or an `AbortError` when it has none) — like the platform's `AbortSignal.any`, but accepting any `AbortSignalLike`.
 - `abortable<T>(promise: PromiseLike<T> | T, signal: AbortSignalLike | null | undefined): Promise<T>` — Settles like `promise`, unless `signal` aborts first, in which case it rejects with the signal's `reason` (or an `AbortError` when it has none).
 - `throwIfAborted(signal: AbortSignalLike | null | undefined): void` — Throws the signal's `reason` (or an `AbortError` when it has none) if `signal` is aborted; does nothing otherwise.
+- `waitForEvent<E = PlatformEvent>(target: EventTargetLike, type: string, options?: WaitForEventOptions<E>): Promise<E>` — Waits for the next `type` event of a DOM `EventTarget` (resolving with the `Event`) or of a Node-style emitter (resolving with the first argument the listeners receive), like `events.once` or `p-event`, with the cleanup done right.
+- `reduceAsync<T, A>(items: Iterable<T> | AsyncIterable<T>, reducer: (accumulator: A, item: Awaited<T>, index: number) => PromiseLike<A> | A, initial: PromiseLike<A> | A, options: ReduceAsyncOptions = {}): Promise<A>` — Reduces a sync or async iterable with an async `reducer`, one item at a time, in order: each item is read only after the previous step has settled, so lazy and infinite sources (async generators, paginated APIs, streams) are consumed on demand.
+- `minDelay<T>(promise: PromiseLike<T> | T, ms: number, options: MinDelayOptions = {}): Promise<T>` — Settles like `promise`, but no earlier than `ms` milliseconds after the call (like `p-min-delay`): a loading indicator shown while waiting then stays up long enough to be read, instead of flickering when the response is fast.
 
 ## color
 
-Hex/RGB/HSL and OKLab/OKLCH conversion with CSS gamut mapping, perceptual mixing and WCAG contrast checks.
+Hex/RGB/HSL/HSV and OKLab/OKLCH conversion with CSS gamut mapping, perceptual mixing and scales, opt-in named colours and WCAG contrast checks.
 Import: `import { … } from 'tinkit/color';`
 
 - `parseHex(hex: string): Rgba` — Parses a CSS hex colour.
 - `parseColor(input: string): Rgba` — Parses a CSS colour string (CSS Color 4) into an `Rgba` colour.
+- `isCssColor(value: unknown): value is string` — Tells whether a value is a CSS colour string that `parseColor` accepts (so that `parseColor(value)` will not throw): hex (with or without `#`), `rgb()`, `rgba()`, `hsl()`, `hsla()`, `oklab()`, `oklch()` or `'transparent'`.
+- `parseNamedColor(name: string): Rgba | undefined` — Parses a CSS named colour (CSS Color 4: the 148 `<named-color>` keywords, such as `'red'` or `'rebeccapurple'`, and `'transparent'`).
+- `toColorName(color: ColorInput, options: ColorNameOptions = {}): string | undefined` — Names a colour with its CSS named colour (see `parseNamedColor`).
 - `toRgba(input: ColorInput): Rgba` — Normalizes any `ColorInput` to a fresh `Rgba` object: strings are parsed with `parseColor` (so every hex string gives the same result as `parseHex`); for objects, `r`, `g`, `b` are clamped to `[0, 255]` and rounded to integers, and `a` (default `1` when missing or `undefined`) is clamped to `[0, 1]`.
 - `toHex(color: ColorInput, options: ToHexOptions = {}): string` — Formats a colour as a lowercase CSS hex string.
 - `toCssRgb(color: ColorInput): string` — Formats a colour as a CSS `rgb()` string in the modern space-separated syntax: `'rgb(r g b)'`, or `'rgb(r g b / a)'` for translucent colours.
 - `toCssHsl(color: ColorInput): string` — Formats a colour as a CSS `hsl()` string in the modern space-separated syntax: `'hsl(h s% l%)'`, or `'hsl(h s% l% / a)'` for translucent colours.
 - `rgbToHsl(color: ColorInput): Hsl` — Converts an RGB colour to HSL using the standard (CSS Color 4) formulas.
+- `rgbToHsv(color: ColorInput): Hsv` — Converts an RGB colour to HSV (HSB), the model of most colour pickers (a hue slider over a saturation/value square).
+- `hsvToRgb(hsv: Hsv): Rgb` — Converts an HSV (HSB) colour to RGB, rounding channels to integers.
 - `hslToRgb(hsl: Hsl): Rgb` — Converts an HSL colour to RGB using the standard (CSS Color 4) formulas, rounding channels to integers.
 - `mix(colorA: ColorInput, colorB: ColorInput, weight = 0.5, options: MixOptions = {}): Rgba` — Mixes two colours.
+- `colorScale(stops: readonly ColorInput[], options: ColorScaleOptions = {}): (t: number) => Rgba` — Creates a colour scale (a gradient as a function, like `chroma.scale` or culori's `interpolate`): `scale(t)` interpolates between the two stops around position `t`, with `mix` and its options (`space: 'oklab'` or `'oklch'` gives perceptually even gradients without the muddy midpoints of sRGB).
+- `colorSteps(stops: readonly ColorInput[], count: number, options: ColorScaleOptions = {}): Rgba[]` — Samples `count` evenly spaced colours from a colour scale (see `colorScale`), both ends of the domain included: a palette for a chart's series or a design system's shades.
 - `lighten(color: ColorInput, amount: number, options: LightnessOptions = {}): Rgba` — Makes a colour lighter by adding `amount` percentage points to its lightness: HSL lightness by default (clamped at `100`, white, keeping hue and saturation), or OKLCH lightness with `{ space: 'oklch' }` (`amount / 100` added to `l`, keeping chroma and hue, gamut mapped): equal amounts then look like equal steps whatever the hue, which HSL does not guarantee (yellow and blue at the same HSL lightness look very different).
 - `darken(color: ColorInput, amount: number, options: LightnessOptions = {}): Rgba` — Makes a colour darker by subtracting `amount` percentage points from its lightness: HSL lightness by default (clamped at `0`, black, keeping hue and saturation), or OKLCH lightness with `{ space: 'oklch' }` (see `lighten`).
+- `saturate(color: ColorInput, amount: number, options: LightnessOptions = {}): Rgba` — Makes a colour more saturated by adding `amount` percentage points: to its HSL saturation by default (clamped at `100`, keeping hue and lightness, like Sass's `saturate`), or with `{ space: 'oklch' }` to its OKLCH chroma, where `100` points are `0.4` as in CSS percentages (keeping perceived lightness and hue, gamut mapped).
+- `desaturate(color: ColorInput, amount: number, options: LightnessOptions = {}): Rgba` — Makes a colour less saturated by subtracting `amount` percentage points: from its HSL saturation by default (clamped at `0`, grey, keeping hue and lightness, like Sass's `desaturate`), or with `{ space: 'oklch' }` from its OKLCH chroma (`100` points are `0.4`, clamped at `0`, keeping perceived lightness and hue).
+- `grayscale(color: ColorInput, options: LightnessOptions = {}): Rgba` — Turns a colour into the grey of the same lightness (same as `desaturate(color, 100, options)`): HSL lightness by default (Sass's `grayscale`: `#ff0000` and `#0000ff` both give `#808080`), or with `{ space: 'oklch' }` perceived lightness (chroma `0`, so yellow gives a light grey and blue a dark one, as they look).
+- `rotateHue(color: ColorInput, degrees: number, options: LightnessOptions = {}): Rgba` — Rotates the hue of a colour by `degrees` (any finite angle, negative included; it wraps around): the HSL hue by default (keeping saturation and lightness), or with `{ space: 'oklch' }` the OKLCH hue (keeping perceived lightness and chroma, gamut mapped, so the rotated colours look equally light, which HSL does not guarantee).
+- `complement(color: ColorInput, options: LightnessOptions = {}): Rgba` — Returns the complementary colour: the hue rotated by 180° (see `rotateHue`), in HSL by default (as Sass's `complement`) or in OKLCH with `{ space: 'oklch' }` (the perceptual opposite, as light as the colour).
 - `toOklab(color: ColorInput): Required<Oklab>` — Converts a colour to OKLab (see `Oklab`).
 - `toOklch(color: ColorInput): Required<Oklch>` — Converts a colour to OKLCH (see `Oklch`).
 - `oklchToRgb(oklch: OklchInput): Rgba` — Converts an OKLCH colour to sRGB.
@@ -464,7 +533,7 @@ Import: `import { … } from 'tinkit/color';`
 
 ## search
 
-Fuzzy matching and ranking with highlight ranges, for command palettes and filter-as-you-type UIs.
+Fuzzy matching and ranking with highlight ranges and optional accent folding, for command palettes and filter-as-you-type UIs.
 Import: `import { … } from 'tinkit/search';`
 
 - `fuzzyMatch(query: string, target: string, options: FuzzyMatchOptions = {}): FuzzyMatch | undefined` — Fuzzy-matches `query` against `target` (as in command palettes and filter-as-you-type lists): the query matches when all of its characters appear in the target in order, not necessarily contiguously.
@@ -520,7 +589,7 @@ Import: `import { … } from 'tinkit/easing';`
 
 ## encoding
 
-Buffer-free base64/base64url, hex and UTF-8 conversions with strict decoding, and a synchronous SHA-256.
+Buffer-free base64/base64url, base32, hex and UTF-8 conversions with strict decoding, RFC 4180 CSV, JWT decoding, constant-time comparison and a synchronous SHA-256.
 Import: `import { … } from 'tinkit/encoding';`
 
 - `toBase64(data: string | BytesInput, options?: ToBase64Options): string` — Encodes binary data (or the UTF-8 encoding of a string) as base64 (RFC 4648 §4) or base64url (§5).
@@ -531,10 +600,29 @@ Import: `import { … } from 'tinkit/encoding';`
 - `decodeUtf8(bytes: BytesInput, options?: DecodeUtf8Options): string` — Decodes UTF-8 bytes into a string, following the WHATWG Encoding Standard exactly (the behaviour of `TextDecoder`): each maximal invalid subsequence (a stray continuation byte, a truncated sequence, an overlong form, a surrogate code point, a value above U+10FFFF) becomes one U+FFFD, or throws with `fatal`.
 - `sha256(data: string | BytesInput): Uint8Array<ArrayBuffer>` — Computes the SHA-256 digest (FIPS 180-4) of binary data or of the UTF-8 encoding of a string, synchronously and in plain JavaScript.
 - `sha256Hex(data: string | BytesInput): string` — Computes the SHA-256 digest of binary data or of the UTF-8 encoding of a string, as 64 lowercase hex digits (see `sha256`).
+- `timingSafeEqual(a: string | BytesInput, b: string | BytesInput): boolean` — Compares two byte sequences (or the UTF-8 encodings of two strings) in a time that depends only on their length, not on where they first differ: use it to check a secret (an HMAC, an API key, a CSRF or reset token) against the expected value, where an early-exit `===` lets an attacker recover it byte by byte by timing the responses.
+- `toBase32(data: string | BytesInput, options?: ToBase32Options): string` — Encodes binary data (or the UTF-8 encoding of a string) as base32: RFC 4648 §6 (the default), base32hex (§7) or Crockford's base32, with uppercase letters.
+- `fromBase32(text: string, options?: FromBase32Options): Uint8Array<ArrayBuffer>` — Decodes base32 text (see `toBase32`) strictly, like `fromBase64`: it rejects characters outside the alphabet (white space and Crockford's optional `-` separators included), misplaced or incomplete padding, a final group of 1, 3 or 6 characters (which no bytes encode to), and non-canonical text whose last character has non-zero unused bits.
+- `decodeJwt<P extends object = JwtPayload, H extends object = JwtHeader>(token: string): DecodedJwt<P, H>` — Decodes a JSON Web Token in compact serialization (`header.payload.signature`, each part base64url-encoded) WITHOUT VERIFYING IT.
+- `getJwtExpiration(token: string): Date | undefined` — Returns the expiration time of a JWT (its `exp` claim), WITHOUT VERIFYING the token (see `decodeJwt`): use it to schedule a token refresh on the client, never to decide whether a token is valid.
+- `isJwtExpired(token: string, options?: IsJwtExpiredOptions): boolean` — Tells whether a JWT has expired, WITHOUT VERIFYING it (see `decodeJwt`): use it to refresh a token before sending it, never to decide whether a token is valid.
+- `parseCsv(text: string, options?: ParseCsvOptions & { readonly header?: false }): string[][]` — Parses CSV text (RFC 4180) into rows of fields, or with `header`, into records keyed by the first row.
+- `toCsv(rows: ReadonlyArray<ReadonlyArray<CsvValue>>, options?: ToCsvOptions): string` — Writes rows as CSV text (RFC 4180) that `parseCsv` reads back exactly: rows of cells, or records (objects) whose keys become the columns.
+
+## errors
+
+Never-throwing error normalization (toError, getErrorMessage) and cycle-safe error serialization that round-trips through JSON.
+Import: `import { … } from 'tinkit/errors';`
+
+- `isErrorLike(value: unknown): value is ErrorLike` — Checks whether a value is error-like: a non-null object with a string `name` and a string `message`, own or inherited (values inherited from `Object.prototype` do not count, so a polluted prototype cannot make every object error-like).
+- `getErrorMessage(value: unknown, fallback?: string): string` — Returns a human-readable message for anything caught: a non-empty string as it is, the `message` of an error or of any object with a non-empty string `message`; otherwise `fallback` when given, or else a description of the value (`'42'`, `'null'`, `'10n'`, `'{"code":1}'` for a plain object or an array, `String(value)` for other objects, so `'Error'` for an error with an empty message).
+- `toError(value: unknown): Error` — Normalizes anything caught into an `Error`: an error (of any realm, including subclasses and `DOMException`s) is returned as it is; anything else becomes a new `Error` whose message is `getErrorMessage`'s, whose `name` is the value's own when it is an error-like object (`{ name: 'AbortError', message }`), and whose `cause` is the original value.
+- `serializeError(value: unknown, options: SerializeErrorOptions = {}): SerializedError` — Converts an error into a plain, JSON-safe object (`JSON.stringify` never throws on it, and `JSON.parse` gives back an equal object).
+- `deserializeError(data: unknown, options: DeserializeErrorOptions = {}): Error` — Rebuilds an `Error` from the output of `serializeError` (after any number of `JSON.stringify`/`JSON.parse` round trips).
 
 ## format
 
-Deterministic, cached Intl formatting: numbers, currency, percent, compact, units, lists, dates, ordinals.
+Deterministic, cached Intl formatting (numbers, currency, percent, compact, units, lists, dates, ordinals) and strict locale-aware number parsing.
 Import: `import { … } from 'tinkit/format';`
 
 - `formatNumber(value: number | bigint, options: FormatNumberOptions = {}): string` — Formats a number with locale-aware grouping and decimal separators via `Intl.NumberFormat` (every non-style option passes through: `minimumFractionDigits`, `maximumFractionDigits`, `signDisplay`, `useGrouping`, `notation`, …).
@@ -547,6 +635,7 @@ Import: `import { … } from 'tinkit/format';`
 - `formatRelativeTime(value: number, unit: Intl.RelativeTimeFormatUnit, options: FormatRelativeTimeOptions = {}): string` — Formats an explicit amount of a unit relative to now (`'in 3 days'`, `'2 hours ago'`) via `Intl.RelativeTimeFormat`.
 - `formatOrdinal(n: number, options: FormatOrdinalOptions = {}): string` — Formats an integer as an ordinal (`'1st'`, `'22nd'`, `'1,001st'`), picking the suffix from its `Intl.PluralRules` ordinal category.
 - `pluralRule(count: number, options: PluralRuleOptions = {}): Intl.LDMLPluralRule` — Returns the `Intl.PluralRules` category of a count — the key to pick the right message variant (`'one'`, `'few'`, `'other'`…).
+- `parseNumber(text: string, options: ParseNumberOptions = {}): number` — Parses a number written for a locale: the inverse of `formatNumber`, `formatPercent`, `formatCurrency` and `formatCompact`.
 
 ## validate
 
@@ -599,7 +688,7 @@ Import: `import { … } from 'tinkit/validate';`
 
 ## date
 
-DST-safe, non-mutating date arithmetic, formatting and parsing, IANA time zones and calendar grids.
+DST-safe, non-mutating date arithmetic, formatting and parsing, IANA time zones, calendar grids, interval sets and business days with holidays.
 Import: `import { … } from 'tinkit/date';`
 
 - `isValidDate(value: unknown): value is ValidDate` — Checks whether a value is a `Date` instance holding a valid time (i.e. not `new Date(NaN)`).
@@ -638,6 +727,10 @@ Import: `import { … } from 'tinkit/date';`
 - `compareDesc(a: DateInput, b: DateInput): -1 | 0 | 1` — Descending comparator, usable with `Array#sort`.
 - `minDate(dates: Iterable<DateInput>): Date | undefined` — Returns a copy of the earliest date.
 - `maxDate(dates: Iterable<DateInput>): Date | undefined` — Returns a copy of the latest date.
+- `closestTo(target: DateInput, dates: Iterable<DateInput>): Date | undefined` — Returns a copy of the date closest to `target` (absolute time; date-fns' `closestTo`).
+- `fromUnixTime(seconds: number): Date` — Returns the date of a Unix timestamp, in SECONDS since 1970-01-01T00:00:00Z (`date +%s`, JWT `exp`/`iat` claims, most APIs).
+- `getUnixTime(date: DateInput): number` — Returns the Unix timestamp of a date: the whole number of SECONDS since 1970-01-01T00:00:00Z, rounded DOWN, so that it is the second the instant is in, also before 1970 (`getUnixTime(-1)` is `-1`; date-fns truncates toward zero and gives `0`).
+- `setParts(date: DateInput, parts: DateParts): Date` — Returns a copy of a date with some of its LOCAL calendar fields replaced (date-fns' `set`, Temporal's `PlainDateTime#with`); the fields that are not given keep their values.
 - `formatDate(date: DateInput, pattern: string): string` — Formats a date (local time) with a token pattern.
 - `toISODateString(date: DateInput): string` — Returns the LOCAL calendar date as `'YYYY-MM-DD'`.
 - `parseISODate(value: string): Date | undefined` — Parses a strict `'YYYY-MM-DD'` string into a date at LOCAL midnight (unlike `new Date('YYYY-MM-DD')`, which is UTC).
@@ -649,8 +742,9 @@ Import: `import { … } from 'tinkit/date';`
 - `startOfQuarter(date: DateInput): Date` — Returns the first day of the local quarter at the start of the day: 00:00:00.000, or the first instant of the day where midnight was skipped (see `startOfDay`).
 - `endOfQuarter(date: DateInput): Date` — Returns the last day of the local quarter at 23:59:59.999.
 - `getAge(birthDate: DateInput, now: DateInput = new Date()): number` — Returns a person's age: the number of COMPLETED years between the LOCAL calendar days of `birthDate` and `now` (the time of day is ignored, so the age increases at the start of the birthday).
-- `addBusinessDays(date: DateInput, amount: number): Date` — Adds a number of business days (Monday-Friday, local time; no holidays), skipping Saturdays and Sundays.
-- `diffInBusinessDays(later: DateInput, earlier: DateInput): number` — Returns the signed number of business days (Monday-Friday, local calendar days; the time of day is ignored) between two dates: for `later >= earlier` it counts the weekdays AFTER `earlier`'s day up to and INCLUDING `later`'s day; for `later < earlier` it is `-diffInBusinessDays(earlier, later)`.
+- `addBusinessDays(date: DateInput, amount: number, options?: BusinessDayOptions): Date` — Adds a number of business days (local time), skipping the weekend days (by default Saturday and Sunday) and the `holidays`.
+- `diffInBusinessDays(later: DateInput, earlier: DateInput, options?: BusinessDayOptions): number` — Returns the signed number of business days (local calendar days; the time of day is ignored) between two dates: for `later >= earlier` it counts the business days AFTER `earlier`'s day up to and INCLUDING `later`'s day; for `later < earlier` it is `-diffInBusinessDays(earlier, later)`.
+- `isBusinessDay(date: DateInput, options?: BusinessDayOptions): boolean` — Checks whether a date is a business day: neither a weekend day (by default Saturday or Sunday) nor one of the `holidays`, which are compared by LOCAL calendar day.
 - `isToday(date: DateInput, now: DateInput = new Date()): boolean` — Checks whether a date falls on the same LOCAL calendar day as `now`.
 - `isPast(date: DateInput, now: DateInput = new Date()): boolean` — Checks whether a date is strictly before `now` (absolute time).
 - `isFuture(date: DateInput, now: DateInput = new Date()): boolean` — Checks whether a date is strictly after `now` (absolute time).
@@ -674,6 +768,10 @@ Import: `import { … } from 'tinkit/date';`
 - `nextWeekday(date: DateInput, weekday: WeekdayIndex): Date` — Returns the next given weekday STRICTLY after `date` (local time), keeping the time of day like `addDays`: on a Monday, `nextWeekday(date, 1)` is the following Monday, 7 days later (never `date` itself).
 - `previousWeekday(date: DateInput, weekday: WeekdayIndex): Date` — Returns the previous given weekday STRICTLY before `date` (local time), keeping the time of day like `addDays`: on a Monday, `previousWeekday(date, 1)` is the Monday before, 7 days earlier (never `date` itself).
 - `intervalsOverlap(a: Interval, b: Interval, options: IntervalsOverlapOptions = {}): boolean` — Checks whether two time intervals overlap (bookings, calendar events…).
+- `intersectIntervals(a: Interval, b: Interval, options: IntervalsOverlapOptions = {}): Interval<Date> | undefined` — Returns the intersection of two time intervals: the instants they share, or `undefined` when they share none (exactly when `intervalsOverlap` with the same options is `false`).
+- `mergeIntervals(intervals: Iterable<Interval>, options: IntervalsOverlapOptions = {}): Array<Interval<Date>>` — Merges time intervals into the fewest disjoint ones that cover exactly the same instants, sorted by start (Luxon's `Interval.merge`): the busy time of a calendar, the booked slots of a resource.
+- `subtractIntervals(from: Interval, remove: Iterable<Interval>): Array<Interval<Date>>` — Removes time intervals from another one: returns the parts of `from` that no interval of `remove` covers, as half-open `[start, end)` intervals sorted by start (no empty ones).
+- `findGaps(within: Interval, busy: Iterable<Interval>, options: FindGapsOptions = {}): Array<Interval<Date>>` — Finds the free slots of a schedule: the gaps that the `busy` intervals leave within `within`, as half-open `[start, end)` intervals sorted by start, optionally only those lasting at least `minDuration` milliseconds (booking pages, "find a time" pickers).
 - `parseDate(value: string, pattern: string): Date | undefined` — Parses a date written with a `formatDate` pattern (same tokens, same `[literal]` syntax), in LOCAL time: the strict inverse of `formatDate`.
 - `getDayOfYear(date: DateInput): number` — Returns the day of the year (1-366) of the LOCAL calendar date.
 - `isTomorrow(date: DateInput, now: DateInput = new Date()): boolean` — Checks whether a date falls on the LOCAL calendar day after `now`'s.
@@ -730,11 +828,12 @@ Import: `import { … } from 'tinkit/iterables';`
 
 ## cache
 
-O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock; plugs into memoize.
+O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock (plugs into memoize), a ring-buffer deque and a priority queue.
 Import: `import { … } from 'tinkit/cache';`
 
 - `createLRUCache<K = unknown, V = unknown>(options: LRUCacheOptions<K, V>): LRUCache<K, V>` — Creates a least-recently-used cache backed by a `Map` for lookups and a doubly linked list for recency, so `get`, `set`, `peek`, `has` and `delete` are O(1) (a hit only relinks two list nodes; it never re-inserts the key into the `Map`).
 - `createPriorityQueue<T>(compare: (a: T, b: T) => number): PriorityQueue<T>` — Creates a priority queue backed by a binary heap: `push` and `pop` are O(log n) and `peek` is O(1).
+- `createDeque<T>(values?: Iterable<T> | null, options: DequeOptions = {}): Deque<T>` — Creates a double-ended queue backed by a growable ring buffer: adding or removing a value at either end, and reading any index, are O(1) (amortized: the ring doubles when full and halves when three quarters empty, so memory follows the size).
 
 ## emitter
 
@@ -745,12 +844,14 @@ Import: `import { … } from 'tinkit/emitter';`
 
 ## store
 
-Tiny state store compatible with React useSyncExternalStore, with derived selectors, typed state machines and undo/redo.
+Tiny state store compatible with React useSyncExternalStore, with derived and computed stores, persistence, typed state machines and undo/redo.
 Import: `import { … } from 'tinkit/store';`
 
+- `computed<S, T>(store: ReadonlyStore<S>, compute: (state: S) => T, options?: ComputedOptions<T>): ReadonlyStore<T>` — Creates a read-only store computed from one or more stores (like nanostores' `computed`, or a selector over several Zustand stores): its state is `compute(...states)`, recomputed when one of the source states changes, and it only notifies when the result changes according to `equals` (default `Object.is`).
 - `createStore<S>(initialState: S, options: StoreOptions<S> = {}): Store<S>` — Creates a tiny synchronous state container, usable from React 18+ without any React dependency: `const state = useSyncExternalStore(store.subscribe, store.getState);` (methods can be passed unbound).
 - `createMachine<const T extends Record<string, StateConfig<C>>, C = undefined>(config: MachineConfig<T, C>): Machine<keyof T & string, C, MachineEvent<T>>` — Creates a tiny, fully typed finite state machine.
 - `createHistory<S>(store: HistorySource<S>, options: HistoryOptions = {}): StoreHistory` — Adds undo/redo to a store (see `createStore`): every change of its state becomes an undo step, holding the previous state by reference (states are meant to be immutable, so no copy is made).
+- `persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setState' | 'subscribe'>, options: PersistOptions<S, P>): Unsubscribe` — Persists a store (see `createStore`) in a synchronous storage, `localStorage` by default, like Zustand's `persist` middleware but for any store with `getState`, `setState` and `subscribe`.
 
 ## random
 
@@ -787,3 +888,50 @@ Import: `import { … } from 'tinkit/decorators';`
 - `once<T extends AnyFunction>(targetOrValue: object, keyOrContext: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>` — Makes the decorated method run at most once per instance (per class for static methods), like `once` from the functions module: later calls on the same instance return the first result (or rethrow the first error) without running the method again, and a re-entrant call made by the method itself returns `undefined`.
 - `retryable(options: RetryOptions = {}, random: RandomGenerator = Math.random): AsyncMethodDecorator` — Creates a decorator for async methods that retries failed calls with `retry` (exponential backoff, optional jitter, `shouldRetry`, `onRetry`, `signal`).
 - `timeout(ms: number, message?: string): AsyncMethodDecorator` — Creates a decorator for async methods that rejects with a `TimeoutError` when the returned promise does not settle within `ms` milliseconds (using `withTimeout`; the timer is always cleared, but the underlying operation is not cancelled).
+
+## types
+
+Type-only utilities (type-fest style, no runtime code): deep partial/required/writable, key reshaping, branded types, exclusive-key constraints, type predicates and `Jsonify`. Also importable from the package root.
+Import: `import type { … } from 'tinkit/utils';`
+
+- `Primitive` — Any JavaScript primitive value.
+- `AnyFunction` — Any callable value.
+- `UnionToIntersection` — Converts a union type into an intersection type.
+- `DeepReadonly` — Recursively marks every property of `T` as `readonly`.
+- `NestedKeyOf` — Every dot-separated path that can be used to reach a property of `T`, up to 8 levels deep.
+- `PathValue` — The type of the value found at the dot-separated path `P` inside `T`.
+- `AbortSignalLike` — Structural subset of the standard `AbortSignal`, so the library works without the DOM or Node type libraries.
+- `RandomGenerator` — A pseudo-random number generator returning floats in `[0, 1)`, compatible with `Math.random`.
+- `PartialDeep` — Recursively makes every property of `T` optional, through nested objects, arrays, tuples, `Map`s and `Set`s.
+- `RequiredDeep` — Recursively makes every property of `T` required, through nested objects, arrays, tuples, `Map`s and `Set`s.
+- `Writable` — Removes `readonly` from every property of `T` (or only from the keys `K`), turning readonly arrays and tuples into mutable ones.
+- `WritableDeep` — Recursively removes `readonly` from `T`: nested objects, readonly arrays and tuples, `ReadonlyMap` (to `Map`) and `ReadonlySet` (to `Set`).
+- `SetOptional` — Makes the keys `K` of `T` optional, keeping the other properties (and every `readonly` modifier) as they are.
+- `SetRequired` — Makes the keys `K` of `T` required, keeping the other properties (and every `readonly` modifier) as they are.
+- `SetNonNullable` — Removes `null` and `undefined` from the types of the keys `K` of `T` (all keys by default).
+- `LiteralUnion` — A union of literal types `L` that still accepts any other value of the primitive type `Base`, without losing editor autocompletion for the literals (a plain `'a' \| 'b' \| string` collapses to `string`).
+- `Tagged` — A nominal ("branded") version of `T`: a `Tagged<string, 'UserId'>` is still a string, but a plain string (or another tag) is not assignable to it.
+- `UnwrapTagged` — Removes every tag from a `Tagged` type: `UnwrapTagged<Tagged<Tagged<string, 'A'>, 'B'>>` is `string`.
+- `ValueOf` — The union of the value types of `T` (optionally only of the keys `K`): `keyof` for values.
+- `Except` — `T` with the keys `K` removed, like `Omit`, except that `K` must be keys of `T`: a typo or a renamed property is a compile error instead of a silent no-op.
+- `RequireAtLeastOne` — `T` where at least one of the keys `K` (all keys by default) must be present.
+- `RequireExactlyOne` — `T` where exactly one of the keys `K` (all keys by default) must be present: providing two of them, or none, is an error.
+- `RequireAllOrNone` — `T` where the keys `K` (all keys by default) must be either all present or all absent.
+- `KeysOfUnion` — Every key of every member of the union `T` (`keyof` on a union only keeps the keys that all members share).
+- `DistributedOmit` — `Omit` applied to each member of the union `T` separately, so that a discriminated union stays discriminated.
+- `DistributedPick` — `Pick` applied to each member of the union `T` separately, so that a discriminated union stays discriminated.
+- `NonEmptyArray` — An array with at least one element, so that `array[0]` is a `T` rather than `T \| undefined` (what `isNonEmptyArray` narrows a mutable array to).
+- `Promisable` — A value or a promise (any thenable) of it: the type of a callback that may be synchronous or asynchronous.
+- `Arrayable` — A single value or a (readonly) array of values: the type of an argument that accepts both.
+- `IsEqual` — `true` when `A` and `B` are exactly the same type (so `any`, `unknown` and `never` only equal themselves, and `readonly` or `?` modifiers count), otherwise `false`.
+- `IsAny` — `true` when `T` is `any`, otherwise `false`.
+- `IsNever` — `true` when `T` is `never`, otherwise `false` (a naive `T extends never` distributes and gives `never` instead).
+- `IsUnknown` — `true` when `T` is `unknown`, otherwise `false` (`any` and `{} \| null \| undefined` are not `unknown`).
+- `UnknownRecord` — An object with unknown values under any key: the safe alternative to `Record<string, any>` for "some object".
+- `EmptyObject` — An object with no properties: `{}` is accepted, while objects with properties, arrays and primitives are not (unlike the `{}` type, which accepts anything but `null` and `undefined`).
+- `IterableElement` — The element type of an iterable, an async iterable, an array or a generator.
+- `AsyncReturnType` — The resolved return type of an async function (or of any function returning a thenable).
+- `Jsonify` — The type of `JSON.parse(JSON.stringify(value))` for a `value` of type `T`: `toJSON()` is honoured (a `Date` becomes a `string`), properties holding `undefined`, functions or symbols are dropped (or become optional when they only may), such array elements become `null`, `Map`, `Set` and `RegExp` become empty objects, symbol keys disappear and `bigint` (which throws) becomes `never`.
+- `MergeExclusive` — Either `A` or `B`, but not a mix of both: the keys that belong to only one side cannot appear together.
+- `ConditionalKeys` — The keys of `T` whose value type is assignable to `C`.
+- `ConditionalPick` — The properties of `T` whose value type is assignable to `C` (see `ConditionalKeys`), with their modifiers.

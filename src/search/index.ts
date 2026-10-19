@@ -1,4 +1,5 @@
-import { assertFunction, assertInteger, assertNumber, describe as typeName } from '../utils/assert.js';
+import { assertFunction, assertInteger, assertNumber, readOption, describe as typeName } from '../utils/assert.js';
+import { DIACRITICS, NON_ASCII, transliterate } from '../utils/latin.js';
 
 /** Points awarded for every matched character. */
 const MATCH = 16;
@@ -26,6 +27,13 @@ export interface FuzzyMatchOptions {
 	 * @default false
 	 */
 	caseSensitive?: boolean;
+	/**
+	 * When `true`, accents and other diacritics are ignored (`'cafe'` matches `'Café'`, precomposed or with a combining accent).
+	 * Folding at most triples the strings (a longer folding, such as `'ﷺ'`'s, is not applied), so the cost grows by at most 9 times.
+	 * See {@link fuzzyMatch}.
+	 * @default false
+	 */
+	ignoreDiacritics?: boolean;
 }
 
 /**
@@ -60,6 +68,12 @@ export interface FuzzySearchOptions<T> {
 	 * @default false
 	 */
 	caseSensitive?: boolean;
+	/**
+	 * When `true`, accents and other diacritics are ignored. Folding at most triples the texts, so the cost grows by at most 9 times.
+	 * See {@link fuzzyMatch}.
+	 * @default false
+	 */
+	ignoreDiacritics?: boolean;
 }
 
 /**
@@ -126,18 +140,23 @@ interface PreparedQuery {
 	needles: string[] | undefined;
 	/** Scratch space of {@link contains}: the next known position of each needle character in the current target (`-1`: none left). */
 	next: Map<string, number>;
+	/** Whether diacritics are ignored (see {@link expand}). */
+	diacritics: boolean;
 }
 
 /**
- * Scratch buffers of the alignment, indexed by target code point.
+ * Scratch buffers of the alignment, indexed by target character: a code point, or with `ignoreDiacritics` one of the characters a
+ * code point folds to (see {@link expand}).
  */
 interface Workspace {
-	/** Folded code points of the target. */
+	/** Folded characters of the target. */
 	codes: Int32Array;
-	/** Original code points of the target. */
+	/** Original characters of the target (with `ignoreDiacritics`, before case folding only), for the exact-case bonus and the word starts. */
 	raw: Int32Array;
-	/** UTF-16 offset of every code point, plus the target length at the end. */
-	offsets: Int32Array;
+	/** UTF-16 offset in the target where the code point of every character starts. */
+	starts: Int32Array;
+	/** UTF-16 offset in the target where the code point of every character ends (with any combining mark that `ignoreDiacritics` skips). */
+	ends: Int32Array;
 	/** Word-start bonus of every target position (see `bonus`), computed once per position rather than per cell. */
 	bonuses: Int8Array;
 	/** Two dynamic-programming rows. */
@@ -159,7 +178,8 @@ function allocate(length: number, cells: number): Workspace {
 	return {
 		codes: new Int32Array(length),
 		raw: new Int32Array(length),
-		offsets: new Int32Array(length + 1),
+		starts: new Int32Array(length),
+		ends: new Int32Array(length),
 		bonuses: new Int8Array(length),
 		rows: [new Float64Array(length), new Float64Array(length)],
 		back: new Int32Array(cells)
@@ -179,6 +199,31 @@ function fold(code: number, caseSensitive: boolean): number {
 	const lower = String.fromCodePoint(code).toLowerCase();
 	const folded = lower.codePointAt(0) as number;
 	return String.fromCodePoint(folded) === lower ? folded : code;
+}
+
+/** The foldings computed by {@link expand}, by code point (at most 4096, then started afresh). */
+const expansions = new Map<number, number[]>();
+
+/**
+ * Folds a code point for `ignoreDiacritics`, before case folding: its compatibility decomposition (NFKD), without the combining
+ * diacritical marks, with the Latin letters that have no decomposition spelled in ASCII (as `toSlug` does). `'é'` and `'É'` give `e` and `E`, a combining accent nothing,
+ * `'ß'` gives `ss`, `'ﬁ'` gives `fi`, `'ﬃ'` gives `ffi`, `'Ａ'` gives `A`. A code point whose folding is longer than 3 characters
+ * (`'ﷺ'`, 18 characters, `'㍿'`) folds to itself instead, so that folding at most triples the length of a text.
+ * @param {number} code - A code point
+ * @returns {number[]} The code points it folds to (none to 3; an ASCII one folds to itself)
+ */
+function expand(code: number): number[] {
+	let codes = expansions.get(code);
+	if (codes === undefined) {
+		codes = [];
+		const text = transliterate(String.fromCodePoint(code).normalize('NFKD').replace(DIACRITICS, ''));
+		for (const char of text) codes.push(char.codePointAt(0) as number);
+		// A folding longer than 3 characters (`'ﷺ'` decomposes to 18, `'㍿'` to 4) is not kept, so that folding at most triples the text.
+		if (codes.length > 3) codes = [code];
+		if (expansions.size === 4096) expansions.clear();
+		expansions.set(code, codes);
+	}
+	return codes;
 }
 
 /**
@@ -210,27 +255,36 @@ function bonus(raw: Int32Array, j: number): number {
  * Splits and folds a query.
  * @param {string} query - The query
  * @param {boolean} caseSensitive - Whether case must match exactly
- * @returns {PreparedQuery} Its code points, original and folded
+ * @param {boolean} diacritics - Whether diacritics are ignored
+ * @returns {PreparedQuery} Its characters (code points, or their foldings with `diacritics`), original and folded
  */
-function prepare(query: string, caseSensitive: boolean): PreparedQuery {
+function prepare(query: string, caseSensitive: boolean, diacritics: boolean): PreparedQuery {
 	const raw: number[] = [];
 	const codes: number[] = [];
 	let needles: string[] | undefined = [];
 	for (let k = 0; k < query.length; k++) {
 		const code = query.codePointAt(k) as number;
 		const folded = fold(code, caseSensitive);
-		raw.push(code);
-		codes.push(folded);
 		if (code > 127) {
 			needles = undefined;
 			if (code > 0xffff) k++;
-		} else {
+			if (diacritics) {
+				for (const char of expand(code)) {
+					raw.push(char);
+					codes.push(fold(char, caseSensitive));
+				}
+				continue;
+			}
+		}
+		raw.push(code);
+		codes.push(folded);
+		if (code <= 127) {
 			// Without case sensitivity, an ASCII letter matches its two cases, and 'k' also the Kelvin sign (whose lower case is 'k').
 			const char = query[k];
 			needles?.push(caseSensitive || folded < 97 || folded > 122 ? char : folded === 107 ? 'kK\u212A' : String.fromCharCode(folded, folded - 32));
 		}
 	}
-	return { codes, raw, needles, next: new Map() };
+	return { codes, raw, needles, next: new Map(), diacritics };
 }
 
 /**
@@ -280,26 +334,60 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean, cal
 	const length = target.length;
 
 	if (m === 0) return { score: 0, ranges: [] };
-	// Fast rejections (the common case while filtering), without allocating: a target has at most `length` code points.
-	if (m > length || (query.needles !== undefined && !contains(query.needles, query.next, target))) return undefined;
-
-	// The linear buffers first: the O(m·n) back-pointer matrix is only allocated once the subsequence check below has passed.
-	const small = length <= SHARED_LENGTH;
-	const workspace = small ? (shared ??= allocate(SHARED_LENGTH, SHARED_CELLS)) : allocate(length, 0);
-	const { codes, raw, offsets, bonuses, rows } = workspace;
-	let n = 0;
+	// With `ignoreDiacritics`, only a target with non-ASCII text needs folding: an ASCII code point folds to itself.
+	const diacritics = query.diacritics && NON_ASCII.test(target);
+	// Fast rejections (the common case while filtering), without allocating: a target has at most `length` code points (but with
+	// `ignoreDiacritics`, one of them may fold to several characters), and an ASCII query is looked for with `indexOf` (but with
+	// `ignoreDiacritics`, an accented letter of the target matches its ASCII base).
+	const filtered = query.needles !== undefined && !diacritics;
+	if ((m > length && !diacritics) || (filtered && !contains(query.needles as string[], query.next, target))) return undefined;
 	// Greedy subsequence check (the alignment only exists if it passes), unless `contains` already did it.
-	let matched = query.needles === undefined ? 0 : m;
-	for (let k = 0; k < length; n++) {
-		const code = target.codePointAt(k) as number;
-		const folded = fold(code, caseSensitive);
-		if (folded === q[matched]) matched++;
-		offsets[n] = k;
-		k += code > 0xffff ? 2 : 1;
-		raw[n] = code;
-		codes[n] = folded;
+	let matched = filtered ? m : 0;
+	// The number of characters of the target: its length bounds them, except with `ignoreDiacritics`, where they are counted first.
+	let capacity = length;
+	if (diacritics) {
+		capacity = 0;
+		for (let k = 0; k < length;) {
+			const code = target.codePointAt(k) as number;
+			k += code > 0xffff ? 2 : 1;
+			for (const char of expand(code)) {
+				if (fold(char, caseSensitive) === q[matched]) matched++;
+				capacity++;
+			}
+		}
+		if (matched < m) return undefined;
 	}
-	offsets[n] = length;
+
+	// The linear buffers first: the O(m·n) back-pointer matrix is only allocated once the subsequence check has passed.
+	const small = capacity <= SHARED_LENGTH;
+	const workspace = small ? (shared ??= allocate(SHARED_LENGTH, SHARED_CELLS)) : allocate(capacity, 0);
+	const { codes, raw, starts, ends, bonuses, rows } = workspace;
+	let n = 0;
+	// The first character of the last code point that folded to some: a combining mark that folds to none extends its range.
+	let group = 0;
+	for (let k = 0; k < length;) {
+		const code = target.codePointAt(k) as number;
+		const start = k;
+		k += code > 0xffff ? 2 : 1;
+		if (diacritics) {
+			const chars = expand(code);
+			if (chars.length === 0) ends.fill(k, group, n);
+			else group = n;
+			for (const char of chars) {
+				starts[n] = start;
+				ends[n] = k;
+				raw[n] = char;
+				codes[n++] = fold(char, caseSensitive);
+			}
+		} else {
+			const folded = fold(code, caseSensitive);
+			if (folded === q[matched]) matched++;
+			starts[n] = start;
+			ends[n] = k;
+			raw[n] = code;
+			codes[n++] = folded;
+		}
+	}
 	if (matched < m) return undefined;
 	const cells = m * n;
 	// An explicit cap: past a few GiB, V8 aborts the process instead of throwing when allocating the matrix.
@@ -348,8 +436,9 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean, cal
 	const ranges: Array<[number, number]> = [];
 	for (let i = m - 1; i >= 0; i--) {
 		const last = ranges[ranges.length - 1];
-		if (last !== undefined && last[0] === offsets[end + 1]) last[0] = offsets[end];
-		else ranges.push([offsets[end], offsets[end + 1]]);
+		// Characters folded from the same code point share its range: they merge, like adjacent ones.
+		if (last !== undefined && last[0] <= ends[end]) last[0] = starts[end];
+		else ranges.push([starts[end], ends[end]]);
 		end = back[i * n + end];
 	}
 
@@ -373,20 +462,32 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean, cal
  * Among equally-scored alignments the one ending first is chosen, preferring consecutive matches, then the shortest gaps.
  *
  * Characters are compared per Unicode code point after `toLowerCase()` (locale-independent; skipped when `caseSensitive`), so the
- * ranges never split a surrogate pair. There is no normalization and no grapheme segmentation: a precomposed `'é'` does not
+ * ranges never split a surrogate pair. By default there is no normalization and no grapheme segmentation: a precomposed `'é'` does not
  * match `'e'` + combining accent, characters whose lower case expands (`'İ'`) only match themselves, and ranges may split
- * multi-code-point graphemes (flags, ZWJ emoji). Normalize both strings (e.g. `.normalize('NFC')`) beforehand when that matters.
+ * multi-code-point graphemes (flags, ZWJ emoji).
  *
- * An empty query matches every target with score `0` and no ranges.
+ * With `ignoreDiacritics` (default `false`, as in fuse.js), both strings are folded per code point the way `toSlug` folds letters, before
+ * case folding: compatibility decomposition (NFKD), combining diacritical marks (U+0300–036F, U+1AB0–1AFF, U+1DC0–1DFF, U+20D0–20FF,
+ * U+FE20–FE2F) removed, and `ß`, `æ`, `œ`, `ø`, `đ`, `ð`, `ł`, `þ`, `ı` (and their capitals) spelled `ss`, `ae`, `oe`, `o`, `d`, `d`, `l`,
+ * `th`, `i`. So `'cafe'` matches `'Café'` and `'Cafe\u0301'`, `'strasse'` matches `'Straße'`, `'fi'` matches the ligature `'ﬁ'`,
+ * `'Ａ'` matches `'a'`, and Hangul syllables are compared by their jamo (`'하'` matches `'한'`). The ranges still index the original target: a combining mark is
+ * highlighted with its letter, and a code point that folds to several characters (`'ß'`) is highlighted whole when any of them
+ * matches. Scores count folded characters (`'ß'` scores as `'ss'`), and the `+1` bonus rewards the same case with the accents removed,
+ * so a target scores the same in NFC and NFD. Other marks (Indic vowel signs, kana voicing marks) are kept as characters of their own.
+ * A code point whose folding is longer than 3 characters (`'ﷺ'`, which decomposes to an 18-character phrase, or `'㍿'`) is kept as it
+ * is, so that folding at most triples either string (`'ﬃ'` still matches `'ffi'`).
+ *
+ * An empty query (or one made only of combining accents, with `ignoreDiacritics`) matches every target with score `0` and no ranges.
  *
  * Cost: a query longer than the target, or that is not a subsequence of it, is rejected in O(target length) time without
  * allocating more than O(target length). A matching query costs O(query length × target length) time and a back-pointer matrix of
  * 4 bytes per (query code point, target code point) pair, at most `2 ** 28` pairs (1 GiB, e.g. a 1 000-character query against a
- * 268 000-character text): larger alignments throw a `RangeError`. Cap the query length of untrusted input (search boxes: 64–256 characters is plenty, e.g. `query.slice(0, 128)`), and the
+ * 268 000-character text): larger alignments throw a `RangeError`. With `ignoreDiacritics`, the lengths are those of the folded
+ * strings, at most 3 times the original ones, so the time and the matrix grow by at most 9 times. Cap the query length of untrusted input (search boxes: 64–256 characters is plenty, e.g. `query.slice(0, 128)`), and the
  * target lengths if they are untrusted too.
  * @param {string} query - The characters to look for, in order
  * @param {string} target - The text to search in
- * @param {FuzzyMatchOptions} [options={}] - `caseSensitive` (default `false`)
+ * @param {FuzzyMatchOptions} [options={}] - `caseSensitive` and `ignoreDiacritics` (both default `false`)
  * @returns {FuzzyMatch | undefined} The score and matched ranges of the best alignment, or `undefined` when the query is not a subsequence of the target
  * @throws {TypeError} when `query` or `target` is not a string
  * @throws {RangeError} when the back-pointer matrix of a matching query would exceed `2 ** 28` cells (see the cost above)
@@ -399,12 +500,17 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean, cal
  * // Word starts and consecutive runs beat scattered matches:
  * fuzzyMatch('gc', 'git commit').score > fuzzyMatch('gc', 'magic').score; // => true
  * fuzzyMatch('ab', 'Ab', { caseSensitive: true }); // => undefined
+ * @example
+ * fuzzyMatch('cafe', 'Café'); // => undefined
+ * fuzzyMatch('cafe', 'Café', { ignoreDiacritics: true })?.ranges; // => [[0, 4]]
+ * fuzzyMatch('cafe', 'Cafe\u0301 noir', { ignoreDiacritics: true })?.ranges; // => [[0, 5]] // the accent is highlighted with its letter
+ * fuzzyMatch('strasse', 'Straße', { ignoreDiacritics: true })?.ranges; // => [[0, 6]]
  */
 export function fuzzyMatch(query: string, target: string, options: FuzzyMatchOptions = {}): FuzzyMatch | undefined {
 	assertString('fuzzyMatch', 'query', query);
 	assertString('fuzzyMatch', 'target', target);
 	const caseSensitive = options.caseSensitive === true;
-	return match(prepare(query, caseSensitive), target, caseSensitive, 'fuzzyMatch');
+	return match(prepare(query, caseSensitive, readOption(options, 'ignoreDiacritics') === true), target, caseSensitive, 'fuzzyMatch');
 }
 
 /**
@@ -417,7 +523,7 @@ export function fuzzyMatch(query: string, target: string, options: FuzzyMatchOpt
  * @template T - The type of the searched items
  * @param {Iterable<T>} items - The items to search; strings unless `key` is given
  * @param {string} query - The characters to look for, in order
- * @param {FuzzySearchOptions<T>} [options={}] - `key` (text(s) of an item, best one wins), `limit`, `threshold` (minimum score), `caseSensitive`
+ * @param {FuzzySearchOptions<T>} [options={}] - `key` (text(s) of an item, best one wins), `limit`, `threshold` (minimum score), `caseSensitive`, `ignoreDiacritics`
  * @returns {Array<FuzzySearchResult<T>>} The matching items with their score, matched `key` text and its `ranges`, best first
  * @throws {TypeError} when `query` is not a string, `key` is not a function, or an item (without `key`) / a text returned by `key` is not a string
  * @throws {RangeError} when `limit` is not an integer >= 0 (or `Infinity`), or `threshold` is `NaN`, or a matching query and text are too
@@ -429,6 +535,8 @@ export function fuzzyMatch(query: string, target: string, options: FuzzyMatchOpt
  * const results = fuzzySearch(commands, 'ff', { key: function (c) { return c.title; }, limit: 1 });
  * results.map(function (r) { return r.item.id; }); // => ['find']
  * results[0].ranges; // => [[0, 1], [8, 9]]
+ * @example
+ * fuzzySearch(['Málaga', 'Zürich', 'Łódź'], 'lodz', { ignoreDiacritics: true }).map(function (r) { return r.item; }); // => ['Łódź']
  */
 export function fuzzySearch<T extends string>(items: Iterable<T>, query: string, options?: FuzzySearchOptions<T>): Array<FuzzySearchResult<T>>;
 export function fuzzySearch<T>(items: Iterable<T>, query: string, options: FuzzySearchKeyedOptions<T>): Array<FuzzySearchResult<T>>;
@@ -440,7 +548,7 @@ export function fuzzySearch<T>(items: Iterable<T>, query: string, options: Fuzzy
 	assertInteger('fuzzySearch', 'limit', limit, 0, true);
 	assertNumber('fuzzySearch', 'threshold', threshold, !Number.isNaN(threshold), 'a number');
 
-	const prepared = prepare(query, caseSensitive);
+	const prepared = prepare(query, caseSensitive, readOption(options, 'ignoreDiacritics') === true);
 	const name = key === undefined ? 'item' : 'key(item)';
 	const results: Array<FuzzySearchResult<T>> = [];
 	for (const item of items) {

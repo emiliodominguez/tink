@@ -1,6 +1,6 @@
 import { isDate, isIterable } from '../guards/index.js';
 import { median } from '../math/index.js';
-import { assertFunction, assertInteger, assertNumber, describe, draw, show } from '../utils/assert.js';
+import { assertFunction, assertInteger, assertNumber, describe, draw, readOption, show } from '../utils/assert.js';
 import type { RandomGenerator } from '../utils/index.js';
 
 /**
@@ -622,7 +622,7 @@ function compareKeys(a: number | string | bigint, b: number | string | bigint): 
  */
 function compareRanked(a: number | string | bigint, b: number | string | bigint, direction: number): number {
 	if (a !== a) return b !== b ? 0 : 1;
-	return b !== b ? -1 : direction * compareKeys(a, b);
+	return b !== b ? -1 : direction === 1 ? compareKeys(a, b) : compareKeys(b, a);
 }
 
 /**
@@ -2663,4 +2663,487 @@ export function powerSet<T>(array: ReadonlyArray<T>): T[][] {
 		}
 	}
 	return result;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Comparators
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Create a {@link Comparator} for `Array.prototype.sort` / `toSorted` (or {@link sortedIndex}, {@link binarySearch}...) that orders
+ * items by the key `selector` returns, with exactly the ordering rules of {@link sortBy} and {@link orderBy}: numbers and bigints
+ * numerically and before strings, strings by UTF-16 code units, `Date`s by timestamp, and `NaN`, invalid `Date`s, `null` and
+ * `undefined` keys after every other key in BOTH directions (equal to each other). The order is total, so the comparator is
+ * consistent and `sort` is deterministic.
+ *
+ * The selector is called twice per comparison: when it is expensive, prefer {@link sortBy}, which calls it once per item.
+ * Combine several keys with {@link combineComparators}. (`sort` itself moves `undefined` ITEMS to the end without calling the comparator.)
+ * @template T
+ * @param {(item: T) => SortKey | null | undefined} selector - Returns the sort key of an item
+ * @param {SortOrder} [order='asc'] - `'asc'` for ascending or `'desc'` for descending keys
+ * @returns {Comparator<T>} A comparator returning `-1`, `0` or `1`
+ * @throws {TypeError} when `selector` is not a function
+ * @throws {RangeError} when `order` is neither `'asc'` nor `'desc'`
+ * @example
+ * [{ n: 2 }, { n: 1 }, {}].sort(compareBy(function (o: { n?: number }) { return o.n; })); // => [{ n: 1 }, { n: 2 }, {}]
+ * [1, NaN, 3].sort(compareBy(function (n) { return n; }, 'desc')); // => [3, 1, NaN]
+ */
+export function compareBy<T>(selector: (item: T) => SortKey | null | undefined, order: SortOrder = 'asc'): Comparator<T> {
+	assertFunction('compareBy', 'selector', selector);
+	const direction = toDirection('compareBy', 'order', order);
+	return function (a: T, b: T): number {
+		return compareRanked(rank(selector(a)), rank(selector(b)), direction);
+	};
+}
+
+/**
+ * Combine comparators into one that compares by the first, then breaks ties with the second, and so on: the first non-zero result
+ * wins (a `NaN` result counts as a tie, as `Array.prototype.sort` treats it). Without comparators, every pair is a tie.
+ * @template T
+ * @param {...Comparator<T>} comparators - The comparators, most significant first
+ * @returns {Comparator<T>} The combined comparator
+ * @throws {TypeError} when one of `comparators` is not a function
+ * @example
+ * type Person = { name: string; age: number };
+ * const people: Person[] = [{ name: 'bo', age: 30 }, { name: 'al', age: 30 }, { name: 'cy', age: 25 }];
+ * people.sort(combineComparators(compareBy(function (p: Person) { return p.age; }, 'desc'), compareBy(function (p: Person) { return p.name; }))); // => [{ name: 'al', age: 30 }, { name: 'bo', age: 30 }, { name: 'cy', age: 25 }]
+ */
+export function combineComparators<T>(...comparators: Array<Comparator<T>>): Comparator<T> {
+	// The parameter names are only formatted on failure.
+	for (let i = 0; i < comparators.length; i++) if (typeof comparators[i] !== 'function') assertFunction('combineComparators', `comparators[${i}]`, comparators[i]);
+	// `comparators` is a fresh rest array: no one else can change it.
+	return function (a: T, b: T): number {
+		for (let i = 0; i < comparators.length; i++) {
+			const comparison = comparators[i](a, b);
+			if (comparison) return comparison;
+		}
+		return 0;
+	};
+}
+
+/**
+ * Reverse a comparator: the result orders items the opposite way (`reverseComparator(c)(a, b)` is `c(b, a)`).
+ * Note that reversing a {@link compareBy} comparator also moves its missing keys (`NaN`, `null`...) FIRST: pass `'desc'` to
+ * `compareBy` instead to keep them last.
+ * @template T
+ * @param {Comparator<T>} compare - The comparator to reverse
+ * @returns {Comparator<T>} The reversed comparator
+ * @throws {TypeError} when `compare` is not a function
+ * @example
+ * [1, 3, 2].sort(reverseComparator(function (a: number, b: number) { return a - b; })); // => [3, 2, 1]
+ */
+export function reverseComparator<T>(compare: Comparator<T>): Comparator<T> {
+	assertFunction('reverseComparator', 'compare', compare);
+	return function (a: T, b: T): number {
+		return compare(b, a);
+	};
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Trees
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * A node built by {@link toTree}: a shallow copy of an item (without any previous `C` property) with its children under `C`.
+ * @template T - The item type
+ * @template C - The name of the children property
+ */
+export type TreeNode<T, C extends string = 'children'> = Omit<T, C> & { [K in C]: Array<TreeNode<T, C>> };
+
+/**
+ * Options accepted by {@link toTree}.
+ * @template T - The item type
+ * @template C - The name of the children property
+ */
+export interface ToTreeOptions<T, C extends string = 'children'> {
+	/**
+	 * The id of an item: a property name, or a function returning it. Ids are compared with SameValueZero and must be unique.
+	 * @default 'id'
+	 */
+	id?: keyof T | ((item: T) => unknown);
+	/**
+	 * The id of an item's parent: a property name, or a function returning it. `null` or `undefined` makes the item a root.
+	 * @default 'parentId'
+	 */
+	parentId?: keyof T | ((item: T) => unknown);
+	/**
+	 * The property the children of each node are stored under (any string but `'__proto__'`).
+	 * @default 'children'
+	 */
+	childrenKey?: C;
+	/**
+	 * What to do with an item whose parent id matches no item: make it a root (`'root'`, so a filtered list still shows every
+	 * match), leave it out with its descendants (`'drop'`), or throw a `RangeError` (`'throw'`).
+	 * @default 'root'
+	 */
+	orphans?: 'root' | 'drop' | 'throw';
+}
+
+/**
+ * Validates the property name a tree helper stores or reads children under.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {unknown} key - The `childrenKey` option
+ * @returns {void}
+ * @throws {TypeError} when `key` is not a string
+ * @throws {RangeError} when `key` is `'__proto__'`
+ */
+function assertChildrenKey(caller: string, key: unknown): asserts key is string {
+	if (typeof key !== 'string') throw new TypeError(`${caller}: \`options.childrenKey\` must be a string, got ${describe(key)}`);
+	if (key === '__proto__') throw new RangeError(`${caller}: \`options.childrenKey\` must not be '__proto__', got __proto__`);
+}
+
+/**
+ * Turns the `id` or `parentId` option of {@link toTree} into a function reading the key of an item.
+ * @template T
+ * @param {string} name - The option name
+ * @param {unknown} key - A property name or a function
+ * @returns {(item: T) => unknown} The key reader
+ * @throws {TypeError} when `key` is neither a property key nor a function
+ * @throws {RangeError} when `key` is `'__proto__'`
+ */
+function keyReader<T extends object>(name: string, key: unknown): (item: T) => unknown {
+	if (typeof key === 'function') return key as (item: T) => unknown;
+	if (typeof key !== 'string' && typeof key !== 'number' && typeof key !== 'symbol') {
+		throw new TypeError(`toTree: \`options.${name}\` must be a property key or a function, got ${describe(key)}`);
+	}
+	if (key === '__proto__') throw new RangeError(`toTree: \`options.${name}\` must not be '__proto__', got __proto__`);
+	return function (item: T): unknown {
+		// Not inherited from a polluted `Object.prototype`.
+		return readOption(item, key as keyof T & string);
+	};
+}
+
+/**
+ * Build a forest from a flat list of items that reference their parent by id (an adjacency list, as rows of a database table or
+ * a CMS export): each item becomes a node, a SHALLOW COPY of the item with the array of its children added under `childrenKey`
+ * (the items themselves are never mutated). Roots are the items whose parent id is `null` or `undefined`; children and roots keep
+ * the order of the input. An item whose parent id matches no item is an orphan: by default it becomes a root (see
+ * {@link ToTreeOptions.orphans}). O(n) time and memory, whatever the order of the items and the depth of the tree.
+ *
+ * Ids are read with `id` and `parentId` (property names or functions; own and class properties are read, values inherited from a
+ * polluted `Object.prototype` are not), compared with SameValueZero (`1` and `'1'` differ). Use {@link flattenTree} for the inverse.
+ * @template T - The item type
+ * @template C - The name of the children property
+ * @param {ReadonlyArray<T>} items - The items, in any order (not mutated)
+ * @param {ToTreeOptions<T, C>} [options={}] - `id` (default `'id'`), `parentId` (default `'parentId'`), `childrenKey` (default
+ * `'children'`) and `orphans` (default `'root'`)
+ * @returns {Array<TreeNode<T, C>>} The root nodes
+ * @throws {TypeError} when `id` or `parentId` is neither a property key nor a function, or `childrenKey` is not a string
+ * @throws {RangeError} when two items have the same id, the parent references form a cycle (an item is its own ancestor), an orphan
+ * is found with `orphans: 'throw'`, or an option has an invalid value
+ * @example
+ * const rows = [{ id: 2, parentId: 1, name: 'b' }, { id: 1, parentId: null, name: 'a' }, { id: 3, parentId: 1, name: 'c' }];
+ * toTree(rows); // => [{ id: 1, parentId: null, name: 'a', children: [{ id: 2, parentId: 1, name: 'b', children: [] }, { id: 3, parentId: 1, name: 'c', children: [] }] }]
+ * @example
+ * const paths = [{ path: 'a' }, { path: 'a/b' }];
+ * toTree(paths, { id: 'path', parentId: function (p) { return p.path.includes('/') ? p.path.slice(0, p.path.lastIndexOf('/')) : null; }, childrenKey: 'items' }); // => [{ path: 'a', items: [{ path: 'a/b', items: [] }] }]
+ * @example
+ * toTree([{ id: 1, parentId: 2 }, { id: 2, parentId: 1 }]); // throws RangeError
+ */
+export function toTree<T extends object, C extends string = 'children'>(items: ReadonlyArray<T>, options: ToTreeOptions<T, C> = {}): Array<TreeNode<T, C>> {
+	const getId = keyReader<T>('id', readOption(options, 'id', 'id'));
+	const getParentId = keyReader<T>('parentId', readOption(options, 'parentId', 'parentId'));
+	const childrenKey = readOption(options, 'childrenKey', 'children');
+	assertChildrenKey('toTree', childrenKey);
+	const orphans = readOption(options, 'orphans', 'root');
+	if (orphans !== 'root' && orphans !== 'drop' && orphans !== 'throw') {
+		throw new RangeError(`toTree: \`options.orphans\` must be 'root', 'drop' or 'throw', got ${show(orphans)}`);
+	}
+	const length = items.length;
+	const indices = new Map<unknown, number>();
+	const nodes: Array<TreeNode<T, C>> = [];
+	const children: Array<Array<TreeNode<T, C>>> = [];
+	for (let i = 0; i < length; i++) {
+		const id = getId(items[i]);
+		if (indices.has(id)) throw new RangeError(`toTree: ids must be unique, got ${show(id)} twice`);
+		indices.set(id, i);
+		children.push([]);
+		// A computed key in a literal is defined, never assigned: no setter or `__proto__` accessor can be triggered.
+		nodes.push({ ...items[i], [childrenKey]: children[i] } as TreeNode<T, C>);
+	}
+	// The index of each item's parent; -1 for a root, -2 for an orphan left out.
+	const parents: number[] = [];
+	const roots: Array<TreeNode<T, C>> = [];
+	for (let i = 0; i < length; i++) {
+		const parentId = getParentId(items[i]);
+		const parent = parentId === null || parentId === undefined ? -1 : (indices.get(parentId) ?? (orphans === 'root' ? -1 : -2));
+		if (parent === -2 && orphans === 'throw') {
+			throw new RangeError(`toTree: the parent of \`items[${i}]\` must be one of the items, got parent id ${show(parentId)}`);
+		}
+		parents.push(parent);
+		if (parent >= 0) children[parent].push(nodes[i]);
+		else if (parent === -1) roots.push(nodes[i]);
+	}
+	// Cycle detection: walk up from every item, stamping the items met with the walk's number. Every item is stamped once, so this is
+	// O(n); meeting an item stamped by the same walk means the walk went round a cycle.
+	const stamps = new Array<number>(length).fill(0);
+	for (let i = 0; i < length; i++) {
+		let j = i;
+		while (j >= 0 && stamps[j] === 0) {
+			stamps[j] = i + 1;
+			j = parents[j];
+		}
+		if (j >= 0 && stamps[j] === i + 1) throw new RangeError(`toTree: the parent ids must not form a cycle, got one through id ${show(getId(items[j]))}`);
+	}
+	return roots;
+}
+
+/**
+ * Options accepted by {@link flattenTree}.
+ */
+export interface FlattenTreeOptions {
+	/**
+	 * The property holding the children of a node (an array; a missing, `null` or `undefined` value means no children).
+	 * @default 'children'
+	 */
+	childrenKey?: string;
+	/**
+	 * `'depth-first'` lists every node before its descendants and after its previous siblings' subtrees (pre-order);
+	 * `'breadth-first'` lists the nodes level by level.
+	 * @default 'depth-first'
+	 */
+	order?: 'depth-first' | 'breadth-first';
+}
+
+/**
+ * List every node of a forest (an array of root nodes, each holding its children under `childrenKey`), the inverse of
+ * {@link toTree}: `toTree(flattenTree(forest))` rebuilds the forest. The nodes themselves are returned (not copies; they still hold
+ * their children). The walk is iterative, so trees of any depth are flattened without overflowing the call stack, in O(n) time.
+ * A node may appear in several places (it is listed each time), but not inside its own subtree.
+ * @template N - The node type
+ * @param {ReadonlyArray<N>} roots - The root nodes
+ * @param {FlattenTreeOptions} [options={}] - `childrenKey` (default `'children'`) and `order` (default `'depth-first'`)
+ * @returns {N[]} A new array of the nodes
+ * @throws {TypeError} when a node's children are neither an array nor nullish, a node is its own descendant, or `childrenKey` is not a string
+ * @throws {RangeError} when `order` is invalid or `childrenKey` is `'__proto__'`
+ * @example
+ * type Node = { id: number; children?: Node[] };
+ * const tree: Node[] = [{ id: 1, children: [{ id: 2, children: [{ id: 4 }] }, { id: 3 }] }];
+ * flattenTree(tree).map(function (node) { return node.id; }); // => [1, 2, 4, 3]
+ * flattenTree(tree, { order: 'breadth-first' }).map(function (node) { return node.id; }); // => [1, 2, 3, 4]
+ */
+export function flattenTree<N extends object>(roots: ReadonlyArray<N>, options: FlattenTreeOptions = {}): N[] {
+	const childrenKey = readOption(options, 'childrenKey', 'children');
+	assertChildrenKey('flattenTree', childrenKey);
+	const order = readOption(options, 'order', 'depth-first');
+	if (order !== 'depth-first' && order !== 'breadth-first') {
+		throw new RangeError(`flattenTree: \`options.order\` must be 'depth-first' or 'breadth-first', got ${show(order)}`);
+	}
+	const result: N[] = [];
+	// Breadth-first order is the depth-first order stably grouped by depth (both order the nodes of a level by their path).
+	const levels: N[][] = [];
+	// The nodes whose children are being listed, the lists holding them, and the index to resume at in each list.
+	const ancestors = new Set<N>();
+	const lists: Array<ReadonlyArray<N>> = [];
+	const positions: number[] = [];
+	let list = roots;
+	let index = 0;
+	for (;;) {
+		if (index === list.length) {
+			if (lists.length === 0) return order === 'depth-first' ? result : levels.flat();
+			list = lists.pop() as ReadonlyArray<N>;
+			index = positions.pop() as number;
+			// The ancestor whose children were just listed is the item before the resume position.
+			ancestors.delete(list[index - 1]);
+			continue;
+		}
+		const node = list[index++];
+		if (order === 'depth-first') result.push(node);
+		else (levels[lists.length] ??= []).push(node);
+		const nodeChildren: unknown = readOption(node, childrenKey as keyof N & string);
+		if (nodeChildren === null || nodeChildren === undefined) continue;
+		if (!Array.isArray(nodeChildren)) throw new TypeError(`flattenTree: \`${childrenKey}\` must be an array, got ${describe(nodeChildren)}`);
+		if (nodeChildren.length === 0) continue;
+		if (ancestors.has(node)) throw new TypeError('flattenTree: cannot flatten a circular tree');
+		ancestors.add(node);
+		lists.push(list);
+		positions.push(index);
+		list = nodeChildren as ReadonlyArray<N>;
+		index = 0;
+	}
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Updating, selecting and paging
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Return a copy of an array where the FIRST item matching `item` is replaced by `item`, or with `item` appended when none matches:
+ * the "insert or update" of a list held in state (save a record, merge a server response). Matching is decided like {@link toggle}:
+ * by SameValueZero, or by comparing the keys `keyFn` returns. Later matches, if any, are kept.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The current items (not mutated)
+ * @param {T} item - The item to insert or put in place of its match
+ * @param {(item: T) => unknown} [keyFn] - Returns the identity key of an item (compared with SameValueZero)
+ * @returns {T[]} A new array of the same length (when an item matched) or one longer
+ * @throws {TypeError} when `keyFn` is given but is not a function
+ * @example
+ * const users = [{ id: 1, name: 'Al' }, { id: 2, name: 'Bo' }];
+ * upsert(users, { id: 2, name: 'Bob' }, function (u) { return u.id; }); // => [{ id: 1, name: 'Al' }, { id: 2, name: 'Bob' }]
+ * upsert(users, { id: 3, name: 'Cy' }, function (u) { return u.id; }); // => [{ id: 1, name: 'Al' }, { id: 2, name: 'Bo' }, { id: 3, name: 'Cy' }]
+ * upsert(['a', 'b'], 'b'); // => ['a', 'b']
+ */
+export function upsert<T>(array: ReadonlyArray<T>, item: T, keyFn?: (item: T) => unknown): T[] {
+	if (keyFn !== undefined) assertFunction('upsert', 'keyFn', keyFn);
+	const target = keyFn === undefined ? item : keyFn(item);
+	const result = Array.from(array);
+	for (let i = 0; i < result.length; i++) {
+		if (sameValueZero(keyFn === undefined ? result[i] : keyFn(result[i]), target)) {
+			result[i] = item;
+			return result;
+		}
+	}
+	result.push(item);
+	return result;
+}
+
+/**
+ * Map an array and drop the `null` and `undefined` results, in one pass (Kotlin's `mapNotNull`, Swift's `compactMap`): return
+ * `undefined` (or nothing, or `null`) from `fn` to skip an item. Other falsy results (`0`, `''`, `false`, `NaN`) are kept.
+ * @template T
+ * @template R
+ * @param {ReadonlyArray<T>} array - The items
+ * @param {(item: T, index: number) => R} fn - Maps an item, or returns `null`/`undefined` to skip it
+ * @returns {Array<NonNullable<R>>} A new array of the non-nullish results, in input order
+ * @throws {TypeError} when `fn` is not a function
+ * @example
+ * filterMap(['1', 'x', '3'], function (s) { const n = Number(s); return Number.isNaN(n) ? undefined : n * 10; }); // => [10, 30]
+ * filterMap(['a=1', 'b', 'c=0'], function (s) { return /=(\d)$/.exec(s)?.[1]; }); // => ['1', '0']
+ */
+export function filterMap<T, R>(array: ReadonlyArray<T>, fn: (item: T, index: number) => R): Array<NonNullable<R>> {
+	assertFunction('filterMap', 'fn', fn);
+	const result: Array<NonNullable<R>> = [];
+	for (let i = 0; i < array.length; i++) {
+		const value = fn(array[i], i);
+		if (value !== null && value !== undefined) result.push(value);
+	}
+	return result;
+}
+
+/**
+ * Return the items that occur more than once (by SameValueZero, or by the key `keyFn` returns), each reported ONCE: the first item
+ * with each repeated key, in order of first occurrence. So `duplicates(array)` is always a subsequence of {@link unique}`(array)`,
+ * and it is empty exactly when every item (key) is distinct.
+ * @template T
+ * @param {ReadonlyArray<T>} array - The items
+ * @param {(item: T, index: number) => unknown} [keyFn] - Returns the identity key of an item (called once per item)
+ * @returns {T[]} A new array with the first item of every repeated key
+ * @throws {TypeError} when `keyFn` is given but is not a function
+ * @example
+ * duplicates([3, 1, 3, 2, 1, 3]); // => [3, 1]
+ * duplicates([{ email: 'a@x.io' }, { email: 'b@x.io' }, { email: 'A@x.io' }], function (u) { return u.email.toLowerCase(); }); // => [{ email: 'a@x.io' }]
+ */
+export function duplicates<T>(array: ReadonlyArray<T>, keyFn?: (item: T, index: number) => unknown): T[] {
+	if (keyFn !== undefined) assertFunction('duplicates', 'keyFn', keyFn);
+	// Each key's first index, stored as `-1 - index` once the key repeats; a Map iterates in insertion (first occurrence) order.
+	const firsts = new Map<unknown, number>();
+	for (let i = 0; i < array.length; i++) {
+		const key = keyFn === undefined ? array[i] : keyFn(array[i], i);
+		const seen = firsts.get(key);
+		if (seen === undefined) firsts.set(key, i);
+		else if (seen >= 0) firsts.set(key, -1 - seen);
+	}
+	const result: T[] = [];
+	for (const index of firsts.values()) if (index < 0) result.push(array[-1 - index]);
+	return result;
+}
+
+/**
+ * Build an object from the `[key, value]` pairs `fn` returns for each item (remeda's `mapToObj`, radash's `objectify`, Kotlin's
+ * `associate`); when several items give the same key, the last one wins. Like {@link keyBy}, the result is a null-prototype object,
+ * so keys such as `'__proto__'` or `'constructor'` are stored safely (no prototype pollution), but it has no `Object.prototype` methods.
+ * @template T
+ * @template K
+ * @template V
+ * @param {ReadonlyArray<T>} array - The items
+ * @param {(item: T, index: number) => readonly [K, V]} fn - Returns the key and the value of an item
+ * @returns {Partial<Record<K, V>>} An object mapping each key to the last value given for it
+ * @throws {TypeError} when `fn` is not a function or returns something other than an array
+ * @example
+ * associate([{ id: 'a', n: 1 }, { id: 'b', n: 2 }], function (o) { return [o.id, o.n]; }); // => { a: 1, b: 2 }
+ * associate(['x', 'yy'], function (s, i) { return [s, i]; }); // => { x: 0, yy: 1 }
+ */
+export function associate<T, K extends PropertyKey, V>(array: ReadonlyArray<T>, fn: (item: T, index: number) => readonly [K, V]): Partial<Record<K, V>> {
+	assertFunction('associate', 'fn', fn);
+	const result = nullObject() as Partial<Record<K, V>>;
+	for (let i = 0; i < array.length; i++) {
+		const entry = fn(array[i], i);
+		if (!Array.isArray(entry)) throw new TypeError(`associate: \`fn\` must return a [key, value] pair, got ${describe(entry)}`);
+		result[entry[0]] = entry[1];
+	}
+	return result;
+}
+
+/**
+ * One page of items, as returned by {@link paginate}.
+ * @template T - The item type
+ */
+export interface Page<T> {
+	/** The items of the page (empty when the page is past the last one). */
+	items: T[];
+	/** The page number, 1-based, as requested. */
+	page: number;
+	/** The maximum number of items per page, as requested. */
+	pageSize: number;
+	/** The number of non-empty pages (`0` for no items). */
+	pageCount: number;
+	/** The number of items in all pages. */
+	total: number;
+	/** Whether `page` is past the first page. */
+	hasPrevious: boolean;
+	/** Whether a non-empty page follows `page`. */
+	hasNext: boolean;
+}
+
+/**
+ * Return one page of an array with the metadata a pager needs. Pages are 1-based. A page past the last one is NOT clamped: it has
+ * no items (like an `OFFSET` past the end of a table), and `page` is reported as requested, so a stale page number shows up as an
+ * empty page instead of silently showing another one; clamp it yourself with `Math.min(page, Math.max(pageCount, 1))` if you prefer.
+ * @template T
+ * @param {ReadonlyArray<T>} array - All the items
+ * @param {number} page - The page number (an integer >= 1)
+ * @param {number} pageSize - The maximum number of items per page (an integer >= 1)
+ * @returns {Page<T>} `{ items, page, pageSize, pageCount, total, hasPrevious, hasNext }`
+ * @throws {TypeError} when `page` or `pageSize` is not a number
+ * @throws {RangeError} when `page` or `pageSize` is not an integer >= 1
+ * @example
+ * paginate(['a', 'b', 'c', 'd', 'e'], 2, 2); // => { items: ['c', 'd'], page: 2, pageSize: 2, pageCount: 3, total: 5, hasPrevious: true, hasNext: true }
+ * paginate(['a', 'b', 'c'], 5, 2).items; // => []
+ */
+export function paginate<T>(array: ReadonlyArray<T>, page: number, pageSize: number): Page<T> {
+	assertInteger('paginate', 'page', page, 1);
+	assertInteger('paginate', 'pageSize', pageSize, 1);
+	const total = array.length;
+	const pageCount = Math.ceil(total / pageSize);
+	const start = Math.min((page - 1) * pageSize, total);
+	return {
+		items: copyRange(array, start, Math.min(start + pageSize, total)),
+		page,
+		pageSize,
+		pageCount,
+		total,
+		hasPrevious: page > 1,
+		hasNext: page < pageCount
+	};
+}
+
+/**
+ * Split an array in two at `index`: the items before it, and the items from it on. A negative index counts from the end, like
+ * `Array.prototype.slice`, and an index out of range is clamped (`splitAt(array, 99)` gives `[copy, []]`).
+ * @template T
+ * @param {ReadonlyArray<T>} array - The source array
+ * @param {number} index - Where the second part starts (an integer; negative counts from the end)
+ * @returns {[T[], T[]]} `[before, after]`, two new arrays
+ * @throws {TypeError} when `index` is not a number
+ * @throws {RangeError} when `index` is not an integer
+ * @example
+ * splitAt([1, 2, 3, 4], 1); // => [[1], [2, 3, 4]]
+ * splitAt([1, 2, 3, 4], -1); // => [[1, 2, 3], [4]]
+ * splitAt([1, 2], 5); // => [[1, 2], []]
+ */
+export function splitAt<T>(array: ReadonlyArray<T>, index: number): [T[], T[]] {
+	assertNumber('splitAt', 'index', index, Number.isInteger(index), 'an integer');
+	const length = array.length;
+	const at = index < 0 ? Math.max(length + index, 0) : Math.min(index, length);
+	return [copyRange(array, 0, at), copyRange(array, at, length)];
 }

@@ -31,6 +31,7 @@ describe('root entry', function () {
 			'easing',
 			'emitter',
 			'encoding',
+			'errors',
 			'format',
 			'functions',
 			'guards',

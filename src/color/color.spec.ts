@@ -1197,3 +1197,448 @@ describe('OKLab / OKLCH', function () {
 		});
 	});
 });
+
+describe('Color scales, names, adjustments and HSV', function () {
+	describe('colorScale', function () {
+		it('interpolates between the stops spread evenly over [0, 1], clamping outside', function () {
+			const scale = helpers.colorScale(['#0000ff', '#ffffff', '#ff0000']);
+			expect(scale(0)).toEqual({ r: 0, g: 0, b: 255, a: 1 });
+			expect(scale(0.25)).toEqual({ r: 128, g: 128, b: 255, a: 1 });
+			expect(scale(0.5)).toEqual({ r: 255, g: 255, b: 255, a: 1 });
+			expect(scale(0.75)).toEqual({ r: 255, g: 128, b: 128, a: 1 });
+			expect(scale(1)).toEqual({ r: 255, g: 0, b: 0, a: 1 });
+			expect(scale(-1)).toEqual({ r: 0, g: 0, b: 255, a: 1 });
+			expect(scale(-Infinity)).toEqual({ r: 0, g: 0, b: 255, a: 1 });
+			expect(scale(Infinity)).toEqual({ r: 255, g: 0, b: 0, a: 1 });
+		});
+
+		it('returns a new object on every call, and is not affected by later changes to its arguments', function () {
+			const first = { r: 10, g: 20, b: 30 };
+			const stops: helpers.ColorInput[] = [first, '#fff'];
+			const domain = [0, 10];
+			const scale = helpers.colorScale(stops, { domain });
+			const middleDomain = [0, 5, 10];
+			const middle = helpers.colorScale(['#000', '#888', '#fff'], { domain: middleDomain });
+			middleDomain[1] = 9;
+			expect(middle(5)).toEqual({ r: 0x88, g: 0x88, b: 0x88, a: 1 });
+			const a = scale(0);
+			a.r = 99;
+			first.r = 50;
+			stops[0] = '#000';
+			domain[1] = 1;
+			expect(scale(0)).toEqual({ r: 10, g: 20, b: 30, a: 1 });
+			expect(scale(10)).toEqual({ r: 255, g: 255, b: 255, a: 1 });
+			expect(scale(0)).not.toBe(scale(0));
+			expect(scale(10)).not.toBe(scale(10));
+		});
+
+		it('places the stops at the domain positions (one per stop, or the two ends)', function () {
+			const scale = helpers.colorScale(['#000000', '#808080', '#ffffff'], { domain: [0, 0.2, 1] });
+			expect(scale(0.1)).toEqual({ r: 64, g: 64, b: 64, a: 1 });
+			expect(scale(0.2)).toEqual({ r: 128, g: 128, b: 128, a: 1 });
+			expect(scale(0.6)).toEqual({ r: 192, g: 192, b: 192, a: 1 });
+			const spread = helpers.colorScale(['#000000', '#808080', '#ffffff'], { domain: [100, 200] });
+			expect(spread(150)).toEqual({ r: 128, g: 128, b: 128, a: 1 });
+			expect(spread(125)).toEqual({ r: 64, g: 64, b: 64, a: 1 });
+			expect(spread(50)).toEqual({ r: 0, g: 0, b: 0, a: 1 });
+			expect(helpers.colorScale(['#000', '#fff'], { domain: [-1e308, 1e308] })(0)).toEqual({ r: 128, g: 128, b: 128, a: 1 });
+			// Subnormal positions (regression: halving them lost their differences).
+			expect(helpers.colorScale(['#000', '#888', '#fff'], { domain: [-1.5e-323, -1e-323, -5e-324] })(-1e-323)).toEqual({ r: 136, g: 136, b: 136, a: 1 });
+			expect(helpers.colorScale(['#000', '#fff'], { domain: [5e-324, 1.5e-323] })(1e-323)).toEqual({ r: 128, g: 128, b: 128, a: 1 });
+			expect(helpers.colorScale(['#000', '#fff'], { domain: [0, 1.5e-323] })(5e-324)).toEqual({ r: 85, g: 85, b: 85, a: 1 });
+			expect(helpers.colorScale(['#000', '#fff'], { domain: [-Number.MAX_VALUE, Number.MAX_VALUE] })(Number.MAX_VALUE / 2)).toEqual({
+				r: 191,
+				g: 191,
+				b: 191,
+				a: 1
+			});
+		});
+
+		it('finds the right segment among many stops', function () {
+			const stops = Array.from({ length: 11 }, function (_, i) {
+				return { r: i * 25, g: 0, b: 0 };
+			});
+			const scale = helpers.colorScale(stops);
+			for (let i = 0; i < 10; i++) {
+				expect(scale((i + 0.4) / 10)).toEqual({ r: i * 25 + 10, g: 0, b: 0, a: 1 });
+			}
+		});
+
+		it('makes a constant scale from a single stop', function () {
+			const scale = helpers.colorScale(['#123456']);
+			for (const t of [-1, 0, 0.5, 1, 2]) expect(scale(t)).toEqual({ r: 0x12, g: 0x34, b: 0x56, a: 1 });
+			expect(helpers.colorScale(['#123456'], { domain: [0, 10] })(5)).toEqual({ r: 0x12, g: 0x34, b: 0x56, a: 1 });
+			expect(helpers.colorScale(['#123456'], { domain: [3] })(5)).toEqual({ r: 0x12, g: 0x34, b: 0x56, a: 1 });
+		});
+
+		it('interpolates in the requested space, with alpha', function () {
+			expect(helpers.colorScale(['#0000ff', '#ffff00'], { space: 'oklch' })(0.5)).toEqual(helpers.mix('#0000ff', '#ffff00', 0.5, { space: 'oklch' }));
+			expect(helpers.colorScale(['#ff0000', '#00ff00'], { space: 'oklch', hue: 'longer' })(0.5)).toEqual(
+				helpers.mix('#ff0000', '#00ff00', 0.5, { space: 'oklch', hue: 'longer' })
+			);
+			expect(helpers.colorScale(['#000', '#fff'], { space: 'oklab' })(0.5)).toEqual({ r: 99, g: 99, b: 99, a: 1 });
+			expect(helpers.colorScale(['transparent', '#ff0000'], { space: 'oklab' })(0.5)).toEqual({ r: 255, g: 0, b: 0, a: 0.5 });
+		});
+
+		it('validates its arguments when created, and t when called', function () {
+			expect(function () {
+				helpers.colorScale('#fff' as never);
+			}).toThrow(new TypeError('colorScale: `stops` must be an array of colours, got string'));
+			expect(function () {
+				helpers.colorScale([]);
+			}).toThrow(new RangeError('colorScale: `stops` must hold at least one colour, got an empty array'));
+			expect(function () {
+				helpers.colorScale(['#fff', 'nope']);
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.colorScale(new Array(2));
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.colorScale(['#000', '#fff'], { space: 'lab' as never });
+			}).toThrow(new RangeError("colorScale: `options.space` must be 'srgb', 'oklab' or 'oklch', got lab"));
+			expect(function () {
+				helpers.colorScale(['#000', '#fff'], { hue: 'up' as never });
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.colorScale(['#000', '#fff'], { domain: '0,1' as never });
+			}).toThrow(new TypeError('colorScale: `options.domain` must be an array of numbers, got string'));
+			expect(function () {
+				helpers.colorScale(['#000', '#888', '#fff'], { domain: [0, 0.5, 0.7, 1] });
+			}).toThrow(new RangeError('colorScale: `options.domain` must hold 2 or 3 positions (one per stop), got 4'));
+			expect(function () {
+				helpers.colorScale(['#000', '#fff'], { domain: [1, 1] });
+			}).toThrow(new RangeError('colorScale: `options.domain[1]` must be a finite number > options.domain[0], got 1'));
+			expect(function () {
+				helpers.colorScale(['#000', '#888', '#fff'], { domain: [0, 2, 1] });
+			}).toThrow(new RangeError('colorScale: `options.domain[2]` must be a finite number > options.domain[1], got 1'));
+			expect(function () {
+				helpers.colorScale(['#000', '#fff'], { domain: [NaN, 1] });
+			}).toThrow(new RangeError('colorScale: `options.domain[0]` must be a finite number, got NaN'));
+			expect(function () {
+				helpers.colorScale(['#000', '#fff'], { domain: [0, Infinity] });
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.colorScale(['#000', '#fff'], { domain: [0, '1'] as never });
+			}).toThrow(new TypeError('colorScale: `options.domain[1]` must be a finite number > options.domain[0], got string'));
+			const scale = helpers.colorScale(['#000', '#fff']);
+			expect(function () {
+				scale(NaN);
+			}).toThrow(new RangeError('colorScale: `t` must be a number other than NaN, got NaN'));
+			expect(function () {
+				scale('0.5' as never);
+			}).toThrow(new TypeError('colorScale: `t` must be a number other than NaN, got string'));
+		});
+
+		it('ignores options inherited from a polluted Object.prototype', function () {
+			const proto = Object.prototype as Record<string, unknown>;
+			proto.domain = [0, 100];
+			proto.space = 'oklab';
+			try {
+				expect(helpers.colorScale(['#000', '#fff'])(0.5)).toEqual({ r: 128, g: 128, b: 128, a: 1 });
+			} finally {
+				delete proto.domain;
+				delete proto.space;
+			}
+		});
+	});
+
+	describe('colorSteps', function () {
+		it('samples evenly, both ends included', function () {
+			expect(
+				helpers.colorSteps(['#000000', '#ffffff'], 5).map(function (color) {
+					return helpers.toHex(color);
+				})
+			).toEqual(['#000000', '#404040', '#808080', '#bfbfbf', '#ffffff']);
+			expect(helpers.colorSteps(['#ff0000', '#0000ff'], 2)).toEqual([
+				{ r: 255, g: 0, b: 0, a: 1 },
+				{ r: 0, g: 0, b: 255, a: 1 }
+			]);
+			expect(helpers.colorSteps(['#ff0000', '#0000ff'], 1)).toEqual([{ r: 255, g: 0, b: 0, a: 1 }]);
+			expect(helpers.colorSteps(['#ff0000', '#0000ff'], 0)).toEqual([]);
+		});
+
+		it('samples over the domain, so uneven stops shape the palette', function () {
+			expect(helpers.colorSteps(['#000000', '#808080', '#ffffff'], 3, { domain: [0, 0.25, 1] })).toEqual([
+				{ r: 0, g: 0, b: 0, a: 1 },
+				{ r: 170, g: 170, b: 170, a: 1 },
+				{ r: 255, g: 255, b: 255, a: 1 }
+			]);
+			expect(helpers.colorSteps(['#000000', '#ffffff'], 3, { domain: [-1e308, 1e308] })[2]).toEqual({ r: 255, g: 255, b: 255, a: 1 });
+			expect(helpers.colorSteps(['#abcdef'], 3)).toEqual([
+				{ r: 0xab, g: 0xcd, b: 0xef, a: 1 },
+				{ r: 0xab, g: 0xcd, b: 0xef, a: 1 },
+				{ r: 0xab, g: 0xcd, b: 0xef, a: 1 }
+			]);
+		});
+
+		it('validates count and the scale arguments', function () {
+			expect(function () {
+				helpers.colorSteps(['#000'], 2.5);
+			}).toThrow(new RangeError('colorSteps: `count` must be an integer >= 0, got 2.5'));
+			expect(function () {
+				helpers.colorSteps(['#000'], -1);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.colorSteps(['#000'], '3' as never);
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.colorSteps([], 3);
+			}).toThrow(new RangeError('colorSteps: `stops` must hold at least one colour, got an empty array'));
+		});
+	});
+
+	describe('isCssColor', function () {
+		it('accepts exactly what parseColor accepts', function () {
+			for (const value of ['#fff', 'fff', '#ff000080', 'rgb(1 2 3)', 'rgba(1, 2, 3, 0.5)', 'hsl(0 0% 0%)', 'oklch(0.5 0.1 30)', 'oklab(0.5 0 0)', ' TRANSPARENT ']) {
+				expect(helpers.isCssColor(value)).toBe(true);
+			}
+			for (const value of ['', 'red', '#ff', 'rgb(1, 2)', 'rgb(1 2 3', 'hsl(1, 2, 3)', 'rgb(1e999 0 0)', ' #fff']) {
+				expect(helpers.isCssColor(value)).toBe(false);
+			}
+		});
+
+		it('returns false for non-strings without throwing', function () {
+			for (const value of [undefined, null, 0, 0xffffff, {}, { r: 0, g: 0, b: 0 }, ['#fff'], Symbol('x')]) {
+				expect(helpers.isCssColor(value)).toBe(false);
+			}
+		});
+
+		it('narrows the type', function () {
+			const value: unknown = '#fff';
+			if (helpers.isCssColor(value)) expect(value.length).toBe(4);
+		});
+	});
+
+	describe('parseNamedColor', function () {
+		it('parses the CSS named colours, case-insensitively and ignoring CSS white space', function () {
+			expect(helpers.parseNamedColor('red')).toEqual({ r: 255, g: 0, b: 0, a: 1 });
+			expect(helpers.parseNamedColor('RebeccaPurple')).toEqual({ r: 102, g: 51, b: 153, a: 1 });
+			expect(helpers.parseNamedColor('\t lightgoldenrodyellow \n')).toEqual({ r: 250, g: 250, b: 210, a: 1 });
+			expect(helpers.parseNamedColor('aliceblue')).toEqual({ r: 240, g: 248, b: 255, a: 1 });
+			expect(helpers.parseNamedColor('yellowgreen')).toEqual({ r: 154, g: 205, b: 50, a: 1 });
+			expect(helpers.parseNamedColor('grey')).toEqual(helpers.parseNamedColor('gray'));
+			expect(helpers.parseNamedColor('TRANSPARENT')).toEqual({ r: 0, g: 0, b: 0, a: 0 });
+		});
+
+		it('returns a new object each time', function () {
+			const a = helpers.parseNamedColor('red') as helpers.Rgba;
+			a.r = 0;
+			expect(helpers.parseNamedColor('red')).toEqual({ r: 255, g: 0, b: 0, a: 1 });
+		});
+
+		it('returns undefined for anything else', function () {
+			for (const value of [
+				'',
+				'#ff0000',
+				'rgb(255 0 0)',
+				'redd',
+				're d',
+				'currentcolor',
+				'\u212Ahaki',
+				'pin\u212A',
+				' red',
+				'red ',
+				'__proto__',
+				'constructor',
+				'toString',
+				'hasOwnProperty',
+				'a'.repeat(21),
+				'lightgoldenrodyellowx'
+			]) {
+				expect(helpers.parseNamedColor(value)).toBeUndefined();
+			}
+		});
+
+		it('throws a TypeError for non-strings', function () {
+			expect(function () {
+				helpers.parseNamedColor(1 as never);
+			}).toThrow(new TypeError('parseNamedColor: `name` must be a string, got number'));
+		});
+	});
+
+	describe('toColorName', function () {
+		it('names exact matches, the first name alphabetically for duplicates', function () {
+			expect(helpers.toColorName('#ff0000')).toBe('red');
+			expect(helpers.toColorName({ r: 0, g: 255, b: 255 })).toBe('aqua');
+			expect(helpers.toColorName('#ff00ff')).toBe('fuchsia');
+			expect(helpers.toColorName('#a9a9a9')).toBe('darkgray');
+			expect(helpers.toColorName('#2f4f4f')).toBe('darkslategray');
+			expect(helpers.toColorName('#9acd32')).toBe('yellowgreen');
+			expect(helpers.toColorName('#f0f8ff')).toBe('aliceblue');
+			expect(helpers.toColorName('#ff0000ff')).toBe('red');
+		});
+
+		it('requires an opaque exact match, and names only transparent black transparent', function () {
+			expect(helpers.toColorName('#ff0001')).toBeUndefined();
+			expect(helpers.toColorName('#ff0000fe')).toBeUndefined();
+			expect(helpers.toColorName({ r: 0, g: 0, b: 0, a: 0 })).toBe('transparent');
+			expect(helpers.toColorName({ r: 255, g: 0, b: 0, a: 0 })).toBeUndefined();
+			expect(helpers.toColorName({ r: 0, g: 0, b: 0, a: 0.5 })).toBeUndefined();
+		});
+
+		it('finds the nearest name in OKLab, ignoring alpha', function () {
+			expect(helpers.toColorName('#ff0001', { nearest: true })).toBe('red');
+			expect(helpers.toColorName('#00ffff', { nearest: true })).toBe('aqua');
+			expect(helpers.toColorName('#010101', { nearest: true })).toBe('black');
+			expect(helpers.toColorName('#fefefe', { nearest: true })).toBe('white');
+			expect(helpers.toColorName({ r: 102, g: 51, b: 150, a: 0.2 }, { nearest: true })).toBe('rebeccapurple');
+			expect(helpers.toColorName('transparent', { nearest: true })).toBe('black');
+			expect(helpers.toColorName('#ff0001', { nearest: false })).toBeUndefined();
+		});
+
+		it('validates the colour and ignores a polluted Object.prototype', function () {
+			expect(function () {
+				helpers.toColorName('red');
+			}).toThrow(TypeError);
+			const proto = Object.prototype as Record<string, unknown>;
+			proto.nearest = true;
+			try {
+				expect(helpers.toColorName('#ff0001')).toBeUndefined();
+			} finally {
+				delete proto.nearest;
+			}
+		});
+	});
+
+	describe('saturate / desaturate / grayscale', function () {
+		it('changes the HSL saturation, clamped to [0, 100], keeping alpha', function () {
+			expect(helpers.saturate('#996666', 20)).toEqual({ r: 179, g: 77, b: 77, a: 1 });
+			expect(helpers.saturate('#ff0000', 50)).toEqual({ r: 255, g: 0, b: 0, a: 1 });
+			expect(helpers.saturate('#80808080', 100)).toEqual({ r: 255, g: 1, b: 1, a: 128 / 255 });
+			expect(helpers.desaturate('#ff0000', 50)).toEqual({ r: 191, g: 64, b: 64, a: 1 });
+			expect(helpers.desaturate('#ff0000', 100)).toEqual({ r: 128, g: 128, b: 128, a: 1 });
+			expect(helpers.grayscale('#ff0000')).toEqual({ r: 128, g: 128, b: 128, a: 1 });
+			expect(helpers.grayscale('#0000ff80')).toEqual({ r: 128, g: 128, b: 128, a: 128 / 255 });
+			expect(helpers.saturate({ r: 10, g: 20, b: 30, a: 0.5 }, 0)).toEqual({ r: 10, g: 20, b: 30, a: 0.5 });
+			expect(helpers.desaturate({ r: 10, g: 20, b: 30, a: 0.5 }, 0)).toEqual({ r: 10, g: 20, b: 30, a: 0.5 });
+		});
+
+		it('changes the OKLCH chroma (100 points = 0.4), keeping lightness and hue', function () {
+			const base = helpers.toOklch('#996666');
+			const more = helpers.toOklch(helpers.saturate('#996666', 5, { space: 'oklch' }));
+			expect(Math.abs(more.c - (base.c + 0.02))).toBeLessThan(0.003);
+			expect(Math.abs(more.l - base.l)).toBeLessThan(0.005);
+			expect(Math.abs(more.h - base.h)).toBeLessThan(1);
+			expect(helpers.grayscale('#ffff00', { space: 'oklch' })).toEqual({ r: 244, g: 244, b: 244, a: 1 });
+			expect(helpers.grayscale('#0000ff', { space: 'oklch' })).toEqual({ r: 86, g: 86, b: 86, a: 1 });
+			expect(helpers.desaturate('#0000ff', 100, { space: 'oklch' })).toEqual(helpers.grayscale('#0000ff', { space: 'oklch' }));
+			expect(helpers.saturate('#ff0000', 100, { space: 'oklch' })).toEqual({ r: 255, g: 0, b: 0, a: 1 });
+		});
+
+		it('validates amount and space', function () {
+			for (const amount of [-1, 101, NaN]) {
+				expect(function () {
+					helpers.saturate('#000', amount);
+				}).toThrow(RangeError);
+				expect(function () {
+					helpers.desaturate('#000', amount);
+				}).toThrow(RangeError);
+			}
+			expect(function () {
+				helpers.saturate('#000', '1' as never);
+			}).toThrow(new TypeError('saturate: `amount` must be a number in [0, 100], got string'));
+			expect(function () {
+				helpers.desaturate('#000', 101);
+			}).toThrow(new RangeError('desaturate: `amount` must be a number in [0, 100], got 101'));
+			expect(function () {
+				helpers.saturate('#000', 1, { space: 'lab' as never });
+			}).toThrow(new RangeError("saturate: `options.space` must be 'hsl' or 'oklch', got lab"));
+			expect(function () {
+				helpers.desaturate('#000', 1, { space: 'lab' as never });
+			}).toThrow(new RangeError("desaturate: `options.space` must be 'hsl' or 'oklch', got lab"));
+			expect(function () {
+				helpers.grayscale('#000', { space: 'lab' as never });
+			}).toThrow(new RangeError("grayscale: `options.space` must be 'hsl' or 'oklch', got lab"));
+			expect(function () {
+				helpers.grayscale('nope');
+			}).toThrow(TypeError);
+		});
+	});
+
+	describe('rotateHue / complement', function () {
+		it('rotates the HSL hue, wrapping around, keeping alpha', function () {
+			expect(helpers.rotateHue('#ff0000', 120)).toEqual({ r: 0, g: 255, b: 0, a: 1 });
+			expect(helpers.rotateHue('#ff0000', -120)).toEqual({ r: 0, g: 0, b: 255, a: 1 });
+			expect(helpers.rotateHue('#ff0000', 360 * 1e6 + 240)).toEqual({ r: 0, g: 0, b: 255, a: 1 });
+			expect(helpers.rotateHue('#ff000080', 360)).toEqual({ r: 255, g: 0, b: 0, a: 128 / 255 });
+			expect(helpers.rotateHue('#808080', 90)).toEqual({ r: 128, g: 128, b: 128, a: 1 });
+			expect(helpers.complement('#ff0000')).toEqual({ r: 0, g: 255, b: 255, a: 1 });
+			expect(helpers.complement('#336699')).toEqual({ r: 153, g: 102, b: 51, a: 1 });
+		});
+
+		it('rotates the OKLCH hue, keeping lightness, and leaves greys alone', function () {
+			const rotated = helpers.toOklch(helpers.rotateHue('#3366cc', 90, { space: 'oklch' }));
+			const base = helpers.toOklch('#3366cc');
+			expect(Math.abs(rotated.l - base.l)).toBeLessThan(0.01);
+			expect(Math.abs((((rotated.h - base.h) % 360) + 360) % 360) - 90).toBeLessThan(1);
+			expect(helpers.rotateHue('#808080', 90, { space: 'oklch' })).toEqual({ r: 128, g: 128, b: 128, a: 1 });
+			expect(helpers.complement('#808080', { space: 'oklch' })).toEqual({ r: 128, g: 128, b: 128, a: 1 });
+			expect(helpers.complement({ r: 255, g: 0, b: 0, a: 0.5 }, { space: 'oklch' })).toEqual({ r: 0, g: 156, b: 178, a: 0.5 });
+		});
+
+		it('validates degrees and space', function () {
+			for (const degrees of [NaN, Infinity, -Infinity]) {
+				expect(function () {
+					helpers.rotateHue('#000', degrees);
+				}).toThrow(RangeError);
+			}
+			expect(function () {
+				helpers.rotateHue('#000', '90' as never);
+			}).toThrow(new TypeError('rotateHue: `degrees` must be a finite number, got string'));
+			expect(function () {
+				helpers.rotateHue('#000', 1, { space: 'oklab' as never });
+			}).toThrow(new RangeError("rotateHue: `options.space` must be 'hsl' or 'oklch', got oklab"));
+			expect(function () {
+				helpers.complement('#000', { space: 'oklab' as never });
+			}).toThrow(new RangeError("complement: `options.space` must be 'hsl' or 'oklch', got oklab"));
+		});
+	});
+
+	describe('rgbToHsv / hsvToRgb', function () {
+		it('converts to HSV', function () {
+			expect(helpers.rgbToHsv('#ff0000')).toEqual({ h: 0, s: 100, v: 100 });
+			expect(helpers.rgbToHsv('#00ff00')).toEqual({ h: 120, s: 100, v: 100 });
+			expect(helpers.rgbToHsv('#0000ff')).toEqual({ h: 240, s: 100, v: 100 });
+			expect(helpers.rgbToHsv('#ff00ff')).toEqual({ h: 300, s: 100, v: 100 });
+			expect(helpers.rgbToHsv('#000000')).toEqual({ h: 0, s: 0, v: 0 });
+			expect(helpers.rgbToHsv('#ffffff')).toEqual({ h: 0, s: 0, v: 100 });
+			expect(helpers.rgbToHsv('#808080')).toEqual({ h: 0, s: 0, v: (128 / 255) * 100 });
+			expect(helpers.rgbToHsv({ r: 300, g: -1, b: 0, a: 0.5 })).toEqual({ h: 0, s: 100, v: 100 });
+		});
+
+		it('converts from HSV, normalizing the hue and clamping saturation and value', function () {
+			expect(helpers.hsvToRgb({ h: 0, s: 100, v: 100 })).toEqual({ r: 255, g: 0, b: 0 });
+			expect(helpers.hsvToRgb({ h: 60, s: 100, v: 100 })).toEqual({ r: 255, g: 255, b: 0 });
+			expect(helpers.hsvToRgb({ h: 180, s: 100, v: 50 })).toEqual({ r: 0, g: 128, b: 128 });
+			expect(helpers.hsvToRgb({ h: 300, s: 50, v: 100 })).toEqual({ r: 255, g: 128, b: 255 });
+			expect(helpers.hsvToRgb({ h: 720 + 240, s: 100, v: 100 })).toEqual({ r: 0, g: 0, b: 255 });
+			expect(helpers.hsvToRgb({ h: -60, s: 150, v: 200 })).toEqual({ r: 255, g: 0, b: 255 });
+			expect(helpers.hsvToRgb({ h: 0, s: -5, v: -5 })).toEqual({ r: 0, g: 0, b: 0 });
+			expect(Object.is(helpers.hsvToRgb({ h: -0, s: -0, v: -0 }).r, 0)).toBe(true);
+		});
+
+		it('validates the HSV object', function () {
+			expect(function () {
+				helpers.hsvToRgb(null as never);
+			}).toThrow(new TypeError('hsvToRgb: `hsv` must be an { h, s, v } object, got null'));
+			expect(function () {
+				helpers.hsvToRgb({ h: Infinity, s: 0, v: 0 });
+			}).toThrow(new RangeError('hsvToRgb: `hsv.h` must be finite, got Infinity'));
+			expect(function () {
+				helpers.hsvToRgb({ h: 0, s: NaN, v: 0 });
+			}).toThrow(new RangeError('hsvToRgb: `hsv.s` must be a number other than NaN, got NaN'));
+			expect(function () {
+				helpers.hsvToRgb({ h: 0, s: 0, v: '1' as never });
+			}).toThrow(new TypeError('hsvToRgb: `hsv.v` must be a number other than NaN, got string'));
+			expect(function () {
+				helpers.rgbToHsv(5 as never);
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.hsvToRgb(5 as never);
+			}).toThrow(new TypeError('hsvToRgb: `hsv` must be an { h, s, v } object, got number'));
+			expect(function () {
+				helpers.hsvToRgb({ h: '0', s: 0, v: 0 } as never);
+			}).toThrow(new TypeError('hsvToRgb: `hsv.h` must be a number other than NaN, got string'));
+		});
+	});
+});

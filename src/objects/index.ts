@@ -1,7 +1,22 @@
-import { isDate, isArrayBuffer, isError, isFunction, isMap, isObject, isPlainObject, isPromise, isRegExp, isSet, isWeakMap, isWeakSet } from '../guards/index.js';
+import {
+	type JsonValue,
+	isDate,
+	isArrayBuffer,
+	isError,
+	isFunction,
+	isMap,
+	isObject,
+	isPlainObject,
+	isPromise,
+	isRegExp,
+	isSet,
+	isWeakMap,
+	isWeakSet
+} from '../guards/index.js';
 import { toCamelCase, toKebabCase, toSnakeCase } from '../strings/index.js';
 import { assertFunction, assertInteger, assertNumber, describe, readOption } from '../utils/assert.js';
 import type { AnyFunction, DeepReadonly, NestedKeyOf, PathValue, Primitive, UnionToIntersection } from '../utils/index.js';
+import { MAX_JSON_DEPTH, toJsonValue, type JsonWalk } from '../utils/json.js';
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Types
@@ -4355,4 +4370,141 @@ export function hash(value: unknown, seed: number = 0): number {
 	h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
 	h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
 	return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+}
+
+/**
+ * Options of {@link safeStringify}.
+ */
+export interface SafeStringifyOptions {
+	/**
+	 * As `JSON.stringify`'s: a function called as `replacer.call(holder, key, value)` for every value (after its `toJSON`, before any
+	 * conversion, so it sees bigints, maps and errors as they are), or the list of the keys to write for objects (strings and numbers;
+	 * own properties only).
+	 */
+	replacer?: ((this: unknown, key: string, value: unknown) => unknown) | ReadonlyArray<string | number>;
+	/** As `JSON.stringify`'s: the number of spaces to indent with (capped at 10), or the indentation string (its first 10 characters). */
+	space?: number | string;
+	/**
+	 * Whether object keys are written in sorted order (default `false`), by UTF-16 code units as in {@link stableStringify}, integer-like
+	 * keys included (`"10"` before `"2"`), for deterministic output; arrays (and the entries of maps and sets) keep their order.
+	 */
+	sortKeys?: boolean;
+	/**
+	 * Objects nested deeper than this (the value itself is at depth 0) become `"[Object]"` (`"[Array]"` for arrays). An integer >= 0 or
+	 * `Infinity` (the default); values above 1000 are clamped to 1000, the hard cap that keeps the text writable, so the default is
+	 * effectively 1000.
+	 */
+	maxDepth?: number;
+}
+
+/** How {@link writeJson} lays the text out. */
+interface JsonLayout {
+	/** One level of indentation (`''` for compact output). */
+	readonly gap: string;
+	/** The keys to write, in order, when a replacer list was given (objects have no other keys then). */
+	readonly keys: ReadonlyArray<string> | undefined;
+	/** Whether the keys of objects are sorted. */
+	readonly sort: boolean;
+}
+
+/**
+ * Writes a tree of JSON values as text, indented as `JSON.stringify` does. Never looks a `toJSON` up, so a polluted prototype cannot
+ * change the output. The keys are written in the order of the replacer list, or sorted, or in the objects' own order: an object cannot
+ * hold integer-like keys in another order than ascending.
+ * @param {JsonValue} value - The value
+ * @param {string} indent - The indentation of the current line
+ * @param {JsonLayout} layout - The gap and key order
+ * @returns {string} The JSON text
+ */
+function writeJson(value: JsonValue, indent: string, layout: JsonLayout): string {
+	if (typeof value !== 'object' || value === null) return typeof value === 'string' ? JSON.stringify(value) : String(value);
+	const isArray = Array.isArray(value);
+	const gap = layout.gap;
+	const inner = indent + gap;
+	let text = '';
+	if (isArray) {
+		for (let index = 0; index < value.length; index++) text += (index === 0 ? '' : ',') + (gap === '' ? '' : '\n' + inner) + writeJson(value[index], inner, layout);
+	} else {
+		const keys = layout.keys ?? (layout.sort ? Object.keys(value).sort() : Object.keys(value));
+		for (const key of keys) {
+			if (!hasOwn(value, key)) continue;
+			text += (text === '' ? '' : ',') + (gap === '' ? '' : '\n' + inner) + JSON.stringify(key) + (gap === '' ? ':' : ': ') + writeJson(value[key], inner, layout);
+		}
+	}
+	if (text === '') return isArray ? '[]' : '{}';
+	return (isArray ? '[' : '{') + text + (gap === '' ? '' : '\n' + indent) + (isArray ? ']' : '}');
+}
+
+/**
+ * `JSON.stringify` that never throws on the value: it gives the same text for everything `JSON.stringify` handles (same `toJSON`,
+ * replacer and `space` semantics), and a useful one where `JSON.stringify` throws or loses data:
+ * - A circular reference becomes `"[Circular]"`; only true ancestors count, so an object referenced twice (siblings, a DAG) is written
+ *   twice.
+ * - A bigint becomes its decimal string (`10n` → `"10"`); a replacer sees it first, to write it otherwise.
+ * - An error (of any realm) becomes `{"name","message","stack",…}` with its own `code`, its `cause`, an `AggregateError`'s `errors` and
+ *   its other own enumerable properties, as `serializeError` (`errors` module) writes it; a `toJSON` method of the error wins.
+ * - A `Map` becomes the array of its `[key, value]` entries (so `new Map(JSON.parse(text))` restores it), a `Set` the array of its values.
+ * - A getter, `toJSON` method, replacer or proxy trap that throws writes `"[Throws: <message>]"` in place of the value, and an object
+ *   deeper than `maxDepth` `"[Object]"` (`"[Array]"`). Nesting is capped at 1000 levels whatever `maxDepth` asks for (deeper objects
+ *   become these markers too), so a hostile, deeply nested value can never make the call, or the writing of its text, overflow the
+ *   stack (a call made from deep in the stack still gets a `"[Throws: …]"` marker where its stack ran out).
+ *
+ * Only own properties are read: an array hole is `null` even when `Array.prototype` has an element there, and a key of a `replacer` list
+ * that an object only inherits is left out; a `toJSON` method inherited from a polluted `Object.prototype` is ignored. Boxed primitives are written as their primitive. The cost is linear in the size of the
+ * value; an array costs its `length`, holes included.
+ *
+ * The `errors` module is not imported for this: both modules share a private converter, which `serializeError` also uses.
+ * @param {unknown} value - The value to serialize
+ * @param {SafeStringifyOptions} [options={}] - `replacer`, `space`, `sortKeys` (default `false`) and `maxDepth` (default `Infinity`,
+ * clamped to 1000)
+ * @returns {string | undefined} The JSON text, or `undefined` where `JSON.stringify` returns it (the value, after `toJSON` and the
+ * replacer, is `undefined`, a function or a symbol)
+ * @throws {TypeError} when `replacer` is not a function or an array, `space` is not a number or a string, or `maxDepth` is not a number
+ * @throws {RangeError} when `maxDepth` is not an integer >= 0 or `Infinity`, or the text would exceed the engine's maximum string length
+ * @example
+ * const node: Record<string, unknown> = { id: 1 };
+ * node.self = node;
+ * safeStringify(node); // => '{"id":1,"self":"[Circular]"}'
+ * const shared = { x: 1 };
+ * safeStringify([shared, shared]); // => '[{"x":1},{"x":1}]'
+ * safeStringify({ big: 10n, tags: new Set(['a']), meta: new Map([['k', 1]]) }); // => '{"big":"10","tags":["a"],"meta":[["k",1]]}'
+ * safeStringify({ b: 1, a: { d: 1, c: 2 } }, { sortKeys: true }); // => '{"a":{"c":2,"d":1},"b":1}'
+ * safeStringify({ get boom() { throw new Error('nope'); } }); // => '{"boom":"[Throws: nope]"}'
+ * safeStringify(new TypeError('Bad'), { replacer: ['name', 'message'] }); // => '{"name":"TypeError","message":"Bad"}'
+ * safeStringify({ a: [1] }, { space: 2 }); // => '{\n  "a": [\n    1\n  ]\n}'
+ * safeStringify(undefined); // => undefined
+ */
+export function safeStringify(value: unknown, options: SafeStringifyOptions = {}): string | undefined {
+	const replacer = readOption(options, 'replacer');
+	const space = readOption(options, 'space');
+	const maxDepth = readOption(options, 'maxDepth', Infinity);
+	if (replacer !== undefined && typeof replacer !== 'function' && !Array.isArray(replacer)) {
+		throw new TypeError(`safeStringify: \`replacer\` must be a function or an array, got ${describe(replacer)}`);
+	}
+	if (space !== undefined && typeof space !== 'number' && typeof space !== 'string') {
+		throw new TypeError(`safeStringify: \`space\` must be a number or a string, got ${describe(space)}`);
+	}
+	assertInteger('safeStringify', 'maxDepth', maxDepth, 0, true);
+	const sort = readOption(options, 'sortKeys') === true;
+	let keys: string[] | undefined;
+	if (Array.isArray(replacer)) {
+		const listed = new Set<string>();
+		for (const key of replacer as ReadonlyArray<unknown>) if (typeof key === 'string' || typeof key === 'number') listed.add(String(key));
+		keys = sort ? [...listed].sort() : [...listed];
+	}
+	const walk: JsonWalk = {
+		replacer: typeof replacer === 'function' ? replacer : undefined,
+		keys,
+		stack: true,
+		maxDepth: Math.min(maxDepth, MAX_JSON_DEPTH),
+		ancestors: [],
+		onPath: new Set()
+	};
+	const tree = toJsonValue({ '': value }, '', walk);
+	// As `JSON.stringify`: at most 10 spaces (none for 0, a negative number or `NaN`), or the first 10 characters of a string.
+	const gap = typeof space === 'number' ? ' '.repeat(Math.min(10, Math.max(0, Math.trunc(space) || 0))) : (space ?? '').slice(0, 10);
+	if (tree === undefined) return undefined;
+	// The tree holds plain objects and arrays only: `JSON.stringify` writes it faster, unless a `toJSON` was planted on their prototypes
+	// or the keys must be written in another order than the tree's.
+	return keys === undefined && !sort && !('toJSON' in Array.prototype) ? JSON.stringify(tree, undefined, gap) : writeJson(tree, '', { gap, keys, sort });
 }

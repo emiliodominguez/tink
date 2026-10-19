@@ -503,3 +503,211 @@ describe('OKLab / OKLCH (property-based)', function () {
 		);
 	});
 });
+
+describe('Scales, names, adjustments and HSV (property-based)', function () {
+	const mixSpaces = fc.constantFrom<helpers.MixSpace>('srgb', 'oklab', 'oklch');
+	const hues = fc.constantFrom<helpers.HueInterpolation>('shorter', 'longer', 'increasing', 'decreasing');
+	/** 1 to 8 stops at strictly increasing finite positions (with a few huge or tiny magnitudes). */
+	const stopsWithDomain = fc
+		.array(fc.tuple(rgba, fc.double({ min: -1e300, max: 1e300, noNaN: true, noDefaultInfinity: true })), { minLength: 1, maxLength: 8 })
+		.map(function (pairs) {
+			const positions = [
+				...new Set(
+					pairs.map(function (pair) {
+						return pair[1] + 0;
+					})
+				)
+			].sort(function (a, b) {
+				return a - b;
+			});
+			return {
+				stops: pairs.slice(0, positions.length).map(function (pair) {
+					return pair[0];
+				}),
+				domain: positions
+			};
+		});
+
+	/**
+	 * Reference implementation of a colour scale: linear search for the segment, then `mix`.
+	 */
+	function referenceScale(stops: helpers.Rgba[], domain: number[], options: helpers.MixOptions, t: number): helpers.Rgba {
+		if (t <= domain[0] || stops.length === 1) return stops[0];
+		if (t >= domain[domain.length - 1]) return stops[stops.length - 1];
+		let i = 0;
+		while (domain[i + 1] <= t) i++;
+		return helpers.mix(stops[i], stops[i + 1], (t - domain[i]) / (domain[i + 1] - domain[i]), options);
+	}
+
+	it('a two-stop scale should equal mix at the same weight', function () {
+		fc.assert(
+			fc.property(rgba, rgba, weight, mixSpaces, hues, function (a, b, t, mixSpace, mixHue) {
+				const options = { space: mixSpace, hue: mixHue };
+				expect(helpers.colorScale([a, b], options)(t)).toEqual(helpers.mix(a, b, t, options));
+			})
+		);
+	});
+
+	it('should equal a linear-search reference, return the stops at their positions and clamp outside the domain', function () {
+		fc.assert(
+			fc.property(stopsWithDomain, fc.double({ noNaN: true }), mixSpaces, function ({ stops, domain }, t, mixSpace) {
+				const scale = helpers.colorScale(stops, { domain, space: mixSpace });
+				expect(scale(t)).toEqual(referenceScale(stops, domain, { space: mixSpace }, t));
+				domain.forEach(function (position, i) {
+					expect(scale(position)).toEqual(stops[i]);
+				});
+				expect(scale(-Infinity)).toEqual(stops[0]);
+				expect(scale(Infinity)).toEqual(stops[stops.length - 1]);
+			})
+		);
+	});
+
+	it('colorSteps should sample the scale evenly, from the first stop to the last', function () {
+		fc.assert(
+			fc.property(fc.array(rgba, { minLength: 1, maxLength: 6 }), fc.integer({ min: 0, max: 20 }), mixSpaces, function (stops, count, mixSpace) {
+				const steps = helpers.colorSteps(stops, count, { space: mixSpace });
+				const scale = helpers.colorScale(stops, { space: mixSpace });
+				expect(steps).toHaveLength(count);
+				steps.forEach(function (color, i) {
+					expect(color).toEqual(scale(count > 1 ? i / (count - 1) : 0));
+				});
+				if (count > 0) expect(steps[0]).toEqual(stops[0]);
+				if (count > 1) expect(steps[count - 1]).toEqual(stops[stops.length - 1]);
+			})
+		);
+	});
+
+	it('isCssColor should agree with parseColor on arbitrary and colour-like strings', function () {
+		const colorLike = fc.oneof(
+			fc.string(),
+			fc.stringMatching(/^#?[0-9a-fA-F]{2,9}$/),
+			fc
+				.tuple(
+					fc.constantFrom('rgb', 'rgba', 'hsl', 'hsla', 'oklab', 'oklch', 'hwb'),
+					fc.array(fc.constantFrom('1', '50%', '0.5', 'none', '1e999', '2turn', ',', '/', ' '), { maxLength: 7 })
+				)
+				.map(function ([name, parts]) {
+					return `${name}(${parts.join(' ')})`;
+				})
+		);
+		fc.assert(
+			fc.property(colorLike, function (text) {
+				let parses = true;
+				try {
+					helpers.parseColor(text);
+				} catch {
+					parses = false;
+				}
+				expect(helpers.isCssColor(text)).toBe(parses);
+			})
+		);
+	});
+
+	it('named colours should round-trip, whatever the case and surrounding CSS white space', function () {
+		const names = fc.integer({ min: 0, max: 0xffffff }).map(function (value) {
+			// Any colour that has a name, found by the nearest search, then looked up exactly.
+			return helpers.toColorName({ r: value >> 16, g: (value >> 8) & 255, b: value & 255 }, { nearest: true }) as string;
+		});
+		const cssSpace = fc.constantFrom('', ' ', '\t', '\n ');
+		fc.assert(
+			fc.property(names, fc.array(fc.boolean(), { minLength: 20, maxLength: 20 }), cssSpace, cssSpace, function (name, upper, before, after) {
+				const color = helpers.parseNamedColor(name) as helpers.Rgba;
+				const mixedCase = [...name]
+					.map(function (letter, i) {
+						return upper[i] ? letter.toUpperCase() : letter;
+					})
+					.join('');
+				expect(helpers.parseNamedColor(before + mixedCase + after)).toEqual(color);
+				const canonical = helpers.toColorName(color) as string;
+				expect(helpers.parseNamedColor(canonical)).toEqual(color);
+				expect(canonical <= name).toBe(true);
+			})
+		);
+	});
+
+	it('toColorName should be exact by default, and nearest should match a brute-force OKLab search', function () {
+		fc.assert(
+			fc.property(rgba, function (color) {
+				const exact = helpers.toColorName(color);
+				if (exact !== undefined && exact !== 'transparent') expect(helpers.parseNamedColor(exact)).toEqual(color);
+				const nearest = helpers.toColorName(color, { nearest: true }) as string;
+				const lab = helpers.toOklab(color);
+				/** The OKLab distance from the colour to a named colour. */
+				function distance(name: string): number {
+					const other = helpers.toOklab(helpers.parseNamedColor(name) as helpers.Rgba);
+					return Math.hypot(lab.l - other.l, lab.a - other.a, lab.b - other.b);
+				}
+				// No named colour is closer (checked against a few candidates the search could have missed).
+				for (const name of ['red', 'black', 'white', 'gray', 'navy', 'teal', 'olive', 'purple', 'orange', 'pink', 'brown', 'gold']) {
+					expect(distance(nearest)).toBeLessThanOrEqual(distance(name));
+				}
+				if (exact !== undefined && color.a === 1) expect(nearest).toBe(exact);
+			})
+		);
+	});
+
+	it('hsvToRgb(rgbToHsv(c)) should give back every 8-bit colour, and agree with HSL on hue', function () {
+		fc.assert(
+			fc.property(rgb, function (color) {
+				const hsv = helpers.rgbToHsv(color);
+				expect(helpers.hsvToRgb(hsv)).toEqual(color);
+				expect(hsv.h).toBe(helpers.rgbToHsl(color).h);
+				expect(hsv.v).toBeCloseTo((Math.max(color.r, color.g, color.b) / 255) * 100, 10);
+				for (const value of [hsv.h / 3.6, hsv.s, hsv.v]) expect(value >= 0 && value < 100.0000001).toBe(true);
+			})
+		);
+	});
+
+	it('hsvToRgb should normalize the hue and clamp saturation and value', function () {
+		fc.assert(
+			fc.property(
+				fc.double({ min: -1e6, max: 1e6, noNaN: true }),
+				fc.double({ min: -50, max: 150, noNaN: true }),
+				fc.double({ min: -50, max: 150, noNaN: true }),
+				fc.integer({ min: -3, max: 3 }),
+				function (h, s, v, turns) {
+					const color = helpers.hsvToRgb({ h, s, v });
+					expectNormalized({ ...color, a: 1 });
+					const clamped = helpers.hsvToRgb({ h, s: Math.min(Math.max(s, 0), 100), v: Math.min(Math.max(v, 0), 100) });
+					expect(color).toEqual(clamped);
+					const wrapped = ((h % 360) + 360) % 360;
+					const shifted = helpers.hsvToRgb({ h: wrapped + turns * 360, s, v });
+					for (const channel of ['r', 'g', 'b'] as const) expect(Math.abs(shifted[channel] - color[channel])).toBeLessThanOrEqual(1);
+				}
+			)
+		);
+	});
+
+	it('saturate/desaturate/rotateHue should change nothing for 0, keep alpha, and grayscale should give greys', function () {
+		fc.assert(
+			fc.property(rgba, fc.constantFrom<'hsl' | 'oklch'>('hsl', 'oklch'), amount, function (color, model, by) {
+				const options = { space: model };
+				expect(helpers.saturate(color, 0, options)).toEqual(color);
+				expect(helpers.desaturate(color, 0, options)).toEqual(color);
+				expect(helpers.rotateHue(color, 0, options)).toEqual(color);
+				for (const result of [helpers.saturate(color, by, options), helpers.desaturate(color, by, options), helpers.rotateHue(color, by * 3.6, options)]) {
+					expectNormalized(result);
+					expect(result.a).toBe(color.a);
+				}
+				const grey = helpers.grayscale(color, options);
+				expect(grey.r === grey.g && grey.g === grey.b).toBe(true);
+				expect(grey).toEqual(helpers.desaturate(color, 100, options));
+				expect(grey.a).toBe(color.a);
+			})
+		);
+	});
+
+	it('HSL adjustments should match the HSL components, and OKLCH ones keep the perceived lightness', function () {
+		fc.assert(
+			fc.property(rgb, amount, function (color, by) {
+				const hsl = helpers.rgbToHsl(color);
+				expect(helpers.saturate(color, by)).toEqual({ ...helpers.hslToRgb({ ...hsl, s: Math.min(hsl.s + by, 100) }), a: 1 });
+				expect(helpers.desaturate(color, by)).toEqual({ ...helpers.hslToRgb({ ...hsl, s: Math.max(hsl.s - by, 0) }), a: 1 });
+				expect(helpers.rotateHue(color, by * 3.6)).toEqual({ ...helpers.hslToRgb({ ...hsl, h: hsl.h + by * 3.6 }), a: 1 });
+				expect(helpers.complement(color)).toEqual({ ...helpers.hslToRgb({ ...hsl, h: hsl.h + 180 }), a: 1 });
+				// The grey of the same OKLab lightness.
+				expect(helpers.grayscale(color, { space: 'oklch' })).toEqual(helpers.oklchToRgb({ l: helpers.toOklch(color).l, c: 0 }));
+			})
+		);
+	});
+});

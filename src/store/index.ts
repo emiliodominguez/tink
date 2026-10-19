@@ -1,5 +1,7 @@
 import type { Unsubscribe } from '../emitter/index.js';
-import { assertFunction, assertInteger, assertNumber, describe, readOption } from '../utils/assert.js';
+import { isPlainObject } from '../guards/index.js';
+import { assertDelay, assertFunction, assertInteger, assertNumber, describe, readOption } from '../utils/assert.js';
+import { withoutProtoKeys } from '../utils/proto.js';
 
 export type { Unsubscribe } from '../emitter/index.js';
 
@@ -216,16 +218,20 @@ const NOTIFIERS = /* @__PURE__ */ new WeakMap<object, Notifier>();
 
 /**
  * Creates a read-only store derived from `source`. While it has no subscribers it is not subscribed to `source` (so unused derived stores
- * never leak), and `getState` recomputes lazily; the selected value is cached and only replaced when `equals` reports a change.
+ * never leak), and `getState` recomputes lazily; the selected value is cached and only replaced when `equals` reports a change. Reading
+ * the source on demand (rather than caching what its notifications carried) keeps every read consistent with the current source state,
+ * which is what makes diamonds glitch-free: the first notification recomputes from the up-to-date state, and the next ones find
+ * nothing changed.
  * @template S - The source state type
  * @template T - The selected type
- * @param {ReadonlyStore<S>} source - The store to derive from
+ * @param {Pick<ReadonlyStore<S>, 'getState' | 'subscribe'>} source - The store to derive from
  * @param {(state: S) => T} selector - Projects the source state
  * @param {EqualityFn<T>} equals - Compares two selected values
  * @returns {ReadonlyStore<T>} The derived store
- * @throws {TypeError} when `selector` or `equals` is not a function
+ * @throws {TypeError} when `selector` or `equals` is not a function, or (from `subscribe`) when the source's `subscribe` does not return
+ * a function
  */
-function derive<S, T>(source: ReadonlyStore<S>, selector: (state: S) => T, equals: EqualityFn<T>): ReadonlyStore<T> {
+function derive<S, T>(source: Pick<ReadonlyStore<S>, 'getState' | 'subscribe'>, selector: (state: S) => T, equals: EqualityFn<T>): ReadonlyStore<T> {
 	assertFunction('select', 'selector', selector);
 	assertFunction('select', 'equals', equals);
 
@@ -288,7 +294,7 @@ function derive<S, T>(source: ReadonlyStore<S>, selector: (state: S) => T, equal
 				if (!detach) {
 					notifiedValue = initial;
 					notifiedVersion = version;
-					detach = source.subscribe(onSourceChange);
+					detach = attach(source, onSourceChange);
 				}
 			}
 
@@ -313,6 +319,173 @@ function derive<S, T>(source: ReadonlyStore<S>, selector: (state: S) => T, equal
 	};
 
 	return store;
+}
+
+/**
+ * Subscribes `listener` to a source store, checking that it returns an unsubscribe function (a foreign store given to {@link computed}
+ * may not).
+ * @param {Pick<ReadonlyStore<unknown>, 'subscribe'>} source - The store
+ * @param {() => void} listener - The listener
+ * @returns {Unsubscribe} The unsubscribe function
+ * @throws {TypeError} when `source.subscribe` does not return a function
+ */
+function attach(source: Pick<ReadonlyStore<unknown>, 'subscribe'>, listener: () => void): Unsubscribe {
+	const unsubscribe: unknown = source.subscribe(listener);
+	if (typeof unsubscribe !== 'function') throw new TypeError(`computed: a source store's \`subscribe\` must return a function, got ${describe(unsubscribe)}`);
+	return unsubscribe as Unsubscribe;
+}
+
+/**
+ * Combines stores into a single source for {@link derive}: its state is the array of their states, read on demand (a new array only
+ * when one of them changed, `Object.is`, so that `derive` recomputes only then), and subscribing to it subscribes to all of them (all
+ * or none: when one throws, the subscriptions already made are removed).
+ * @param {ReadonlyArray<ReadonlyStore<unknown>>} sources - The stores
+ * @returns {Pick<ReadonlyStore<unknown[]>, 'getState' | 'subscribe'>} The combined source
+ */
+function combineStores(sources: ReadonlyArray<ReadonlyStore<unknown>>): Pick<ReadonlyStore<unknown[]>, 'getState' | 'subscribe'> {
+	let states: unknown[] | undefined;
+
+	return {
+		getState(): unknown[] {
+			// Allocated only when a state changed (or on the first read).
+			let next: unknown[] | undefined = states === undefined ? [] : undefined;
+			for (let i = 0; i < sources.length; i++) {
+				const state = sources[i].getState();
+				if (next === undefined && !Object.is(state, (states as unknown[])[i])) next = (states as unknown[]).slice(0, i);
+				if (next !== undefined) next.push(state);
+			}
+			if (next !== undefined) states = next;
+			return states as unknown[];
+		},
+
+		subscribe(listener: () => void): Unsubscribe {
+			const subscriptions: Unsubscribe[] = [];
+			try {
+				for (const source of sources) subscriptions.push(attach(source, listener));
+			} catch (error) {
+				for (const unsubscribe of subscriptions) unsubscribe();
+				throw error;
+			}
+			return function (): void {
+				for (const unsubscribe of subscriptions) unsubscribe();
+			};
+		}
+	};
+}
+
+/**
+ * The states of a tuple (or array) of stores, in the same order: what {@link computed} passes to its `compute` function.
+ * @template T - The stores
+ */
+export type StoreStates<T extends readonly unknown[]> = { [K in keyof T]: T[K] extends ReadonlyStore<infer S> ? S : never };
+
+/**
+ * Options accepted by {@link computed}.
+ * @template T - The computed type
+ */
+export interface ComputedOptions<T> {
+	/** Decides whether a new computed value equals the previous one (equal values are not stored and do not notify). Defaults to `Object.is`. */
+	equals?: EqualityFn<T>;
+}
+
+/**
+ * Throws unless `value` looks like a store (an object with `getState` and `subscribe` methods).
+ * @param {string} name - The parameter name, for the error message
+ * @param {unknown} value - The value to validate
+ * @returns {void}
+ * @throws {TypeError} when `value` is not a store
+ */
+function assertStore(name: string, value: unknown): asserts value is ReadonlyStore<unknown> {
+	if (!isObject(value) || typeof value.getState !== 'function' || typeof value.subscribe !== 'function') {
+		throw new TypeError(`computed: \`${name}\` must be a store (an object with getState and subscribe methods), got ${describe(value)}`);
+	}
+}
+
+/**
+ * Creates a read-only store computed from one or more stores (like nanostores' `computed`, or a selector over several Zustand stores):
+ * its state is `compute(...states)`, recomputed when one of the source states changes, and it only notifies when the result changes
+ * according to `equals` (default `Object.is`). Works with any store with `getState` and `subscribe` (those of this module, machines,
+ * histories, other computed stores...).
+ *
+ * - Lazy and leak-free: it subscribes to its sources only while it has subscribers of its own (from the first `subscribe` to the last
+ *   unsubscribe), so a computed store nobody listens to can be garbage collected with no cleanup. Without subscribers, `getState`
+ *   recomputes on demand, only when a source state changed (`Object.is`).
+ * - Glitch-free: `compute` always sees the current state of every source, and one change notifies the computed store's subscribers
+ *   at most once, even through a diamond (two sources derived from the same store: one recomputation, one notification). Sources are
+ *   read on demand, so this holds for every store whose `getState` is always up to date, which is the case of this module's stores.
+ * - `useSyncExternalStore` friendly: `getState` returns the same reference until the result changes, and methods can be passed
+ *   unbound: `useSyncExternalStore(total.subscribe, total.getState)`.
+ * - `compute` and `equals` must be pure: they may run for a `getState` call, not only on changes. Errors they throw propagate to
+ *   the caller (`getState`, or the source's `setState` through the notification), and the next read recomputes.
+ * @template S - The source state type (single store)
+ * @template T - The computed type
+ * @param {ReadonlyStore<S> | ReadonlyArray<ReadonlyStore<unknown>>} stores - A store, or an array of stores (whose states are passed to
+ * `compute` in the same order)
+ * @param {(state: S) => T} compute - Computes the state from the source state(s)
+ * @param {ComputedOptions<T>} [options={}] - `equals` (default `Object.is`)
+ * @returns {ReadonlyStore<T>} The computed store
+ * @throws {TypeError} when `stores` is not a store or an array of stores, or `compute` or `options.equals` is not a function, or (from
+ * `subscribe`) when a source's `subscribe` does not return a function
+ * @example
+ * const price = createStore(10);
+ * const quantity = createStore(3);
+ * const total = computed([price, quantity], function (p, q) { return p * q; });
+ * total.getState(); // => 30
+ * const seen: number[] = [];
+ * total.subscribe(function () { seen.push(total.getState()); });
+ * price.setState(12);
+ * quantity.setState(3); // unchanged: no notification
+ * seen; // => [36]
+ * @example
+ * // A diamond: both sources derive from `celsius`, yet one change makes one recomputation and one notification
+ * const celsius = createStore(0);
+ * const fahrenheit = celsius.select(function (c) { return c * 1.8 + 32; });
+ * const kelvin = computed(celsius, function (c) { return c + 273.15; });
+ * let runs = 0;
+ * const label = computed([fahrenheit, kelvin], function (f, k) { runs++; return `${f} °F / ${k} K`; });
+ * const labels: string[] = [];
+ * label.subscribe(function () { labels.push(label.getState()); });
+ * celsius.setState(100);
+ * labels; // => ['212 °F / 373.15 K']
+ * runs; // => 2 // the initial computation, then one per change
+ */
+export function computed<S, T>(store: ReadonlyStore<S>, compute: (state: S) => T, options?: ComputedOptions<T>): ReadonlyStore<T>;
+export function computed<const Stores extends ReadonlyArray<ReadonlyStore<unknown>>, T>(
+	stores: Stores,
+	compute: (...states: StoreStates<Stores>) => T,
+	options?: ComputedOptions<T>
+): ReadonlyStore<T>;
+/**
+ * Implementation of {@link computed} (see the first overload for the full documentation).
+ * @template T - The computed type
+ * @param {ReadonlyStore<unknown> | ReadonlyArray<ReadonlyStore<unknown>>} stores - A store, or an array of stores
+ * @param {(...states: never[]) => T} compute - Computes the state from the source states
+ * @param {ComputedOptions<T>} [options={}] - `equals`
+ * @returns {ReadonlyStore<T>} The computed store
+ */
+export function computed<T>(
+	stores: ReadonlyStore<unknown> | ReadonlyArray<ReadonlyStore<unknown>>,
+	compute: (...states: never[]) => T,
+	options: ComputedOptions<T> = {}
+): ReadonlyStore<T> {
+	const many = Array.isArray(stores);
+	// Copied, so that changing the array afterwards has no effect.
+	const sources = many ? Array.from(stores as ReadonlyArray<ReadonlyStore<unknown>>) : [stores as ReadonlyStore<unknown>];
+	sources.forEach(function (source, i) {
+		assertStore(many ? `stores[${i}]` : 'stores', source);
+	});
+	assertFunction('computed', 'compute', compute);
+	const equals = readOption(options, 'equals', Object.is as EqualityFn<T>);
+	assertFunction('computed', 'options.equals', equals);
+
+	if (!many) return derive(sources[0], compute as (state: unknown) => T, equals);
+	return derive(
+		combineStores(sources),
+		function (states: unknown[]): T {
+			return compute(...(states as never[]));
+		},
+		equals
+	);
 }
 
 /**
@@ -1217,5 +1390,336 @@ export function createHistory<S>(store: HistorySource<S>, options: HistoryOption
 			present = undefined as S;
 			publish();
 		}
+	};
+}
+
+/**
+ * A synchronous string storage, such as `localStorage` or `sessionStorage` (or any object with these three methods: an in-memory
+ * `Map` wrapper for tests and servers, a cookie or a native storage adapter...).
+ */
+export interface PersistStorage {
+	/** Returns the value stored under `key`, or `null` (or `undefined`) when there is none. */
+	getItem(key: string): string | null | undefined;
+	/** Stores `value` under `key`. */
+	setItem(key: string, value: string): void;
+	/** Removes `key`. */
+	removeItem(key: string): void;
+}
+
+/**
+ * What {@link persistStore} stores under its key (once serialized): the persisted state and the version of its shape.
+ * @template P - The persisted state type
+ */
+export interface PersistedState<P> {
+	/** The persisted state (the store's state, or what `partialize` returned). */
+	state: P;
+	/** The `version` option at the time it was written. */
+	version: number;
+}
+
+/**
+ * Options accepted by {@link persistStore}.
+ * @template S - The store's state type
+ * @template P - The persisted state type (what `partialize` returns; the whole state by default)
+ */
+export interface PersistOptions<S, P = S> {
+	/** The storage key. */
+	key: string;
+	/**
+	 * Where the state is kept. Defaults to `globalThis.localStorage` when it is available (a browser, or Node with `--localstorage-file`);
+	 * otherwise nothing is read or written.
+	 */
+	storage?: PersistStorage;
+	/** Turns a {@link PersistedState} into the stored string. Defaults to `JSON.stringify`. */
+	serialize?: (value: PersistedState<P>) => string;
+	/**
+	 * Turns the stored string back into a {@link PersistedState}. Defaults to `JSON.parse`, dropping every `__proto__` key and every `constructor`
+	 * object with a `prototype` key, so that the parsed state cannot pollute prototypes when it is later copied with `Object.assign` or a
+	 * deep merge.
+	 */
+	deserialize?: (text: string) => unknown;
+	/**
+	 * The version of the persisted state's shape (an integer `>= 0`): bump it when the shape changes, and give `migrate`.
+	 * @default 0
+	 */
+	version?: number;
+	/**
+	 * Converts a state persisted with another version (given as the second argument) into the current shape. Without it, a state of
+	 * another version is discarded (and reported to `onError`).
+	 */
+	migrate?: (persisted: unknown, version: number) => P;
+	/**
+	 * Selects what is persisted (e.g. `function (s) { return { theme: s.theme }; }`); returning `undefined` removes the key from the
+	 * storage. Defaults to the whole state.
+	 */
+	partialize?: (state: S) => P;
+	/**
+	 * Combines the persisted state with the store's current state when hydrating. Defaults to a shallow merge when both are plain
+	 * objects (`{ ...current, ...persisted }`, without `__proto__` keys: keys added to the state since it was persisted keep their
+	 * initial values), and to the persisted state otherwise. Stored data is untrusted input: validate it here or in `migrate`.
+	 */
+	merge?: (persisted: P, current: S) => S;
+	/**
+	 * Delays writes by this many milliseconds: every change made meanwhile is written at once, so a burst of changes (typing, dragging)
+	 * costs one write, and a continuous stream of changes one write per `debounce` milliseconds. `0` writes on every change, synchronously.
+	 * A pending write is made by the dispose function.
+	 * @default 0
+	 */
+	debounce?: number;
+	/**
+	 * Receives the errors of reading, parsing, migrating, merging, serializing and writing, which never propagate (a storage may throw
+	 * when it is full or disabled, and stored data may be corrupt). By default they are ignored.
+	 */
+	onError?: (error: unknown) => void;
+}
+
+/**
+ * Tells whether a value has the three methods of a {@link PersistStorage}.
+ * @param {unknown} value - The value
+ * @returns {boolean} `true` when `value` is a storage
+ */
+function isStorage(value: unknown): value is PersistStorage {
+	return isObject(value) && typeof value.getItem === 'function' && typeof value.setItem === 'function' && typeof value.removeItem === 'function';
+}
+
+/**
+ * Returns `globalThis.localStorage` when it is a usable storage.
+ * @returns {PersistStorage | undefined} The storage, or `undefined`
+ */
+function defaultStorage(): PersistStorage | undefined {
+	try {
+		const storage: unknown = (globalThis as { localStorage?: unknown }).localStorage;
+		return isStorage(storage) ? storage : undefined;
+	} catch {
+		// Reading `localStorage` throws a `SecurityError` where storage is disabled (blocked cookies, sandboxed iframes).
+		return undefined;
+	}
+}
+
+/**
+ * The default `deserialize`: `JSON.parse`, dropping prototype-pollution keys (`__proto__`, and `constructor` objects with a `prototype`)
+ * at every depth.
+ * @param {string} text - The stored text
+ * @returns {unknown} The parsed value
+ * @throws {SyntaxError} when `text` is not JSON
+ */
+function parseJSON(text: string): unknown {
+	return JSON.parse(text, withoutProtoKeys);
+}
+
+/**
+ * The default `merge`: a shallow merge of two plain objects (never copying a `__proto__` key), or the persisted state.
+ * @template S - The state type
+ * @param {unknown} persisted - The persisted state
+ * @param {S} current - The store's current state
+ * @returns {S} The merged state
+ * @throws {TypeError} when the current state is a plain object and the persisted one is not
+ */
+function mergeShallow<S>(persisted: unknown, current: S): S {
+	if (!isPlainObject(current)) return persisted as S;
+	if (!isPlainObject(persisted)) throw new TypeError(`persistStore: the persisted state must be a plain object like the current one, got ${describe(persisted)}`);
+	const merged: Record<string, unknown> = { ...current };
+	// Plain assignments, never through a `__proto__` key (it would replace the prototype, as `Object.assign` does).
+	for (const key of Object.keys(persisted)) if (key !== '__proto__') merged[key] = persisted[key];
+	return merged as S;
+}
+
+/**
+ * Returns its argument (the default `partialize`).
+ * @template T - The value type
+ * @param {T} value - The value
+ * @returns {T} `value`
+ */
+function identity<T>(value: T): T {
+	return value;
+}
+
+/**
+ * Persists a store (see {@link createStore}) in a synchronous storage, `localStorage` by default, like Zustand's `persist` middleware
+ * but for any store with `getState`, `setState` and `subscribe`. Returns a function that stops persisting (making a pending write
+ * first).
+ *
+ * - Hydration, right away and synchronously: the stored value is deserialized, migrated when its `version` differs, merged into the
+ *   current state (`merge`) and set on the store, which notifies its listeners as for any change. A migrated state is written back at
+ *   once, in the current `version`. When nothing is stored, the store keeps its state (nothing is written until it changes).
+ * - Never throws on bad storage: a missing key, a storage that throws (disabled, full, private mode), corrupt or foreign data, a
+ *   version without `migrate`, or a failing `migrate`/`merge`/`serialize` leaves the store's state as it was (or skips the write) and
+ *   reports the error to `onError`. Only invalid arguments throw.
+ * - Writes follow the store's changes (debounced with `debounce`) and are skipped when the serialized text is the one the storage
+ *   already holds. Only the `partialize`d part of the state is written, as `serialize({ state, version })`.
+ * - Safe with untrusted stored data: the default `deserialize` drops `__proto__` keys and `constructor.prototype` objects at every
+ *   depth, and the default `merge` copies
+ *   own keys with plain assignments. A custom `deserialize` or `merge` must take the same care.
+ * - Changes made in other tabs (`storage` events) are not followed; call `persistStore` again to re-hydrate.
+ * @template S - The store's state type
+ * @template P - The persisted state type
+ * @param {Pick<Store<S>, 'getState' | 'setState' | 'subscribe'>} store - The store (any object with `getState`, `setState` and `subscribe`)
+ * @param {PersistOptions<S, P>} options - `key` (required), and `storage`, `serialize`, `deserialize`, `version`, `migrate`,
+ * `partialize`, `merge`, `debounce` and `onError`
+ * @returns {Unsubscribe} Stops persisting: writes a pending change, then unsubscribes from the store (idempotent)
+ * @throws {TypeError} when `store` lacks one of the methods, `options` is not an object, `key` is not a string, `storage` is not a
+ * storage, a function option is not a function, or `version` or `debounce` is not a number
+ * @throws {RangeError} when `version` is not an integer `>= 0`, or `debounce` is not a usable delay
+ * @example
+ * // An in-memory storage (in a browser, omit `storage` to use localStorage)
+ * const memory = new Map<string, string>([['settings', '{"state":{"theme":"dark"},"version":0}']]);
+ * const storage = {
+ * 	getItem(key: string) { return memory.get(key) ?? null; },
+ * 	setItem(key: string, value: string) { memory.set(key, value); },
+ * 	removeItem(key: string) { memory.delete(key); }
+ * };
+ * const settings = createStore({ theme: 'light', fontSize: 14 });
+ * const stop = persistStore(settings, { key: 'settings', storage });
+ * settings.getState(); // => { theme: 'dark', fontSize: 14 } // hydrated, merged with the new `fontSize` key
+ * settings.setState({ theme: 'dark', fontSize: 16 });
+ * memory.get('settings'); // => '{"state":{"theme":"dark","fontSize":16},"version":0}'
+ * stop();
+ * @example
+ * // Persist a slice, with a migration from version 0 (where the theme was a boolean)
+ * const writes: string[] = [];
+ * const storage = {
+ * 	getItem() { return '{"state":{"dark":true},"version":0}'; },
+ * 	setItem(key: string, value: string) { writes.push(value); },
+ * 	removeItem() { writes.push('(removed)'); }
+ * };
+ * const ui = createStore({ theme: 'light', menuOpen: false });
+ * persistStore(ui, {
+ * 	key: 'ui',
+ * 	storage,
+ * 	version: 1,
+ * 	partialize(state) { return { theme: state.theme }; },
+ * 	migrate(persisted, version) { return version === 0 ? { theme: (persisted as { dark: boolean }).dark ? 'dark' : 'light' } : (persisted as { theme: string }); }
+ * });
+ * ui.getState(); // => { theme: 'dark', menuOpen: false }
+ * ui.setState({ theme: 'dark', menuOpen: true });
+ * ui.setState({ theme: 'dark', menuOpen: false }); // same persisted slice: no write
+ * writes; // => ['{"state":{"theme":"dark"},"version":1}']
+ */
+export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setState' | 'subscribe'>, options: PersistOptions<S, P>): Unsubscribe {
+	if (!isObject(store)) throw new TypeError(`persistStore: \`store\` must be a store, got ${describe(store)}`);
+	const { getState, setState, subscribe } = store;
+	assertFunction('persistStore', 'store.getState', getState);
+	assertFunction('persistStore', 'store.setState', setState);
+	assertFunction('persistStore', 'store.subscribe', subscribe);
+	if (!isObject(options)) throw new TypeError(`persistStore: \`options\` must be an object, got ${describe(options)}`);
+	const settings: PersistOptions<S, P> = options;
+	const key = readOption(settings, 'key');
+	if (typeof key !== 'string') throw new TypeError(`persistStore: \`options.key\` must be a string, got ${describe(key)}`);
+	const version = readOption(settings, 'version', 0);
+	const debounce = readOption(settings, 'debounce', 0);
+	const serialize = readOption(settings, 'serialize', JSON.stringify as (value: PersistedState<P>) => string);
+	const deserialize = readOption(settings, 'deserialize', parseJSON);
+	const migrate = readOption(settings, 'migrate');
+	const partialize = readOption(settings, 'partialize', identity as (state: S) => P);
+	const merge = readOption(settings, 'merge', mergeShallow as (persisted: P, current: S) => S);
+	const onError = readOption(settings, 'onError');
+	assertInteger('persistStore', 'options.version', version);
+	assertDelay('persistStore', 'options.debounce', debounce);
+	assertFunction('persistStore', 'options.serialize', serialize);
+	assertFunction('persistStore', 'options.deserialize', deserialize);
+	if (migrate !== undefined) assertFunction('persistStore', 'options.migrate', migrate);
+	assertFunction('persistStore', 'options.partialize', partialize);
+	assertFunction('persistStore', 'options.merge', merge);
+	if (onError !== undefined) assertFunction('persistStore', 'options.onError', onError);
+	const given = readOption(settings, 'storage');
+	if (given !== undefined && !isStorage(given)) {
+		throw new TypeError(`persistStore: \`options.storage\` must have getItem, setItem and removeItem methods, got ${describe(given)}`);
+	}
+	const storage = given ?? defaultStorage();
+	// Nowhere to persist: nothing to read, write or stop.
+	if (storage === undefined) return identity as Unsubscribe;
+
+	// The text the storage is known to hold under `key` (`null`: none), so that writing it again is skipped.
+	let stored: string | null = null;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let active = true;
+
+	/**
+	 * Reports an error to `onError`, if any.
+	 * @param {unknown} error - The error
+	 * @returns {void}
+	 */
+	function report(error: unknown): void {
+		if (onError !== undefined) onError(error);
+	}
+
+	/**
+	 * Reads, migrates and merges the stored state into the store. Never throws: errors go to `onError`.
+	 * @returns {boolean} Whether a stored state of another version was migrated and set on the store (it must then be written back)
+	 */
+	function hydrate(): boolean {
+		try {
+			const text: unknown = (storage as PersistStorage).getItem(key as string);
+			if (text === null || text === undefined) return false;
+			if (typeof text !== 'string') throw new TypeError(`persistStore: \`storage.getItem\` must return a string or null, got ${describe(text)}`);
+			stored = text;
+			const persisted = deserialize(text);
+			if (!isObject(persisted) || !Object.hasOwn(persisted, 'state') || typeof own(persisted, 'version') !== 'number') {
+				throw new TypeError(`persistStore: the stored value must be a { state, version } object, got ${describe(persisted)}`);
+			}
+			const from = persisted.version as number;
+			let state = persisted.state;
+			if (from !== version) {
+				if (migrate === undefined) throw new RangeError(`persistStore: the stored state has version ${from}, not ${version}, and no \`migrate\` was given`);
+				state = migrate(state, from);
+			}
+			const next = merge(state as P, getState.call(store));
+			// Wrapped: `setState` would call a function-valued state as an updater.
+			setState.call(store, function (): S {
+				return next;
+			});
+			return from !== version;
+		} catch (error) {
+			report(error);
+			return false;
+		}
+	}
+
+	/**
+	 * Writes the current (partialized) state, unless the storage already holds the same text. Never throws: errors go to `onError`.
+	 * @returns {void}
+	 */
+	function write(): void {
+		timer = undefined;
+		try {
+			const state = partialize(getState.call(store));
+			if (state === undefined) {
+				if (stored === null) return;
+				(storage as PersistStorage).removeItem(key as string);
+				stored = null;
+				return;
+			}
+			const text: unknown = serialize({ state, version: version as number });
+			if (typeof text !== 'string') throw new TypeError(`persistStore: \`serialize\` must return a string, got ${describe(text)}`);
+			if (text === stored) return;
+			(storage as PersistStorage).setItem(key as string, text);
+			stored = text;
+		} catch (error) {
+			report(error);
+		}
+	}
+
+	/**
+	 * The store listener: writes now, or schedules a write.
+	 * @returns {void}
+	 */
+	function onChange(): void {
+		if (debounce === 0) write();
+		else if (timer === undefined) timer = setTimeout(write, debounce);
+	}
+
+	const migrated = hydrate();
+	const unsubscribe: unknown = subscribe.call(store, onChange);
+	assertFunction('persistStore', 'store.subscribe()', unsubscribe);
+	// The storage still holds the old version: replace it now, or every load would migrate it again (and fail once `migrate` is gone).
+	if (migrated) write();
+
+	return function (): void {
+		if (!active) return;
+		active = false;
+		unsubscribe();
+		if (timer === undefined) return;
+		clearTimeout(timer);
+		write();
 	};
 }

@@ -14,7 +14,7 @@ When a new run reports a survivor that is not in its module's list, treat it as 
 | ----------------------------- | ------: | -----------------: |
 | [`arrays`](./arrays.md)       |  94.22% |                 56 |
 | [`async`](./async.md)         |  98.66% |                  6 |
-| `cache`                       | 100.00% |                  0 |
+| [`cache`](./cache.md)         | 100.00% |                  0 |
 | [`color`](./color.md)         |  97.86% |                 11 |
 | [`date`](./date.md)           |  98.26% |                 13 |
 | `decorators`                  | 100.00% |                  0 |

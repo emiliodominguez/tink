@@ -1,5 +1,5 @@
 /**
- * Locale-aware formatting helpers built on the `Intl` APIs.
+ * Locale-aware formatting helpers built on the `Intl` APIs, and {@link parseNumber}, which reads back the numbers they write.
  *
  * Conventions shared by every function in this module:
  * - **Deterministic default locale.** Every function takes an optional `locale` (a BCP 47 tag or a priority list of tags) that defaults
@@ -26,7 +26,7 @@
 import { createLRUCache, type LRUCache } from '../cache/index.js';
 import type { DateInput } from '../date/index.js';
 import { isDate, isIterable, isString } from '../guards/index.js';
-import { describe } from '../utils/assert.js';
+import { describe, readOption, show } from '../utils/assert.js';
 
 /**
  * A BCP 47 language tag (`'de-DE'`) or a priority list of tags (`['fr-CA', 'fr']`).
@@ -142,6 +142,39 @@ export interface FormatOrdinalOptions {
 export interface PluralRuleOptions extends Intl.PluralRulesOptions {
 	/** Locale(s) to use. Defaults to `'en-US'`. */
 	locale?: LocaleInput;
+}
+
+/**
+ * What {@link parseNumber} reads: a plain number, a percentage, an amount of money or a number in compact notation.
+ */
+export type ParseNumberStyle = 'decimal' | 'percent' | 'currency' | 'compact';
+
+/**
+ * Options accepted by {@link parseNumber}. Any other option is ignored, so the options given to a `format*` helper can be passed as they are.
+ */
+export interface ParseNumberOptions {
+	/** Locale(s) whose separators, signs, digits and symbols to read. Defaults to `'en-US'`. */
+	locale?: LocaleInput;
+	/**
+	 * What the text holds, which decides the symbols accepted around the number (each one optional):
+	 * - `'decimal'`: a plain number, as {@link formatNumber} writes it;
+	 * - `'percent'`: a percentage, as {@link formatPercent} writes it, with or without the percent sign: the result is the ratio (`'25%'`
+	 *   and `'25'` both give `0.25`);
+	 * - `'currency'`: an amount, as {@link formatCurrency} writes it: a currency symbol or code (see `currency`);
+	 * - `'compact'`: a number in compact notation, as {@link formatCompact} writes it (`'1.2K'`, `'3 Mio.'`, `'1.2万'`, `'2 thousand'`), with the
+	 *   locale's short or long suffix.
+	 * @default 'currency' when `currency` is given, 'decimal' otherwise
+	 */
+	style?: ParseNumberStyle;
+	/**
+	 * With the `'currency'` style, an ISO 4217 code (`'EUR'`): only that currency's symbol, narrow symbol, code and names (in every plural
+	 * form) in the locale are accepted (`'€'`, `'EUR'`, `'euros'`). Without it, any currency sign (Unicode category Sc, with up to two capital
+	 * letters before and after it, as in `US$`, `R$` or `$US`) or code of three capital letters is accepted, but not names, nor symbols made
+	 * of letters only (`zł`, `kr`).
+	 */
+	currency?: string;
+	/** The numbering system to read the digits of, as `Intl.NumberFormat` takes it (`'arab'`, `'deva'`, `'fullwide'`). Defaults to the locale's. */
+	numberingSystem?: string;
 }
 
 /** Locale used when none is given, and appended as the last fallback of every locale list. */
@@ -352,6 +385,8 @@ const RELATIVE_MEMO: FormatterMemo = { formatter: undefined, locale: undefined, 
 const ORDINAL_MEMO: FormatterMemo = { formatter: undefined, locale: undefined, options: {}, size: 0 };
 /** @see NUMBER_MEMO */
 const PLURAL_MEMO: FormatterMemo = { formatter: undefined, locale: undefined, options: {}, size: 0 };
+/** @see NUMBER_MEMO */
+const PARSE_MEMO: FormatterMemo = { formatter: undefined, locale: undefined, options: {}, size: 0 };
 
 /**
  * Returns the language subtag of the locale a plural-rules formatter resolved to. `resolvedOptions()` allocates and is several times
@@ -705,4 +740,480 @@ export function pluralRule(count: number, options: PluralRuleOptions = {}): Intl
 	const { locale, ...rest } = options;
 
 	return getFormatter('plural', Intl.PluralRules, locale, rest, PLURAL_MEMO).select(pluralSubject(count));
+}
+
+/** The kinds of {@link Affix}, as bits (each kind may appear once around a number): a sign. */
+const SIGN = 1;
+/** A percent sign. */
+const PERCENT = 2;
+/** A currency symbol, code or name. */
+const CURRENCY = 4;
+/** A compact-notation suffix. */
+const COMPACT = 8;
+/** A currency name (which some locales write after the symbol: `'$5,00 ABD doları'` in `tr-TR`). */
+const CURRENCY_NAME = 16;
+
+/**
+ * A sign, symbol or suffix that {@link parseNumber} accepts before or after the digits.
+ */
+interface Affix {
+	/** Its text, normalized by {@link normalizeNumberText}. */
+	text: string;
+	/** Its kind: `SIGN`, `PERCENT`, `CURRENCY`, `CURRENCY_NAME` or `COMPACT`. */
+	kind: number;
+	/** Whether it makes the number negative (a minus sign). */
+	negative: boolean;
+	/** The power of ten it multiplies the number by (`3` for the compact suffix `K`). */
+	power: number;
+	/** Whether it can stand for its unit without a number (the French compact `mille` is 1000, as `formatCompact` writes it). */
+	alone: boolean;
+}
+
+/** The options a {@link NumberSymbols} is built from. */
+interface NumberSymbolOptions {
+	/** The numbering system, when not the locale's. */
+	numberingSystem?: string;
+	/** The style. */
+	style: ParseNumberStyle;
+	/** The currency of the `'currency'` style, when known. */
+	currency?: string;
+}
+
+/** Bidirectional marks that `Intl` puts around signs and symbols in right-to-left locales: invisible, so ignored. */
+const BIDI_MARKS = /[\u061c\u200e\u200f]/g;
+
+/** Horizontal whitespace (including the no-break spaces `Intl` writes), read as a space, and the typographic apostrophe, read as `'`. */
+const SPACE_OR_APOSTROPHE = /[\t \u00a0\u2000-\u200a\u202f\u205f\u3000\u2019]/g;
+
+/**
+ * A currency when no `currency` is given: a code of three capital letters, or a currency sign with at most two capital letters before
+ * and after it (`US$`, `$US`, `£GB`). Linear: each part is bounded.
+ */
+const ANY_CURRENCY = /[A-Z]{3}|[A-Z]{0,2}\p{Sc}[A-Z]{0,2}/uy;
+
+/** Counts whose plural forms cover those of every locale (`one`, `two`, `few`, `many`, `other`, fractions), for currency names. */
+const PLURAL_SAMPLES: ReadonlyArray<number> = [0, 1, 2, 3, 5, 11, 100, 1.5];
+
+/**
+ * Normalizes text for {@link parseNumber}: removes bidirectional marks, and turns every horizontal space into U+0020 and `’` into `'`.
+ * @param {string} text - The text
+ * @returns {string} The normalized text
+ */
+function normalizeNumberText(text: string): string {
+	return text.replace(BIDI_MARKS, '').replace(SPACE_OR_APOSTROPHE, function (char: string): string {
+		return char === '\u2019' ? "'" : ' ';
+	});
+}
+
+/**
+ * The symbols of a locale that {@link parseNumber} reads, all derived from `Intl.NumberFormat`. Built once per locale and options, and
+ * cached with the formatters.
+ */
+class NumberSymbols {
+	/** The value of each digit, by code point: the locale's digits are 0 to 9, ASCII digits (when the locale has others) 10 to 19. */
+	readonly digits = new Map<number, number>();
+	/** The grouping separator (`''` when the locale does not group digits). */
+	readonly group: string = '';
+	/**
+	 * The ways the style groups digits, as pairs: the size of the group next to the decimal separator (3), then the size of the others (3,
+	 * or 2 in Indian grouping: `12,34,567`).
+	 */
+	readonly groupings: number[] = [];
+	/** The decimal separator. */
+	readonly decimal: string = '';
+	/** The exponent separators (`E` and `e`, or the locale's, such as `×10^`). */
+	readonly exponents: string[];
+	/** The signs and symbols accepted around the number, longest first. */
+	readonly affixes: Affix[] = [];
+	/** Whether any currency sign or code is accepted (the `'currency'` style without `currency`). */
+	readonly anyCurrency: boolean;
+	/** The power of ten the number is multiplied by: `-2` for the `'percent'` style, `0` otherwise. */
+	readonly power: number;
+
+	/**
+	 * Reads the symbols of a locale.
+	 * @param {string[]} locales - The resolved locale list
+	 * @param {NumberSymbolOptions} options - The numbering system, style and currency
+	 */
+	constructor(locales: string[], options: NumberSymbolOptions) {
+		const { numberingSystem, style, currency } = options;
+		// The style's own separators and grouping, which can differ from those of plain numbers (`de-AT` groups amounts with `.`, numbers
+		// with a space; `mr-IN` groups amounts by threes, numbers the Indian way), and even between the ways of writing an amount.
+		const main: Intl.NumberFormatOptions = { numberingSystem, minimumFractionDigits: 1, maximumFractionDigits: 1 };
+		const variants = [main];
+		let integers = '';
+		let exponent = 'E';
+
+		if (style === 'percent') main.style = 'percent';
+		if (style === 'currency') {
+			main.style = 'currency';
+			main.currency = currency ?? 'USD';
+			variants.push({ ...main, currencySign: 'accounting' }, { ...main, currencyDisplay: 'name' });
+		}
+		// Plain numbers last, whose integer digits are the digits 1 to 9, then 0.
+		const plain = { numberingSystem };
+		variants.push(plain);
+
+		for (const variant of variants) {
+			const sizes: number[] = [];
+
+			for (const { type, value } of new Intl.NumberFormat(locales, variant).formatToParts(-1234567890.5)) {
+				if (type === 'integer') {
+					if (variant === plain) integers += value;
+					sizes.push(Array.from(value).length);
+				} else if (variant !== main) continue;
+				else if (type === 'group') this.group = normalizeNumberText(value);
+				else if (type === 'decimal') this.decimal = normalizeNumberText(value);
+				else if (type === 'minusSign') this.add(value, SIGN, true);
+			}
+
+			this.groupings.push(sizes[sizes.length - 1], sizes[sizes.length - 2]);
+		}
+
+		for (const { type, value } of new Intl.NumberFormat(locales, { numberingSystem, style: 'percent', notation: 'scientific', signDisplay: 'always' }).formatToParts(1)) {
+			if (type === 'plusSign') this.add(value, SIGN, false);
+			else if (type === 'exponentSeparator') exponent = normalizeNumberText(value);
+			else if (type === 'percentSign' && style === 'percent') this.add(value, PERCENT, false);
+		}
+
+		for (let digit = 0; digit < 10; digit++) this.digits.set(48 + digit, digit + 10);
+		Array.from(integers).forEach(function (this: NumberSymbols, char: string, index: number): void {
+			this.digits.set(char.codePointAt(0) as number, (index + 1) % 10);
+		}, this);
+		this.exponents = exponent === 'E' ? ['E', 'e'] : [exponent];
+		this.add('-', SIGN, true);
+		this.add('\u2212', SIGN, true);
+		this.add('+', SIGN, false);
+		if (style === 'percent') this.add('%', PERCENT, false);
+		this.power = style === 'percent' ? -2 : 0;
+		this.anyCurrency = style === 'currency' && currency === undefined;
+
+		if (style === 'currency' && currency !== undefined) {
+			for (const currencyDisplay of ['symbol', 'narrowSymbol', 'code', 'name'] as const) {
+				const formatter = new Intl.NumberFormat(locales, {
+					numberingSystem,
+					style: 'currency',
+					currency,
+					currencyDisplay,
+					minimumFractionDigits: 0,
+					maximumFractionDigits: 1
+				});
+				for (const sample of PLURAL_SAMPLES) {
+					for (const { type, value } of formatter.formatToParts(sample))
+						if (type === 'currency') this.add(value, currencyDisplay === 'name' ? CURRENCY_NAME : CURRENCY, false);
+				}
+			}
+		}
+
+		if (style === 'compact') {
+			for (const compactDisplay of ['short', 'long'] as const) {
+				const formatter = new Intl.NumberFormat(locales, { numberingSystem, notation: 'compact', compactDisplay });
+				for (let power = 3; power < 21; power++) {
+					for (const sample of [1, 2, 5, 1.5]) {
+						let digits = 0;
+						let suffix = '';
+						for (const { type, value } of formatter.formatToParts(sample * 10 ** power)) {
+							if (type === 'integer') digits += Array.from(value).length;
+							else if (type === 'compact') suffix = value;
+						}
+						// The value has `power + 1` integer digits: those not written are the suffix's power of ten (`1.5K` and `15K`: 3). A
+						// suffix written without digits stands for `10 ** power` on its own (`mille` in French, for 1000 exactly).
+						this.add(suffix, COMPACT, false, digits === 0 ? power : power + 1 - digits, digits === 0);
+					}
+				}
+			}
+		}
+
+		this.affixes.sort(function (a: Affix, b: Affix): number {
+			return b.text.length - a.text.length;
+		});
+	}
+
+	/**
+	 * Adds an affix, unless it is empty or already known.
+	 * @param {string} text - Its text, as `Intl` writes it
+	 * @param {number} kind - Its kind
+	 * @param {boolean} negative - Whether it is a minus sign
+	 * @param {number} [power=0] - The power of ten it multiplies the number by
+	 * @param {boolean} [alone=false] - Whether it can stand without a number
+	 * @returns {void}
+	 */
+	add(text: string, kind: number, negative: boolean, power: number = 0, alone: boolean = false): void {
+		const normalized = normalizeNumberText(text).trim();
+		const known = this.affixes.some(function (affix: Affix): boolean {
+			return affix.text === normalized;
+		});
+
+		if (normalized !== '' && !known) this.affixes.push({ text: normalized, kind, negative, power, alone });
+	}
+}
+
+/**
+ * What {@link parseNumber} has read so far.
+ */
+interface NumberScan {
+	/** The ASCII forms of the digits: the integer digits, then the fraction digits, then the exponent digits. */
+	digits: string;
+	/** Their numbering system: `-1` before the first digit, `0` the locale's, `1` ASCII, `2` both (which is invalid). */
+	system: number;
+	/** The kinds of the affixes read (each may appear once). */
+	seen: number;
+	/** Whether a minus sign (or parentheses) was read. */
+	negative: boolean;
+	/** The power of ten to multiply the number by. */
+	power: number;
+	/** Whether an affix that can stand without a number was read. */
+	alone: boolean;
+}
+
+/**
+ * Reads the run of digits at `index`.
+ * @param {NumberSymbols} symbols - The locale's symbols
+ * @param {string} text - The text
+ * @param {number} index - Where the run starts
+ * @param {NumberScan} scan - What was read so far; the digits of the run are appended
+ * @returns {number} The index after the run
+ */
+function scanDigits(symbols: NumberSymbols, text: string, index: number, scan: NumberScan): number {
+	for (;;) {
+		const code = text.codePointAt(index);
+		const value = code === undefined ? undefined : symbols.digits.get(code);
+
+		if (value === undefined) return index;
+
+		const system = value < 10 ? 0 : 1;
+
+		if (scan.system !== system) scan.system = scan.system < 0 ? system : 2;
+		scan.digits += value % 10;
+		index += (code as number) > 0xffff ? 2 : 1;
+	}
+}
+
+/**
+ * Finds the affix at `index` (the longest one, when several match).
+ * @param {NumberSymbols} symbols - The locale's symbols
+ * @param {string} text - The text
+ * @param {number} index - Where the affix would start
+ * @returns {Affix | undefined} The affix, or `undefined` when none is there
+ */
+function matchAffix(symbols: NumberSymbols, text: string, index: number): Affix | undefined {
+	for (const affix of symbols.affixes) if (text.startsWith(affix.text, index)) return affix;
+
+	if (symbols.anyCurrency) {
+		ANY_CURRENCY.lastIndex = index;
+		const match = ANY_CURRENCY.exec(text);
+
+		if (match !== null) return { text: match[0], kind: CURRENCY, negative: false, power: 0, alone: false };
+	}
+
+	return undefined;
+}
+
+/**
+ * Reads the affixes (and spaces) at `index`: up to the end of the text, or, before the digits, up to the first digit or a decimal
+ * separator followed by a digit.
+ * @param {NumberSymbols} symbols - The locale's symbols
+ * @param {string} text - The text
+ * @param {number} index - Where to start
+ * @param {NumberScan} scan - What was read so far, updated with the affixes
+ * @returns {number} The index after the affixes, or `-1` when something else is there, or an affix of a kind already read
+ */
+function scanAffixes(symbols: NumberSymbols, text: string, index: number, scan: NumberScan): number {
+	const leading = scan.digits === '';
+
+	while (index < text.length) {
+		if (text[index] === ' ') {
+			index++;
+			continue;
+		}
+		if (
+			leading &&
+			(symbols.digits.has(text.codePointAt(index) as number) ||
+				(text.startsWith(symbols.decimal, index) && symbols.digits.has(text.codePointAt(index + symbols.decimal.length) as number)))
+		)
+			break;
+
+		const affix = matchAffix(symbols, text, index);
+
+		if (affix === undefined || (scan.seen & affix.kind) !== 0) return -1;
+		scan.seen |= affix.kind;
+		scan.negative ||= affix.negative;
+		scan.power += affix.power;
+		scan.alone ||= affix.alone;
+		index += affix.text.length;
+	}
+
+	return index;
+}
+
+/**
+ * Tells whether the digits are grouped as the locale groups them (in one of its ways): the group next to the decimal separator has the
+ * primary size, the others the secondary size, except the first, which may be shorter but does not start with `0`.
+ * @param {NumberSymbols} symbols - The locale's symbols
+ * @param {readonly number[]} runs - The sizes of the groups, at least two
+ * @param {string} digits - The integer digits
+ * @returns {boolean} Whether the grouping is valid
+ */
+function validGroups(symbols: NumberSymbols, runs: readonly number[], digits: string): boolean {
+	const groupings = symbols.groupings;
+	const last = runs.length - 1;
+
+	for (let pair = 0; pair < groupings.length; pair += 2) {
+		const secondary = groupings[pair + 1];
+		let valid = digits[0] !== '0' && runs[0] <= secondary && runs[last] === groupings[pair];
+
+		for (let i = 1; i < last; i++) valid &&= runs[i] === secondary;
+		if (valid) return true;
+	}
+
+	return false;
+}
+
+/**
+ * Reads a number written with a locale's symbols (see {@link parseNumber}): affixes, the integer digits (in groups), the fraction digits,
+ * the exponent, then affixes.
+ * @param {NumberSymbols} symbols - The locale's symbols
+ * @param {string} input - The normalized, trimmed text
+ * @returns {number} The number, or `NaN` when the text is not one
+ */
+function readNumber(symbols: NumberSymbols, input: string): number {
+	// Accounting notation: an amount in parentheses is negative (and has no other sign).
+	const accounting = input.startsWith('(') && input.endsWith(')');
+	const text = accounting ? input.slice(1, -1) : input;
+	const scan: NumberScan = { digits: '', system: -1, seen: accounting ? SIGN : 0, negative: accounting, power: symbols.power, alone: false };
+	let index = scanAffixes(symbols, text, 0, scan);
+
+	if (index < 0) return NaN;
+
+	// The integer digits, in groups. A separator not followed by a digit ends them (as the space before `€` in `fr-FR`), and so does a
+	// locale without a separator (`''`), since the run before it was read whole.
+	index = scanDigits(symbols, text, index, scan);
+	const runs = [scan.digits.length];
+
+	while (text.startsWith(symbols.group, index)) {
+		const before = scan.digits.length;
+		const next = scanDigits(symbols, text, index + symbols.group.length, scan);
+
+		if (scan.digits.length === before) break;
+		runs.push(scan.digits.length - before);
+		index = next;
+	}
+
+	let integer = scan.digits.length;
+
+	if (runs.length > 1 && !validGroups(symbols, runs, scan.digits)) return NaN;
+
+	// The fraction digits.
+	if (text.startsWith(symbols.decimal, index)) {
+		const next = scanDigits(symbols, text, index + symbols.decimal.length, scan);
+
+		if (scan.digits.length > integer) index = next;
+	}
+
+	// No digits: the text is only affixes, which is a number only when one of them stands for its unit (`'mille'`).
+	if (scan.digits === '') {
+		if (!scan.alone) return NaN;
+		scan.digits = '1';
+		integer = 1;
+	}
+
+	const fraction = scan.digits.length;
+	let exponent = '';
+
+	// The exponent, with an optional sign. A separator not followed by digits is not one (the `E` of `'1EUR'`).
+	for (const separator of symbols.exponents) {
+		if (!text.startsWith(separator, index)) continue;
+
+		const sign = matchAffix(symbols, text, index + separator.length);
+		const signed = sign !== undefined && sign.kind === SIGN;
+		const next = scanDigits(symbols, text, index + separator.length + (signed ? sign.text.length : 0), scan);
+
+		if (scan.digits.length > fraction) {
+			exponent = (signed && sign.negative ? '-' : '') + scan.digits.slice(fraction);
+			index = next;
+		}
+		break;
+	}
+
+	if (scanAffixes(symbols, text, index, scan) < 0 || scan.system > 1) return NaN;
+
+	const digits = scan.digits;
+	// An exponent of more than 15 significant digits is beyond what the digits of any string can make up for: the number is a zero
+	// when the exponent is negative or the digits are all zeros, and out of range otherwise. Deciding it here keeps the cost linear,
+	// where converting such an exponent to a bigint is not.
+	const significant = exponent.replace(/^-?0*/, '');
+
+	if (significant.length > 15) return exponent.startsWith('-') || !/[1-9]/.test(digits.slice(0, fraction)) ? (scan.negative ? -0 : 0) : NaN;
+
+	// Otherwise the exponent and the power of the affixes add up exactly, and the decimal is converted once, so the result is the double
+	// nearest to the decimal written.
+	const value = Number(`${scan.negative ? '-' : ''}${digits.slice(0, integer) || 0}.${digits.slice(integer, fraction)}0e${Number(exponent) + scan.power}`);
+
+	return Number.isFinite(value) ? value : NaN;
+}
+
+/**
+ * Parses a number written for a locale: the inverse of {@link formatNumber}, {@link formatPercent}, {@link formatCurrency} and
+ * {@link formatCompact}. The locale's grouping and decimal separators, signs, digits (Arabic-Indic, Devanagari, full-width…), exponent
+ * separator, percent sign, currency symbols and names and compact suffixes are all read from `Intl.NumberFormat` (once per locale and
+ * options: they are cached like the formatters), for the style at hand, since they can differ between plain numbers and amounts (`de-AT`
+ * groups amounts with `.` and numbers with a space). So a number formatted by this module parses back, with the same options and the
+ * matching `style`, to its value as printed (rounded to the digits shown): `parseNumber(formatNumber(n, options), options)`,
+ * `parseNumber(formatCurrency(n, 'EUR', options), { ...options, currency: 'EUR' })`. The exceptions come from the locale data: a few
+ * compact abbreviations stand for two powers of ten (Bengali, Nepali), and Burmese writes large compact numbers between two words, which are
+ * not read.
+ *
+ * Strict, like `toNumber` from the strings module: text that is not exactly one number in the locale's notation gives `NaN` rather than a
+ * guess. Grouping separators are optional, but when present they must all be in place (`'1,234,567'`, or `'12,34,567'` in `hi-IN`;
+ * `'1,23'` and `'12,345,6'` are `NaN`), so that a number written for another locale is not misread; there may be one decimal separator, one
+ * sign, one symbol of each kind and nothing else (`'1.2.3'` and `'12px'` are `NaN`). Within those rules, input is accepted where it is
+ * unambiguous:
+ * - Surrounding whitespace is ignored, and any space (U+0020, the no-break spaces U+00A0 and U+202F that `Intl` writes…) stands for a
+ *   space grouping separator (`fr-FR`, `pl-PL`); `'` and `’` stand for each other (`de-CH`). The invisible bidirectional marks that `Intl`
+ *   writes in right-to-left locales are ignored.
+ * - ASCII digits are accepted in every locale, as are the locale's own (or `numberingSystem`'s), but not both in one number.
+ * - `-`, `−` (U+2212) and the locale's minus sign, and `+` and the locale's plus sign, are signs, before or after the number and its symbols,
+ *   and an amount in parentheses is negative (accounting notation: `'($1,234.50)'`).
+ * - The locale's exponent separator is read (`'1.5E3'`; `e` too), as `formatNumber` writes it with `notation: 'scientific'`.
+ *
+ * The result is the double nearest to the decimal written, converted once (`'30%'` is `0.3`, not `30 / 100`, which is
+ * `0.30000000000000004`). `'-0'` is `-0`. Text that does not hold a finite number (including `'Infinity'` and values beyond
+ * `Number.MAX_VALUE`) gives `NaN`; text that is not a string, and invalid options, throw. The cost is linear in the length of the text,
+ * whatever it holds.
+ * @param {string} text - The text to parse
+ * @param {ParseNumberOptions} [options={}] - `locale` (default `'en-US'`), `style` (default `'decimal'`, or `'currency'` with `currency`),
+ * `currency` and `numberingSystem`; other options are ignored
+ * @returns {number} The number, or `NaN` when `text` is not one number in the locale's notation
+ * @throws {TypeError} when `text` or `currency` is not a string
+ * @throws {RangeError} when `style` is not a style, or the locale, numbering system or currency code is malformed
+ * @example
+ * parseNumber('1,234.5'); // => 1234.5
+ * parseNumber('1.234,5', { locale: 'de-DE' }); // => 1234.5
+ * parseNumber('1 234,5', { locale: 'fr-FR' }); // => 1234.5
+ * parseNumber("1'234.5", { locale: 'de-CH' }); // => 1234.5
+ * parseNumber('12,34,567', { locale: 'hi-IN' }); // => 1234567
+ * parseNumber('١٬٢٣٤٫٥', { locale: 'ar-EG' }); // => 1234.5
+ * parseNumber('25.6%', { style: 'percent' }); // => 0.256
+ * parseNumber('($1,234.50)', { style: 'currency' }); // => -1234.5
+ * parseNumber('-1.234,50 €', { locale: 'de-DE', currency: 'EUR' }); // => -1234.5
+ * parseNumber('1.2K', { style: 'compact' }); // => 1200
+ * parseNumber(formatNumber(-1234.5678, { locale: 'ar-EG' }), { locale: 'ar-EG' }); // => -1234.568
+ * parseNumber('1.234'); // => 1.234 // en-US: a decimal separator
+ * parseNumber('1,23'); // => NaN
+ * parseNumber('12px'); // => NaN
+ */
+export function parseNumber(text: string, options: ParseNumberOptions = {}): number {
+	if (typeof text !== 'string') throw new TypeError(`parseNumber: \`text\` must be a string, got ${describe(text)}`);
+
+	const currency = readOption(options, 'currency');
+	const style = readOption(options, 'style', currency === undefined ? 'decimal' : 'currency');
+
+	if (style !== 'decimal' && style !== 'percent' && style !== 'currency' && style !== 'compact') {
+		throw new RangeError(`parseNumber: \`style\` must be 'decimal', 'percent', 'currency' or 'compact', got ${show(style)}`);
+	}
+	if (currency !== undefined) assertString('parseNumber', 'currency', currency);
+
+	const symbolOptions: NumberSymbolOptions = { numberingSystem: readOption(options, 'numberingSystem'), style, currency: style === 'currency' ? currency : undefined };
+
+	return readNumber(getFormatter('parse', NumberSymbols, readOption(options, 'locale'), symbolOptions, PARSE_MEMO), normalizeNumberText(text).trim());
 }

@@ -1,5 +1,5 @@
-import { isDate } from '../guards/index.js';
-import { describe, show } from '../utils/assert.js';
+import { isDate, isRegExp } from '../guards/index.js';
+import { assertFunction, assertNumber, describe, readOption, show } from '../utils/assert.js';
 
 /**
  * A single query-string value. Dates are serialized with `toISOString()`, everything else with `String()`.
@@ -1648,4 +1648,466 @@ export function compilePath<P extends string>(pattern: P): PathBuilder<P> {
 
 		return trailing ? path + '/' : path || '/';
 	} as PathBuilder<P>;
+}
+
+/**
+ * The `SameSite` attribute of a cookie: `'strict'` (never sent on cross-site requests), `'lax'` (sent on top-level cross-site
+ * navigations only, the browsers' default) or `'none'` (always sent; requires `secure`).
+ */
+export type CookieSameSite = 'strict' | 'lax' | 'none';
+
+/** The `Priority` attribute of a cookie (a Chromium extension): which cookies are evicted first when a domain has too many. */
+export type CookiePriority = 'low' | 'medium' | 'high';
+
+/**
+ * Options accepted by {@link serializeCookie}: the cookie's attributes (RFC 6265 and its successor drafts), and how to encode its value.
+ */
+export interface SerializeCookieOptions {
+	/** `Max-Age`: the lifetime in seconds, an integer (`0` or less deletes the cookie). Browsers prefer it to `expires`. */
+	readonly maxAge?: number;
+	/** `Expires`: the expiry date. Without `maxAge` or `expires`, the cookie lasts for the browser session. */
+	readonly expires?: Date;
+	/** `Domain`: the host whose subdomains also receive the cookie. Without it, only the exact host that set it does. */
+	readonly domain?: string;
+	/** `Path`: the path prefix the cookie is sent for. Without it, the directory of the request that set it. */
+	readonly path?: string;
+	/** `Secure`: send the cookie over HTTPS only. Defaults to `false`. */
+	readonly secure?: boolean;
+	/** `HttpOnly`: hide the cookie from `document.cookie`. Defaults to `false`. */
+	readonly httpOnly?: boolean;
+	/** `SameSite`: whether the cookie is sent on cross-site requests. Browsers default to `'lax'`. */
+	readonly sameSite?: CookieSameSite;
+	/** `Partitioned` (CHIPS): keep a separate cookie jar per top-level site. Requires `secure`. Defaults to `false`. */
+	readonly partitioned?: boolean;
+	/** `Priority`. */
+	readonly priority?: CookiePriority;
+	/**
+	 * Encodes the value. Defaults to `encodeURIComponent` (lone surrogates become U+FFFD), which {@link parseCookie} undoes; its result
+	 * must be a valid cookie value.
+	 */
+	readonly encode?: (value: string) => string;
+}
+
+/**
+ * Removes the spaces and tabs around a slice of text.
+ * @param {string} text - The text
+ * @param {number} start - Index of the slice's first character
+ * @param {number} end - Index after the slice's last character
+ * @returns {string} The trimmed slice
+ */
+function trimSpaces(text: string, start: number, end: number): string {
+	while (start < end && (text.charCodeAt(start) === 32 || text.charCodeAt(start) === 9)) start++;
+
+	while (end > start && (text.charCodeAt(end - 1) === 32 || text.charCodeAt(end - 1) === 9)) end--;
+
+	return text.slice(start, end);
+}
+
+/**
+ * Parses a `Cookie` request header (`'a=1; b=2'`) into a record of cookie values, like the `cookie` package's `parse`: names and values
+ * are trimmed of spaces and tabs, a value wrapped in double quotes loses them, and values are decoded with
+ * {@link safeDecodeURIComponent} (so a malformed escape is kept as it is, where `cookie` keeps the whole value undecoded). The first
+ * occurrence of a name wins (browsers send the most specific cookie first). Malformed pairs (without `=`) are skipped: it never throws
+ * on a string. Runs in linear time.
+ *
+ * The result has a `null` prototype, so a `__proto__` or `constructor` cookie is an ordinary own key; use `Object.hasOwn` or `in` on it.
+ * @param {string} header - The value of a `Cookie` header (`document.cookie` has the same format)
+ * @returns {Record<string, string>} The cookies, by name
+ * @throws {TypeError} when `header` is not a string
+ * @example
+ * parseCookie('theme=dark; lang=en'); // => { theme: 'dark', lang: 'en' }
+ * parseCookie('a=1; a=2; b="quoted"; c=caf%C3%A9; d=100%'); // => { a: '1', b: 'quoted', c: 'café', d: '100%' }
+ * parseCookie('broken; ok=1'); // => { ok: '1' }
+ */
+export function parseCookie(header: string): Record<string, string> {
+	if (typeof header !== 'string') throw new TypeError(`parseCookie: \`header\` must be a string, got ${describe(header)}`);
+
+	const cookies = Object.create(null) as Record<string, string>;
+	let index = 0;
+
+	while (index < header.length) {
+		const equals = header.indexOf('=', index);
+
+		if (equals === -1) break;
+
+		const semicolon = header.indexOf(';', index);
+		const end = semicolon === -1 ? header.length : semicolon;
+
+		if (equals > end) {
+			// The pairs without `=` are skipped at once, up to the pair holding that `=` (rescanning them one by one would be quadratic).
+			index = header.lastIndexOf(';', equals) + 1;
+			continue;
+		}
+
+		const name = trimSpaces(header, index, equals);
+
+		if (!(name in cookies)) {
+			let value = trimSpaces(header, equals + 1, end);
+
+			if (value.length > 1 && value.charCodeAt(0) === 34 && value.charCodeAt(value.length - 1) === 34) value = value.slice(1, -1);
+
+			cookies[name] = safeDecodeURIComponent(value);
+		}
+
+		index = end + 1;
+	}
+
+	return cookies;
+}
+
+/** A cookie name: an RFC 7230 token, as RFC 6265 requires (no control character, space or separator such as `;`, `=`, `,` or `"`). */
+const COOKIE_NAME = /^[\w!#$%&'*+.^`|~-]+$/;
+
+/** A cookie value (RFC 6265 §4.1.1): printable ASCII except space, `"`, `,`, `;` and `\`, optionally wrapped in double quotes. */
+const COOKIE_VALUE = /^("?)[!#-+\--:<-[\]-~]*\1$/;
+
+/** A `Domain` attribute: labels of letters, digits and inner hyphens, up to 63 characters each, with an optional leading dot. */
+const COOKIE_DOMAIN = /^\.?[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?(?:\.[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?)*$/i;
+
+/** A `Path` attribute (RFC 6265 §4.1.1): printable ASCII except `;`. */
+const COOKIE_PATH = /^[ -:<-~]*$/;
+
+/**
+ * Reads a boolean option.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {object} options - The options
+ * @param {string} key - The option name
+ * @returns {boolean} Its value, `false` when absent
+ * @throws {TypeError} when the option is neither absent nor a boolean
+ */
+function flagOption(caller: string, options: object, key: string): boolean {
+	const value = readOption(options as Record<string, unknown>, key, false);
+
+	if (typeof value !== 'boolean') throw new TypeError(`${caller}: \`${key}\` must be a boolean, got ${describe(value)}`);
+
+	return value;
+}
+
+/**
+ * Reads an option of {@link serializeCookie} that must be one of a few names, and capitalizes it for the attribute.
+ * @param {SerializeCookieOptions} options - The options
+ * @param {'sameSite' | 'priority'} key - The option name
+ * @param {ReadonlyArray<string>} names - The accepted names
+ * @returns {string | undefined} The capitalized name, `undefined` when absent
+ * @throws {RangeError} when the option is not one of `names`
+ */
+function cookieChoice(options: SerializeCookieOptions, key: 'sameSite' | 'priority', names: ReadonlyArray<string>): string | undefined {
+	const value: unknown = readOption(options, key);
+
+	if (value === undefined) return undefined;
+
+	if (!names.includes(value as string)) {
+		throw new RangeError(`serializeCookie: \`${key}\` must be '${names.slice(0, -1).join("', '")}' or '${names[names.length - 1]}', got ${show(value)}`);
+	}
+
+	return (value as string)[0].toUpperCase() + (value as string).slice(1);
+}
+
+/**
+ * Throws the error for a part of {@link serializeCookie}'s output that would break the header's syntax.
+ * @param {string} key - The parameter or option name
+ * @param {unknown} value - Its value
+ * @param {string} expected - What it must be
+ * @returns {never} Never returns
+ * @throws {TypeError} always
+ */
+function invalidCookiePart(key: string, value: unknown, expected: string): never {
+	throw new TypeError(`serializeCookie: \`${key}\` must be ${expected}, got ${typeof value === 'string' ? JSON.stringify(value) : describe(value)}`);
+}
+
+/**
+ * Builds a `Set-Cookie` header value (`'name=value; Path=/; HttpOnly'`) like the `cookie` package's `serialize`, with the attributes
+ * in the same order.
+ *
+ * Header injection is impossible: the name must be an RFC 7230 token, the encoded value an RFC 6265 cookie value, the domain a host name
+ * and the path printable ASCII without `;`; anything else (a `;`, a line break, a space in the name…) throws a `TypeError` instead of
+ * slipping in another attribute or header. The value is encoded with `encodeURIComponent` by default, so any string is accepted.
+ *
+ * Unlike `cookie`, it also rejects the combinations that browsers silently drop: `sameSite: 'none'`, `partitioned`, or a `__Secure-` or
+ * `__Host-` name without `secure`, and a `__Host-` cookie with a `domain` or a `path` other than `'/'`. Its name grammar is RFC 6265's
+ * (stricter than `cookie` 1.x, which also accepts separators such as `(`, `@` or `/`), and `sameSite` and `priority` must be lowercase.
+ * @param {string} name - The cookie name
+ * @param {string} value - The cookie value (encoded with `options.encode`)
+ * @param {SerializeCookieOptions} [options={}] - The attributes, and `encode`
+ * @returns {string} The `Set-Cookie` header value
+ * @throws {TypeError} when `name`, the encoded `value`, `domain` or `path` is invalid, or an option has the wrong type
+ * @throws {RangeError} when `maxAge` is not an integer, `expires` is an invalid date, `sameSite` or `priority` is unknown, or the
+ * attributes form a combination that browsers reject
+ * @example
+ * serializeCookie('theme', 'dark'); // => 'theme=dark'
+ * serializeCookie('sid', 'a b;c', { httpOnly: true, secure: true, sameSite: 'lax', path: '/', maxAge: 3600 }); // => 'sid=a%20b%3Bc; Max-Age=3600; Path=/; HttpOnly; Secure; SameSite=Lax'
+ * serializeCookie('id', '1', { expires: new Date(Date.UTC(2030, 0, 1)) }); // => 'id=1; Expires=Tue, 01 Jan 2030 00:00:00 GMT'
+ * serializeCookie('bad;name', 'x'); // throws TypeError
+ * serializeCookie('id', '1', { path: '/\r\nSet-Cookie: admin=1' }); // throws TypeError
+ * serializeCookie('id', '1', { sameSite: 'none' }); // throws RangeError // browsers require Secure with SameSite=None
+ */
+export function serializeCookie(name: string, value: string, options: SerializeCookieOptions = {}): string {
+	if (typeof options !== 'object' || options === null) throw new TypeError(`serializeCookie: \`options\` must be an object, got ${describe(options)}`);
+
+	if (typeof name !== 'string' || !COOKIE_NAME.test(name)) invalidCookiePart('name', name, "a cookie name (letters, digits and !#$%&'*+-.^_`|~)");
+
+	if (typeof value !== 'string') throw new TypeError(`serializeCookie: \`value\` must be a string, got ${describe(value)}`);
+
+	const encode: unknown = readOption(options, 'encode');
+
+	if (encode !== undefined) assertFunction('serializeCookie', 'encode', encode);
+
+	const encoded: unknown = encode === undefined ? encodeComponent(value) : (encode as (value: string) => unknown)(value);
+
+	if (typeof encoded !== 'string' || !COOKIE_VALUE.test(encoded)) {
+		invalidCookiePart('value', encoded, "a cookie value once encoded (printable ASCII except spaces and '\"', ',', ';' or '\\')");
+	}
+
+	let cookie = `${name}=${encoded}`;
+	const maxAge: unknown = readOption(options, 'maxAge');
+
+	if (maxAge !== undefined) {
+		assertNumber('serializeCookie', 'maxAge', maxAge, Number.isSafeInteger(maxAge), 'an integer (seconds)');
+		cookie += `; Max-Age=${maxAge}`;
+	}
+
+	const domain: unknown = readOption(options, 'domain');
+
+	if (domain !== undefined) {
+		if (typeof domain !== 'string' || !COOKIE_DOMAIN.test(domain)) invalidCookiePart('domain', domain, 'a host name (ASCII letters, digits, hyphens and dots)');
+
+		cookie += `; Domain=${domain}`;
+	}
+
+	const path: unknown = readOption(options, 'path');
+
+	if (path !== undefined) {
+		if (typeof path !== 'string' || !COOKIE_PATH.test(path)) invalidCookiePart('path', path, "printable ASCII without ';'");
+
+		cookie += `; Path=${path}`;
+	}
+
+	const expires: unknown = readOption(options, 'expires');
+
+	if (expires !== undefined) {
+		if (!isDate(expires)) throw new TypeError(`serializeCookie: \`expires\` must be a Date, got ${describe(expires)}`);
+
+		if (Number.isNaN(Date.prototype.getTime.call(expires))) throw new RangeError('serializeCookie: `expires` must be a valid Date, got Invalid Date');
+
+		cookie += `; Expires=${Date.prototype.toUTCString.call(expires)}`;
+	}
+
+	const httpOnly = flagOption('serializeCookie', options, 'httpOnly');
+	const secure = flagOption('serializeCookie', options, 'secure');
+	const partitioned = flagOption('serializeCookie', options, 'partitioned');
+
+	if (httpOnly) cookie += '; HttpOnly';
+
+	if (secure) cookie += '; Secure';
+
+	if (partitioned) cookie += '; Partitioned';
+
+	const priority = cookieChoice(options, 'priority', ['low', 'medium', 'high']);
+
+	if (priority !== undefined) cookie += `; Priority=${priority}`;
+
+	const sameSite = cookieChoice(options, 'sameSite', ['strict', 'lax', 'none']);
+
+	if (sameSite !== undefined) cookie += `; SameSite=${sameSite}`;
+
+	// The rules under which browsers silently drop a cookie (RFC 6265bis cookie prefixes and SameSite=None, CHIPS).
+	const prefix = /^__(?:secure|host)-/i.exec(name);
+	const insecure = sameSite === 'None' ? "`sameSite` is 'none'" : partitioned ? '`partitioned` is set' : prefix !== null ? `the name starts with "${prefix[0]}"` : '';
+
+	if (!secure && insecure !== '') throw new RangeError(`serializeCookie: \`secure\` must be true when ${insecure} (browsers reject the cookie otherwise)`);
+
+	if (prefix !== null && prefix[0].length === 7 && (domain !== undefined || path !== '/')) {
+		throw new RangeError(`serializeCookie: a "${prefix[0]}" cookie must have \`path: '/'\` and no \`domain\` (browsers reject it otherwise)`);
+	}
+
+	return cookie;
+}
+
+/**
+ * The main members of a WHATWG `URL`, for type environments without one (plain ES2022 has no DOM or Node types).
+ */
+interface UrlLike {
+	href: string;
+	readonly origin: string;
+	protocol: string;
+	username: string;
+	password: string;
+	host: string;
+	hostname: string;
+	port: string;
+	pathname: string;
+	search: string;
+	readonly searchParams: Iterable<[string, string]> & { get(name: string): string | null };
+	hash: string;
+	toString(): string;
+	toJSON(): string;
+}
+
+/**
+ * A WHATWG `URL` instance: the global `URL` type when the type environment declares one (the DOM library or `@types/node`), else
+ * {@link UrlLike}.
+ */
+export type UrlObject = typeof globalThis extends { URL: abstract new (...args: never[]) => infer U } ? U : UrlLike;
+
+/**
+ * Options accepted by {@link normalizeUrl}. They all default to `false` (or `[]`): without options, only the changes that keep the
+ * URL's meaning are made.
+ */
+export interface NormalizeUrlOptions {
+	/** Remove the fragment (`#…`). */
+	readonly stripHash?: boolean;
+	/** Remove a leading `www.` from the host (`www.example.com` → `example.com`; `www.com` and `www.www.example.com` are kept). */
+	readonly stripWww?: boolean;
+	/** Sort the query parameters by name (stably, by UTF-16 code units). Re-encodes the query as `URLSearchParams` does (`a` → `a=`). */
+	readonly sortQuery?: boolean;
+	/** Remove the trailing slashes of the path (`/docs/` → `/docs`), except the root path `/`. */
+	readonly removeTrailingSlash?: boolean;
+	/**
+	 * Remove the query parameters whose name equals one of these strings or matches one of these regular expressions (e.g. `[/^utm_/i]`).
+	 * When one is removed, the query is re-encoded as `URLSearchParams` does.
+	 */
+	readonly removeQueryParams?: ReadonlyArray<string | RegExp>;
+	/** Turn `http:` into `https:` (an explicit `:443` port then disappears as the default one). */
+	readonly forceHttps?: boolean;
+}
+
+/** A percent-escape. */
+const ESCAPE = /%[\da-f]{2}/gi;
+
+/** A character that RFC 3986 calls unreserved: it never needs encoding, so decoding its escape does not change the URL. */
+const UNRESERVED = /[\w.~-]/;
+
+/**
+ * Normalizes the percent-escapes of URL text (RFC 3986 §6.2.2): an escape of an unreserved character is decoded, any other gets
+ * uppercase hex digits.
+ * @param {string} text - The URL text
+ * @returns {string} The text with normalized escapes
+ */
+function normalizeEscapes(text: string): string {
+	return text.replace(ESCAPE, function (escape: string): string {
+		const char = String.fromCharCode(parseInt(escape.slice(1), 16));
+
+		return UNRESERVED.test(char) ? char : escape.toUpperCase();
+	});
+}
+
+/**
+ * Normalizes an absolute URL so that equivalent spellings compare equal (for cache keys, deduplication or canonical links), like
+ * `normalize-url` and ufo's `normalizeURL`. Built on the WHATWG URL parser, so it reads URLs exactly as browsers do.
+ *
+ * Always done (these keep the URL's meaning, RFC 3986 §6.2.2): the scheme and host are lowercased (an internationalized host becomes
+ * punycode), a default port (`:80` for `http:`, `:443` for `https:`…) is removed, `.` and `..` path segments are resolved, escapes of
+ * unreserved characters are decoded (`%7E` → `~`, `%41` → `A`) and the other escapes get uppercase hex digits (`%2f` → `%2F`), and an
+ * empty query or fragment (a bare `?` or `#`) is removed. The other changes are opt-in, since they can change what the URL points to.
+ *
+ * The result is a fixed point: `normalizeUrl(normalizeUrl(url, options), options) === normalizeUrl(url, options)`.
+ * @param {string | UrlObject} url - An absolute URL
+ * @param {NormalizeUrlOptions} [options={}] - `stripHash`, `stripWww`, `sortQuery`, `removeTrailingSlash`, `removeQueryParams` and
+ * `forceHttps`, all off by default
+ * @returns {string} The normalized URL
+ * @throws {TypeError} when `url` is not an absolute URL (or a `URL`), `options` is not an object, or an option has the wrong type
+ * @example
+ * normalizeUrl('HTTP://Example.COM:80/a/./b/../c?q=%7e%2f'); // => 'http://example.com/a/c?q=~%2F'
+ * normalizeUrl('http://www.example.com/docs/?utm_source=x&b=2&a=1#top', {
+ * 	forceHttps: true,
+ * 	stripWww: true,
+ * 	removeTrailingSlash: true,
+ * 	removeQueryParams: [/^utm_/],
+ * 	sortQuery: true,
+ * 	stripHash: true
+ * }); // => 'https://example.com/docs?a=1&b=2'
+ * normalizeUrl('/relative'); // throws TypeError
+ */
+export function normalizeUrl(url: string | UrlObject, options: NormalizeUrlOptions = {}): string {
+	if (typeof options !== 'object' || options === null) throw new TypeError(`normalizeUrl: \`options\` must be an object, got ${describe(options)}`);
+
+	const [stripHash, stripWww, sortQuery, removeTrailingSlash, forceHttps] = ['stripHash', 'stripWww', 'sortQuery', 'removeTrailingSlash', 'forceHttps'].map(function (
+		key: string
+	): boolean {
+		return flagOption('normalizeUrl', options, key);
+	});
+	const removed: unknown = readOption(options, 'removeQueryParams', []);
+
+	if (
+		!Array.isArray(removed) ||
+		!removed.every(function (pattern: unknown): boolean {
+			return typeof pattern === 'string' || isRegExp(pattern);
+		})
+	) {
+		throw new TypeError(`normalizeUrl: \`removeQueryParams\` must be an array of strings and regular expressions, got ${describe(removed)}`);
+	}
+
+	if (typeof url !== 'string' && !(url instanceof URL)) throw new TypeError(`normalizeUrl: \`url\` must be a string or a URL, got ${describe(url)}`);
+
+	const parsed = tryParseUrl(url);
+
+	if (parsed === undefined) throw new TypeError(`normalizeUrl: \`url\` must be an absolute URL, got ${JSON.stringify(url)}`);
+
+	// The parser only lowercases the hosts of special schemes (http, https, ws, wss, ftp, file). Escapes are decoded first, so that `%41`
+	// becomes `a`, not an `A` that the next normalization would lowercase.
+	const host = normalizeEscapes(parsed.hostname).toLowerCase();
+
+	if (host !== parsed.hostname) parsed.hostname = host;
+
+	if (forceHttps && parsed.protocol === 'http:') parsed.protocol = 'https:';
+
+	const rest = parsed.hostname.slice(4);
+
+	// `www.www.example.com` is kept whole: stripping one `www.` would leave another one for the next normalization.
+	if (stripWww && parsed.hostname.startsWith('www.') && rest.includes('.') && !rest.startsWith('www.')) parsed.hostname = rest;
+
+	if (removed.length > 0) {
+		const params = parsed.searchParams;
+
+		for (const key of new Set(params.keys())) {
+			if (
+				removed.some(function (pattern: string | RegExp): boolean {
+					// `search` ignores (and keeps) the `lastIndex` of a global or sticky expression.
+					return typeof pattern === 'string' ? pattern === key : key.search(pattern) !== -1;
+				})
+			) {
+				params.delete(key);
+			}
+		}
+	}
+
+	if (sortQuery) parsed.searchParams.sort();
+
+	if (stripHash || parsed.hash === '') parsed.hash = '';
+
+	if (parsed.search === '') parsed.search = '';
+
+	const path = parsed.pathname;
+	let end = path.length;
+
+	while (removeTrailingSlash && end > 1 && path.charCodeAt(end - 1) === 47) end--;
+
+	// An opaque path (`mailto:a/`) does not start with `/`, and cannot be changed.
+	if (end < path.length && path.startsWith('/')) parsed.pathname = path.slice(0, end);
+
+	return normalizeEscapes(parsed.href);
+}
+
+/**
+ * Parses a URL, returning `undefined` instead of throwing when it is invalid: the `URL.parse` of newer runtimes (Node 22, 2024
+ * browsers), which it uses when available, for every runtime this library supports.
+ * @param {string | UrlObject} input - The URL, absolute or relative to `base`
+ * @param {string | UrlObject} [base] - The base URL for a relative `input`
+ * @returns {UrlObject | undefined} A new `URL`, or `undefined` when `input` (or `base`) is not a valid URL
+ * @example
+ * tryParseUrl('https://example.com/a?b=1')?.searchParams.get('b'); // => '1'
+ * tryParseUrl('../c', 'https://example.com/a/b')?.href; // => 'https://example.com/c'
+ * tryParseUrl('/relative'); // => undefined
+ * tryParseUrl('https://exa mple.com'); // => undefined
+ */
+export function tryParseUrl(input: string | UrlObject, base?: string | UrlObject): UrlObject | undefined {
+	const Native = URL as { parse?: (input: string | URL, base?: string | URL) => URL | null };
+
+	if (typeof Native.parse === 'function') return Native.parse(input, base) ?? undefined;
+
+	try {
+		return new URL(input, base);
+	} catch {
+		return undefined;
+	}
 }

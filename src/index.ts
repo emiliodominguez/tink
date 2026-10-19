@@ -14,6 +14,7 @@ export * as decorators from './decorators/index.js';
 export * as easing from './easing/index.js';
 export * as emitter from './emitter/index.js';
 export * as encoding from './encoding/index.js';
+export * as errors from './errors/index.js';
 export * as format from './format/index.js';
 export * as functions from './functions/index.js';
 export * as guards from './guards/index.js';

@@ -255,3 +255,149 @@ describe('Search helpers (property-based)', function () {
 		});
 	});
 });
+
+/** The combining diacritical mark blocks that `ignoreDiacritics` removes. */
+const DIACRITIC = /[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]/gu;
+/** The letters `ignoreDiacritics` spells in ASCII. */
+const SPELLED: Record<string, string> = {
+	ß: 'ss',
+	ẞ: 'SS',
+	æ: 'ae',
+	Æ: 'AE',
+	œ: 'oe',
+	Œ: 'OE',
+	ø: 'o',
+	Ø: 'O',
+	đ: 'd',
+	Đ: 'D',
+	ð: 'd',
+	Ð: 'D',
+	ł: 'l',
+	Ł: 'L',
+	þ: 'th',
+	Þ: 'TH',
+	ı: 'i'
+};
+
+/**
+ * Reference folding for `ignoreDiacritics`: the characters each code point of `text` folds to, case kept (a code point that would fold to
+ * more than 3 characters is kept as it is).
+ */
+function foldChars(text: string): string[] {
+	const chars: string[] = [];
+	for (const char of text) {
+		const decomposed = char.normalize('NFKD').replace(DIACRITIC, '');
+		const parts: string[] = [];
+		for (const part of decomposed) parts.push(...Array.from(Object.hasOwn(SPELLED, part) ? SPELLED[part] : part));
+		chars.push(...(parts.length > 3 ? [char] : parts));
+	}
+	return chars;
+}
+
+/** Brute force over already-folded characters. */
+function bruteForceChars(q: string[], t: string[], caseSensitive: boolean): number | undefined {
+	if (q.length === 0) return 0;
+	let best: number | undefined;
+	(function search(i: number, from: number, positions: number[]): void {
+		if (i === q.length) {
+			const score = referenceScore(q, t, positions);
+			if (best === undefined || score > best) best = score;
+			return;
+		}
+		for (let p = from; p < t.length; p++) {
+			if (fold(q[i], caseSensitive) === fold(t[p], caseSensitive)) search(i + 1, p + 1, [...positions, p]);
+		}
+	})(0, 0, []);
+	return best;
+}
+
+// Accented letters, precomposed and decomposed, letters that fold to several characters, and separators.
+// `'ﬃ'` folds to 3 characters, `'㏂'` (`a.m.`), `'㍿'` and `'ﷺ'` (18 characters) to more, so they are kept as they are.
+const accented = fc.constantFrom('a', 'e', 'E', 'é', 'É', 'e\u0301', 'è', 'ß', 'æ', 'Ø', '\ufb01', '\ufb03', '\u33c2', '\u337f', '\ufdfa', ' ', '-', 'B', 'b', '\u0301');
+const accentedText = fc.array(accented, { maxLength: 7 }).map(function (chars) {
+	return chars.join('');
+});
+const accentedQuery = fc.array(fc.constantFrom('a', 'e', 'E', 'é', 's', 'ß', 'f', 'i', 'o', 'b', 'B', '\u0301', '\ufdfa', 'm', '.'), { maxLength: 4 }).map(function (chars) {
+	return chars.join('');
+});
+
+describe('Search helpers with ignoreDiacritics (property-based)', function () {
+	it('scores the optimal alignment of the folded characters (vs brute force)', function () {
+		fc.assert(
+			fc.property(accentedQuery, accentedText, fc.boolean(), function (query, target, caseSensitive) {
+				const result = helpers.fuzzyMatch(query, target, { caseSensitive, ignoreDiacritics: true });
+				expect(result?.score).toBe(bruteForceChars(foldChars(query), foldChars(target), caseSensitive));
+			}),
+			{ numRuns: 500 }
+		);
+	});
+
+	it('returns ranges of whole code points with their accents, whose folded text holds the query', function () {
+		fc.assert(
+			fc.property(accentedQuery, accentedText, function (query, target) {
+				const result = helpers.fuzzyMatch(query, target, { ignoreDiacritics: true });
+				if (result === undefined) return;
+				let spelled: string[] = [];
+				result.ranges.forEach(function ([start, end], i) {
+					expect(0 <= start && start < end && end <= target.length).toBe(true);
+					if (i > 0) expect(start).toBeGreaterThan(result.ranges[i - 1][1]);
+					// A range neither starts nor ends next to a combining accent of its letter.
+					expect(/^[\u0300-\u036f]/.test(target.slice(start))).toBe(false);
+					expect(/^[\u0300-\u036f]/.test(target.slice(end))).toBe(false);
+					spelled = spelled.concat(foldChars(target.slice(start, end)));
+				});
+				const needed = foldChars(query).map(function (char) {
+					return char.toLowerCase();
+				});
+				let k = 0;
+				for (const char of spelled) if (char.toLowerCase() === needed[k]) k++;
+				expect(k).toBe(needed.length);
+			})
+		);
+	});
+
+	it('folds a text to at most 3 characters per code point', function () {
+		fc.assert(
+			fc.property(fc.string({ unit: fc.oneof(fc.string({ unit: 'binary', minLength: 1, maxLength: 1 }), accented) }), function (text) {
+				const codePoints = Array.from(text).length;
+				expect(foldChars(text).length).toBeLessThanOrEqual(3 * codePoints);
+				// Matched against itself, every folded character is matched, and earns at most 16 + 8 + 5 + 1 = 30.
+				const self = helpers.fuzzyMatch(text, text, { ignoreDiacritics: true });
+				expect(self).toBeDefined();
+				expect((self as { score: number }).score).toBeLessThanOrEqual(30 * 3 * codePoints);
+			})
+		);
+	});
+
+	it('scores a text the same in NFC and NFD', function () {
+		fc.assert(
+			fc.property(accentedQuery, accentedText, fc.boolean(), function (query, target, caseSensitive) {
+				const options = { caseSensitive, ignoreDiacritics: true };
+				const composed = helpers.fuzzyMatch(query.normalize('NFC'), target.normalize('NFC'), options);
+				const decomposed = helpers.fuzzyMatch(query.normalize('NFD'), target.normalize('NFD'), options);
+				expect(decomposed?.score).toBe(composed?.score);
+			})
+		);
+	});
+
+	it('changes nothing for ASCII text', function () {
+		fc.assert(
+			fc.property(shortQuery, shortText, fc.boolean(), function (query, target, caseSensitive) {
+				fc.pre(!/[^\0-\x7f]/.test(query + target));
+				expect(helpers.fuzzyMatch(query, target, { caseSensitive, ignoreDiacritics: true })).toEqual(helpers.fuzzyMatch(query, target, { caseSensitive }));
+			})
+		);
+	});
+
+	it('finds what fuzzySearch finds with the same option', function () {
+		fc.assert(
+			fc.property(fc.array(accentedText, { maxLength: 8 }), accentedQuery, function (items, query) {
+				const results = helpers.fuzzySearch(items, query, { ignoreDiacritics: true });
+				const expected = items.filter(function (item) {
+					return helpers.fuzzyMatch(query, item, { ignoreDiacritics: true }) !== undefined;
+				});
+				expect(results).toHaveLength(expected.length);
+			})
+		);
+	});
+});

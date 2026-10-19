@@ -278,6 +278,32 @@ export function min(numbers: ReadonlyArray<number>): number {
 }
 
 /**
+ * Finds the smallest and the largest value of some numbers in a single pass, with the semantics of {@link min} and {@link max}: elements
+ * are converted once with unary `+`, any `NaN` makes both bounds `NaN`, and `-0` is smaller than `0`. Unlike `[min(xs), max(xs)]`, it
+ * reads the numbers once, so it also works on a generator, and an empty input is `undefined` rather than `[Infinity, -Infinity]`.
+ * @param {Iterable<number>} numbers - The numbers (an array or any iterable)
+ * @returns {[number, number] | undefined} `[smallest, largest]`, or `undefined` when there are no numbers
+ * @example
+ * extent([3, 1, 4, 1, 5]); // => [1, 5]
+ * extent(new Set([2])); // => [2, 2]
+ * extent([]); // => undefined
+ * extent([1, NaN]); // => [NaN, NaN]
+ */
+export function extent(numbers: Iterable<number>): [number, number] | undefined {
+	let low = Infinity;
+	let high = -Infinity;
+	let empty = true;
+	for (const item of numbers) {
+		const value = +item;
+		if (value !== value) return [NaN, NaN];
+		empty = false;
+		if (value < low || (low === 0 && Object.is(value, -0))) low = value;
+		if (value > high || (value === 0 && Object.is(high, -0))) high = value;
+	}
+	return empty ? undefined : [low, high];
+}
+
+/**
  * Finds the absolute value of a number.
  * @param {number} number - The number whose absolute value is to be found
  * @returns {number} The absolute value of the given number
@@ -553,6 +579,45 @@ export function clamp(value: number, minimum: number, maximum: number): number {
 }
 
 /**
+ * Wraps a value cyclically into the half-open range `[minimum, maximum)`, for angles (`wrap(370, 0, 360) === 10`), carousel or ring-buffer
+ * indices (`wrap(-1, 0, 5) === 4`) and other periodic quantities: the result is the value of the range congruent to `value` modulo
+ * `maximum - minimum` (the Euclidean remainder, shifted to `minimum`). Unlike {@link clamp}, out-of-range values come back in from the other
+ * side, and `maximum` itself wraps to `minimum`.
+ *
+ * A value already in range is returned as is (`-0` included). Otherwise the remainders are taken with `%`, which is exact, so integers stay
+ * exact and neither the distance to `minimum` nor the span overflows; when the exact result is so close to `maximum` that it rounds to it,
+ * `minimum`, the congruent value nearest on the circle, is returned (as {@link modulo} does), so the result is always below `maximum`.
+ * `NaN` and `±Infinity` give `NaN`.
+ * @param {number} value - The value to wrap
+ * @param {number} minimum - Inclusive lower bound
+ * @param {number} maximum - Exclusive upper bound
+ * @returns {number} The value of `[minimum, maximum)` congruent to `value`
+ * @throws {RangeError} when a bound is not finite, or `minimum >= maximum`
+ * @throws {TypeError} when a bound is not a number
+ * @example
+ * wrap(370, 0, 360); // => 10
+ * wrap(-10, 0, 360); // => 350
+ * wrap(190, -180, 180); // => -170
+ * wrap(5, 0, 5); // => 0
+ * wrap(-1, 0, 5); // => 4
+ * wrap(1, 3, 3); // throws RangeError
+ */
+export function wrap(value: number, minimum: number, maximum: number): number {
+	assertNumber('wrap', 'minimum', minimum, Number.isFinite(minimum), 'a finite number');
+	assertNumber('wrap', 'maximum', maximum, Number.isFinite(maximum), 'a finite number');
+	if (!(minimum < maximum)) throw new RangeError(`wrap: \`minimum\` must be less than \`maximum\`, got ${minimum} and ${maximum}`);
+	if (value >= minimum && value < maximum) return value;
+	const span = maximum - minimum;
+	// The span exceeds `Number.MAX_VALUE` (so the bounds are huge and the value out of range is too): halving all three is exact.
+	if (span === Infinity) return 2 * wrap(value / 2, minimum / 2, maximum / 2);
+	// `(value - minimum) mod span`, from the exact remainders of both (subtracting first could overflow, or lose the digits of a small
+	// `minimum` next to a large `value`).
+	const result = minimum + modulo((value % span) - (minimum % span), span);
+	// `NaN` (for a value that is not finite) fails the comparison and is returned.
+	return result >= maximum ? minimum : result;
+}
+
+/**
  * Linear interpolation between `start` and `end`. `t = 0` gives exactly `start`, `t = 1` exactly `end`
  * (even when the other endpoint is infinite), and `start === end` gives exactly `start` for every finite `t`;
  * `t` outside `[0, 1]` extrapolates.
@@ -766,6 +831,215 @@ export function standardDeviation(numbers: ReadonlyArray<number>, options: Varia
 	// The variance overflows although every value is finite, but its square root (at most half the range) does not: take the root of
 	// the scaled variance, then scale back by 2 ** 600.
 	return Math.sqrt(scaledVariance(numbers, readOption(options, 'sample') === true ? numbers.length - 1 : numbers.length)) * 2 ** 600;
+}
+
+/**
+ * The statistics of paired samples that {@link covariance}, {@link correlation} and {@link linearRegression} derive their results from.
+ */
+interface PairedMoments {
+	/** The number of pairs. */
+	count: number;
+	/** The mean of `xs`. */
+	meanX: number;
+	/** The mean of `ys`. */
+	meanY: number;
+	/** The power of two the values of `xs` are multiplied by in the sums (see {@link scaledSample}). */
+	scaleX: number;
+	/** The power of two the values of `ys` are multiplied by in the sums. */
+	scaleY: number;
+	/** The sum of the squared (scaled) deviations of `xs` from their mean. */
+	sxx: number;
+	/** The sum of the squared (scaled) deviations of `ys` from their mean. */
+	syy: number;
+	/** The sum of the products of the paired (scaled) deviations. */
+	sxy: number;
+}
+
+/**
+ * Converts a sample with unary `+` and multiplies it by a power of two that brings its largest magnitude close to `1` (by `1` when that is
+ * `0` or not finite), between `2 ** -1000` and `2 ** 1000` so that it is a normal double. The scaling is exact (subnormal values become
+ * normal), and the scaled values, their sums and their squares neither overflow nor underflow.
+ * @param {ReadonlyArray<number>} numbers - The sample
+ * @returns {[number[], number]} The scaled values and the scale
+ */
+function scaledSample(numbers: ReadonlyArray<number>): [number[], number] {
+	const values = Array.from(numbers, function (value) {
+		return +value;
+	});
+	let largest = 0;
+	// `NaN` once a value is `NaN`.
+	for (const value of values) largest = Math.max(largest, Math.abs(value));
+	const scale = largest > 0 && largest < Infinity ? 2 ** Math.min(1000, Math.max(-1000, -Math.floor(Math.log2(largest)))) : 1;
+	return [
+		values.map(function (value) {
+			return value * scale;
+		}),
+		scale
+	];
+}
+
+/**
+ * Computes the means and the centred sums of squares and products of paired samples: the means first (compensated, see {@link average}),
+ * then the sums of the deviations from them, which is numerically stable (no catastrophic cancellation, unlike the textbook
+ * `Σxy - n·x̄·ȳ`). Each sample is scaled by a power of two first (exactly), so that neither the deviations nor the sums overflow or
+ * underflow, whatever the magnitude of the values: only a final result can. Values are converted with unary `+`.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {ReadonlyArray<number>} xs - The first sample
+ * @param {ReadonlyArray<number>} ys - The second sample, as long as `xs`
+ * @returns {PairedMoments} The count, means, scales and sums
+ * @throws {RangeError} when `xs` and `ys` have different lengths
+ */
+function pairedMoments(caller: string, xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): PairedMoments {
+	const count = xs.length;
+	if (count !== ys.length) throw new RangeError(`${caller}: \`xs\` and \`ys\` must have the same length, got ${count} and ${ys.length}`);
+	const [x, scaleX] = scaledSample(xs);
+	const [y, scaleY] = scaledSample(ys);
+	const centreX = average(x);
+	const centreY = average(y);
+	let sumX = 0;
+	let sumY = 0;
+	let sxx = 0;
+	let syy = 0;
+	let sxy = 0;
+	for (let i = 0; i < count; i++) {
+		const dx = x[i] - centreX;
+		const dy = y[i] - centreY;
+		sumX += dx;
+		sumY += dy;
+		sxx += dx * dx;
+		syy += dy * dy;
+		sxy += dx * dy;
+	}
+	// The corrected two-pass algorithm (Chan, Golub and LeVeque): the deviations from the rounded means add up to `n` times the rounding
+	// error `e` of the mean instead of `0`, which adds `n·e²` to the sum of squares; subtracting `(Σd)² / n` takes it out again.
+	return {
+		count,
+		meanX: centreX / scaleX,
+		meanY: centreY / scaleY,
+		scaleX,
+		scaleY,
+		sxx: sxx - (sumX * sumX) / count,
+		syy: syy - (sumY * sumY) / count,
+		sxy: sxy - (sumX * sumY) / count
+	};
+}
+
+/**
+ * The coefficient of determination of paired samples, `sxy² / (sxx · syy)` (which the scales do not change), capped at `1` against rounding.
+ * @param {PairedMoments} moments - The paired moments
+ * @returns {number} The squared correlation, in `[0, 1]` (`NaN` when a sample is constant)
+ */
+function determination(moments: PairedMoments): number {
+	return Math.min((moments.sxy / moments.sxx) * (moments.sxy / moments.syy), 1);
+}
+
+/**
+ * Computes the covariance of two paired samples: how they vary together, `Σ(x - x̄)(y - ȳ) / n`. By default the population covariance
+ * (divide by `n`) is returned; pass `{ sample: true }` for the sample covariance (divide by `n - 1`), like {@link variance}, of which it is
+ * the generalization (`covariance(xs, xs)` is `variance(xs)`, up to rounding). It is computed in two passes (compensated means, then the
+ * centred products, corrected for the rounding of the means), so it stays accurate for data far from zero, where the one-pass
+ * `Σxy / n - x̄ȳ` formula loses every digit, and on values scaled by powers of two, so that it only overflows or underflows when the
+ * covariance itself does.
+ * Values are converted once with unary `+` (numeric strings count as numbers).
+ * @param {ReadonlyArray<number>} xs - The first sample
+ * @param {ReadonlyArray<number>} ys - The second sample, one value per value of `xs`
+ * @param {VarianceOptions} [options={}] - `sample`: compute the sample covariance instead of the population one
+ * @returns {number} The covariance; `NaN` for empty samples, for a sample covariance of fewer than 2 pairs, or if a value is not finite;
+ * `±Infinity` when every value is finite but the covariance overflows
+ * @throws {RangeError} when `xs` and `ys` have different lengths
+ * @example
+ * covariance([1, 2, 3, 4], [2, 4, 6, 8]); // => 2.5
+ * covariance([1, 2, 3, 4], [2, 4, 6, 8], { sample: true }); // => 3.3333333333333335
+ * covariance([1, 2, 3], [3, 2, 1]); // => -0.6666666666666666
+ * covariance([], []); // => NaN
+ * covariance([1, 2], [1]); // throws RangeError
+ */
+export function covariance(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>, options: VarianceOptions = {}): number {
+	const sample = readOption(options, 'sample') === true;
+	const moments = pairedMoments('covariance', xs, ys);
+	const divisor = sample ? moments.count - 1 : moments.count;
+	if (divisor <= 0) return NaN;
+	// Scaled back by the smaller scale first: the intermediate result grows, so it cannot underflow before the final one does.
+	return moments.sxy / divisor / Math.min(moments.scaleX, moments.scaleY) / Math.max(moments.scaleX, moments.scaleY);
+}
+
+/**
+ * Computes the Pearson correlation coefficient of two paired samples: their covariance divided by the product of their standard deviations,
+ * from `-1` (perfectly opposite linear relation) through `0` (no linear relation) to `1` (perfectly linear). The sums come from the same
+ * stable two-pass computation as {@link covariance}, the coefficient is computed so that it neither overflows nor underflows, and it never
+ * leaves `[-1, 1]` through rounding. Values are converted once with unary `+`.
+ * @param {ReadonlyArray<number>} xs - The first sample
+ * @param {ReadonlyArray<number>} ys - The second sample, one value per value of `xs`
+ * @returns {number} The coefficient, in `[-1, 1]`; `NaN` for fewer than 2 pairs, when either sample is constant (the coefficient is
+ * undefined), or if a value is not finite
+ * @throws {RangeError} when `xs` and `ys` have different lengths
+ * @example
+ * correlation([1, 2, 3, 4], [2, 4, 6, 8]); // => 1
+ * correlation([1, 2, 3], [3, 2, 1]); // => -1
+ * correlation([1, 2, 3, 4], [1, 3, 2, 4]); // => 0.8
+ * correlation([1, 2, 3], [5, 5, 5]); // => NaN
+ */
+export function correlation(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): number {
+	const moments = pairedMoments('correlation', xs, ys);
+	const root = Math.sqrt(determination(moments));
+	return moments.sxy < 0 ? -root : root;
+}
+
+/**
+ * The result of {@link linearRegression}: the least-squares line `y = slope · x + intercept` and how well it fits.
+ */
+export interface LinearRegression {
+	/** The slope of the line. */
+	readonly slope: number;
+	/** The value of the line at `x = 0`. */
+	readonly intercept: number;
+	/** The coefficient of determination R², in `[0, 1]`: the share of the variance of `ys` that the line explains. */
+	readonly r2: number;
+	/**
+	 * The value of the line at `x`: `slope * x + intercept`, computed as `ȳ + slope * (x - x̄)` (the line through the means), which is
+	 * more accurate far from zero (`intercept` can be large and rounded when the `xs` are timestamps).
+	 * @param {number} x - A value of the independent variable
+	 * @returns {number} The predicted value
+	 */
+	readonly predict: (x: number) => number;
+}
+
+/**
+ * Fits a straight line through paired samples by ordinary least squares (simple linear regression of `ys` on `xs`), as
+ * simple-statistics' `linearRegression` and `rSquared`, or Excel's `SLOPE`, `INTERCEPT` and `RSQ`, do. The slope is
+ * `Σ(x - x̄)(y - ȳ) / Σ(x - x̄)²`, from the same stable two-pass sums as {@link covariance} (accurate for data far from zero, such as
+ * timestamps), and the line goes through the means. `r2` is the squared {@link correlation}; when every `y` is the same, the horizontal
+ * line fits every point exactly and `r2` is `1` (as in scikit-learn).
+ * Values are converted once with unary `+`; a value that is not finite makes every field `NaN`.
+ * @param {ReadonlyArray<number>} xs - The values of the independent variable
+ * @param {ReadonlyArray<number>} ys - The observed values, one per value of `xs`
+ * @returns {LinearRegression} `{ slope, intercept, r2, predict }`
+ * @throws {RangeError} when `xs` and `ys` have different lengths, hold fewer than 2 points, or every `x` is the same (the slope is
+ * undefined: the line would be vertical)
+ * @example
+ * const line = linearRegression([1, 2, 3, 4], [3, 5, 7, 9]);
+ * [line.slope, line.intercept, line.r2]; // => [2, 1, 1]
+ * line.predict(10); // => 21
+ * linearRegression([1, 2, 3], [2, 1, 3]).slope; // => 0.5
+ * linearRegression([1, 1], [2, 3]); // throws RangeError
+ */
+export function linearRegression(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): LinearRegression {
+	const moments = pairedMoments('linearRegression', xs, ys);
+	if (moments.count < 2) throw new RangeError(`linearRegression: \`xs\` and \`ys\` must hold at least 2 points, got ${moments.count}`);
+	if (moments.sxx === 0) throw new RangeError('linearRegression: `xs` must not all be equal (the line would be vertical)');
+	// The ratio of the scaled sums, scaled back.
+	const slope = (moments.sxy / moments.sxx) * (moments.scaleX / moments.scaleY);
+	const { meanX, meanY } = moments;
+	const intercept = meanY - slope * meanX;
+	return {
+		slope,
+		intercept,
+		// Constant `ys` (and no `NaN` among the `xs`): every point is on the horizontal line.
+		r2: moments.syy === 0 && moments.sxx === moments.sxx ? 1 : determination(moments),
+		predict: function (x: number): number {
+			return meanY + slope * (x - meanX);
+		}
+	};
 }
 
 /**
@@ -1024,7 +1298,16 @@ function decimalPlaces(value: number): number {
  */
 export function quantile(numbers: ReadonlyArray<number>, q: number): number {
 	assertNumber('quantile', 'q', q, q >= 0 && q <= 1, 'a number in [0, 1]');
-	const sorted = sortedCopy(numbers);
+	return sortedQuantile(sortedCopy(numbers), q);
+}
+
+/**
+ * The `q`-quantile of numbers sorted by {@link sortedCopy} (see {@link quantile}).
+ * @param {ArrayLike<number>} sorted - The sorted numbers
+ * @param {number} q - The quantile, in `[0, 1]`
+ * @returns {number} The quantile, or `NaN` if there are no numbers or one is `NaN`
+ */
+function sortedQuantile(sorted: ArrayLike<number>, q: number): number {
 	const length = sorted.length;
 	// The largest value is missing (empty input) or NaN (sorted last): the quantile is undefined.
 	if (!(sorted[length - 1] <= Infinity)) return NaN;
@@ -1049,6 +1332,42 @@ export function quantile(numbers: ReadonlyArray<number>, q: number): number {
 export function percentile(numbers: ReadonlyArray<number>, p: number): number {
 	assertNumber('percentile', 'p', p, p >= 0 && p <= 100, 'a number in [0, 100]');
 	return quantile(numbers, p / 100);
+}
+
+/**
+ * Computes the interquartile range of an array of numbers, the spread of their middle half: `quantile(numbers, 0.75) -
+ * quantile(numbers, 0.25)`, with the same interpolation as {@link quantile} (R type 7, Excel's `QUARTILE.INC`), but sorting only once.
+ * The input is not mutated, and elements are converted once with unary `+` (numeric strings count as numbers).
+ * @param {ReadonlyArray<number>} numbers - The numbers
+ * @returns {number} The interquartile range, or `NaN` if the array is empty or contains `NaN`
+ * @example
+ * interquartileRange([1, 2, 3, 4, 5, 6, 7, 8]); // => 3.5
+ * interquartileRange([7, 7, 7]); // => 0
+ * interquartileRange([]); // => NaN
+ */
+export function interquartileRange(numbers: ReadonlyArray<number>): number {
+	const sorted = sortedCopy(numbers);
+	return sortedQuantile(sorted, 0.75) - sortedQuantile(sorted, 0.25);
+}
+
+/**
+ * Computes the standard score of a value: how many standard deviations it lies above (positive) or below (negative) the mean,
+ * `(value - mean) / standardDeviation`. Pass the mean and standard deviation of the reference population (see {@link average} and
+ * {@link standardDeviation}).
+ * @param {number} value - The value to score
+ * @param {number} mean - The mean of the population
+ * @param {number} deviation - Its standard deviation, a number `> 0`
+ * @returns {number} The z-score
+ * @throws {RangeError} when `deviation` is not greater than `0` (including `NaN`)
+ * @throws {TypeError} when `deviation` is not a number
+ * @example
+ * zScore(130, 100, 15); // => 2
+ * zScore(85, 100, 15); // => -1
+ * zScore(1, 0, 0); // throws RangeError
+ */
+export function zScore(value: number, mean: number, deviation: number): number {
+	assertNumber('zScore', 'deviation', deviation, deviation > 0, 'a number > 0');
+	return (value - mean) / deviation;
 }
 
 /**
@@ -1185,6 +1504,115 @@ export function normalize(numbers: ReadonlyArray<number>): number[] {
 	const scaledRange = high * scale - low * scale;
 	return numbers.map(function (value) {
 		return (value * scale - low * scale) / scaledRange;
+	});
+}
+
+/** What every ratio of {@link allocate} must be. */
+const ALLOCATE_RATIO = 'a finite number >= 0 or a bigint >= 0';
+
+/**
+ * Splits an integer amount (cents, items, seats) in proportion to some ratios, without losing or creating a single unit: the shares always
+ * add up to exactly `total`. Each share is its exact quota `total * ratio / Σ ratios` rounded down or up (never off by 1 or more), by the
+ * largest remainder (Hamilton) method: every share gets the integer part of its quota, then the units left over go, one each, to the shares
+ * with the largest fractional parts, ties going to the earlier index. The arithmetic is exact (in `BigInt`, with the ratios read as the exact
+ * fractions their doubles hold), so `[1, 1, 1]`, `[0.1, 0.1, 0.1]` and `[1n, 1n, 1n]` split alike, and no rounding error can make a remainder
+ * win or lose a unit. Unlike dinero.js' `allocate`, which hands the leftover units to the first shares in order, a unit always goes where
+ * the quota is closest to the next integer.
+ *
+ * A negative `total` is split like its absolute value, with every share negated (`allocate(-total, r)` is `allocate(total, r)` negated). A
+ * zero ratio always gets `0`. A `bigint` total gives `bigint` shares, for amounts beyond `Number.MAX_SAFE_INTEGER`.
+ * @param {number | bigint} total - The amount to split: a safe integer, or a bigint
+ * @param {ReadonlyArray<number | bigint>} ratios - One finite, non-negative weight per share (numbers, bigints or both), not all zero; only
+ * their proportions matter (`[70, 20, 10]` splits like `[0.7, 0.2, 0.1]`)
+ * @returns {Array<number | bigint>} The shares, one per ratio, in order, of the same type as `total`
+ * @throws {TypeError} when `total` is neither a number nor a bigint, `ratios` is not an array, or a ratio is neither a number nor a bigint
+ * @throws {RangeError} when `total` is not a safe integer, a ratio is negative or not finite, or every ratio is zero (including no ratios)
+ * @example
+ * allocate(100, [1, 1, 1]); // => [34, 33, 33]
+ * allocate(1000, [70, 20, 10]); // => [700, 200, 100]
+ * allocate(5, [0.5, 0.25, 0.25]); // => [3, 1, 1]
+ * allocate(-100, [1, 1, 1]); // => [-34, -33, -33]
+ * allocate(10, [1, 0, 2]); // => [3, 0, 7]
+ * allocate(10n ** 20n, [1, 2]); // => [33333333333333333333n, 66666666666666666667n]
+ * allocate(100, [0, 0]); // throws RangeError
+ */
+export function allocate(total: number, ratios: ReadonlyArray<number | bigint>): number[];
+/**
+ * {@link allocate} for a `bigint` total: the shares are bigints.
+ * @param {bigint} total - The amount to split
+ * @param {ReadonlyArray<number | bigint>} ratios - One finite, non-negative weight per share, not all zero
+ * @returns {bigint[]} The shares, one per ratio, adding up to exactly `total`
+ * @example
+ * allocate(5n, [1, 1]); // => [3n, 2n]
+ */
+export function allocate(total: bigint, ratios: ReadonlyArray<number | bigint>): bigint[];
+/**
+ * Splits an integer amount in proportion to some ratios without losing or creating a unit (see the overloads).
+ * @param {number | bigint} total - The amount to split: a safe integer, or a bigint
+ * @param {ReadonlyArray<number | bigint>} ratios - One finite, non-negative weight per share, not all zero
+ * @returns {Array<number | bigint>} The shares, of the same type as `total`
+ * @throws {TypeError} when `total` is neither a number nor a bigint, `ratios` is not an array, or a ratio is neither a number nor a bigint
+ * @throws {RangeError} when `total` is not a safe integer, a ratio is negative or not finite, or every ratio is zero
+ * @example
+ * allocate(7, [1, 1]); // => [4, 3]
+ */
+export function allocate(total: number | bigint, ratios: ReadonlyArray<number | bigint>): Array<number | bigint> {
+	const big = typeof total === 'bigint';
+	if (!big) assertNumber('allocate', 'total', total, Number.isSafeInteger(total), 'a safe integer or a bigint');
+	if (!Array.isArray(ratios)) throw new TypeError(`allocate: \`ratios\` must be an array, got ${describe(ratios)}`);
+	// Each ratio as an integer times a power of two (`mantissas[i] * 2 ** exponents[i]`), the exact value of its double.
+	const mantissas: bigint[] = [];
+	const exponents: number[] = [];
+	let lowest = 0;
+	for (let i = 0; i < ratios.length; i++) {
+		// Read once: the value validated is the value used.
+		let ratio: unknown = ratios[i];
+		let exponent = 0;
+		if (typeof ratio === 'bigint') {
+			if (ratio < 0n) throw new RangeError(`allocate: \`ratios[${i}]\` must be ${ALLOCATE_RATIO}, got ${ratio}`);
+		} else {
+			assertNumber('allocate', `ratios[${i}]`, ratio, typeof ratio === 'number' && ratio >= 0 && ratio < Infinity, ALLOCATE_RATIO);
+			// Doubling a double is exact, and after at most 1074 doublings any finite double is an integer.
+			for (; !Number.isInteger(ratio); exponent--) ratio *= 2;
+			ratio = BigInt(ratio);
+		}
+		mantissas.push(ratio as bigint);
+		exponents.push(exponent);
+		lowest = Math.min(lowest, exponent);
+	}
+	// The ratios over their common denominator `2 ** -lowest`: integers in the same proportions.
+	let denominator = 0n;
+	const weights = mantissas.map(function (mantissa, index) {
+		const weight = mantissa << BigInt(exponents[index] - lowest);
+		denominator += weight;
+		return weight;
+	});
+	if (denominator === 0n) throw new RangeError('allocate: `ratios` must contain a ratio > 0');
+	const amount = BigInt(total);
+	const magnitude = amount < 0n ? -amount : amount;
+	// Every quota `magnitude * weight / denominator`, split into its integer part (the share so far) and its remainder (its fraction, times
+	// `denominator`).
+	let left = magnitude;
+	const remainders: bigint[] = [];
+	const shares = weights.map(function (weight) {
+		const scaled = magnitude * weight;
+		const share = scaled / denominator;
+		remainders.push(scaled % denominator);
+		left -= share;
+		return share;
+	});
+	// `left` units remain (fewer than there are shares with a remainder): one each to the largest remainders, the earlier first on a tie (the
+	// sort is stable).
+	const order = shares.map(function (_share, index) {
+		return index;
+	});
+	order.sort(function (a, b) {
+		return remainders[a] < remainders[b] ? 1 : remainders[a] > remainders[b] ? -1 : 0;
+	});
+	for (let i = 0; i < left; i++) shares[order[i]]++;
+	return shares.map(function (share) {
+		const signed = amount < 0n ? -share : share;
+		return big ? signed : Number(signed);
 	});
 }
 

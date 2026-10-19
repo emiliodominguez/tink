@@ -1401,3 +1401,325 @@ describe('route patterns (review regressions)', function () {
 		}
 	});
 });
+
+describe('parseCookie', function () {
+	it('should read name-value pairs, trimming spaces and tabs', function () {
+		expect(helpers.parseCookie('a=1; b=2;c=3')).toEqual({ a: '1', b: '2', c: '3' });
+		expect(helpers.parseCookie(' \ta = 1 \t;\tb=\t')).toEqual({ a: '1', b: '' });
+		expect(helpers.parseCookie('a=\u00a01')).toEqual({ a: '\u00a01' });
+		expect(helpers.parseCookie('a=b=c')).toEqual({ a: 'b=c' });
+		expect(helpers.parseCookie('=x; y=')).toEqual({ '': 'x', y: '' });
+		expect(helpers.parseCookie('')).toEqual({});
+	});
+
+	it('should keep the first occurrence of a name', function () {
+		expect(helpers.parseCookie('a=1; a=2; b=3; a=4')).toEqual({ a: '1', b: '3' });
+		expect(helpers.parseCookie('a=%ZZ; a=2')).toEqual({ a: '%ZZ' });
+	});
+
+	it('should remove surrounding double quotes only when both are there', function () {
+		expect(helpers.parseCookie('a="x y"; b=""; c="; d=x"; e="x')).toEqual({ a: 'x y', b: '', c: '"', d: 'x"', e: '"x' });
+	});
+
+	it('should decode values without ever throwing, and leave + alone', function () {
+		expect(helpers.parseCookie('a=caf%C3%A9; b=100%; c=%E9t%C3%A9; d=a+b; e%20f=1')).toEqual({ a: 'café', b: '100%', c: '%E9té', d: 'a+b', 'e%20f': '1' });
+	});
+
+	it('should skip malformed pairs', function () {
+		expect(helpers.parseCookie('a; b=1;; c ;d=2')).toEqual({ b: '1', d: '2' });
+		expect(helpers.parseCookie('a;b;c')).toEqual({});
+		expect(helpers.parseCookie('a=1;b')).toEqual({ a: '1' });
+	});
+
+	it('should return a null-prototype record, safe from hostile names', function () {
+		const cookies = helpers.parseCookie('__proto__=x; constructor=y; toString=z');
+		expect(Object.getPrototypeOf(cookies)).toBeNull();
+		expect(Object.keys(cookies)).toEqual(['__proto__', 'constructor', 'toString']);
+		expect(cookies['__proto__']).toBe('x');
+		expect(({} as Record<string, unknown>).x).toBeUndefined();
+	});
+
+	it('should run in linear time on hostile headers', function () {
+		expect(helpers.parseCookie('a;'.repeat(200_000) + 'b=1')).toEqual({ b: '1' });
+		expect(Object.keys(helpers.parseCookie('a=1;'.repeat(200_000))).length).toBe(1);
+	});
+
+	it('should reject anything but a string', function () {
+		expect(function () {
+			helpers.parseCookie(undefined as never);
+		}).toThrow(new TypeError('parseCookie: `header` must be a string, got undefined'));
+	});
+});
+
+describe('serializeCookie', function () {
+	it('should encode the value with encodeURIComponent', function () {
+		expect(helpers.serializeCookie('a', 'b')).toBe('a=b');
+		expect(helpers.serializeCookie('a', '')).toBe('a=');
+		expect(helpers.serializeCookie('a', 'x y;z,"é\\')).toBe('a=x%20y%3Bz%2C%22%C3%A9%5C');
+		expect(helpers.serializeCookie('a', '\ud800')).toBe('a=%EF%BF%BD');
+		expect(helpers.parseCookie(helpers.serializeCookie('a', 'x y;z,"é\\'))).toEqual({ a: 'x y;z,"é\\' });
+	});
+
+	it('should write every attribute, in the cookie package order', function () {
+		expect(
+			helpers.serializeCookie('a', 'b', {
+				sameSite: 'none',
+				priority: 'medium',
+				partitioned: true,
+				secure: true,
+				httpOnly: true,
+				expires: new Date(0),
+				path: '/',
+				domain: '.example.com',
+				maxAge: 0
+			})
+		).toBe('a=b; Max-Age=0; Domain=.example.com; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Secure; Partitioned; Priority=Medium; SameSite=None');
+		expect(helpers.serializeCookie('a', 'b', { sameSite: 'strict', priority: 'low', maxAge: -1 })).toBe('a=b; Max-Age=-1; Priority=Low; SameSite=Strict');
+		expect(helpers.serializeCookie('a', 'b', { priority: 'high', sameSite: 'lax', secure: false, httpOnly: false })).toBe('a=b; Priority=High; SameSite=Lax');
+		expect(helpers.serializeCookie('a', 'b', { expires: vm.runInNewContext('new Date(86400000)') as Date })).toBe('a=b; Expires=Fri, 02 Jan 1970 00:00:00 GMT');
+	});
+
+	it('should accept RFC 6265 names, domains and paths', function () {
+		expect(helpers.serializeCookie("!#$%&'*+-.^_`|~09AZaz", 'x')).toBe("!#$%&'*+-.^_`|~09AZaz=x");
+		for (const domain of ['localhost', 'example.com', '.sub.ex-ample.co.uk', '127.0.0.1', 'A1.B2', `${'a'.repeat(63)}.com`]) {
+			expect(helpers.serializeCookie('a', 'b', { domain })).toBe(`a=b; Domain=${domain}`);
+		}
+		for (const path of ['', '/', '/a b/c=d?e#f', '/~!']) expect(helpers.serializeCookie('a', 'b', { path })).toBe(`a=b; Path=${path}`);
+	});
+
+	it('should reject names, values, domains and paths that would break the header', function () {
+		for (const name of ['', 'a b', 'a;b', 'a=b', 'a,b', 'a"b', 'a\r\nb', 'é', 'a(b', 'a/b', 'a@b', 'a\tb']) {
+			expect(function () {
+				helpers.serializeCookie(name, 'x');
+			}).toThrow(new TypeError(`serializeCookie: \`name\` must be a cookie name (letters, digits and !#$%&'*+-.^_\`|~), got ${JSON.stringify(name)}`));
+		}
+		expect(function () {
+			helpers.serializeCookie(1 as never, 'x');
+		}).toThrow(new TypeError("serializeCookie: `name` must be a cookie name (letters, digits and !#$%&'*+-.^_`|~), got number"));
+		for (const domain of ['', 'exa mple.com', 'a;b', '-a.com', 'a-.com', 'a..com', 'a.com.', '..a', `${'a'.repeat(64)}.com`, 'a.com\r\nX: y', 'é.com']) {
+			expect(function () {
+				helpers.serializeCookie('a', 'b', { domain });
+			}).toThrow(new TypeError(`serializeCookie: \`domain\` must be a host name (ASCII letters, digits, hyphens and dots), got ${JSON.stringify(domain)}`));
+		}
+		expect(function () {
+			helpers.serializeCookie('a', 'b', { domain: null as never });
+		}).toThrow(new TypeError('serializeCookie: `domain` must be a host name (ASCII letters, digits, hyphens and dots), got null'));
+		for (const path of ['/a;b', '/\r\nSet-Cookie: x=1', '/\x7f', '/é', '/\0']) {
+			expect(function () {
+				helpers.serializeCookie('a', 'b', { path });
+			}).toThrow(new TypeError(`serializeCookie: \`path\` must be printable ASCII without ';', got ${JSON.stringify(path)}`));
+		}
+		expect(function () {
+			helpers.serializeCookie('a', 'b', { path: 1 as never });
+		}).toThrow(new TypeError("serializeCookie: `path` must be printable ASCII without ';', got number"));
+		expect(function () {
+			helpers.serializeCookie('a', 1 as never);
+		}).toThrow(new TypeError('serializeCookie: `value` must be a string, got number'));
+	});
+
+	it('should use a custom encoder, and check what it returns', function () {
+		function raw(value: string): string {
+			return value;
+		}
+		expect(helpers.serializeCookie('a', '"b"', { encode: raw })).toBe('a="b"');
+		expect(helpers.serializeCookie('a', '{x:1}', { encode: raw })).toBe('a={x:1}');
+		const expected = "a cookie value once encoded (printable ASCII except spaces and '\"', ',', ';' or '\\')";
+		for (const value of ['a b', 'a;b', 'a,b', 'a\\b', '"a', 'a"b', '"a"b"', 'é', '\r\n']) {
+			expect(function () {
+				helpers.serializeCookie('a', value, { encode: raw });
+			}).toThrow(new TypeError(`serializeCookie: \`value\` must be ${expected}, got ${JSON.stringify(value)}`));
+		}
+		expect(function () {
+			helpers.serializeCookie('a', 'b', {
+				encode: function () {
+					return 1 as never;
+				}
+			});
+		}).toThrow(new TypeError(`serializeCookie: \`value\` must be ${expected}, got number`));
+		expect(function () {
+			helpers.serializeCookie('a', 'b', { encode: 'raw' as never });
+		}).toThrow(new TypeError('serializeCookie: `encode` must be a function, got string'));
+	});
+
+	it('should validate the other options', function () {
+		expect(function () {
+			helpers.serializeCookie('a', 'b', { maxAge: 1.5 });
+		}).toThrow(new RangeError('serializeCookie: `maxAge` must be an integer (seconds), got 1.5'));
+		expect(function () {
+			helpers.serializeCookie('a', 'b', { maxAge: 2 ** 53 });
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.serializeCookie('a', 'b', { maxAge: '60' as never });
+		}).toThrow(new TypeError('serializeCookie: `maxAge` must be an integer (seconds), got string'));
+		expect(function () {
+			helpers.serializeCookie('a', 'b', { expires: new Date(NaN) });
+		}).toThrow(new RangeError('serializeCookie: `expires` must be a valid Date, got Invalid Date'));
+		expect(function () {
+			helpers.serializeCookie('a', 'b', { expires: 0 as never });
+		}).toThrow(new TypeError('serializeCookie: `expires` must be a Date, got number'));
+		expect(function () {
+			helpers.serializeCookie('a', 'b', { sameSite: 'Strict' as never });
+		}).toThrow(new RangeError("serializeCookie: `sameSite` must be 'strict', 'lax' or 'none', got Strict"));
+		expect(function () {
+			helpers.serializeCookie('a', 'b', { sameSite: true as never });
+		}).toThrow(new RangeError("serializeCookie: `sameSite` must be 'strict', 'lax' or 'none', got true"));
+		expect(function () {
+			helpers.serializeCookie('a', 'b', { priority: 'urgent' as never });
+		}).toThrow(new RangeError("serializeCookie: `priority` must be 'low', 'medium' or 'high', got urgent"));
+		for (const key of ['secure', 'httpOnly', 'partitioned'] as const) {
+			expect(function () {
+				helpers.serializeCookie('a', 'b', { [key]: 'yes' });
+			}).toThrow(new TypeError(`serializeCookie: \`${key}\` must be a boolean, got string`));
+		}
+		expect(function () {
+			helpers.serializeCookie('a', 'b', null as never);
+		}).toThrow(new TypeError('serializeCookie: `options` must be an object, got null'));
+	});
+
+	it('should reject the combinations that browsers drop', function () {
+		expect(function () {
+			helpers.serializeCookie('a', 'b', { sameSite: 'none' });
+		}).toThrow(new RangeError("serializeCookie: `secure` must be true when `sameSite` is 'none' (browsers reject the cookie otherwise)"));
+		expect(function () {
+			helpers.serializeCookie('a', 'b', { partitioned: true });
+		}).toThrow(new RangeError('serializeCookie: `secure` must be true when `partitioned` is set (browsers reject the cookie otherwise)'));
+		for (const name of ['__Secure-id', '__secure-id', '__Host-id', '__HOST-id']) {
+			expect(function () {
+				helpers.serializeCookie(name, 'b', { path: '/' });
+			}).toThrow(new RangeError(`serializeCookie: \`secure\` must be true when the name starts with "${name.slice(0, -2)}" (browsers reject the cookie otherwise)`));
+		}
+		expect(helpers.serializeCookie('__Secure-id', 'b', { secure: true, domain: 'example.com' })).toBe('__Secure-id=b; Domain=example.com; Secure');
+		expect(helpers.serializeCookie('__Host-id', 'b', { secure: true, path: '/' })).toBe('__Host-id=b; Path=/; Secure');
+		for (const options of [{ secure: true }, { secure: true, path: '/a' }, { secure: true, path: '/', domain: 'example.com' }]) {
+			expect(function () {
+				helpers.serializeCookie('__Host-id', 'b', options);
+			}).toThrow(new RangeError(`serializeCookie: a "__Host-" cookie must have \`path: '/'\` and no \`domain\` (browsers reject it otherwise)`));
+		}
+		expect(helpers.serializeCookie('__Hostess', 'b')).toBe('__Hostess=b');
+		expect(helpers.serializeCookie('__Secure_id', 'b')).toBe('__Secure_id=b');
+	});
+
+	it('should ignore options inherited from a polluted Object.prototype', function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		proto.domain = 'evil.example';
+		proto.encode = function (value: string): string {
+			return value;
+		};
+		proto.secure = 'yes';
+		try {
+			expect(helpers.serializeCookie('a', 'b c', {})).toBe('a=b%20c');
+		} finally {
+			delete proto.domain;
+			delete proto.encode;
+			delete proto.secure;
+		}
+	});
+});
+
+describe('normalizeUrl', function () {
+	it('should make the changes that keep the meaning', function () {
+		expect(helpers.normalizeUrl('HTTP://User@Example.COM:80/a/./b/../c?q=%7e%2f#%7e')).toBe('http://User@example.com/a/c?q=~%2F#~');
+		expect(helpers.normalizeUrl('https://example.com:443')).toBe('https://example.com/');
+		expect(helpers.normalizeUrl('https://example.com:8443/')).toBe('https://example.com:8443/');
+		expect(helpers.normalizeUrl('http://münchen.de/ä')).toBe('http://xn--mnchen-3ya.de/%C3%A4');
+		expect(helpers.normalizeUrl('http://x/%7euser/%2fa%2F/%c3%a9/%41%2D%5F%2E%30/%2e%2E/z')).toBe('http://x/~user/%2Fa%2F/%C3%A9/z');
+		expect(helpers.normalizeUrl('http://x/a%2e/%zz')).toBe('http://x/a./%zz');
+		expect(helpers.normalizeUrl('http://%75ser:p%61ss@x/')).toBe('http://user:pass@x/');
+		expect(helpers.normalizeUrl('http://x/?#')).toBe('http://x/');
+		expect(helpers.normalizeUrl('http://x/path/?a=1&a=1')).toBe('http://x/path/?a=1&a=1');
+		expect(helpers.normalizeUrl('FOO://%41B.Com:80/%7e/x/?#')).toBe('foo://ab.com:80/~/x/');
+		expect(helpers.normalizeUrl('mailto:Someone@Example.com?subject=%7e')).toBe('mailto:Someone@Example.com?subject=~');
+		expect(helpers.normalizeUrl(new URL('HTTP://X'))).toBe('http://x/');
+	});
+
+	it('should strip the hash and www., force https, and remove trailing slashes on demand', function () {
+		expect(helpers.normalizeUrl('http://x/a#b', { stripHash: true })).toBe('http://x/a');
+		expect(helpers.normalizeUrl('http://www.example.com/', { stripWww: true })).toBe('http://example.com/');
+		for (const kept of ['http://www.com/', 'http://www.www.example.com/', 'http://wwwx.example.com/', 'http://a.www.example.com/']) {
+			expect(helpers.normalizeUrl(kept, { stripWww: true })).toBe(kept);
+		}
+		expect(helpers.normalizeUrl('http://x:443/', { forceHttps: true })).toBe('https://x/');
+		expect(helpers.normalizeUrl('http://x:8080/', { forceHttps: true })).toBe('https://x:8080/');
+		expect(helpers.normalizeUrl('ws://x/', { forceHttps: true })).toBe('ws://x/');
+		expect(helpers.normalizeUrl('http://x/a//?q#h', { removeTrailingSlash: true })).toBe('http://x/a?q#h');
+		expect(helpers.normalizeUrl('http://x//', { removeTrailingSlash: true })).toBe('http://x/');
+		expect(helpers.normalizeUrl('http://x/', { removeTrailingSlash: true })).toBe('http://x/');
+		expect(helpers.normalizeUrl('foo://x/a/', { removeTrailingSlash: true })).toBe('foo://x/a');
+		expect(helpers.normalizeUrl('mailto:a/', { removeTrailingSlash: true })).toBe('mailto:a/');
+		expect(helpers.normalizeUrl('http://x/a/')).toBe('http://x/a/');
+	});
+
+	it('should sort and filter query parameters on demand', function () {
+		expect(helpers.normalizeUrl('http://x/?b=2&a=1&c&a=0', { sortQuery: true })).toBe('http://x/?a=1&a=0&b=2&c=');
+		expect(helpers.normalizeUrl('http://x/?q=a%20b~', { sortQuery: true })).toBe('http://x/?q=a+b~');
+		expect(helpers.normalizeUrl('http://x/?', { sortQuery: true })).toBe('http://x/');
+		const removeQueryParams = ['ref', /^utm_/i, /x/g];
+		expect(helpers.normalizeUrl('http://x/?utm_source=a&UTM_medium=b&ref=c&reference=d&q=1&ax=2', { removeQueryParams })).toBe('http://x/?reference=d&q=1');
+		expect((removeQueryParams[2] as RegExp).lastIndex).toBe(0);
+		expect(helpers.normalizeUrl('http://x/?utm_source=a#h', { removeQueryParams })).toBe('http://x/#h');
+		expect(helpers.normalizeUrl('http://x/?q=a%20b', { removeQueryParams: ['z'] })).toBe('http://x/?q=a%20b');
+		expect(helpers.normalizeUrl('http://x/?q=1', { removeQueryParams: [vm.runInNewContext('/q/') as RegExp] })).toBe('http://x/');
+	});
+
+	it('should be idempotent', function () {
+		const options = { stripHash: true, stripWww: true, sortQuery: true, removeTrailingSlash: true, removeQueryParams: [/^utm_/], forceHttps: true };
+		for (const url of ['HTTP://WWW.www.Example.com:80/a/%7e//?utm_x=1&b=%7e&a', 'foo://%41/%2e/', 'http://x/a/..%2F', 'file:///C:/a/../b/']) {
+			for (const opts of [{}, options]) {
+				const once = helpers.normalizeUrl(url, opts);
+				expect(helpers.normalizeUrl(once, opts)).toBe(once);
+			}
+		}
+	});
+
+	it('should reject relative or invalid URLs and invalid options', function () {
+		for (const url of ['/relative', 'example.com', 'http://exa mple.com', '']) {
+			expect(function () {
+				helpers.normalizeUrl(url);
+			}).toThrow(new TypeError(`normalizeUrl: \`url\` must be an absolute URL, got ${JSON.stringify(url)}`));
+		}
+		expect(function () {
+			helpers.normalizeUrl(1 as never);
+		}).toThrow(new TypeError('normalizeUrl: `url` must be a string or a URL, got number'));
+		expect(function () {
+			helpers.normalizeUrl('http://x/', 'strip' as never);
+		}).toThrow(new TypeError('normalizeUrl: `options` must be an object, got string'));
+		for (const key of ['stripHash', 'stripWww', 'sortQuery', 'removeTrailingSlash', 'forceHttps']) {
+			expect(function () {
+				helpers.normalizeUrl('http://x/', { [key]: 1 });
+			}).toThrow(new TypeError(`normalizeUrl: \`${key}\` must be a boolean, got number`));
+		}
+		for (const removeQueryParams of ['utm', ['a', 1], [null]]) {
+			expect(function () {
+				helpers.normalizeUrl('http://x/', { removeQueryParams: removeQueryParams as never });
+			}).toThrow(
+				new TypeError(
+					`normalizeUrl: \`removeQueryParams\` must be an array of strings and regular expressions, got ${typeof removeQueryParams === 'string' ? 'string' : 'object'}`
+				)
+			);
+		}
+	});
+});
+
+describe('tryParseUrl', function () {
+	it('should parse like new URL, returning undefined instead of throwing, with or without URL.parse', function () {
+		const native = Object.getOwnPropertyDescriptor(URL, 'parse');
+		try {
+			for (const withParse of [true, false]) {
+				if (!withParse) delete (URL as { parse?: unknown }).parse;
+				expect(helpers.tryParseUrl('https://example.com/a?b=1')?.href).toBe('https://example.com/a?b=1');
+				expect(helpers.tryParseUrl('../c', 'https://example.com/a/b')?.href).toBe('https://example.com/c');
+				expect(helpers.tryParseUrl('c', new URL('https://example.com/a/'))?.href).toBe('https://example.com/a/c');
+				const url = new URL('https://example.com/');
+				const copy = helpers.tryParseUrl(url);
+				expect(copy).toBeInstanceOf(URL);
+				expect(copy).not.toBe(url);
+				expect(helpers.tryParseUrl('/relative')).toBeUndefined();
+				expect(helpers.tryParseUrl('a', 'not a base')).toBeUndefined();
+				expect(helpers.tryParseUrl('http://exa mple.com')).toBeUndefined();
+			}
+		} finally {
+			if (native) Object.defineProperty(URL, 'parse', native);
+		}
+		expect(typeof (URL as { parse?: unknown }).parse).toBe('function');
+	});
+});

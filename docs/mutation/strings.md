@@ -32,3 +32,16 @@
 957: `length < common.length` → `<=` — at `length === common.length`, `common[length]` is undefined; matching `indentation[length]` (also undefined) adds 1 but `common.slice(0, length)` is still the whole of `common`.
 1097: `wordLength > width` → `>=` — a word of exactly `width` graphemes is placed on its own line by either branch (it never fits after other words).
 1165: `hidden <= 0` → `hidden < 0` — with `hidden === 0`, the masked form `start + '' + end` is the original string.
+416: `found > 0` → `found >= 0` — position 0 is always in `boundaries`, so the loop stops there either way.
+474: `string.slice(0, length + 1)` → `string`, or the test → `true` — truncate fast path (every position a grapheme boundary); the grapheme path gives the same cut and boundaries.
+747: `if (NON_ASCII.test(text))` → `if (true)` — toSlug ASCII fast path: NFKD, the diacritic and transliteration replacements leave ASCII unchanged.
+2564: `index < length` → `index <= length` — past the end `charCodeAt` gives `NaN`, and the next check returns the length either way.
+2570: `index >= length` → `index > length` — at the end the code is `NaN`: one more iteration reaches the same `return length`.
+2588: `index < length` → `index <= length` — same as 2564, for an unquoted attribute value.
+2748: `if (prefix === '') return string` → `if (false)` — indent fast path: prepending `''` changes nothing.
+2754: `index < parts.length` → `<=` — `parts.length` is odd and `index` even, so `index` never equals it.
+2834: `index < string.length` → `<=` — `charCodeAt` past the end is `NaN`, which adds no bytes.
+2838: `code >= 0x80` → `code > 0x80` — U+0080 is a C1 control, replaced before any UTF-8 length is measured.
+2851: `utf8Length(string) <= budget` → `false` or `<` — fitBytes fast path: the grapheme loop keeps the whole string when it fits.
+2875: `end > 0` → `true` or `end >= 0` — `string[-1]` is `undefined`, which ends the loop.
+2924: `dot > 0` → `dot >= 0` — a leading dot gives an empty stem, which takes the same whole-name path as no extension.

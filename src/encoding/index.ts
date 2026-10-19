@@ -1,5 +1,6 @@
 /**
- * Binary-to-text encodings and hashing that work in every JavaScript runtime, without Node's `Buffer`.
+ * Binary-to-text encodings (base64, base32, hex, UTF-8), hashing, constant-time comparison, JWT decoding and CSV that work in every
+ * JavaScript runtime, without Node's `Buffer`.
  *
  * Conventions shared by every function in this module:
  * - **Inputs.** Byte parameters accept a {@link BytesInput}: a `Uint8Array` (a Node `Buffer` too), any other typed array or `DataView`
@@ -21,7 +22,8 @@
  *   used everywhere else.
  */
 
-import { describe, show } from '../utils/assert.js';
+import { assertNumber, describe, show } from '../utils/assert.js';
+import { withoutProtoKeys } from '../utils/proto.js';
 
 export type { Base64Padding } from '../validate/index.js';
 import type { Base64Padding } from '../validate/index.js';
@@ -168,12 +170,13 @@ function bytesOf(caller: string, value: unknown): Uint8Array {
  * Normalizes a string or {@link BytesInput} parameter: strings are encoded as UTF-8 (lone surrogates as U+FFFD).
  * @param {string} caller - Name of the public function, used in the error message
  * @param {unknown} value - The value of its `data` parameter
+ * @param {string} [name='data'] - Name of the parameter, used in the error message
  * @returns {Uint8Array} The bytes
  * @throws {TypeError} when `value` is neither a string nor binary data
  */
-function dataOf(caller: string, value: unknown): Uint8Array {
+function dataOf(caller: string, value: unknown, name = 'data'): Uint8Array {
 	const view = typeof value === 'string' ? encodeUtf8(value) : viewOf(value);
-	if (view === undefined) throw new TypeError(`${caller}: \`data\` must be a string, an ArrayBuffer or an ArrayBuffer view, got ${describe(value)}`);
+	if (view === undefined) throw new TypeError(`${caller}: \`${name}\` must be a string, an ArrayBuffer or an ArrayBuffer view, got ${describe(value)}`);
 	return view;
 }
 
@@ -878,4 +881,817 @@ export function sha256(data: string | BytesInput): Uint8Array<ArrayBuffer> {
  */
 export function sha256Hex(data: string | BytesInput): string {
 	return toHex(sha256(data));
+}
+
+/**
+ * Compares two byte sequences (or the UTF-8 encodings of two strings) in a time that depends only on their length, not on where they
+ * first differ: use it to check a secret (an HMAC, an API key, a CSRF or reset token) against the expected value, where an early-exit
+ * `===` lets an attacker recover it byte by byte by timing the responses.
+ *
+ * The LENGTH is not hidden: inputs of different lengths return `false` at once. That is the norm (Node's `crypto.timingSafeEqual`
+ * throws instead) and harmless for fixed-length values such as digests; to hide the length of a variable-length secret, compare their
+ * digests instead (`timingSafeEqual(sha256(a), sha256(b))`). JavaScript engines give no formal constant-time guarantee, but the loop has
+ * no data-dependent branch or early exit.
+ * @param {string | BytesInput} a - The first value (a string is compared as UTF-8)
+ * @param {string | BytesInput} b - The second value
+ * @returns {boolean} Whether both hold the same bytes
+ * @throws {TypeError} when `a` or `b` is neither a string nor binary data
+ * @example
+ * timingSafeEqual(new Uint8Array([1, 2, 3]), new Uint8Array([1, 2, 3])); // => true
+ * timingSafeEqual('secret-token', 'secret-tokem'); // => false
+ * timingSafeEqual('abc', 'abcd'); // => false // a different length returns false at once
+ * timingSafeEqual(sha256('a'), sha256('a')); // => true
+ */
+export function timingSafeEqual(a: string | BytesInput, b: string | BytesInput): boolean {
+	const left = dataOf('timingSafeEqual', a, 'a');
+	const right = dataOf('timingSafeEqual', b, 'b');
+	const length = left.length;
+	if (length !== right.length) return false;
+	let difference = 0;
+	for (let i = 0; i < length; i++) difference |= left[i] ^ right[i];
+	return difference === 0;
+}
+
+/**
+ * The base32 alphabets: `'rfc4648'` (RFC 4648 §6: `A`–`Z` then `2`–`7`, as in TOTP secrets), `'hex'` (base32hex, RFC 4648 §7: `0`–`9`
+ * then `A`–`V`, which keeps the sort order of the bytes) and `'crockford'` (Douglas Crockford's: `0`–`9` then the letters except `I`,
+ * `L`, `O` and `U`, as in ULIDs).
+ */
+export type Base32Alphabet = 'rfc4648' | 'hex' | 'crockford';
+
+/**
+ * Options accepted by {@link toBase32}.
+ */
+export interface ToBase32Options {
+	/** The alphabet. Defaults to `'rfc4648'`. */
+	readonly alphabet?: Base32Alphabet;
+	/** Append `=` padding up to a multiple of 8 characters. Defaults to `true`, except with `'crockford'` (which has no padding). */
+	readonly padding?: boolean;
+}
+
+/**
+ * Options accepted by {@link fromBase32}.
+ */
+export interface FromBase32Options {
+	/** The alphabet. Defaults to `'rfc4648'`. */
+	readonly alphabet?: Base32Alphabet;
+	/** Whether `=` padding is `'optional'`, `'required'` or `'forbidden'`. Defaults to `'optional'`. */
+	readonly padding?: Base64Padding;
+}
+
+/** The base32 alphabets, at the indexes returned by {@link base32Kind}. */
+const BASE32 = ['ABCDEFGHIJKLMNOPQRSTUVWXYZ234567', '0123456789ABCDEFGHIJKLMNOPQRSTUV', '0123456789ABCDEFGHJKMNPQRSTVWXYZ'];
+
+/** Lazily built base32 decoding tables (indexes as in {@link BASE32}): ASCII code → 5-bit value, `32` for invalid characters. */
+const base32Tables: Uint8Array[] = [];
+
+/**
+ * Validates the `alphabet` option of the base32 functions.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {unknown} alphabet - The option (`undefined` when absent)
+ * @returns {number} `0` for `'rfc4648'`, `1` for `'hex'`, `2` for `'crockford'`
+ * @throws {RangeError} when `alphabet` is not one of those names
+ */
+function base32Kind(caller: string, alphabet: unknown): number {
+	const kind = alphabet === undefined ? 0 : ['rfc4648', 'hex', 'crockford'].indexOf(alphabet as string);
+	if (kind === -1) throw new RangeError(`${caller}: \`alphabet\` must be 'rfc4648', 'hex' or 'crockford', got ${show(alphabet)}`);
+	return kind;
+}
+
+/**
+ * Encodes binary data (or the UTF-8 encoding of a string) as base32: RFC 4648 §6 (the default), base32hex (§7) or Crockford's base32,
+ * with uppercase letters.
+ * @param {string | BytesInput} data - The bytes to encode, or a string to encode as UTF-8
+ * @param {ToBase32Options} [options={}] - `alphabet` (default `'rfc4648'`): `'rfc4648'`, `'hex'` or `'crockford'`; `padding` (default
+ * `true`, `false` with `'crockford'`): append `=` up to a multiple of 8 characters
+ * @returns {string} The encoded text (empty for no bytes)
+ * @throws {TypeError} when `data` is neither a string nor binary data, `options` is not an object, or `padding` is not a boolean
+ * @throws {RangeError} when `alphabet` is not `'rfc4648'`, `'hex'` or `'crockford'`
+ * @example
+ * toBase32('foobar'); // => 'MZXW6YTBOI======'
+ * toBase32('foobar', { padding: false }); // => 'MZXW6YTBOI'
+ * toBase32('foobar', { alphabet: 'hex' }); // => 'CPNMUOJ1E8======'
+ * toBase32(new Uint8Array([255, 0]), { alphabet: 'crockford' }); // => 'ZW00'
+ */
+export function toBase32(data: string | BytesInput, options?: ToBase32Options): string {
+	const [alphabetOption, paddingOption] = readOptions('toBase32', options, ['alphabet', 'padding']);
+	const kind = base32Kind('toBase32', alphabetOption);
+	const padding = booleanOption('toBase32', 'padding', paddingOption, kind !== 2);
+	const bytes = dataOf('toBase32', data);
+	const alphabet = BASE32[kind];
+	const length = bytes.length;
+	// At most two characters per byte, plus the final partial one.
+	const codes = new Uint16Array(Math.min(CHUNK, 2 * length) + 3);
+	let count = 0;
+	let text = '';
+	// The bits not yet written are the low `bits` bits of `buffer` (higher ones fall off the 32-bit shifts harmlessly).
+	let buffer = 0;
+	let bits = 0;
+	for (let i = 0; i < length; i++) {
+		buffer = (buffer << 8) | bytes[i];
+		bits += 8;
+		while (bits >= 5) {
+			bits -= 5;
+			codes[count++] = alphabet.charCodeAt((buffer >> bits) & 31);
+		}
+		if (count >= CHUNK) {
+			text += fromCodes(codes, count);
+			count = 0;
+		}
+	}
+	// The leftover bits, completed with zeros to a whole character.
+	if (bits > 0) codes[count++] = alphabet.charCodeAt((buffer << (5 - bits)) & 31);
+	text += fromCodes(codes, count);
+	return padding ? text + '='.repeat(-text.length & 7) : text;
+}
+
+/**
+ * Decodes base32 text (see {@link toBase32}) strictly, like {@link fromBase64}: it rejects characters outside the alphabet (white space
+ * and Crockford's optional `-` separators included), misplaced or incomplete padding, a final group of 1, 3 or 6 characters (which no
+ * bytes encode to), and non-canonical text whose last character has non-zero unused bits. Letters may be in either case (base32 is
+ * meant to be case-insensitive), and with `'crockford'`, `I` and `L` read as `1` and `O` as `0`, as its specification requires; so
+ * `toBase32(fromBase32(text))` gives `text` back up to letter case (and those substitutions).
+ * @param {string} text - The base32 text
+ * @param {FromBase32Options} [options={}] - `alphabet` (default `'rfc4648'`): `'rfc4648'`, `'hex'` or `'crockford'`; `padding` (default
+ * `'optional'`): whether `=` padding is `'optional'`, `'required'` or `'forbidden'`
+ * @returns {Uint8Array} The decoded bytes, in a new array
+ * @throws {TypeError} when `text` is not a string or `options` is not an object
+ * @throws {RangeError} when `alphabet` or `padding` is not one of the accepted names
+ * @throws {SyntaxError} when `text` is not canonical base32 text in that alphabet, satisfying the options
+ * @example
+ * decodeUtf8(fromBase32('MZXW6YTBOI======')); // => 'foobar'
+ * decodeUtf8(fromBase32('mzxw6ytboi')); // => 'foobar'
+ * fromBase32('ZW00', { alphabet: 'crockford' }); // => new Uint8Array([255, 0])
+ * fromBase32('zwoo', { alphabet: 'crockford' }); // => new Uint8Array([255, 0])
+ * fromBase32('MZXW6YTBOI', { padding: 'required' }); // throws SyntaxError
+ * fromBase32('MZ======'); // throws SyntaxError // non-canonical: the last character's unused bits are not zero
+ */
+export function fromBase32(text: string, options?: FromBase32Options): Uint8Array<ArrayBuffer> {
+	const [alphabetOption, padding = 'optional'] = readOptions('fromBase32', options, ['alphabet', 'padding']);
+	const kind = base32Kind('fromBase32', alphabetOption);
+	if (padding !== 'optional' && padding !== 'required' && padding !== 'forbidden') {
+		throw new RangeError(`fromBase32: \`padding\` must be 'optional', 'required' or 'forbidden', got ${show(padding)}`);
+	}
+	if (typeof text !== 'string') throw new TypeError(`fromBase32: \`text\` must be a string, got ${describe(text)}`);
+
+	const length = text.length;
+	// `end` is the number of data characters: at most six final `=` are padding; any other `=` is an invalid character below.
+	let end = length;
+	while (end > length - 6 && text.charCodeAt(end - 1) === 61) end--;
+	const remainder = end % 8;
+	// As in `fromBase64`, a misplaced or missing padding is reported after any invalid character.
+	let problem: string | undefined;
+	if (remainder === 1 || remainder === 3 || remainder === 6) {
+		problem = `must not end with a group of ${remainder} characters (no bytes encode to it), got ${end} data characters`;
+	} else if (end < length ? padding === 'forbidden' : remainder !== 0 && padding === 'required') {
+		problem = end < length ? `must not be padded, got "=" at index ${end}` : `must be padded to a multiple of 8 characters, got ${length}`;
+	} else if (end < length && length % 8 !== 0) {
+		problem = `must be padded to a multiple of 8 characters, got ${length}`;
+	}
+
+	let table = base32Tables[kind];
+	if (table === undefined) {
+		table = base32Tables[kind] = new Uint8Array(128).fill(32);
+		const alphabet = BASE32[kind];
+		// Both letter cases (`| 32` lowercases a letter and leaves a digit unchanged).
+		for (let i = 0; i < 32; i++) table[alphabet.charCodeAt(i)] = table[alphabet.charCodeAt(i) | 32] = i;
+		if (kind === 2) {
+			// Crockford: `I` and `L` read as 1, `O` as 0, in either case.
+			for (const letter of 'IiLl') table[letter.charCodeAt(0)] = 1;
+			table[79] = table[111] = 0;
+		}
+	}
+	const bytes = new Uint8Array(Math.floor((end * 5) / 8));
+	let buffer = 0;
+	let bits = 0;
+	let offset = 0;
+	for (let i = 0; i < end; i++) {
+		const code = text.charCodeAt(i);
+		// Codes above 127 index past the table: `undefined`, which is not 32 but is caught by `>= 32`.
+		const value = table[code];
+		if (!(value < 32)) {
+			const name = ['base32', 'base32hex', 'Crockford base32'][kind];
+			throw new SyntaxError(`fromBase32: \`text\` must contain only ${name} characters, got ${quoteAt(text, i)} at index ${i}`);
+		}
+		buffer = (buffer << 5) | value;
+		bits += 5;
+		if (bits >= 8) {
+			bits -= 8;
+			bytes[offset++] = buffer >> bits;
+		}
+	}
+	if (problem !== undefined) throw new SyntaxError(`fromBase32: \`text\` ${problem}`);
+	if (buffer & ((1 << bits) - 1)) {
+		throw new SyntaxError(`fromBase32: \`text\` must be canonical (the unused bits of its last character must be 0), got ${quoteAt(text, end - 1)} at index ${end - 1}`);
+	}
+	return bytes;
+}
+
+/**
+ * The registered claims of a JWT payload (RFC 7519 §4.1), all optional, and any other claim.
+ */
+export interface JwtPayload {
+	/** Issuer. */
+	readonly iss?: string;
+	/** Subject. */
+	readonly sub?: string;
+	/** Audience: one recipient or several. */
+	readonly aud?: string | readonly string[];
+	/** Expiration time, in seconds since the epoch. */
+	readonly exp?: number;
+	/** Time before which the token must not be accepted, in seconds since the epoch. */
+	readonly nbf?: number;
+	/** Issue time, in seconds since the epoch. */
+	readonly iat?: number;
+	/** Unique identifier. */
+	readonly jti?: string;
+	/** Any other claim. */
+	readonly [claim: string]: unknown;
+}
+
+/**
+ * The common parameters of a JWT's JOSE header (RFC 7515 §4.1), and any other parameter.
+ */
+export interface JwtHeader {
+	/** The signature algorithm (`'HS256'`, `'RS256'`, `'ES256'`, `'none'`…). */
+	readonly alg?: string;
+	/** The media type of the token (usually `'JWT'`). */
+	readonly typ?: string;
+	/** The identifier of the signing key. */
+	readonly kid?: string;
+	/** Any other parameter. */
+	readonly [parameter: string]: unknown;
+}
+
+/**
+ * A JWT decoded by {@link decodeJwt}.
+ * @template P - The payload type
+ * @template H - The header type
+ */
+export interface DecodedJwt<P extends object = JwtPayload, H extends object = JwtHeader> {
+	/** The JOSE header. */
+	readonly header: H;
+	/** The claims. */
+	readonly payload: P;
+	/** The signature bytes (empty for an unsecured `alg: 'none'` token), NOT checked. */
+	readonly signature: Uint8Array<ArrayBuffer>;
+}
+
+/**
+ * Options accepted by {@link isJwtExpired}.
+ */
+export interface IsJwtExpiredOptions {
+	/** The current time, as a `Date` or in milliseconds since the epoch. Defaults to `Date.now()`. */
+	readonly now?: Date | number;
+	/** Tolerated clock skew, in seconds: the token expires `leeway` seconds after its `exp` time. Defaults to `0`. */
+	readonly leeway?: number;
+}
+
+/**
+ * Decodes a JSON Web Token in compact serialization (`header.payload.signature`, each part base64url-encoded) WITHOUT VERIFYING IT.
+ *
+ * ⚠️ The signature is not checked: anyone can forge a token with any claims, so never trust the payload to authenticate or authorize
+ * a request (verify the token server-side with its key, e.g. with `crypto.subtle.verify` or a JOSE library, before relying on it). This
+ * is for reading claims you already trust (a token your own server just issued to this client) or for display and debugging, like
+ * `jwt-decode` and jose's `decodeJwt`.
+ *
+ * Strict: the token must have exactly three parts (an encrypted JWE, with five, is rejected), each canonical base64url text without
+ * padding (see {@link fromBase64}); the header and payload must be UTF-8 JSON objects. Prototype-pollution keys are removed from them
+ * (any `__proto__` key, and a `constructor` key holding an object with a `prototype` key, as the validate module's `parseJson` does with
+ * `proto: 'remove'`), so the claims can be merged or spread safely.
+ * @template P - The payload type (not validated: check the claims you rely on)
+ * @template H - The header type
+ * @param {string} token - The JWT
+ * @returns {DecodedJwt<P, H>} The header, the payload, and the signature bytes
+ * @throws {TypeError} when `token` is not a string
+ * @throws {SyntaxError} when `token` is not three base64url parts, or its header or payload is not a JSON object
+ * @example
+ * const token = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
+ * decodeJwt(token).header; // => { alg: 'HS256', typ: 'JWT' }
+ * decodeJwt(token).payload; // => { sub: '1234567890', name: 'John Doe', iat: 1516239022 }
+ * decodeJwt(token).signature.length; // => 32
+ * decodeJwt('not.a.jwt'); // throws SyntaxError
+ */
+export function decodeJwt<P extends object = JwtPayload, H extends object = JwtHeader>(token: string): DecodedJwt<P, H> {
+	return decodeToken('decodeJwt', token) as DecodedJwt<P, H>;
+}
+
+/**
+ * Decodes a JWT for {@link decodeJwt} and the expiration helpers.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {unknown} token - The token
+ * @returns {DecodedJwt} The decoded token
+ * @throws {TypeError} when `token` is not a string
+ * @throws {SyntaxError} when `token` is malformed
+ */
+function decodeToken(caller: string, token: unknown): DecodedJwt {
+	if (typeof token !== 'string') throw new TypeError(`${caller}: \`token\` must be a string, got ${describe(token)}`);
+	const first = token.indexOf('.');
+	// Without a first dot, `second` is -1 too.
+	const second = token.indexOf('.', first + 1);
+	if (second === -1 || token.includes('.', second + 1)) {
+		throw new SyntaxError(`${caller}: \`token\` must have 3 parts separated by dots, got ${token.split('.').length}`);
+	}
+	return {
+		header: jwtObject(caller, token.slice(0, first), 'header'),
+		payload: jwtObject(caller, token.slice(first + 1, second), 'payload'),
+		signature: jwtBytes(caller, token.slice(second + 1), 'signature')
+	};
+}
+
+/**
+ * Decodes one base64url part of a JWT.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {string} part - The text of the part
+ * @param {string} name - Its name, for the error message
+ * @returns {Uint8Array} The bytes
+ * @throws {SyntaxError} when `part` is not canonical base64url text without padding
+ */
+function jwtBytes(caller: string, part: string, name: string): Uint8Array<ArrayBuffer> {
+	try {
+		return fromBase64(part, { urlSafe: true, padding: 'forbidden' });
+	} catch (error) {
+		throw new SyntaxError(`${caller}: the ${name} of \`token\` must be base64url text without padding`, { cause: error });
+	}
+}
+
+/**
+ * Decodes the JSON object of a JWT part, without prototype-pollution keys.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {string} part - The base64url text of the part
+ * @param {string} name - Its name, for error messages
+ * @returns {Record<string, unknown>} The object
+ * @throws {SyntaxError} when `part` is not the base64url encoding of a UTF-8 JSON object
+ */
+function jwtObject(caller: string, part: string, name: string): Record<string, unknown> {
+	const bytes = jwtBytes(caller, part, name);
+	let value: unknown;
+	try {
+		value = JSON.parse(decodeUtf8(bytes, { fatal: true }), withoutProtoKeys);
+	} catch (error) {
+		throw new SyntaxError(`${caller}: the ${name} of \`token\` must be UTF-8 JSON`, { cause: error });
+	}
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		throw new SyntaxError(`${caller}: the ${name} of \`token\` must be a JSON object, got ${Array.isArray(value) ? 'array' : describe(value)}`);
+	}
+	return value as Record<string, unknown>;
+}
+
+/**
+ * Reads the `exp` claim of a JWT.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {unknown} token - The token
+ * @returns {Date | undefined} The expiration time, `undefined` without an `exp` claim
+ * @throws {TypeError} when `token` is not a string
+ * @throws {SyntaxError} when `token` is malformed or its `exp` claim is not a valid time
+ */
+function expirationOf(caller: string, token: unknown): Date | undefined {
+	const exp = (decodeToken(caller, token).payload as JwtPayload).exp as unknown;
+	if (exp === undefined) return undefined;
+	const date = new Date(typeof exp === 'number' ? exp * 1000 : NaN);
+	if (Number.isNaN(date.getTime())) {
+		throw new SyntaxError(`${caller}: the \`exp\` claim of \`token\` must be a time in seconds since the epoch, got ${typeof exp === 'number' ? exp : describe(exp)}`);
+	}
+	return date;
+}
+
+/**
+ * Returns the expiration time of a JWT (its `exp` claim), WITHOUT VERIFYING the token (see {@link decodeJwt}): use it to schedule a
+ * token refresh on the client, never to decide whether a token is valid.
+ * @param {string} token - The JWT
+ * @returns {Date | undefined} The expiration time, or `undefined` when the token has no `exp` claim
+ * @throws {TypeError} when `token` is not a string
+ * @throws {SyntaxError} when `token` is malformed (see {@link decodeJwt}) or its `exp` claim is not a number of seconds in the range of `Date`
+ * @example
+ * const token = 'eyJhbGciOiJub25lIn0.eyJleHAiOjE3MDAwMDAwMDB9.';
+ * getJwtExpiration(token); // => new Date(1_700_000_000_000)
+ * getJwtExpiration('eyJhbGciOiJub25lIn0.e30.'); // => undefined
+ */
+export function getJwtExpiration(token: string): Date | undefined {
+	return expirationOf('getJwtExpiration', token);
+}
+
+/**
+ * Tells whether a JWT has expired, WITHOUT VERIFYING it (see {@link decodeJwt}): use it to refresh a token before sending it, never to
+ * decide whether a token is valid. Like jose, a token is expired from its `exp` time on (`now >= exp + leeway`), and a token WITHOUT an
+ * `exp` claim never expires (`false`).
+ * @param {string} token - The JWT
+ * @param {IsJwtExpiredOptions} [options={}] - `now` (default `Date.now()`): the current time, as a `Date` or in milliseconds;
+ * `leeway` (default `0`): tolerated clock skew, in seconds
+ * @returns {boolean} Whether the `exp` time (plus the leeway) has passed
+ * @throws {TypeError} when `token` is not a string, `options` is not an object, or `now` or `leeway` has the wrong type
+ * @throws {RangeError} when `now` is an invalid date or not finite, or `leeway` is negative or not finite
+ * @throws {SyntaxError} when `token` is malformed or its `exp` claim is not a valid time (see {@link getJwtExpiration})
+ * @example
+ * const token = 'eyJhbGciOiJub25lIn0.eyJleHAiOjE3MDAwMDAwMDB9.'; // exp: 1700000000
+ * isJwtExpired(token, { now: 1_699_999_999_000 }); // => false
+ * isJwtExpired(token, { now: 1_700_000_000_000 }); // => true
+ * isJwtExpired(token, { now: 1_700_000_010_000, leeway: 30 }); // => false
+ * isJwtExpired('eyJhbGciOiJub25lIn0.e30.'); // => false // no exp claim
+ */
+export function isJwtExpired(token: string, options?: IsJwtExpiredOptions): boolean {
+	const [nowOption, leeway = 0] = readOptions('isJwtExpired', options, ['now', 'leeway']);
+	const now = nowOption === undefined ? Date.now() : nowOption instanceof Date ? nowOption.getTime() : nowOption;
+	assertNumber('isJwtExpired', 'now', now, Number.isFinite(now), 'a valid Date or a finite number of milliseconds');
+	assertNumber('isJwtExpired', 'leeway', leeway, Number.isFinite(leeway) && (leeway as number) >= 0, 'a finite number of seconds >= 0');
+	const expiration = expirationOf('isJwtExpired', token);
+	// Compared in seconds: `leeway * 1000` overflows to `Infinity` past 1.8e305 seconds, while the difference of two times cannot.
+	return expiration !== undefined && (now - expiration.getTime()) / 1000 >= leeway;
+}
+
+/**
+ * Options accepted by {@link parseCsv}.
+ */
+export interface ParseCsvOptions {
+	/** The field separator: a single character other than `"`, `\r` and `\n`. Defaults to `','`. */
+	readonly delimiter?: string;
+	/**
+	 * Read the first row as column names and return records instead of arrays; a field missing from a short row is absent from its
+	 * record. Defaults to `false`.
+	 */
+	readonly header?: boolean;
+	/** Throw when a row has a different number of fields than the first row (with `header`, every record then has every column). Defaults to `false`. */
+	readonly strict?: boolean;
+	/** Skip lines holding no character at all (a line holding `""` is not empty). Defaults to `false`: such a line is a row of one empty field. */
+	readonly skipEmptyLines?: boolean;
+}
+
+/**
+ * A cell accepted by {@link toCsv}: numbers, bigints and booleans are written with `String()`, `null` and `undefined` as empty fields.
+ */
+export type CsvValue = string | number | bigint | boolean | null | undefined;
+
+/**
+ * Options accepted by {@link toCsv}.
+ */
+export interface ToCsvOptions {
+	/** The field separator: a single character other than `"`, `\r` and `\n`. Defaults to `','`. */
+	readonly delimiter?: string;
+	/** The line break between rows: `'\r\n'` (RFC 4180) or `'\n'`. No line break follows the last row. Defaults to `'\r\n'`. */
+	readonly newline?: '\r\n' | '\n';
+	/** Quote only the fields that need it (`'needed'`) or every field (`'all'`). Defaults to `'needed'`. */
+	readonly quote?: 'needed' | 'all';
+	/**
+	 * The column names. For records: the keys written, in this order (defaults to every own enumerable key, in the order first seen).
+	 * For arrays: the header row. Defaults to none for arrays.
+	 */
+	readonly columns?: readonly string[];
+	/** Write the column names as the first row (when there are any). Defaults to `true`. */
+	readonly header?: boolean;
+	/**
+	 * Defuse CSV (formula) injection (OWASP): prefix with `'` every string cell starting with a tab or a carriage return, or whose first
+	 * character after any leading white space is `=`, `+`, `-`, `@` or their full-width forms `＝`, `＋`, `－`, `＠`, so that spreadsheet
+	 * software shows it as text instead of running it as a formula; and quote every field, as `quote: 'all'` does. Defaults to `false`,
+	 * which keeps the data exact (`parseCsv` reads back what was written): turn it on for files meant to be opened in Excel, LibreOffice
+	 * or Google Sheets.
+	 */
+	readonly formulaEscape?: boolean;
+}
+
+/**
+ * Validates the `delimiter` option of the CSV functions.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {unknown} delimiter - The option (`undefined` when absent)
+ * @returns {number} The delimiter's character code (`,` by default)
+ * @throws {TypeError} when `delimiter` is not a string
+ * @throws {RangeError} when `delimiter` is not a single character other than `"`, `\r` and `\n`
+ */
+function delimiterOf(caller: string, delimiter: unknown): number {
+	if (delimiter === undefined) return 44;
+	if (typeof delimiter !== 'string') throw new TypeError(`${caller}: \`delimiter\` must be a string, got ${describe(delimiter)}`);
+	const code = delimiter.charCodeAt(0);
+	if (delimiter.length !== 1 || code === 34 || code === 10 || code === 13) {
+		throw new RangeError(`${caller}: \`delimiter\` must be a single character other than '"', '\\r' and '\\n', got ${JSON.stringify(delimiter)}`);
+	}
+	return code;
+}
+
+/**
+ * Describes a position of CSV text for an error message (lines end with CRLF, LF or CR; columns count UTF-16 code units from 1).
+ * @param {string} text - The CSV text
+ * @param {number} index - The position
+ * @returns {string} `'line L, column C'`
+ */
+function csvPosition(text: string, index: number): string {
+	let line = 1;
+	// A byte order mark is not a column.
+	let start = text.charCodeAt(0) === 0xfeff ? 1 : 0;
+	for (let i = 0; i < index; i++) {
+		const code = text.charCodeAt(i);
+		if (code === 10 || (code === 13 && text.charCodeAt(i + 1) !== 10)) {
+			line++;
+			start = i + 1;
+		}
+	}
+	return `line ${line}, column ${index - start + 1}`;
+}
+
+/**
+ * Parses CSV text (RFC 4180) into rows of fields, or with `header`, into records keyed by the first row.
+ *
+ * - Fields are separated by `delimiter`, rows by CRLF, LF or CR (mixed freely). A line break after the last row does not start
+ *   another one; an empty line inside the text is a row with one empty field (unless `skipEmptyLines`).
+ * - A field starting with `"` is quoted: it runs to the next lone `"`, may hold delimiters and line breaks (kept as written), and `""`
+ *   inside it stands for one `"`. A `"` inside an unquoted field is kept as is; anything but a delimiter or a line break after a closing
+ *   quote, or an unclosed quote, throws a `SyntaxError` with its line and column.
+ * - A leading byte order mark (U+FEFF) is ignored. Fields are not trimmed nor converted: every value is a string.
+ * - Ragged rows are returned as they are, unless `strict` is set: then every row must have as many fields as the first one.
+ * - With `header`, every record has a `null` prototype (a `__proto__` or `constructor` column is an ordinary own key) and holds the
+ *   fields of its row, keyed by column. A row shorter than the header leaves its missing trailing fields ABSENT from its record (not
+ *   `''`), so that the records take memory in proportion to the text, not to columns × rows; fields past the last column are dropped.
+ *   Use `strict` to reject such rows instead: then every record has every column. An empty column name is the key `''`; a repeated one
+ *   throws a `SyntaxError`, since one of the columns would be lost.
+ *
+ * Runs in linear time, and the result takes memory in proportion to the text. `toCsv` writes text that this function reads back exactly.
+ * @template K - The column names, with `header`
+ * @param {string} text - The CSV text
+ * @param {ParseCsvOptions} [options={}] - `delimiter` (default `','`), `header` (default `false`), `strict` (default `false`) and
+ * `skipEmptyLines` (default `false`)
+ * @returns {string[][] | Partial<Record<K, string>>[]} The rows, or with `header` the records (with every column, `Record<K, string>[]`,
+ * when `strict` is also set)
+ * @throws {TypeError} when `text` is not a string, `options` is not an object, or an option has the wrong type
+ * @throws {RangeError} when `delimiter` is not a single character other than `"`, `\r` and `\n`
+ * @throws {SyntaxError} when a quote is unclosed or followed by other text, a header name repeats, or with `strict`, a row is ragged
+ * @example
+ * parseCsv('a,b\r\n1,"x, ""y"""\n'); // => [['a', 'b'], ['1', 'x, "y"']]
+ * parseCsv('name;age\nAda;36', { delimiter: ';', header: true }); // => [{ name: 'Ada', age: '36' }]
+ * parseCsv('name,age\nAda\nAlan,41,x', { header: true }); // => [{ name: 'Ada' }, { name: 'Alan', age: '41' }]
+ * parseCsv('"multi\nline",2'); // => [['multi\nline', '2']]
+ * parseCsv('a,b\n1', { strict: true }); // throws SyntaxError
+ * parseCsv('"open'); // throws SyntaxError
+ */
+export function parseCsv(text: string, options?: ParseCsvOptions & { readonly header?: false }): string[][];
+/**
+ * Parses CSV text into records keyed by its first row, rejecting ragged rows, so that every record has every column (see the first
+ * overload).
+ * @template K - The column names
+ * @param {string} text - The CSV text
+ * @param {ParseCsvOptions} options - With `header: true` and `strict: true`
+ * @returns {Record<K, string>[]} The records, with a `null` prototype
+ */
+export function parseCsv<K extends string = string>(text: string, options: ParseCsvOptions & { readonly header: true; readonly strict: true }): Record<K, string>[];
+/**
+ * Parses CSV text into records keyed by its first row; a field missing from a short row is absent from its record (see the first overload).
+ * @template K - The column names
+ * @param {string} text - The CSV text
+ * @param {ParseCsvOptions} options - With `header: true`
+ * @returns {Partial<Record<K, string>>[]} The records, with a `null` prototype
+ */
+export function parseCsv<K extends string = string>(text: string, options: ParseCsvOptions & { readonly header: true }): Partial<Record<K, string>>[];
+/**
+ * Parses CSV text into rows or records (see the first overload).
+ * @param {string} text - The CSV text
+ * @param {ParseCsvOptions} [options={}] - The options
+ * @returns {string[][] | Partial<Record<string, string>>[]} The rows, or with `header` the records
+ */
+export function parseCsv(text: string, options?: ParseCsvOptions): string[][] | Partial<Record<string, string>>[];
+/**
+ * Implementation of the overloads above.
+ * @param {string} text - The CSV text
+ * @param {ParseCsvOptions} [options={}] - The options
+ * @returns {string[][] | Partial<Record<string, string>>[]} The rows or records
+ */
+export function parseCsv(text: string, options?: ParseCsvOptions): string[][] | Partial<Record<string, string>>[] {
+	const [delimiterOption, headerOption, strictOption, skipOption] = readOptions('parseCsv', options, ['delimiter', 'header', 'strict', 'skipEmptyLines']);
+	const delimiter = delimiterOf('parseCsv', delimiterOption);
+	const header = booleanOption('parseCsv', 'header', headerOption, false);
+	const strict = booleanOption('parseCsv', 'strict', strictOption, false);
+	const skipEmptyLines = booleanOption('parseCsv', 'skipEmptyLines', skipOption, false);
+	if (typeof text !== 'string') throw new TypeError(`parseCsv: \`text\` must be a string, got ${describe(text)}`);
+
+	const rows: string[][] = [];
+	const length = text.length;
+	let i = text.charCodeAt(0) === 0xfeff ? 1 : 0;
+	// The fields of the current row, `row[0]` to `row[count - 1]`, copied into an array of their exact size at the end of the row: an
+	// array grown by `push` reserves room for 17 fields, about 150 bytes, which is much more than the text of a short row.
+	const row: string[] = [];
+	let count = 0;
+	let rowStart = i;
+	while (i < length) {
+		let field: string;
+		if (text.charCodeAt(i) === 34) {
+			// A quoted field runs to the next lone `"`; `""` stands for one `"`.
+			const open = i;
+			field = '';
+			for (;;) {
+				const close = text.indexOf('"', i + 1);
+				if (close === -1) throw new SyntaxError(`parseCsv: \`text\` must close every quoted field, got one opened at ${csvPosition(text, open)}`);
+				field += text.slice(i + 1, close);
+				i = close + 1;
+				if (text.charCodeAt(i) !== 34) break;
+				field += '"';
+			}
+			const code = text.charCodeAt(i);
+			if (i < length && code !== delimiter && code !== 10 && code !== 13) {
+				throw new SyntaxError(`parseCsv: \`text\` must have a delimiter or a line break after a closing quote, got ${quoteAt(text, i)} at ${csvPosition(text, i)}`);
+			}
+		} else {
+			const start = i;
+			for (let code = text.charCodeAt(i); i < length && code !== delimiter && code !== 10 && code !== 13; code = text.charCodeAt(i)) i++;
+			field = text.slice(start, i);
+		}
+		row[count++] = field;
+		const code = text.charCodeAt(i);
+		if (code === delimiter) {
+			i++;
+			// A delimiter ending the text is followed by one more, empty, field.
+			if (i === length) row[count++] = '';
+			else continue;
+		}
+		// The end of the row: a line break, or the end of the text. An empty line has its line break at `rowStart`.
+		if (!(skipEmptyLines && i === rowStart)) {
+			if (strict && rows.length > 0 && count !== rows[0].length) {
+				throw new SyntaxError(
+					`parseCsv: \`text\` must have ${rows[0].length} fields in every row, like the first one, got ${count} in row ${rows.length + 1} (${csvPosition(text, rowStart)})`
+				);
+			}
+			rows.push(row.slice(0, count));
+		}
+		i += code === 13 && text.charCodeAt(i + 1) === 10 ? 2 : 1;
+		count = 0;
+		rowStart = i;
+	}
+	return header ? csvRecords(rows) : rows;
+}
+
+/**
+ * Turns parsed CSV rows into records keyed by the first row (see {@link parseCsv}). A record holds only the fields of its row, so the
+ * records take as much memory as the rows, whatever the number of columns.
+ * @param {string[][]} rows - The rows, the first one holding the column names
+ * @returns {Partial<Record<string, string>>[]} The records, with a `null` prototype
+ * @throws {SyntaxError} when a column name repeats
+ */
+function csvRecords(rows: string[][]): Partial<Record<string, string>>[] {
+	const names = rows.length > 0 ? rows[0] : [];
+	const seen = new Set<string>();
+	for (let column = 0; column < names.length; column++) {
+		if (seen.has(names[column])) {
+			throw new SyntaxError(`parseCsv: the header of \`text\` must not repeat a column name, got ${JSON.stringify(names[column])} again in column ${column + 1}`);
+		}
+		seen.add(names[column]);
+	}
+	const records: Partial<Record<string, string>>[] = [];
+	for (let index = 1; index < rows.length; index++) {
+		const row = rows[index];
+		const record = Object.create(null) as Record<string, string>;
+		const fields = Math.min(row.length, names.length);
+		for (let column = 0; column < fields; column++) record[names[column]] = row[column];
+		records.push(record);
+	}
+	return records;
+}
+
+/**
+ * The start of a cell that spreadsheet software may run as a formula: OWASP's CSV injection list (a tab or a carriage return, or `=`,
+ * `+`, `-`, `@`), also after leading white space (any `\s`: spaces, no-break spaces, U+3000, the byte order mark…), which spreadsheets
+ * skip, and in full-width form (`＝`, `＋`, `－`, `＠`), which some read as the ASCII sign.
+ */
+const FORMULA_START = /^[\t\r]|^\s*[=+\-@＝＋－＠]/;
+
+/**
+ * Writes rows as CSV text (RFC 4180) that {@link parseCsv} reads back exactly: rows of cells, or records (objects) whose keys become
+ * the columns.
+ *
+ * - A field is quoted only when it must be (it holds the delimiter, `"`, `\r` or `\n`, or starts with a byte order mark), or always
+ *   with `quote: 'all'` or `formulaEscape`; a `"` inside it is doubled. A row of one empty field is written `""`, so that it is not an empty line.
+ * - Strings are written as they are, numbers, bigints and booleans with `String()`, `null` and `undefined` as empty fields; any other
+ *   value (an object, a `Date`…) throws, so format it first.
+ * - Records: only own properties are read. The columns are `columns`, or every own enumerable key in the order first seen; a missing
+ *   key is an empty field. The column names are written as the first row unless `header` is `false`. With arrays, `columns` (when given)
+ *   is the header row.
+ * - Rows are separated by `newline` (CRLF by default), with none after the last one. A row with no cells is written as an empty line,
+ *   which `parseCsv` reads as one empty field.
+ *
+ * ⚠️ CSV injection: a cell such as `=HYPERLINK(...)` or `@SUM(...)` runs as a formula when the file is opened in a spreadsheet. When
+ * the data comes from users and the file is meant for Excel, LibreOffice or Google Sheets, set `formulaEscape: true` (OWASP's advice),
+ * which applies two rules:
+ * - A string cell starting with a tab or a carriage return, or whose first character after any leading white space (spaces, tabs, line
+ *   breaks, no-break spaces, U+3000, a byte order mark…) is `=`, `+`, `-`, `@` or a full-width `＝`, `＋`, `－`, `＠`, gets a leading
+ *   `'`: spreadsheets skip such white space and read the full-width signs as ASCII ones, so `' =1+2'` is as dangerous as `'=1+2'`.
+ * - Every field is quoted, as with `quote: 'all'`: the file may be opened in a spreadsheet whose locale uses another separator (`;` in
+ *   much of Europe), where an unquoted `safe;=1+2` would be split into a second cell `=1+2` that the first rule never saw.
+ *
+ * It is off by default because it changes the data (`-5` written as a string reads back as `'-5`); number cells are never prefixed.
+ * @param {ReadonlyArray<ReadonlyArray<CsvValue>>} rows - The rows: arrays of cells
+ * @param {ToCsvOptions} [options={}] - `delimiter` (default `','`), `newline` (default `'\r\n'`), `quote` (default `'needed'`),
+ * `columns`, `header` (default `true`) and `formulaEscape` (default `false`)
+ * @returns {string} The CSV text
+ * @throws {TypeError} when `rows` is not an array of arrays or of records, a cell has an unsupported type, `options` is not an object, or
+ * an option has the wrong type
+ * @throws {RangeError} when `delimiter`, `newline` or `quote` has an unsupported value
+ * @example
+ * toCsv([['a', 'b'], [1, 'x, "y"']]); // => 'a,b\r\n1,"x, ""y"""'
+ * toCsv([{ name: 'Ada', age: 36 }, { name: 'Alan' }], { newline: '\n' }); // => 'name,age\nAda,36\nAlan,'
+ * toCsv([[1, 2]], { columns: ['x', 'y'], delimiter: ';' }); // => 'x;y\r\n1;2'
+ * toCsv([['=1+2', ' @x', 'safe;=1+2', -3]], { formulaEscape: true }); // => `"'=1+2","' @x","safe;=1+2","-3"`
+ */
+export function toCsv(rows: ReadonlyArray<ReadonlyArray<CsvValue>>, options?: ToCsvOptions): string;
+/**
+ * Writes records as CSV text, one column per key (see the first overload).
+ * @template R - The record type
+ * @param {ReadonlyArray<R>} rows - The records
+ * @param {ToCsvOptions} [options={}] - The options; `columns` lists keys of the records
+ * @returns {string} The CSV text
+ */
+export function toCsv<R extends { readonly [K in keyof R]: CsvValue }>(
+	rows: ReadonlyArray<R>,
+	options?: ToCsvOptions & { readonly columns?: ReadonlyArray<R extends unknown ? keyof R & string : never> }
+): string;
+/**
+ * Implementation of the overloads above.
+ * @param {ReadonlyArray<unknown>} rows - The rows or records
+ * @param {ToCsvOptions} [options={}] - The options
+ * @returns {string} The CSV text
+ */
+export function toCsv(rows: ReadonlyArray<unknown>, options?: ToCsvOptions): string {
+	const [delimiterOption, newline = '\r\n', quote = 'needed', columns, headerOption, escapeOption] = readOptions('toCsv', options, [
+		'delimiter',
+		'newline',
+		'quote',
+		'columns',
+		'header',
+		'formulaEscape'
+	]);
+	const delimiter = delimiterOf('toCsv', delimiterOption);
+	if (newline !== '\r\n' && newline !== '\n')
+		throw new RangeError(`toCsv: \`newline\` must be '\\r\\n' or '\\n', got ${typeof newline === 'string' ? JSON.stringify(newline) : show(newline)}`);
+	if (quote !== 'needed' && quote !== 'all') throw new RangeError(`toCsv: \`quote\` must be 'needed' or 'all', got ${show(quote)}`);
+	if (columns !== undefined) {
+		const bad = Array.isArray(columns)
+			? columns.findIndex(function (name: unknown): boolean {
+					return typeof name !== 'string';
+				})
+			: -2;
+		if (bad !== -1) {
+			throw new TypeError(
+				`toCsv: \`columns\` must be an array of strings, got ${bad === -2 ? describe(columns) : `${describe((columns as unknown[])[bad])} at index ${bad}`}`
+			);
+		}
+	}
+	const header = booleanOption('toCsv', 'header', headerOption, true);
+	const formulaEscape = booleanOption('toCsv', 'formulaEscape', escapeOption, false);
+	// Escaping formulas quotes every field, so that no cell can be split off where a spreadsheet uses another separator.
+	const quoteAll = quote === 'all' || formulaEscape;
+	if (!Array.isArray(rows)) throw new TypeError(`toCsv: \`rows\` must be an array, got ${describe(rows)}`);
+
+	const records = rows.length > 0 ? !Array.isArray(rows[0]) : false;
+	let names = columns as string[] | undefined;
+	if (records && names === undefined) {
+		const keys = new Set<string>();
+		for (const row of rows) if (typeof row === 'object' && row !== null) for (const key of Object.keys(row)) keys.add(key);
+		names = [...keys];
+	}
+
+	/**
+	 * Writes one cell.
+	 * @param {unknown} value - The cell
+	 * @param {string} at - Its position (`'rows[1][2]'`), for the error message
+	 * @returns {string} The field, quoted when needed
+	 * @throws {TypeError} when `value` is not a {@link CsvValue}
+	 */
+	function field(value: unknown, at: string): string {
+		let text: string;
+		if (typeof value === 'string') text = formulaEscape && FORMULA_START.test(value) ? `'${value}` : value;
+		else if (value === null || value === undefined) text = '';
+		else if (typeof value === 'number' || typeof value === 'bigint' || typeof value === 'boolean') text = String(value);
+		else throw new TypeError(`toCsv: \`${at}\` must be a string, number, bigint, boolean, null or undefined, got ${describe(value)}`);
+		let needed = quoteAll || text.charCodeAt(0) === 0xfeff;
+		for (let i = 0; !needed && i < text.length; i++) {
+			const code = text.charCodeAt(i);
+			needed = code === delimiter || code === 34 || code === 10 || code === 13;
+		}
+		return needed ? `"${text.replaceAll('"', '""')}"` : text;
+	}
+
+	/**
+	 * Writes one row.
+	 * @param {ReadonlyArray<unknown>} cells - The cells
+	 * @param {string} at - The row's position (`'rows[1]'`), for error messages
+	 * @returns {string} The line, without its line break
+	 */
+	function line(cells: ReadonlyArray<unknown>, at: string): string {
+		const fields = cells.map(function (cell: unknown, index: number): string {
+			return field(cell, `${at}[${records ? JSON.stringify((names as string[])[index]) : index}]`);
+		});
+		return fields.length === 1 && fields[0] === '' ? '""' : fields.join(String.fromCharCode(delimiter));
+	}
+
+	const lines: string[] = [];
+	if (names !== undefined && header) lines.push(line(names, 'columns'));
+	for (let index = 0; index < rows.length; index++) {
+		const row = rows[index] as Readonly<Record<string, unknown>> | ReadonlyArray<unknown>;
+		const isArray = Array.isArray(row);
+		if (records ? isArray || typeof row !== 'object' || row === null : !isArray) {
+			throw new TypeError(
+				`toCsv: \`rows[${index}]\` must be ${records ? 'a record (a non-array object)' : 'an array'} like the first row, got ${isArray ? 'array' : describe(row)}`
+			);
+		}
+		const cells = records
+			? (names as string[]).map(function (key: string): unknown {
+					return Object.hasOwn(row, key) ? (row as Readonly<Record<string, unknown>>)[key] : undefined;
+				})
+			: (row as ReadonlyArray<unknown>);
+		lines.push(line(cells, `rows[${index}]`));
+	}
+	return lines.join(newline as string);
 }

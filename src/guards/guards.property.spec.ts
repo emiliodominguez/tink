@@ -423,3 +423,66 @@ describe('round 11 guards (properties)', function () {
 		);
 	});
 });
+
+describe('getType and small guards (properties)', function () {
+	/** The guard each object type name stands for. */
+	const GUARDS: ReadonlyArray<[guards.TypeName, (value: unknown) => boolean]> = [
+		['array', guards.isArray],
+		['date', guards.isDate],
+		['regexp', guards.isRegExp],
+		['map', guards.isMap],
+		['set', guards.isSet],
+		['weakmap', guards.isWeakMap],
+		['weakset', guards.isWeakSet],
+		['arraybuffer', guards.isArrayBuffer],
+		['error', guards.isError]
+	];
+
+	const values = fc.oneof(
+		anythingOrFunction,
+		fc.constantFrom(new WeakMap(), new WeakSet(), new ArrayBuffer(1), new DataView(new ArrayBuffer(1)), new Error('x'), Promise.resolve(), /a/),
+		fc.constantFrom(
+			async function () {},
+			function* () {},
+			async function* () {}
+		),
+		fc.string().map(function (tag) {
+			return { [Symbol.toStringTag]: tag };
+		})
+	);
+
+	it('getType agrees with typeof for primitives and with the brand-checking guards for objects', function () {
+		fc.assert(
+			fc.property(values, function (value) {
+				const type = guards.getType(value);
+				if (value === null) expect(type).toBe('null');
+				else if (typeof value !== 'object' && typeof value !== 'function') expect(type).toBe(typeof value);
+				else if (typeof value === 'function') expect(['function', 'asyncfunction', 'generatorfunction', 'asyncgeneratorfunction']).toContain(type);
+				for (const [name, guard] of GUARDS) expect([name, type === name]).toEqual([name, guard(value)]);
+				if (guards.isTypedArray(value)) expect(type).toMatch(/^[a-z0-9]+array$/);
+				if (type !== 'array' && type.endsWith('array')) expect(ArrayBuffer.isView(value)).toBe(true);
+				expect(type === 'asyncfunction').toBe(guards.isAsyncFunction(value));
+				expect(type === 'generatorfunction').toBe(guards.isGeneratorFunction(value));
+			})
+		);
+	});
+
+	it('isPropertyKey holds exactly for strings, numbers and symbols', function () {
+		fc.assert(
+			fc.property(anythingOrFunction, function (value) {
+				expect(guards.isPropertyKey(value)).toBe(['string', 'number', 'symbol'].includes(typeof value));
+			})
+		);
+	});
+
+	it('isArrayLike holds for arrays, strings and typed arrays, never for functions or nullish values', function () {
+		fc.assert(
+			fc.property(anythingOrFunction, function (value) {
+				const arrayLike = guards.isArrayLike(value);
+				if (Array.isArray(value) || typeof value === 'string' || guards.isTypedArray(value)) expect(arrayLike).toBe(true);
+				if (value == null || typeof value === 'function') expect(arrayLike).toBe(false);
+				if (arrayLike) expect(Number.isSafeInteger((value as ArrayLike<unknown>).length)).toBe(true);
+			})
+		);
+	});
+});

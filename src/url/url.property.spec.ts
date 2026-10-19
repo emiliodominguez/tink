@@ -836,3 +836,157 @@ describe('route patterns (properties)', function () {
 		);
 	});
 });
+
+describe('Cookie helpers (properties)', function () {
+	/** A cookie name: an RFC 7230 token. */
+	const cookieName = fc.string({ unit: fc.constantFrom(..."aZ09!#$%&'*+-.^_`|~"), minLength: 1, maxLength: 6 });
+
+	/** The naive reading of a Cookie header: split on `;`, then on the first `=`, first occurrence wins. */
+	function reference(header: string): Record<string, string> {
+		const cookies = Object.create(null) as Record<string, string>;
+		for (const pair of header.split(';')) {
+			const equals = pair.indexOf('=');
+			if (equals === -1) continue;
+			const name = pair.slice(0, equals).replace(/^[ \t]+|[ \t]+$/g, '');
+			if (Object.hasOwn(cookies, name)) continue;
+			const text = pair.slice(equals + 1).replace(/^[ \t]+|[ \t]+$/g, '');
+			cookies[name] = helpers.safeDecodeURIComponent(/^".*"$/s.test(text) ? text.slice(1, -1) : text);
+		}
+		return cookies;
+	}
+
+	it('parseCookie reads any string like the naive split, without throwing', function () {
+		fc.assert(
+			fc.property(
+				fc.oneof(fc.string({ unit: fc.constantFrom('a', 'b', '=', ';', ' ', '\t', '"', '%', '2', '0', 'é') }), fc.string({ unit: 'binary' })),
+				function (header) {
+					expect({ ...helpers.parseCookie(header) }).toEqual({ ...reference(header) });
+				}
+			)
+		);
+	});
+
+	it('parseCookie reads back what serializeCookie wrote, for any value', function () {
+		fc.assert(
+			fc.property(fc.array(fc.tuple(cookieName, fc.string({ unit: 'grapheme' })), { maxLength: 5 }), function (pairs) {
+				const header = pairs
+					.map(function ([name, text]) {
+						return helpers.serializeCookie(name, text);
+					})
+					.join('; ');
+				const expected: Record<string, string> = {};
+				for (const [name, text] of pairs) if (!Object.hasOwn(expected, name)) expected[name] = text;
+				expect({ ...helpers.parseCookie(header) }).toEqual(expected);
+			})
+		);
+	});
+
+	it('serializeCookie never lets an input add an attribute or a header', function () {
+		const hostile = fc.string({ unit: fc.constantFrom('a', '.', '-', '/', ';', '=', ' ', '\r', '\n', '"', ',', '\\', 'é', '\0') });
+		fc.assert(
+			fc.property(hostile, hostile, hostile, hostile, function (name, text, domain, cookiePath) {
+				let cookie: string;
+				try {
+					cookie = helpers.serializeCookie(name, text, { domain, path: cookiePath, encode: String });
+				} catch (error) {
+					expect(error).toBeInstanceOf(TypeError);
+					return;
+				}
+				expect(cookie).toBe(`${name}=${text}; Domain=${domain}; Path=${cookiePath}`);
+				expect(cookie.split(';')).toHaveLength(3);
+				expect(cookie).toMatch(/^[ -~]+$/);
+			})
+		);
+	});
+});
+
+describe('normalizeUrl / tryParseUrl (properties)', function () {
+	const options = fc.record(
+		{
+			stripHash: fc.boolean(),
+			stripWww: fc.boolean(),
+			sortQuery: fc.boolean(),
+			removeTrailingSlash: fc.boolean(),
+			removeQueryParams: fc.array(fc.oneof(fc.constantFrom('a', 'utm_source', ''), fc.constantFrom(/^utm_/i, /a/g, /^$/)), { maxLength: 2 }),
+			forceHttps: fc.boolean()
+		},
+		{ requiredKeys: [] }
+	);
+
+	/** Absolute URLs with odd spellings: mixed case, escapes, dot segments, slashes, `www.`, empty queries and fragments. */
+	const url = fc.oneof(
+		fc.webUrl({ withQueryParameters: true, withFragments: true, validSchemes: ['http', 'https', 'ftp', 'ws', 'foo', 'git+ssh'] }),
+		fc
+			.tuple(
+				fc.constantFrom('http://', 'HTTPS://', 'foo://', 'Foo:', 'mailto:', 'file:///'),
+				fc.constantFrom('', 'www.', 'WWW.www.', '%41', 'x%2e'),
+				fc.constantFrom('Example.com', 'x', '127.0.0.1', '[::1]', ''),
+				fc.constantFrom('', ':80', ':443', ':8080'),
+				fc.string({ unit: fc.constantFrom('/', '.', '%2e', '%7E', '%2f', '%c3%a9', 'a', 'Z', '~', '?', '#', '&', '=', '+', '%', ' ', 'é', '\\') })
+			)
+			.map(function (parts) {
+				return parts.join('');
+			})
+	);
+
+	it('normalizeUrl is idempotent for any options', function () {
+		fc.assert(
+			fc.property(url, options, function (input, opts) {
+				const once = helpers.tryParseUrl(input) === undefined ? undefined : helpers.normalizeUrl(input, opts);
+				if (once === undefined) return;
+				expect(helpers.normalizeUrl(once, opts)).toBe(once);
+				expect(helpers.normalizeUrl(once)).toBe(helpers.normalizeUrl(helpers.normalizeUrl(once)));
+			})
+		);
+	});
+
+	it('normalizeUrl gives equivalent spellings the same result', function () {
+		fc.assert(
+			fc.property(
+				fc.webUrl({ withQueryParameters: true, withFragments: true }),
+				fc.array(fc.boolean(), { maxLength: 120 }),
+				fc.boolean(),
+				function (input, flags, sortQuery) {
+					const href = new URL(input).href;
+					const authority = /^[a-z][a-z\d+.-]*:\/\/[^/?#]*/.exec(href) as RegExpExecArray;
+					let rest = '';
+					for (let i = authority[0].length; i < href.length; i++) {
+						const char = href[i];
+						// Escape some unreserved characters (in random letter case), and lowercase some existing escapes.
+						if (flags[i] && /[\w~-]/.test(char)) {
+							rest += '%' + char.charCodeAt(0).toString(16)[flags[i + 1] ? 'toUpperCase' : 'toLowerCase']();
+						} else if (flags[i] && char === '%') {
+							rest += href.slice(i, i + 3).toLowerCase();
+							i += 2;
+						} else {
+							rest += char;
+						}
+					}
+					const variant = authority[0].toUpperCase() + rest;
+					expect(helpers.normalizeUrl(variant, { sortQuery })).toBe(helpers.normalizeUrl(href, { sortQuery }));
+				}
+			)
+		);
+	});
+
+	it('tryParseUrl agrees with new URL, with or without URL.parse', function () {
+		const native = Object.getOwnPropertyDescriptor(URL, 'parse');
+		fc.assert(
+			fc.property(fc.oneof(url, fc.string()), fc.option(fc.constantFrom('http://a/b/c', 'foo:bar', 'invalid'), { nil: undefined }), function (input, base) {
+				let expected: string | undefined;
+				try {
+					expected = new URL(input, base).href;
+				} catch {
+					expected = undefined;
+				}
+				expect(helpers.tryParseUrl(input, base)?.href).toBe(expected);
+				delete (URL as { parse?: unknown }).parse;
+				try {
+					expect(helpers.tryParseUrl(input, base)?.href).toBe(expected);
+				} finally {
+					if (native) Object.defineProperty(URL, 'parse', native);
+				}
+			})
+		);
+	});
+});

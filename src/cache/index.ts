@@ -1,4 +1,4 @@
-import { assertFunction, assertInteger, assertNumber, describe } from '../utils/assert.js';
+import { assertFunction, assertInteger, assertNumber, describe, readOption } from '../utils/assert.js';
 
 /**
  * Why an entry left an {@link LRUCache}, as reported to `onEvict`:
@@ -54,6 +54,14 @@ export interface LRUCache<K, V> extends Iterable<[K, V]> {
 	readonly size: number;
 	/** Returns the value of a live entry and marks it most-recently used (restarting its TTL with `updateAgeOnGet`); `undefined` otherwise. */
 	get(key: K): V | undefined;
+	/**
+	 * Returns the value of a live entry, as `get` does (a stored `undefined` included); on a miss (or an expired entry) calls
+	 * `factory(key)`, stores its result as `set(key, value, options)` does, and returns it. `factory` is only called on a miss; when it
+	 * throws, nothing is stored. Its result replaces anything `factory` itself stored under `key`. For async values, store the promise
+	 * (`V = Promise<T>`): concurrent callers then share one call (single flight); delete the key when it rejects, or the rejection
+	 * stays cached until it expires.
+	 */
+	getOrSet(key: K, factory: (key: K) => V, options?: LRUCacheSetOptions): V;
 	/** Returns the value of a live entry without changing its recency or TTL; `undefined` otherwise. */
 	peek(key: K): V | undefined;
 	/** Whether `key` holds a live (unexpired) entry. Does not change recency. */
@@ -124,9 +132,9 @@ function assertTTL(caller: string, ttl: number): void {
  * and `delete` are O(1) (a hit only relinks two list nodes; it never re-inserts the key into the `Map`).
  *
  * Semantics:
- * - Recency: `get` and `set` make an entry most-recently used; `peek`, `has` and iteration do not.
+ * - Recency: `get`, `getOrSet` and `set` make an entry most-recently used; `peek`, `has` and iteration do not.
  * - Expiry: an entry expires once `now() >= setTime + ttl`. Expired entries behave as absent everywhere, but are removed lazily: by any
- *   operation that looks the key up (`get`, `peek`, `has`, `set`, `delete`), by `prune()`, by `clear()`, or when they are the
+ *   operation that looks the key up (`get`, `getOrSet`, `peek`, `has`, `set`, `delete`), by `prune()`, by `clear()`, or when they are the
  *   least-recently-used entry at a capacity eviction. Until then they count towards `size` and `max`. The clock is only read for entries
  *   that can expire, so a cache without TTLs never calls `now`.
  * - `onEvict(key, value, reason)` fires once per removed entry (see {@link LRUEvictionReason}), never for misses. Overwriting an entry
@@ -142,8 +150,9 @@ function assertTTL(caller: string, ttl: number): void {
  * @template V - The value type (defaults to `unknown`)
  * @param {LRUCacheOptions<K, V>} options - `max` (required), and optional `ttl`, `now`, `onEvict`, `updateAgeOnGet`
  * @returns {LRUCache<K, V>} A new, empty cache
- * @throws {TypeError} when `options` is not an object, `now`/`onEvict` is provided but not a function, or `max`/`ttl` is not a number
- * @throws {RangeError} when `max` is not an integer `>= 1` (or `Infinity`), or `ttl` (here or in `set`) is not a number `> 0`
+ * @throws {TypeError} when `options` is not an object, `now`/`onEvict` is provided but not a function, `max`/`ttl` is not a number, or
+ * (from `getOrSet`) `factory` is not a function
+ * @throws {RangeError} when `max` is not an integer `>= 1` (or `Infinity`), or `ttl` (here, in `set` or in `getOrSet`) is not a number `> 0`
  * @throws {AggregateError} from `clear`/`prune` when several `onEvict` calls threw
  * @example
  * const cache = createLRUCache<string, number>({ max: 2 });
@@ -162,6 +171,15 @@ function assertTTL(caller: string, ttl: number): void {
  * sessions.get('otp'); // => undefined
  * sessions.get('user'); // => 'ada'
  * sessions.prune(); // optional (e.g. on an interval): reclaims the memory of expired entries nobody looked up
+ * @example
+ * // Compute on a miss: `getOrSet` returns the cached value, or stores and returns what the factory returns
+ * const lengths = createLRUCache<string, number>({ max: 100 });
+ * let calls = 0;
+ * function measure(text: string): number { calls++; return text.length; }
+ * lengths.getOrSet('hello', measure); // => 5
+ * lengths.getOrSet('hello', measure); // => 5
+ * calls; // => 1
+ * lengths.getOrSet('x', 'nope' as never); // throws TypeError
  * @example
  * // Bounded memoization
  * import { memoize } from 'tinkit/functions';
@@ -322,25 +340,60 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 		return [entry.key, entry.value];
 	}
 
+	/**
+	 * Looks `key` up as `get` does: a live entry becomes the most recently used one (and its TTL restarts with `updateAgeOnGet`).
+	 * @param {K} key - The key to look up
+	 * @returns {Entry<K, V> | undefined} The live entry, or `undefined`
+	 */
+	function touch(key: K): Entry<K, V> | undefined {
+		const entry = store.get(key);
+		if (entry === undefined) return undefined;
+
+		// Same as `lookup`, keeping the time for `updateAgeOnGet` (an entry that cannot expire has no TTL to restart).
+		if (entry.expiresAt !== Infinity) {
+			const time = readNow();
+			if (time >= entry.expiresAt) return expire(entry);
+			if (updateAgeOnGet) entry.expiresAt = time + entry.ttl;
+		}
+
+		if (entry !== newest) {
+			unlink(entry);
+			pushNewest(entry);
+		}
+
+		return entry;
+	}
+
+	/**
+	 * Reads the TTL of a `set` (or `getOrSet`) call, validating it when it is not the (already validated) default.
+	 * @param {string} caller - Name of the method, used in the error message
+	 * @param {LRUCacheSetOptions | undefined} setOptions - The call's options
+	 * @returns {number} The TTL
+	 * @throws {RangeError} when the TTL is not a number `> 0`
+	 */
+	function readTTL(caller: string, setOptions: LRUCacheSetOptions | undefined): number {
+		const ttl = setOptions?.ttl ?? defaultTTL;
+		if (ttl !== defaultTTL) assertTTL(caller, ttl);
+		return ttl;
+	}
+
 	// `size` is defined below, with the getter shared by every cache (see `getSize`).
 	const cache = {
 		get(key: K): V | undefined {
-			const entry = store.get(key);
-			if (entry === undefined) return undefined;
+			return touch(key)?.value;
+		},
+		getOrSet(key: K, factory: (key: K) => V, setOptions?: LRUCacheSetOptions): V {
+			assertFunction('LRUCache.getOrSet', 'factory', factory);
+			// Validated before `factory` runs, so that its result is never computed for nothing.
+			readTTL('LRUCache.getOrSet', setOptions);
 
-			// Same as `lookup`, keeping the time for `updateAgeOnGet` (an entry that cannot expire has no TTL to restart).
-			if (entry.expiresAt !== Infinity) {
-				const time = readNow();
-				if (time >= entry.expiresAt) return expire(entry);
-				if (updateAgeOnGet) entry.expiresAt = time + entry.ttl;
-			}
+			const entry = touch(key);
+			if (entry !== undefined) return entry.value;
 
-			if (entry !== newest) {
-				unlink(entry);
-				pushNewest(entry);
-			}
+			const value = factory(key);
+			cache.set(key, value, setOptions);
 
-			return entry.value;
+			return value;
 		},
 		peek(key: K): V | undefined {
 			return lookup(key)?.value;
@@ -349,13 +402,9 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 			return lookup(key) !== undefined;
 		},
 		set(key: K, value: V, setOptions?: LRUCacheSetOptions): LRUCache<K, V> {
-			const ttl = setOptions?.ttl ?? defaultTTL;
+			const ttl = readTTL('LRUCache.set', setOptions);
 
-			// The default was validated by `createLRUCache`.
-			if (ttl !== defaultTTL) {
-				assertTTL('LRUCache.set', ttl);
-				if (ttl !== Infinity) timed = true;
-			}
+			if (ttl !== Infinity) timed = true;
 
 			const time = clock();
 			const entry = store.get(key);
@@ -668,4 +717,201 @@ export function createPriorityQueue<T>(compare: (a: T, b: T) => number): Priorit
 	});
 
 	return queue;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// createDeque
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Options accepted by {@link createDeque}.
+ */
+export interface DequeOptions {
+	/**
+	 * The maximum number of values (an integer `>= 1`, or `Infinity`). Adding a value to a full deque drops the value at the other end:
+	 * `pushBack` drops the front value and `pushFront` the back one, so a bounded deque fed with `pushBack` keeps the most recent values
+	 * (a ring buffer: the last N log lines, samples or undo steps).
+	 * @default Infinity
+	 */
+	capacity?: number;
+}
+
+/**
+ * A double-ended queue, as returned by {@link createDeque}.
+ * @template T - The value type
+ */
+export interface Deque<T> extends Iterable<T> {
+	/** Number of values. */
+	readonly size: number;
+	/** The maximum number of values (`Infinity` when unbounded). */
+	readonly capacity: number;
+	/** Adds a value at the back (dropping the front value when the deque is full) and returns the new size. */
+	pushBack(value: T): number;
+	/** Adds a value at the front (dropping the back value when the deque is full) and returns the new size. */
+	pushFront(value: T): number;
+	/** Removes and returns the back value; `undefined` when empty. */
+	popBack(): T | undefined;
+	/** Removes and returns the front value; `undefined` when empty. */
+	popFront(): T | undefined;
+	/** Returns the front value without removing it; `undefined` when empty. */
+	peekFront(): T | undefined;
+	/** Returns the back value without removing it; `undefined` when empty. */
+	peekBack(): T | undefined;
+	/** Returns the value at `index` from the front (`0` is the front; a negative index counts from the back: `-1` is the back); `undefined` when out of range. */
+	at(index: number): T | undefined;
+	/** Removes every value. */
+	clear(): void;
+	/** The values from front to back (a snapshot taken when called). */
+	[Symbol.iterator](): IterableIterator<T>;
+}
+
+/** Smallest length of a deque's ring (a power of two). */
+const MIN_RING = 8;
+
+/**
+ * Creates a double-ended queue backed by a growable ring buffer: adding or removing a value at either end, and reading any index, are
+ * O(1) (amortized: the ring doubles when full and halves when three quarters empty, so memory follows the size). `Array.prototype.shift`
+ * and `unshift` are O(n), which makes arrays slow as queues; a deque is the right structure for FIFO queues, sliding windows, work
+ * stealing or BFS.
+ *
+ * - With a `capacity`, the deque is bounded: adding to a full deque drops the value at the opposite end (see {@link DequeOptions}).
+ *   Initial values beyond the capacity drop the first ones, as if pushed back one by one.
+ * - Removed values are released at once (their slots are cleared), so a deque never keeps a reference to a value it no longer holds.
+ * - Iteration goes from front to back over a snapshot: changing the deque while iterating is safe and does not affect the loop.
+ * @template T - The value type
+ * @param {Iterable<T> | null} [values] - Initial values, from front to back
+ * @param {DequeOptions} [options={}] - `capacity` (default `Infinity`)
+ * @returns {Deque<T>} A new deque
+ * @throws {TypeError} when `values` is neither iterable nor `null`/`undefined`, or `capacity` is not a number
+ * @throws {RangeError} when `capacity` is not an integer `>= 1` or `Infinity`
+ * @example
+ * const deque = createDeque([2, 3]);
+ * deque.pushFront(1); // => 3
+ * deque.pushBack(4); // => 4
+ * [...deque]; // => [1, 2, 3, 4]
+ * deque.at(-1); // => 4
+ * deque.popFront(); // => 1
+ * deque.popBack(); // => 4
+ * deque.size; // => 2
+ * @example
+ * // A ring buffer of the last 3 values
+ * const recent = createDeque<string>(null, { capacity: 3 });
+ * for (const line of ['a', 'b', 'c', 'd', 'e']) recent.pushBack(line);
+ * [...recent]; // => ['c', 'd', 'e']
+ * createDeque([], { capacity: 0 }); // throws RangeError
+ */
+export function createDeque<T>(values?: Iterable<T> | null, options: DequeOptions = {}): Deque<T> {
+	const capacity = readOption(options, 'capacity', Infinity);
+	assertInteger('createDeque', 'options.capacity', capacity, 1, true);
+	if (values != null && typeof (values as Partial<Iterable<T>>)[Symbol.iterator] !== 'function') {
+		throw new TypeError(`createDeque: \`values\` must be an iterable, got ${describe(values)}`);
+	}
+
+	// The ring (its length a power of two, so that indexes wrap with a mask; filled, so that no read reaches `Array.prototype`), the
+	// index of the front value, and the number of values.
+	let ring: Array<T | undefined> = new Array<T | undefined>(MIN_RING).fill(undefined);
+	let head = 0;
+	let length = 0;
+
+	/**
+	 * Moves the values into a new ring of `size` slots, the front value first.
+	 * @param {number} size - The new ring length (a power of two `>= length`)
+	 * @returns {void}
+	 */
+	function resize(size: number): void {
+		const next = new Array<T | undefined>(size).fill(undefined);
+		for (let i = 0; i < length; i++) next[i] = ring[(head + i) & (ring.length - 1)];
+		ring = next;
+		head = 0;
+	}
+
+	/**
+	 * Releases the ring's memory once it is three quarters empty.
+	 * @returns {void}
+	 */
+	function shrink(): void {
+		if (ring.length > MIN_RING && length <= ring.length >> 2) resize(ring.length >> 1);
+	}
+
+	/**
+	 * Makes room for one more value: drops the value at the other end when full, grows the ring when it has no free slot.
+	 * @param {boolean} back - Whether the value goes to the back
+	 * @returns {void}
+	 */
+	function reserve(back: boolean): void {
+		if (length === capacity) {
+			// Full: the value at the other end leaves (its slot is cleared, so that it is not retained).
+			const slot = back ? head : (head + length - 1) & (ring.length - 1);
+			ring[slot] = undefined;
+			if (back) head = (head + 1) & (ring.length - 1);
+			length--;
+		} else if (length === ring.length) resize(ring.length * 2);
+	}
+
+	const deque = {
+		capacity,
+		pushBack(value: T): number {
+			reserve(true);
+			ring[(head + length) & (ring.length - 1)] = value;
+			return ++length;
+		},
+		pushFront(value: T): number {
+			reserve(false);
+			head = (head - 1) & (ring.length - 1);
+			ring[head] = value;
+			return ++length;
+		},
+		popBack(): T | undefined {
+			if (length === 0) return undefined;
+			const slot = (head + length - 1) & (ring.length - 1);
+			const value = ring[slot];
+			ring[slot] = undefined;
+			length--;
+			shrink();
+			return value;
+		},
+		popFront(): T | undefined {
+			if (length === 0) return undefined;
+			const value = ring[head];
+			ring[head] = undefined;
+			head = (head + 1) & (ring.length - 1);
+			length--;
+			shrink();
+			return value;
+		},
+		peekFront(): T | undefined {
+			return length === 0 ? undefined : ring[head];
+		},
+		peekBack(): T | undefined {
+			return length === 0 ? undefined : ring[(head + length - 1) & (ring.length - 1)];
+		},
+		at(index: number): T | undefined {
+			if (!Number.isInteger(index)) assertNumber('Deque.at', 'index', index, false, 'an integer');
+			const offset = index < 0 ? index + length : index;
+			return offset >= 0 && offset < length ? ring[(head + offset) & (ring.length - 1)] : undefined;
+		},
+		clear(): void {
+			ring = new Array<T | undefined>(MIN_RING).fill(undefined);
+			head = 0;
+			length = 0;
+		},
+		[Symbol.iterator](): IterableIterator<T> {
+			const snapshot: T[] = [];
+			for (let i = 0; i < length; i++) snapshot.push(ring[(head + i) & (ring.length - 1)] as T);
+			return snapshot.values();
+		}
+	} as Deque<T>;
+
+	Object.defineProperties(deque, {
+		[SIZE]: {
+			value: function (): number {
+				return length;
+			}
+		},
+		size: { get: getSize, enumerable: true, configurable: true }
+	});
+
+	if (values != null) for (const value of values) deque.pushBack(value);
+
+	return deque;
 }

@@ -1,5 +1,22 @@
-import { toBase64, fromBase64, toHex, fromHex, encodeUtf8, decodeUtf8, sha256, sha256Hex } from 'tinkit/encoding';
-import type { BytesInput, ToBase64Options, FromBase64Options, Base64Padding, DecodeUtf8Options } from 'tinkit/encoding';
+import {
+	toBase64,
+	fromBase64,
+	toHex,
+	fromHex,
+	encodeUtf8,
+	decodeUtf8,
+	sha256,
+	sha256Hex,
+	toBase32,
+	fromBase32,
+	timingSafeEqual,
+	decodeJwt,
+	getJwtExpiration,
+	isJwtExpired,
+	parseCsv,
+	toCsv
+} from 'tinkit/encoding';
+import type { BytesInput, ToBase64Options, FromBase64Options, Base64Padding, DecodeUtf8Options, Base32Alphabet, CsvValue, DecodedJwt, JwtPayload } from 'tinkit/encoding';
 import { uuidv7, createUuidv7, uuidv7Timestamp, ulid, createUlid, ulidTimestamp, createRandom, randomBytes } from 'tinkit/random';
 import type { TimeIdOptions } from 'tinkit/random';
 
@@ -48,3 +65,31 @@ createUuidv7(null);
 // @ts-expect-error boolean options are booleans
 toBase64('a', { urlSafe: 'false' });
 void [encodedBase64, encodedHex, decodedBytes, ownBuffers, decodedText, bytesInput, encodingOptions, createdAt, timeIdOptions];
+
+const base32: string = toBase32('a', { alphabet: 'crockford' satisfies Base32Alphabet, padding: false });
+const base32Bytes: ArrayBuffer = fromBase32(base32, { alphabet: 'crockford', padding: 'forbidden' }).buffer;
+const sameSecret: boolean = timingSafeEqual('a', new Uint8Array(1));
+const jwt: DecodedJwt<JwtPayload & { role: string }> = decodeJwt<JwtPayload & { role: string }>('a.b.c');
+const jwtRole: string = jwt.payload.role;
+const jwtExp: number | undefined = decodeJwt('a.b.c').payload.exp;
+const jwtExpiry: Date | undefined = getJwtExpiration('a.b.c');
+const jwtExpired: boolean = isJwtExpired('a.b.c', { now: new Date(), leeway: 30 });
+const csvRows: string[][] = parseCsv('a,b', { delimiter: ';' });
+const csvRecords: Partial<Record<'a' | 'b', string>>[] = parseCsv<'a' | 'b'>('a,b', { header: true });
+const csvComplete: Record<'a' | 'b', string>[] = parseCsv<'a' | 'b'>('a,b', { header: true, strict: true });
+// @ts-expect-error without strict, a short row leaves its missing fields absent
+const csvIncomplete: Record<'a' | 'b', string>[] = parseCsv<'a' | 'b'>('a,b', { header: true });
+declare const csvHeader: boolean;
+const csvEither: string[][] | Partial<Record<string, string>>[] = parseCsv('a', { header: csvHeader });
+const csvCells: CsvValue[] = ['a', 1, 2n, true, null, undefined];
+interface Person {
+	name: string;
+	age?: number;
+}
+declare const people: Person[];
+const csvText: string = toCsv([csvCells]) + toCsv(people, { columns: ['name', 'age'], formulaEscape: true }) + toCsv([{ a: 1 }, { b: 'x' }], { columns: ['b'] });
+// @ts-expect-error records hold CSV values only
+toCsv([{ a: new Date() }]);
+// @ts-expect-error columns are keys of the records
+toCsv(people, { columns: ['nmae'] });
+void [base32Bytes, sameSecret, jwtRole, jwtExp, jwtExpiry, jwtExpired, csvRows, csvRecords, csvComplete, csvIncomplete, csvEither, csvText];

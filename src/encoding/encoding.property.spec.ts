@@ -240,4 +240,269 @@ describe('Encoding helpers (property-based)', function () {
 			);
 		});
 	});
+
+	describe('timingSafeEqual', function () {
+		it('should agree with Buffer#equals', function () {
+			fc.assert(
+				fc.property(fc.uint8Array({ maxLength: 8 }), fc.uint8Array({ maxLength: 8 }), fc.boolean(), function (a, b, same) {
+					const other = same ? a.slice() : b;
+					expect(helpers.timingSafeEqual(a, other)).toBe(Buffer.from(a).equals(Buffer.from(other)));
+				})
+			);
+		});
+	});
+
+	describe('base32', function () {
+		const ALPHABETS = {
+			rfc4648: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567',
+			hex: '0123456789ABCDEFGHIJKLMNOPQRSTUV',
+			crockford: '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
+		} as const;
+		const alphabet = fc.constantFrom('rfc4648' as const, 'hex' as const, 'crockford' as const);
+
+		/** A naive reference encoder: the bits as a string of 0s and 1s, cut into groups of 5. */
+		function reference(data: Uint8Array, name: keyof typeof ALPHABETS, pad: boolean): string {
+			const bits = Array.from(data, function (byte) {
+				return byte.toString(2).padStart(8, '0');
+			}).join('');
+			let text = '';
+			for (let i = 0; i < bits.length; i += 5) text += ALPHABETS[name][parseInt(bits.slice(i, i + 5).padEnd(5, '0'), 2)];
+			return pad ? text.padEnd(Math.ceil(text.length / 8) * 8, '=') : text;
+		}
+
+		it('should equal the reference encoding and round-trip, in either letter case', function () {
+			fc.assert(
+				fc.property(bytes, alphabet, fc.boolean(), function (data, name, pad) {
+					const encoded = helpers.toBase32(data, { alphabet: name, padding: pad });
+					expect(encoded).toBe(reference(data, name, pad));
+					expect(helpers.fromBase32(encoded, { alphabet: name, padding: pad ? 'required' : 'optional' })).toEqual(data);
+					expect(helpers.fromBase32(encoded.toLowerCase(), { alphabet: name })).toEqual(data);
+				})
+			);
+		});
+
+		it('should accept only canonical text, which re-encodes to itself up to case and Crockford substitutions', function () {
+			const base32ish = fc.oneof(
+				fc.string({ unit: fc.constantFrom(...'AZaz27019ILOUilou=-', ' ', 'é'), maxLength: 18 }),
+				fc.tuple(bytes, alphabet, fc.boolean(), fc.nat()).map(function ([data, name, pad, cut]) {
+					const encoded = reference(data, name, pad);
+					return encoded.slice(0, encoded.length - (cut % 3));
+				})
+			);
+			fc.assert(
+				fc.property(base32ish, alphabet, padding, function (text, name, pad) {
+					const result = outcome(function () {
+						return helpers.fromBase32(text, { alphabet: name, padding: pad });
+					});
+					if ('value' in result) {
+						let expected = text.toUpperCase();
+						if (name === 'crockford') expected = expected.replace(/[IL]/g, '1').replace(/O/g, '0');
+						expect(helpers.toBase32(result.value, { alphabet: name, padding: text.includes('=') })).toBe(expected);
+						expect(pad === 'required' ? text.length % 8 === 0 : pad === 'forbidden' ? !text.includes('=') : true).toBe(true);
+					} else {
+						expect(result.error).toMatch(/^SyntaxError: fromBase32: `text` must /);
+					}
+				})
+			);
+		});
+	});
+
+	describe('decodeJwt', function () {
+		/** JSON objects whose text holds no prototype-pollution key (those are removed, see the unit tests). */
+		const claims = fc.dictionary(fc.string(), fc.jsonValue()).filter(function (value) {
+			return !/__proto__|constructor/.test(JSON.stringify(value));
+		});
+
+		it('should decode what was encoded', function () {
+			fc.assert(
+				fc.property(claims, claims, fc.uint8Array({ maxLength: 70 }), function (header, payload, signature) {
+					const token = [JSON.stringify(header), JSON.stringify(payload)]
+						.map(function (part) {
+							return Buffer.from(part).toString('base64url');
+						})
+						.concat(Buffer.from(signature).toString('base64url'))
+						.join('.');
+					const decoded = helpers.decodeJwt(token);
+					expect(decoded.header).toEqual(JSON.parse(JSON.stringify(header)));
+					expect(decoded.payload).toEqual(JSON.parse(JSON.stringify(payload)));
+					expect(decoded.signature).toEqual(signature);
+				})
+			);
+		});
+
+		it('should tell expiry exactly as now >= exp + leeway', function () {
+			fc.assert(
+				fc.property(fc.integer({ min: 0, max: 4e9 }), fc.integer({ min: 0, max: 4e12 }), fc.nat({ max: 600 }), function (exp, now, leeway) {
+					const token = `e30.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.`;
+					expect(helpers.isJwtExpired(token, { now, leeway })).toBe(now >= (exp + leeway) * 1000);
+					expect(helpers.getJwtExpiration(token)).toEqual(new Date(exp * 1000));
+				})
+			);
+		});
+
+		it('should only stop being expired as the leeway grows, over the whole range of numbers', function () {
+			const leeway = fc.double({ min: 0, noNaN: true, noDefaultInfinity: true });
+			fc.assert(
+				fc.property(fc.integer({ min: -8.64e12, max: 8.64e12 }), fc.double({ noNaN: true, noDefaultInfinity: true }), leeway, leeway, function (exp, now, a, b) {
+					const token = `e30.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.`;
+					const [small, large] = a <= b ? [a, b] : [b, a];
+					if (helpers.isJwtExpired(token, { now, leeway: large })) expect(helpers.isJwtExpired(token, { now, leeway: small })).toBe(true);
+					// A leeway beyond any time span never expires the token.
+					if (large > Number.MAX_VALUE / 500) expect(helpers.isJwtExpired(token, { now, leeway: large })).toBe(false);
+				})
+			);
+		});
+	});
+
+	describe('parseCsv / toCsv', function () {
+		/** Cells full of the characters that need quoting. */
+		const cell = fc.oneof(fc.string({ unit: fc.constantFrom(',', ';', '\t', '"', '\r', '\n', '﻿', 'a', ' ', '=') }), fc.string({ unit: 'binary' }));
+		const csvOptions = fc.record({
+			delimiter: fc.constantFrom(',', ';', '\t', '|'),
+			newline: fc.constantFrom('\r\n' as const, '\n' as const),
+			quote: fc.constantFrom('needed' as const, 'all' as const)
+		});
+
+		it('should read back exactly the rows it wrote', function () {
+			fc.assert(
+				fc.property(fc.array(fc.array(cell, { minLength: 1, maxLength: 5 }), { maxLength: 6 }), csvOptions, function (rows, options) {
+					const text = helpers.toCsv(rows, options);
+					expect(helpers.parseCsv(text, { delimiter: options.delimiter, strict: false })).toEqual(rows);
+				})
+			);
+		});
+
+		it('should read back exactly the records it wrote', function () {
+			fc.assert(
+				fc.property(
+					fc.uniqueArray(cell, { minLength: 1, maxLength: 4 }),
+					fc.array(fc.array(cell, { minLength: 4, maxLength: 4 }), { maxLength: 5 }),
+					csvOptions,
+					function (names, values, options) {
+						const records = values.map(function (row) {
+							return Object.fromEntries(
+								names.map(function (name, index) {
+									return [name, row[index]];
+								})
+							);
+						});
+						const text = helpers.toCsv(records, { ...options, columns: names });
+						expect(helpers.parseCsv(text, { delimiter: options.delimiter, header: true, strict: true })).toEqual(records);
+					}
+				)
+			);
+		});
+
+		it('should split quote-free text on delimiters and line breaks, like a naive reference', function () {
+			fc.assert(
+				fc.property(fc.string({ unit: fc.constantFrom('a', 'b', ',', '\r', '\n', ' ') }), function (text) {
+					const expected =
+						text === ''
+							? []
+							: text
+									.replace(/(?:\r\n|\r|\n)$/, '')
+									.split(/\r\n|\r|\n/)
+									.map(function (line) {
+										return line.split(',');
+									});
+					expect(helpers.parseCsv(text)).toEqual(expected);
+				})
+			);
+		});
+
+		it('should only throw SyntaxErrors on arbitrary text, and write back what it reads to text that reads the same', function () {
+			fc.assert(
+				fc.property(fc.string({ unit: fc.constantFrom('"', ',', '\n', '\r', 'a') }), fc.boolean(), fc.boolean(), function (text, header, strict) {
+					const result = outcome(function () {
+						return helpers.parseCsv(text, { header, strict });
+					});
+					if ('error' in result) expect(result.error).toMatch(/^SyntaxError: parseCsv: /);
+					else if (!header) expect(helpers.parseCsv(helpers.toCsv(result.value as string[][]))).toEqual(result.value);
+				})
+			);
+		});
+
+		it('should give each record the fields of its row only, so records hold no more keys than the text has fields', function () {
+			fc.assert(
+				fc.property(fc.string({ unit: fc.constantFrom('a', 'b', 'c', ',', '\n', '""') }), function (text) {
+					const result = outcome(function () {
+						return helpers.parseCsv(text, { header: true });
+					});
+					if ('error' in result) {
+						expect(result.error).toMatch(/^SyntaxError: parseCsv: /);
+						return;
+					}
+					const [names = [], ...rows] = helpers.parseCsv(text);
+					expect(result.value).toHaveLength(rows.length);
+					let keys = 0;
+					let fields = 0;
+					result.value.forEach(function (record, index) {
+						const row = rows[index];
+						const kept = row.slice(0, names.length);
+						expect(Object.entries(record)).toEqual(
+							kept.map(function (field, column) {
+								return [names[column], field];
+							})
+						);
+						keys += Object.keys(record).length;
+						fields += row.length;
+					});
+					expect(keys).toBeLessThanOrEqual(fields);
+				})
+			);
+		});
+
+		it('should prefix every cell a spreadsheet could run as a formula and quote every field, with formulaEscape', function () {
+			const risky = fc.string({
+				unit: fc.constantFrom(
+					' ',
+					'\t',
+					'\r',
+					'\n',
+					String.fromCharCode(0xa0),
+					String.fromCharCode(0x3000),
+					String.fromCharCode(0xfeff),
+					'=',
+					'+',
+					'-',
+					'@',
+					'＝',
+					'＋',
+					'－',
+					'＠',
+					'a',
+					';',
+					',',
+					'"',
+					"'"
+				),
+				maxLength: 6
+			});
+			/**
+			 * A naive reference: does the cell start with a tab or a carriage return, or with a formula sign after white space?
+			 */
+			function dangerous(text: string): boolean {
+				if (text.startsWith('\t') || text.startsWith('\r')) return true;
+				let index = 0;
+				while (index < text.length && /\s/.test(text[index])) index++;
+				return '=+-@＝＋－＠'.includes(text[index] ?? 'x');
+			}
+			fc.assert(
+				fc.property(fc.array(fc.array(fc.oneof(risky, fc.integer()), { minLength: 1, maxLength: 4 }), { maxLength: 4 }), csvOptions, function (rows, options) {
+					const escaped = rows.map(function (row) {
+						return row.map(function (value) {
+							return typeof value === 'string' && dangerous(value) ? `'${value}` : value;
+						});
+					});
+					const text = helpers.toCsv(rows, { ...options, formulaEscape: true });
+					expect(text).toBe(helpers.toCsv(escaped, { ...options, quote: 'all' }));
+					expect(helpers.parseCsv(text, { delimiter: options.delimiter })).toEqual(
+						escaped.map(function (row) {
+							return row.map(String);
+						})
+					);
+				})
+			);
+		});
+	});
 });

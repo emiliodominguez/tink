@@ -779,3 +779,390 @@ describe('Format helpers (hostile inputs)', function () {
 		expect([joinAll(new Set(['a', 'b'])), joinArray(['c'] as const)]).toEqual(['a and b', 'c']);
 	});
 });
+
+describe('parseNumber', function () {
+	const NBSP = String.fromCharCode(0xa0);
+	const NNBSP = String.fromCharCode(0x202f);
+	const ALM = String.fromCharCode(0x61c);
+	const RLM = String.fromCharCode(0x200f);
+	const MINUS = String.fromCharCode(0x2212);
+	const RIGHT_QUOTE = String.fromCharCode(0x2019);
+
+	describe('plain numbers (en-US by default)', function () {
+		it('reads digits, grouping, a decimal separator, signs and an exponent', function () {
+			expect(helpers.parseNumber('1234.5')).toBe(1234.5);
+			expect(helpers.parseNumber('1,234.5')).toBe(1234.5);
+			expect(helpers.parseNumber('1,234,567')).toBe(1234567);
+			expect(helpers.parseNumber('-1,234.5')).toBe(-1234.5);
+			expect(helpers.parseNumber('+5')).toBe(5);
+			expect(helpers.parseNumber(`${MINUS}5`)).toBe(-5);
+			expect(helpers.parseNumber('.5')).toBe(0.5);
+			expect(helpers.parseNumber('007')).toBe(7);
+			expect(helpers.parseNumber('  42 ')).toBe(42);
+			expect(helpers.parseNumber('1.5E3')).toBe(1500);
+			expect(helpers.parseNumber('1.5e-3')).toBe(0.0015);
+			expect(helpers.parseNumber('1E+3')).toBe(1000);
+			expect(helpers.parseNumber(`2E${MINUS}2`)).toBe(0.02);
+		});
+
+		it('accepts a sign after the number, or separated from it by spaces', function () {
+			expect(helpers.parseNumber('5-')).toBe(-5);
+			expect(helpers.parseNumber('- 5')).toBe(-5);
+			expect(helpers.parseNumber('5 +')).toBe(5);
+		});
+
+		it('reads an amount in parentheses as negative (accounting notation)', function () {
+			expect(helpers.parseNumber('(1,234.50)')).toBe(-1234.5);
+			expect(helpers.parseNumber('( 5 )')).toBe(-5);
+			expect(helpers.parseNumber('(-5)')).toBeNaN();
+			expect(helpers.parseNumber('(5')).toBeNaN();
+			expect(helpers.parseNumber('5)')).toBeNaN();
+			expect(helpers.parseNumber('()')).toBeNaN();
+		});
+
+		it('keeps the sign of zero', function () {
+			expect(helpers.parseNumber('-0')).toBe(-0);
+			expect(helpers.parseNumber('(0)')).toBe(-0);
+			expect(helpers.parseNumber('0')).toBe(0);
+			expect(helpers.parseNumber('0.000')).toBe(0);
+		});
+
+		it('converts the decimal once, to the nearest double', function () {
+			expect(helpers.parseNumber('0.1')).toBe(0.1);
+			expect(helpers.parseNumber('9007199254740993')).toBe(9007199254740992);
+			expect(helpers.parseNumber('123,456,789,012,345,678,901,234')).toBe(1.2345678901234569e23);
+			expect(helpers.parseNumber('5e-324')).toBe(5e-324);
+			expect(helpers.parseNumber('1e-400')).toBe(0);
+			expect(helpers.parseNumber('0E99999999999999999999999')).toBe(0);
+		});
+
+		it('decides an exponent of more than 15 significant digits without converting it', function () {
+			// Regression: converting a 2-million-digit exponent to a bigint took 0.6 s (1.4 s for 4 million digits: more than linear).
+			const huge = '9'.repeat(2_000_000);
+			const start = performance.now();
+			expect(helpers.parseNumber(`1e${huge}`)).toBeNaN();
+			expect(helpers.parseNumber(`1e-${huge}`)).toBe(0);
+			expect(performance.now() - start).toBeLessThan(600);
+			const nines = '9'.repeat(20);
+			expect(helpers.parseNumber(`-1e-${nines}`)).toBe(-0);
+			expect(helpers.parseNumber(`0e${nines}`)).toBe(0);
+			expect(helpers.parseNumber(`-0.000e${nines}`)).toBe(-0);
+			expect(helpers.parseNumber(`(0e${nines})`)).toBe(-0);
+			expect(helpers.parseNumber(`(1e${nines})`)).toBeNaN();
+			// At the boundary: 15 significant digits are converted (with the leading zeros dropped), 16 are decided.
+			expect(helpers.parseNumber('1e000000999999999999999')).toBeNaN();
+			expect(helpers.parseNumber('1e-000000999999999999999')).toBe(0);
+			expect(helpers.parseNumber('1e1000000000000000')).toBeNaN();
+			expect(helpers.parseNumber('-1e-1000000000000000')).toBe(-0);
+			expect(helpers.parseNumber('0.0e1000000000000000')).toBe(0);
+			expect(helpers.parseNumber(`1e${'0'.repeat(100_000)}308`)).toBe(1e308);
+			// A long enough fraction makes up for an exponent of 7 digits.
+			expect(helpers.parseNumber(`0.${'0'.repeat(1_000_000)}1e1000002`)).toBe(10);
+			expect(helpers.parseNumber(`1e-${'0'.repeat(100_000)}324`)).toBe(0);
+			expect(helpers.parseNumber(`${'0'.repeat(1000)}1e-${'0'.repeat(20)}323`)).toBe(1e-323);
+			expect(helpers.parseNumber('1E-000000000000000000002%', { style: 'percent' })).toBe(1e-4);
+		});
+
+		it('gives NaN for misplaced grouping separators', function () {
+			for (const text of ['1,23', '12,345,6', '1,2345', '1234,567', ',123', '1,,234', '1,234,', '01,234', '0,123', '1,23,456', '1,234.567,8']) {
+				expect(helpers.parseNumber(text)).toBeNaN();
+			}
+		});
+
+		it('gives NaN for anything but one number', function () {
+			for (const text of [
+				'',
+				' ',
+				'-',
+				'+-1',
+				'--1',
+				'1-+',
+				'1.2.3',
+				'1..2',
+				'1.',
+				'12px',
+				'px12',
+				'1 2',
+				'1 000',
+				'0x1f',
+				'1_000',
+				'Infinity',
+				'-Infinity',
+				'NaN',
+				'1e400',
+				'1E',
+				'E5',
+				'1e5e5',
+				'\n',
+				'1\n000',
+				'$5',
+				'5%',
+				'1.2K',
+				'١٢٣'
+			]) {
+				expect(helpers.parseNumber(text)).toBeNaN();
+			}
+		});
+	});
+
+	describe('locales', function () {
+		it('reads the separators of the locale', function () {
+			expect(helpers.parseNumber('1.234,5', { locale: 'de-DE' })).toBe(1234.5);
+			expect(helpers.parseNumber('1.234', { locale: 'de-DE' })).toBe(1234);
+			expect(helpers.parseNumber('1,234', { locale: 'de-DE' })).toBe(1.234);
+			expect(helpers.parseNumber('1.23', { locale: 'de-DE' })).toBeNaN();
+			expect(helpers.parseNumber('1234,5', { locale: 'es-ES' })).toBe(1234.5);
+			expect(helpers.parseNumber('12.345,5', { locale: 'es-ES' })).toBe(12345.5);
+			expect(helpers.parseNumber('1.234', { locale: ['xx-invalid', 'en-US'] })).toBe(1.234);
+		});
+
+		it('takes any space for a space grouping separator (fr-FR, pl-PL), and both apostrophes in de-CH', function () {
+			for (const space of [' ', NBSP, NNBSP, String.fromCharCode(0x2009)]) {
+				expect(helpers.parseNumber(`1${space}234${space}567,5`, { locale: 'fr-FR' })).toBe(1234567.5);
+				expect(helpers.parseNumber(`1${space}234,5`, { locale: 'pl-PL' })).toBe(1234.5);
+			}
+			expect(helpers.parseNumber("1'234.5", { locale: 'de-CH' })).toBe(1234.5);
+			expect(helpers.parseNumber(`1${RIGHT_QUOTE}234.5`, { locale: 'de-CH' })).toBe(1234.5);
+			expect(helpers.parseNumber('1 23,5', { locale: 'fr-FR' })).toBeNaN();
+			expect(helpers.parseNumber('1\t234,5', { locale: 'fr-FR' })).toBe(1234.5);
+		});
+
+		it('reads Indian grouping where the locale uses it, and only there', function () {
+			expect(helpers.parseNumber('12,34,567.5', { locale: 'hi-IN' })).toBe(1234567.5);
+			expect(helpers.parseNumber('1,23,45,67,890', { locale: 'en-IN' })).toBe(1234567890);
+			expect(helpers.parseNumber('1,234,567', { locale: 'hi-IN' })).toBeNaN();
+			expect(helpers.parseNumber('123,456', { locale: 'hi-IN' })).toBeNaN();
+			expect(helpers.parseNumber('12,34,567', { locale: 'en-US' })).toBeNaN();
+		});
+
+		it('reads the digits of the locale or of its numbering system, and ASCII digits, but not both in one number', function () {
+			expect(helpers.parseNumber('١٬٢٣٤٫٥', { locale: 'ar-EG' })).toBe(1234.5);
+			expect(helpers.parseNumber('1٬234٫5', { locale: 'ar-EG' })).toBe(1234.5);
+			expect(helpers.parseNumber('١2', { locale: 'ar-EG' })).toBeNaN();
+			const scientific = helpers.formatNumber(100, { locale: 'ar-EG', notation: 'scientific' });
+			expect(helpers.parseNumber(scientific, { locale: 'ar-EG' })).toBe(100);
+			expect(helpers.parseNumber(`${scientific.slice(0, -1)}2`, { locale: 'ar-EG' })).toBeNaN();
+			expect(helpers.parseNumber('१,२३,४५६.७', { locale: 'hi-IN-u-nu-deva' })).toBe(123456.7);
+			expect(helpers.parseNumber('१,२३,४५६.७', { locale: 'hi-IN', numberingSystem: 'deva' })).toBe(123456.7);
+			expect(helpers.parseNumber('１，２３４', { locale: 'ja-JP-u-nu-fullwide' })).toBeNaN();
+			expect(helpers.parseNumber('１,２３４．５', { locale: 'ja-JP-u-nu-fullwide' })).toBeNaN();
+			expect(helpers.parseNumber('１,２３４.５', { locale: 'ja-JP-u-nu-fullwide' })).toBe(1234.5);
+		});
+
+		it('reads digits outside the Basic Multilingual Plane (mathbold)', function () {
+			const text = helpers.formatNumber(-1234.5, { numberingSystem: 'mathbold' });
+			expect(text.length).toBeGreaterThan(8);
+			expect(helpers.parseNumber(text, { numberingSystem: 'mathbold' })).toBe(-1234.5);
+		});
+
+		it('ignores the bidirectional marks of right-to-left locales', function () {
+			expect(helpers.parseNumber(`${ALM}-١٬٢٣٤٫٥`, { locale: 'ar-EG' })).toBe(-1234.5);
+			expect(helpers.parseNumber(helpers.formatNumber(-1234.5, { locale: 'ar-EG' }), { locale: 'ar-EG' })).toBe(-1234.5);
+			expect(helpers.parseNumber(helpers.formatNumber(-1234.5, { locale: 'fa-IR' }), { locale: 'fa-IR' })).toBe(-1234.5);
+			expect(helpers.parseNumber(`${RLM}-1,234.5`, { locale: 'he-IL' })).toBe(-1234.5);
+		});
+
+		it("reads the locale's exponent separator", function () {
+			expect(helpers.parseNumber(helpers.formatNumber(-1234.5, { locale: 'sv-SE', notation: 'scientific', maximumFractionDigits: 4 }), { locale: 'sv-SE' })).toBe(
+				-1234.5
+			);
+			expect(helpers.parseNumber('1,5×10^3', { locale: 'sv-SE' })).toBe(1500);
+			expect(helpers.parseNumber('1,5E3', { locale: 'sv-SE' })).toBeNaN();
+			expect(helpers.parseNumber(helpers.formatNumber(0.000123, { locale: 'ar-EG', notation: 'scientific' }), { locale: 'ar-EG' })).toBe(0.000123);
+		});
+	});
+
+	describe('percent style', function () {
+		it('gives the ratio, with or without the percent sign', function () {
+			expect(helpers.parseNumber('25%', { style: 'percent' })).toBe(0.25);
+			expect(helpers.parseNumber('25', { style: 'percent' })).toBe(0.25);
+			expect(helpers.parseNumber('-12.5 %', { style: 'percent' })).toBe(-0.125);
+			expect(helpers.parseNumber('30%', { style: 'percent' })).toBe(0.3);
+			expect(helpers.parseNumber(`25,6${NBSP}%`, { locale: 'de-DE', style: 'percent' })).toBe(0.256);
+			expect(helpers.parseNumber('%25', { locale: 'tr-TR', style: 'percent' })).toBe(0.25);
+			expect(helpers.parseNumber(helpers.formatPercent(-0.25, { locale: 'ar-EG' }), { locale: 'ar-EG', style: 'percent' })).toBe(-0.25);
+		});
+
+		it('rejects two percent signs, and a percent sign in another style', function () {
+			expect(helpers.parseNumber('25%%', { style: 'percent' })).toBeNaN();
+			expect(helpers.parseNumber('%25%', { style: 'percent' })).toBeNaN();
+			expect(helpers.parseNumber('25%')).toBeNaN();
+			expect(helpers.parseNumber('25%', { style: 'currency' })).toBeNaN();
+		});
+	});
+
+	describe('currency style', function () {
+		it('accepts any currency sign or code without `currency`', function () {
+			expect(helpers.parseNumber('$1,234.50', { style: 'currency' })).toBe(1234.5);
+			expect(helpers.parseNumber('-$5', { style: 'currency' })).toBe(-5);
+			expect(helpers.parseNumber('$-5', { style: 'currency' })).toBe(-5);
+			expect(helpers.parseNumber('($1,234.50)', { style: 'currency' })).toBe(-1234.5);
+			expect(helpers.parseNumber('US$5', { style: 'currency' })).toBe(5);
+			expect(helpers.parseNumber(`5,00${NBSP}$US`, { locale: 'fr-FR', style: 'currency' })).toBe(5);
+			expect(helpers.parseNumber('5 USD', { style: 'currency' })).toBe(5);
+			expect(helpers.parseNumber('EUR 5', { style: 'currency' })).toBe(5);
+			expect(helpers.parseNumber('1EUR', { style: 'currency' })).toBe(1);
+			expect(helpers.parseNumber('5', { style: 'currency' })).toBe(5);
+			expect(helpers.parseNumber('₹1,23,456.50', { locale: 'en-IN', style: 'currency' })).toBe(123456.5);
+		});
+
+		it('rejects two currencies, names and lowercase codes without `currency`', function () {
+			for (const text of ['$5 €', '$€5', '5 usd', '5 US dollars', '5 zł', '5 USDX', '5 EU', '5 $$']) {
+				expect(helpers.parseNumber(text, { style: 'currency' })).toBeNaN();
+			}
+		});
+
+		it("accepts only the given currency's symbols, code and names with `currency` (which implies the style)", function () {
+			expect(helpers.parseNumber('-1.234,50 €', { locale: 'de-DE', currency: 'EUR' })).toBe(-1234.5);
+			expect(helpers.parseNumber('1.234,50 EUR', { locale: 'de-DE', currency: 'EUR' })).toBe(1234.5);
+			expect(helpers.parseNumber('1.234,50 Euro', { locale: 'de-DE', currency: 'EUR' })).toBe(1234.5);
+			expect(helpers.parseNumber('1.234,50 $', { locale: 'de-DE', currency: 'EUR' })).toBeNaN();
+			expect(helpers.parseNumber('1234,50 zł', { locale: 'pl-PL', currency: 'PLN' })).toBe(1234.5);
+			expect(helpers.parseNumber('5 złotych polskich', { locale: 'pl-PL', currency: 'PLN' })).toBe(5);
+			expect(helpers.parseNumber('2 złote polskie', { locale: 'pl-PL', currency: 'PLN' })).toBe(2);
+			expect(helpers.parseNumber('1,5 złotego polskiego', { locale: 'pl-PL', currency: 'PLN' })).toBe(1.5);
+			expect(helpers.parseNumber('1,234.50 US dollars', { currency: 'usd' })).toBe(1234.5);
+			expect(helpers.parseNumber('1 US dollar', { currency: 'USD' })).toBe(1);
+			expect(helpers.parseNumber('￥1,235', { locale: 'ja-JP', currency: 'JPY' })).toBe(1235);
+			expect(helpers.parseNumber('1,235円', { locale: 'ja-JP', currency: 'JPY' })).toBe(1235);
+			expect(helpers.parseNumber('5', { currency: 'EUR', style: 'decimal' })).toBe(5);
+			expect(helpers.parseNumber('5 €', { currency: 'EUR', style: 'decimal' })).toBeNaN();
+		});
+
+		it('reads the separators and grouping of amounts, which can differ from those of numbers', function () {
+			expect(helpers.parseNumber('€ 1.234,50', { locale: 'de-AT', currency: 'EUR' })).toBe(1234.5);
+			expect(helpers.parseNumber(`1${NBSP}234,5`, { locale: 'de-AT' })).toBe(1234.5);
+			expect(helpers.parseNumber("1'234.50 CHF", { locale: 'fr-CH', currency: 'CHF' })).toBe(1234.5);
+			expect(helpers.parseNumber("1'234,5", { locale: 'fr-CH' })).toBe(1234.5);
+			expect(helpers.parseNumber('-$१,२३४,५६७.००', { locale: 'mr-IN', currency: 'USD' })).toBe(-1234567);
+			expect(helpers.parseNumber('-$१२,३४,५६७.००', { locale: 'mr-IN', currency: 'USD' })).toBe(-1234567);
+		});
+
+		it('reads a currency symbol and a currency name together (as tr-TR writes names)', function () {
+			const text = helpers.formatCurrency(-1234.5, 'USD', { locale: 'tr-TR', display: 'name' });
+			expect(helpers.parseNumber(text, { locale: 'tr-TR', currency: 'USD' })).toBe(-1234.5);
+		});
+	});
+
+	describe('compact style', function () {
+		it('multiplies by the power of ten of the suffix, short or long', function () {
+			expect(helpers.parseNumber('1.2K', { style: 'compact' })).toBe(1200);
+			expect(helpers.parseNumber('3.4M', { style: 'compact' })).toBe(3_400_000);
+			expect(helpers.parseNumber('-1.5B', { style: 'compact' })).toBe(-1_500_000_000);
+			expect(helpers.parseNumber('2T', { style: 'compact' })).toBe(2e12);
+			expect(helpers.parseNumber('1.2 thousand', { style: 'compact' })).toBe(1200);
+			expect(helpers.parseNumber('999', { style: 'compact' })).toBe(999);
+			expect(helpers.parseNumber(`1,2${NBSP}Mio.`, { locale: 'de-DE', style: 'compact' })).toBe(1_200_000);
+			expect(helpers.parseNumber('2 Millionen', { locale: 'de-DE', style: 'compact' })).toBe(2_000_000);
+			expect(helpers.parseNumber('1.2万', { locale: 'ja-JP', style: 'compact' })).toBe(12_000);
+			expect(helpers.parseNumber('12万', { locale: 'ja-JP', style: 'compact' })).toBe(120_000);
+			expect(helpers.parseNumber('3億', { locale: 'ja-JP', style: 'compact' })).toBe(3e8);
+			expect(helpers.parseNumber('100,000京', { locale: 'ja-JP', style: 'compact' })).toBe(1e21);
+			expect(helpers.parseNumber('1.5E3K', { style: 'compact' })).toBe(1_500_000);
+		});
+
+		it('reads a word that stands for its unit without a number', function () {
+			expect(helpers.formatCompact(1000, { locale: 'fr-CH', display: 'long' })).toBe('mille');
+			expect(helpers.parseNumber('mille', { locale: 'fr-CH', style: 'compact' })).toBe(1000);
+			expect(helpers.parseNumber('-mille', { locale: 'fr-CH', style: 'compact' })).toBe(-1000);
+			expect(helpers.parseNumber('2 mille', { locale: 'fr-CH', style: 'compact' })).toBe(2000);
+			expect(helpers.parseNumber('mille mille', { locale: 'fr-CH', style: 'compact' })).toBeNaN();
+		});
+
+		it('rejects unknown, repeated and misplaced suffixes', function () {
+			for (const text of ['1.2k', '1.2KK', 'K', '1.2 K M', '1.2X', '1.2万']) {
+				expect(helpers.parseNumber(text, { style: 'compact' })).toBeNaN();
+			}
+			expect(helpers.parseNumber('1.2K')).toBeNaN();
+		});
+	});
+
+	describe('round trips', function () {
+		it('parses back what the format helpers write', function () {
+			expect(helpers.parseNumber(helpers.formatNumber(-1234567.891, { locale: 'hi-IN' }), { locale: 'hi-IN' })).toBe(-1234567.891);
+			expect(helpers.parseNumber(helpers.formatCurrency(-1234.5, 'EUR', { locale: 'fr-FR', currencySign: 'accounting' }), { locale: 'fr-FR', currency: 'EUR' })).toBe(
+				-1234.5
+			);
+			expect(helpers.parseNumber(helpers.formatCurrency(1234.5, 'USD', { locale: 'en-IN', currencySign: 'accounting' }), { locale: 'en-IN', currency: 'USD' })).toBe(
+				1234.5
+			);
+			expect(helpers.parseNumber(helpers.formatPercent(0.256, { locale: 'fr-FR', decimals: 1 }), { locale: 'fr-FR', style: 'percent' })).toBe(0.256);
+			expect(helpers.parseNumber(helpers.formatCompact(1_234_567, { locale: 'es-ES', display: 'long' }), { locale: 'es-ES', style: 'compact' })).toBe(1_200_000);
+			expect(helpers.parseNumber(helpers.formatNumber(1e21), {})).toBe(1e21);
+		});
+	});
+
+	describe('options and errors', function () {
+		it('rejects a non-string text, an unknown style and a non-string currency', function () {
+			expect(function () {
+				helpers.parseNumber(5 as unknown as string);
+			}).toThrow(new TypeError('parseNumber: `text` must be a string, got number'));
+			expect(function () {
+				helpers.parseNumber(null as unknown as string);
+			}).toThrow(new TypeError('parseNumber: `text` must be a string, got null'));
+			expect(function () {
+				helpers.parseNumber('5', { style: 'unit' as never });
+			}).toThrow(new RangeError("parseNumber: `style` must be 'decimal', 'percent', 'currency' or 'compact', got unit"));
+			expect(function () {
+				helpers.parseNumber('5', { style: {} as never });
+			}).toThrow(new RangeError("parseNumber: `style` must be 'decimal', 'percent', 'currency' or 'compact', got object"));
+			expect(function () {
+				helpers.parseNumber('5', { currency: 5 as unknown as string });
+			}).toThrow(new TypeError('parseNumber: `currency` must be a string, got number'));
+		});
+
+		it('lets Intl reject a malformed locale, currency code or numbering system', function () {
+			expect(function () {
+				helpers.parseNumber('5', { locale: 'en_US' });
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.parseNumber('5', { currency: 'US' });
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.parseNumber('5', { numberingSystem: 'a' });
+			}).toThrow(RangeError);
+		});
+
+		it('ignores the other options, so the options of a format helper can be passed as they are', function () {
+			const options = { locale: 'de-DE', maximumFractionDigits: 1, useGrouping: false } as const;
+			expect(helpers.parseNumber(helpers.formatNumber(1234.56, options), options)).toBe(1234.6);
+		});
+
+		it('builds the symbols of a locale once (cached), and gives the same answers from the cache', function () {
+			const first = helpers.parseNumber('1 234,5', { locale: 'fr-CA' });
+			const spy = jest.spyOn(Intl, 'NumberFormat');
+			expect(helpers.parseNumber('1 234,5', { locale: 'fr-CA' })).toBe(first);
+			expect(helpers.parseNumber('-2', { locale: ['fr-CA'] })).toBe(-2);
+			expect(helpers.parseNumber('-2', { locale: ['fr-CA'] })).toBe(-2);
+			expect(spy).not.toHaveBeenCalled();
+		});
+
+		it('ignores options inherited from a polluted Object.prototype', function () {
+			const proto = Object.prototype as Record<string, unknown>;
+			proto.style = 'percent';
+			proto.currency = 'EUR';
+			proto.locale = 'de-DE';
+			try {
+				expect(helpers.parseNumber('1,234.5')).toBe(1234.5);
+				expect(helpers.parseNumber('1,234.5', {})).toBe(1234.5);
+				expect(helpers.parseNumber('$5', { style: 'currency' })).toBe(5);
+			} finally {
+				delete proto.style;
+				delete proto.currency;
+				delete proto.locale;
+			}
+		});
+
+		it('runs in linear time on hostile input', function () {
+			const start = performance.now();
+			expect(helpers.parseNumber('1'.repeat(200_000))).toBe(NaN);
+			expect(helpers.parseNumber(`1${',234'.repeat(100_000)}`)).toBe(NaN);
+			expect(helpers.parseNumber(`1${' '.repeat(200_000)}x`)).toBeNaN();
+			expect(helpers.parseNumber(`${'US$'.repeat(100_000)}1`, { style: 'currency' })).toBeNaN();
+			expect(helpers.parseNumber(`1${' K'.repeat(100_000)}`, { style: 'compact' })).toBeNaN();
+			expect(helpers.parseNumber(`${'('.repeat(100_000)}1${')'.repeat(100_000)}`)).toBeNaN();
+			expect(helpers.parseNumber(`0.${'0'.repeat(200_000)}1e200000`)).toBe(0.1);
+			expect(performance.now() - start).toBeLessThan(1000);
+		});
+	});
+});

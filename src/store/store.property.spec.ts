@@ -1,5 +1,5 @@
 import fc from 'fast-check';
-import { createHistory, createMachine, createStore } from '.';
+import { computed, createHistory, createMachine, createStore, persistStore } from '.';
 
 type Op = { kind: 'set'; value: number } | { kind: 'add'; value: number } | { kind: 'reset' };
 
@@ -362,6 +362,167 @@ describe('createHistory (properties)', function () {
 					expect(store.getState()).toBe(present);
 					expect(history.getState()).toEqual({ canUndo: past.length > 0, canRedo: future.length > 0, undoCount: past.length, redoCount: future.length });
 				}
+			})
+		);
+	});
+});
+
+describe('computed (properties)', function () {
+	/** An operation on one of three root stores. */
+	const rootOpArb = fc.tuple(fc.integer({ min: 0, max: 2 }), opArb);
+
+	it('always equals the reference combination, and notifies at most once per change, exactly when the result changes', function () {
+		fc.assert(
+			fc.property(selectorArb, selectorArb, equalsArb, fc.array(rootOpArb, { maxLength: 40 }), function (selectA, selectB, equals, ops) {
+				const roots = [createStore(0), createStore(1), createStore(2)];
+				// A diamond: `left` and `right` both derive from roots[0], and `total` combines them with the other roots.
+				const left = roots[0].select(selectA);
+				const right = computed([roots[0], roots[1]], function (a, b) {
+					return String(selectB(a)) + b;
+				});
+				let computations = 0;
+				const total = computed(
+					[left, right, roots[2]],
+					function (l, r, c) {
+						computations++;
+						return String(l).length + r.length + c;
+					},
+					{ equals: equals.fn }
+				);
+				/** The reference value, from the root states. */
+				function reference(): number {
+					const [a, b, c] = roots.map(function (root) {
+						return root.getState();
+					});
+					return String(selectA(a)).length + (String(selectB(a)) + b).length + c;
+				}
+				let notified = total.getState();
+				let calls = 0;
+				total.subscribe(function () {
+					calls++;
+				});
+				for (const [index, op] of ops) {
+					const before = calls;
+					const computationsBefore = computations;
+					apply(roots[index], op);
+					const expected = reference();
+					// The stored value only changes when `equals` says so, so compare through it.
+					expect(equals.fn(total.getState(), expected)).toBe(true);
+					expect(calls - before).toBeLessThanOrEqual(1);
+					expect(computations - computationsBefore).toBeLessThanOrEqual(1);
+					if (!equals.fn(notified, total.getState())) {
+						notified = total.getState();
+						expect(calls - before).toBe(1);
+					} else expect(calls - before).toBe(0);
+				}
+			})
+		);
+	});
+
+	it('getState without subscribers equals getState with subscribers', function () {
+		fc.assert(
+			fc.property(selectorArb, fc.array(rootOpArb, { maxLength: 30 }), fc.array(fc.boolean(), { maxLength: 30 }), function (selector, ops, toggles) {
+				const roots = [createStore(0), createStore(1), createStore(2)];
+				const view = computed(roots, function (a, b, c) {
+					return [selector(a), b, c];
+				});
+				let unsubscribe: (() => void) | undefined;
+				ops.forEach(function ([index, op], i) {
+					if (toggles[i]) {
+						if (unsubscribe === undefined) unsubscribe = view.subscribe(function () {});
+						else {
+							unsubscribe();
+							unsubscribe = undefined;
+						}
+					}
+					apply(roots[index], op);
+					expect(view.getState()).toEqual([selector(roots[0].getState()), roots[1].getState(), roots[2].getState()]);
+					expect(view.getState()).toBe(view.getState());
+				});
+			})
+		);
+	});
+});
+
+describe('persistStore (properties)', function () {
+	/**
+	 * An in-memory storage.
+	 */
+	function memory(): { getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem(key: string): void; data: Map<string, string> } {
+		const data = new Map<string, string>();
+		return {
+			data,
+			getItem(key: string): string | null {
+				return data.get(key) ?? null;
+			},
+			setItem(key: string, value: string): void {
+				data.set(key, value);
+			},
+			removeItem(key: string): void {
+				data.delete(key);
+			}
+		};
+	}
+
+	/**
+	 * What a JSON round trip without `__proto__` keys gives.
+	 */
+	function sanitized(value: unknown): unknown {
+		return JSON.parse(JSON.stringify(value), function (key, item) {
+			return key === '__proto__' ? undefined : item;
+		});
+	}
+
+	const keyArb = fc.oneof(fc.string(), fc.constantFrom('__proto__', 'constructor', 'prototype', 'toString'));
+	const stateArb = fc.dictionary(keyArb, fc.jsonValue(), { maxKeys: 6 });
+
+	it('a persisted state hydrates a new store to the same (JSON) state', function () {
+		fc.assert(
+			fc.property(stateArb, stateArb, function (state, initial) {
+				const storage = memory();
+				const source = createStore<Record<string, unknown>>({});
+				persistStore(source, { key: 'k', storage });
+				source.setState(state);
+				const target = createStore<Record<string, unknown>>(initial);
+				persistStore(target, { key: 'k', storage });
+				const expected = { ...(sanitized(initial) as object) };
+				for (const [key, value] of Object.entries(sanitized(state) as object)) {
+					Object.defineProperty(expected, key, { value, enumerable: true, writable: true, configurable: true });
+				}
+				expect(sanitized(target.getState())).toEqual(sanitized(expected));
+				expect(Object.getPrototypeOf(target.getState())).toBe(Object.prototype);
+				expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+			})
+		);
+	});
+
+	it('hydration never throws on arbitrary stored text, and either keeps the state or reports nothing', function () {
+		const textArb = fc.oneof(
+			fc.string(),
+			fc.json(),
+			fc.jsonValue().map(function (value) {
+				return JSON.stringify({ state: value, version: 0 });
+			})
+		);
+		fc.assert(
+			fc.property(textArb, function (text) {
+				const storage = memory();
+				storage.data.set('k', text);
+				const store = createStore<unknown>({ initial: true });
+				const before = store.getState();
+				const errors: unknown[] = [];
+				expect(function () {
+					persistStore(store, {
+						key: 'k',
+						storage,
+						onError(error) {
+							errors.push(error);
+						}
+					});
+				}).not.toThrow();
+				// Exactly one outcome: hydrated (no error) or untouched (one error).
+				if (errors.length > 0) expect(store.getState()).toBe(before);
+				expect(errors.length).toBeLessThanOrEqual(1);
 			})
 		);
 	});
