@@ -720,6 +720,17 @@ export function isNonEmptyArray<T>(value: ReadonlyArray<T> | null | undefined): 
  * isNonEmptyArray([]); // => false
  * isNonEmptyArray('a'); // => false
  */
+/**
+ * Checks whether an array of a union of array types (`string[] | number[]`) has at least one element, narrowing it to that type with a
+ * first element.
+ * @template A - The array type
+ * @param {A | null | undefined} value - The array to check
+ * @returns {boolean} Whether the value is a non-empty array
+ * @example
+ * const list = [1] as string[] | number[];
+ * if (isNonEmptyArray(list)) list[0]; // string | number
+ */
+export function isNonEmptyArray<A extends ReadonlyArray<unknown>>(value: A | null | undefined): value is A & readonly [A[number], ...A[number][]];
 export function isNonEmptyArray(value: unknown): value is [unknown, ...unknown[]];
 /**
  * Checks whether a value is an array with at least one element (implementation of the overloads above).
@@ -748,7 +759,7 @@ export function isNonEmptyArray(value: unknown): value is [unknown, ...unknown[]
  * isKeyOf(colors, 'toString'); // => false // inherited
  * isKeyOf(colors, 42); // => false
  */
-export function isKeyOf<T extends object>(object: T, key: unknown): key is keyof T {
+export function isKeyOf<T extends object>(object: T, key: unknown): key is T extends unknown ? keyof T : never {
 	if (object === null || object === undefined) throw new TypeError(`isKeyOf: \`object\` must not be null or undefined, got ${object}`);
 	if (typeof key !== 'string' && typeof key !== 'number' && typeof key !== 'symbol') return false;
 
@@ -772,6 +783,7 @@ export function isOneOf<const T extends ReadonlyArray<unknown>>(values: T): (val
 	if (!Array.isArray(values)) throw new TypeError(`isOneOf: \`values\` must be an array, got ${typeName(values)}`);
 
 	const allowed = new Set<unknown>(values);
+	const count = values.length;
 
 	return explainable(
 		function isOneOfValues(value: unknown): value is T[number] {
@@ -780,7 +792,7 @@ export function isOneOf<const T extends ReadonlyArray<unknown>>(values: T): (val
 		function explainOneOf(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
 			if (allowed.has(value)) return true;
 
-			issues.push({ message: `Expected one of ${values.length} allowed values (got ${typeName(value)})`, path: path.slice() });
+			issues.push({ message: `Expected one of ${count} allowed values (got ${typeName(value)})`, path: path.slice() });
 
 			return false;
 		}
@@ -1264,7 +1276,7 @@ export function isShape<S extends ShapeGuards>(shape: S, options?: IsShapeOption
  * While {@link isDiscriminatedUnion} runs a variant guard: the object being checked and its discriminant key. Exact shapes accept that key
  * on that very object (only), since the union checks it and variants do not repeat it.
  */
-let discriminated: { readonly object: object; readonly key: string } | undefined;
+let discriminated: { readonly object: object; readonly key: string; readonly previous: typeof discriminated } | undefined;
 
 /**
  * Whether `key` of `value` is the discriminant of the object a discriminated union is checking (see {@link discriminated}).
@@ -1273,7 +1285,10 @@ let discriminated: { readonly object: object; readonly key: string } | undefined
  * @returns {boolean} `true` for the discriminant of the discriminated object
  */
 function isDiscriminant(value: object, key: string): boolean {
-	return discriminated !== undefined && discriminated.object === value && discriminated.key === key;
+	// Every enclosing union counts (two-level tagging of one object: `{ type, sub, … }`).
+	for (let entry = discriminated; entry !== undefined; entry = entry.previous) if (entry.object === value && entry.key === key) return true;
+
+	return false;
 }
 
 /**
@@ -1894,7 +1909,7 @@ export function isDiscriminatedUnion<const K extends string, const V extends Sha
 	 */
 	function withDiscriminant(value: object, check: () => boolean): boolean {
 		const previous = discriminated;
-		discriminated = { object: value, key };
+		discriminated = { object: value, key, previous };
 		try {
 			return check();
 		} finally {
@@ -2331,7 +2346,9 @@ function compilePattern(pattern: unknown, ancestors: unknown[]): Guard<unknown> 
  * {@link isShape}, {@link isMatching}, {@link isArrayOf}, {@link isRecordOf}, {@link isTuple}, {@link isUnion}, {@link isDiscriminatedUnion},
  * {@link isIntersection}, {@link isOptional}, {@link isNullable}, {@link isLazy}, {@link refine}, {@link isOneOf}, {@link isLiteral},
  * {@link isNumberInRange}, {@link isIntegerInRange}, {@link isStringOfLength}, {@link isStringMatching} and {@link withMessage}, and the
- * JSON guards ({@link isJsonValue}…), report precise nested issues; any other guard is reported as one issue at its path.
+ * JSON guards ({@link isJsonValue}…), report precise nested issues; any other guard is reported as one issue at its path. Reports are
+ * recursive (unlike {@link isJsonValue}'s check): a value nested more than about a thousand levels deep in a recursive schema
+ * ({@link isLazy}) can overflow the stack (a `RangeError`) where the guard alone still answers.
  * @param {Guard<unknown>} guard - The guard to check against
  * @param {unknown} value - The value to check
  * @returns {SchemaIssue[]} The issues, in traversal order (empty when `value` passes)
@@ -2350,7 +2367,12 @@ export function explain(guard: Guard<unknown>, value: unknown): SchemaIssue[] {
 	scope.depth++;
 	try {
 		// Guards never consult the explainers, so valid values take the fast path and allocate nothing beyond the result.
-		if (!guard(value)) collect(guard, value, [], issues);
+		if (!guard(value)) {
+			collect(guard, value, [], issues);
+			// The report re-evaluates: a stateful guard (a global regex) or a getter returning another value may pass then. The value was
+			// still rejected, so it is reported (and `ensure` never returns it).
+			if (issues.length === 0) issues.push({ message: `Invalid value (got ${typeName(value)})`, path: [] });
+		}
 	} catch (error) {
 		if (scope.depth !== 1 || !isTooDeep(error)) throw error;
 		issues.length = 0;
@@ -2521,8 +2543,10 @@ function walkJson(root: unknown, path: PropertyKey[] | undefined, issues: Schema
 				if (path !== undefined && !isRoot) path.push(key);
 				stack.push(value, EXIT);
 				if (Array.isArray(value)) {
-					// Holes read as `undefined`, which is rejected: `JSON.stringify` would write them as `null`.
-					for (let index = value.length - 1; index >= 0; index--) stack.push(index, value[index]);
+					// Holes read as `undefined` (also under a polluted `Array.prototype`), which is rejected: `JSON.stringify` writes them as `null`.
+					const polluted = isArrayPrototypePolluted();
+
+					for (let index = value.length - 1; index >= 0; index--) stack.push(index, polluted && !hasOwn.call(value, index) ? undefined : value[index]);
 				} else {
 					const keys = Object.keys(value);
 

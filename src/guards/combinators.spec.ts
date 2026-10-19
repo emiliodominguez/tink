@@ -4,6 +4,7 @@ import {
 	ensure,
 	isArrayOf,
 	isDate,
+	isDiscriminatedUnion,
 	isFalsy,
 	isPromise,
 	isPlainObject,
@@ -14,12 +15,15 @@ import {
 	isJsonArray,
 	isJsonObject,
 	isJsonValue,
+	isKeyOf,
 	isLazy,
 	isLiteral,
 	isMatching,
+	isNonEmptyArray,
 	isNonNegativeInteger,
 	isNonNegativeNumber,
 	isNumberInRange,
+	isOneOf,
 	isOptional,
 	isPositiveInteger,
 	isPositiveNumber,
@@ -30,6 +34,7 @@ import {
 	isUnion,
 	refine,
 	withMessage,
+	ValidationError,
 	type FalsyNumber,
 	type FalsyPart,
 	type Guard,
@@ -843,5 +848,60 @@ describe('guards (regressions)', function () {
 			}
 		});
 		expect([isJsonValue(list), isJsonArray(list), isJsonValue({ list })]).toEqual([false, false, false]);
+	});
+});
+
+describe('guards (pass 3 regressions)', function () {
+	it('accepts the discriminants of nested discriminated unions on the same object', function () {
+		const inner = isDiscriminatedUnion('sub', { x: isShape({ n: isFiniteNumber }, { exact: true }) });
+		const outer = isDiscriminatedUnion('type', { a: inner });
+		expect(outer({ type: 'a', sub: 'x', n: 1 })).toBe(true);
+		expect(explain(outer, { type: 'a', sub: 'x', n: 1 })).toEqual([]);
+		expect(outer({ type: 'a', sub: 'x', n: 1, extra: true })).toBe(false);
+	});
+
+	it('reports a rejected value even when the report pass accepts it', function () {
+		const startsWithA = /^a/g;
+		startsWithA.lastIndex = 1;
+		const isNamed = isShape({
+			name: function (value: unknown): value is string {
+				return typeof value === 'string' && startsWithA.test(value);
+			}
+		});
+		expect(function () {
+			ensure(isNamed, { name: 'abc' });
+		}).toThrow(ValidationError);
+	});
+
+	it('rejects sparse JSON arrays under a polluted Array.prototype', function () {
+		const indexes = Array.prototype as unknown as Record<number, unknown>;
+		indexes[1] = 2;
+		try {
+			// eslint-disable-next-line no-sparse-arrays
+			expect(isJsonValue([1, , 3])).toBe(false);
+		} finally {
+			delete indexes[1];
+		}
+	});
+
+	it('reports the number of values isOneOf was created with', function () {
+		const list = ['a', 'b'];
+		const isListed = isOneOf(list);
+		list.push('c', 'd', 'e');
+		expect(explain(isListed, 'z')).toEqual([{ message: 'Expected one of 2 allowed values (got string)', path: [] }]);
+	});
+
+	it('types isKeyOf over union objects and isNonEmptyArray over unions of arrays', function () {
+		const object = { a: 1 } as { a: number } | { b: number };
+		const key: unknown = 'a';
+		if (isKeyOf(object, key)) {
+			const narrowed: Equal<typeof key, 'a' | 'b'> = true;
+			expect(narrowed).toBe(true);
+		}
+		const list = [1] as string[] | number[];
+		if (isNonEmptyArray(list)) {
+			const first: string | number = list[0];
+			expect(first).toBe(1);
+		}
 	});
 });
