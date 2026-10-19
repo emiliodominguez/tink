@@ -1408,8 +1408,8 @@ describe('fromUnixTime (properties)', function () {
 	it('keeps the written milliseconds and drops finer digits, toward zero', function () {
 		fc.assert(
 			fc.property(
-				// Up to 2^33 s (year 2242), where a double still tells microseconds apart: beyond, `x.000992` and `x.001` are one number.
-				fc.integer({ min: 0, max: 2 ** 33 }),
+				// Below 2^33 s (year 2242), where a double still tells microseconds apart: from 2^33 on, `x.000999` and `x.001` are one number.
+				fc.integer({ min: 0, max: 2 ** 33 - 1 }),
 				fc.integer({ min: 0, max: 999 }),
 				fc.integer({ min: 0, max: 999 }),
 				fc.boolean(),
