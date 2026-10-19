@@ -1061,14 +1061,15 @@ type Flatten<T> = { [K in keyof T]: T[K] };
  * separator or a `\` (`/a%2F..`) and more than 256 segments.
  * @template P - The pattern
  * @template V - The value type
+ * @template O - The extra type of an optional parameter (`undefined` for inputs, so that `exactOptionalPropertyTypes` accepts it)
  */
-type ParamsOf<P extends string, V> = P extends unknown
+type ParamsOf<P extends string, V, O = never> = P extends unknown
 	? // A key type with a `string` hole makes an index signature, which `{}` satisfies.
 		Record<never, never> extends Record<P, 1>
 		? Record<string, V | undefined>
 		: P extends `/${infer Rest}`
 			? IsValidPattern<Rest> extends true
-				? Flatten<{ [K in RequiredNames<PatternSegments<P>>]: V } & { [K in OptionalNames<PatternSegments<P>>]?: V }>
+				? Flatten<{ [K in RequiredNames<PatternSegments<P>>]: V } & { [K in OptionalNames<PatternSegments<P>>]?: V | O }>
 				: never
 			: never
 	: never;
@@ -1092,7 +1093,7 @@ export type PathParams<P extends string> = ParamsOf<P, string>;
  * (an object without keys for a pattern without parameters, so that a primitive is rejected).
  * @template P - The pattern
  */
-export type PathParamsInput<P extends string> = P extends unknown ? WithoutKeys<ParamsOf<P, string | number>> : never;
+export type PathParamsInput<P extends string> = P extends unknown ? WithoutKeys<ParamsOf<P, string | number, undefined>> : never;
 
 /**
  * `T`, or an object type accepting no keys (nor a primitive, unlike `{}`) when `T` has none.
@@ -1113,7 +1114,7 @@ type NoParams = Readonly<Record<string, never>>;
 export type PathBuilder<P extends string> = [PathParamsInput<P>] extends [never]
 	? (params: never) => string
 	: [PathParamsInput<P>] extends [NoParams]
-		? { (): string; (params: NoParams | undefined): string }
+		? { (): string; (params?: NoParams): string }
 		: Record<never, never> extends PathParamsInput<P>
 			? (params?: PathParamsInput<P>) => string
 			: (params: PathParamsInput<P>) => string;

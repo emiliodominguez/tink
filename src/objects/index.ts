@@ -1908,8 +1908,8 @@ function propertiesEqual(a: object, b: object, stack: ComparisonStack): boolean 
 }
 
 /**
- * Compares the own enumerable (string and symbol) properties of two plain objects, ignoring those whose value is `undefined` (as JSON
- * does). Each value is read once.
+ * Compares the own enumerable string-keyed properties of two plain objects, ignoring those whose value is `undefined` (as JSON does,
+ * and as {@link createPatch}, which diffs string keys only). Each value is read once.
  * @param {object} a - First object
  * @param {object} b - Second object
  * @param {ComparisonStack} stack - Cycle detection stack
@@ -1917,12 +1917,12 @@ function propertiesEqual(a: object, b: object, stack: ComparisonStack): boolean 
  */
 function definedMembersEqual(a: object, b: object, stack: ComparisonStack): boolean {
 	const defined = new Map<PropertyKey, unknown>();
-	for (const key of ownEnumerableKeys(b)) {
+	for (const key of Object.keys(b)) {
 		const value = (b as Properties)[key];
 		if (value !== undefined) defined.set(key, value);
 	}
 	let count = 0;
-	for (const key of ownEnumerableKeys(a)) {
+	for (const key of Object.keys(a)) {
 		const value = (a as Properties)[key];
 		if (value === undefined) continue;
 		if (!defined.has(key) || !equalWith(value, defined.get(key), stack, key)) return false;

@@ -1094,9 +1094,12 @@ export function cumulativeSum(numbers: Iterable<number>): number[] {
  * approximatelyEqual(1e-12, 0); // => false
  * approximatelyEqual(1e-12, 0, { absolute: 1e-9 }); // => true
  */
-export function approximatelyEqual(a: number, b: number, options: ApproximatelyEqualOptions = {}): boolean {
-	const relative = readOption(options, 'relative', 1e-9);
-	const absolute = readOption(options, 'absolute', 0);
+export function approximatelyEqual(a: number, b: number, options?: ApproximatelyEqualOptions): boolean {
+	// Often called in loops: read inline (see `readOption`), and not at all without options.
+	let relative = options?.relative;
+	if (relative === undefined || (relative === (Object.prototype as ApproximatelyEqualOptions).relative && !Object.hasOwn(options as object, 'relative'))) relative = 1e-9;
+	let absolute = options?.absolute;
+	if (absolute === undefined || (absolute === (Object.prototype as ApproximatelyEqualOptions).absolute && !Object.hasOwn(options as object, 'absolute'))) absolute = 0;
 	assertNumber('approximatelyEqual', 'relative', relative, relative >= 0, 'a number >= 0');
 	assertNumber('approximatelyEqual', 'absolute', absolute, absolute >= 0, 'a number >= 0');
 	if (a === b) return true;

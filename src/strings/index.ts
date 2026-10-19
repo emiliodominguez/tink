@@ -1964,13 +1964,16 @@ function compareRuns(a: string, b: string): number {
  * ['b', 'A2', 'a10', 'a2'].sort(function (a, b) { return compareNatural(a, b, { ignoreCase: true }); }); // => ['A2', 'a2', 'a10', 'b']
  * compareNatural('img12.png', 'img2.png'); // => 1
  */
-export function compareNatural(a: string, b: string, options: CompareNaturalOptions = {}): number {
+export function compareNatural(a: string, b: string, options?: CompareNaturalOptions): number {
 	assertString('compareNatural', 'a', a);
 	assertString('compareNatural', 'b', b);
 
 	if (a === b) return 0;
 
-	const order = readOption(options, 'ignoreCase') === true ? compareRuns(foldCase(a), foldCase(b)) : compareRuns(a, b);
+	// A sort comparator: read inline (see `readOption`), and not at all without options.
+	const flag = options?.ignoreCase;
+	const ignoreCase = flag === true && (flag !== (Object.prototype as CompareNaturalOptions).ignoreCase || Object.hasOwn(options as object, 'ignoreCase'));
+	const order = ignoreCase ? compareRuns(foldCase(a), foldCase(b)) : compareRuns(a, b);
 
 	return order !== 0 ? order : a < b ? -1 : 1;
 }

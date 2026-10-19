@@ -90,3 +90,12 @@ void matchPath('/:a/%2E?', '/a')?.a;
 const distinctNames: PathParams<'/:a/:ab/*b'> = { a: '1', ab: '2', b: '3' };
 const dotted: PathParams<'/.well-known/:file.json'> = { file: 'x' };
 void [templated, badName, twoParams, distinctNames, dotted];
+// A builder without parameters keeps an optional parameter for Parameters<> and inference.
+const noArguments: Parameters<PathBuilder<'/about'>> = [];
+declare const routes: { home: PathBuilder<'/'>; user: PathBuilder<'/users/:id'> };
+declare function routeLink<K extends keyof typeof routes>(name: K, ...params: Parameters<(typeof routes)[K]>): string;
+const homeLink: string = routeLink('home');
+const userLink: string = routeLink('user', { id: 1 });
+declare const maybePage: string | undefined;
+const pageLink: string = compilePath('/docs/:page?')({ page: maybePage });
+void [noArguments, homeLink, userLink, pageLink];

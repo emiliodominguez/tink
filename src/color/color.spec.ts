@@ -783,6 +783,15 @@ describe('Color helpers under prototype pollution', function () {
 		expect(function () {
 			helpers.mix('#00f', '#ff0', 0.5, null as unknown as helpers.MixOptions);
 		}).toThrow(TypeError);
+		// Even when a polluted Object.prototype holds the same key.
+		const keys = Object.prototype as Record<string, unknown>;
+		keys.space = 'oklab';
+		try {
+			expect(helpers.mix('#00f', '#ff0', 0.5, new MixOptions())).toEqual(helpers.mix('#00f', '#ff0', 0.5, { space: 'oklch' }));
+			expect(helpers.mix('#00f', '#ff0', 0.5, {})).toEqual(helpers.mix('#00f', '#ff0', 0.5, { space: 'srgb' }));
+		} finally {
+			delete keys.space;
+		}
 	});
 
 	it('never reads a missing OKLab / OKLCH component from Object.prototype', function () {

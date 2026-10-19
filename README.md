@@ -140,7 +140,7 @@ More examples, including dates, text and decorators, are in [Recipes](./docs/REC
 
 ## Numbers
 
-- **Size:** a median of 551 B per import, 4.7 kB at most, 89 kB gzipped for all 21 modules. The cost of every export is in [docs/SIZES.md](./docs/SIZES.md).
+- **Size:** a median of 551 B per import, 4.8 kB at most, 90 kB gzipped for all 21 modules. The cost of every export is in [docs/SIZES.md](./docs/SIZES.md).
 - **Speed:** benchmarked at 10, 1k and 100k items against the popular libraries with the same helpers. Results are in [docs/PERFORMANCE.md](./docs/PERFORMANCE.md) (`yarn bench`).
 
 ## How it's tested

@@ -128,20 +128,22 @@ export function draw(caller: string, random: RandomGenerator): number {
 
 /**
  * Reads a property of an options object (or of an input object) once, ignoring a value inherited from a polluted `Object.prototype`:
- * own properties are read, and so are properties of the object's own prototypes (class getters, proxies), but never a key that only
- * `Object.prototype` holds. Allocation-free, for hot paths.
+ * own properties are read, and so are properties of the object's own prototypes (class getters, proxies), but an inherited value that
+ * is the very value `Object.prototype` holds for that key is not (only this realm's `Object.prototype` is known). Allocation-free, and
+ * the common case (the option is not set) costs a single property read.
  * @template O - The options type
  * @template K - The key
  * @template D - The fallback type
  * @param {O} options - The options (`null` and `undefined` throw a `TypeError`, like destructuring them)
  * @param {K} key - The option name
  * @param {D} [fallback] - Returned instead of `undefined`
- * @returns {Exclude<O[K], undefined> | D} The value, or `fallback` when it is `undefined` or only inherited from `Object.prototype`
+ * @returns {Exclude<O[K], undefined> | D} The value, or `fallback` when it is `undefined` or inherited from `Object.prototype`
  * @internal
  */
 export function readOption<O extends object, K extends keyof O & string, D = undefined>(options: O, key: K, fallback?: D): Exclude<O[K], undefined> | D {
-	const value = hasOwn.call(options, key) || !hasOwn.call(Object.prototype, key) ? options[key] : undefined;
-	return (value === undefined ? fallback : value) as Exclude<O[K], undefined> | D;
+	const value = options[key];
+	if (value === undefined || (value === (Object.prototype as O)[key] && !hasOwn.call(options, key))) return fallback as D;
+	return value as Exclude<O[K], undefined>;
 }
 
 /** `Object.prototype.hasOwnProperty`, captured before any user code runs. */

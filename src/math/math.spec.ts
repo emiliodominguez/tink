@@ -2516,6 +2516,11 @@ describe('Math helpers under prototype pollution', function () {
 		try {
 			expect(helpers.histogram([1, 2, 3, 4])).toEqual(clean);
 			expect(helpers.approximatelyEqual(1, 2)).toBe(false);
+			expect(helpers.approximatelyEqual(1, 2, {})).toBe(false);
+			// An own option equal to the polluted value is still an option.
+			expect(helpers.approximatelyEqual(1, 2, { absolute: 1 })).toBe(true);
+			expect(helpers.approximatelyEqual(1, 2, { relative: 1 })).toBe(true);
+			expect(helpers.approximatelyEqual(1, 2, { absolute: 0.5 })).toBe(false);
 		} finally {
 			for (const key of ['thresholds', 'domain', 'decimals', 'base', 'relative', 'absolute']) delete polluted[key];
 		}

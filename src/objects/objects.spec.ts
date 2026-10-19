@@ -4472,3 +4472,11 @@ describe('Object helpers read their options as own properties only', function ()
 		expect(reads).toBe(1);
 	});
 });
+
+describe('JSON Patch and symbol keys', function () {
+	it('ignores symbol keys in the test op, as createPatch does', function () {
+		const symbol = Symbol('meta');
+		expect(helpers.createPatch({ a: 1, [symbol]: 1 }, { a: 1 })).toEqual([]);
+		expect(helpers.applyPatch({ x: { a: 1, [symbol]: 1 } }, [{ op: 'test', path: '/x', value: { a: 1 } }])).toEqual({ x: { a: 1, [symbol]: 1 } });
+	});
+});

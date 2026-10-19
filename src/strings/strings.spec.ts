@@ -2036,6 +2036,8 @@ describe('String helpers under prototype pollution', function () {
 		try {
 			expect(helpers.truncateMiddle('abcdefghij', 5)).toBe('ab…hij');
 			expect(helpers.compareNatural('a', 'B')).toBe(1);
+			expect(helpers.compareNatural('a', 'B', {})).toBe(1);
+			expect(helpers.compareNatural('a', 'B', { ignoreCase: true })).toBe(-1);
 			expect(helpers.mask('12345678')).toBe('****5678');
 			expect(helpers.wordWrap('abcdefghij', 4)).toBe('abcdefghij');
 			expect(helpers.toDelimitedCase('helloWorld', '-')).toBe('hello-world');
