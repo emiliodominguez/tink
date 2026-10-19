@@ -1,4 +1,4 @@
-![tinkit: Small utilities. Solid foundations. A smiling pastel building block next to the wordmark tinkit, an npm i tinkit command and four facts: ~600 typed helpers, 20 modules, 0 dependencies, tree-shakeable.](https://raw.githubusercontent.com/emiliodominguez/tinkit/main/docs/assets/tinkit-banner.png)
+![tinkit: Small utilities. Solid foundations. A smiling pastel building block next to the wordmark tinkit, an npm i tinkit command and four facts: ~650 typed helpers, 21 modules, 0 dependencies, tree-shakeable.](https://raw.githubusercontent.com/emiliodominguez/tinkit/main/docs/assets/tinkit-banner.png)
 
 [![CI](https://img.shields.io/github/actions/workflow/status/emiliodominguez/tinkit/tests.yml?branch=main&style=for-the-badge&label=CI&labelColor=161b22&logo=githubactions&logoColor=white)](https://github.com/emiliodominguez/tinkit/actions/workflows/tests.yml)
 [![TypeScript: strict](https://img.shields.io/badge/TS-strict-3178c6?style=for-the-badge&labelColor=161b22&logo=typescript&logoColor=white)](./tsconfig.json)
@@ -8,7 +8,7 @@
 
 **Strictly typed utilities for everyday JavaScript, with the edge cases handled.**
 
-~600 tree-shakeable helpers · 20 modules · zero dependencies · a median of 528 B per import
+~650 tree-shakeable helpers · 21 modules · zero dependencies · a median of 551 B per import
 
 ```bash
 npm install tinkit
@@ -20,7 +20,7 @@ import { isShape, isInteger, isString } from 'tinkit/guards';
 import { retry } from 'tinkit/async';
 ```
 
-ESM, fully typed, Node 20.19+ and modern browsers. Each module is a deep import, so your bundle only contains the helpers you call.
+ESM, fully typed (TypeScript 5.7+), Node 20.19+ and modern browsers. Each module is a deep import, so your bundle only contains the helpers you call.
 
 ## The edge cases
 
@@ -112,37 +112,38 @@ More examples, including dates, text and decorators, are in [Recipes](./docs/REC
 
 ## Modules
 
-| Module                                   | Highlights                                                                                                                                                                                   |
-| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`arrays`](./docs/API.md#arrays)         | `orderBy`, `groupBy`, `partition`, `chunk`, top-N `takeFirstBy`, `sampleSize`, combinatorics, Myers `diffSequences`, set algebra (`…By`/`…With`)                                             |
-| [`objects`](./docs/API.md#objects)       | `deepClone`, `deepMerge`/`defaults`, `isEqual`/`isMatch`, immutable `updatePath`, `toCamelCaseKeys`, `stableStringify`/`hash`, `diff`                                                        |
-| [`guards`](./docs/API.md#guards)         | 50+ predicates, `isShape`/`isUnion`/`isDiscriminatedUnion`/`isLazy`/`refine` schemas, `isStringOfLength`, `isMatching`, `explain`/`ensure`, `toStandardSchema`                               |
-| [`strings`](./docs/API.md#strings)       | every case style, grapheme-aware `padStart`/`trimChars`/`truncate`, `toSlug`, `dedent`, `wordWrap`, `levenshtein`, `mask`, `escapeHtml`                                                      |
-| [`math`](./docs/API.md#math)             | precise `sum`/`round`/`ceil`/`floor`, `quantile`, `variance`, `clamp`/`lerp`, `formatBytes`/`parseBytes`, Miller–Rabin `isPrime`                                                             |
-| [`functions`](./docs/API.md#functions)   | `debounce`/`throttle` with `cancel`/`flush`, `memoize`, exhaustive `match`, `curry`, `pipe`, `allPass`/`anyPass`, `attempt`                                                                  |
-| [`async`](./docs/API.md#async)           | `retry`, `withTimeout`, priority `createQueue`, `createRateLimiter`, `memoizeAsync`, abortable `mapWithConcurrency`, `pollUntil`                                                             |
-| [`date`](./docs/API.md#date)             | DST-safe `addDuration`/`addMonths`, `intervalToDuration`, strict `parseDate`/`formatDate`, ISO weeks, `toISOStringLocal`, `eachOfInterval`                                                   |
-| [`format`](./docs/API.md#format)         | deterministic, cached Intl formatting: `formatCurrency`, `formatCompact`, `formatPercent`, `formatList`, `formatOrdinal`, …                                                                  |
-| [`validate`](./docs/API.md#validate)     | ReDoS-safe predicates (`isEmail`, look-alike safe `isUrl`, `isUuid`, `isIP`, `isSemver`…), safe `parseJson`, zod-like `parse` with strict `asInteger`/`asBoolean`/`asDate` and `withDefault` |
-| [`color`](./docs/API.md#color)           | CSS `parseColor` (hex, `rgb()`, `hsl()`), `mix`, `lighten`/`darken`, WCAG `contrastRatio`, `getReadableTextColor`, `meetsContrast`                                                           |
-| [`search`](./docs/API.md#search)         | `fuzzyMatch`/`fuzzySearch` with optimal scoring and highlight ranges, `highlight` segments for rendering matches                                                                             |
-| [`easing`](./docs/API.md#easing)         | 31 tree-shakeable easings, CSS-accurate `cubicBezier`/`steps`, analytic `spring`, `interpolate`                                                                                              |
-| [`url`](./docs/API.md#url)               | `buildQueryString`/`parseQueryString` (pollution-safe), `isSafeUrl`/`sanitizeUrl`, `withQuery`, `joinUrl`, `withBase`, slash helpers                                                         |
-| [`iterables`](./docs/API.md#iterables)   | lazy `map`/`filter`/`take`/`chunk`/`zip` over any (async) iterable, bounded `mapConcurrent` with backpressure                                                                                |
-| [`cache`](./docs/API.md#cache)           | O(1) `createLRUCache` with TTL and eviction reasons, stable binary-heap `createPriorityQueue`                                                                                                |
-| [`emitter`](./docs/API.md#emitter)       | typed `createEmitter` with wildcard listeners, `once`, `waitFor` (timeout/abort) and error isolation                                                                                         |
-| [`store`](./docs/API.md#store)           | `createStore` for `useSyncExternalStore`, with equality-gated updates and cached `select()` stores                                                                                           |
-| [`random`](./docs/API.md#random)         | seeded `createRandom` (cross-platform deterministic), secure `secureRandom`/`randomId`/`randomUUID`/`randomBytes`, `weightedRandom`                                                          |
-| [`decorators`](./docs/API.md#decorators) | `@memoize`/`@once` (per instance), `@bound`, `@debounced`, `@throttled`, `@retryable`, `@timeout`, `@readonly`, `@deprecated`                                                                |
+| Module                                   | Highlights                                                                                                                                                                                                                         |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`arrays`](./docs/API.md#arrays)         | `orderBy`, `groupBy`, `partition`, `chunk`, top-N `takeFirstBy`, `sampleSize`, combinatorics, Myers `diffSequences`, set algebra (`…By`/`…With`)                                                                                   |
+| [`objects`](./docs/API.md#objects)       | `deepClone`, `deepMerge`/`defaults`, `isEqual`/`isMatch`, immutable `updatePath`, `toCamelCaseKeys`, `stableStringify`/`hash`, `diff`, JSON Patch `createPatch`/`applyPatch`, `replaceEqualDeep`                                   |
+| [`guards`](./docs/API.md#guards)         | 50+ predicates, `isShape`/`isUnion`/`isDiscriminatedUnion`/`isLazy`/`refine` schemas, `isStringOfLength`, `isMatching`, `explain`/`ensure`, `toStandardSchema`                                                                     |
+| [`strings`](./docs/API.md#strings)       | every case style, grapheme-aware `padStart`/`trimChars`/`truncate`/`truncateMiddle`, `compareNatural`, terminal `stringWidth`, `toSlug`, `dedent`, `wordWrap`, `levenshtein`, `mask`                                               |
+| [`math`](./docs/API.md#math)             | precise `sum`/`round`/`ceil`/`floor`, exact `sumPrecise`, `toSignificant`, `quantile`, `variance`, `histogram`, `movingAverage`, `clamp`/`lerp`, `formatBytes`/`parseBytes`, Miller–Rabin `isPrime`                                |
+| [`functions`](./docs/API.md#functions)   | `debounce`/`throttle` with `cancel`/`flush`, `memoize`, exhaustive `match`, `curry`, `pipe`, `allPass`/`anyPass`, `attempt`                                                                                                        |
+| [`async`](./docs/API.md#async)           | `retry`, `withTimeout`, DataLoader-style `createBatcher`, priority `createQueue`, `createRateLimiter`, `memoizeAsync`, abortable `mapWithConcurrency`, `pollUntil`                                                                 |
+| [`date`](./docs/API.md#date)             | DST-safe `addDuration`/`addMonths`, IANA time zones (`formatInTimeZone`, `fromZonedTime`, `getZonedParts`), `getCalendarMonth`, strict `parseDate`/`formatDate`, ISO weeks, `eachOfInterval`                                       |
+| [`format`](./docs/API.md#format)         | deterministic, cached Intl formatting: `formatCurrency`, `formatCompact`, `formatPercent`, `formatList`, `formatOrdinal`, …                                                                                                        |
+| [`validate`](./docs/API.md#validate)     | ReDoS-safe predicates (`isEmail`, look-alike safe `isUrl`, `isUuid`, `isIP`, `isSemver`…), safe `parseJson`, zod-like `parse` with strict `asInteger`/`asBoolean`/`asDate`, `withDefault`, and `parseEnv` that never leaks a value |
+| [`color`](./docs/API.md#color)           | CSS `parseColor` (hex, `rgb()`, `hsl()`, `oklch()`, `oklab()`), OKLCH conversions with CSS gamut mapping, perceptual `mix`, `lighten`/`darken`, WCAG `contrastRatio`, `getReadableTextColor`                                       |
+| [`search`](./docs/API.md#search)         | `fuzzyMatch`/`fuzzySearch` with optimal scoring and highlight ranges, `highlight` segments for rendering matches                                                                                                                   |
+| [`easing`](./docs/API.md#easing)         | 31 tree-shakeable easings, CSS-accurate `cubicBezier`/`steps`, analytic `spring`, `interpolate`                                                                                                                                    |
+| [`encoding`](./docs/API.md#encoding)     | strict base64/base64url, hex and UTF-8 without `Buffer`, synchronous `sha256`                                                                                                                                                      |
+| [`url`](./docs/API.md#url)               | typed route patterns `matchPath`/`compilePath`, `buildQueryString`/`parseQueryString` (pollution-safe), `parseFormData`, `isSafeUrl`/`sanitizeUrl`, `withQuery`, `joinUrl`, slash helpers                                          |
+| [`iterables`](./docs/API.md#iterables)   | lazy `map`/`filter`/`take`/`chunk`/`zip` over any (async) iterable, bounded `mapConcurrent` with backpressure                                                                                                                      |
+| [`cache`](./docs/API.md#cache)           | O(1) `createLRUCache` with TTL and eviction reasons, stable binary-heap `createPriorityQueue`                                                                                                                                      |
+| [`emitter`](./docs/API.md#emitter)       | typed `createEmitter` with wildcard listeners, `once`, `waitFor` (timeout/abort) and error isolation                                                                                                                               |
+| [`store`](./docs/API.md#store)           | `createStore` for `useSyncExternalStore` with cached `select()` stores, typed state machines (`createMachine`), undo/redo `createHistory`                                                                                          |
+| [`random`](./docs/API.md#random)         | seeded `createRandom` (cross-platform deterministic), time-ordered `uuidv7`/`ulid`, secure `secureRandom`/`randomId`/`randomUUID`/`randomBytes`, `weightedRandom`                                                                  |
+| [`decorators`](./docs/API.md#decorators) | `@memoize`/`@once` (per instance), `@bound`, `@debounced`, `@throttled`, `@retryable`, `@timeout`, `@readonly`, `@deprecated`                                                                                                      |
 
 ## Numbers
 
-- **Size:** a median of 528 B per import, 3.8 kB at most, 69 kB gzipped for all 20 modules. The cost of every export is in [docs/SIZES.md](./docs/SIZES.md).
+- **Size:** a median of 551 B per import, 4.7 kB at most, 89 kB gzipped for all 21 modules. The cost of every export is in [docs/SIZES.md](./docs/SIZES.md).
 - **Speed:** benchmarked at 10, 1k and 100k items against the popular libraries with the same helpers. Results are in [docs/PERFORMANCE.md](./docs/PERFORMANCE.md) (`yarn bench`).
 
 ## How it's tested
 
-3,600+ tests, run in four time zones before every push, with 100% statement and branch coverage. They include [fast-check](https://fast-check.dev) property tests for the laws behind each helper, every JSDoc example (1,400+ assertions) run against the build, and [mutation testing](./docs/mutation/README.md).
+4,700+ tests, run in six time zones before every push, with 100% statement and branch coverage. They include [fast-check](https://fast-check.dev) property tests for the laws behind each helper, every JSDoc example (1,700+ assertions) run against the build, and [mutation testing](./docs/mutation/README.md).
 
 ## Docs
 

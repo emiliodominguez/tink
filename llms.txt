@@ -1,6 +1,6 @@
 # tink (tinkit)
 
-> Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities (20 modules, 608 exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, fuzzy search, caches, emitters and stores. Property-tested and mutation-tested.
+> Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities (21 modules, 653 exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, encoding, fuzzy search, caches, emitters and stores. Property-tested and mutation-tested.
 
 Key facts for code generation:
 - ESM only, zero dependencies, Node >= 20.19 or any modern browser/runtime. TypeScript types ship in the package.
@@ -24,6 +24,7 @@ Key facts for code generation:
 - [color](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#color): Hex/RGB/HSL conversion, mixing, lightening and WCAG contrast checks. Import from `tinkit/color`.
 - [search](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#search): Fuzzy matching and ranking with highlight ranges, for command palettes and filter-as-you-type UIs. Import from `tinkit/search`.
 - [easing](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#easing): Animation easing curves, CSS-accurate cubic-bezier() and steps(), and an analytic spring. Import from `tinkit/easing`.
+- [encoding](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#encoding): Buffer-free base64/base64url, hex and UTF-8 conversions with strict decoding, and a synchronous SHA-256. Import from `tinkit/encoding`.
 - [format](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#format): Deterministic, cached Intl formatting: numbers, currency, percent, compact, units, lists, dates, ordinals. Import from `tinkit/format`.
 - [validate](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#validate): Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates, and zod-like parsing with coercion, defaults and transforms. Import from `tinkit/validate`.
 - [date](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#date): DST-safe, non-mutating local-time date arithmetic, formatting and parsing. Import from `tinkit/date`.

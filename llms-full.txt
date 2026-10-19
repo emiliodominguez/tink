@@ -132,6 +132,10 @@ Import: `import { … } from 'tinkit/objects';`
 - `hasPath(target: object, path: string): boolean` — Checks whether a dot-separated path exists in an object: it is `true` exactly when `getPath` resolves the path to a property (whose value may be `undefined`) rather than falling back to the default value.
 - `deletePath(target: object, path: string): boolean` — Deletes the property at a dot-separated path.
 - `diff(a: object, b: object): ObjectDiff` — Computes the structural differences between two trees of plain objects and arrays, as dot-separated paths (array elements use numeric segments: `'list.0'`).
+- `replaceEqualDeep<T>(prev: unknown, next: T): T` — Structural sharing, as TanStack Query applies it to refetched data: returns `next`, except that every part of it deeply equal (`isEqual`) to the part of `prev` at the same place is replaced by that part of `prev`, and `prev` itself is returned when everything is equal.
+- `JsonPatchErrornew (message: string, index: number, operation: JsonPatchOperation)` — Error thrown by `applyPatch` when a well-formed operation cannot be applied to the document: a location that does not exist, an array index out of bounds, a value that cannot be walked into, a failed `test`, a `move` into its own child, or a `remove` of the whole document.
+- `createPatch(a: unknown, b: unknown): JsonPatchOperation[]` — Computes a JSON Patch (RFC 6902) that turns `a` into `b`: `applyPatch(a, createPatch(a, b))` is deeply equal to `b` for JSON values.
+- `applyPatch<T>(document: T, operations: ReadonlyArray<JsonPatchOperation>): T` — Applies a JSON Patch (RFC 6902) to a document and returns the NEW document: the input is never modified, and the parts of it that the patch does not touch are shared with the result (only the plain objects and arrays on the changed paths are copied, once per call).
 - `findKey<T extends object, S extends T[keyof T]>(object: T, predicate: (value: T[keyof T], key: StringKeyOf<T>, object: T) => value is S): KeysMatching<T, S> | undefined` — Returns the first own enumerable string key (in `Object.keys` order) whose value satisfies `predicate`.
 - `findEntry<T extends object, S extends T[keyof T]>(object: T, predicate: (value: T[keyof T], key: StringKeyOf<T>, object: T) => value is S): [KeysMatching<T, S>, S] | undefined` — Returns the first `[key, value]` own enumerable string-keyed entry whose value satisfies a type-guard `predicate`, narrowed.
 - `mapEntries<T extends object, K extends PropertyKey, V>(object: T, fn: (value: T[keyof T], key: StringKeyOf<T>, object: T) => readonly [K, V]): Record<K, V>` — Creates a new object by mapping every own enumerable string-keyed entry (in `Object.keys` order) to a new `[key, value]` pair.
@@ -281,6 +285,9 @@ Import: `import { … } from 'tinkit/strings';`
 - `padStart(string: string, width: number, fill: string = ' '): string` — Pads the start of a string until it is `width` user-perceived characters (grapheme clusters) wide.
 - `padEnd(string: string, width: number, fill: string = ' '): string` — Pads the end of a string until it is `width` user-perceived characters (grapheme clusters) wide (see `padStart`).
 - `padCenter(string: string, width: number, fill: string = ' '): string` — Pads both ends of a string until it is `width` user-perceived characters (grapheme clusters) wide (see `padStart`).
+- `compareNatural(a: string, b: string, options: CompareNaturalOptions = {}): number` — Compares two strings in natural order, for `Array.prototype.sort`: runs of digits compare by their numeric value, so `'file2'` sorts before `'file10'` and `'v1.9'` before `'v1.10'`, and everything else compares by UTF-16 code units, like `<` (or case-insensitively, with `ignoreCase`).
+- `truncateMiddle(string: string, length: number, options: TruncateMiddleOptions = {}): string` — Shortens a string by removing its middle, so both ends stay visible (paths, URLs, identifiers, hashes): when the string is longer than `length` user-perceived characters (grapheme clusters), it keeps `length` of them, half from the start and half from the end by default, with the ellipsis between.
+- `stringWidth(string: string): number` — Computes how many columns a string takes up in a monospace terminal, for aligning tables, progress bars and other command-line output.
 
 ## url
 
@@ -307,6 +314,8 @@ Import: `import { … } from 'tinkit/url';`
 - `withFragment(url: string, fragment: string): string` — Sets the fragment of a URL string, replacing any existing one and keeping the query before it.
 - `withoutFragment(url: string): string` — Removes the fragment (`#...`) of a URL string.
 - `withoutQuery(url: string): string` — Removes the query (`?...`) of a URL string and keeps its fragment (a `?` inside the fragment is not a query).
+- `matchPath<P extends string>(pattern: P, pathname: string, options: MatchPathOptions = {}): PathParams<P> | null` — Matches a pathname against a route pattern and returns the parameters it captures, or `null` when it does not match.
+- `compilePath<P extends string>(pattern: P): PathBuilder<P>` — Compiles a route pattern (see `matchPath` for the syntax) into a function that builds pathnames from parameters, the inverse of `matchPath`.
 
 ## math
 
@@ -358,6 +367,10 @@ Import: `import { … } from 'tinkit/math';`
 - `ordinal(n: number): string` — Converts an integer to its English ordinal string (`1st`, `2nd`, `3rd`, `4th`, `11th`, `12th`, `13th`, `21st`, `112th`, …).
 - `nthRoot(value: number, n: number): number` — Computes the real `n`-th root of a number.
 - `roundToStep(value: number, step: number): number` — Rounds a number to the nearest multiple of `step` (e.g. snapping to quarters with `step = 0.25`).
+- `toSignificant(input: number, digits: number): number` — Rounds a number to `digits` significant figures.
+- `sumPrecise(numbers: Iterable<number>): number` — Adds up numbers exactly, then rounds once: the result is the double nearest to the true sum (ties to even), whatever the order of the numbers and however much they cancel.
+- `movingAverage(values: ReadonlyArray<number>, window: number): number[]` — Computes the simple moving average of a series: the mean of every run of `window` consecutive values, in order.
+- `histogram(values: ReadonlyArray<number>, options: HistogramOptions = {}): HistogramBin[]` — Counts values into bins, like d3's `bin()`: equal-width `bins` (Sturges' rule by default) or explicit `thresholds`, over a `domain` that defaults to the extent of the values.
 
 ## functions
 
@@ -415,6 +428,7 @@ Import: `import { … } from 'tinkit/async';`
 - `debounceAsync<F extends (...args: never[]) => unknown>(fn: F, wait: number): DebouncedAsync<F>` — Creates a debounced version of a (possibly async) function: `fn` is invoked `wait` ms after the last call of a burst, with the latest `this` and arguments, and every call of the burst returns a promise that settles with the result of that single invocation.
 - `memoizeAsync<F extends AnyFunction>(fn: F, options: MemoizeAsyncOptions<F> = {}): MemoizedAsync<F>` — Memoizes an async (or promise-returning) function, correctly.
 - `sequence<T>(tasks: Iterable<() => PromiseLike<T> | T>): Promise<T[]>` — Runs (possibly async) tasks one at a time, in iteration order, and resolves with their results in the same order.
+- `createBatcher<K, V>(batchLoad: BatchLoadFunction<K, V>, options: BatcherOptions<K, V> = {}): Batcher<K, V>` — Creates a request batcher, DataLoader-style: every key requested with `load` while a batch is open goes to ONE call of `batchLoad`, which returns one value per key, and each caller gets the value of its own key.
 - `timeoutSignal(ms: number): PlatformAbortSignal` — Creates an `AbortSignal` that aborts with a `TimeoutError` after `ms` milliseconds — like the platform's `AbortSignal.timeout`, but with this library's `TimeoutError` as the reason (so `error instanceof TimeoutError` works across the async helpers).
 - `anySignal(signals: Iterable<AbortSignalLike | null | undefined>): PlatformAbortSignal` — Combines abort signals: returns a new `AbortSignal` that aborts as soon as any of the inputs aborts, with that input's `reason` (or an `AbortError` when it has none) — like the platform's `AbortSignal.any`, but accepting any `AbortSignalLike`.
 - `abortable<T>(promise: PromiseLike<T> | T, signal: AbortSignalLike | null | undefined): Promise<T>` — Settles like `promise`, unless `signal` aborts first, in which case it rejects with the signal's `reason` (or an `AbortError` when it has none).
@@ -433,9 +447,15 @@ Import: `import { … } from 'tinkit/color';`
 - `toCssHsl(color: ColorInput): string` — Formats a colour as a CSS `hsl()` string in the modern space-separated syntax: `'hsl(h s% l%)'`, or `'hsl(h s% l% / a)'` for translucent colours.
 - `rgbToHsl(color: ColorInput): Hsl` — Converts an RGB colour to HSL using the standard (CSS Color 4) formulas.
 - `hslToRgb(hsl: Hsl): Rgb` — Converts an HSL colour to RGB using the standard (CSS Color 4) formulas, rounding channels to integers.
-- `mix(colorA: ColorInput, colorB: ColorInput, weight = 0.5): Rgba` — Mixes two colours by plain linear interpolation of their sRGB channels and alpha (no gamma-correct or premultiplied blending).
-- `lighten(color: ColorInput, amount: number): Rgba` — Makes a colour lighter by adding `amount` percentage points to its HSL lightness (the result is clamped at `100`, white).
-- `darken(color: ColorInput, amount: number): Rgba` — Makes a colour darker by subtracting `amount` percentage points from its HSL lightness (the result is clamped at `0`, black).
+- `mix(colorA: ColorInput, colorB: ColorInput, weight = 0.5, options: MixOptions = {}): Rgba` — Mixes two colours.
+- `lighten(color: ColorInput, amount: number, options: LightnessOptions = {}): Rgba` — Makes a colour lighter by adding `amount` percentage points to its lightness: HSL lightness by default (clamped at `100`, white, keeping hue and saturation), or OKLCH lightness with `{ space: 'oklch' }` (`amount / 100` added to `l`, keeping chroma and hue, gamut mapped): equal amounts then look like equal steps whatever the hue, which HSL does not guarantee (yellow and blue at the same HSL lightness look very different).
+- `darken(color: ColorInput, amount: number, options: LightnessOptions = {}): Rgba` — Makes a colour darker by subtracting `amount` percentage points from its lightness: HSL lightness by default (clamped at `0`, black, keeping hue and saturation), or OKLCH lightness with `{ space: 'oklch' }` (see `lighten`).
+- `toOklab(color: ColorInput): Required<Oklab>` — Converts a colour to OKLab (see `Oklab`).
+- `toOklch(color: ColorInput): Required<Oklch>` — Converts a colour to OKLCH (see `Oklch`).
+- `oklchToRgb(oklch: OklchInput): Rgba` — Converts an OKLCH colour to sRGB.
+- `oklabToRgb(oklab: Oklab): Rgba` — Converts an OKLab colour to sRGB, with the same gamut mapping as `oklchToRgb`.
+- `inGamut(oklch: OklchInput): boolean` — Tells whether an OKLCH colour lies inside the sRGB gamut (within a tolerance of `0.000075` per channel, which absorbs rounding), i.e. whether `oklchToRgb` can show it without gamut mapping.
+- `toCssOklch(color: ColorInput): string` — Formats a colour as a CSS `oklch()` string: `'oklch(l c h)'`, or `'oklch(l c h / a)'` for translucent colours.
 - `withAlpha(color: ColorInput, alpha: number): Rgba` — Returns a copy of a colour with the given alpha.
 - `relativeLuminance(color: ColorInput): number` — Computes the WCAG 2.x relative luminance of a colour: `0.2126 R + 0.7152 G + 0.0722 B` over the linearized sRGB channels.
 - `contrastRatio(a: ColorInput, b: ColorInput): number` — Computes the WCAG 2.x contrast ratio `(L1 + 0.05) / (L2 + 0.05)` between two colours, where `L1` is the larger relative luminance.
@@ -497,6 +517,20 @@ Import: `import { … } from 'tinkit/easing';`
 - `steps(count: number, position: StepPosition = 'jump-end'): EasingFunction` — Creates a step easing function equivalent to CSS `steps(count, position)`: the output jumps between `jumps + 1` evenly spaced levels `0, 1/jumps, ..., 1`, where `jumps` is `count` (`jump-start` / `jump-end`), `count - 1` (`jump-none`) or `count + 1` (`jump-both`).
 - `spring(options: SpringOptions = {}): Spring` — Solves a damped harmonic oscillator (mass `m` on a spring of stiffness `k` with damping `c`) released at position `0` with initial `velocity` towards a target at `1`, in closed form (under-, critically and over-damped cases), like the physics springs of SwiftUI, Framer Motion or React Spring.
 - `interpolate(from: number, to: number, t: number, easing: EasingFunction = linear): number` — Interpolates between two numbers with an easing function: `lerp(from, to, easing(t))`.
+
+## encoding
+
+Buffer-free base64/base64url, hex and UTF-8 conversions with strict decoding, and a synchronous SHA-256.
+Import: `import { … } from 'tinkit/encoding';`
+
+- `toBase64(data: string | BytesInput, options?: ToBase64Options): string` — Encodes binary data (or the UTF-8 encoding of a string) as base64 (RFC 4648 §4) or base64url (§5).
+- `fromBase64(text: string, options?: FromBase64Options): Uint8Array<ArrayBuffer>` — Decodes base64 (RFC 4648 §4) or base64url (§5) text, strictly: it accepts exactly the strings that the validate module's `isBase64` accepts with the same options.
+- `toHex(data: string | BytesInput): string` — Encodes binary data (or the UTF-8 encoding of a string) as lowercase hexadecimal, two digits per byte.
+- `fromHex(text: string): Uint8Array<ArrayBuffer>` — Decodes hexadecimal text, two digits per byte, in either letter case.
+- `encodeUtf8(text: string, options?: EncodeUtf8Options): Uint8Array<ArrayBuffer>` — Encodes a string as UTF-8 bytes.
+- `decodeUtf8(bytes: BytesInput, options?: DecodeUtf8Options): string` — Decodes UTF-8 bytes into a string, following the WHATWG Encoding Standard exactly (the behaviour of `TextDecoder`): each maximal invalid subsequence (a stray continuation byte, a truncated sequence, an overlong form, a surrogate code point, a value above U+10FFFF) becomes one U+FFFD, or throws with `fatal`.
+- `sha256(data: string | BytesInput): Uint8Array<ArrayBuffer>` — Computes the SHA-256 digest (FIPS 180-4) of binary data or of the UTF-8 encoding of a string, synchronously and in plain JavaScript.
+- `sha256Hex(data: string | BytesInput): string` — Computes the SHA-256 digest of binary data or of the UTF-8 encoding of a string, as 64 lowercase hex digits (see `sha256`).
 
 ## format
 
@@ -561,6 +595,7 @@ Import: `import { … } from 'tinkit/validate';`
 - `lazy<T>(getter: () => Schema): Parser<T>` — Creates a parser for recursive schemas (`z.lazy()`): `getter` returns the schema, and is called once, on first use, so the schema can refer to the parser being defined.
 - `blankAsUndefined<S extends Schema>(schema: S): Parser<SchemaOutput<S>>` — Creates a parser that treats blank strings (empty, or only whitespace) as missing: what an empty HTML form field sends.
 - `asJson<S extends Schema>(schema: S): Parser<SchemaOutput<S>>` — Creates a parser for strings holding JSON (an environment variable, a form field, a message payload): the text is parsed with `parseJson`, so `__proto__` and `constructor.prototype` keys are rejected, and the result is parsed with `schema`, whose issues are reported below the string's path.
+- `parseEnv<S extends ObjectSchema>(schema: S, env?: object, options: ParseEnvOptions = {}): SchemaOutput<S>` — Parses environment variables with an object schema and returns the typed result, or throws ONE `ValidationError` listing every missing or invalid variable, one per line, so that a misconfigured deployment fails at startup with the whole list instead of one variable per restart (or a crash much later, on first use): ```text Invalid environment variables: DATABASE_URL: Missing required variable PORT: Expected an integer or an integer string (got string) ``` No part of a value can reach the error (its message, `issues`, stack or anything else), since everything in it comes from fixed texts: the variable name; array indexes, but no object key (a JSON object's keys come from the value); and messages from a fixed list: this module's own (its `(got …)` part kept only when it names a type), range, length, pattern and allowed-values messages without their bounds (`Expected an integer in the allowed range`: a number in them may come from the value), and `Invalid value` for anything else, custom `withError` and `check` messages and those of other libraries (zod, valibot…) included, since they may quote the value.
 
 ## date
 
@@ -581,13 +616,13 @@ Import: `import { … } from 'tinkit/date';`
 - `diffInMinutes(later: DateInput, earlier: DateInput): number` — Returns the signed number of whole minutes between two dates, truncated toward zero (absolute time).
 - `diffInSeconds(later: DateInput, earlier: DateInput): number` — Returns the signed number of whole seconds between two dates, truncated toward zero (absolute time).
 - `diffInMonths(later: DateInput, earlier: DateInput): number` — Returns the signed number of COMPLETE calendar months between two dates (date-fns `differenceInMonths` semantics): for `later >= earlier` it is the largest `n` such that `addMonths(earlier, n) <= later` (time of day included, with end-of-month clamping, so Jan 31 → Feb 28 counts as one full month); for `later < earlier` it is `-diffInMonths(earlier, later)`.
-- `startOfDay(date: DateInput): Date` — Returns the start of the local day (00:00:00.000).
+- `startOfDay(date: DateInput): Date` — Returns the start of the local day: 00:00:00.000, or where midnight was skipped by a DST change, the first instant of the day (01:00 in Havana on 2024-03-10; 00:30 in Toronto on 1919-03-31, where the clocks went from 23:30 to 00:30, whereas `setHours(0)` gives 01:00).
 - `endOfDay(date: DateInput): Date` — Returns the last millisecond of the local day (23:59:59.999).
-- `startOfMonth(date: DateInput): Date` — Returns the first day of the local month at 00:00:00.000.
+- `startOfMonth(date: DateInput): Date` — Returns the first day of the local month at the start of the day: 00:00:00.000, or the first instant of the day where midnight was skipped (see `startOfDay`; Cairo, 2014-08-01, started at 01:00).
 - `endOfMonth(date: DateInput): Date` — Returns the last day of the local month at 23:59:59.999.
-- `startOfWeek(date: DateInput, weekStartsOn: WeekdayIndex = 0): Date` — Returns the start (00:00:00.000, local) of the week containing `date`.
+- `startOfWeek(date: DateInput, weekStartsOn: WeekdayIndex = 0): Date` — Returns the start of the week containing `date`: its first day (local time) at 00:00:00.000, or the first instant of that day where midnight was skipped (see `startOfDay`).
 - `endOfWeek(date: DateInput, weekStartsOn: WeekdayIndex = 0): Date` — Returns the end (23:59:59.999, local) of the week containing `date`.
-- `startOfYear(date: DateInput): Date` — Returns January 1st of the local year at 00:00:00.000.
+- `startOfYear(date: DateInput): Date` — Returns January 1st of the local year at the start of the day: 00:00:00.000, or the first instant of the day where midnight was skipped (see `startOfDay`).
 - `endOfYear(date: DateInput): Date` — Returns December 31st of the local year at 23:59:59.999.
 - `isSameDay(a: DateInput, b: DateInput): boolean` — Checks whether two dates fall on the same local calendar day.
 - `isSameMonth(a: DateInput, b: DateInput): boolean` — Checks whether two dates fall in the same local calendar month (of the same year).
@@ -611,7 +646,7 @@ Import: `import { … } from 'tinkit/date';`
 - `getISOWeek(date: DateInput): number` — Returns the ISO 8601 week number (1-53) of the LOCAL calendar date.
 - `getISOWeekYear(date: DateInput): number` — Returns the ISO 8601 week-numbering year of the LOCAL calendar date: the calendar year of the Thursday of its ISO week.
 - `getQuarter(date: DateInput): Quarter` — Returns the calendar quarter (1-4) of the LOCAL date: `Math.floor(monthIndex / 3) + 1`.
-- `startOfQuarter(date: DateInput): Date` — Returns the first day of the local quarter at 00:00:00.000.
+- `startOfQuarter(date: DateInput): Date` — Returns the first day of the local quarter at the start of the day: 00:00:00.000, or the first instant of the day where midnight was skipped (see `startOfDay`).
 - `endOfQuarter(date: DateInput): Date` — Returns the last day of the local quarter at 23:59:59.999.
 - `getAge(birthDate: DateInput, now: DateInput = new Date()): number` — Returns a person's age: the number of COMPLETED years between the LOCAL calendar days of `birthDate` and `now` (the time of day is ignored, so the age increases at the start of the birthday).
 - `addBusinessDays(date: DateInput, amount: number): Date` — Adds a number of business days (Monday-Friday, local time; no holidays), skipping Saturdays and Sundays.
@@ -645,6 +680,14 @@ Import: `import { … } from 'tinkit/date';`
 - `isYesterday(date: DateInput, now: DateInput = new Date()): boolean` — Checks whether a date falls on the LOCAL calendar day before `now`'s.
 - `isSameWeek(a: DateInput, b: DateInput, weekStartsOn: WeekdayIndex = 0): boolean` — Checks whether two dates fall in the same local week (see `startOfWeek`).
 - `isSameQuarter(a: DateInput, b: DateInput): boolean` — Checks whether two dates fall in the same local calendar quarter (of the same year).
+- `isValidTimeZone(value: unknown): value is TimeZone` — Checks whether a string is a time zone that the functions of this module accept: an IANA time zone name known to the engine's `Intl` (`'Europe/Paris'`, `'UTC'`, legacy links such as `'US/Eastern'`; case-insensitive), or a fixed UTC offset written `±HH:MM`, `±HHMM` or `±HH` (`'+05:30'`, `'-08'`).
+- `getTimeZoneOffset(timeZone: string, date: DateInput = new Date()): number` — Returns the UTC offset of a time zone at an instant, in minutes EAST of UTC: `330` in India, `-300` in New York in winter and `-240` in summer.
+- `getZonedParts(date: DateInput, timeZone: string): ZonedDateTimeParts` — Returns the wall-clock fields of an instant in a time zone: what a clock on the wall there shows.
+- `fromZonedTime(fields: WallClockTime, timeZone: string, options: FromZonedTimeOptions = {}): Date` — Returns the instant at which the wall clock of a time zone shows the given date and time: the inverse of `getZonedParts` (date-fns-tz's `fromZonedTime`, Temporal's `ZonedDateTime.from`), e.g. "9:00 on March 10th in New York" as a `Date`.
+- `formatInTimeZone(date: DateInput, timeZone: string, pattern: string): string` — Formats an instant as read on the wall clock of a time zone, with the token language of `formatDate` (`YYYY`, `MM`, `DD`, `HH`, `mm`, `ss`, `SSS`, `A`… and `[literal]` text) plus two UTC offset tokens: \| Token \| Output \| \|-------\|--------\| \| `Z` \| `+05:30`, `-04:00`, `+00:00` \| \| `ZZ` \| `+0530`, `-0400`, `+0000` \| With `'YYYY-MM-DD[T]HH:mm:ss.SSSZ'`, the result is an RFC 3339 timestamp for the years 0-9999 and whole-minute offsets.
+- `startOfDayInTimeZone(date: DateInput, timeZone: string): Date` — Returns the first instant of the calendar day that the wall clock of a time zone shows at `date`: normally its 00:00:00.000 there, but the end of the gap where midnight was skipped (in Havana, 2024-03-10 starts at 01:00; in Toronto, 1919-03-31 started at 00:30, the clocks having gone from 23:30 to 00:30, where date-fns-tz and Temporal's `'compatible'` midnight give 01:00) and the first midnight where it was repeated.
+- `endOfDayInTimeZone(date: DateInput, timeZone: string): Date` — Returns the last millisecond of the calendar day that the wall clock of a time zone shows at `date`: the instant before the next day starts there (normally 23:59:59.999).
+- `getCalendarMonth(year: number, monthIndex: number, options: CalendarMonthOptions = {}): Date[][]` — Returns the grid of a month as every date picker shows it: an array of weeks, each an array of 7 dates at the start of their LOCAL day (normally 00:00; where midnight was skipped, the end of the gap, like `startOfDay`: 01:00 in Havana or Beirut on the night the clocks go forward), from the week containing the 1st to the week containing the last day.
 
 ## iterables
 
@@ -706,6 +749,8 @@ Tiny state store compatible with React useSyncExternalStore, with derived select
 Import: `import { … } from 'tinkit/store';`
 
 - `createStore<S>(initialState: S, options: StoreOptions<S> = {}): Store<S>` — Creates a tiny synchronous state container, usable from React 18+ without any React dependency: `const state = useSyncExternalStore(store.subscribe, store.getState);` (methods can be passed unbound).
+- `createMachine<const T extends Record<string, StateConfig<C>>, C = undefined>(config: MachineConfig<T, C>): Machine<keyof T & string, C, MachineEvent<T>>` — Creates a tiny, fully typed finite state machine.
+- `createHistory<S>(store: HistorySource<S>, options: HistoryOptions = {}): StoreHistory` — Adds undo/redo to a store (see `createStore`): every change of its state becomes an undo step, holding the previous state by reference (states are meant to be immutable, so no copy is made).
 
 ## random
 
@@ -713,8 +758,14 @@ Seeded deterministic PRNG plus cryptographically secure ids, UUIDs and bytes.
 Import: `import { … } from 'tinkit/random';`
 
 - `createRandom(seed: number | string): SeededRandom` — Creates a deterministic, seedable pseudo-random generator (sfc32, seeded through the cyrb128 string hash).
-- `randomBytes(length: number): Uint8Array` — Generates cryptographically secure random bytes using `globalThis.crypto.getRandomValues`.
+- `randomBytes(length: number): Uint8Array<ArrayBuffer>` — Generates cryptographically secure random bytes using `globalThis.crypto.getRandomValues`.
 - `randomUUID(): string` — Generates a random RFC 4122 / RFC 9562 version 4 UUID (e.g. `'3b241101-e2bb-4255-8caf-4136c566a962'`).
+- `createUuidv7(options?: TimeIdOptions): () => string` — Creates a generator of RFC 9562 version 7 UUIDs: time-ordered UUIDs whose first 48 bits are the Unix time in milliseconds, so they sort by creation time as strings and as bytes, and make B-tree database keys that stay local (unlike random version 4 UUIDs).
+- `uuidv7(): string` — Generates an RFC 9562 version 7 UUID: time-ordered (the first 48 bits are the current Unix time in milliseconds), strictly increasing across calls in this module instance, its random bits drawn from the CSPRNG (see `createUuidv7` for the layout and the handling of counter rollover and clocks that move backwards).
+- `uuidv7Timestamp(id: string): number` — Reads the creation time back from a version 7 UUID (its first 48 bits).
+- `createUlid(options?: TimeIdOptions): () => string` — Creates a generator of ULIDs (Universally Unique Lexicographically Sortable Identifiers, github.com/ulid/spec): 26 Crockford base32 characters, a 48-bit millisecond timestamp (10 characters) followed by 80 random bits (16 characters).
+- `ulid(): string` — Generates a ULID: 26 uppercase Crockford base32 characters, a 48-bit millisecond timestamp then 80 bits from the CSPRNG, lexicographically sortable by creation time and strictly increasing across calls in this module instance (monotonic, see `createUlid`).
+- `ulidTimestamp(id: string): number` — Reads the creation time back from a ULID (its first 10 characters).
 - `randomId(size: number = 21, alphabet: string = URL_ALPHABET): string` — Generates a cryptographically secure random identifier (nanoid-style).
 - `secureRandom(): number` — A cryptographically secure `RandomGenerator`: returns a uniformly distributed float in `[0, 1)` with the full 53 bits of precision of a double (every multiple of `2 ** -53` is equally likely), drawn from `globalThis.crypto.getRandomValues`.
 - `weightedRandom<T>(items: ReadonlyArray<T>, weights: ReadonlyArray<number>, random: RandomGenerator = Math.random): T` — Picks a random item, with each item's chance proportional to its weight.

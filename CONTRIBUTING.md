@@ -4,7 +4,7 @@
 
 ```bash
 yarn install   # also installs the git hooks: lint-staged on commit, commitlint on the message, `yarn validate` on push
-yarn validate  # lint, format, types, tests in 4 time zones, doctests, build, dist smoke test, size budget, exports
+yarn validate  # lint, format, types, tests in 6 time zones, doctests, build, dist smoke test, size budget, exports
 ```
 
 ## Commits
@@ -49,7 +49,7 @@ oxlint enforces most of these:
 yarn test                         # all suites
 yarn test src/strings             # a single module
 yarn test:coverage                # with coverage thresholds
-yarn test:tz                      # the suite under UTC, New York, Lord Howe and Kolkata (works on Windows too)
+yarn test:tz                      # the suite under UTC, New York, Lord Howe, Kolkata, Apia and Havana (works on Windows too)
 ```
 
 ### Executable examples
