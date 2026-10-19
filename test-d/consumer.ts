@@ -2,6 +2,7 @@
 // consumer with no DOM or Node types (skipLibCheck off), resolve through the exports map, and stay cheap to type-check.
 import { getPath, setPath, deepMerge, merge, pick, omit, toCamelCaseKeys } from 'tinkit/objects';
 import { curry, pipe, compose } from 'tinkit/functions';
+import { bound, debounced, log, memoize, once, retryable } from 'tinkit/decorators';
 import type { NestedKeyOf, PathValue } from 'tinkit/utils';
 import {
 	isShape,
@@ -209,6 +210,23 @@ const unknownOutput: number = parse(someSchema, 1).length;
 const camel: { userId: number; createdAt: string } = toCamelCaseKeys({ user_id: 1, created_at: '2024-01-01' });
 // @ts-expect-error the snake_case key no longer exists
 const snake = camel.user_id;
-export { a, b, c, keys, v, m, dm, p, o, r, f, g, everything, spec, output, wrong, camel, snake };
+// Standard (TC39) method decorators accept methods that declare their `this` type, and still reject getters.
+class Counter {
+	count = 1;
+	@log @memoize @once @debounced(10) add(this: Counter, n: number): number {
+		return this.count + n;
+	}
+	@bound read(this: Counter): number {
+		return this.count;
+	}
+	@retryable() async load(this: Counter): Promise<number> {
+		return this.count;
+	}
+	// @ts-expect-error a getter is not a method
+	@log get value(): number {
+		return this.count;
+	}
+}
+export { a, b, c, keys, v, m, dm, p, o, r, f, g, everything, spec, output, wrong, camel, snake, Counter };
 export { figure, badFigure, envBack, envWrong, port, envSpec, badDefault };
 export { click, legacy, badEvent, parsedShapes, locales, category, patch, strict, fieldErrors, formTypes, extras, badFallback, unknownOutput };

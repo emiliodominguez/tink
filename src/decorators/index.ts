@@ -52,12 +52,21 @@ export interface BabelFieldDescriptor extends PropertyDescriptor {
 }
 
 /**
+ * The context of a TC39 standard decorator applied to a method of type `T` of a `This` class. Both are inferred from the decorated
+ * method, so that methods declaring a `this` parameter (`m(this: C)`) are accepted, which the default `ClassMethodDecoratorContext`
+ * (with `This = unknown`) rejects.
+ * @template This - The class (instance or constructor) type
+ * @template T - The method type
+ */
+export type MethodContext<This, T extends AnyFunction> = ClassMethodDecoratorContext<This, T & ((this: This, ...args: Parameters<T>) => ReturnType<T>)>;
+
+/**
  * A method decorator usable both with TypeScript's `experimentalDecorators` (and Babel legacy) and with TC39 standard decorators.
  * Returned by the decorator factories of this module ({@link debounced}, {@link throttled}, {@link deprecated}).
  */
 export interface UniversalMethodDecorator {
 	<T extends AnyFunction>(target: object, propertyKey: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>;
-	<T extends AnyFunction>(value: T, context: ClassMethodDecoratorContext): T;
+	<This, T extends AnyFunction>(value: T, context: MethodContext<This, T>): T;
 }
 
 /**
@@ -66,7 +75,7 @@ export interface UniversalMethodDecorator {
  */
 export interface AsyncMethodDecorator {
 	<T extends (...args: never[]) => PromiseLike<unknown>>(target: object, propertyKey: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>;
-	<T extends (...args: never[]) => PromiseLike<unknown>>(value: T, context: ClassMethodDecoratorContext): T;
+	<This, T extends (...args: never[]) => PromiseLike<unknown>>(value: T, context: MethodContext<This, T>): T;
 }
 
 /**
@@ -200,7 +209,8 @@ function createMethodDecorator(decoratorName: string, wrap: MethodWrapper): Univ
  *   assignment (`useDefineForClassFields: false`, TypeScript's default for targets below ES2022); with `[[Define]]` semantics the
  *   instance field shadows the accessor and the decorator has no effect. On a static field, the existing value is made non-writable.
  * - Babel legacy: returns the field descriptor with `writable: false`. On a method, the method becomes non-writable.
- * - TC39 standard decorators: registers an initializer that locks the own property once the field has been defined. Runtimes that
+ * - TC39 standard decorators: registers an initializer that locks the own property once the field has been defined; a field still
+ *   `undefined` then (no initializer, e.g. assigned in the constructor) is locked by its first assignment instead. Runtimes that
  *   run field `addInitializer` callbacks before the field is defined (pre-2023 drafts) are not supported: the field stays writable.
  *   Private (`#field`) fields are rejected.
  * @param {object | undefined} targetOrValue - Legacy: the prototype (or constructor); standard: `undefined`
@@ -239,11 +249,26 @@ export function readonly(targetOrValue: unknown, keyOrContext: unknown, descript
 		}
 
 		context.addInitializer(function lockField(this: unknown): void {
-			const owner = this as object;
+			const owner = this as Record<PropertyKey, unknown>;
+			const name = context.name;
+			const field = Object.getOwnPropertyDescriptor(owner, name);
 
-			if (Object.prototype.hasOwnProperty.call(owner, context.name)) {
-				Object.defineProperty(owner, context.name, { writable: false, configurable: false });
+			if (field === undefined) return;
+			if (owner[name] !== undefined) {
+				Object.defineProperty(owner, name, { writable: false, configurable: false });
+				return;
 			}
+			// No value yet (a field without initializer, assigned in the constructor): the first assignment defines the read-only property.
+			Object.defineProperty(owner, name, {
+				configurable: true,
+				enumerable: field.enumerable,
+				get: function (): undefined {
+					return undefined;
+				},
+				set: function (value: unknown): void {
+					Object.defineProperty(owner, name, { value, writable: false, configurable: false, enumerable: field.enumerable });
+				}
+			});
 		});
 
 		return;
@@ -355,7 +380,7 @@ function wrapLog(method: UnknownMethod, name: string): UnknownMethod {
  * ```
  */
 export function log<T extends AnyFunction>(targetOrValue: object, keyOrContext: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>;
-export function log<T extends AnyFunction>(targetOrValue: T, keyOrContext: ClassMethodDecoratorContext): T;
+export function log<This, T extends AnyFunction>(targetOrValue: T, keyOrContext: MethodContext<This, T>): T;
 /**
  * Implementation of {@link log} (see the first overload for the full documentation).
  * @param {unknown} targetOrValue - Legacy: the prototype (or constructor); standard: the method
@@ -443,7 +468,7 @@ function memoizeWrapper(options: MemoizeMethodOptions): MethodWrapper {
  * ```
  */
 export function memoize<T extends AnyFunction>(targetOrValue: object, keyOrContext: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>;
-export function memoize<T extends AnyFunction>(targetOrValue: T, keyOrContext: ClassMethodDecoratorContext): T;
+export function memoize<This, T extends AnyFunction>(targetOrValue: T, keyOrContext: MethodContext<This, T>): T;
 export function memoize(options: MemoizeMethodOptions): UniversalMethodDecorator;
 /**
  * Implementation of {@link memoize} (see the first overload for the full documentation).
@@ -506,7 +531,7 @@ let wrapMemoizeDefault: MethodWrapper | undefined;
  * ```
  */
 export function bound<T extends AnyFunction>(targetOrValue: object, keyOrContext: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>;
-export function bound<T extends AnyFunction>(targetOrValue: T, keyOrContext: ClassMethodDecoratorContext): void;
+export function bound<This, T extends AnyFunction>(targetOrValue: T, keyOrContext: MethodContext<This, T>): void;
 /**
  * Implementation of {@link bound} (see the first overload for the full documentation).
  * @param {unknown} targetOrValue - Legacy: the prototype (or constructor); standard: the method
@@ -626,12 +651,13 @@ function bindingAccessor(method: UnknownMethod, key: string | symbol, enumerable
  * ```
  */
 export function debounced(wait: number, options?: DebounceOptions): UniversalMethodDecorator {
-	// Validate eagerly, at class definition time.
-	debounce(noop, wait, options);
+	// Validate eagerly, at class definition time, a copy that every instance then uses (later changes to `options` have no effect).
+	const settings = copyOptions(options);
+	debounce(noop, wait, settings);
 
 	return createMethodDecorator('debounced', function (method: UnknownMethod): UnknownMethod {
 		return perInstance(function (): UnknownMethod {
-			return debounce(method, wait, options);
+			return debounce(method, wait, settings);
 		});
 	});
 }
@@ -664,14 +690,26 @@ export function debounced(wait: number, options?: DebounceOptions): UniversalMet
  * ```
  */
 export function throttled(wait: number, options?: ThrottleOptions): UniversalMethodDecorator {
-	// Validate eagerly, at class definition time.
-	throttle(noop, wait, options);
+	// Validate eagerly, at class definition time, a copy that every instance then uses (later changes to `options` have no effect).
+	const settings = copyOptions(options);
+	throttle(noop, wait, settings);
 
 	return createMethodDecorator('throttled', function (method: UnknownMethod): UnknownMethod {
 		return perInstance(function (): UnknownMethod {
-			return throttle(method, wait, options);
+			return throttle(method, wait, settings);
 		});
 	});
+}
+
+/**
+ * A shallow copy of a decorator's options object, taken when the decorator is created (anything else is passed on unchanged, for the
+ * wrapped helper to validate).
+ * @template O - The options type
+ * @param {O} options - The options
+ * @returns {O} The copy
+ */
+function copyOptions<O>(options: O): O {
+	return typeof options === 'object' && options !== null ? { ...options } : options;
 }
 
 /**
@@ -750,7 +788,7 @@ function wrapOnce(method: UnknownMethod): UnknownMethod {
  * ```
  */
 export function once<T extends AnyFunction>(targetOrValue: object, keyOrContext: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>;
-export function once<T extends AnyFunction>(targetOrValue: T, keyOrContext: ClassMethodDecoratorContext): T;
+export function once<This, T extends AnyFunction>(targetOrValue: T, keyOrContext: MethodContext<This, T>): T;
 /**
  * Implementation of {@link once} (see the first overload for the full documentation).
  * @param {unknown} targetOrValue - Legacy: the prototype (or constructor); standard: the method

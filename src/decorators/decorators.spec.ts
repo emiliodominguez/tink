@@ -232,6 +232,20 @@ describe('Decorators', function () {
 			expect(withoutField.x).toBe(5);
 		});
 
+		it('should keep the first assignment of a standard field that has no value yet (assigned in the constructor)', function () {
+			const { context, runInitializers } = fakeContext('field', 'x');
+			decorators.readonly(undefined, context);
+			const instance: { x: number | undefined } = { x: undefined };
+			runInitializers(instance);
+			expect(instance.x).toBeUndefined();
+			expect(Object.keys(instance)).toEqual(['x']);
+			instance.x = 1;
+			expect(Object.getOwnPropertyDescriptor(instance, 'x')).toEqual({ value: 1, writable: false, enumerable: true, configurable: false });
+			expect(function () {
+				instance.x = 2;
+			}).toThrow(TypeError);
+		});
+
 		it.each([
 			['method', {}, 'methods'],
 			['accessor', {}, 'accessors'],
@@ -537,6 +551,21 @@ describe('Decorators', function () {
 	});
 
 	describe('debounced', function () {
+		it('should use the options it validated, whatever later happens to the object', function () {
+			jest.useFakeTimers();
+
+			const options = { leading: true, trailing: true };
+			const debouncedSpy = jest.fn();
+			const throttledSpy = jest.fn();
+			const debounce = decorators.debounced(10, options)(debouncedSpy, fakeContext('method', 'm').context);
+			const throttle = decorators.throttled(10, options)(throttledSpy, fakeContext('method', 'n').context);
+			options.leading = false;
+			options.trailing = false;
+			debounce.call(undefined, 1);
+			throttle.call(undefined, 1);
+			expect([debouncedSpy.mock.calls, throttledSpy.mock.calls]).toEqual([[[1]], [[1]]]);
+		});
+
 		it('should debounce per instance', function () {
 			jest.useFakeTimers();
 
