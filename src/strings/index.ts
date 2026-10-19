@@ -21,9 +21,21 @@ export interface IsPalindromeOptions {
 }
 
 /**
+ * Throws a `TypeError` unless `value` is a (primitive) string.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {string} name - Name of the validated parameter
+ * @param {unknown} value - The value to validate
+ * @returns {void}
+ * @throws {TypeError} when `value` is not a string
+ */
+function assertString(caller: string, name: string, value: unknown): asserts value is string {
+	if (typeof value !== 'string') throw new TypeError(`${caller}: \`${name}\` must be a string, got ${describe(value)}`);
+}
+
+/**
  * Values accepted by {@link interpolate}: a (possibly nested) record whose leaves are stringified with `String()`.
  */
-export type InterpolationValues = Readonly<Record<string, unknown>>;
+export type InterpolationValues = object;
 
 /**
  * Lazily created grapheme segmenter (grapheme is the default granularity). `undefined` = not initialized yet, `null` = `Intl.Segmenter` is not available.
@@ -545,10 +557,12 @@ const DIACRITICS = /[\u0300-\u036f]|[\u1ab0-\u1aff]|[\u1dc0-\u1dff]|[\u20d0-\u20
  * and the result is recomposed (NFC). Only the combining diacritical mark blocks are removed, so scripts that use other combining marks are left intact.
  * @param {string} string - The string to clean
  * @returns {string} The string without diacritics
+ * @throws {TypeError} when `string` is not a string
  * @example
  * removeDiacritics('Crème Brûlée à Málaga'); // => 'Creme Brulee a Malaga'
  */
 export function removeDiacritics(string: string): string {
+	assertString('removeDiacritics', 'string', string);
 	// ASCII text has no decomposition and nothing to recompose.
 	return NON_ASCII.test(string) ? string.normalize('NFD').replace(DIACRITICS, '').normalize('NFC') : string;
 }
@@ -664,6 +678,7 @@ export function endsWith(string: string, subString: string): boolean {
  * @param {string} subString - The substring to search for; an empty substring yields `0`
  * @param {CountSubStringOptions} [options={}] - Matching options
  * @returns {number} The number of occurrences
+ * @throws {TypeError} when `string` or `subString` is not a string
  * @example
  * countSubString('hello world, hello', 'hello'); // => 2
  * countSubString('Hello hello', 'hello'); // => 1
@@ -671,6 +686,9 @@ export function endsWith(string: string, subString: string): boolean {
  * countSubString('a.b.c', '.'); // => 2
  */
 export function countSubString(string: string, subString: string, options: CountSubStringOptions = {}): number {
+	assertString('countSubString', 'string', string);
+	// Checked before the search: a needle without a length (a number, an array) would never advance it.
+	assertString('countSubString', 'subString', subString);
 	if (subString === '') return 0;
 
 	const haystack = options.ignoreCase ? foldCase(string) : string;
@@ -715,12 +733,14 @@ export function getWords(string: string): string[] {
  * @param {string} string - The string to be checked
  * @param {IsPalindromeOptions} [options={}] - `ignoreCase` and `ignoreNonAlphanumeric` (both default to `false`)
  * @returns {boolean} Whether the string is a palindrome
+ * @throws {TypeError} when `string` is not a string
  * @example
  * isPalindrome('racecar'); // => true
  * isPalindrome('Racecar'); // => false
  * isPalindrome('A man, a plan, a canal: Panama', { ignoreCase: true, ignoreNonAlphanumeric: true }); // => true
  */
 export function isPalindrome(string: string, options: IsPalindromeOptions = {}): boolean {
+	assertString('isPalindrome', 'string', string);
 	let candidate = options.ignoreNonAlphanumeric ? string.replace(/[^\p{L}\p{M}\p{N}]/gu, '') : string;
 
 	if (options.ignoreCase) candidate = foldCase(candidate);
@@ -748,7 +768,7 @@ function foldCase(string: string): string {
 const REGEXP_ESCAPED = /^[0-9A-Za-z]|[$^\\.*+?()[\]{}|/,\-=<>#&!%:;@~'`"\s]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
 
 /** Escape sequences computed by {@link escapeRegExpChar}, by character (at most the ~2 200 code units {@link REGEXP_ESCAPED} matches). */
-const regExpEscapes: Record<string, string> = {};
+const regExpEscapes = new Map<string, string>();
 
 /**
  * Escapes one character matched by {@link REGEXP_ESCAPED}: `\` before a syntax character or `/`, a control escape (`\t`, `\n`, `\v`,
@@ -757,7 +777,7 @@ const regExpEscapes: Record<string, string> = {};
  * @returns {string} Its escape sequence
  */
 function escapeRegExpChar(char: string): string {
-	let escape = regExpEscapes[char];
+	let escape = regExpEscapes.get(char);
 
 	if (escape === undefined) {
 		const control = '\t\n\v\f\r'.indexOf(char);
@@ -770,7 +790,7 @@ function escapeRegExpChar(char: string): string {
 				: code < 256
 					? `\\x${code.toString(16).padStart(2, '0')}`
 					: `\\u${code.toString(16).padStart(4, '0')}`;
-		regExpEscapes[char] = escape;
+		regExpEscapes.set(char, escape);
 	}
 
 	return escape;
@@ -860,7 +880,8 @@ export function unescapeHtml(value: unknown): string {
 	if (!string.includes('&')) return string;
 
 	return string.replace(/&(?:amp|lt|gt|quot|apos|#39|#[xX]27);/g, function (entity: string): string {
-		return HTML_UNESCAPES[entity] ?? "'";
+		// Own entries only: a polluted `Object.prototype` must not supply the decoding of `&#39;`.
+		return (Object.hasOwn(HTML_UNESCAPES, entity) ? HTML_UNESCAPES[entity] : undefined) ?? "'";
 	});
 }
 
@@ -1013,12 +1034,15 @@ function editDistance(a: ReadonlyArray<string>, b: ReadonlyArray<string>): numbe
  * @param {string} a - The first string
  * @param {string} b - The second string
  * @returns {number} The edit distance (a non-negative integer, `0` iff the strings are equal)
+ * @throws {TypeError} when `a` or `b` is not a string
  * @example
  * levenshtein('kitten', 'sitting'); // => 3
  * levenshtein('', 'abc'); // => 3
  * levenshtein('😀a', '😃a'); // => 1
  */
 export function levenshtein(a: string, b: string): number {
+	assertString('levenshtein', 'a', a);
+	assertString('levenshtein', 'b', b);
 	return editDistance(Array.from(a), Array.from(b));
 }
 
@@ -1028,6 +1052,7 @@ export function levenshtein(a: string, b: string): number {
  * @param {string} a - The first string
  * @param {string} b - The second string
  * @returns {number} A score in `[0, 1]`: `1` iff the strings are equal, `0` when every character must be changed
+ * @throws {TypeError} when `a` or `b` is not a string
  * @example
  * similarity('kitten', 'sitting'); // => 0.5714285714285714 // 1 - 3 / 7
  * similarity('abc', 'abc'); // => 1
@@ -1035,6 +1060,8 @@ export function levenshtein(a: string, b: string): number {
  * similarity('abc', 'xyz'); // => 0
  */
 export function similarity(a: string, b: string): number {
+	assertString('similarity', 'a', a);
+	assertString('similarity', 'b', b);
 	const left = Array.from(a);
 	const right = Array.from(b);
 	const maxLength = Math.max(left.length, right.length);
@@ -1509,9 +1536,16 @@ function trimGraphemes(caller: string, string: string, chars: string | ReadonlyA
 	let start = 0;
 	let end = string.length;
 
+	// The graphemes from `start`, split once the start holds complex text (splitting the rest again for every grapheme was quadratic).
+	let front: string[] | undefined;
+	let next = 0;
+
 	while (fromStart && start < end) {
 		// `start` is a grapheme boundary: the code unit there is a whole grapheme when it and the next one are both simple.
-		const grapheme = isSimpleCode(string.charCodeAt(start)) && isSimpleCode(string.charCodeAt(start + 1)) ? string[start] : firstGrapheme(string.slice(start));
+		const grapheme =
+			front === undefined && isSimpleCode(string.charCodeAt(start)) && isSimpleCode(string.charCodeAt(start + 1))
+				? string[start]
+				: (front ??= splitGraphemes(string.slice(start, end)))[next++];
 
 		if (!set.has(grapheme)) break;
 

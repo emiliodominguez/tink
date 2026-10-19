@@ -1514,3 +1514,61 @@ describe('strings (helper review regressions)', function () {
 		expect(Array.from(helpers.randomString(4, 'a🍎'))).toHaveLength(4);
 	});
 });
+
+describe('Strings helpers (hostile inputs)', function () {
+	it('rejects non-string arguments instead of looping or answering wrongly', function () {
+		for (const call of [
+			function () {
+				helpers.countSubString('a1a', 1 as never);
+			},
+			function () {
+				helpers.countSubString('abc', [] as never);
+			},
+			function () {
+				helpers.levenshtein(123 as never, 'abc');
+			},
+			function () {
+				helpers.similarity(123 as never, 456 as never);
+			},
+			function () {
+				helpers.removeDiacritics(null as never);
+			},
+			function () {
+				helpers.isPalindrome(new String('racecar') as never);
+			}
+		]) {
+			expect(call).toThrow(TypeError);
+		}
+	});
+
+	it('trims the start of long non-Latin text in linear time', function () {
+		const started = Date.now();
+		expect(helpers.trimStartChars('а'.repeat(40_000) + 'x', 'а')).toBe('x');
+		expect(helpers.trimChars('é'.repeat(8_000) + 'x' + 'é'.repeat(8_000), 'é')).toBe('x');
+		expect(Date.now() - started).toBeLessThan(1000);
+	});
+
+	it('ignores a polluted Object.prototype in its escape tables', function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		proto['-'] = '-';
+		proto['&#39;'] = '<img>';
+		try {
+			expect(new RegExp(`[${helpers.escapeRegExp('a-z')}]`).test('m')).toBe(false);
+			expect(helpers.unescapeHtml('&#39;')).toBe("'");
+		} finally {
+			delete proto['-'];
+			delete proto['&#39;'];
+		}
+	});
+
+	it('interpolates values typed as interfaces or class instances', function () {
+		interface User {
+			name: string;
+		}
+		const user: User = { name: 'Ada' };
+		class Point {
+			constructor(readonly x: number) {}
+		}
+		expect([helpers.interpolate('{name}', user), helpers.interpolate('{x}', new Point(1))]).toEqual(['Ada', '1']);
+	});
+});
