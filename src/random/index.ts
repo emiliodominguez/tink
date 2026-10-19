@@ -324,7 +324,8 @@ export function randomUUID(): string {
  * @param {string} [alphabet=URL_ALPHABET] - Between 2 and 256 distinct characters to draw from
  * @returns {string} A random string of `size` characters from `alphabet`
  * @throws {TypeError} when `size` is not a number
- * @throws {RangeError} when `size` is not a non-negative safe integer, or `alphabet` has fewer than 2 or more than 256 characters or contains duplicates
+ * @throws {RangeError} when `size` is not a non-negative safe integer, or `alphabet` has fewer than 2 or more than 256 characters, or
+ * contains duplicates or lone surrogates (which could pair up into a different character in the result)
  * @throws {Error} when no cryptographically secure random source is available
  * @example
  * randomId(); // e.g. 'V1StGXR8_Z5jdHi6B-myT'
@@ -485,12 +486,15 @@ function generateId(count: number, characters: string[], crypto: CryptoLike): st
 let cachedAlphabet: string | undefined;
 let cachedCharacters: string[];
 
+/** A UTF-16 surrogate that is not part of a pair (with the `u` flag, paired ones form a single code point). */
+const LONE_SURROGATE = /\p{Cs}/u;
+
 /**
  * Splits a {@link randomId} alphabet into its code points and validates it. The last result is cached, so repeated
  * calls with the same alphabet (the common case) skip the split and the duplicate check.
  * @param {string} alphabet - The alphabet to split
  * @returns {string[]} The characters of the alphabet
- * @throws {RangeError} when the alphabet has fewer than 2 or more than 256 characters or contains duplicates
+ * @throws {RangeError} when the alphabet has fewer than 2 or more than 256 characters, contains duplicates or lone surrogates
  * @example
  * alphabetCharacters('ab🍎'); // => ['a', 'b', '🍎']
  */
@@ -504,6 +508,8 @@ function alphabetCharacters(alphabet: string): string[] {
 	if (new Set(characters).size !== length) {
 		throw new RangeError('randomId: `alphabet` must not contain duplicate characters');
 	}
+	// A lone surrogate counts as one code point here, but in the result a high one followed by a low one would form a single character.
+	if (LONE_SURROGATE.test(alphabet)) throw new RangeError('randomId: `alphabet` must not contain lone surrogates');
 	cachedAlphabet = alphabet;
 	cachedCharacters = characters;
 	return characters;
@@ -529,24 +535,27 @@ export function weightedRandom<T>(items: ReadonlyArray<T>, weights: ReadonlyArra
 		throw new RangeError(`weightedRandom: \`items\` and \`weights\` must have the same length, got ${items.length} and ${weights.length}`);
 	}
 	let total = 0;
+	let largest = 0;
 	// Index of the last positive weight: there is one once the total weight is known to be positive.
 	let lastPositive = 0;
 	for (let i = 0; i < weights.length; i++) {
 		const weight = weights[i];
 		if (!(typeof weight === 'number' && weight >= 0 && weight < Infinity)) assertNumber('weightedRandom', `weights[${i}]`, weight, false, 'a finite number >= 0');
 		total += weight;
+		if (weight > largest) largest = weight;
 		if (weight > 0) lastPositive = i;
 	}
 	if (!(total > 0 && total < Infinity)) {
 		throw new RangeError(`weightedRandom: the total weight must be positive and finite, got ${total}`);
 	}
 
-	const target = draw('weightedRandom', random) * total;
+	// Weights are scaled by the largest one, so that the draw times the total keeps its precision for tiny (subnormal) weights too.
+	const target = draw('weightedRandom', random) * (total / largest);
 	let cumulative = 0;
 	// A zero-weight item can never satisfy `target < cumulative` before an earlier positive item did, so it is never chosen.
 	// The last positive item takes whatever remains, which also absorbs floating-point rounding at the top end.
 	for (let i = 0; i < lastPositive; i++) {
-		cumulative += weights[i];
+		cumulative += weights[i] / largest;
 		if (target < cumulative) return items[i];
 	}
 	return items[lastPositive];

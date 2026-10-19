@@ -448,6 +448,14 @@ describe('random', function () {
 	});
 
 	describe('randomId', function () {
+		it('should reject alphabets with lone surrogates, which could pair up in the result', function () {
+			expect(function () {
+				helpers.randomId(2, '\uDC00\uD800');
+			}).toThrow(new RangeError('randomId: `alphabet` must not contain lone surrogates'));
+			// Astral characters (paired surrogates) are still accepted.
+			expect(Array.from(helpers.randomId(5, 'ab🍎'))).toHaveLength(5);
+		});
+
 		it('should default to 21 URL-safe characters', function () {
 			const id = helpers.randomId();
 			expect(id).toHaveLength(21);
@@ -606,6 +614,17 @@ describe('random', function () {
 	});
 
 	describe('weightedRandom', function () {
+		it('should keep the weight ratios for subnormal weights', function () {
+			/**
+			 * Always draws 0.3.
+			 */
+			function fixed(): number {
+				return 0.3;
+			}
+			expect(helpers.weightedRandom(['a', 'b'], [5e-324, 5e-324], fixed)).toBe(helpers.weightedRandom(['a', 'b'], [1, 1], fixed));
+			expect(helpers.weightedRandom(['a', 'b'], [5e-324, 1e-323], fixed)).toBe('a');
+		});
+
 		it('should reject numeric strings instead of concatenating them (e.g. weights read from a query string)', function () {
 			expect(function () {
 				helpers.weightedRandom(['a', 'b'], ['5', '3'] as never);
