@@ -9,7 +9,7 @@ export type QueryValue = string | number | boolean | bigint | Date;
  * The parameters accepted by {@link buildQueryString} and {@link withQuery}: a single value or a list of values per key.
  * `undefined` values are always skipped; `null` values depend on the `skipNull` option.
  */
-export type QueryParams = Readonly<Record<string, QueryValue | ReadonlyArray<QueryValue> | undefined | null>>;
+export type QueryParams = Readonly<Record<string, QueryValue | ReadonlyArray<QueryValue | undefined | null> | undefined | null>>;
 
 /**
  * How {@link buildQueryString} serializes arrays:
@@ -54,9 +54,12 @@ function encodeComponent(value: string, encode: (value: string) => string = enco
 		return encode(value);
 	} catch {
 		// Only a lone surrogate (a `Cs` code point in a `u` regular expression, unlike a valid pair) makes the encoders throw.
-		return encode(value.replace(/\p{Cs}/gu, '\ufffd'));
+		return encode(value.replace(LONE_SURROGATES, '\ufffd'));
 	}
 }
+
+/** Lone UTF-16 surrogates (with the `u` flag, paired ones form a single code point), which URL encoding writes as U+FFFD. */
+const LONE_SURROGATES = /\p{Cs}/gu;
 
 /**
  * Decodes a query-string component the way {@link parseQueryString} does: `+` is a space and malformed percent sequences never throw.
@@ -248,16 +251,19 @@ export function withQuery(url: string, params: QueryParams, options: BuildQueryS
 	// Keys are compared without their `[]` suffix on both sides, so `a` and `a[]` replace each other.
 	const replaced = new Set<string>();
 
+	// Lone surrogates are written as U+FFFD (see `encodeComponent`), so both sides are compared in that form: otherwise a key with one
+	// would not replace its existing occurrences, and could be smuggled in twice.
 	for (const key of Object.keys(params)) {
-		if (params[key] !== undefined) replaced.add(withoutBrackets(key));
+		if (params[key] !== undefined) replaced.add(withoutBrackets(key.replace(LONE_SURROGATES, '\ufffd')));
 	}
 
 	const pairs = query.split('&').filter(function (pair: string): boolean {
 		if (pair === '') return false;
 
 		const equalsIndex = pair.indexOf('=');
+		const key = decodeComponent(equalsIndex === -1 ? pair : pair.slice(0, equalsIndex)).replace(LONE_SURROGATES, '\ufffd');
 
-		return !replaced.has(withoutBrackets(decodeComponent(equalsIndex === -1 ? pair : pair.slice(0, equalsIndex))));
+		return !replaced.has(withoutBrackets(key));
 	});
 	const added = buildQueryString(params, options);
 
@@ -485,23 +491,26 @@ export function isSafeUrl(url: string, options: IsSafeUrlOptions = {}): boolean 
 
 	if (!Array.isArray(protocols)) throw new TypeError(`isSafeUrl: \`options.protocols\` must be an array of strings, got ${describe(protocols)}`);
 
-	if (typeof url !== 'string') return false;
-
-	// A scheme found in the string as it is contains no ignored character, so removing them could not change it.
-	const scheme = SCHEME.exec(url) ?? SCHEME.exec(url.replace(IGNORED, ''));
-	const protocol = scheme === null ? '' : scheme[0].toLowerCase();
-	let allowed = scheme === null && allowRelative;
-
+	// The options are validated whatever `url` is.
 	for (const entry of protocols as ReadonlyArray<unknown>) {
 		if (typeof entry !== 'string') throw new TypeError(`isSafeUrl: \`options.protocols\` must be an array of strings, got ${describe(entry)} in it`);
 
 		if (!(SCHEME.test(entry) && entry.indexOf(':') === entry.length - 1))
 			throw new RangeError(`isSafeUrl: \`options.protocols\` entries must be schemes ending with ':' (such as 'https:'), got ${JSON.stringify(entry)}`);
-
-		if (entry.toLowerCase() === protocol) allowed = true;
 	}
 
-	return allowed;
+	if (typeof url !== 'string') return false;
+
+	// A scheme found in the string as it is contains no ignored character, so removing them could not change it.
+	const scheme = SCHEME.exec(url) ?? SCHEME.exec(url.replace(IGNORED, ''));
+	const protocol = scheme === null ? '' : scheme[0].toLowerCase();
+
+	return (
+		(scheme === null && allowRelative) ||
+		(protocols as ReadonlyArray<string>).some(function (entry: string): boolean {
+			return entry.toLowerCase() === protocol;
+		})
+	);
 }
 
 /**

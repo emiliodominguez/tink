@@ -638,3 +638,26 @@ describe('fragment before a question mark', function () {
 		expect(helpers.withoutQuery('/a#x?y')).toBe('/a#x?y');
 	});
 });
+
+describe('url (helper review regressions)', function () {
+	it('withQuery replaces keys holding lone surrogates, which are written as U+FFFD', function () {
+		expect(helpers.withQuery('/a?\ud800=1', { '\ud800': '2' })).toBe('/a?%EF%BF%BD=2');
+		expect(helpers.withQuery('/a?x%EF%BF%BD=evil&y=1', { 'x\udfff': 'safe' })).toBe('/a?y=1&x%EF%BF%BD=safe');
+	});
+
+	it('accepts null and undefined array items in the parameter types, and skips them', function () {
+		const ids: Array<string | undefined> = ['a', undefined];
+		expect(helpers.buildQueryString({ a: [1, null], b: ids })).toBe('a=1&b=a');
+		expect(helpers.withQuery('/x', { a: [null, 'b'] })).toBe('/x?a=b');
+	});
+
+	it('isSafeUrl validates its protocols whatever the url is', function () {
+		expect(function () {
+			helpers.isSafeUrl(123 as never, { protocols: [1 as never] });
+		}).toThrow(TypeError);
+		expect(function () {
+			helpers.isSafeUrl(123 as never, { protocols: ['https'] });
+		}).toThrow(RangeError);
+		expect(helpers.isSafeUrl(123 as never, { protocols: ['https:'] })).toBe(false);
+	});
+});
