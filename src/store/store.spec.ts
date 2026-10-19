@@ -1,7 +1,18 @@
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import { isEqual } from '../objects/index.js';
-import { createHistory, createMachine, createStore, type HistorySource, type MachineSnapshot, type ReadonlyStore, type StateConfig, type Store, type Unsubscribe } from '.';
+import {
+	createHistory,
+	createMachine,
+	createStore,
+	type HistorySource,
+	type MachineSnapshot,
+	type ReadonlyStore,
+	type StateConfig,
+	type Store,
+	type StoreHistory,
+	type Unsubscribe
+} from '.';
 
 interface State {
 	count: number;
@@ -1671,6 +1682,61 @@ describe('createHistory', function () {
 			expect(history.redo()).toBe(true);
 			expect(history.redo()).toBe(true);
 			expect(editor.getState()).toEqual({ text: 'ab', upper: 'AB' });
+		});
+
+		it('reads its options as own properties only', function () {
+			const polluted = Object.prototype as Record<string, unknown>;
+			polluted.limit = 1;
+			polluted.coalesce = 1e9;
+			try {
+				const store = createStore(0);
+				const history = createHistory(store);
+				store.setState(1);
+				store.setState(2);
+				store.setState(3);
+				expect(history.getState().undoCount).toBe(3);
+			} finally {
+				delete polluted.limit;
+				delete polluted.coalesce;
+			}
+			expect(function () {
+				createHistory(createStore(0), null as unknown as object);
+			}).toThrow(new TypeError('createHistory: `options` must be an object, got null'));
+		});
+
+		it('keeps a batch run by a listener in the step of the change that triggered it, before or after the history', function () {
+			for (const first of [true, false]) {
+				const store = createStore({ v: 0, a: 0, b: 0 });
+				let history = first ? createHistory(store) : undefined;
+				store.subscribe(function () {
+					const state = store.getState();
+					if (state.a === state.v * 2) return;
+					(history as StoreHistory).batch(function () {
+						store.setState({ ...store.getState(), a: state.v * 2 });
+						store.setState({ ...store.getState(), b: state.v * 3 });
+					});
+				});
+				history = history ?? createHistory(store);
+
+				store.setState({ ...store.getState(), v: 1 });
+				expect(store.getState()).toEqual({ v: 1, a: 2, b: 3 });
+				expect(history.getState().undoCount).toBe(1);
+				expect(history.undo()).toBe(true);
+				expect(store.getState()).toEqual({ v: 0, a: 0, b: 0 });
+				expect(history.redo()).toBe(true);
+				expect(store.getState()).toEqual({ v: 1, a: 2, b: 3 });
+				expect(history.getState()).toEqual({ canUndo: true, canRedo: false, undoCount: 1, redoCount: 0 });
+			}
+			const counter = createStore(0);
+			const history = createHistory(counter);
+			counter.subscribe(function () {
+				history.batch(function () {
+					return Promise.resolve();
+				});
+			});
+			expect(function () {
+				counter.setState(1);
+			}).toThrow('batch: `fn` must be synchronous');
 		});
 
 		it('keeps restoring until the notification ends when undo is called by a listener', function () {

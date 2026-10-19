@@ -2507,3 +2507,17 @@ describe('histogram', function () {
 		).toBe(50_000);
 	});
 });
+
+describe('Math helpers under prototype pollution', function () {
+	it('read their options as own properties only', function () {
+		const clean = helpers.histogram([1, 2, 3, 4]);
+		const polluted = Object.prototype as Record<string, unknown>;
+		Object.assign(polluted, { thresholds: [2], domain: [0, 100], decimals: 5, base: 1024, relative: 1, absolute: 1 });
+		try {
+			expect(helpers.histogram([1, 2, 3, 4])).toEqual(clean);
+			expect(helpers.approximatelyEqual(1, 2)).toBe(false);
+		} finally {
+			for (const key of ['thresholds', 'domain', 'decimals', 'base', 'relative', 'absolute']) delete polluted[key];
+		}
+	});
+});

@@ -125,3 +125,15 @@ export function draw(caller: string, random: RandomGenerator): number {
 	if (!(typeof value === 'number' && value >= 0 && value < 1)) throw new RangeError(`${caller}: \`random()\` must return a number in [0, 1), got ${show(value)}`);
 	return value;
 }
+
+/**
+ * Copies the own enumerable properties of an options object into a null-prototype object, so that destructuring it never reads an
+ * option from a polluted `Object.prototype` (and each own getter runs once).
+ * @template T - The options type
+ * @param {T} options - The options
+ * @returns {T} The own options
+ * @internal
+ */
+export function ownOptions<T extends object>(options: T): T {
+	return Object.assign(Object.create(null) as T, options);
+}

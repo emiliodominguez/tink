@@ -1,5 +1,5 @@
 import { clamp, lerp, modulo, round } from '../math/index.js';
-import { assertNumber, describe, show } from '../utils/assert.js';
+import { assertNumber, describe, ownOptions, show } from '../utils/assert.js';
 
 /**
  * An sRGB colour with 8-bit channels (`0`–`255`). Values produced by this module are always integers in that range.
@@ -94,7 +94,8 @@ export type MixSpace = 'srgb' | 'oklab' | 'oklch';
 
 /**
  * How {@link mix} interpolates hues in `'oklch'` (CSS Color 4 hue interpolation methods): along the `'shorter'` (default) or
- * `'longer'` arc of the hue circle, or always `'increasing'` / `'decreasing'` the angle.
+ * `'longer'` arc of the hue circle, or always `'increasing'` / `'decreasing'` the angle. With `'longer'`, two equal hues (or a grey,
+ * whose powerless hue takes the other colour's) are a full turn apart.
  */
 export type HueInterpolation = 'shorter' | 'longer' | 'increasing' | 'decreasing';
 
@@ -934,7 +935,8 @@ function hslChannel(offset: number, h: number, l: number, chroma: number): numbe
  * - `space: 'oklab'` / `'oklch'`: interpolation in the perceptual OKLab space, or in its polar form OKLCH (whose hues follow the
  *   `hue` method, `'shorter'` by default), with premultiplied alpha and the result gamut mapped into sRGB: the same colour as CSS
  *   `color-mix(in oklch, colorA, colorB weight)` shows on an sRGB screen (up to 8-bit rounding). A grey's hue is powerless: the
- *   other colour's hue is used, so mixing with white, black or grey never drifts through unrelated hues.
+ *   other colour's hue is used, so mixing with white, black or grey never drifts through unrelated hues (except with `hue: 'longer'`,
+ *   which then goes a full turn round the hue circle, as in CSS).
  * @param {ColorInput} colorA - The colour at `weight = 0`
  * @param {ColorInput} colorB - The colour at `weight = 1`
  * @param {number} [weight=0.5] - Proportion of `colorB`, in `[0, 1]`
@@ -956,7 +958,7 @@ function hslChannel(offset: number, h: number, l: number, chroma: number): numbe
  */
 export function mix(colorA: ColorInput, colorB: ColorInput, weight = 0.5, options: MixOptions = {}): Rgba {
 	assertNumber('mix', 'weight', weight, weight >= 0 && weight <= 1, 'a number in [0, 1]');
-	const { space = 'srgb', hue = 'shorter' } = options;
+	const { space = 'srgb', hue = 'shorter' } = ownOptions(options);
 	if (space !== 'srgb' && space !== 'oklab' && space !== 'oklch') throw new RangeError(`mix: \`options.space\` must be 'srgb', 'oklab' or 'oklch', got ${show(space)}`);
 	if (hue !== 'shorter' && hue !== 'longer' && hue !== 'increasing' && hue !== 'decreasing') {
 		throw new RangeError(`mix: \`options.hue\` must be 'shorter', 'longer', 'increasing' or 'decreasing', got ${show(hue)}`);
@@ -1008,7 +1010,7 @@ export function mix(colorA: ColorInput, colorB: ColorInput, weight = 0.5, option
  * shiftLightness('lighten', '#808080', 10, {}); // lighter grey
  */
 function shiftLightness(caller: string, color: ColorInput, delta: number, options: LightnessOptions): Rgba {
-	const { space = 'hsl' } = options;
+	const { space = 'hsl' } = ownOptions(options);
 	if (space !== 'hsl' && space !== 'oklch') throw new RangeError(`${caller}: \`options.space\` must be 'hsl' or 'oklch', got ${show(space)}`);
 	const rgba = toRgba(color);
 	// `toRgba` returns a fresh object: overwrite its channels, keeping its alpha.
@@ -1105,6 +1107,16 @@ export function toOklch(color: ColorInput): Required<Oklch> {
 }
 
 /**
+ * Reads an own property: a component missing from a colour object is never read from a polluted `Object.prototype`.
+ * @param {object} object - The colour object
+ * @param {string} key - The component
+ * @returns {unknown} Its value, or `undefined` when it is not an own property
+ */
+function own(object: object, key: string): unknown {
+	return Object.hasOwn(object, key) ? (object as Record<string, unknown>)[key] : undefined;
+}
+
+/**
  * Reads and validates an OKLCH object for `caller`.
  * @param {string} caller - Name of the public function, used in error messages
  * @param {OklchInput} oklch - The colour
@@ -1116,11 +1128,11 @@ export function toOklch(color: ColorInput): Required<Oklch> {
  */
 function readOklch(caller: string, oklch: OklchInput): number[] {
 	if (typeof oklch !== 'object' || oklch === null) throw new TypeError(`${caller}: \`oklch\` must be an { l, c, h } object, got ${describe(oklch)}`);
-	const l = readChannel(caller, 'oklch.l', oklch.l);
-	const c = readChannel(caller, 'oklch.c', oklch.c);
-	const h = oklch.h ?? NaN;
+	const l = readChannel(caller, 'oklch.l', own(oklch, 'l'));
+	const c = readChannel(caller, 'oklch.c', own(oklch, 'c'));
+	const h = (own(oklch, 'h') as number | null | undefined) ?? NaN;
 	assertNumber(caller, 'oklch.h', h, Number.isFinite(h) || Number.isNaN(h), 'a finite number, NaN, null or undefined');
-	return [l, c, Number.isNaN(h) ? 0 : h, readAlpha(caller, 'oklch.alpha', oklch.alpha)];
+	return [l, c, Number.isNaN(h) ? 0 : h, readAlpha(caller, 'oklch.alpha', own(oklch, 'alpha'))];
 }
 
 /**
@@ -1158,10 +1170,10 @@ export function oklchToRgb(oklch: OklchInput): Rgba {
  */
 export function oklabToRgb(oklab: Oklab): Rgba {
 	if (typeof oklab !== 'object' || oklab === null) throw new TypeError(`oklabToRgb: \`oklab\` must be an { l, a, b } object, got ${describe(oklab)}`);
-	const l = readChannel('oklabToRgb', 'oklab.l', oklab.l);
-	const a = readChannel('oklabToRgb', 'oklab.a', oklab.a);
-	const b = readChannel('oklabToRgb', 'oklab.b', oklab.b);
-	return oklabToBytes(l, a, b, { r: 0, g: 0, b: 0, a: readAlpha('oklabToRgb', 'oklab.alpha', oklab.alpha) });
+	const l = readChannel('oklabToRgb', 'oklab.l', own(oklab, 'l'));
+	const a = readChannel('oklabToRgb', 'oklab.a', own(oklab, 'a'));
+	const b = readChannel('oklabToRgb', 'oklab.b', own(oklab, 'b'));
+	return oklabToBytes(l, a, b, { r: 0, g: 0, b: 0, a: readAlpha('oklabToRgb', 'oklab.alpha', own(oklab, 'alpha')) });
 }
 
 /**
@@ -1306,7 +1318,7 @@ export function getReadableTextColor(background: ColorInput, options: ReadableTe
  * meetsContrast('#767676', '#ffffff', { level: 'AAA' }); // => false
  */
 export function meetsContrast(foreground: ColorInput, background: ColorInput, options: MeetsContrastOptions = {}): boolean {
-	const { level = 'AA', largeText = false } = options;
+	const { level = 'AA', largeText = false } = ownOptions(options);
 	if (level !== 'AA' && level !== 'AAA') throw new RangeError(`meetsContrast: \`level\` must be 'AA' or 'AAA', got ${show(level)}`);
 	const threshold = level === 'AA' ? (largeText ? 3 : 4.5) : largeText ? 4.5 : 7;
 	return contrastRatio(foreground, background) >= threshold;

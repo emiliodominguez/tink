@@ -1,4 +1,4 @@
-import { assertInteger, assertNumber, describe, draw, show } from '../utils/assert.js';
+import { assertInteger, assertNumber, describe, draw, ownOptions, show } from '../utils/assert.js';
 import type { RandomGenerator } from '../utils/index.js';
 import { isNumericString } from '../validate/index.js';
 
@@ -1247,7 +1247,7 @@ export interface WordWrapOptions {
 export function wordWrap(string: string, width: number, options: WordWrapOptions = {}): string {
 	assertInteger('wordWrap', 'width', width, 1, true);
 
-	const { breakLongWords = false, newline = '\n' } = options;
+	const { breakLongWords = false, newline = '\n' } = ownOptions(options);
 	if (typeof newline !== 'string') throw new TypeError(`wordWrap: \`newline\` must be a string, got ${describe(newline)}`);
 	const output: string[] = [];
 
@@ -1318,7 +1318,7 @@ export interface MaskOptions {
  * mask('1234'); // => '****'
  */
 export function mask(string: string, options: MaskOptions = {}): string {
-	const { visibleStart = 0, visibleEnd = 4, char = '*' } = options;
+	const { visibleStart = 0, visibleEnd = 4, char = '*' } = ownOptions(options);
 
 	assertInteger('mask', 'visibleStart', visibleStart);
 	assertInteger('mask', 'visibleEnd', visibleEnd);
@@ -1687,7 +1687,7 @@ const WORD_CASES: ReadonlySet<string> = new Set<WordCase>(['lower', 'upper', 'ca
  * toDelimitedCase('XMLHttpRequest', ':', { case: 'preserve' }); // => 'XML:Http:Request'
  */
 export function toDelimitedCase(string: string, delimiter: string, options: DelimitedCaseOptions = {}): string {
-	const { case: wordCase = 'lower' } = options;
+	const { case: wordCase = 'lower' } = ownOptions(options);
 
 	if (typeof delimiter !== 'string') throw new TypeError(`toDelimitedCase: \`delimiter\` must be a string, got ${describe(delimiter)}`);
 
@@ -1940,7 +1940,7 @@ function compareRuns(a: string, b: string): number {
  *
  * It is a consistent total order, so sorting gives the same result whatever the input order: it is antisymmetric and transitive, and only
  * equal strings compare equal. Numbers that only differ in leading zeros (`'a01'` and `'a1'`) are tied, and ties are broken by code
- * units, so zero-padded numbers come first (`'001'`, `'01'`, `'1'`). Digit runs of any length compare exactly (no conversion to a double
+ * units, which puts zero-padded numbers first (`'001'`, `'01'`, `'1'`), except for runs of zeros only (`'0'` comes before `'00'`). Digit runs of any length compare exactly (no conversion to a double
  * that would merge `'9007199254740993'` with `'9007199254740992'`).
  *
  * Only ASCII digits form numbers: signs, decimal points and thousands separators are ordinary characters (`'1.5'` sorts before `'1.25'`,
@@ -1966,7 +1966,7 @@ export function compareNatural(a: string, b: string, options: CompareNaturalOpti
 
 	if (a === b) return 0;
 
-	const order = options.ignoreCase === true ? compareRuns(foldCase(a), foldCase(b)) : compareRuns(a, b);
+	const order = ownOptions(options).ignoreCase === true ? compareRuns(foldCase(a), foldCase(b)) : compareRuns(a, b);
 
 	return order !== 0 ? order : a < b ? -1 : 1;
 }
@@ -2011,10 +2011,10 @@ export function truncateMiddle(string: string, length: number, options: Truncate
 	assertString('truncateMiddle', 'string', string);
 	assertInteger('truncateMiddle', 'length', length);
 
-	const { ellipsis = '…', position = 0.5 } = options;
+	const { ellipsis = '…', position = 0.5 } = ownOptions(options);
 
 	assertString('truncateMiddle', 'ellipsis', ellipsis);
-	assertNumber('truncateMiddle', 'position', position, position >= 0 && position <= 1, 'a number between 0 and 1');
+	assertNumber('truncateMiddle', 'position', position, typeof position === 'number' && position >= 0 && position <= 1, 'a number between 0 and 1');
 
 	// A string never has more graphemes than UTF-16 code units.
 	if (string.length <= length) return string;
@@ -2288,7 +2288,8 @@ function graphemeWidth(grapheme: string): number {
  * Every assigned code point measures as with `string-width` 8.3, and so do jamo clusters. Sequences differ in a few places:
  * - any pair of regional indicators is a 2-column flag, not only the pairs that are country flags (`'🇦🇦'` is 2 here, 1 there);
  * - an emoji sequence followed by a stray code point is still 2 columns: a keycap followed by a ZWJ or a combining mark (`'1️⃣'` + ZWJ
- *   is 2 here, 1 there), an emoji with a skin tone and a stray selector;
+ *   is 2 here, 1 there), an emoji with a skin tone and a stray selector (a spacing mark after an emoji sequence adds its column: `'©️'` + U+0903 is 3
+ *   here, 2 there);
  * - escape sequences are found by their ECMA-48 syntax, so malformed and rare ones are removed differently: an `ESC` inside an OSC
  *   cancels it (its text is not shown, as in terminals), an unterminated CSI sequence or control string at the end is removed to the end,
  *   `ESC SP F` is removed whole, and `ESC 3 1 3` keeps its `13` (`ESC 3` is a complete escape).

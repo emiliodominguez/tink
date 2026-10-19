@@ -2028,3 +2028,19 @@ describe('stringWidth', function () {
 		expect(performance.now() - start).toBeLessThan(5000);
 	});
 });
+
+describe('String helpers under prototype pollution', function () {
+	it('read their options as own properties only', function () {
+		const polluted = Object.prototype as Record<string, unknown>;
+		Object.assign(polluted, { ellipsis: '<EVIL>', position: 0, ignoreCase: true, visibleEnd: 0, char: '#', breakLongWords: true, case: 'upper' });
+		try {
+			expect(helpers.truncateMiddle('abcdefghij', 5)).toBe('ab…hij');
+			expect(helpers.compareNatural('a', 'B')).toBe(1);
+			expect(helpers.mask('12345678')).toBe('****5678');
+			expect(helpers.wordWrap('abcdefghij', 4)).toBe('abcdefghij');
+			expect(helpers.toDelimitedCase('helloWorld', '-')).toBe('hello-world');
+		} finally {
+			for (const key of ['ellipsis', 'position', 'ignoreCase', 'visibleEnd', 'char', 'breakLongWords', 'case']) delete polluted[key];
+		}
+	});
+});

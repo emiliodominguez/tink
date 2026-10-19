@@ -978,7 +978,11 @@ export function createHistory<S>(store: HistorySource<S>, options: HistoryOption
 	assertFunction('createHistory', 'store.getState', getState);
 	assertFunction('createHistory', 'store.setState', setState);
 	assertFunction('createHistory', 'store.subscribe', subscribe);
-	const { limit = Infinity, coalesce = 0, now = Date.now } = options;
+	if (!isObject(options)) throw new TypeError(`createHistory: \`options\` must be an object, got ${describe(options)}`);
+	// Own properties only: a polluted `Object.prototype` cannot set a limit or a coalescing window.
+	const limit = (own(options as Record<string, unknown>, 'limit') ?? Infinity) as number;
+	const coalesce = (own(options as Record<string, unknown>, 'coalesce') ?? 0) as number;
+	const now = (own(options as Record<string, unknown>, 'now') ?? Date.now) as () => number;
 	assertInteger('createHistory', 'options.limit', limit, 1, true);
 	assertNumber('createHistory', 'options.coalesce', coalesce, coalesce >= 0, 'a number >= 0');
 	assertFunction('createHistory', 'options.now', now);
@@ -1171,6 +1175,13 @@ export function createHistory<S>(store: HistorySource<S>, options: HistoryOption
 
 		batch<R>(fn: () => R): R {
 			assertFunction('batch', 'fn', fn);
+			// Called by a listener of the store: everything until the notification ends already makes one step with the change that
+			// triggered it, and recording now would split it in two.
+			if (notifier !== undefined && notifier.defer(record)) {
+				const reaction = fn();
+				if (isThenable(reaction)) throw new TypeError('batch: `fn` must be synchronous, got a function returning a thenable');
+				return reaction;
+			}
 			record();
 			if (depth++ === 0) batched = false;
 			let result: R;

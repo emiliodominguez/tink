@@ -736,6 +736,36 @@ describe('Color helpers under prototype pollution', function () {
 			delete keys['%'];
 		}
 	});
+
+	it('reads the options of mix, lighten, darken and meetsContrast as own properties only', function () {
+		const clean = [helpers.mix('#f00', '#00f'), helpers.lighten('#336699', 10), helpers.meetsContrast('#777', '#fff')];
+		const keys = Object.prototype as Record<string, unknown>;
+		Object.assign(keys, { space: 'oklch', hue: 'longer', level: 'AAA', largeText: true });
+		try {
+			expect([helpers.mix('#f00', '#00f'), helpers.lighten('#336699', 10), helpers.meetsContrast('#777', '#fff')]).toEqual(clean);
+		} finally {
+			for (const key of ['space', 'hue', 'level', 'largeText']) delete keys[key];
+		}
+	});
+
+	it('never reads a missing OKLab / OKLCH component from Object.prototype', function () {
+		const keys = Object.prototype as Record<string, unknown>;
+		keys.h = 250;
+		keys.alpha = 0;
+		keys.l = 0.5;
+		try {
+			expect(helpers.oklchToRgb({ l: 0.6, c: 0.1 })).toEqual(helpers.oklchToRgb({ l: 0.6, c: 0.1, h: NaN, alpha: 1 }));
+			expect(helpers.oklabToRgb({ l: 0.6, a: 0.1, b: 0 }).a).toBe(1);
+			expect(helpers.inGamut({ l: 0.6, c: 0.1 })).toBe(helpers.inGamut({ l: 0.6, c: 0.1, h: 0 }));
+			expect(function () {
+				helpers.oklchToRgb({ c: 0.1 } as unknown as helpers.Oklch);
+			}).toThrow(TypeError);
+		} finally {
+			delete keys.h;
+			delete keys.alpha;
+			delete keys.l;
+		}
+	});
 });
 
 /**
