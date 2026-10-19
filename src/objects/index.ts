@@ -162,7 +162,7 @@ type Properties = Record<PropertyKey, unknown>;
  * @example
  * type I = Invert<{ a: 'x'; b: 'y' }>; // { x: 'a'; y: 'b' }
  */
-export type Invert<T> = { -readonly [K in keyof T as T[K] & PropertyKey]: K extends number ? `${K}` : K };
+export type Invert<T> = { -readonly [K in keyof T as K extends symbol ? never : T[K] & PropertyKey]: K extends number ? `${K}` : K };
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Internal helpers
@@ -308,6 +308,18 @@ function adoptPrototype<T extends object>(copy: T, original: object): T {
 }
 
 /**
+ * A genuine error object (with the internal slot that `Object.prototype.toString` and `Error.isError` check) with the prototype of
+ * `original` and no own properties yet, to copy the properties of `original` onto.
+ * @param {object} original - The error being copied
+ * @returns {object} The empty copy
+ */
+function errorShell(original: object): object {
+	const shell = adoptPrototype(new Error(), original) as unknown as Properties;
+	for (const key of Reflect.ownKeys(shell)) delete shell[key];
+	return shell;
+}
+
+/**
  * The built-in `%TypedArray%.prototype[Symbol.toStringTag]` getter: a typed array's real constructor name, `undefined` otherwise.
  */
 const typedArrayTag = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag)?.get as () => unknown;
@@ -325,7 +337,15 @@ const sharedByteLength: (() => unknown) | undefined =
  * @returns {ArrayBuffer | ArrayBufferView} An independent copy with the same prototype
  */
 function copyBinary(value: ArrayBuffer | ArrayBufferView): ArrayBuffer | ArrayBufferView {
-	if (!ArrayBuffer.isView(value)) return adoptPrototype(value.slice(0), value);
+	if (!ArrayBuffer.isView(value)) {
+		const { resizable, growable, maxByteLength } = value as ArrayBuffer & { resizable?: boolean; growable?: boolean; maxByteLength?: number };
+		// `slice` returns a fixed-length buffer: a resizable (or growable shared) one is rebuilt with its maximum length.
+		if (!resizable && !growable) return adoptPrototype(value.slice(0), value);
+		const Buffer = (growable ? SharedArrayBuffer : ArrayBuffer) as unknown as new (length: number, options: { maxByteLength?: number }) => ArrayBuffer;
+		const copy = new Buffer(value.byteLength, { maxByteLength });
+		new Uint8Array(copy).set(new Uint8Array(value));
+		return adoptPrototype(copy, value);
+	}
 
 	const bytes = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
 	// The built-in tag getter reads the typed array's internal name, so a subclass overriding `Symbol.toStringTag` can't mislead it;
@@ -455,7 +475,7 @@ export function merge<T extends object, S extends object[]>(target: T, ...source
  * - Arrays stay arrays (holes preserved); class instances keep their prototype and own enumerable (string and symbol) properties.
  * - `Date`, `RegExp` (incl. `lastIndex`), `Map`, `Set`, `ArrayBuffer`, typed arrays/`DataView` and boxed primitives get a new instance with the same contents.
  * - Errors keep `message`, `stack` and other own (even non-enumerable) properties.
- * - `WeakMap`, `WeakSet` and promises cannot be copied and are returned by reference.
+ * - `WeakMap`, `WeakSet` and promises (any object with a `then` method) cannot be copied and are returned by reference.
  * - Keys are defined, never assigned: a `'__proto__'` key stays an own data property (no prototype change); `constructor` and
  *   `prototype` keys are copied like any other own data key.
  * @template T - The type of the value
@@ -1206,7 +1226,7 @@ function copyWith(value: unknown, seen?: Map<object, unknown>): unknown {
 	}
 
 	const error = isError(value);
-	const copy: object = !error && Array.isArray(value) ? adoptPrototype(new Array(value.length), value) : Object.create(Object.getPrototypeOf(value));
+	const copy: object = error ? errorShell(value) : Array.isArray(value) ? adoptPrototype(new Array(value.length), value) : Object.create(Object.getPrototypeOf(value));
 	seen?.set(value, copy);
 	// Errors keep all their own properties (`message` and `stack` are not enumerable), as they are defined (getters included).
 	for (const key of error ? Reflect.ownKeys(value) : ownEnumerableKeys(value)) {
@@ -1268,7 +1288,7 @@ function copyChild(value: unknown, seen?: Map<object, unknown>): unknown {
  *   getters are read and stored as data properties).
  * - `Date`, `RegExp` (incl. `lastIndex`), `Map` (keys and values cloned), `Set`, `ArrayBuffer`, typed arrays, `DataView` and boxed primitives get new instances.
  * - Errors keep their prototype and all own properties (`message`, `stack`, `cause`, ...).
- * - `WeakMap`, `WeakSet` and promises cannot be copied and are returned by reference.
+ * - `WeakMap`, `WeakSet` and promises (any object with a `then` method) cannot be copied and are returned by reference.
  * - Shared and CIRCULAR references are preserved (the copy has the same reference graph).
  * - Extra own properties attached to built-ins (Date, Map, Set, RegExp, typed arrays) are not copied.
  * - Keys are defined, never assigned: a `'__proto__'` key stays an own data property (no prototype change); `constructor` and
@@ -1894,7 +1914,7 @@ function customEqual(a: unknown, b: unknown, stack: ComparisonStack, key: unknow
  * - `Map`/`Set`: same size and a one-to-one matching of deeply equal entries/members. Primitive keys/members are matched in O(1);
  *   object keys/members are matched pairwise, which is O(n²) in the worst case.
  * - Typed arrays (element-wise), `DataView`/`ArrayBuffer` (byte-wise), boxed primitives (by value), errors (`name` + `message` + own enumerable props).
- * - `WeakMap`, `WeakSet` and promises are only equal to themselves.
+ * - `WeakMap`, `WeakSet` and promises (any object with a `then` method) are only equal to themselves.
  * - Circular structures are supported (pairs already under comparison are assumed equal).
  *
  * Recursion depth is bounded by the call stack (~thousands of levels): deeper input throws a `RangeError`
@@ -3302,7 +3322,8 @@ function encodeValue(value: unknown, ancestors: object[]): string {
  *   `-Infinity`, `-0`, bigints (`12n`), `Date(ms)`, `RegExp("/a/g")`, `Map([[k,v],...])` and `Set([...])` (entries sorted by encoding),
  *   typed arrays, `DataView`s and `ArrayBuffer`s (`Uint8Array([1,2])`, bytes for the last two), boxed primitives (`Number(1)`), and other
  *   objects (class instances, errors...) as `ClassName{...}` with their own enumerable string keys.
- * - Functions, symbols, `WeakMap`s, `WeakSet`s, promises and circular references throw a `TypeError` (shared references are fine).
+ * - Functions, symbols, `WeakMap`s, `WeakSet`s, promises (any object with a `then` method) and circular references throw a
+ *   `TypeError` (shared references are fine).
  *
  * Getters are invoked; `toJSON` methods are NOT. Distinct classes sharing a name encode alike.
  * @param {unknown} value - The value to serialize

@@ -317,6 +317,34 @@ describe('Objects helpers', function () {
 	});
 
 	describe('deepClone', function () {
+		it('should copy errors as genuine error objects', function () {
+			const original = new TypeError('boom', { cause: 1 });
+			const copy = helpers.deepClone(original);
+			expect(Object.prototype.toString.call(copy)).toBe('[object Error]');
+			expect(copy).toBeInstanceOf(TypeError);
+			expect([copy.message, copy.cause, copy.stack]).toEqual(['boom', 1, original.stack]);
+			expect(helpers.isEqual(copy, original)).toBe(true);
+			expect(helpers.isEqual(helpers.deepClone({ original }), { original })).toBe(true);
+			expect(helpers.isEqual(helpers.clone(original), original)).toBe(true);
+		});
+
+		it('should keep array buffers resizable', function () {
+			// ES2024 buffers (the library targets ES2022 types).
+			type Resizable = ArrayBuffer & { readonly resizable: boolean; readonly maxByteLength: number; resize(length: number): void };
+			type Growable = SharedArrayBuffer & { readonly growable: boolean; readonly maxByteLength: number };
+			const ResizableBuffer = ArrayBuffer as unknown as new (length: number, options: { maxByteLength: number }) => Resizable;
+			const GrowableBuffer = SharedArrayBuffer as unknown as new (length: number, options: { maxByteLength: number }) => Growable;
+			const buffer = new ResizableBuffer(4, { maxByteLength: 16 });
+			new Uint8Array(buffer).set([1, 2, 3, 4]);
+			const copy = helpers.deepClone(buffer);
+			expect([copy.resizable, copy.maxByteLength, [...new Uint8Array(copy)]]).toEqual([true, 16, [1, 2, 3, 4]]);
+			copy.resize(8);
+			expect(buffer.byteLength).toBe(4);
+			const shared = new GrowableBuffer(2, { maxByteLength: 8 });
+			const sharedCopy = helpers.deepClone(shared);
+			expect([sharedCopy.growable, sharedCopy.maxByteLength, sharedCopy === shared]).toEqual([true, 8, false]);
+		});
+
 		it('copies nested structures without sharing references', function () {
 			const original = { a: [1, { b: 2 }], c: { d: { e: 'x' } }, when: new Date(10) };
 			const copy = helpers.deepClone(original);
@@ -761,6 +789,14 @@ describe('Objects helpers', function () {
 	});
 
 	describe('invert', function () {
+		it('should not type symbol keys, which are never inverted', function () {
+			const tag = Symbol('tag');
+			const inverted = helpers.invert({ a: 'x', [tag]: 'y' } as { a: 'x'; [tag]: 'y' });
+			// @ts-expect-error `y` came from a symbol key
+			expect(inverted.y).toBeUndefined();
+			expect(inverted).toEqual({ x: 'a' });
+		});
+
 		it('swaps keys and values', function () {
 			const result = helpers.invert({ a: 'x', b: 'y' } as const);
 			assertType<Equals<typeof result, { x: 'a'; y: 'b' }>>(true);
