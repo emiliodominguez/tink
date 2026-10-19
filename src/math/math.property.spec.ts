@@ -75,18 +75,18 @@ describe('Math helpers (property-based)', function () {
 		});
 
 		it('should equal the decimal-string reference algorithm, ties and binary-inexact decimals included', function () {
-			// Reference: shift the decimal point in the string representation, round, shift back (no binary multiplication).
-			function shift(value: number, exponent: number): number {
-				const [mantissa, current = '0'] = String(value).split('e');
-				return Number(`${mantissa}e${Number(current) + exponent}`);
-			}
 			function reference(x: number, d: number): number {
-				// A number written with at most `d` decimals is already rounded (shifting it there and back could change its last digit).
-				const [mantissa, exponent = '0'] = String(x).split('e');
-				if ((mantissa.split('.')[1] ?? '').length - Number(exponent) <= d) return x;
-				const shifted = shift(Math.abs(x), d);
-				if (!Number.isFinite(shifted)) return x;
-				const rounded = shift(Math.round(shifted), -d);
+				// Exact decimal arithmetic on the number as written: `|x| = digits / 10 ** f` (`f` negative for large numbers), so with
+				// `F = max(f, 0)`, `|x| = n / 10 ** F` for the integer `n = digits * 10 ** (F - f)`, rounded half away from zero by division.
+				const [mantissa, exponent = '0'] = String(Math.abs(x)).split('e');
+				const f = (mantissa.split('.')[1] ?? '').length - Number(exponent);
+				// A number written with at most `d` decimals is already rounded.
+				if (f <= d) return x;
+				const scale = Math.max(f, 0);
+				const n = BigInt(mantissa.replace('.', '')) * 10n ** BigInt(scale - f);
+				const divisor = 10n ** BigInt(scale - d);
+				const quotient = n / divisor + (2n * (n % divisor) >= divisor ? 1n : 0n);
+				const rounded = Number(`${quotient}e${-d}`);
 				return x < 0 || Object.is(x, -0) ? -rounded : rounded;
 			}
 			// Decimal literals such as 1.005 or 2.675 (k * 10^-e), half-way values, and arbitrary doubles of every magnitude.

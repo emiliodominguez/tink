@@ -141,14 +141,35 @@ export function round(number: number, decimals = 0): number {
 	const scale = POWERS_OF_TEN[decimals];
 	const scaled = number * scale;
 	if (Math.abs(scaled - Math.floor(scaled) - 0.5) > Math.abs(scaled) * 2 ** -46) return Math.round(scaled) / scale;
+	// Non-finite input, or the number already has at most `decimals` fractional digits: rounding is the identity.
+	if (!Number.isFinite(number) || decimalPlaces(number) <= decimals) return number;
 	// `1 / -0` is `-Infinity`.
 	const negative = 1 / number < 0;
-	const shifted = shiftDecimal(Math.abs(number), decimals);
-	// Non-finite input (whose string is not a number), or the number already has at most `decimals` fractional digits: rounding is
-	// the identity (shifting 17 significant digits there and back could change the last one).
-	if (!Number.isFinite(shifted) || decimalPlaces(number) <= decimals) return number;
-	const rounded = shiftDecimal(Math.round(shifted), -decimals);
+	const rounded = roundDecimalString(Math.abs(number), decimals);
 	return negative ? -rounded : rounded;
+}
+
+/**
+ * Rounds a positive finite number half up on its shortest decimal representation (the digits `String` shows), to `decimals` places.
+ * The digits are rounded as text and converted once: shifting them into a double first would lose the first dropped digit for
+ * values of `2 ** 51` and more once shifted (`3.0000000000000004` to 15 places would round up).
+ * @param {number} value - A positive finite number with more than `decimals` decimal places
+ * @param {number} decimals - The integer number of decimal places to keep (may be negative)
+ * @returns {number} The double nearest to the rounded decimal
+ * @example
+ * roundDecimalString(3.0000000000000004, 15); // => 3
+ */
+function roundDecimalString(value: number, decimals: number): number {
+	const [mantissa, exponent = '0'] = String(value).split('e');
+	const point = mantissa.indexOf('.');
+	const digits = point === -1 ? mantissa : mantissa.slice(0, point) + mantissa.slice(point + 1);
+	// The number of digits before the decimal point, in the full positional form of the value.
+	const integerDigits = (point === -1 ? mantissa.length : point) + Number(exponent);
+	const keep = integerDigits + decimals;
+	// Every kept digit is beyond the ones of the value, and the first dropped one is a leading zero: it rounds to zero.
+	if (keep < 0) return 0;
+	const kept = BigInt(digits.slice(0, keep) || '0') + (digits.charCodeAt(keep) >= 53 ? 1n : 0n);
+	return Number(`${kept}e${-decimals}`);
 }
 
 /** `10 ** k` for `k` in `0..22`, the powers of ten that are exactly representable as doubles. */
@@ -163,7 +184,15 @@ const POWERS_OF_TEN: ReadonlyArray<number> = [1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1
  * average([]); // => NaN
  */
 export function average(numbers: ReadonlyArray<number>): number {
-	return sum(numbers) / numbers.length;
+	const total = sum(numbers);
+	if (total !== Infinity && total !== -Infinity) return total / numbers.length;
+	// The sum overflowed (or an element is infinite): the sum of the terms divided by the count cannot overflow when the mean is finite.
+	const count = numbers.length;
+	return sum(
+		numbers.map(function (value) {
+			return +value / count;
+		})
+	);
 }
 
 /**
@@ -646,24 +675,38 @@ export function mode(numbers: ReadonlyArray<number>): number[] {
  */
 export function variance(numbers: ReadonlyArray<number>, options: VarianceOptions = {}): number {
 	const sample = options.sample === true;
+	const [count, squaredDistance, allFinite] = welford(numbers, 1);
+	const divisor = sample ? count - 1 : count;
+	if (divisor <= 0 || !allFinite) return NaN;
+	if (squaredDistance >= 0 && squaredDistance < Infinity) return squaredDistance / divisor;
+	// The running sum of squared deviations (`n` times the variance) overflowed, or Welford's update turned that into `-Infinity` or
+	// `NaN`: redo it on values scaled by 2 ** -600 (exact), then scale the variance back in two exact steps, so that only a variance
+	// that really overflows is `Infinity`.
+	const scaledDistance = welford(numbers, 2 ** -600)[1];
+	return (scaledDistance / divisor) * 2 ** 600 * 2 ** 600;
+}
+
+/**
+ * Welford's online algorithm on `numbers` multiplied by `scale`: the count, the sum of squared deviations from the mean, and whether
+ * every element is finite. Elements are converted with unary `+`.
+ * @param {ReadonlyArray<number>} numbers - The numbers
+ * @param {number} scale - A power of two to multiply them by
+ * @returns {[number, number, boolean]} The count, the sum of squared deviations (of the scaled values) and whether all are finite
+ */
+function welford(numbers: ReadonlyArray<number>, scale: number): [number, number, boolean] {
 	let count = 0;
 	let mean = 0;
 	let squaredDistance = 0;
 	let allFinite = true;
 	for (const item of numbers) {
-		const value = +item;
+		const value = +item * scale;
 		count++;
 		if (!Number.isFinite(value)) allFinite = false;
 		const delta = value - mean;
 		mean += delta / count;
 		squaredDistance += delta * (value - mean);
 	}
-	const divisor = sample ? count - 1 : count;
-	if (divisor <= 0 || !allFinite) return NaN;
-	// With finite inputs the intermediate deltas can only overflow when the true variance is astronomically large,
-	// which Welford's update turns into `-Infinity` or `NaN`: report the overflow as `Infinity`.
-	if (!(squaredDistance >= 0)) return Infinity;
-	return squaredDistance / divisor;
+	return [count, squaredDistance, allFinite];
 }
 
 /**
@@ -1049,7 +1092,16 @@ export function weightedAverage(values: ReadonlyArray<number>, weights: Readonly
 	const products = values.map(function (value, index) {
 		return value * scaledWeights[index];
 	});
-	return sum(products) / sum(scaledWeights);
+	const totalWeight = sum(scaledWeights);
+	const total = sum(products);
+	if (total !== Infinity && total !== -Infinity) return total / totalWeight;
+	// The sum of the products overflowed (or a value is infinite): dividing each product by the total weight first cannot overflow
+	// when the mean is finite.
+	return sum(
+		products.map(function (weighted) {
+			return weighted / totalWeight;
+		})
+	);
 }
 
 /**
@@ -1085,6 +1137,19 @@ export function normalize(numbers: ReadonlyArray<number>): number[] {
 }
 
 /**
+ * Expresses a byte count in the unit `base ** exponent`. SI units shift the decimal digits (like {@link parseBytes}), since powers of
+ * `1000` beyond `1000 ** 7` are not exact doubles (`305.035e24` bytes must read `305.035 YB` before rounding); powers of `1024` divide
+ * exactly.
+ * @param {number} bytes - A finite byte count
+ * @param {number} base - `1000` or `1024`
+ * @param {number} exponent - The unit's power of `base`
+ * @returns {number} The count in that unit
+ */
+function inUnit(bytes: number, base: number, exponent: number): number {
+	return base === 1000 ? Math.sign(bytes) * shiftDecimal(Math.abs(bytes), -3 * exponent) : bytes / Math.pow(base, exponent);
+}
+
+/**
  * Formats a byte count as a human-readable string, using SI units (`kB`, `MB`, …, powers of `1000`) by default,
  * or IEC binary units (`KiB`, `MiB`, …, powers of `1024`) with `{ base: 1024 }`.
  * The value is rounded with {@link round} to at most `decimals` places (trailing zeros are dropped), and moves up to the
@@ -1112,10 +1177,10 @@ export function formatBytes(bytes: number, options: FormatBytesOptions = {}): st
 	const magnitude = Math.abs(bytes);
 	let exponent = 0;
 	while (exponent < units.length - 1 && magnitude >= Math.pow(base, exponent + 1)) exponent++;
-	let value = round(bytes / Math.pow(base, exponent), decimals);
+	let value = round(inUnit(bytes, base, exponent), decimals);
 	if (Math.abs(value) >= base && exponent < units.length - 1) {
 		exponent++;
-		value = round(bytes / Math.pow(base, exponent), decimals);
+		value = round(inUnit(bytes, base, exponent), decimals);
 	}
 	// A template literal prints `-0` as "0", so tiny negative values do not print as "-0".
 	return `${value} ${units[exponent]}`;
@@ -1151,7 +1216,8 @@ const BYTES_REGEX = /^\s*(-?(?:\d+(?:\.\d+)?|\.\d+))(?:[eE]([+-]?\d+))?(?:\s*([A
  * exactly (not `1100.0000000000002`). Fractional results are returned as-is (`'0.5 kB'` is `500`, `'1.5 B'` is `1.5`).
  *
  * `parseBytes(formatBytes(n, options), options)` is `n` rounded as `formatBytes` displays it, and
- * `formatBytes(parseBytes(text, options), options) === text` for every `text` that `formatBytes` produced.
+ * `formatBytes(parseBytes(text, options), options) === text` for every `text` that `formatBytes` produced with at most 15
+ * significant digits (a double holds 15 to 17, so longer numbers may come back with a different last digit).
  * @param {string} value - The text to parse, e.g. `'1.5 MB'`, `'2KiB'` or `'512'`
  * @param {ParseBytesOptions} [options={}] - `base`: what the SI symbols denote, `1000` (default) or `1024`
  * @returns {number} The number of bytes
@@ -1278,6 +1344,31 @@ export function roundToStep(value: number, step: number): number {
 	// Beyond 2 ** 53 steps, every double is already (within its own precision) a multiple of `step`. Non-finite values (whose
 	// shifted string is `NaN`) are returned here too.
 	if (!(quotient < 2 ** 53)) return value;
-	const rounded = round(Math.round(quotient) * step, stepDecimals);
+	// The number of steps. When the shifted value has more digits than a double holds exactly, the quotient of the doubles can be off:
+	// divide the exact decimal integers instead, rounding half away from zero (the count itself is below 2 ** 53, so exact as a double).
+	let multiple = Math.round(quotient);
+	if (scaledValue >= 2 ** 53) {
+		const exactValue = scaledInteger(magnitude, shift);
+		const exactStep = scaledInteger(step, shift);
+		multiple = Number(exactValue / exactStep + (2n * (exactValue % exactStep) >= exactStep ? 1n : 0n));
+	}
+	const rounded = round(multiple * step, stepDecimals);
 	return negative ? -rounded : rounded;
+}
+
+/**
+ * The exact integer `value * 10 ** shift`, read from the decimal representation of `value` (`shift` is at least its number of
+ * decimal places).
+ * @param {number} value - A non-negative finite number
+ * @param {number} shift - The power of ten, at least `decimalPlaces(value)`
+ * @returns {bigint} The shifted value
+ * @example
+ * scaledInteger(1.25, 3); // => 1250n
+ */
+function scaledInteger(value: number, shift: number): bigint {
+	const [mantissa, exponent = '0'] = String(value).split('e');
+	const point = mantissa.indexOf('.');
+	const digits = point === -1 ? mantissa : mantissa.slice(0, point) + mantissa.slice(point + 1);
+	const fractionDigits = (point === -1 ? 0 : mantissa.length - point - 1) - Number(exponent);
+	return BigInt(digits) * 10n ** BigInt(shift - fractionDigits);
 }

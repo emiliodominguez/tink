@@ -881,6 +881,49 @@ describe('Math helpers', function () {
 		});
 	});
 
+	describe('regressions (helper review)', function () {
+		it('round keeps the first dropped digit even when the shifted value exceeds 2 ** 51', function () {
+			expect(helpers.round(3.0000000000000004, 15)).toBe(3);
+			expect(helpers.round(34729124319504.973, 2)).toBe(34729124319504.97);
+			expect(helpers.round(49725191080312.305, 2)).toBe(49725191080312.31);
+			expect(helpers.round(-49725191080312.305, 2)).toBe(-49725191080312.31);
+			expect(helpers.round(434026.60000000003, 10)).toBe(434026.6);
+			expect(helpers.round(5e-324, 0)).toBe(0);
+			expect(Object.is(helpers.round(-5e-324, 0), -0)).toBe(true);
+			expect(helpers.round(1.7976931348623157e308, -308)).toBe(Infinity);
+		});
+
+		it('roundToStep finds the nearest multiple when the shifted value exceeds 2 ** 53', function () {
+			expect(helpers.roundToStep(434026.6, 1e-10)).toBe(434026.6);
+			expect(helpers.roundToStep(3.0000000000000004, 1e-15)).toBe(3);
+			// 69859533205.86203 is 2794381328234481.2 steps of 0.000025: the nearest multiple is step 2794381328234481.
+			expect(helpers.roundToStep(69859533205.86203, 0.000025)).toBe(helpers.round(2794381328234481 * 0.000025, 6));
+			expect(helpers.roundToStep(-69859533205.86203, 0.000025)).toBe(-helpers.roundToStep(69859533205.86203, 0.000025));
+		});
+
+		it('variance and standardDeviation stay finite when only n times the variance overflows', function () {
+			expect(helpers.variance([1.2e154, -1.2e154, 1.2e154, -1.2e154])).toBeCloseTo(1.44e308, -300);
+			expect(helpers.standardDeviation([1.2e154, -1.2e154, 1.2e154, -1.2e154])).toBeCloseTo(1.2e154, -146);
+			expect(helpers.variance([1e308, -1e308])).toBe(Infinity);
+		});
+
+		it('average and weightedAverage do not overflow when the mean is finite', function () {
+			expect(helpers.average([1e308, 1e308])).toBe(1e308);
+			expect(helpers.average([1e308, 1e308, -1e308])).toBeCloseTo(1e308 / 3, -300);
+			expect(helpers.average([Infinity, 1])).toBe(Infinity);
+			expect(helpers.average([Infinity, -Infinity])).toBeNaN();
+			expect(helpers.weightedAverage([1e308, 1e308], [1, 1])).toBe(1e308);
+			expect(helpers.weightedAverage([Infinity, 1], [1, 1])).toBe(Infinity);
+		});
+
+		it('formatBytes rounds SI values as written in every unit, YB included', function () {
+			expect(helpers.formatBytes(305.035e24, { decimals: 2 })).toBe('305.04 YB');
+			expect(helpers.formatBytes(305.035e21, { decimals: 2 })).toBe('305.04 ZB');
+			expect(helpers.formatBytes(-305.035e24, { decimals: 2 })).toBe('-305.04 YB');
+			expect(helpers.formatBytes(1536, { base: 1024 })).toBe('1.5 KiB');
+		});
+	});
+
 	describe('regressions (round 2 bug hunt)', function () {
 		it('log should return the exact integer for exact powers of any base', function () {
 			expect(helpers.log(81, 3)).toBe(4);
