@@ -78,7 +78,7 @@ const env = parse(
 ); // { PORT: number; DEBUG: boolean; MODE: 'dev' | 'prod'; DATABASE_URL: string }, every other variable stripped
 ```
 
-`asNumber('')` fails instead of returning `0`, `asInteger` rejects integers that would lose precision, and `asDate` rejects `'2023-02-29'` and offset-less local times. Every parser is a Standard Schema validator, and zod schemas can be nested inside. `union`, `discriminatedUnion`, `recordOf`, `tuple`, `lazy`, `exact` and `partial` cover the rest of zod's shapes; `asArray`, `blankAsUndefined` and `asJson` handle repeated query parameters, empty form fields and JSON in environment variables; `issuesByPath` turns issues into per-field messages.
+`asNumber('')` fails instead of returning `0`, `asInteger` rejects integers that would lose precision, and `asDate` rejects `'2023-02-29'` and offset-less local times. Every parser is a Standard Schema validator, and zod schemas can be nested inside. `union`, `discriminatedUnion`, `recordOf`, `tuple`, `lazy`, `exact` and `partial` cover the rest of zod's shapes; `asArray`, `asList`, `blankAsUndefined` and `asJson` handle repeated query parameters, comma-separated lists, empty form fields and JSON in environment variables; `check` adds rules across fields, `withFallback` replaces a bad value instead of failing, `asBigInt` reads 64-bit ids, and `issuesByPath` turns issues into per-field messages.
 
 ## Hostile input is a non-event
 

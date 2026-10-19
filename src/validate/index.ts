@@ -1897,6 +1897,44 @@ export function withDefault<S extends Schema>(
 }
 
 /**
+ * Creates a parser that returns `fallback` for any value `schema` rejects, missing ones included, instead of failing (`.catch()` in zod):
+ * for inputs where a bad value should fall back to a sensible one rather than fail the whole parse, such as a page number in a query
+ * string or a stored user preference. The rejected value is dropped without a trace, so prefer {@link withDefault} where a typo should
+ * be reported. When `fallback` is a function it is called for every rejected value; the fallback itself is not validated.
+ * @template S - The schema
+ * @param {S} schema - The schema for the value
+ * @param {SchemaOutput<S> | (() => SchemaOutput<S>)} fallback - The value for rejected inputs, or a function returning it
+ * @returns {Parser<SchemaOutput<S>>} The parser, which never fails
+ * @throws {TypeError} when `schema` is not a {@link Schema}
+ * @example
+ * import { isOneOf } from 'tinkit/guards';
+ * import { parseQueryString } from 'tinkit/url';
+ * const query = { page: withFallback(asInteger, 1), sort: withFallback(isOneOf(['new', 'top']), 'new') };
+ * parse(query, parseQueryString('?page=3&sort=top')); // => { page: 3, sort: 'top' }
+ * parse(query, parseQueryString('?page=last&sort=random')); // => { page: 1, sort: 'new' }
+ * parse(query, {}); // => { page: 1, sort: 'new' }
+ */
+export function withFallback<S extends Schema>(schema: S, fallback: SchemaOutput<S> | (() => SchemaOutput<S>)): Parser<SchemaOutput<S>> {
+	const node = compile('withFallback', 'schema', schema, []);
+
+	/**
+	 * Parses the value, or returns the fallback when `schema` rejects it.
+	 * @param {unknown} value - The value
+	 * @returns {unknown} The output, or the fallback
+	 */
+	function fastWithFallback(value: unknown): unknown {
+		const output = node.fast(value);
+
+		if (output !== FAIL) return output;
+
+		return typeof fallback === 'function' ? (fallback as () => unknown)() : fallback;
+	}
+
+	// The fast parse never fails, so the reporting parse is never needed: it is the same function.
+	return toCompiledParser({ fast: fastWithFallback, run: fastWithFallback, guard: undefined, handlesMissing: always });
+}
+
+/**
  * Creates a parser that accepts `undefined` (returned as is) and parses any other value with `schema`: in an object schema the key
  * becomes optional (`.optional()` in zod). For guards, the guards module's `isOptional` does the same.
  * @template S - The schema
@@ -1985,6 +2023,66 @@ export function chain<A extends Schema, B extends Schema>(first: A, second: B): 
 		missing: head.missing,
 		handlesMissing: head.handlesMissing,
 		score: head.score
+	});
+}
+
+/**
+ * Creates a parser that parses the value with `schema`, then requires `predicate` to accept the output (`.refine()` in zod), reporting
+ * `message` otherwise: the place for rules a single guard cannot express, across fields included. `path` (relative to the value) puts
+ * the issue on the field a form should highlight. `predicate` only sees outputs `schema` accepted, so coercions and defaults are applied.
+ * @template S - The schema
+ * @param {S} schema - The schema for the value
+ * @param {(value: SchemaOutput<S>) => boolean} predicate - The rule the output must satisfy
+ * @param {string} [message='Invalid value'] - The message of the issue
+ * @param {ReadonlyArray<PropertyKey>} [path=[]] - Where the issue goes, relative to the value
+ * @returns {Parser<SchemaOutput<S>>} The parser
+ * @throws {TypeError} when `schema` is not a {@link Schema}, `predicate` is not a function, `message` is not a string or `path` is not an array
+ * @example
+ * import { isString } from 'tinkit/guards';
+ * const signUp = check(
+ *   { password: isString, confirm: isString },
+ *   function (form) { return form.password === form.confirm; },
+ *   'Passwords do not match',
+ *   ['confirm']
+ * );
+ * parse(signUp, { password: 'hunter2', confirm: 'hunter2' }); // => { password: 'hunter2', confirm: 'hunter2' }
+ * safeParse(signUp, { password: 'hunter2', confirm: 'hunter3' })[0]?.issues; // => [{ message: 'Passwords do not match', path: ['confirm'] }]
+ * parse(check(asInteger, function (n) { return n % 2 === 0; }, 'Expected an even number'), '42'); // => 42
+ */
+export function check<S extends Schema>(
+	schema: S,
+	predicate: (value: SchemaOutput<S>) => boolean,
+	message = 'Invalid value',
+	path: ReadonlyArray<PropertyKey> = []
+): Parser<SchemaOutput<S>> {
+	const node = compile('check', 'schema', schema, []);
+
+	if (typeof predicate !== 'function') throw new TypeError(`check: \`predicate\` must be a function, got ${describe(predicate)}`);
+	if (typeof message !== 'string') throw new TypeError(`check: \`message\` must be a string, got ${describe(message)}`);
+	if (!Array.isArray(path)) throw new TypeError(`check: \`path\` must be an array, got ${describe(path)}`);
+
+	const relative = path.slice();
+
+	return toCompiledParser({
+		fast: function fastCheck(value: unknown): unknown {
+			const output = node.fast(value);
+
+			return output !== FAIL && predicate(output as SchemaOutput<S>) ? output : FAIL;
+		},
+		run: function runCheck(value: unknown, at: PropertyKey[], issues: SchemaIssue[]): unknown {
+			// The fast parse failed: either `schema` rejected the value, or `predicate` rejected its output.
+			if (node.fast(value) === FAIL) return node.run(value, at, issues);
+			issues.push({ message, path: [...at, ...relative] });
+
+			return undefined;
+		},
+		guard: undefined,
+		missing: node.missing,
+		handlesMissing: node.handlesMissing,
+		score: function scoreCheck(value: unknown): number {
+			// A value `schema` accepts only failed the predicate: as close as a rejected value gets.
+			return node.fast(value) === FAIL ? scoreOf(node, value) : 0;
+		}
 	});
 }
 
@@ -2112,6 +2210,63 @@ export function asArray<S extends Schema>(schema: S): Parser<SchemaOutput<S>[]> 
 			}
 
 			return [node.run(value, path, issues)];
+		},
+		guard: undefined
+	});
+}
+
+/**
+ * Splits a list written as one string.
+ * @param {string} text - The list
+ * @param {string} separator - The separator
+ * @returns {string[]} The items, trimmed, without empty ones
+ */
+function splitList(text: string, separator: string): string[] {
+	const items: string[] = [];
+
+	for (const part of text.split(separator)) {
+		const item = part.trim();
+
+		if (item !== '') items.push(item);
+	}
+
+	return items;
+}
+
+/**
+ * Creates a parser for lists written as one string, the way environment variables and query parameters carry them
+ * (`ALLOWED_ORIGINS=https://a.com, https://b.com`): the string is split on `separator`, each item is trimmed (as `String#trim`
+ * does), empty items are dropped, and every item is parsed with `schema`. An array is parsed element by element as it is, like
+ * {@link arrayOf}. A missing value still fails: pair with {@link withDefault} for an empty default.
+ * @template S - The item schema
+ * @param {S} schema - The schema of each item
+ * @param {string} [separator=','] - The string between items
+ * @returns {Parser<SchemaOutput<S>[]>} The parser
+ * @throws {TypeError} when `schema` is not a {@link Schema}, or `separator` is not a non-empty string
+ * @example
+ * const env = { ORIGINS: asList(isUrl), PORTS: asList(asInteger), TAGS: withDefault(asList(isSlug, ' '), function () { return []; }) };
+ * parse(env, { ORIGINS: 'https://a.com, https://b.com', PORTS: '80,443,' }); // => { ORIGINS: ['https://a.com', 'https://b.com'], PORTS: [80, 443], TAGS: [] }
+ * safeParse(asList(asInteger), '1,two')[0]?.issues; // => [{ message: 'Expected an integer or an integer string (got string)', path: [1] }]
+ */
+export function asList<S extends Schema>(schema: S, separator = ','): Parser<SchemaOutput<S>[]> {
+	const node = compile('asList', 'schema', schema, []);
+
+	if (typeof separator !== 'string' || separator === '') {
+		throw new TypeError(`asList: \`separator\` must be a non-empty string, got ${separator === '' ? 'empty string' : describe(separator)}`);
+	}
+
+	return toCompiledParser({
+		fast: function fastAsList(value: unknown): unknown {
+			if (typeof value === 'string') return parseElements(node, splitList(value, separator));
+
+			return Array.isArray(value) ? parseElements(node, value) : FAIL;
+		},
+		run: function runAsList(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			if (typeof value === 'string') return reportElements(node, splitList(value, separator), path, issues);
+			if (Array.isArray(value)) return reportElements(node, value, path, issues);
+			issues.push({ message: `Expected a list string or an array (got ${describe(value)})`, path: path.slice() });
+
+			return undefined;
 		},
 		guard: undefined
 	});
@@ -3038,6 +3193,53 @@ export const asInteger: Parser<number> = {
 		}
 	}
 } as CompiledParser<number>;
+
+/**
+ * The fast parse of {@link asBigInt}.
+ * @param {unknown} value - The value
+ * @returns {unknown} The bigint, or `FAIL`
+ */
+function fastBigInt(value: unknown): unknown {
+	if (typeof value === 'bigint') return value;
+	if (typeof value === 'number') return Number.isSafeInteger(value) ? BigInt(value) : FAIL;
+	if (typeof value !== 'string') return FAIL;
+
+	const text = value.trim();
+
+	return INTEGER_PATTERN.test(text) ? BigInt(text) : FAIL;
+}
+
+/**
+ * The reporting parse of {@link asBigInt}.
+ * @param {unknown} value - The value
+ * @param {PropertyKey[]} path - The path of `value`
+ * @param {SchemaIssue[]} issues - Where issues are pushed
+ * @returns {unknown} `undefined`
+ */
+function runBigInt(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+	return reject(value, path, issues, 'a bigint, an integer or an integer string');
+}
+
+/**
+ * Parses bigints, safe integers and integer strings (an optional sign and decimal digits, surrounding whitespace ignored, of any
+ * length) to bigints: 64-bit database ids and snowflake ids, which `asInteger` would reject beyond `Number.MAX_SAFE_INTEGER`.
+ * Numbers beyond the safe range are rejected, since their digits are already rounded.
+ * @example
+ * parse(asBigInt, '9007199254740993'); // => 9007199254740993n
+ * parse(asBigInt, 42); // => 42n
+ * parse(asBigInt, 9007199254740993); // throws ValidationError
+ * parse(asBigInt, '1e3'); // throws ValidationError
+ */
+export const asBigInt: Parser<bigint> = {
+	'~tink.1': { fast: fastBigInt, run: runBigInt, guard: undefined },
+	'~standard': {
+		version: 1,
+		vendor: 'tink',
+		validate: function validate(value: unknown): StandardSchemaResult<bigint> {
+			return validateWith(fastBigInt, runBigInt, value) as StandardSchemaResult<bigint>;
+		}
+	}
+} as CompiledParser<bigint>;
 
 /**
  * Parses booleans, the numbers `1` and `0`, and the strings `'true'`/`'false'`, `'yes'`/`'no'`, `'on'`/`'off'` and `'1'`/`'0'` (case and

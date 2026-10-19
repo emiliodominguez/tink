@@ -307,28 +307,46 @@ describe('README examples', function () {
 			newsletter: true
 		});
 
+		const password = validate.check(
+			{ password: guards.isStringOfLength(8, 128), confirm: guards.isString },
+			function (form: { password: string; confirm: string }): boolean {
+				return form.password === form.confirm;
+			},
+			'Passwords do not match',
+			['confirm']
+		);
+
+		expect(guards.issuesByPath(validate.safeParse(password, { password: 'correct horse', confirm: 'correct' })[0]?.issues ?? [])).toEqual({
+			confirm: ['Passwords do not match']
+		});
+
 		const search = {
 			tag: validate.withDefault(validate.asArray(validate.isSlug), function () {
 				return [];
 			}),
-			page: validate.withDefault(validate.asInteger, 1),
-			sort: validate.withDefault(guards.isOneOf(['new', 'top']), 'new')
+			page: validate.withFallback(validate.asInteger, 1),
+			sort: validate.withFallback(guards.isOneOf(['new', 'top']), 'new')
 		};
 
 		expect(validate.parse(search, url.parseQueryString('?tag=ts&tag=js&page=2'))).toEqual({ tag: ['ts', 'js'], page: 2, sort: 'new' });
+		expect(validate.parse(search, url.parseQueryString('?page=last&sort=random'))).toEqual({ tag: [], page: 1, sort: 'new' });
 
 		const event = validate.discriminatedUnion('type', { click: { x: validate.asInteger, y: validate.asInteger }, key: { code: guards.isString } });
 
 		expect(validate.parse(event, { type: 'click', x: '10', y: '20', target: 'button' })).toEqual({ type: 'click', x: 10, y: 20 });
 
 		const flags = {
+			ALLOWED_ORIGINS: validate.asList(validate.isUrl),
 			FEATURE_FLAGS: validate.withDefault(validate.asJson(validate.recordOf(guards.isBoolean)), function () {
 				return {};
 			})
 		};
 
-		expect(validate.parse(flags, { FEATURE_FLAGS: '{"beta":true}' })).toEqual({ FEATURE_FLAGS: { beta: true } });
-		expect(validate.parse(flags, {})).toEqual({ FEATURE_FLAGS: {} });
-		expect(validate.safeParse(flags, { FEATURE_FLAGS: '{"__proto__":{"beta":true}}' })[0]).toBeInstanceOf(guards.ValidationError);
+		expect(validate.parse(flags, { ALLOWED_ORIGINS: 'https://a.com, https://b.com', FEATURE_FLAGS: '{"beta":true}' })).toEqual({
+			ALLOWED_ORIGINS: ['https://a.com', 'https://b.com'],
+			FEATURE_FLAGS: { beta: true }
+		});
+		expect(validate.parse(flags, { ALLOWED_ORIGINS: '' })).toEqual({ ALLOWED_ORIGINS: [], FEATURE_FLAGS: {} });
+		expect(validate.safeParse(flags, { ALLOWED_ORIGINS: '', FEATURE_FLAGS: '{"__proto__":{"beta":true}}' })[0]).toBeInstanceOf(guards.ValidationError);
 	});
 });

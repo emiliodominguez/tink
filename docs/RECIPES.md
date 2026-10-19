@@ -119,15 +119,19 @@ import {
 	asBoolean,
 	asInteger,
 	asJson,
+	asList,
 	blankAsUndefined,
+	check,
 	discriminatedUnion,
 	isEmail,
 	isSlug,
+	isUrl,
 	optional,
 	parse,
 	recordOf,
 	safeParse,
-	withDefault
+	withDefault,
+	withFallback
 } from 'tinkit/validate';
 import { parseQueryString } from 'tinkit/url';
 
@@ -136,23 +140,35 @@ const signup = { email: isEmail, name: blankAsUndefined(isStringOfLength(1, 50))
 const [error, user] = safeParse(signup, Object.fromEntries(new FormData(formElement)));
 if (error) showErrors(issuesByPath(error.issues)); // { email: ['Invalid value (got string)'], name: ['Missing required property'] }
 
-// Query strings: a repeated parameter arrives as an array, a single one as a string.
+// Rules across fields: the issue goes on the field to highlight.
+const password = check(
+	{ password: isStringOfLength(8, 128), confirm: isString },
+	function (form) {
+		return form.password === form.confirm;
+	},
+	'Passwords do not match',
+	['confirm']
+);
+
+// Query strings: a repeated parameter arrives as an array, a single one as a string; a bad page or sort falls back instead of failing.
 const search = {
 	tag: withDefault(asArray(isSlug), function () {
 		return [];
 	}),
-	page: withDefault(asInteger, 1),
-	sort: withDefault(isOneOf(['new', 'top']), 'new')
+	page: withFallback(asInteger, 1),
+	sort: withFallback(isOneOf(['new', 'top']), 'new')
 };
 parse(search, parseQueryString('?tag=ts&tag=js&page=2')); // { tag: ['ts', 'js'], page: 2, sort: 'new' }
+parse(search, parseQueryString('?page=last&sort=random')); // { tag: [], page: 1, sort: 'new' }
 
 // Tagged payloads: one object schema per variant, the tag first in the output.
 const event = discriminatedUnion('type', { click: { x: asInteger, y: asInteger }, key: { code: isString } });
 parse(event, { type: 'click', x: '10', y: '20', target: 'button' }); // { type: 'click', x: 10, y: 20 }
 
-// JSON inside an environment variable, rejected if it carries a __proto__ key.
-const flags = parse(
+// Lists and JSON inside environment variables (JSON rejected if it carries a __proto__ key).
+const config = parse(
 	{
+		ALLOWED_ORIGINS: asList(isUrl), // 'https://a.com, https://b.com'
 		FEATURE_FLAGS: withDefault(asJson(recordOf(isBoolean)), function () {
 			return {};
 		})
