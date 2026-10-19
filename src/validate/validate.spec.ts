@@ -1,4 +1,4 @@
-import { isNumber, isString } from '../guards/index.js';
+import { isIntegerInRange, isLiteral, isNumber, isOneOf, isString, ValidationError, withMessage } from '../guards/index.js';
 import * as helpers from '.';
 
 const NON_STRINGS: unknown[] = [undefined, null, 0, 1, NaN, true, {}, [], Symbol('x'), 1n, new String('a'), function () {}];
@@ -1104,5 +1104,516 @@ describe('validate (helper review regressions)', function () {
 		expect(helpers.parse(helpers.partial(form), { name: 'Ada', age: '36' })).toEqual({ name: 'Ada', age: 36 });
 		expect(helpers.parse(helpers.optional(helpers.blankAsUndefined(isString)), '')).toBeUndefined();
 		expect(helpers.safeParse(form, { name: '', age: '1' })[0]?.issues).toEqual([{ message: 'Missing required property', path: ['name'] }]);
+	});
+});
+
+describe('parseEnv', function () {
+	const { parseEnv, asInteger, asBoolean, asList, asJson, withDefault, optional, chain, withError, blankAsUndefined, isUrl } = helpers;
+
+	/** Runs `fn` and returns the error it throws. */
+	function thrown(fn: () => unknown): ValidationError {
+		try {
+			fn();
+		} catch (error) {
+			return error as ValidationError;
+		}
+		throw new Error('expected a throw');
+	}
+
+	it('parses the declared variables, typed, and leaves the others out', function () {
+		const env = parseEnv(
+			{
+				DATABASE_URL: isUrl,
+				PORT: withDefault(asInteger, 3000),
+				DEBUG: withDefault(asBoolean, false),
+				ORIGINS: asList(isUrl),
+				MODE: isOneOf(['dev', 'prod'])
+			},
+			{ DATABASE_URL: 'https://db.example.com', PORT: ' 8080 ', ORIGINS: 'https://a.com, https://b.com', MODE: 'prod', HOME: '/root' }
+		);
+		expect(env).toEqual({ DATABASE_URL: 'https://db.example.com', PORT: 8080, DEBUG: false, ORIGINS: ['https://a.com', 'https://b.com'], MODE: 'prod' });
+		const typed: { PORT: number; DEBUG: boolean; ORIGINS: string[]; MODE: 'dev' | 'prod' } = env;
+		expect(typed.PORT).toBe(8080);
+	});
+
+	it('leaves optional variables that are not set out of the output', function () {
+		const env = parseEnv({ SENTRY_DSN: optional(isUrl), PORT: optional(asInteger) }, { PORT: '1' });
+		expect(env).toEqual({ PORT: 1 });
+		expect(Object.keys(env)).toEqual(['PORT']);
+	});
+
+	it('parses values that are not strings as they are (Vite booleans, Worker bindings)', function () {
+		const binding = { get: function () {} };
+		function isObject(value: unknown): value is object {
+			return typeof value === 'object';
+		}
+		expect(parseEnv({ DEV: asBoolean, KV: isObject }, { DEV: true, KV: binding })).toEqual({ DEV: true, KV: binding });
+	});
+
+	it('reports every problem at once, one variable per line, in schema order', function () {
+		const error = thrown(function () {
+			return parseEnv(
+				{ DATABASE_URL: isUrl, PORT: asInteger, API_KEY: isString, ORIGINS: asList(isUrl), LIMITS: asJson({ rpm: asInteger }), OK: isString },
+				{ PORT: 'eighty', API_KEY: '', ORIGINS: 'https://a.com,nope', LIMITS: '{}', OK: 'fine' }
+			);
+		});
+		expect(error).toBeInstanceOf(ValidationError);
+		expect(error.name).toBe('ValidationError');
+		expect(error.message).toBe(
+			[
+				'Invalid environment variables:',
+				'  DATABASE_URL: Missing required variable',
+				'  PORT: Expected an integer or an integer string (got string)',
+				'  API_KEY: Missing required variable (set but blank)',
+				'  ORIGINS.1: Invalid value (got string)',
+				'  LIMITS: Missing required property'
+			].join('\n')
+		);
+		expect(error.issues).toEqual([
+			{ message: 'Missing required variable', path: ['DATABASE_URL'] },
+			{ message: 'Expected an integer or an integer string (got string)', path: ['PORT'] },
+			{ message: 'Missing required variable (set but blank)', path: ['API_KEY'] },
+			{ message: 'Invalid value (got string)', path: ['ORIGINS', 1] },
+			// Object keys are dropped from paths: they may come from the value.
+			{ message: 'Missing required property', path: ['LIMITS'] }
+		]);
+		expect(error.stack?.startsWith('ValidationError: Invalid environment variables:\n  DATABASE_URL')).toBe(true);
+	});
+
+	describe('no part of a value reaches the error (review regressions)', function () {
+		/** Everything an error exposes (its stack without the frames, whose line numbers would match digits). */
+		function dump(error: ValidationError): string {
+			const header = String(error.stack).split('\n    at ')[0];
+
+			return [String(error), error.message, JSON.stringify(error.issues), header, String((error as Error & { cause?: unknown }).cause)].join('\n');
+		}
+
+		it('keeps only the type in `(got …)`, and drops the bounds of range messages (they may hold a normalised value)', function () {
+			const { transform } = helpers;
+			const error = thrown(function () {
+				return parseEnv(
+					{
+						A: chain(asInteger, isIntegerInRange(0, 9999)),
+						B: chain(asInteger, isIntegerInRange(0, 9999)),
+						C: chain(helpers.asNumber, helpers.toParser(isOneOf([1, 2]))),
+						D: isLiteral(1),
+						E: chain(asInteger, isLiteral(1)),
+						PIN: isString,
+						F: asJson({ pin: isIntegerInRange(0, 9) }),
+						G: chain(
+							transform(isString, function (text: string) {
+								return text.length;
+							}),
+							isIntegerInRange(0, 3)
+						)
+					},
+					{ A: '0012345', B: '+48213', C: '4821.50', D: '00042', E: '00042', PIN: 123456, F: '{"pin": 48213}', G: '8765432' }
+				);
+			});
+			expect(error.issues).toEqual([
+				{ message: 'Expected an integer in the allowed range', path: ['A'] },
+				{ message: 'Expected an integer in the allowed range', path: ['B'] },
+				{ message: 'Expected one of the allowed values (got number)', path: ['C'] },
+				{ message: 'Invalid value (got string)', path: ['D'] },
+				{ message: 'Invalid value', path: ['E'] },
+				{ message: 'Invalid value (got number)', path: ['PIN'] },
+				{ message: 'Expected an integer in the allowed range', path: ['F'] },
+				{ message: 'Expected an integer in the allowed range', path: ['G'] }
+			]);
+			for (const leak of ['12345', '48213', '4821', '42', '123456', '8765432']) expect(dump(error)).not.toContain(leak);
+		});
+
+		it('never copies messages of other validators or custom messages, which may quote the value or part of it', function () {
+			const secret = 'sk_live_51HxQ_super-secret';
+			const foreign = {
+				'~standard': {
+					version: 1 as const,
+					vendor: 'zod',
+					validate: function (value: unknown) {
+						return { issues: [{ message: "Invalid enum value, received '" + String(value) + "'", path: [{ key: String(value) }, 3] }] };
+					}
+				}
+			};
+			const error = thrown(function () {
+				return parseEnv(
+					{
+						A: withError(isUrl, function (value) {
+							return 'Not a URL: ' + JSON.stringify(value);
+						}),
+						B: foreign,
+						C: asList(foreign),
+						D: asJson({ token: foreign }),
+						E: helpers.check(
+							isString,
+							function () {
+								return false;
+							},
+							'Must be at least 64 characters'
+						),
+						F: withMessage(isUrl, function (value) {
+							return String(value).toUpperCase() + ' (got string)';
+						}),
+						G: {
+							'~standard': {
+								version: 1 as const,
+								vendor: 'other',
+								validate: function () {
+									return { issues: [{ message: 42 as unknown as string }] };
+								}
+							}
+						}
+					},
+					{ A: secret, B: secret, C: 'sk_live_one,sk_live_two', D: JSON.stringify({ token: secret }), E: secret, F: secret, G: secret }
+				);
+			});
+			expect(error.issues).toEqual([
+				{ message: 'Invalid value', path: ['A'] },
+				{ message: 'Invalid value', path: ['B'] },
+				{ message: 'Invalid value', path: ['C', 0] },
+				{ message: 'Invalid value', path: ['C', 1] },
+				{ message: 'Invalid value', path: ['D'] },
+				{ message: 'Invalid value', path: ['E'] },
+				{ message: 'Invalid value (got string)', path: ['F'] },
+				{ message: 'Invalid value', path: ['G'] }
+			]);
+			for (const leak of ['sk_live', 'super', 'SK_LIVE', '51HxQ']) expect(dump(error)).not.toContain(leak);
+		});
+
+		it('drops object keys from paths: they may come from the value (JSON objects, records, unknown properties)', function () {
+			const { recordOf, exact } = helpers;
+			const error = thrown(function () {
+				return parseEnv(
+					{ CFG: asJson(recordOf(asInteger)), STRICT: asJson(exact({ a: asInteger })), LIST: asJson(helpers.arrayOf({ n: asInteger })) },
+					{ CFG: '{"sk_live_secretkey": "x"}', STRICT: '{"a": 1, "sk_live_other": 2}', LIST: '[{"n": 1}, {"n": "x"}]' }
+				);
+			});
+			expect(error.issues).toEqual([
+				{ message: 'Expected an integer or an integer string (got string)', path: ['CFG'] },
+				{ message: 'Unknown property', path: ['STRICT'] },
+				{ message: 'Expected an integer or an integer string (got string)', path: ['LIST', 1] }
+			]);
+			expect(dump(error)).not.toContain('sk_live');
+		});
+
+		it('reports each problem once when dropped details make issues identical', function () {
+			const error = thrown(function () {
+				return parseEnv({ LIMITS: asJson({ rpm: asInteger, burst: asInteger }) }, { LIMITS: '{}' });
+			});
+			expect(error.issues).toEqual([{ message: 'Missing required property', path: ['LIMITS'] }]);
+		});
+
+		it('keeps its own messages intact whatever the value (no redaction pass garbling them)', function () {
+			const error = thrown(function () {
+				return parseEnv({ N: asInteger, M: asInteger, B: asBoolean }, { N: 'string', M: 'integer', B: 'boolean' });
+			});
+			expect(error.issues).toEqual([
+				{ message: 'Expected an integer or an integer string (got string)', path: ['N'] },
+				{ message: 'Expected an integer or an integer string (got string)', path: ['M'] },
+				{ message: 'Expected a boolean or a boolean string such as "true" or "false" (got string)', path: ['B'] }
+			]);
+		});
+
+		it('reports a schema that throws by the name of a built-in error only, and still checks the other variables', function () {
+			const { transform } = helpers;
+			const secret = 'sk_live_{not json';
+			class SecretError extends Error {
+				override name = 'sk_live_name';
+			}
+			const named = {
+				get name(): string {
+					throw new Error('sk_live_getter');
+				}
+			};
+			const error = thrown(function () {
+				return parseEnv(
+					{
+						JSON_CHECK: helpers.check(isString, function (text: string) {
+							return JSON.parse(text) !== null;
+						}),
+						URL: transform(isString, function (text: string) {
+							return new URL(text);
+						}),
+						CUSTOM: transform(isString, function (text: string): never {
+							throw new SecretError(text);
+						}),
+						STRING: transform(isString, function (text: string): never {
+							throw text;
+						}),
+						GETTER: transform(isString, function (): never {
+							throw named;
+						}),
+						NULL: transform(isString, function (): never {
+							throw null;
+						}),
+						PORT: asInteger
+					},
+					{ JSON_CHECK: secret, URL: secret, CUSTOM: secret, STRING: secret, GETTER: secret, NULL: secret, PORT: 'x' }
+				);
+			});
+			expect(error.issues).toEqual([
+				{ message: 'Invalid value (the schema threw SyntaxError)', path: ['JSON_CHECK'] },
+				{ message: 'Invalid value (the schema threw TypeError)', path: ['URL'] },
+				{ message: 'Invalid value (the schema threw an exception)', path: ['CUSTOM'] },
+				{ message: 'Invalid value (the schema threw an exception)', path: ['STRING'] },
+				{ message: 'Invalid value (the schema threw an exception)', path: ['GETTER'] },
+				{ message: 'Invalid value (the schema threw an exception)', path: ['NULL'] },
+				{ message: 'Expected an integer or an integer string (got string)', path: ['PORT'] }
+			]);
+			expect(dump(error)).not.toContain('sk_live');
+		});
+	});
+
+	describe('options and environment (review regressions)', function () {
+		it('reads only own options, and only own variables into a null-prototype output', function () {
+			const polluted = Object.prototype as Record<string, unknown>;
+			polluted.prefix = 'EVIL_';
+			polluted.strict = true;
+			polluted.blankAsMissing = false;
+			polluted.ADMIN_TOKEN = 'attacker';
+			try {
+				const env = parseEnv({ PORT: withDefault(asInteger, 1), ADMIN_TOKEN: optional(isString) }, { PORT: '', EVIL_PORT: '666' });
+				expect(env).toEqual({ PORT: 1 });
+				expect(env.ADMIN_TOKEN).toBeUndefined();
+				expect(Object.getPrototypeOf(env)).toBeNull();
+			} finally {
+				delete polluted.prefix;
+				delete polluted.strict;
+				delete polluted.blankAsMissing;
+				delete polluted.ADMIN_TOKEN;
+			}
+		});
+
+		it('requires boolean flags and an options object', function () {
+			expect(function () {
+				parseEnv({}, {}, { strict: 'false' as unknown as boolean, prefix: 'APP_' });
+			}).toThrow(new TypeError('parseEnv: `strict` must be a boolean, got string'));
+			expect(function () {
+				parseEnv({}, {}, { blankAsMissing: 0 as unknown as boolean });
+			}).toThrow(new TypeError('parseEnv: `blankAsMissing` must be a boolean, got number'));
+			expect(function () {
+				parseEnv({}, {}, null as unknown as object);
+			}).toThrow(new TypeError('parseEnv: `options` must be an object, got null'));
+			expect(parseEnv({}, {}, { prefix: undefined, strict: undefined, blankAsMissing: undefined })).toEqual({});
+		});
+
+		it('rejects a Map and Deno.env-like objects, whose variables would all look unset', function () {
+			expect(function () {
+				parseEnv({ PORT: asInteger }, new Map([['PORT', '1']]));
+			}).toThrow(new TypeError('parseEnv: `env` must be an object of variables, got Map (pass `Object.fromEntries(map)`)'));
+			class DenoEnv {
+				get(_name: string): string | undefined {
+					return '1';
+				}
+				toObject(): Record<string, string> {
+					return { PORT: '1' };
+				}
+			}
+			expect(function () {
+				parseEnv({ PORT: asInteger }, new DenoEnv());
+			}).toThrow(new TypeError('parseEnv: `env` must be an object of variables, got an object with `get` and `toObject` methods (pass `Deno.env.toObject()`)'));
+			expect(parseEnv({ PORT: asInteger }, new DenoEnv().toObject())).toEqual({ PORT: 1 });
+			// Variables named like the methods are fine, and so is an empty environment.
+			expect(parseEnv({ get: optional(isString) }, { get: 'x', toObject: 'y' })).toEqual({ get: 'x' });
+			expect(parseEnv({ A: optional(isString) }, {})).toEqual({});
+			expect(parseEnv({ A: optional(isString) }, { get: function () {} })).toEqual({});
+		});
+	});
+
+	describe('blank values', function () {
+		it('count as unset by default: required ones fail as missing, defaults apply', function () {
+			expect(parseEnv({ PORT: withDefault(asInteger, 3000), NAME: optional(isString) }, { PORT: '', NAME: ' \t\n' })).toEqual({ PORT: 3000 });
+			expect(
+				thrown(function () {
+					return parseEnv({ TOKEN: isString }, { TOKEN: '   ' });
+				}).issues
+			).toEqual([{ message: 'Missing required variable (set but blank)', path: ['TOKEN'] }]);
+		});
+
+		it('are passed to the schema with blankAsMissing: false', function () {
+			expect(parseEnv({ PREFIX: withDefault(isString, '/api') }, { PREFIX: '' }, { blankAsMissing: false })).toEqual({ PREFIX: '' });
+			expect(
+				thrown(function () {
+					return parseEnv({ PORT: withDefault(asInteger, 3000) }, { PORT: '' }, { blankAsMissing: false });
+				}).issues
+			).toEqual([{ message: 'Expected an integer or an integer string (got string)', path: ['PORT'] }]);
+			// The schema's own blank handling still counts a blank value as missing.
+			expect(
+				thrown(function () {
+					return parseEnv({ PORT: blankAsUndefined(asInteger) }, { PORT: ' ' }, { blankAsMissing: false });
+				}).issues
+			).toEqual([{ message: 'Missing required variable (set but blank)', path: ['PORT'] }]);
+			expect(parseEnv({ PORT: blankAsUndefined(optional(asInteger)) }, { PORT: ' ' }, { blankAsMissing: false })).toEqual({});
+		});
+
+		it('reports the real problem of a default that fails a later check', function () {
+			const port = chain(withDefault(asInteger, 0), isIntegerInRange(1, 65535));
+			expect(
+				thrown(function () {
+					return parseEnv({ PORT: port }, {});
+				}).issues
+			).toEqual([{ message: 'Expected an integer in the allowed range', path: ['PORT'] }]);
+		});
+	});
+
+	describe('prefix and strict', function () {
+		it('reads prefixed names, returns unprefixed keys and reports full names', function () {
+			const schema = { API_URL: isUrl, DEBUG: withDefault(asBoolean, false) };
+			expect(parseEnv(schema, { VITE_API_URL: 'https://api.example.com', VITE_DEBUG: 'on', API_URL: 'nope' }, { prefix: 'VITE_' })).toEqual({
+				API_URL: 'https://api.example.com',
+				DEBUG: true
+			});
+			expect(
+				thrown(function () {
+					return parseEnv(schema, { API_URL: 'https://api.example.com', VITE_DEBUG: 'maybe' }, { prefix: 'VITE_' });
+				}).issues
+			).toEqual([
+				{ message: 'Missing required variable', path: ['VITE_API_URL'] },
+				{ message: 'Expected a boolean or a boolean string such as "true" or "false" (got string)', path: ['VITE_DEBUG'] }
+			]);
+		});
+
+		it('reports unknown prefixed variables with strict, sorted by name, after the other problems', function () {
+			const env = { APP_PORT: 'x', APP_PROT: '80', APP_A: '', HOME: '/root', PORT: '1' };
+			expect(
+				thrown(function () {
+					return parseEnv({ PORT: asInteger }, env, { prefix: 'APP_', strict: true });
+				}).issues
+			).toEqual([
+				{ message: 'Expected an integer or an integer string (got string)', path: ['APP_PORT'] },
+				{ message: 'Unknown variable', path: ['APP_A'] },
+				{ message: 'Unknown variable', path: ['APP_PROT'] }
+			]);
+			expect(parseEnv({ PORT: asInteger }, { APP_PORT: '1', HOME: '/root' }, { prefix: 'APP_', strict: true })).toEqual({ PORT: 1 });
+		});
+
+		it('rejects strict without a prefix, and a prefix that is not a string', function () {
+			expect(function () {
+				parseEnv({}, {}, { strict: true });
+			}).toThrow(new RangeError('parseEnv: `prefix` must be a non-empty string with `strict`, got empty string'));
+			expect(function () {
+				parseEnv({}, {}, { prefix: 1 as unknown as string });
+			}).toThrow(new TypeError('parseEnv: `prefix` must be a string, got number'));
+		});
+	});
+
+	describe('the environment', function () {
+		it('defaults to process.env', function () {
+			process.env.TINKIT_PARSE_ENV_TEST = '42';
+			try {
+				expect(parseEnv({ TINKIT_PARSE_ENV_TEST: asInteger })).toEqual({ TINKIT_PARSE_ENV_TEST: 42 });
+				expect(parseEnv({ TEST: asInteger }, undefined, { prefix: 'TINKIT_PARSE_ENV_' })).toEqual({ TEST: 42 });
+			} finally {
+				delete process.env.TINKIT_PARSE_ENV_TEST;
+			}
+		});
+
+		it('throws a clear error when there is no process.env', function () {
+			const original = Object.getOwnPropertyDescriptor(globalThis, 'process') as PropertyDescriptor;
+			const message =
+				'parseEnv: `env` was not given and `process.env` is not available in this environment; pass the variables, e.g. `parseEnv(schema, import.meta.env)`';
+			for (const value of [undefined, {}, { env: null }, { env: 'A=1' }]) {
+				Object.defineProperty(globalThis, 'process', { value, configurable: true, writable: true });
+				try {
+					expect(function () {
+						parseEnv({ A: optional(isString) });
+					}).toThrow(new Error(message));
+				} finally {
+					Object.defineProperty(globalThis, 'process', original);
+				}
+			}
+		});
+
+		it('rejects an env that is not an object', function () {
+			for (const [value, got] of [
+				[null, 'null'],
+				['A=1', 'string'],
+				[1, 'number']
+			] as const) {
+				expect(function () {
+					parseEnv({}, value as unknown as object);
+				}).toThrow(new TypeError('parseEnv: `env` must be an object, got ' + got));
+			}
+		});
+
+		it('reads each declared variable once, as an own property only', function () {
+			const reads: PropertyKey[] = [];
+			const env = new Proxy({ PORT: '1', OTHER: 'x' } as Record<string, string>, {
+				get(target, property, receiver) {
+					reads.push(property);
+					return Reflect.get(target, property, receiver);
+				}
+			});
+			expect(parseEnv({ PORT: asInteger, MISSING: optional(isString) }, env)).toEqual({ PORT: 1 });
+			expect(reads).toEqual(['PORT']);
+			const inherited = Object.create({ PORT: '1' }) as object;
+			expect(
+				thrown(function () {
+					return parseEnv({ PORT: asInteger }, inherited);
+				}).issues
+			).toEqual([{ message: 'Missing required variable', path: ['PORT'] }]);
+		});
+
+		it('ignores a polluted Object.prototype and handles keys such as __proto__', function () {
+			(Object.prototype as Record<string, unknown>).TINKIT_POLLUTED = 'https://evil.example.com';
+			try {
+				expect(
+					thrown(function () {
+						return parseEnv({ TINKIT_POLLUTED: isUrl }, {});
+					}).issues
+				).toEqual([{ message: 'Missing required variable', path: ['TINKIT_POLLUTED'] }]);
+			} finally {
+				delete (Object.prototype as Record<string, unknown>).TINKIT_POLLUTED;
+			}
+			const schema: Record<string, unknown> = {};
+			Object.defineProperty(schema, '__proto__', { value: optional(asInteger), enumerable: true, writable: true, configurable: true });
+			schema['constructor'] = optional(isString);
+			const env = JSON.parse('{"__proto__": "7", "constructor": "x"}') as object;
+			const output = parseEnv(schema as Record<string, typeof isString>, env) as Record<string, unknown>;
+			expect(Object.getPrototypeOf(output)).toBeNull();
+			expect(Object.getOwnPropertyDescriptor(output, '__proto__')?.value).toBe(7);
+			expect(output['constructor']).toBe('x');
+		});
+	});
+
+	describe('schema errors', function () {
+		it('rejects schemas that are not plain objects of schemas, before reading the environment', function () {
+			const env = new Proxy(
+				{},
+				{
+					get(): never {
+						throw new Error('read');
+					},
+					getOwnPropertyDescriptor(): never {
+						throw new Error('read');
+					}
+				}
+			);
+			expect(function () {
+				parseEnv(isString as unknown as Record<string, typeof isString>, env);
+			}).toThrow(new TypeError('parseEnv: `schema` must be a plain object of schemas, got function'));
+			expect(function () {
+				parseEnv([isString] as unknown as Record<string, typeof isString>, env);
+			}).toThrow(new TypeError('parseEnv: `schema` must be a plain object of schemas, got array'));
+			expect(function () {
+				parseEnv(asInteger as unknown as Record<string, typeof isString>, env);
+			}).toThrow(TypeError);
+			expect(function () {
+				parseEnv({ PORT: 3000 } as unknown as Record<string, typeof isString>, env);
+			}).toThrow(new TypeError('parseEnv: `schema.PORT` must be a guard, a parser or a plain object of schemas, got number'));
+			const circular: Record<string, unknown> = {};
+			circular.SELF = circular;
+			expect(function () {
+				parseEnv(circular as Record<string, typeof isString>, env);
+			}).toThrow(new TypeError('parseEnv: `schema.SELF` must be acyclic, got a circular reference'));
+		});
+
+		it('reports a nested object schema against a string as an invalid value', function () {
+			expect(
+				thrown(function () {
+					return parseEnv({ DB: { HOST: isString } }, { DB: 'localhost' });
+				}).issues
+			).toEqual([{ message: 'Expected an object (got string)', path: ['DB'] }]);
+			expect(parseEnv({ N: withMessage(isNumber, 'x') }, { N: 1 })).toEqual({ N: 1 });
+		});
 	});
 });

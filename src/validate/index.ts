@@ -2,6 +2,7 @@ import { daysInMonth } from '../date/index.js';
 import {
 	explain,
 	isDate,
+	isMap,
 	isPlainObject,
 	ValidationError,
 	type Guard,
@@ -3402,3 +3403,299 @@ export const asDate: Parser<Date> = {
 		}
 	}
 } as CompiledParser<Date>;
+
+// ---------------------------------------------------------------------------------------------------------------------
+// parseEnv
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Options accepted by {@link parseEnv}. Only own properties are read, so a polluted `Object.prototype` cannot set one.
+ */
+export interface ParseEnvOptions {
+	/**
+	 * Prepended to every key of the schema to form the name of the variable read: with `'APP_'`, `{ PORT: asInteger }` reads `APP_PORT`
+	 * and returns `{ PORT }`. Problems are reported under the full variable names. Defaults to `''`.
+	 */
+	prefix?: string;
+	/**
+	 * Whether a blank value (empty, or only whitespace) counts as unset: a required variable then fails as missing, and one with a
+	 * default gets the default. Defaults to `true`, since `FOO=` in a `.env` file or `FOO: ${FOO}` in a compose file almost always means
+	 * "not set"; pass `false` when an empty string is a meaningful value.
+	 */
+	blankAsMissing?: boolean;
+	/**
+	 * Whether to report every variable whose name starts with `prefix` but that the schema does not declare, as `Unknown variable`: a typo
+	 * such as `APP_PROT` then fails at startup instead of being silently ignored. Requires a non-empty `prefix`. Defaults to `false`.
+	 */
+	strict?: boolean;
+}
+
+/** The type names in a `(got …)` part of an issue message that {@link parseEnv} passes on. */
+const TYPE_NAME = /^(?:undefined|null|boolean|number|bigint|string|symbol|object|function|array)$/;
+
+/** The messages (without their `(got …)` part) that {@link parseEnv} passes on as they are: fixed texts of this module and of guards. */
+const FIXED_MESSAGE =
+	/^(?:Invalid value|Invalid key|Missing required property|Unknown property|Circular reference|Value is nested too deeply|Expected (?:an array|an object|a plain object|a value or an array|a list string or an array|a JSON string|valid JSON|a finite number|a number or a numeric string|an integer or an integer string|a bigint, an integer or an integer string|a valid date, an ISO 8601 string or a timestamp|a boolean or a boolean string such as "true" or "false"|JSON without "__proto__" or "constructor\.prototype" keys))$/;
+
+/** Messages of this module and of guards whose variable parts {@link parseEnv} drops, each with the fixed text it reports instead. */
+const GENERIC_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
+	[/^Expected a number between /, 'Expected a number in the allowed range'],
+	[/^Expected an integer between /, 'Expected an integer in the allowed range'],
+	[/^Expected a string of /, 'Expected a string of the allowed length'],
+	[/^Expected a string matching /, 'Expected a string matching the required pattern'],
+	[/^Expected (?:one of |")/, 'Expected one of the allowed values'],
+	[/^Expected a tuple of /, 'Expected a tuple of the allowed length'],
+	[/^Invalid key: /, 'Invalid key']
+];
+
+/** The names of the built-in errors, the only names {@link parseEnv} reports for a schema that throws. */
+const ERROR_NAME = /^(?:Error|TypeError|RangeError|SyntaxError|ReferenceError|URIError|EvalError|AggregateError|ValidationError)$/;
+
+/**
+ * Turns an issue message into one built only from fixed texts (see {@link parseEnv}), so that no part of a value can reach it.
+ * @param {unknown} message - The message of an issue
+ * @returns {string} A fixed text, followed by the type of the rejected value when the message named one
+ */
+function envMessage(message: unknown): string {
+	if (typeof message !== 'string') return 'Invalid value';
+
+	const got = / \(got ([^()]*)\)$/.exec(message);
+	const head = got === null ? message : message.slice(0, got.index);
+	const suffix = got !== null && TYPE_NAME.test(got[1]) ? ` (got ${got[1]})` : '';
+
+	if (FIXED_MESSAGE.test(head)) return head + suffix;
+	for (const [pattern, text] of GENERIC_MESSAGES) if (pattern.test(head)) return text + suffix;
+
+	return `Invalid value${suffix}`;
+}
+
+/**
+ * Builds the path of an issue for {@link parseEnv}: the variable name, then the array indexes at the start of the issue's own path.
+ * Object keys are dropped (with everything after them), since they may come from the value (a JSON object, a record).
+ * @param {string} name - The variable name
+ * @param {ReadonlyArray<unknown>} path - The issue's path below the variable
+ * @returns {PropertyKey[]} The path
+ */
+function envPath(name: string, path: ReadonlyArray<unknown>): PropertyKey[] {
+	const output: PropertyKey[] = [name];
+
+	for (const segment of path) {
+		if (!(typeof segment === 'number' && Number.isSafeInteger(segment) && segment >= 0)) break;
+		output.push(segment);
+	}
+
+	return output;
+}
+
+/**
+ * Names what a schema threw, for {@link parseEnv}: a built-in error name, never its message.
+ * @param {unknown} error - What was thrown
+ * @returns {string} The error name, or `'an exception'`
+ */
+function thrownName(error: unknown): string {
+	let name: unknown;
+
+	try {
+		name = (error as { name?: unknown } | null | undefined)?.name;
+	} catch {
+		// A getter that throws: an exception without a usable name.
+	}
+
+	return typeof name === 'string' && ERROR_NAME.test(name) ? name : 'an exception';
+}
+
+/**
+ * Reads an own property of the options of {@link parseEnv}.
+ * @param {object} options - The options
+ * @param {string} key - The option name
+ * @returns {unknown} Its value, or `undefined` when it is not an own property
+ */
+function ownOption(options: object, key: string): unknown {
+	return hasOwn.call(options, key) ? (options as Record<string, unknown>)[key] : undefined;
+}
+
+/**
+ * Returns `process.env`, looked up through `globalThis` (Node, Bun and Deno have it; browsers and some edge runtimes do not).
+ * @returns {object} The environment variables
+ * @throws {Error} when there is no `process.env`
+ */
+function processEnv(): object {
+	const env = (globalThis as unknown as { process?: { env?: unknown } }).process?.env;
+
+	if (typeof env !== 'object' || env === null) {
+		throw new Error('parseEnv: `env` was not given and `process.env` is not available in this environment; pass the variables, e.g. `parseEnv(schema, import.meta.env)`');
+	}
+
+	return env;
+}
+
+/**
+ * Throws unless `env` is an object holding the variables as properties: a `Map` or Deno's `Deno.env` (whose variables are read through
+ * methods) would make every variable look unset.
+ * @param {unknown} env - The environment
+ * @returns {void}
+ * @throws {TypeError} when `env` is not such an object
+ */
+function assertEnv(env: unknown): asserts env is object {
+	if (typeof env !== 'object' || env === null) throw new TypeError(`parseEnv: \`env\` must be an object, got ${describe(env)}`);
+	if (isMap(env)) throw new TypeError('parseEnv: `env` must be an object of variables, got Map (pass `Object.fromEntries(map)`)');
+
+	const methods = env as { get?: unknown; toObject?: unknown };
+
+	if (Object.keys(env).length === 0 && typeof methods.get === 'function' && typeof methods.toObject === 'function') {
+		throw new TypeError('parseEnv: `env` must be an object of variables, got an object with `get` and `toObject` methods (pass `Deno.env.toObject()`)');
+	}
+}
+
+/**
+ * Parses environment variables with an object schema and returns the typed result, or throws ONE {@link ValidationError} listing every
+ * missing or invalid variable, one per line, so that a misconfigured deployment fails at startup with the whole list instead of one
+ * variable per restart (or a crash much later, on first use):
+ *
+ * ```text
+ * Invalid environment variables:
+ *   DATABASE_URL: Missing required variable
+ *   PORT: Expected an integer or an integer string (got string)
+ * ```
+ *
+ * No part of a value can reach the error (its message, `issues`, stack or anything else), since everything in it comes from fixed
+ * texts: the variable name; array indexes, but no object key (a JSON object's keys come from the value); and messages from a fixed
+ * list: this module's own (its `(got …)` part kept only when it names a type), range, length, pattern and allowed-values messages
+ * without their bounds (`Expected an integer in the allowed range`: a number in them may come from the value), and `Invalid value`
+ * for anything else, custom `withError` and `check` messages and those of other libraries (zod, valibot…) included, since they may
+ * quote the value. A schema that throws is reported as `Invalid value (the schema threw TypeError)`, without its message, and the
+ * other variables are still checked.
+ *
+ * Each key of the schema names a variable, parsed with its schema ({@link asInteger}, {@link asBoolean}, {@link asList},
+ * {@link asJson}, {@link withDefault}, {@link optional}, guards such as {@link isUrl}...). Only those variables are read, each once, as
+ * own properties (a polluted `Object.prototype` cannot supply one). The output has a `null` prototype, so an optional variable left
+ * unset cannot be read from a polluted `Object.prototype` either; it holds only the schema's keys. Blank values count as unset by
+ * default (see {@link ParseEnvOptions.blankAsMissing}), and a `prefix` maps `PORT` to `APP_PORT` or `VITE_PORT`.
+ *
+ * `env` defaults to `process.env` when the runtime has one. Elsewhere pass an object of variables: `import.meta.env` (Vite),
+ * `Deno.env.toObject()` (not `Deno.env` itself), the `env` bindings of a Cloudflare Worker, `Object.fromEntries(map)` for a `Map`.
+ * @template S - The object schema
+ * @param {S} schema - A plain object of schemas, one per variable
+ * @param {object} [env=process.env] - The variables (values that are not strings, such as Vite's booleans, are parsed as they are)
+ * @param {ParseEnvOptions} [options] - `prefix` (`''`), `blankAsMissing` (`true`) and `strict` (`false`)
+ * @returns {SchemaOutput<S>} The parsed variables, keyed like the schema, in a `null`-prototype object
+ * @throws {ValidationError} when a variable is missing or invalid (or, with `strict`, unknown), with every problem in its message and `issues`
+ * @throws {TypeError} when `schema` is not a plain object of schemas, `env` is not an object of variables (a `Map`, `Deno.env`),
+ * `options` is not an object, `prefix` is not a string, or `blankAsMissing` or `strict` is not a boolean
+ * @throws {RangeError} when `strict` is set without a `prefix`
+ * @throws {Error} when `env` is omitted and the runtime has no `process.env`
+ * @example
+ * import { isOneOf } from 'tinkit/guards';
+ * const schema = {
+ *   DATABASE_URL: isUrl,
+ *   PORT: withDefault(asInteger, 3000),
+ *   LOG_LEVEL: withDefault(isOneOf(['debug', 'info', 'error']), 'info'),
+ *   ORIGINS: withDefault(asList(isUrl), function () { return []; })
+ * };
+ * parseEnv(schema, { DATABASE_URL: 'https://db.example.com', PORT: '8080', LOG_LEVEL: '', HOME: '/root' }); // => { DATABASE_URL: 'https://db.example.com', PORT: 8080, LOG_LEVEL: 'info', ORIGINS: [] }
+ * @example
+ * import { isString, isIntegerInRange } from 'tinkit/guards';
+ * try {
+ *   parseEnv({ DATABASE_URL: isUrl, PORT: chain(asInteger, isIntegerInRange(1, 65535)), API_KEY: isString }, { PORT: '70000', API_KEY: ' ' });
+ * } catch (error) {
+ *   (error as Error).message; // => 'Invalid environment variables:\n  DATABASE_URL: Missing required variable\n  PORT: Expected an integer in the allowed range\n  API_KEY: Missing required variable (set but blank)'
+ * }
+ * @example
+ * const env = { VITE_API_URL: 'https://api.example.com', VITE_DEBUG: 'yes', VITE_DEBGU: 'no' };
+ * parseEnv({ API_URL: isUrl, DEBUG: withDefault(asBoolean, false) }, env, { prefix: 'VITE_' }); // => { API_URL: 'https://api.example.com', DEBUG: true }
+ * parseEnv({ API_URL: isUrl, DEBUG: withDefault(asBoolean, false) }, env, { prefix: 'VITE_', strict: true }); // throws ValidationError // VITE_DEBGU: Unknown variable
+ * @example
+ * // doctest: skip
+ * export const env = parseEnv({ DATABASE_URL: isUrl, PORT: withDefault(asInteger, 3000) }); // reads process.env
+ */
+export function parseEnv<S extends ObjectSchema>(schema: S, env?: object, options: ParseEnvOptions = {}): SchemaOutput<S> {
+	assertObjectSchema('parseEnv', 'schema', schema);
+	if (typeof options !== 'object' || options === null) throw new TypeError(`parseEnv: \`options\` must be an object, got ${describe(options)}`);
+
+	const prefix = ownOption(options, 'prefix') ?? '';
+	const blankAsMissing = ownOption(options, 'blankAsMissing') ?? true;
+	const strict = ownOption(options, 'strict') ?? false;
+
+	if (typeof prefix !== 'string') throw new TypeError(`parseEnv: \`prefix\` must be a string, got ${describe(prefix)}`);
+	if (typeof blankAsMissing !== 'boolean') throw new TypeError(`parseEnv: \`blankAsMissing\` must be a boolean, got ${describe(blankAsMissing)}`);
+	if (typeof strict !== 'boolean') throw new TypeError(`parseEnv: \`strict\` must be a boolean, got ${describe(strict)}`);
+	if (strict && prefix === '') throw new RangeError('parseEnv: `prefix` must be a non-empty string with `strict`, got empty string');
+
+	const keys = Object.keys(schema);
+	// Compiled before any variable is read, so that a mistake in the schema throws whatever the environment holds.
+	const children = keys.map(function (key: string): Node {
+		return compile('parseEnv', `schema.${key}`, schema[key], [schema]);
+	});
+	const source = env === undefined ? processEnv() : env;
+
+	assertEnv(source);
+
+	const output: Record<string, unknown> = Object.create(null);
+	const issues: SchemaIssue[] = [];
+	const reported = new Set<string>();
+
+	/**
+	 * Records a problem, once.
+	 * @param {PropertyKey[]} path - Its path, the variable name first
+	 * @param {string} message - Its message
+	 * @returns {void}
+	 */
+	function record(path: PropertyKey[], message: string): void {
+		const line = `${path.map(String).join('.')}: ${message}`;
+
+		if (reported.has(line)) return;
+		reported.add(line);
+		issues.push({ message, path });
+	}
+
+	for (let index = 0; index < keys.length; index++) {
+		const key = keys[index];
+		const child = children[index];
+		const name = prefix + key;
+		const raw = hasOwn.call(source, name) ? (source as Record<string, unknown>)[name] : undefined;
+		const value = blankAsMissing && isBlank(raw) ? undefined : raw;
+		const found: SchemaIssue[] = [];
+		let present: boolean;
+		let result: unknown;
+
+		try {
+			present = value !== undefined && !flags(child, value);
+			result = execute(child.fast, child.run, value, found);
+		} catch (error) {
+			record([name], `Invalid value (the schema threw ${thrownName(error)})`);
+			continue;
+		}
+		if (found.length === 0) {
+			if (result !== undefined || present) assign(output, key, result);
+		} else if (!present && !handlesMissing(child)) {
+			// A missing variable fails as such, unless its schema handles `undefined` (then a default can genuinely fail a later check).
+			record([name], raw === undefined ? 'Missing required variable' : 'Missing required variable (set but blank)');
+		} else {
+			for (const issue of found) record(envPath(name, issue.path), envMessage(issue.message));
+		}
+	}
+	if (strict) {
+		const declared = new Set(
+			keys.map(function (key: string): string {
+				return prefix + key;
+			})
+		);
+
+		for (const name of Object.keys(source).sort()) {
+			if (name.startsWith(prefix) && !declared.has(name)) record([name], 'Unknown variable');
+		}
+	}
+	if (issues.length > 0) {
+		const error = new ValidationError(issues);
+
+		error.message = [
+			'Invalid environment variables:',
+			...issues.map(function (issue: SchemaIssue): string {
+				return `  ${issue.path.map(String).join('.')}: ${issue.message}`;
+			})
+		].join('\n');
+		throw error;
+	}
+
+	return output as SchemaOutput<S>;
+}

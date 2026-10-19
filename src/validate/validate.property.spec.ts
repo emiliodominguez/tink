@@ -2,6 +2,7 @@ import fc from 'fast-check';
 
 import { parseHex, toHex } from '../color/index.js';
 import { randomUUID } from '../random/index.js';
+import { isIntegerInRange, isLiteral, isNumberInRange, isString } from '../guards/index.js';
 import { toSlug } from '../strings/index.js';
 import * as helpers from '.';
 
@@ -414,6 +415,192 @@ describe('isUrl (properties)', function () {
 				expect([host.toLowerCase(), new URL(`http://${host}`).hostname]).toContain(new URL(url).hostname);
 			}),
 			{ numRuns: 1000 }
+		);
+	});
+});
+
+describe('parseEnv (properties)', function () {
+	const schema = { A: helpers.asInteger, B: helpers.withDefault(helpers.asInteger, 7), C: helpers.optional(helpers.asBoolean), D: helpers.asList(helpers.asInteger) };
+	const value = fc.option(
+		fc.oneof(
+			fc.constantFrom('', ' ', '\t', 'true', 'off', '0', 'secret-value', '1,2', '1,x'),
+			fc.integer({ min: -1000, max: 1000 }).map(String),
+			fc.string({ maxLength: 12 })
+		),
+		{ nil: undefined }
+	);
+	const environment = fc.record({ A: value, B: value, C: value, D: value, EXTRA: value }, { requiredKeys: [] });
+
+	/** The distinct variable names of a list of issues, in order. */
+	function variables(issues: ReadonlyArray<{ readonly path: ReadonlyArray<PropertyKey> }>): string[] {
+		return Array.from(
+			new Set(
+				issues.map(function (issue) {
+					return String(issue.path[0]);
+				})
+			)
+		);
+	}
+
+	/** Runs `fn`, returning `['ok', output]` or `['error', error]`. */
+	function outcome(fn: () => unknown): ['ok' | 'error', unknown] {
+		try {
+			return ['ok', fn()];
+		} catch (error) {
+			return ['error', error];
+		}
+	}
+
+	it('matches safeParse on the environment without its blank values, reporting the same variables, never quoting their values', function () {
+		fc.assert(
+			fc.property(environment, function (env) {
+				const present: Record<string, unknown> = {};
+				for (const [name, text] of Object.entries(env)) if (text !== undefined && text.trim() !== '') present[name] = text;
+				const [error, expected] = helpers.safeParse(schema, present);
+				const [status, result] = outcome(function () {
+					return helpers.parseEnv(schema, env);
+				});
+
+				if (error === undefined) {
+					expect([status, result]).toEqual(['ok', expected]);
+					return;
+				}
+				expect(status).toBe('error');
+				const { issues } = result as typeof error;
+				expect(variables(issues)).toEqual(variables(error.issues));
+				const message = (result as Error).message;
+				expect(message.split('\n')).toHaveLength(issues.length + 1);
+				// No issue quotes the value of its variable (values shorter than 4 characters are not redacted).
+				for (const issue of issues) {
+					const text = (env as Record<string, string | undefined>)[String(issue.path[0])]?.trim() ?? '';
+					if (text.length >= 4) expect(issue.message).not.toContain(text);
+				}
+			})
+		);
+	});
+
+	it('reads PREFIX + key and reports full names: the same outcome as without a prefix', function () {
+		fc.assert(
+			fc.property(environment, fc.constantFrom('APP_', 'VITE_', 'x'), function (env, prefix) {
+				const prefixed: Record<string, unknown> = { A: '1', B: 'not a number' };
+				for (const [name, text] of Object.entries(env)) prefixed[prefix + name] = text;
+				const plain = outcome(function () {
+					return helpers.parseEnv(schema, env);
+				});
+				const withPrefix = outcome(function () {
+					return helpers.parseEnv(schema, prefixed, { prefix });
+				});
+
+				expect(withPrefix[0]).toBe(plain[0]);
+				if (plain[0] === 'ok') {
+					expect(withPrefix[1]).toEqual(plain[1]);
+				} else {
+					expect((withPrefix[1] as Error).message).toBe((plain[1] as Error).message.replace(/^ {2}/gm, '  ' + prefix));
+				}
+			})
+		);
+	});
+});
+
+describe('parseEnv (non-interference)', function () {
+	const { asInteger, asJson, asList, asNumber, chain, parseEnv, recordOf, transform, withError } = helpers;
+
+	/** A validator from another library whose messages and paths quote the value, as zod's and valibot's can. */
+	const quoting = {
+		'~standard': {
+			version: 1 as const,
+			vendor: 'other',
+			validate: function (value: unknown) {
+				return { issues: [{ message: "Invalid enum value, received '" + String(value) + "'", path: [{ key: String(value) }] }] };
+			}
+		}
+	};
+	const textSchema = {
+		INT: asInteger,
+		ECHO: withError(isUrlLike, function (value) {
+			return 'Not a URL: ' + JSON.stringify(value);
+		}),
+		QUOTING: quoting,
+		LIST: asList(quoting),
+		JSON_LEAF: asJson({ token: asInteger }),
+		JSON_KEYS: asJson(recordOf(asInteger)),
+		THROWS: transform(isString, function (text: string): never {
+			throw new Error(text);
+		}),
+		UPPER: chain(
+			transform(isString, function (text: string) {
+				return text.toUpperCase();
+			}),
+			withError(isUrlLike, function (value) {
+				return String(value);
+			})
+		)
+	};
+	const numberSchema = {
+		RANGE: chain(asInteger, isIntegerInRange(0, 9999)),
+		SIGNED: chain(asInteger, isIntegerInRange(0, 9999)),
+		DECIMAL: chain(asNumber, isNumberInRange(0, 1)),
+		LITERAL: chain(asInteger, isLiteral(1)),
+		RAW: isString,
+		JSON_NUMBER: asJson({ pin: isIntegerInRange(0, 9) })
+	};
+
+	/** Whether a value is an `https:` URL (rejects every generated secret). */
+	function isUrlLike(value: unknown): value is string {
+		return typeof value === 'string' && value.startsWith('https://');
+	}
+
+	/** Everything the error of `parseEnv(schema, env)` exposes, but the frames of its stack. */
+	function exposed(schema: helpers.ObjectSchema, env: object): string {
+		try {
+			parseEnv(schema, env);
+		} catch (error) {
+			const { stack, message, issues, cause } = error as Error & { issues?: unknown; cause?: unknown };
+			return JSON.stringify([String(error), message, issues, String(stack).split('\n    at ')[0], String(cause)]);
+		}
+		throw new Error('expected a throw');
+	}
+
+	it('gives the same error for any two secrets (strings), so no part of them can be in it', function () {
+		fc.assert(
+			fc.property(fc.stringMatching(/^sk_[A-Za-z0-9]{8,24}$/), fc.stringMatching(/^sk_[A-Za-z0-9]{8,24}$/), function (a, b) {
+				function env(secret: string): object {
+					return {
+						INT: secret,
+						ECHO: secret,
+						QUOTING: secret,
+						LIST: `${secret},${secret}x`,
+						JSON_LEAF: JSON.stringify({ token: secret }),
+						JSON_KEYS: JSON.stringify({ [secret]: secret }),
+						THROWS: secret,
+						UPPER: secret
+					};
+				}
+				const first = exposed(textSchema, env(a));
+				expect(exposed(textSchema, env(b))).toBe(first);
+				expect(first).not.toContain(a.slice(3));
+				expect(first).not.toContain(a.slice(3).toUpperCase());
+			})
+		);
+	});
+
+	it('gives the same error for any two secrets (numbers, normalised by the parsers), so no digit of them can be in it', function () {
+		fc.assert(
+			fc.property(fc.integer({ min: 10_000, max: 2 ** 40 }), fc.integer({ min: 10_000, max: 2 ** 40 }), function (a, b) {
+				function env(secret: number): object {
+					return {
+						RANGE: `00${secret}`,
+						SIGNED: `+${secret}`,
+						DECIMAL: `${secret}.50`,
+						LITERAL: `000${secret}`,
+						RAW: secret,
+						JSON_NUMBER: `{"pin": ${secret}}`
+					};
+				}
+				const first = exposed(numberSchema, env(a));
+				expect(exposed(numberSchema, env(b))).toBe(first);
+				expect(first).not.toMatch(/\d/);
+			})
 		);
 	});
 });
