@@ -3250,3 +3250,85 @@ describe('isMatch regression', function () {
 		expect(helpers.isMatch(object, { '': { prototype: '' } })).toBe(false);
 	});
 });
+
+describe('objects (helper review regressions)', function () {
+	it('deepClone keeps shared Dates, RegExps, boxed values, buffers and views shared', function () {
+		const date = new Date(0);
+		const bytes = new Uint8Array(2);
+		const buffer = new ArrayBuffer(4);
+		const regex = /a/g;
+		const boxed = Object(1) as number;
+		const copy = helpers.deepClone({ d1: date, d2: date, u1: bytes, u2: bytes, buffer, view: new Uint8Array(buffer, 1, 2), r1: regex, r2: regex, n1: boxed, n2: boxed });
+		expect(copy.d1).toBe(copy.d2);
+		expect(copy.d1).not.toBe(date);
+		expect(copy.u1).toBe(copy.u2);
+		expect(copy.view.buffer).toBe(copy.buffer);
+		expect([copy.view.byteOffset, copy.view.length]).toEqual([1, 2]);
+		expect(copy.r1).toBe(copy.r2);
+		expect(copy.n1).toBe(copy.n2);
+		const view = new DataView(buffer, 2);
+		const viewCopy = helpers.deepClone({ buffer, view });
+		expect(viewCopy.view.buffer).toBe(viewCopy.buffer);
+		expect([viewCopy.view.byteOffset, viewCopy.view.byteLength]).toEqual([2, 2]);
+		// A shallow clone still copies only the view's own bytes.
+		const sub = new Uint8Array(new ArrayBuffer(8), 2, 3);
+		expect([helpers.clone(sub).byteOffset, helpers.clone(sub).buffer.byteLength]).toEqual([0, 3]);
+	});
+
+	it('clone and deepClone keep the stack of errors', function () {
+		const error = new TypeError('broken');
+		expect(helpers.clone(error).stack).toBe(error.stack);
+		expect(helpers.deepClone(error).stack).toBe(error.stack);
+		expect(Object.getOwnPropertyDescriptor(helpers.deepClone(error), 'stack')?.enumerable).toBe(false);
+	});
+
+	it('deepMergeWith never mutates an input that a customizer returned', function () {
+		const first = { x: 1 };
+		const result = helpers.deepMergeWith(
+			{
+				customizer: function (targetValue, sourceValue, { key }) {
+					return key === 'a' && targetValue === undefined ? sourceValue : undefined;
+				}
+			},
+			{},
+			{ a: first },
+			{ a: { y: 2 } }
+		);
+		expect(first).toStrictEqual({ x: 1 });
+		expect(result).toStrictEqual({ a: { x: 1, y: 2 } });
+		expect((result as { a: object }).a).not.toBe(first);
+	});
+
+	it('stableStringify and hash tell trailing holes apart', function () {
+		expect(helpers.stableStringify(new Array(1))).toBe('[,]');
+		expect(helpers.stableStringify([])).toBe('[]');
+		// eslint-disable-next-line no-sparse-arrays
+		expect(helpers.stableStringify([1, ,])).toBe('[1,,]');
+		// eslint-disable-next-line no-sparse-arrays
+		expect(helpers.stableStringify([1, , 3])).toBe('[1,,3]');
+		expect(helpers.hash(new Array(1))).not.toBe(helpers.hash([]));
+	});
+
+	it('getPath types paths through numeric keys', function () {
+		const indexed = { 1: 'a' } as { 1: string };
+		const nested = { a: { 2: { b: true } } } as { a: { 2: { b: boolean } } };
+		const one = helpers.getPath(indexed, '1');
+		const deep = helpers.getPath(nested, 'a.2.b');
+		assertType<Equals<typeof one, string>>(true);
+		assertType<Equals<typeof deep, boolean>>(true);
+		expect([one, deep]).toEqual(['a', true]);
+	});
+
+	it('transformKeysDeep rejects a symbol returned for a string key, and keeps symbol keys', function () {
+		const symbol = Symbol('kept');
+		expect(function () {
+			helpers.transformKeysDeep({ a: 1 }, function () {
+				return Symbol('k') as unknown as string;
+			});
+		}).toThrow(TypeError);
+		const renamed = helpers.transformKeysDeep({ [symbol]: 1, a: 2 }, function (key) {
+			return key.toUpperCase();
+		}) as Record<PropertyKey, unknown>;
+		expect([renamed[symbol], renamed.A]).toEqual([1, 2]);
+	});
+});

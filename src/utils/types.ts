@@ -68,7 +68,12 @@ type PathSegmentValue<T, K extends string> = K extends keyof NonNullable<T>
 		? K extends `${number}`
 			? U | undefined
 			: undefined
-		: undefined;
+		: // A numeric key (`{ 1: string }`) is a number in `keyof`, while the path segment is its string.
+			K extends `${infer N extends number}`
+			? N extends keyof NonNullable<T>
+				? NonNullable<T>[N] | (T extends null | undefined ? undefined : never)
+				: undefined
+			: undefined;
 
 /**
  * The type of the value found at the dot-separated path `P` inside `T`.

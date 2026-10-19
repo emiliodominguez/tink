@@ -94,6 +94,8 @@ type DeepMergeValue<A, B, C extends boolean> = IsMergeable<A> extends true ? (Is
 /**
  * The type produced by {@link deepMerge}: like {@link Merge}, but keys holding objects on both sides are merged recursively.
  * `C` (default `false`) is `true` when two arrays at the same key are combined ({@link deepMergeWith} with `'concat'` or `'union'`).
+ * An optional key of a source is assumed absent when it is not set, as with `exactOptionalPropertyTypes`: the type keeps the earlier
+ * value (or merges into it), while at runtime a key present with the value `undefined` wins.
  * @example
  * type M = DeepMerge<{ a: { x: number; y: string } }, { a: { x: boolean } }>; // { a: { x: boolean; y: string } }
  */
@@ -833,7 +835,7 @@ function assignPath(
  * @example
  * getPath({ a: { b: [{ id: 1 }] } }, 'a.b.0.id'); // => 1
  * getPath({ a: {} as { x?: { y: number } } }, 'a.x.y'); // => undefined
- * getPath({ name: 'Ada' }, 'name.length'); // => 3
+ * getPath({ name: 'Ada' }, 'name.length' as never); // => 3 // inherited properties resolve, beyond the paths the types offer
  * getPath({ viewer: { read: true } } as Record<string, object>, 'viewer.constructor' as never, false); // => false
  */
 export function getPath<T extends object, P extends NestedKeyOf<T>>(target: T, keys: P): PathValue<T, P>;
@@ -1177,10 +1179,11 @@ function copyWith(value: unknown, seen?: Map<object, unknown>): unknown {
 	if (isUncloneable(value)) return value;
 
 	const [isBoxed, primitive] = unbox(value);
-	if (isBoxed) return adoptPrototype(Object(primitive), value);
-	if (isDate(value)) return adoptPrototype(new Date(value.getTime()), value);
-	if (isRegExp(value)) return copyRegExp(value);
-	if (isBinary(value)) return copyBinary(value);
+	// Recorded in `seen` too, so that shared references to them stay shared in a deep copy.
+	if (isBoxed) return remember(seen, value, adoptPrototype(Object(primitive), value));
+	if (isDate(value)) return remember(seen, value, adoptPrototype(new Date(value.getTime()), value));
+	if (isRegExp(value)) return remember(seen, value, copyRegExp(value));
+	if (isBinary(value)) return remember(seen, value, seen !== undefined && ArrayBuffer.isView(value) ? copyViewOver(value, seen) : copyBinary(value));
 
 	if (isMap(value)) {
 		if (seen === undefined) return adoptPrototype(new Map(value), value);
@@ -1210,10 +1213,42 @@ function copyWith(value: unknown, seen?: Map<object, unknown>): unknown {
 		if (error) {
 			const descriptor = Object.getOwnPropertyDescriptor(value, key) as PropertyDescriptor;
 			if ('value' in descriptor) descriptor.value = copyChild(descriptor.value, seen);
+			// V8 defines `stack` as an own accessor reading an internal slot of the original, which the copy lacks: copy its value.
+			else if (key === 'stack') {
+				Object.defineProperty(copy, key, { value: (value as Error).stack, writable: true, configurable: true, enumerable: descriptor.enumerable === true });
+				continue;
+			}
 			Object.defineProperty(copy, key, descriptor);
 		} else defineValue(copy, key, copyChild((value as Properties)[key], seen));
 	}
 	return copy;
+}
+
+/**
+ * Records `copy` as the copy of `value` in a deep copy's `seen` map (a shallow copy has none).
+ * @param {Map<object, unknown> | undefined} seen - The objects already copied
+ * @param {object} value - The original
+ * @param {T} copy - Its copy
+ * @returns {T} `copy`
+ */
+function remember<T>(seen: Map<object, unknown> | undefined, value: object, copy: T): T {
+	seen?.set(value, copy);
+	return copy;
+}
+
+/**
+ * Copies a typed array or a `DataView` for a deep copy: a view of the same type, offset and length over the COPY of its buffer (copied
+ * whole, once), so that views sharing a buffer still share one, as with `structuredClone`.
+ * @param {ArrayBufferView} value - The view
+ * @param {Map<object, unknown>} seen - The objects already copied
+ * @returns {ArrayBufferView} The copy
+ */
+function copyViewOver(value: ArrayBufferView, seen: Map<object, unknown>): ArrayBufferView {
+	const buffer = copyWith(value.buffer, seen) as ArrayBufferLike;
+	const name = (typedArrayTag.call(value) as string | undefined) ?? 'DataView';
+	const View = (globalThis as unknown as Record<string, new (buffer: ArrayBufferLike, byteOffset: number, length: number) => ArrayBufferView>)[name];
+	const length = name === 'DataView' ? value.byteLength : (value as unknown as { length: number }).length;
+	return adoptPrototype(new View(buffer, value.byteOffset, length), value);
 }
 
 /**
@@ -1318,6 +1353,8 @@ interface MergeSettings {
 	arrays: ArrayMergeStrategy;
 	/** The customizer of {@link deepMergeWith}, if any. */
 	customizer: MergeCustomizer | undefined;
+	/** The plain objects created by the current merge, the only ones merged into in place (set by {@link mergeAll}). */
+	created?: WeakSet<object>;
 }
 
 /**
@@ -1375,7 +1412,7 @@ function mergeInto(result: object, source: object, ancestors: object[], settings
 				const kept = fill && current !== undefined && !(settings.nullish && current === null);
 				if (plain && (isPlainObject(current) || !kept)) {
 					path.push(key);
-					value = mergeInto(isPlainObject(current) ? current : emptyLike(incoming as object), incoming as object, ancestors, settings, path);
+					value = mergeInto(mergeBase(current, incoming as object, ancestors, settings, path), incoming as object, ancestors, settings, path);
 					path.pop();
 				} else if (arrays !== 'replace' && Array.isArray(current) && Array.isArray(incoming)) {
 					value = combineArrays(current, incoming, arrays === 'union');
@@ -1391,6 +1428,24 @@ function mergeInto(result: object, source: object, ancestors: object[], settings
 }
 
 /**
+ * The object a plain `incoming` value is merged into: the value merged so far when the merge created it, a copy of it when it comes
+ * from elsewhere (a customizer may return an input, which must not be mutated), or a new empty object.
+ * @param {unknown} current - The value merged so far
+ * @param {object} incoming - The plain object being merged
+ * @param {object[]} ancestors - Sources being merged around this one (to detect cycles)
+ * @param {MergeSettings} settings - The merge rules
+ * @param {PropertyKey[]} path - The keys leading to the merged value
+ * @returns {object} The object to merge `incoming` into
+ */
+function mergeBase(current: unknown, incoming: object, ancestors: object[], settings: MergeSettings, path: PropertyKey[]): object {
+	const created = settings.created as WeakSet<object>;
+	if (isPlainObject(current) && created.has(current)) return current;
+	const base = emptyLike(isPlainObject(current) ? current : incoming);
+	created.add(base);
+	return isPlainObject(current) ? mergeInto(base, current, ancestors, { ...settings, customizer: undefined }, path) : base;
+}
+
+/**
  * Merges `sources` over a copy of `target` with the merge engine (the entry point of the merge-style helpers).
  * @param {MergeSettings} settings - The merge rules
  * @param {object} target - The base plain object
@@ -1402,15 +1457,18 @@ function mergeAll(settings: MergeSettings, target: object, sources: ReadonlyArra
 	if (!isPlainObject(target)) throw new TypeError(`${settings.caller}: \`target\` must be a plain object, got ${describe(target)}`);
 
 	const ancestors: object[] = [];
+	const run: MergeSettings = { ...settings, created: new WeakSet<object>() };
 	// The target is copied (into an empty object, so the mode and the array strategy make no difference) without the customizer.
-	const copy = settings.customizer === undefined ? settings : { ...settings, customizer: undefined };
-	const result = mergeInto(emptyLike(target), target, ancestors, copy, []);
+	const copy = run.customizer === undefined ? run : { ...run, customizer: undefined };
+	const result = emptyLike(target);
+	run.created?.add(result);
+	mergeInto(result, target, ancestors, copy, []);
 
 	for (let index = 0; index < sources.length; index++) {
 		const source = sources[index];
 		if (source == null) continue;
 		if (!isPlainObject(source)) throw new TypeError(`${settings.caller}: \`sources[${index}]\` must be a plain object, got ${describe(source)}`);
-		mergeInto(result, source, ancestors, settings, []);
+		mergeInto(result, source, ancestors, run, []);
 	}
 
 	return result;
@@ -3012,7 +3070,8 @@ function renameKeys(caller: string, value: unknown, rename: (key: string) => str
 		const renamed: PropertyKey[] = [];
 		for (const key of keys) {
 			const newKey = typeof key === 'string' ? rename(key) : key;
-			if (typeof newKey !== 'string' && typeof newKey !== 'symbol')
+			// Symbol keys are kept as they are; a renamed string key must stay a string.
+			if (typeof key === 'string' && typeof newKey !== 'string')
 				throw new TypeError(`${caller}: \`fn\` must return a string, got ${describe(newKey)} for "${String(key)}"`);
 			if (hasOwn(result, newKey)) {
 				throw new RangeError(`${caller}: keys "${String(keys[renamed.indexOf(newKey)])}" and "${String(key)}" both become "${String(newKey)}"`);
@@ -3155,6 +3214,8 @@ function encodeItems(items: ArrayLike<unknown>, ancestors: object[]): string {
 		if (index > 0) text += ',';
 		if (index in items) text += encodeValue(items[index], ancestors);
 	}
+	// As in array literals, a trailing hole needs one more comma: otherwise `new Array(1)` would encode like `[]`.
+	if (items.length > 0 && !(items.length - 1 in items)) text += ',';
 	return text + ']';
 }
 
@@ -3235,7 +3296,8 @@ function encodeValue(value: unknown, ancestors: object[]): string {
  * of {@link hash}. Encoding version 1 (it only changes in a major release):
  * - JSON values encode exactly like `JSON.stringify` with keys sorted (by UTF-16 code units): `{"a":[1,"x"],"b":null}`. Plain objects
  *   (`Object.prototype` or `null` prototype) encode their own enumerable string keys; symbol keys are ignored. Arrays encode their
- *   items; a hole encodes as nothing (`[1,,3]`).
+ *   items; a hole encodes as nothing (`[1,,3]`), and a trailing one
+ *   adds a comma, as in array literals (`[1,,]` for `[1, <hole>]`).
  * - Values JSON cannot represent get a distinct encoding: `undefined` (also as an object value: `{"a":undefined}`), `NaN`, `Infinity`,
  *   `-Infinity`, `-0`, bigints (`12n`), `Date(ms)`, `RegExp("/a/g")`, `Map([[k,v],...])` and `Set([...])` (entries sorted by encoding),
  *   typed arrays, `DataView`s and `ArrayBuffer`s (`Uint8Array([1,2])`, bytes for the last two), boxed primitives (`Number(1)`), and other
