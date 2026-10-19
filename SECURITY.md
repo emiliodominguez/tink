@@ -36,7 +36,7 @@ Documented costs (for example the O(n·m) of `levenshtein` or `fuzzyMatch`) and 
 ## Supply chain
 
 - Zero runtime dependencies.
-- Releases are published from GitHub Actions with npm trusted publishing (OIDC, no long-lived token) and
-  [provenance](https://docs.npmjs.com/generating-provenance-statements): `npm audit signatures` verifies that a tarball was built
-  from this repository.
+- Releases are published by the maintainer after `yarn validate` passes (`prepublishOnly` runs it). The `release.yml` workflow can
+  publish instead, with npm trusted publishing (OIDC, no long-lived token) and
+  [provenance](https://docs.npmjs.com/generating-provenance-statements); `npm audit signatures` verifies the releases it published.
 - Workflow actions are pinned to commit SHAs and kept current by Dependabot.

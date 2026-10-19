@@ -526,12 +526,12 @@ Whole module: **4.4 kB**
 
 ## objects
 
-Whole module: **9.0 kB**
+Whole module: **9.2 kB**
 
 | Export              | min + gzip |
 | ------------------- | ---------: |
-| `clone`             |     1.6 kB |
-| `compactObject`     |      572 B |
+| `clone`             |     1.7 kB |
+| `compactObject`     |      571 B |
 | `deepClone`         |     1.6 kB |
 | `deepFreeze`        |      615 B |
 | `deepMerge`         |     1.2 kB |
@@ -541,35 +541,35 @@ Whole module: **9.0 kB**
 | `defaultsWith`      |     1.4 kB |
 | `deletePath`        |      693 B |
 | `deleteProperty`    |      289 B |
-| `diff`              |     1.9 kB |
+| `diff`              |     2.0 kB |
 | `evolve`            |     2.0 kB |
 | `findEntry`         |      436 B |
 | `findKey`           |      441 B |
 | `flattenObject`     |      844 B |
-| `getPath`           |      552 B |
+| `getPath`           |      554 B |
 | `getProperty`       |      485 B |
 | `getPropertyNames`  |      294 B |
 | `hasPath`           |      555 B |
-| `hasProperty`       |      309 B |
+| `hasProperty`       |      308 B |
 | `hash`              |     1.7 kB |
-| `invert`            |      487 B |
+| `invert`            |      486 B |
 | `isEmpty`           |      575 B |
 | `isEqual`           |     1.7 kB |
 | `isEqualWith`       |     1.8 kB |
 | `isMatch`           |     2.2 kB |
 | `mapEntries`        |      600 B |
-| `mapKeys`           |      605 B |
-| `mapValues`         |      592 B |
+| `mapKeys`           |      603 B |
+| `mapValues`         |      593 B |
 | `merge`             |      330 B |
-| `omit`              |      479 B |
-| `omitBy`            |      572 B |
+| `omit`              |      477 B |
+| `omitBy`            |      573 B |
 | `omitPath`          |     2.3 kB |
 | `pick`              |      560 B |
-| `pickBy`            |      548 B |
+| `pickBy`            |      547 B |
 | `setPath`           |     1.0 kB |
 | `setProperty`       |      348 B |
 | `shallowEqual`      |     1.0 kB |
-| `sortKeys`          |      998 B |
+| `sortKeys`          |      999 B |
 | `stableStringify`   |     1.4 kB |
 | `toCamelCaseKeys`   |     1.7 kB |
 | `toKebabCaseKeys`   |     1.5 kB |
@@ -691,7 +691,7 @@ Whole module: **2.9 kB**
 | `isAbsoluteUrl`          |      310 B |
 | `isSafeUrl`              |      578 B |
 | `joinUrl`                |      652 B |
-| `parseFormData`          |      456 B |
+| `parseFormData`          |      491 B |
 | `parseQueryString`       |      355 B |
 | `safeDecodeURIComponent` |      245 B |
 | `sanitizeUrl`            |      611 B |

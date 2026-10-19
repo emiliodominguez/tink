@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0
 
 Zod-like schemas, without the dependency:
 
@@ -13,6 +13,15 @@ Zod-like schemas, without the dependency:
 - **Fixed:** `isArrayOf` and `isTuple` read the holes of a sparse array through a polluted `Array.prototype` or `Object.prototype`; holes are now always checked as `undefined`.
 - **Faster:** `isShape` (and the object patterns of `isMatching`) compile to specialized code like `parse`, about 3.5× faster (2.9× faster than zod 4 on the bundled benchmark); `isUrl` recognises plain `http(s)` URLs without the URL parser, about 5× faster (2.4× faster than zod's `z.url()`), with every other URL going through the full check as before.
 - **Fixed:** a recursive `isUnion` (through `isLazy`) whose members are told apart deep inside a value took time exponential in its depth, to check and to explain: each lazy guard now checks an object once per check, and `explain` reports the closest member only (a nested `isUnion` now scores as its closest member). A value nested too deeply to check is rejected (`Value is nested too deeply`) instead of throwing a `RangeError`.
+- **Hardening (three review passes over every module, each fix with a regression test):**
+    - **No hangs:** `countSubString` with a non-string needle, binary searches past 2^31 items, `parseJson` under a polluted `Object.prototype`, path readers on a `Proxy` that is its own prototype, and `mapConcurrent` on hand-written sources all terminate now.
+    - **No blow-ups:** `isEqual`, `isMatch` and `diff` handle subtrees shared by many paths once (they were exponential); reporting an invalid deep `lazy` value and trimming non-Latin text are linear (they were quadratic); huge sparse arrays are walked by their elements.
+    - **Hostile signals:** `async`, `emitter` and `iterables` helpers settle and clean up when an `AbortSignal`-like object's methods or `reason` getter throw, instead of crashing from a timer.
+    - **Prototype pollution and frozen prototypes:** lookup tables, `Intl` options and parsed objects never read inherited values; `safeParse`, `setPath` and `unflattenObject` work under a frozen `Object.prototype`; `secureRandom` never serves bytes from a failed refill.
+    - **Numbers and dates:** `roundToStep` is exact from 2^52, `averageBy([1e308, 1e308])` and `standardDeviation([-1e308, 1e308])` stay finite, springs settle at extreme ratios, and end-of-day/week helpers handle skipped and repeated midnights (Samoa, St. John's, Havana, Lord Howe).
+    - **Clones:** `deepClone` keeps errors as real errors, resizable buffers resizable, and views that reach the end of one length-tracking.
+    - **Types:** `pipe`/`compose` reject mismatched steps at compile time, `emitter` wrappers generic over the event map compile again, `retry` takes `PromiseLike`, and standard decorators accept methods that declare `this`.
+- **Stricter inputs (may surface bugs in callers):** a few helpers now throw a `TypeError` instead of coercing nonsense: `clamp` with non-number bounds, `levenshtein`, `similarity`, `removeDiacritics`, `isPalindrome` and `countSubString` with non-strings, `mask`/`truncate`/`wordWrap` with non-string options, a `memoize` cache missing its methods, `mapKeys` returning a non-key, `typedFromEntries` and `parseFormData` given entries that are not pairs, and `createLRUCache` with a clock that does not return a number.
 - **Package size:** the runtime budget of `yarn check:size` is now 72 kB gzipped (was 64 kB) for the new validation layer, and the packed budget 300 kB (was 280 kB) for the documentation the type declarations and `llms-full.txt` carry; per-helper import costs are listed in [docs/SIZES.md](./docs/SIZES.md).
 
 ## 1.0.1

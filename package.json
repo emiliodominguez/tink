@@ -1,6 +1,6 @@
 {
 	"name": "tinkit",
-	"version": "1.0.1",
+	"version": "1.1.0",
 	"description": "tink: strictly typed, zero-dependency, tree-shakeable TypeScript utilities for everyday JavaScript.",
 	"keywords": [
 		"typescript",
@@ -134,7 +134,6 @@
 		"zod": "^4.6.7"
 	},
 	"publishConfig": {
-		"access": "public",
-		"provenance": true
+		"access": "public"
 	}
 }
