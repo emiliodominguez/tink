@@ -2087,6 +2087,43 @@ export function check<S extends Schema>(
 }
 
 /**
+ * Creates a parser that parses the value with `schema`, and reports one issue with `message` at the value when it fails, in place of
+ * the issues of `schema` (the `error` option of zod's schemas): the wording a form shows next to its field. A missing property gets
+ * `message` as well, instead of `Missing required property`. `message` may be a function of the rejected value.
+ * @template S - The schema
+ * @param {S} schema - The schema for the value
+ * @param {string | ((value: unknown) => string)} message - The message, or a function returning it
+ * @returns {Parser<SchemaOutput<S>>} The parser
+ * @throws {TypeError} when `schema` is not a {@link Schema}, or `message` is not a string or a function
+ * @example
+ * const signUp = { email: withError(isEmail, 'Enter a valid email'), age: withError(asInteger, 'Enter your age in years') };
+ * safeParse(signUp, { age: '3.5' })[0]?.issues; // => [{ message: 'Enter a valid email', path: ['email'] }, { message: 'Enter your age in years', path: ['age'] }]
+ * parse(signUp, { email: 'ada@example.com', age: '36' }); // => { email: 'ada@example.com', age: 36 }
+ */
+export function withError<S extends Schema>(schema: S, message: string | ((value: unknown) => string)): Parser<SchemaOutput<S>> {
+	const node = compile('withError', 'schema', schema, []);
+
+	if (typeof message !== 'string' && typeof message !== 'function') {
+		throw new TypeError(`withError: \`message\` must be a string or a function, got ${describe(message)}`);
+	}
+
+	return toCompiledParser({
+		fast: node.fast,
+		// Only reached when the fast parse failed: the issues of `schema` are not even collected.
+		run: function runWithError(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			issues.push({ message: typeof message === 'string' ? message : String(message(value)), path: path.slice() });
+
+			return undefined;
+		},
+		guard: undefined,
+		missing: node.missing,
+		// Reported as is when the property is missing, rather than as `Missing required property`.
+		handlesMissing: always,
+		score: node.score
+	});
+}
+
+/**
  * Creates a parser for arrays whose elements are parsed with `schema`, returning a new array of the outputs (`z.array()`). Every
  * index from `0` to `length - 1` is parsed, so holes are parsed as `undefined`. For elements that only need checking, the guards
  * module's `isArrayOf` works too (and returns the array itself).

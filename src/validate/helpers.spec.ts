@@ -6,6 +6,7 @@ import {
 	asList,
 	blankAsUndefined,
 	check,
+	isEmail,
 	isSlug,
 	isUrl,
 	optional,
@@ -13,6 +14,7 @@ import {
 	safeParse,
 	union,
 	withDefault,
+	withError,
 	withFallback,
 	type Parser,
 	type Schema
@@ -180,5 +182,40 @@ describe('asBigInt', function () {
 				issues: [{ message: expect.stringMatching(/^Expected a bigint, an integer or an integer string \(got /), path: [] }]
 			});
 		}
+	});
+});
+
+describe('withError', function () {
+	const signUp = {
+		email: withError(isEmail, 'Enter a valid email'),
+		age: withError(asInteger, function (value: unknown): string {
+			return `Enter your age in years, not ${JSON.stringify(value)}`;
+		}),
+		name: withError(blankAsUndefined(isString), 'Enter your name')
+	};
+
+	it('should parse valid values like its schema', function () {
+		expect(parse(signUp, { email: 'ada@example.com', age: '36', name: 'Ada' })).toEqual({ email: 'ada@example.com', age: 36, name: 'Ada' });
+	});
+
+	it('should replace the issues of its schema, a missing property and a blank value included', function () {
+		expect(issuesOf(signUp, { age: '3.5', name: ' ' })).toEqual([
+			{ message: 'Enter a valid email', path: ['email'] },
+			{ message: 'Enter your age in years, not "3.5"', path: ['age'] },
+			{ message: 'Enter your name', path: ['name'] }
+		]);
+		expect(issuesOf(withError({ a: isString, b: isString }, 'Invalid pair'), { a: 1, b: 2 })).toEqual([{ message: 'Invalid pair', path: [] }]);
+	});
+
+	it('should keep the missing values, defaults and score of its schema', function () {
+		expect(parse({ name: optional(withError(blankAsUndefined(isString), 'Enter your name')) }, { name: '' })).toEqual({});
+		expect(parse(withDefault(withError(asInteger, 'x'), 1), undefined)).toBe(1);
+		expect(issuesOf(union(isNumber, withError({ n: isNumber }, 'Expected a point')), { n: 'x' })).toEqual([{ message: 'Expected a point', path: [] }]);
+	});
+
+	it('should reject a message that is not a string or a function', function () {
+		expect(function () {
+			withError(isString, 1 as unknown as string);
+		}).toThrow('withError: `message` must be a string or a function, got number');
 	});
 });
