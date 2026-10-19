@@ -572,7 +572,7 @@ function* zipped<T extends Array<Iterable<unknown>>>(iterables: T): Generator<Zi
 			const tuple = new Array<unknown>(iterators.length);
 			for (current = 0; current < iterators.length; current++) {
 				const result = iterators[current].next();
-				if (result.done === true) return;
+				if (result.done) return;
 				tuple[current] = result.value;
 			}
 			current = -1;
@@ -1217,7 +1217,16 @@ async function* mappedConcurrently(
 	function fill(): void {
 		if (pulling || exhausted || stopped || buffered >= concurrency) return;
 		pulling = true;
-		source.next().then(
+
+		let pull: Promise<IteratorResult<unknown>>;
+
+		// A hand-written source may throw from `next()` or return a plain result: treated like `for await` does.
+		try {
+			pull = Promise.resolve(source.next());
+		} catch (error) {
+			pull = Promise.reject(error);
+		}
+		pull.then(
 			function (step) {
 				pulling = false;
 				if (step.done) {
@@ -1265,6 +1274,8 @@ async function* mappedConcurrently(
 
 	signal?.addEventListener('abort', onAbort);
 
+	let failed = false;
+
 	try {
 		for (;;) {
 			if (signal?.aborted) throw abortReason(signal);
@@ -1288,15 +1299,33 @@ async function* mappedConcurrently(
 				});
 			}
 		}
+	} catch (error) {
+		failed = true;
+		throw error;
 	} finally {
 		stopped = true;
 		signal?.removeEventListener('abort', onAbort);
 		// Close the source unless it finished or failed on its own. An async generator answers a pending pull before `return()`, which
 		// may never happen (an idle stream): the close is then requested without waiting for it, so that the consumer is not blocked.
+		// When the iteration fails, a failure to close is ignored so that the original error comes out (like `for await`).
 		if (!exhausted) {
 			if (pulling) closeLater(source);
+			else if (failed) await closeQuietly(source);
 			else await source.return?.();
 		}
+	}
+}
+
+/**
+ * Closes an async iterator and waits for it, ignoring a failure to close (see {@link mapConcurrent}).
+ * @param {AsyncIterator<unknown>} source - The iterator to close
+ * @returns {Promise<void>} Settles once the iterator is closed
+ */
+async function closeQuietly(source: AsyncIterator<unknown>): Promise<void> {
+	try {
+		await source.return?.();
+	} catch {
+		// The error the iteration failed with is the one reported.
 	}
 }
 

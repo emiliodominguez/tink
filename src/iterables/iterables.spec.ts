@@ -562,6 +562,23 @@ describe('iterables', function () {
 	});
 
 	describe('zip', function () {
+		it('stops on any truthy done, like for...of', function () {
+			let i = 0;
+			const loose: Iterable<number> = {
+				[Symbol.iterator](): Iterator<number> {
+					return {
+						next(): IteratorResult<number> {
+							return (i < 2 ? { done: false, value: i++ } : { done: 1, value: undefined }) as IteratorResult<number>;
+						}
+					};
+				}
+			};
+			expect(helpers.toArray(helpers.zip(loose, [10, 20, 30]))).toEqual([
+				[0, 10],
+				[1, 20]
+			]);
+		});
+
 		it('closes the sources already opened when opening a later one throws', function () {
 			const first = spy([1, 2]);
 			const second = spy([3, 4]);
@@ -1783,6 +1800,98 @@ describe('iterables', function () {
 });
 
 describe('mapConcurrent', function () {
+	/**
+	 * A hand-written async iterator (no async generator): `next` returns what `step` gives for each pull, and calls are logged.
+	 */
+	function handWritten(step: (pull: number) => unknown, onReturn: () => unknown = function () {}): { iterable: AsyncIterable<number>; log: string[] } {
+		const log: string[] = [];
+		let pulls = 0;
+		const iterable = {
+			[Symbol.asyncIterator]: function () {
+				return {
+					next: function () {
+						log.push('next');
+						return step(pulls++);
+					},
+					return: function () {
+						log.push('return');
+						return onReturn();
+					}
+				};
+			}
+		} as unknown as AsyncIterable<number>;
+		return { iterable, log };
+	}
+
+	function identity(value: number): number {
+		return value;
+	}
+
+	it('rejects with the error of a next() that throws synchronously, without closing that source', async function () {
+		const first = handWritten(function () {
+			throw new Error('sync next');
+		});
+		await expect(helpers.toArrayAsync(helpers.mapConcurrent(first.iterable, identity, 1))).rejects.toThrow('sync next');
+		expect(first.log).toEqual(['next']);
+		const later = handWritten(function (pull) {
+			if (pull === 1) throw new Error('second pull');
+			return Promise.resolve({ done: false, value: pull });
+		});
+		await expect(helpers.toArrayAsync(helpers.mapConcurrent(later.iterable, identity, 2))).rejects.toThrow('second pull');
+		expect(later.log).toEqual(['next', 'next']);
+	});
+
+	it('accepts a next() that returns a plain result, like for await', async function () {
+		const plain = handWritten(function (pull) {
+			return pull < 3 ? { done: false, value: pull } : { done: true, value: undefined };
+		});
+		await expect(helpers.toArrayAsync(helpers.mapConcurrent(plain.iterable, identity, 2))).resolves.toEqual([0, 1, 2]);
+	});
+
+	it('reports the error the iteration failed with, not a failure to close the source', async function () {
+		function source(): AsyncIterable<number> {
+			return handWritten(
+				function (pull) {
+					return Promise.resolve({ done: false, value: pull });
+				},
+				function () {
+					return Promise.reject(new Error('cannot close'));
+				}
+			).iterable;
+		}
+		await expect(
+			helpers.toArrayAsync(
+				helpers.mapConcurrent(
+					source(),
+					async function () {
+						throw new Error('mapping failed');
+					},
+					1
+				)
+			)
+		).rejects.toThrow('mapping failed');
+		const controller = new AbortController();
+		const reason = new Error('aborted');
+		await expect(
+			helpers.toArrayAsync(
+				helpers.mapConcurrent(
+					source(),
+					function (value: number) {
+						if (value === 1) controller.abort(reason);
+						return value;
+					},
+					{ concurrency: 1, signal: controller.signal }
+				)
+			)
+		).rejects.toBe(reason);
+		// Closing after a `break` still reports its failure.
+		await expect(
+			(async function () {
+				for await (const value of helpers.mapConcurrent(source(), identity, 1)) if (value === 0) break;
+			})()
+		).rejects.toThrow('cannot close');
+	});
+
 	/**
 	 * Yields 1, then waits forever (an idle stream).
 	 */
