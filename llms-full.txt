@@ -447,7 +447,7 @@ Fuzzy matching and ranking with highlight ranges, for command palettes and filte
 Import: `import { … } from 'tinkit/search';`
 
 - `fuzzyMatch(query: string, target: string, options: FuzzyMatchOptions = {}): FuzzyMatch | undefined` — Fuzzy-matches `query` against `target` (as in command palettes and filter-as-you-type lists): the query matches when all of its characters appear in the target in order, not necessarily contiguously.
-- `fuzzySearch(items: Iterable<string>, query: string, options?: FuzzySearchOptions<string>): Array<FuzzySearchResult<string>>` — Fuzzy-filters and ranks `items` by how well they match `query` (see `fuzzyMatch` for the matching and scoring rules).
+- `fuzzySearch<T extends string>(items: Iterable<T>, query: string, options?: FuzzySearchOptions<T>): Array<FuzzySearchResult<T>>` — Fuzzy-filters and ranks `items` by how well they match `query` (see `fuzzyMatch` for the matching and scoring rules).
 - `highlight(text: string, ranges: Iterable<readonly [number, number]>): HighlightSegment[]` — Splits `text` into alternating matched / unmatched segments, e.g. to render the `ranges` of `fuzzyMatch` with `<mark>` elements in React (no `dangerouslySetInnerHTML` needed).
 
 ## easing

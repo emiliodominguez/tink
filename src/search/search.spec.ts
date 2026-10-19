@@ -2,6 +2,28 @@ import * as helpers from '.';
 
 describe('Search helpers', function () {
 	describe('fuzzyMatch', function () {
+		it('scans the target at most once per needle character when rejecting an ASCII query', function () {
+			const indexOf = jest.spyOn(String.prototype, 'indexOf');
+			try {
+				expect(helpers.fuzzyMatch('a'.repeat(100) + 'b', 'a'.repeat(1000))).toBeUndefined();
+				// The upper-case form of `a` is absent: it is looked for once, not once per query character.
+				expect(
+					indexOf.mock.calls.filter(function ([needle]) {
+						return needle === 'A';
+					})
+				).toHaveLength(1);
+			} finally {
+				indexOf.mockRestore();
+			}
+		});
+
+		it('throws a RangeError instead of allocating a back-pointer matrix of more than 2 ** 28 cells', function () {
+			const long = 'a'.repeat(20_000);
+			expect(function () {
+				helpers.fuzzyMatch(long, long);
+			}).toThrow(new RangeError('fuzzyMatch: the query and text are too long to align (20000 × 20000 code points, more than 268435456 cells)'));
+		});
+
 		it('should match subsequences and return merged, ascending UTF-16 ranges', function () {
 			expect(helpers.fuzzyMatch('fb', 'fooBar')).toEqual({
 				score: 45,
@@ -153,6 +175,25 @@ describe('Search helpers', function () {
 	});
 
 	describe('fuzzySearch', function () {
+		it('rejects array items without `key`, like any other non-string item', function () {
+			expect(function () {
+				helpers.fuzzySearch([['abc', 'xyz']] as never, 'a');
+			}).toThrow(TypeError);
+		});
+
+		it('keeps literal item types', function () {
+			const results = helpers.fuzzySearch(['x', 'y'] as const, 'x');
+			const item: 'x' | 'y' = results[0].item;
+			expect(item).toBe('x');
+		});
+
+		it('names itself when an alignment is too large', function () {
+			const long = 'a'.repeat(20_000);
+			expect(function () {
+				helpers.fuzzySearch([long], long);
+			}).toThrow(/^fuzzySearch: the query and text are too long to align/);
+		});
+
 		const files = ['src/index.ts', 'README.md', 'src/search/index.ts', 'docs/search.md'];
 
 		it('should filter and sort string items by score', function () {

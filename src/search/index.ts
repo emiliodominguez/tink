@@ -105,6 +105,8 @@ const UPPER_CASE = 4;
 const SHARED_LENGTH = 256;
 /** Largest back-pointer matrix (query code points × target code points) kept in the reused scratch buffers. */
 const SHARED_CELLS = 8192;
+/** Largest back-pointer matrix allowed (`2 ** 28` cells: 1 GiB); larger alignments throw a `RangeError`. */
+const MAX_CELLS = 2 ** 28;
 
 /**
  * A query split into code points, folded once per search.
@@ -116,6 +118,8 @@ interface PreparedQuery {
 	raw: number[];
 	/** For an ASCII query, the characters (as one string) each query character matches, to reject targets with `indexOf`; `undefined` otherwise. */
 	needles: string[] | undefined;
+	/** Scratch space of {@link contains}: the next known position of each needle character in the current target (`-1`: none left). */
+	next: Map<string, number>;
 }
 
 /**
@@ -217,21 +221,29 @@ function prepare(query: string, caseSensitive: boolean): PreparedQuery {
 			needles?.push(caseSensitive || folded < 97 || folded > 122 ? char : folded === 107 ? 'kK\u212A' : String.fromCharCode(folded, folded - 32));
 		}
 	}
-	return { codes, raw, needles };
+	return { codes, raw, needles, next: new Map() };
 }
 
 /**
  * Whether `target` contains, in order, one of the characters of every needle (the subsequence test for ASCII queries, done with `indexOf`).
+ * The next position found for each character is remembered, so that `indexOf` only runs again once the search has moved past it, and
+ * never for a character with none left: every character scans the target at most once, keeping the test O(target length).
  * @param {string[]} needles - The characters matched by each query character
+ * @param {Map<string, number>} next - Scratch space for the positions (cleared here)
  * @param {string} target - The text searched
  * @returns {boolean} `false` when the query cannot match
  */
-function contains(needles: string[], target: string): boolean {
+function contains(needles: string[], next: Map<string, number>, target: string): boolean {
+	next.clear();
 	let from = 0;
 	for (const alternatives of needles) {
 		let found = -1;
 		for (const needle of alternatives) {
-			const index = target.indexOf(needle, from);
+			let index = next.get(needle);
+			if (index === undefined || (index >= 0 && index < from)) {
+				index = target.indexOf(needle, from);
+				next.set(needle, index);
+			}
 			if (index >= 0 && (found < 0 || index < found)) found = index;
 		}
 		if (found < 0) return false;
@@ -249,16 +261,18 @@ function contains(needles: string[], target: string): boolean {
  * @param {PreparedQuery} query - The prepared query
  * @param {string} target - The text searched
  * @param {boolean} caseSensitive - Whether case must match exactly
+ * @param {string} caller - Name of the public function, for the error message
  * @returns {FuzzyMatch | undefined} The best alignment, or `undefined` when the query is not a subsequence of the target
+ * @throws {RangeError} when the back-pointer matrix would exceed `MAX_CELLS` cells
  */
-function match(query: PreparedQuery, target: string, caseSensitive: boolean): FuzzyMatch | undefined {
+function match(query: PreparedQuery, target: string, caseSensitive: boolean, caller: string): FuzzyMatch | undefined {
 	const q = query.codes;
 	const m = q.length;
 	const length = target.length;
 
 	if (m === 0) return { score: 0, ranges: [] };
 	// Fast rejections (the common case while filtering), without allocating: a target has at most `length` code points.
-	if (m > length || (query.needles !== undefined && !contains(query.needles, target))) return undefined;
+	if (m > length || (query.needles !== undefined && !contains(query.needles, query.next, target))) return undefined;
 
 	// The linear buffers first: the O(m·n) back-pointer matrix is only allocated once the subsequence check below has passed.
 	const small = length <= SHARED_LENGTH;
@@ -279,6 +293,8 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean): Fu
 	offsets[n] = length;
 	if (matched < m) return undefined;
 	const cells = m * n;
+	// An explicit cap: past a few GiB, V8 aborts the process instead of throwing when allocating the matrix.
+	if (cells > MAX_CELLS) throw new RangeError(`${caller}: the query and text are too long to align (${m} × ${n} code points, more than ${MAX_CELLS} cells)`);
 	const back = small && cells <= SHARED_CELLS ? workspace.back : new Int32Array(cells);
 
 	let [row, previousRow] = rows;
@@ -355,15 +371,15 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean): Fu
  *
  * Cost: a query longer than the target, or that is not a subsequence of it, is rejected in O(target length) time without
  * allocating more than O(target length). A matching query costs O(query length × target length) time and a back-pointer matrix of
- * 4 bytes per (query code point, target code point) pair — a 10 000-character query against a 100 000-character text is 4 GB.
- * Cap the query length of untrusted input (search boxes: 64–256 characters is plenty, e.g. `query.slice(0, 128)`), and the
+ * 4 bytes per (query code point, target code point) pair, at most `2 ** 28` pairs (1 GiB, e.g. a 1 000-character query against a
+ * 268 000-character text): larger alignments throw a `RangeError`. Cap the query length of untrusted input (search boxes: 64–256 characters is plenty, e.g. `query.slice(0, 128)`), and the
  * target lengths if they are untrusted too.
  * @param {string} query - The characters to look for, in order
  * @param {string} target - The text to search in
  * @param {FuzzyMatchOptions} [options={}] - `caseSensitive` (default `false`)
  * @returns {FuzzyMatch | undefined} The score and matched ranges of the best alignment, or `undefined` when the query is not a subsequence of the target
  * @throws {TypeError} when `query` or `target` is not a string
- * @throws {RangeError} when the back-pointer matrix of a matching query is too large to allocate (see the cost above)
+ * @throws {RangeError} when the back-pointer matrix of a matching query would exceed `2 ** 28` cells (see the cost above)
  * @example
  * fuzzyMatch('fb', 'fooBar'); // => { score: 45, ranges: [[0, 1], [3, 4]] }
  * fuzzyMatch('bar', 'fooBar'); // => { score: 65, ranges: [[3, 6]] }
@@ -378,7 +394,7 @@ export function fuzzyMatch(query: string, target: string, options: FuzzyMatchOpt
 	assertString('fuzzyMatch', 'query', query);
 	assertString('fuzzyMatch', 'target', target);
 	const caseSensitive = options.caseSensitive === true;
-	return match(prepare(query, caseSensitive), target, caseSensitive);
+	return match(prepare(query, caseSensitive), target, caseSensitive, 'fuzzyMatch');
 }
 
 /**
@@ -404,7 +420,7 @@ export function fuzzyMatch(query: string, target: string, options: FuzzyMatchOpt
  * results.map(function (r) { return r.item.id; }); // => ['find']
  * results[0].ranges; // => [[0, 1], [8, 9]]
  */
-export function fuzzySearch(items: Iterable<string>, query: string, options?: FuzzySearchOptions<string>): Array<FuzzySearchResult<string>>;
+export function fuzzySearch<T extends string>(items: Iterable<T>, query: string, options?: FuzzySearchOptions<T>): Array<FuzzySearchResult<T>>;
 export function fuzzySearch<T>(items: Iterable<T>, query: string, options: FuzzySearchOptions<T> & Required<Pick<FuzzySearchOptions<T>, 'key'>>): Array<FuzzySearchResult<T>>;
 export function fuzzySearch<T>(items: Iterable<T>, query: string, options: FuzzySearchOptions<T> = {}): Array<FuzzySearchResult<T>> {
 	const { key, limit = Infinity, threshold = -Infinity, caseSensitive = false } = options;
@@ -419,15 +435,16 @@ export function fuzzySearch<T>(items: Iterable<T>, query: string, options: Fuzzy
 	for (const item of items) {
 		const texts: unknown = key === undefined ? item : key(item);
 		let best: FuzzySearchResult<T> | undefined;
-		if (Array.isArray(texts)) {
+		// Several texts per item only come from `key`: without it, an array item is rejected like any other non-string.
+		if (key !== undefined && Array.isArray(texts)) {
 			for (const text of texts as unknown[]) {
 				assertString('fuzzySearch', name, text);
-				const result = match(prepared, text, caseSensitive);
+				const result = match(prepared, text, caseSensitive, 'fuzzySearch');
 				if (result !== undefined && (best === undefined || result.score > best.score)) best = { item, key: text, score: result.score, ranges: result.ranges };
 			}
 		} else {
 			assertString('fuzzySearch', name, texts);
-			const result = match(prepared, texts, caseSensitive);
+			const result = match(prepared, texts, caseSensitive, 'fuzzySearch');
 			if (result !== undefined) best = { item, key: texts, score: result.score, ranges: result.ranges };
 		}
 		if (best !== undefined && best.score >= threshold) results.push(best);
