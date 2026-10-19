@@ -13,7 +13,7 @@ Zod-like schemas, without the dependency:
 - **Fixed:** `isArrayOf` and `isTuple` read the holes of a sparse array through a polluted `Array.prototype` or `Object.prototype`; holes are now always checked as `undefined`.
 - **Faster:** `isShape` (and the object patterns of `isMatching`) compile to specialized code like `parse`, about 3.5× faster (2.9× faster than zod 4 on the bundled benchmark); `isUrl` recognises plain `http(s)` URLs without the URL parser, about 5× faster (2.4× faster than zod's `z.url()`), with every other URL going through the full check as before.
 - **Fixed:** a recursive `isUnion` (through `isLazy`) whose members are told apart deep inside a value took time exponential in its depth, to check and to explain: each lazy guard now checks an object once per check, and `explain` reports the closest member only (a nested `isUnion` now scores as its closest member). A value nested too deeply to check is rejected (`Value is nested too deeply`) instead of throwing a `RangeError`.
-- **Package size:** the runtime budget of `yarn check:size` is now 72 kB gzipped (was 64 kB) for the new validation layer; per-helper import costs are listed in [docs/SIZES.md](./docs/SIZES.md).
+- **Package size:** the runtime budget of `yarn check:size` is now 72 kB gzipped (was 64 kB) for the new validation layer, and the packed budget 300 kB (was 280 kB) for the documentation the type declarations and `llms-full.txt` carry; per-helper import costs are listed in [docs/SIZES.md](./docs/SIZES.md).
 
 ## 1.0.1
 
