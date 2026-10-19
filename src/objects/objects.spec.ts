@@ -345,6 +345,15 @@ describe('Objects helpers', function () {
 			expect([sharedCopy.growable, sharedCopy.maxByteLength, sharedCopy === shared]).toEqual([true, 8, false]);
 		});
 
+		it('should keep views of resizable buffers tracking their length', function () {
+			type Resizable = ArrayBuffer & { resize(length: number): void };
+			const ResizableBuffer = ArrayBuffer as unknown as new (length: number, options: { maxByteLength: number }) => Resizable;
+			const buffer = new ResizableBuffer(4, { maxByteLength: 16 });
+			const { tracking, view, fixed } = helpers.deepClone({ tracking: new Uint16Array(buffer, 2), view: new DataView(buffer), fixed: new Uint8Array(buffer, 0, 2) });
+			(tracking.buffer as Resizable).resize(8);
+			expect([tracking.length, view.byteLength, fixed.length, tracking.buffer === view.buffer]).toEqual([3, 8, 2, true]);
+		});
+
 		it('copies nested structures without sharing references', function () {
 			const original = { a: [1, { b: 2 }], c: { d: { e: 'x' } }, when: new Date(10) };
 			const copy = helpers.deepClone(original);
@@ -3399,6 +3408,37 @@ describe('Objects helpers (pass 3 regressions)', function () {
 		const started = Date.now();
 		expect(helpers.isEqual(node, helpers.deepClone(node))).toBe(true);
 		expect(Date.now() - started).toBeLessThan(1000);
+	});
+
+	it('diffs and matches shared subtrees once', function () {
+		/**
+		 * Builds a value of 2 ** 40 paths over 40 shared nodes.
+		 * @param {number} leaf - The value at the bottom
+		 * @returns {object} The value
+		 */
+		function shared(leaf: number): object {
+			let node: object = { leaf };
+			for (let i = 0; i < 40; i++) node = { l: node, r: node, list: [node] };
+			return node;
+		}
+		const started = Date.now();
+		expect(helpers.diff(shared(1), shared(1))).toStrictEqual({ added: [], removed: [], changed: [] });
+		expect(helpers.isMatch(shared(1), shared(1))).toBe(true);
+		expect(helpers.isMatch(shared(1), shared(2))).toBe(false);
+		expect(helpers.isMatch(shared(1), shared(1), { arrays: 'subset' })).toBe(true);
+		expect(Date.now() - started).toBeLessThan(1000);
+		// One subtree compared with two copies of it.
+		const big = shared(1);
+		const pair = { x: big, y: big };
+		expect(helpers.diff(pair, { x: shared(1), y: shared(1) })).toStrictEqual({ added: [], removed: [], changed: [] });
+		expect(helpers.isMatch(pair, { x: shared(1), y: shared(1) })).toBe(true);
+		// The subtree of a pair is walked in full under a cycle, which settles nothing.
+		const loop: Record<string, unknown> = { n: 1 };
+		loop.self = loop;
+		let node: object = loop;
+		for (let i = 0; i < 10; i++) node = { l: node, r: node };
+		expect(helpers.isMatch(node, helpers.deepClone(node))).toBe(true);
+		expect(helpers.isMatch(node, helpers.setPath(helpers.deepClone(node), 'l.l.l.self.n', 2))).toBe(false);
 	});
 
 	it('walks huge sparse arrays by their elements', function () {

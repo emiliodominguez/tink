@@ -1328,15 +1328,21 @@ function remember<T>(seen: Map<object, unknown> | undefined, value: object, copy
 
 /**
  * Copies a typed array or a `DataView` for a deep copy: a view of the same type, offset and length over the COPY of its buffer (copied
- * whole, once), so that views sharing a buffer still share one, as with `structuredClone`.
+ * whole, once), so that views sharing a buffer still share one, as with `structuredClone`. Over a resizable buffer, a view that reaches
+ * its end tracks its length.
  * @param {ArrayBufferView} value - The view
  * @param {Map<object, unknown>} seen - The objects already copied
  * @returns {ArrayBufferView} The copy
  */
 function copyViewOver(value: ArrayBufferView, seen: Map<object, unknown>): ArrayBufferView {
-	const buffer = copyWith(value.buffer, seen) as ArrayBufferLike;
+	const buffer = copyWith(value.buffer, seen) as ArrayBufferLike & { resizable?: boolean; growable?: boolean };
 	const name = (typedArrayTag.call(value) as string | undefined) ?? 'DataView';
-	const View = (globalThis as unknown as Record<string, new (buffer: ArrayBufferLike, byteOffset: number, length: number) => ArrayBufferView>)[name];
+	const View = (globalThis as unknown as Record<string, new (buffer: ArrayBufferLike, byteOffset: number, length?: number) => ArrayBufferView>)[name];
+	// Whether a view tracks the length of its buffer cannot be read: a view of a resizable (or growable) buffer that reaches its end is
+	// copied as length-tracking, which is how such views are made (`new Uint8Array(buffer)`), so that it grows with the copied buffer.
+	if ((buffer.resizable === true || buffer.growable === true) && value.byteOffset + value.byteLength === buffer.byteLength) {
+		return adoptPrototype(new View(buffer, value.byteOffset), value);
+	}
 	const length = name === 'DataView' ? value.byteLength : (value as unknown as { length: number }).length;
 	return adoptPrototype(new View(buffer, value.byteOffset, length), value);
 }
@@ -1357,6 +1363,7 @@ function copyChild(value: unknown, seen?: Map<object, unknown>): unknown {
  * - Arrays, plain objects and class instances are copied recursively (prototype preserved; own enumerable string AND symbol keys copied,
  *   getters are read and stored as data properties).
  * - `Date`, `RegExp` (incl. `lastIndex`), `Map` (keys and values cloned), `Set`, `ArrayBuffer`, typed arrays, `DataView` and boxed primitives get new instances.
+ *   Resizable buffers stay resizable, and a view that reaches the end of one tracks its length (whether the original did cannot be read).
  * - Errors keep their prototype and all own properties (`message`, `stack`, `cause`, ...).
  * - `WeakMap`, `WeakSet` and promises (any object with a `then` method) cannot be copied and are returned by reference.
  * - Shared and CIRCULAR references are preserved (the copy has the same reference graph).
@@ -1785,6 +1792,8 @@ type ComparisonStack = Array<[object, object, unknown?]> & {
 	assumed?: number;
 	/** Pairs with a large subtree proven equal without assumptions: a subtree shared by several paths is then compared once. */
 	proven?: WeakMap<object, object>;
+	/** For {@link isMatch}: the results of pairs with a large subtree, settled without assumptions. */
+	settled?: WeakMap<object, WeakMap<object, boolean>>;
 };
 
 /** How many nested object pairs an equal pair must have needed for {@link isEqual} to remember it (small subtrees are cheaper to redo). */
@@ -2077,8 +2086,15 @@ function matchWith(value: unknown, pattern: unknown, subset: boolean, stack: Com
 	const plain = isPlainObject(pattern);
 	if (!plain && !Array.isArray(pattern)) return isObject(pattern) && equalWith(value, pattern, []);
 	if (!(isObject(value) || isFunction(value)) || (!plain && !Array.isArray(value))) return false;
-	if (isComparing(stack, value, pattern)) return true;
+	if (isComparing(stack, value, pattern)) {
+		stack.assumed = (stack.assumed ?? 0) + 1;
+		return true;
+	}
+	const settled = stack.settled?.get(value)?.get(pattern);
+	if (settled !== undefined) return settled;
 
+	const assumed = stack.assumed ?? 0;
+	const compared = (stack.compared = (stack.compared ?? 0) + 1);
 	stack.push([value, pattern]);
 	let result: boolean;
 	if (plain) {
@@ -2102,6 +2118,14 @@ function matchWith(value: unknown, pattern: unknown, subset: boolean, stack: Com
 				});
 	}
 	stack.pop();
+	// A pair reached through several paths would otherwise be matched once per path: an exponential number of times. A mismatch holds
+	// anywhere (assuming the pairs on the stack match only made matching easier), a match only when it assumed nothing.
+	if ((stack.compared as number) - compared > PROVEN_SUBTREE && (!result || (stack.assumed ?? 0) === assumed)) {
+		const settledPairs = (stack.settled ??= new WeakMap());
+		let pairs = settledPairs.get(value);
+		if (pairs === undefined) settledPairs.set(value, (pairs = new WeakMap()));
+		pairs.set(pattern, result);
+	}
 	return result;
 }
 
@@ -2636,14 +2660,17 @@ export interface ObjectDiff {
  * @param {string} prefix - The path of the containers followed by `'.'` (empty at the root)
  * @param {string[]} missing - Receives the paths of `a` that `b` lacks (mutated)
  * @param {string[] | undefined} changed - Receives the paths of differing leaves (mutated); `undefined` to skip leaf comparisons
- * @param {Set<object>} ancestors - Containers of `a`'s tree on the current path (cycle detection: only `a`'s tree is checked, as the
- * walk stops where `b` ends and {@link diff} walks each tree in turn)
+ * @param {DiffState} state - The containers on the current path, and the pairs already found identical
  * @returns {void}
  * @throws {TypeError} when a tree contains a circular reference
  */
-function diffWalk(a: object, b: object, prefix: string, missing: string[], changed: string[] | undefined, ancestors: Set<object>): void {
+function diffWalk(a: object, b: object, prefix: string, missing: string[], changed: string[] | undefined, state: DiffState): void {
+	const { ancestors } = state;
 	if (ancestors.has(a)) throw new TypeError('diff: cannot diff circular structures');
+	if (state.same.get(a)?.has(b) === true) return;
 	ancestors.add(a);
+	const found = missing.length + (changed?.length ?? 0);
+	const walked = ++state.walked;
 
 	for (const key of Object.keys(a)) {
 		const path = prefix + key;
@@ -2655,13 +2682,31 @@ function diffWalk(a: object, b: object, prefix: string, missing: string[], chang
 		const right = (b as Properties)[key];
 		if (left === right) continue;
 		if ((Array.isArray(left) && Array.isArray(right)) || (isPlainObject(left) && isPlainObject(right))) {
-			diffWalk(left, right, path + '.', missing, changed, ancestors);
+			diffWalk(left, right, path + '.', missing, changed, state);
 		} else if (changed !== undefined && !isEqual(left, right)) {
 			changed.push(path);
 		}
 	}
 
 	ancestors.delete(a);
+	// A pair of containers shared by several paths (`{ l: node, r: node }` at every level) would otherwise be walked once per path: an
+	// exponential number of times. A pair with no difference has none under any path, so the pairs with large subtrees are remembered.
+	if (state.walked - walked > PROVEN_SUBTREE && missing.length + (changed?.length ?? 0) === found) {
+		let pairs = state.same.get(a);
+		if (pairs === undefined) state.same.set(a, (pairs = new WeakSet()));
+		pairs.add(b);
+	}
+}
+
+/** The state of one walk of {@link diffWalk}. */
+interface DiffState {
+	/** Containers of `a`'s tree on the current path (cycle detection: only `a`'s tree is checked, as the walk stops where `b` ends and
+	 * {@link diff} walks each tree in turn). */
+	readonly ancestors: Set<object>;
+	/** Pairs of containers with a large subtree found identical. */
+	readonly same: WeakMap<object, WeakSet<object>>;
+	/** The number of container pairs walked so far. */
+	walked: number;
 }
 
 /**
@@ -2690,8 +2735,8 @@ export function diff(a: object, b: object): ObjectDiff {
 		throw new TypeError('diff: `a` and `b` must both be plain objects or both be arrays');
 	}
 	const result: ObjectDiff = { added: [], removed: [], changed: [] };
-	diffWalk(a, b, '', result.removed, result.changed, new Set());
-	diffWalk(b, a, '', result.added, undefined, new Set());
+	diffWalk(a, b, '', result.removed, result.changed, { ancestors: new Set(), same: new WeakMap(), walked: 0 });
+	diffWalk(b, a, '', result.added, undefined, { ancestors: new Set(), same: new WeakMap(), walked: 0 });
 	return result;
 }
 
