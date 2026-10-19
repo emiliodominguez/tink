@@ -30,6 +30,7 @@ describe('root entry', function () {
 			'decorators',
 			'easing',
 			'emitter',
+			'encoding',
 			'format',
 			'functions',
 			'guards',

@@ -21,6 +21,7 @@ assert.deepEqual(Object.keys(root).sort(), [
 	'decorators',
 	'easing',
 	'emitter',
+	'encoding',
 	'format',
 	'functions',
 	'guards',

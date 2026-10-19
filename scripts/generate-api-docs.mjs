@@ -16,6 +16,7 @@ const MODULES = [
 	['color', 'Hex/RGB/HSL conversion, mixing, lightening and WCAG contrast checks.'],
 	['search', 'Fuzzy matching and ranking with highlight ranges, for command palettes and filter-as-you-type UIs.'],
 	['easing', 'Animation easing curves, CSS-accurate cubic-bezier() and steps(), and an analytic spring.'],
+	['encoding', 'Buffer-free base64/base64url, hex and UTF-8 conversions with strict decoding, and a synchronous SHA-256.'],
 	['format', 'Deterministic, cached Intl formatting: numbers, currency, percent, compact, units, lists, dates, ordinals.'],
 	[
 		'validate',
@@ -162,7 +163,7 @@ const llms = `# tink (tinkit)
 
 > Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities (${MODULES.length} modules, ${[...EXPORTS.values()].reduce(function (total, rows) {
 	return total + rows.length;
-}, 0)} exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, fuzzy search, caches, emitters and stores. Property-tested and mutation-tested.
+}, 0)} exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, encoding, fuzzy search, caches, emitters and stores. Property-tested and mutation-tested.
 
 ${PRINCIPLES}
 
