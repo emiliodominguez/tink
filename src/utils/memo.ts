@@ -17,7 +17,16 @@ export const PENDING: object = {};
  * How many checks (or parses) are running: the memos are released when it drops back to 0. Callers update it inline rather than
  * through a function, since a call made while unwinding a stack overflow can overflow again, and skip the update.
  */
-export const scope = { depth: 0 };
+export const scope = {
+	depth: 0,
+	/** The deepest `depth` reached since the scope opened: a stack overflow counts as a value too deep only when it is large. */
+	deepest: 0,
+	/** How many times a lazy schema met an object it was already checking (a cycle): results that did are not remembered. */
+	cycles: 0
+};
+
+/** The nesting of lazy schemas from which a stack overflow is blamed on the value, not on the code (a guard or transform recursing). */
+const TOO_DEEP = 100;
 
 /** The memos (and sets of objects being explained) holding entries. */
 const held: Array<Map<object, unknown> | Set<object>> = [];
@@ -44,6 +53,7 @@ export function hold<C extends Map<object, unknown> | Set<object>>(collection: C
 export function release(): void {
 	for (let index = 0; index < held.length; index++) held[index].clear();
 	held.length = 0;
+	scope.deepest = 0;
 }
 
 /**
@@ -51,8 +61,19 @@ export function release(): void {
  * `InternalError: too much recursion` in SpiderMonkey).
  * @param {unknown} error - The thrown value
  * @returns {boolean} `true` for a stack overflow
+ */
+function isStackOverflow(error: unknown): boolean {
+	return error instanceof Error && (error.name === 'RangeError' || error.name === 'InternalError') && /call stack|too much recursion/i.test(error.message);
+}
+
+/**
+ * Whether `error`, caught by the outermost check (or parse), means the value is nested too deeply to check: a stack overflow, raised
+ * after lazy schemas nested at least {@link TOO_DEEP} deep. An overflow at a shallower nesting comes from the code (a guard or a
+ * transform that recurses forever, or a check started near the stack limit), and is rethrown.
+ * @param {unknown} error - The thrown value
+ * @returns {boolean} `true` for a value too deep to check
  * @internal
  */
-export function isStackOverflow(error: unknown): boolean {
-	return error instanceof Error && (error.name === 'RangeError' || error.name === 'InternalError') && /call stack|too much recursion/i.test(error.message);
+export function isTooDeep(error: unknown): boolean {
+	return scope.deepest >= TOO_DEEP && isStackOverflow(error);
 }

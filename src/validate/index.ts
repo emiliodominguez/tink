@@ -13,7 +13,7 @@ import {
 import { describe } from '../utils/assert.js';
 import type { AnyFunction } from '../utils/index.js';
 import { generate } from '../utils/jit.js';
-import { hold, isStackOverflow, PENDING, release, scope } from '../utils/memo.js';
+import { hold, isTooDeep, PENDING, release, scope } from '../utils/memo.js';
 import { guardScore } from '../utils/score.js';
 
 /**
@@ -1281,11 +1281,7 @@ export interface ObjectSchema {
  *   its output is returned;
  * - a plain object of schemas ({@link ObjectSchema}), nested as deep as needed.
  */
-// The guard member is `value is any`, not `value is unknown`: as the constraint of a schema argument it is also the contextual type of a
-// generic guard written in place, and `unknown` would infer `isLiteral('b')` as a guard of `unknown` when a callback argument is annotated
-// (`transform(isLiteral('b'), function (tag: 'b') {…})`).
-// oxlint-disable-next-line typescript/no-explicit-any
-export type Schema = ((value: unknown) => value is any) | StandardSchemaLike | ObjectSchema;
+export type Schema = Guard<unknown> | StandardSchemaLike | ObjectSchema;
 
 /**
  * The output type of a {@link Schema}: the guarded type of a guard, the output of a parser or Standard Schema validator, and for object
@@ -1730,7 +1726,7 @@ function report(run: Run, value: unknown, issues: SchemaIssue[]): unknown {
 		return run(value, [], issues);
 	} catch (error) {
 		// Only the outermost parse turns it into an issue: a parse nested in a transform lets it reach the parse around it.
-		if (scope.depth !== 1 || !isStackOverflow(error)) throw error;
+		if (scope.depth !== 1 || !isTooDeep(error)) throw error;
 		issues.length = 0;
 		issues.push({ message: 'Value is nested too deeply', path: [] });
 
@@ -2819,19 +2815,29 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 
 			const known = memo.get(value);
 
-			if (known !== undefined || memo.has(value)) return known === PENDING ? FAIL : known;
+			if (known === PENDING) {
+				scope.cycles++;
+
+				return FAIL;
+			}
+			if (known !== undefined || memo.has(value)) return known;
 			hold(memo).set(value, PENDING);
+
+			const cycles = scope.cycles;
+
 			// The outermost lazy parser of a fast parse scopes the memos of the parsers it reaches to its call.
-			scope.depth++;
+			if (++scope.depth > scope.deepest) scope.deepest = scope.depth;
 			try {
 				const output = node.fast(value);
 
-				memo.set(value, output);
+				// An output that met a cycle depends on the path that led here (which objects were being parsed): it is not remembered.
+				if (scope.cycles === cycles) memo.set(value, output);
+				else memo.delete(value);
 
 				return output;
 			} catch (error) {
 				// A value too deep to parse fails; the reporting parse then reports it (see `execute`).
-				if (scope.depth === 1 && isStackOverflow(error)) return FAIL;
+				if (scope.depth === 1 && isTooDeep(error)) return FAIL;
 				memo.delete(value);
 				throw error;
 			} finally {
@@ -2848,11 +2854,14 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 				return undefined;
 			}
 			hold(reporting).add(value);
+			// A parser of another copy of tinkit may report through this one: the scope keeps `reporting` until this call returns.
+			if (++scope.depth > scope.deepest) scope.deepest = scope.depth;
 			try {
 				// The fast parse of this very value just failed: parsing it again first would double the cost at every level.
 				return node.run(value, path, issues);
 			} finally {
 				reporting.delete(value);
+				if (--scope.depth === 0) release();
 			}
 		},
 		guard: undefined,

@@ -352,42 +352,116 @@ describe('recursive unions told apart deep inside', function () {
 		}).toThrow('Value is nested too deeply');
 	});
 
-	it('should treat the overflow errors of every engine as such, whatever throws them', function () {
+	describe('stack overflows', function () {
 		/**
-		 * Returns a guard that throws `error`.
+		 * Returns a guard that throws `error` for strings, and rejects anything else.
 		 * @param {Error} error - The error
-		 * @returns {Guard<string>} The guard
+		 * @returns {Guard<never>} The guard
 		 */
-		function throwing(error: Error): Guard<string> {
-			return function isNever(_value: unknown): _value is string {
-				throw error;
+		function throwing(error: Error): Guard<never> {
+			return function isNever(value: unknown): value is never {
+				if (typeof value === 'string') throw error;
+
+				return false;
 			};
 		}
+
+		/**
+		 * Builds `{ next: { next: … 'leaf' } }`, `depth` objects deep.
+		 * @param {number} depth - The depth
+		 * @returns {object} The value
+		 */
+		function nest(depth: number): object {
+			let value: unknown = 'leaf';
+
+			for (let level = 0; level < depth; level++) value = { next: value };
+
+			return value as object;
+		}
+
+		/**
+		 * A lazy parser and a lazy guard of `{ next }` chains whose leaf is checked by `throwing(error)`.
+		 * @param {Error} error - The error the leaf throws
+		 * @returns {[Parser<unknown>, Guard<unknown>]} The parser and the guard
+		 */
+		function chains(error: Error): [Parser<unknown>, Guard<unknown>] {
+			const parser: Parser<unknown> = lazy(function () {
+				return { next: union(throwing(error), parser) };
+			});
+			const guard: Guard<unknown> = isLazy(function () {
+				return isShape({ next: isUnion(throwing(error), guard) });
+			});
+
+			return [parser, guard];
+		}
+
 		const v8 = new RangeError('Maximum call stack size exceeded');
 		const spiderMonkey = Object.assign(new Error('too much recursion'), { name: 'InternalError' });
 		const other = new RangeError('Invalid array length');
 		const overflowed = [{ message: 'Value is nested too deeply', path: [] }];
 
-		// The fast parse fails on `b` before reaching `a`: `a` is first parsed by the reporting parse.
-		expect(issuesOf({ b: isString, a: throwing(v8) }, { b: 1, a: 'x' })).toEqual(overflowed);
-		expect(issuesOf({ b: isString, a: throwing(spiderMonkey) }, { b: 1, a: 'x' })).toEqual(overflowed);
-		expect(function () {
-			safeParse({ b: isString, a: throwing(other) }, { b: 1, a: 'x' });
-		}).toThrow(other);
-		expect(
-			isLazy(function () {
-				return throwing(v8);
-			})({})
-		).toBe(false);
-		expect(function () {
-			isLazy(function () {
-				return throwing(other);
-			})({});
-		}).toThrow(other);
-		expect(explain(isShape({ a: throwing(spiderMonkey) }), { a: 1 })).toEqual(overflowed);
-		expect(function () {
-			explain(isShape({ a: throwing(other) }), { a: 1 });
-		}).toThrow(other);
+		it('should blame the value for an overflow raised deep in lazy schemas, on every engine', function () {
+			for (const error of [v8, spiderMonkey]) {
+				const [parser, guard] = chains(error);
+
+				expect(issuesOf(parser, nest(150))).toEqual(overflowed);
+				expect(guard(nest(150))).toBe(false);
+				expect(explain(guard, nest(150))).toEqual(overflowed);
+			}
+		});
+
+		it('should rethrow an overflow raised close to the root: the code recursed, not the value', function () {
+			const [parser, guard] = chains(v8);
+
+			expect(function () {
+				safeParse(parser, nest(3));
+			}).toThrow(v8);
+			expect(function () {
+				guard(nest(3));
+			}).toThrow(v8);
+			expect(function () {
+				explain(guard, nest(3));
+			}).toThrow(v8);
+
+			const recursing = lazy(function () {
+				return transform({ a: isString }, function forever(value: { a: string }): never {
+					return forever(value);
+				});
+			});
+
+			expect(function () {
+				parse(recursing, { a: 'x' });
+			}).toThrow(RangeError);
+		});
+
+		it('should let a reporting parse nested in another one rethrow to it', function () {
+			const inner = { b: isString, a: throwing(v8) };
+			// Both fast parses fail on `b` before reaching `a`, which only the reporting parses check.
+			const outer = {
+				b: isString,
+				a: transform(isString, function (): unknown {
+					return safeParse(inner, { b: 1, a: 'x' });
+				})
+			};
+
+			expect(function () {
+				safeParse(outer, { b: 1, a: 'x' });
+			}).toThrow(v8);
+		});
+
+		it('should rethrow other errors', function () {
+			const [parser, guard] = chains(other);
+
+			expect(function () {
+				safeParse(parser, nest(150));
+			}).toThrow(other);
+			expect(function () {
+				guard(nest(150));
+			}).toThrow(other);
+			expect(function () {
+				explain(guard, nest(150));
+			}).toThrow(other);
+		});
 	});
 
 	it('should let a transform report a parse of its own while the parse around it reports', function () {
@@ -447,6 +521,54 @@ describe('recursive unions told apart deep inside', function () {
 		}).toThrow('Invalid array length');
 		throws = false;
 		expect(parse(fragile, value)).toBe(value);
+	});
+
+	it('should detect cycles while another copy of tinkit reports through a lazy parser', function () {
+		type Tree = { children: Tree[] };
+		const tree: Parser<Tree> = lazy(function () {
+			return { children: arrayOf(tree) };
+		});
+		const node = (tree as unknown as Record<string, { run(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown }>)['~tink.1'];
+		const a: Tree = { children: [] };
+		const b: Tree = { children: [a] };
+		const issues: SchemaIssue[] = [];
+
+		a.children.push(b);
+		node.run(a, [], issues);
+		expect(issues).toEqual([{ message: 'Circular reference', path: ['children', 0, 'children', 0] }]);
+	});
+
+	it('should give circular values the same result whatever the order they are met in', function () {
+		const isNode: Guard<unknown> = isLazy(function () {
+			return isUnion(arrayOfGuard(isNode), isShape({ next: isNode }), isShape({ tag: isString }));
+		});
+		const node: Parser<unknown> = lazy(function () {
+			return union(arrayOf(node), { next: node }, { tag: isString });
+		});
+		const a: Record<string, unknown> = { tag: 'a' };
+		const b: Record<string, unknown> = { tag: 'b' };
+
+		a.next = b;
+		b.next = a;
+		expect(isNode([a, b])).toBe(true);
+		expect(isNode([b, a])).toBe(true);
+		expect(explain(isNode, [a, b])).toEqual([]);
+		expect(parse(node, [a, b])).toEqual((parse(node, [b, a]) as unknown[]).reverse());
+	});
+
+	it('should remember a truthy result of a guard that is not a boolean as a pass', function () {
+		const isOk = isLazy(function () {
+			return function hasOk(value: unknown): value is { ok: unknown } {
+				return (value as { ok?: unknown }).ok as boolean;
+			};
+		});
+		const leaf = { ok: 1 };
+
+		expect(
+			isLazy(function () {
+				return isShape({ a: isOk, b: isOk });
+			})({ a: leaf, b: leaf })
+		).toBe(true);
 	});
 
 	it('should keep the memo of a lazy parser called outside a parse to that call', function () {

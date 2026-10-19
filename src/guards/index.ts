@@ -1,7 +1,7 @@
 import { assertFunction, assertNumber, describe as typeName } from '../utils/assert.js';
 import type { AnyFunction, Primitive, UnionToIntersection } from '../utils/index.js';
 import { generate } from '../utils/jit.js';
-import { hold, isStackOverflow, PENDING, release, scope } from '../utils/memo.js';
+import { hold, isTooDeep, PENDING, release, scope } from '../utils/memo.js';
 import { guardScore, scored } from '../utils/score.js';
 
 /**
@@ -2127,18 +2127,28 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 
 			const known = memo.get(value);
 
+			if (known === PENDING) {
+				scope.cycles++;
+
+				return false;
+			}
 			if (known !== undefined) return known === true;
 			hold(memo).set(value, PENDING);
-			scope.depth++;
+
+			const cycles = scope.cycles;
+
+			if (++scope.depth > scope.deepest) scope.deepest = scope.depth;
 			try {
 				const passed = guard(value);
 
-				memo.set(value, passed);
+				// A result that met a cycle depends on the path that led here (which objects were being checked): it is not remembered.
+				if (scope.cycles === cycles) memo.set(value, Boolean(passed));
+				else memo.delete(value);
 
 				return passed;
 			} catch (error) {
 				// The outermost check rejects a value too deep to check; inside `explain`, or another lazy guard, the error goes on up.
-				if (scope.depth === 1 && isStackOverflow(error)) return false;
+				if (scope.depth === 1 && isTooDeep(error)) return false;
 				memo.delete(value);
 				throw error;
 			} finally {
@@ -2154,6 +2164,7 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 
 				return false;
 			}
+			// Explainers only run inside `explain` (or a parse of the validate module), whose scope keeps `explaining` until it ends.
 			hold(explaining).add(value);
 			try {
 				return collect(guard, value, path, issues);
@@ -2291,7 +2302,7 @@ export function explain(guard: Guard<unknown>, value: unknown): SchemaIssue[] {
 		// Guards never consult the explainers, so valid values take the fast path and allocate nothing beyond the result.
 		if (!guard(value)) collect(guard, value, [], issues);
 	} catch (error) {
-		if (scope.depth !== 1 || !isStackOverflow(error)) throw error;
+		if (scope.depth !== 1 || !isTooDeep(error)) throw error;
 		issues.length = 0;
 		issues.push({ message: 'Value is nested too deeply', path: [] });
 	} finally {

@@ -49,7 +49,7 @@ import {
 	withError,
 	withFallback
 } from 'tinkit/validate';
-import type { Parser, SchemaOutput } from 'tinkit/validate';
+import type { Parser, Schema, SchemaOutput } from 'tinkit/validate';
 import type { StandardSchemaV1 } from '@standard-schema/spec';
 // The root entry pulls in every module's declarations.
 import * as everything from 'tinkit';
@@ -200,13 +200,10 @@ const extras: { page: number; ids: bigint[]; origins: string[]; age: number } = 
 );
 // @ts-expect-error the fallback must match the schema's output
 const badFallback = withFallback(asInteger, 'x');
-// A generic guard written in place keeps its type when the callback parameter is annotated.
-const tagLength: Parser<number> = transform(isOneOf(['a', 'bb']), function (tag: 'a' | 'bb'): number {
-	return tag.length;
-});
-const area: Parser<number> = transform(isShape({ w: isFiniteNumber, h: isFiniteNumber }), function (size: { w: number; h: number }): number {
-	return size.w * size.h;
-});
+// A schema only known as a `Schema` outputs `unknown`, never `any`.
+declare const someSchema: Schema;
+// @ts-expect-error the output must be narrowed before use
+const unknownOutput: number = parse(someSchema, 1).length;
 
 // README tour: key transforms keep their value types.
 const camel: { userId: number; createdAt: string } = toCamelCaseKeys({ user_id: 1, created_at: '2024-01-01' });
@@ -214,4 +211,4 @@ const camel: { userId: number; createdAt: string } = toCamelCaseKeys({ user_id: 
 const snake = camel.user_id;
 export { a, b, c, keys, v, m, dm, p, o, r, f, g, everything, spec, output, wrong, camel, snake };
 export { figure, badFigure, envBack, envWrong, port, envSpec, badDefault };
-export { click, legacy, badEvent, parsedShapes, locales, category, patch, strict, fieldErrors, tagLength, area, formTypes, extras, badFallback };
+export { click, legacy, badEvent, parsedShapes, locales, category, patch, strict, fieldErrors, formTypes, extras, badFallback, unknownOutput };

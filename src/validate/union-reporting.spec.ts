@@ -128,7 +128,8 @@ describe('missing values in unions', function () {
 
 	it('should parse an optional recursive union in linear time', function () {
 		let runs = 0;
-		const tagOf = transform(isLiteral('b'), function (tag: 'b'): 'b' {
+		const isB = isLiteral('b');
+		const tagOf = transform(isB, function (tag: 'b'): 'b' {
 			runs++;
 
 			return tag;
