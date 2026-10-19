@@ -1,7 +1,7 @@
 name: Release
 
 # Publishes to npm when a version tag (e.g. v1.0.0) is pushed, using npm trusted publishing (OIDC): no long-lived npm token exists.
-# One-time setup on npmjs.com → package settings → Trusted publishing: GitHub Actions, repository emiliodominguez/js-helpers,
+# One-time setup on npmjs.com → package settings → Trusted publishing: GitHub Actions, repository emiliodominguez/tinkit,
 # workflow `release.yml`, environment `npm`. Then create the `npm` environment in the repository settings (add required reviewers).
 #
 # The job that runs project code (dev dependencies, tests, doctests) has no publishing rights; the job that can publish runs no

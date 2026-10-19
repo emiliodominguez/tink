@@ -10,7 +10,7 @@
 ## Reporting a vulnerability
 
 Please **do not open a public issue**. Report it privately through
-[GitHub Security Advisories](https://github.com/emiliodominguez/js-helpers/security/advisories/new) ("Report a vulnerability").
+[GitHub Security Advisories](https://github.com/emiliodominguez/tinkit/security/advisories/new) ("Report a vulnerability").
 
 Include the affected function, the input that triggers the problem and what you expected. You will get an acknowledgement within
 7 days; fixes are released as a patch version and credited in the advisory unless you prefer otherwise. Please give us a reasonable

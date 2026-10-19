@@ -148,7 +148,7 @@ const output = `# API reference\n\n> Generated from the JSDoc in \`src/*/index.t
 mkdirSync('docs', { recursive: true });
 writeFileSync('docs/API.md', output);
 
-const REPO = 'https://github.com/emiliodominguez/js-helpers/blob/main';
+const REPO = 'https://github.com/emiliodominguez/tinkit/blob/main';
 const PRINCIPLES = `Key facts for code generation:
 - ESM only, zero dependencies, Node >= 20.19 or any modern browser/runtime. TypeScript types ship in the package.
 - Import from module entry points: \`import { debounce } from 'tinkit/functions'\` (the root entry exposes namespaces: \`import { functions } from 'tinkit'\`).

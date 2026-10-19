@@ -1,6 +1,6 @@
-![tinkit: Small utilities. Solid foundations. A smiling pastel building block next to the wordmark tinkit, an npm i tinkit command and four facts: ~600 typed helpers, 20 modules, 0 dependencies, tree-shakeable.](https://raw.githubusercontent.com/emiliodominguez/js-helpers/main/docs/assets/tinkit-banner.png)
+![tinkit: Small utilities. Solid foundations. A smiling pastel building block next to the wordmark tinkit, an npm i tinkit command and four facts: ~600 typed helpers, 20 modules, 0 dependencies, tree-shakeable.](https://raw.githubusercontent.com/emiliodominguez/tinkit/main/docs/assets/tinkit-banner.png)
 
-[![CI](https://img.shields.io/github/actions/workflow/status/emiliodominguez/js-helpers/tests.yml?branch=main&style=for-the-badge&label=CI&labelColor=161b22&logo=githubactions&logoColor=white)](https://github.com/emiliodominguez/js-helpers/actions/workflows/tests.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/emiliodominguez/tinkit/tests.yml?branch=main&style=for-the-badge&label=CI&labelColor=161b22&logo=githubactions&logoColor=white)](https://github.com/emiliodominguez/tinkit/actions/workflows/tests.yml)
 [![TypeScript: strict](https://img.shields.io/badge/TS-strict-3178c6?style=for-the-badge&labelColor=161b22&logo=typescript&logoColor=white)](./tsconfig.json)
 [![Runtime dependencies: 0](https://img.shields.io/badge/deps-0-2ea44f?style=for-the-badge&labelColor=161b22&logo=npm&logoColor=white)](./package.json)
 [![Property tests: fast-check](https://img.shields.io/badge/tests-fast--check-8250df?style=for-the-badge&labelColor=161b22&logo=jest&logoColor=white)](#how-its-tested)

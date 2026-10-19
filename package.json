@@ -28,12 +28,12 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/emiliodominguez/js-helpers.git"
+		"url": "git+https://github.com/emiliodominguez/tinkit.git"
 	},
 	"bugs": {
-		"url": "https://github.com/emiliodominguez/js-helpers/issues"
+		"url": "https://github.com/emiliodominguez/tinkit/issues"
 	},
-	"homepage": "https://github.com/emiliodominguez/js-helpers#readme",
+	"homepage": "https://github.com/emiliodominguez/tinkit#readme",
 	"type": "module",
 	"types": "./dist/index.d.ts",
 	"exports": {
