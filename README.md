@@ -8,7 +8,7 @@
 
 **Strictly typed utilities for everyday JavaScript, with the edge cases handled.**
 
-~600 tree-shakeable helpers · 20 modules · zero dependencies · a median of 450 B per import
+~600 tree-shakeable helpers · 20 modules · zero dependencies · a median of 490 B per import
 
 ```bash
 npm install tinkit
@@ -137,7 +137,7 @@ More examples, including dates, text and decorators, are in [Recipes](./docs/REC
 
 ## Numbers
 
-- **Size:** a median of 450 B per import, 2.7 kB at most, 57 kB gzipped for all 20 modules. The cost of every export is in [docs/SIZES.md](./docs/SIZES.md).
+- **Size:** a median of 490 B per import, 3.4 kB at most, 64 kB gzipped for all 20 modules. The cost of every export is in [docs/SIZES.md](./docs/SIZES.md).
 - **Speed:** benchmarked at 10, 1k and 100k items against the popular libraries with the same helpers. Results are in [docs/PERFORMANCE.md](./docs/PERFORMANCE.md) (`yarn bench`).
 
 ## How it's tested
