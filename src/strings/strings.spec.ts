@@ -1482,3 +1482,20 @@ describe('getWords on non-ASCII text without words', function () {
 		expect(helpers.getWords('é')).toEqual(['é']);
 	});
 });
+
+describe('strings (helper review regressions)', function () {
+	it('isPalindrome and countSubString ignore the case of the Greek sigma', function () {
+		expect(helpers.isPalindrome('ΣΟΣ', { ignoreCase: true })).toBe(true);
+		expect(helpers.countSubString('ΟΔΟΣ', 'Σ', { ignoreCase: true })).toBe(1);
+		expect(helpers.countSubString('ΟΔΟΣ', 'ς', { ignoreCase: true })).toBe(1);
+		expect(helpers.isPalindrome('ΣΟΣ')).toBe(true);
+		expect(helpers.isPalindrome('σος')).toBe(false);
+	});
+
+	it('randomString rejects alphabets with lone surrogates, which could pair up in the result', function () {
+		expect(function () {
+			helpers.randomString(2, '\udc00\ud83d');
+		}).toThrow(new RangeError('randomString: `alphabet` must not contain lone surrogates'));
+		expect(Array.from(helpers.randomString(4, 'a🍎'))).toHaveLength(4);
+	});
+});

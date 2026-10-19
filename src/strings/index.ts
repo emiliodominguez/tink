@@ -6,7 +6,7 @@ import { isNumericString } from '../validate/index.js';
  * Options accepted by {@link countSubString}.
  */
 export interface CountSubStringOptions {
-	/** Compare case-insensitively (both strings are lower-cased with `String.prototype.toLowerCase`). Defaults to `false`. */
+	/** Compare case-insensitively (both strings are lower-cased with `String.prototype.toLowerCase`, final `ς` read as `σ`). Defaults to `false`. */
 	readonly ignoreCase?: boolean;
 }
 
@@ -14,7 +14,7 @@ export interface CountSubStringOptions {
  * Options accepted by {@link isPalindrome}.
  */
 export interface IsPalindromeOptions {
-	/** Compare case-insensitively (the string is lower-cased with `String.prototype.toLowerCase`). Defaults to `false`. */
+	/** Compare case-insensitively (the string is lower-cased with `String.prototype.toLowerCase`, final `ς` read as `σ`). Defaults to `false`. */
 	readonly ignoreCase?: boolean;
 	/** Ignore every character that is not a Unicode letter, combining mark or number (spaces, punctuation, symbols...). Defaults to `false`. */
 	readonly ignoreNonAlphanumeric?: boolean;
@@ -657,7 +657,7 @@ export function endsWith(string: string, subString: string): boolean {
 /**
  * Counts the non-overlapping, literal occurrences of a substring, scanning left to right (`countSubString('aaaa', 'aa')` is `2`).
  * The comparison is case-sensitive by default. With `ignoreCase`, both strings are lower-cased with the locale-independent
- * `String.prototype.toLowerCase` before counting; since a few characters change length when lower-cased (e.g. `'İ'`), the count is
+ * `String.prototype.toLowerCase` (and the final sigma `ς` read as `σ`, since `'Σ'` lower-cases to either) before counting; since a few characters change length when lower-cased (e.g. `'İ'`), the count is
  * computed on the lower-cased forms.
  * @param {string} string - The string to search in
  * @param {string} subString - The substring to search for; an empty substring yields `0`
@@ -672,8 +672,8 @@ export function endsWith(string: string, subString: string): boolean {
 export function countSubString(string: string, subString: string, options: CountSubStringOptions = {}): number {
 	if (subString === '') return 0;
 
-	const haystack = options.ignoreCase ? string.toLowerCase() : string;
-	const needle = options.ignoreCase ? subString.toLowerCase() : subString;
+	const haystack = options.ignoreCase ? foldCase(string) : string;
+	const needle = options.ignoreCase ? foldCase(subString) : subString;
 	let count = 0;
 	let index = haystack.indexOf(needle);
 
@@ -722,9 +722,21 @@ export function getWords(string: string): string[] {
 export function isPalindrome(string: string, options: IsPalindromeOptions = {}): boolean {
 	let candidate = options.ignoreNonAlphanumeric ? string.replace(/[^\p{L}\p{M}\p{N}]/gu, '') : string;
 
-	if (options.ignoreCase) candidate = candidate.toLowerCase();
+	if (options.ignoreCase) candidate = foldCase(candidate);
 
 	return candidate === reverse(candidate);
+}
+
+/**
+ * Lower-cases a string for case-insensitive comparisons: `String.prototype.toLowerCase`, with the final sigma `ς` read as `σ` (`'Σ'`
+ * lower-cases to `ς` at the end of a word and to `σ` elsewhere, so `'ΣΟΣ'` would not read the same backwards). The length is unchanged.
+ * @param {string} string - The string
+ * @returns {string} Its folded form
+ * @example
+ * foldCase('ΣΟΣ'); // => 'σοσ'
+ */
+function foldCase(string: string): string {
+	return string.toLowerCase().replace(/ς/g, 'σ');
 }
 
 /**
@@ -1310,7 +1322,8 @@ const ALPHANUMERIC = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012345
  * @param {string} [alphabet='A-Za-z0-9'] - The characters to choose from (defaults to the 62 ASCII letters and digits)
  * @param {RandomGenerator} [random=Math.random] - Source of uniform numbers in `[0, 1)`, injectable for deterministic results
  * @returns {string} The random string
- * @throws {RangeError} when `length` is not a non-negative integer, `alphabet` is empty, or `random()` returns a value outside `[0, 1)`
+ * @throws {RangeError} when `length` is not a non-negative integer, `alphabet` is empty or contains lone surrogates (which could pair
+ * up into a different character in the result), or `random()` returns a value outside `[0, 1)`
  * @throws {TypeError} when `length` is not a number, or `random` is not a function
  * @example
  * randomString(8); // e.g. 'aZ3kP0qx'
@@ -1323,6 +1336,8 @@ export function randomString(length: number, alphabet: string = ALPHANUMERIC, ra
 	const characters = Array.from(new Set(alphabet));
 
 	if (characters.length === 0) throw new RangeError('randomString: `alphabet` must not be empty');
+	// A lone surrogate counts as one code point here, but in the result a high one followed by a low one would form a single character.
+	if (/\p{Cs}/u.test(alphabet)) throw new RangeError('randomString: `alphabet` must not contain lone surrogates');
 
 	let result = '';
 
