@@ -10,6 +10,9 @@ Zod-like schemas, without the dependency:
 - **Real-world input:** `asArray` (a repeated query parameter is a string or an array), `blankAsUndefined` (an empty form field counts as missing) and `asJson` (JSON in an environment variable, pollution-safe); `issuesByPath` (`guards`) turns issues into per-field messages.
 - **`guards`:** `isDiscriminatedUnion` (direct variant lookup, with the tag added to each variant's type), `isIntegerInRange`, `isStringOfLength` and `isStringMatching` (stateless with `g`/`y` regexes). Their failures are explained without echoing the rejected strings.
 - **Fixed:** `isArrayOf` and `isTuple` read the holes of a sparse array through a polluted `Array.prototype` or `Object.prototype`; holes are now always checked as `undefined`.
+- **Faster:** `isShape` (and the object patterns of `isMatching`) compile to specialized code like `parse`, about 3.5× faster (2.9× faster than zod 4 on the bundled benchmark); `isUrl` recognises plain `http(s)` URLs without the URL parser, about 5× faster (2.4× faster than zod's `z.url()`), with every other URL going through the full check as before.
+- **Fixed:** explaining a recursive `isUnion` (through `isLazy`) took time exponential in the depth of an invalid value; it now explains the closest member only.
+- **Package size:** the runtime budget of `yarn check:size` is now 72 kB gzipped (was 64 kB) for the new validation layer; per-helper import costs are listed in [docs/SIZES.md](./docs/SIZES.md).
 
 ## 1.0.1
 

@@ -1,5 +1,7 @@
 import { assertFunction, assertNumber, describe as typeName } from '../utils/assert.js';
 import type { AnyFunction, Primitive, UnionToIntersection } from '../utils/index.js';
+import { generate } from '../utils/jit.js';
+import { guardScore, scored } from '../utils/score.js';
 
 /**
  * Returns the internal `[object Tag]` string of a value (as produced by `Object.prototype.toString`).
@@ -1202,7 +1204,8 @@ function isArrayPrototypePolluted(): boolean {
  * Each guard receives the OWN property value, or `undefined` when the property is missing or only inherited (so `toString` or a
  * polluted `Object.prototype` can never satisfy a shape). Properties whose guard accepts `undefined` (see {@link isOptional}) are
  * optional in the inferred type. Arrays and `null` are rejected. The shape is copied, so later mutations do not affect the guard.
- * Combine with {@link explain}, {@link ensure} or {@link toStandardSchema} for path-aware error reports.
+ * Combine with {@link explain}, {@link ensure} or {@link toStandardSchema} for path-aware error reports. The check compiles to specialized
+ * code where `new Function` is allowed (a loop otherwise); like any reflective check, it trusts the traps of a `Proxy`, which is code, not data.
  * @template S - The property guards
  * @param {S} shape - A plain object mapping each property name to its guard
  * @param {IsShapeOptions} [options] - `exact` rejects unknown keys
@@ -1247,6 +1250,57 @@ function isDiscriminant(value: object, key: string): boolean {
 }
 
 /**
+ * Generates the check of a shape with string keys: one named property read and one direct guard call per key (see `utils/jit.ts`).
+ * Objects that inherit from `Object.prototype` (or nothing) are read directly once `Object.prototype` is known to hold none of the keys,
+ * since every defined value is then an own property and a missing key reads as `undefined`, which is what the loop checks it as; other
+ * objects, and a polluted `Object.prototype`, take `loop`.
+ * @param {ReadonlyArray<string>} keys - The checked keys
+ * @param {ReadonlyArray<Guard<unknown>>} guards - The guard of each key
+ * @param {ReadonlyArray<boolean> | undefined} required - Per key, whether it must be an own property
+ * @param {((value: object) => boolean) | undefined} hasUnknownKey - For exact shapes, whether an object has a key the shape does not know
+ * @param {Guard<unknown>} loop - The key-by-key check to fall back to
+ * @returns {Guard<unknown> | undefined} The generated check, or `undefined` when code generation is disallowed
+ */
+function generateShape(
+	keys: ReadonlyArray<string>,
+	guards: ReadonlyArray<Guard<unknown>>,
+	required: ReadonlyArray<boolean> | undefined,
+	hasUnknownKey: ((value: object) => boolean) | undefined,
+	loop: Guard<unknown>
+): Guard<unknown> | undefined {
+	const literals = keys.map(function (key: string): string {
+		return JSON.stringify(key);
+	});
+	// The generated code ships as written, so its names are short: `v` the value, `x` a property value, `g0`… the guards; the parameters
+	// are listed in the `generate` call below.
+	const source = [
+		...literals.map(function (_: string, index: number): string {
+			return `const g${index} = G[${index}];`;
+		}),
+		'return function isShaped(v) {',
+		"if (typeof v !== 'object' || v === null || A(v)) return false;",
+		'const p = P(v);',
+		`if ((p !== O && p !== null)${literals
+			.map(function (key: string): string {
+				return ` || ${key} in O`;
+			})
+			.join('')}) return L(v);`,
+		'let x;',
+		...literals.map(function (key: string, index: number): string {
+			return required !== undefined && required[index]
+				? `x = v[${key}]; if (!g${index}(x) || (x === undefined && !H.call(v, ${key}))) return false;`
+				: `if (!g${index}(v[${key}])) return false;`;
+		}),
+		hasUnknownKey === undefined ? 'return true;' : 'return !U(v);',
+		'};'
+	].join('\n');
+
+	return generate(['O', 'A', 'P', 'H', 'L', 'G', 'U'], source, [Object.prototype, Array.isArray, Object.getPrototypeOf, hasOwn, loop, guards, hasUnknownKey]) as
+		| Guard<unknown>
+		| undefined;
+}
+
+/**
  * Builds the guard behind {@link isShape} and the object patterns of {@link isMatching}.
  * @param {ReadonlyArray<PropertyKey>} keys - The checked keys
  * @param {ReadonlyArray<Guard<unknown>>} guards - The guard of each key
@@ -1269,20 +1323,40 @@ function shapeGuard(
 		return (required !== undefined && required[index]) || !guards[index](undefined);
 	}
 
-	return explainable(
-		function isShaped(value: unknown): value is object {
-			if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+	/**
+	 * Whether an exact shape meets an own enumerable string key it does not know.
+	 * @param {object} value - The checked object
+	 * @returns {boolean} `true` when `value` has an unknown key
+	 */
+	function hasUnknownKey(value: object): boolean {
+		for (const key in value) if (hasOwn.call(value, key) && !(known as ReadonlySet<PropertyKey>).has(key) && !isDiscriminant(value, key)) return true;
 
-			for (let index = 0; index < keys.length; index++) {
-				const key = keys[index];
+		return false;
+	}
 
-				if (hasOwn.call(value, key) ? !guards[index]((value as Record<PropertyKey, unknown>)[key]) : missingFails(index)) return false;
-			}
+	/**
+	 * Checks an object key by key, reading own properties only.
+	 * @param {unknown} value - The value to check
+	 * @returns {boolean} Whether `value` matches the shape
+	 */
+	function isShapedLoop(value: unknown): value is object {
+		if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
 
-			if (known !== undefined) for (const key in value) if (hasOwn.call(value, key) && !known.has(key) && !isDiscriminant(value, key)) return false;
+		for (let index = 0; index < keys.length; index++) {
+			const key = keys[index];
 
-			return true;
-		},
+			if (hasOwn.call(value, key) ? !guards[index]((value as Record<PropertyKey, unknown>)[key]) : missingFails(index)) return false;
+		}
+
+		return known === undefined || !hasUnknownKey(value);
+	}
+
+	const shaped = explainable(
+		(keys.every(function (key: PropertyKey): boolean {
+			return typeof key === 'string';
+		}) &&
+			generateShape(keys as ReadonlyArray<string>, guards, required, known === undefined ? undefined : hasUnknownKey, isShapedLoop)) ||
+			isShapedLoop,
 		function explainShape(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
 			if (typeof value !== 'object' || value === null || Array.isArray(value)) {
 				issues.push({ message: `Expected an object (got ${Array.isArray(value) ? 'array' : typeName(value)})`, path: path.slice() });
@@ -1315,11 +1389,32 @@ function shapeGuard(
 			return passed;
 		}
 	);
+
+	scored(shaped, function scoreShape(value: unknown): number {
+		if (typeof value !== 'object' || value === null || Array.isArray(value)) return 2;
+
+		let failed = 0;
+
+		for (let index = 0; index < keys.length; index++) {
+			const own = hasOwn.call(value, keys[index]);
+			const raw = own ? (value as Record<PropertyKey, unknown>)[keys[index]] : undefined;
+
+			// Nested objects are not checked: that would walk their whole subtree, and nested unions would make scoring exponential.
+			if (typeof raw === 'object' && raw !== null) continue;
+			if (own ? !guards[index](raw) : missingFails(index)) failed++;
+		}
+
+		return failed / (keys.length + 1);
+	});
+
+	return shaped;
 }
 
 /**
  * Creates a guard that passes when ANY of `guards` passes, narrowing to the union of their types (`z.union()`). Guards run in order
- * and stop at the first match.
+ * and stop at the first match. {@link explain} reports the member closest to the value (for tagged objects, the matching variant).
+ * A recursive union whose members are only told apart deep inside a value costs time exponential in its depth on hostile input: tag
+ * such objects with a field and use {@link isDiscriminatedUnion}.
  * @template G - The member guards
  * @param {...G} guards - The member guards (at least one)
  * @returns {(value: unknown) => boolean} A guard narrowing to the union of the members' types
@@ -1344,19 +1439,24 @@ export function isUnion<const G extends ReadonlyArray<Guard<unknown>>>(...guards
 			return false;
 		},
 		function explainUnion(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
-			// Report the member that came closest (fewest issues): for discriminated unions that is the matching variant.
-			let best: SchemaIssue[] | undefined;
+			// Explainers also run on the valid children of an explained object.
+			for (let index = 0; index < members.length; index++) if (members[index](value)) return true;
 
-			for (let index = 0; index < members.length; index++) {
-				const attempt: SchemaIssue[] = [];
+			// Report the member that came closest (see `utils/score.ts`; the first one on a tie): for tagged objects that is the matching variant.
+			// Explaining every member, at every level of a recursive union, would take exponential time on invalid input.
+			let closest = members[0];
+			let best = guardScore(closest, value);
 
-				if (collect(members[index], value, path, attempt)) return true;
-				if (best === undefined || attempt.length < best.length) best = attempt;
+			for (let index = 1; index < members.length && best > 0; index++) {
+				const score = guardScore(members[index], value);
+
+				if (score < best) {
+					closest = members[index];
+					best = score;
+				}
 			}
 
-			issues.push(...(best as SchemaIssue[]));
-
-			return false;
+			return collect(closest, value, path, issues);
 		}
 	);
 }
@@ -1374,12 +1474,18 @@ export function isUnion<const G extends ReadonlyArray<Guard<unknown>>>(...guards
 export function isOptional<T>(guard: Guard<T>): (value: unknown) => value is T | undefined {
 	assertFunction('isOptional', 'guard', guard);
 
-	return explainable(
-		function isOptionalValue(value: unknown): value is T | undefined {
-			return value === undefined || guard(value);
-		},
-		function explainOptional(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
-			return value === undefined || collect(guard, value, path, issues);
+	return scored(
+		explainable(
+			function isOptionalValue(value: unknown): value is T | undefined {
+				return value === undefined || guard(value);
+			},
+			function explainOptional(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
+				return value === undefined || collect(guard, value, path, issues);
+			}
+		),
+		function scoreOptional(value: unknown): number {
+			// Only asked about values the guard rejects, which are never `undefined`.
+			return guardScore(guard, value);
 		}
 	);
 }
@@ -1397,12 +1503,18 @@ export function isOptional<T>(guard: Guard<T>): (value: unknown) => value is T |
 export function isNullable<T>(guard: Guard<T>): (value: unknown) => value is T | null {
 	assertFunction('isNullable', 'guard', guard);
 
-	return explainable(
-		function isNullableValue(value: unknown): value is T | null {
-			return value === null || guard(value);
-		},
-		function explainNullable(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
-			return value === null || collect(guard, value, path, issues);
+	return scored(
+		explainable(
+			function isNullableValue(value: unknown): value is T | null {
+				return value === null || guard(value);
+			},
+			function explainNullable(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
+				return value === null || collect(guard, value, path, issues);
+			}
+		),
+		function scoreNullable(value: unknown): number {
+			// Only asked about values the guard rejects, which are never `null`.
+			return guardScore(guard, value);
 		}
 	);
 }
@@ -1474,12 +1586,17 @@ export function withMessage<T>(guard: Guard<T>, message: string | ((value: unkno
 		throw new TypeError(`withMessage: \`message\` must be a string or a function, got ${typeName(message)}`);
 	}
 
-	return failing(
-		function isLabelled(value: unknown): value is T {
-			return guard(value);
-		},
-		function (value: unknown): string {
-			return typeof message === 'string' ? message : String(message(value));
+	return scored(
+		failing(
+			function isLabelled(value: unknown): value is T {
+				return guard(value);
+			},
+			function (value: unknown): string {
+				return typeof message === 'string' ? message : String(message(value));
+			}
+		),
+		function scoreLabelled(value: unknown): number {
+			return guardScore(guard, value);
 		}
 	);
 }
@@ -1746,40 +1863,48 @@ export function isDiscriminatedUnion<const K extends string, const V extends Sha
 		}
 	}
 
-	return explainable(
-		function isVariant(value: unknown): value is DiscriminatedUnionType<K, V> {
-			if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+	return scored(
+		explainable(
+			function isVariant(value: unknown): value is DiscriminatedUnionType<K, V> {
+				if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
 
-			const guard = variantOf(value);
+				const guard = variantOf(value);
 
-			return (
-				guard !== undefined &&
-				withDiscriminant(value, function (): boolean {
-					return guard(value);
-				})
-			);
-		},
-		function explainVariant(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
-			if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-				issues.push({ message: `Expected an object (got ${Array.isArray(value) ? 'array' : typeName(value)})`, path: path.slice() });
+				return (
+					guard !== undefined &&
+					withDiscriminant(value, function (): boolean {
+						return guard(value);
+					})
+				);
+			},
+			function explainVariant(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
+				if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+					issues.push({ message: `Expected an object (got ${Array.isArray(value) ? 'array' : typeName(value)})`, path: path.slice() });
+
+					return false;
+				}
+
+				const guard = variantOf(value);
+
+				if (guard !== undefined) {
+					return withDiscriminant(value, function (): boolean {
+						return collect(guard, value, path, issues);
+					});
+				}
+				issues.push(
+					hasOwn.call(value, key)
+						? { message: `${expected} (got ${typeName((value as Record<string, unknown>)[key])})`, path: [...path, key] }
+						: { message: 'Missing required property', path: [...path, key] }
+				);
 
 				return false;
 			}
+		),
+		function scoreVariant(value: unknown): number {
+			const guard = typeof value === 'object' && value !== null && !Array.isArray(value) ? variantOf(value) : undefined;
 
-			const guard = variantOf(value);
-
-			if (guard !== undefined) {
-				return withDiscriminant(value, function (): boolean {
-					return collect(guard, value, path, issues);
-				});
-			}
-			issues.push(
-				hasOwn.call(value, key)
-					? { message: `${expected} (got ${typeName((value as Record<string, unknown>)[key])})`, path: [...path, key] }
-					: { message: 'Missing required property', path: [...path, key] }
-			);
-
-			return false;
+			// A wrong or missing tag is further than any failure of the right variant.
+			return guard === undefined ? Number.MAX_SAFE_INTEGER : guardScore(guard, value);
 		}
 	);
 }
@@ -1818,32 +1943,41 @@ export function isIntersection<const G extends ReadonlyArray<Guard<unknown>>>(..
 
 	const members = guards.slice();
 
-	return explainable(
-		function isIntersectionMember(value: unknown): value is IntersectionType<G> {
-			for (let index = 0; index < members.length; index++) if (!members[index](value)) return false;
+	return scored(
+		explainable(
+			function isIntersectionMember(value: unknown): value is IntersectionType<G> {
+				for (let index = 0; index < members.length; index++) if (!members[index](value)) return false;
 
-			return true;
-		},
-		function explainIntersection(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
-			const seen = new Set<string>();
-			let passed = true;
+				return true;
+			},
+			function explainIntersection(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
+				const seen = new Set<string>();
+				let passed = true;
 
-			for (let index = 0; index < members.length; index++) {
-				const found: SchemaIssue[] = [];
+				for (let index = 0; index < members.length; index++) {
+					const found: SchemaIssue[] = [];
 
-				if (collect(members[index], value, path, found)) continue;
-				passed = false;
-				for (const issue of found) {
-					const id = `${issue.path.map(String).join('\0')}\u0001${issue.message}`;
+					if (collect(members[index], value, path, found)) continue;
+					passed = false;
+					for (const issue of found) {
+						const id = `${issue.path.map(String).join('\0')}\u0001${issue.message}`;
 
-					if (!seen.has(id)) {
-						seen.add(id);
-						issues.push(issue);
+						if (!seen.has(id)) {
+							seen.add(id);
+							issues.push(issue);
+						}
 					}
 				}
-			}
 
-			return passed;
+				return passed;
+			}
+		),
+		function scoreIntersection(value: unknown): number {
+			let worst = 0;
+
+			for (let index = 0; index < members.length; index++) if (!members[index](value)) worst = Math.max(worst, guardScore(members[index], value));
+
+			return worst;
 		}
 	);
 }
@@ -1898,20 +2032,26 @@ export function refine<T>(guard: Guard<T>, predicate: (value: T) => boolean, mes
 		throw new TypeError(`refine: \`message\` must be a string or a function, got ${typeName(message)}`);
 	}
 
-	return explainable(
-		function isRefined(value: unknown): value is T {
-			return guard(value) && predicate(value);
-		},
-		function explainRefined(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
-			if (!collect(guard, value, path, issues)) return false;
-			if (predicate(value as T)) return true;
+	return scored(
+		explainable(
+			function isRefined(value: unknown): value is T {
+				return guard(value) && predicate(value);
+			},
+			function explainRefined(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
+				if (!collect(guard, value, path, issues)) return false;
+				if (predicate(value as T)) return true;
 
-			issues.push({
-				message: message === undefined ? `Invalid value (got ${typeName(value)})` : typeof message === 'string' ? message : String(message(value as T)),
-				path: path.slice()
-			});
+				issues.push({
+					message: message === undefined ? `Invalid value (got ${typeName(value)})` : typeof message === 'string' ? message : String(message(value as T)),
+					path: path.slice()
+				});
 
-			return false;
+				return false;
+			}
+		),
+		function scoreRefined(value: unknown): number {
+			// A value the base guard accepts only failed the predicate: as close as a rejected value gets.
+			return guard(value) ? 0 : guardScore(guard, value);
 		}
 	);
 }
@@ -1961,7 +2101,7 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 		return resolved;
 	}
 
-	return explainable(
+	const lazyGuard = explainable(
 		function isLazyValue(value: unknown): value is T {
 			const guard = resolve();
 
@@ -1991,6 +2131,12 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 			}
 		}
 	);
+
+	scored(lazyGuard, function scoreLazy(value: unknown): number {
+		return guardScore(resolve(), value);
+	});
+
+	return lazyGuard;
 }
 
 /**
@@ -2138,28 +2284,46 @@ export function ensure<T>(guard: Guard<T>, value: unknown): T {
 
 /**
  * Groups issues by path, for showing errors next to form fields: each key is a path joined with dots (`'address.city'`, `'tags.1'`,
- * `''` for the root), each value the messages at that path, in order. Works with {@link explain}'s result, a {@link ValidationError}'s
- * `issues` and Standard Schema issues. The result has a `null` prototype, so a `__proto__` path is an ordinary key.
- * @param {ReadonlyArray<SchemaIssue>} issues - The issues
+ * `''` for the root or a missing path), each value the messages at that path, in order. Works with {@link explain}'s result, a
+ * {@link ValidationError}'s `issues` and Standard Schema issues from any library (whose path segments may be `{ key }` objects). Keys
+ * that contain dots make paths ambiguous (`['a.b']` and `['a', 'b']` both give `'a.b'`). The result has a `null` prototype, so a
+ * `__proto__` path is an ordinary key.
+ * @param {ReadonlyArray<StandardSchemaIssue>} issues - The issues
  * @returns {Record<string, string[]>} The messages by path
  * @throws {TypeError} when `issues` is not an array
  * @example
  * const isSignup = isShape({ email: isString, age: isIntegerInRange(13, 130), tags: isArrayOf(isString) });
  * issuesByPath(explain(isSignup, { age: 7, tags: ['a', 1] })); // => { email: ['Missing required property'], age: ['Expected an integer between 13 and 130 (got 7)'], 'tags.1': ['Invalid value (got number)'] }
  * issuesByPath(explain(isString, 1)); // => { '': ['Invalid value (got number)'] }
+ * issuesByPath([{ message: 'Too short', path: [{ key: 'name' }] }, { message: 'Invalid form' }]); // => { name: ['Too short'], '': ['Invalid form'] }
  */
-export function issuesByPath(issues: ReadonlyArray<SchemaIssue>): Record<string, string[]> {
+export function issuesByPath(issues: ReadonlyArray<StandardSchemaIssue>): Record<string, string[]> {
 	if (!Array.isArray(issues)) throw new TypeError(`issuesByPath: \`issues\` must be an array, got ${typeName(issues)}`);
 
 	const grouped: Record<string, string[]> = Object.create(null);
 
 	for (const issue of issues) {
-		const key = issue.path.map(String).join('.');
+		const key = (issue.path ?? [])
+			.map(function (segment: PropertyKey | { readonly key: PropertyKey }): string {
+				return String(typeof segment === 'object' && segment !== null ? segment.key : segment);
+			})
+			.join('.');
 
 		(grouped[key] ??= []).push(issue.message);
 	}
 
 	return grouped;
+}
+
+/**
+ * An issue as any [Standard Schema](https://standardschema.dev) validator reports it: the {@link SchemaIssue}s of this module, or those
+ * of zod, valibot and the rest, whose path is optional and may hold `{ key }` segments.
+ */
+export interface StandardSchemaIssue {
+	/** What is wrong. */
+	readonly message: string;
+	/** Where it is wrong, from the root; missing for the root itself. */
+	readonly path?: ReadonlyArray<PropertyKey | { readonly key: PropertyKey }> | undefined;
 }
 
 /**

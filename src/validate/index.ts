@@ -12,6 +12,8 @@ import {
 } from '../guards/index.js';
 import { describe } from '../utils/assert.js';
 import type { AnyFunction } from '../utils/index.js';
+import { generate } from '../utils/jit.js';
+import { guardScore } from '../utils/score.js';
 
 /**
  * Options accepted by {@link isUrl}.
@@ -238,6 +240,93 @@ function isEncodingOf(host: string, hostname: string): boolean {
 	);
 }
 
+/** A host label that the URL parser reads as a number (decimal, or `0x` hex), making the host an IPv4 address. */
+const NUMERIC_LABEL_PATTERN = /^(?:[0-9]+|0x[0-9a-f]*)$/i;
+
+/** The `URL` constructor of the runtime when this module loaded: {@link isPlainWebUrl} assumes its WHATWG behaviour. */
+const NATIVE_URL: unknown = (globalThis as unknown as { URL?: unknown }).URL;
+
+/**
+ * Whether the character code is an ASCII letter, digit or hyphen: the characters of a plain host label.
+ * @param {number} code - A UTF-16 code unit (`NaN` past the end of a string)
+ * @returns {boolean} Whether it is `[A-Za-z0-9-]`
+ */
+function isLabelCharacter(code: number): boolean {
+	return (code >= 97 && code <= 122) || (code >= 65 && code <= 90) || (code >= 48 && code <= 57) || code === 45;
+}
+
+/**
+ * Recognises the plainest web URLs without the URL parser (about three times faster): `http://` or `https://` in any case, a host of
+ * non-empty dot-separated labels of ASCII letters, digits and hyphens, none starting with `xn--` (decoded as punycode) and the last
+ * not a number (which the parser reads as IPv4: `127.1`, `0x7f`), no credentials, an optional port of up to 5 digits and at most
+ * 65535, then nothing or a path, query or fragment of printable ASCII. Every such string is a URL the full check of {@link isUrl}
+ * accepts, with the host as written; `false` only means "not this plain", and the full check decides.
+ * @param {string} value - The candidate URL
+ * @param {boolean} requireTld - Whether the host must end in a top-level domain (`isUrl`'s `requireTld`)
+ * @returns {boolean} `true` when `value` is a plain web URL meeting `requireTld`
+ */
+function isPlainWebUrl(value: string, requireTld: boolean): boolean {
+	// `| 32` lower-cases ASCII letters, and maps no other character onto `h`, `t`, `p`, `s` or `x`, `n`.
+	if ((value.charCodeAt(0) | 32) !== 104 || (value.charCodeAt(1) | 32) !== 116 || (value.charCodeAt(2) | 32) !== 116 || (value.charCodeAt(3) | 32) !== 112) {
+		return false;
+	}
+
+	let index = (value.charCodeAt(4) | 32) === 115 ? 5 : 4;
+
+	if (value.charCodeAt(index) !== 58 || value.charCodeAt(index + 1) !== 47 || value.charCodeAt(index + 2) !== 47) return false;
+	index += 3;
+
+	let labels = 0;
+	let labelStart = index;
+
+	for (;;) {
+		const code = value.charCodeAt(index);
+
+		if (isLabelCharacter(code)) {
+			index++;
+			continue;
+		}
+		if (index === labelStart) return false;
+		if (
+			(value.charCodeAt(labelStart) | 32) === 120 &&
+			(value.charCodeAt(labelStart + 1) | 32) === 110 &&
+			value.charCodeAt(labelStart + 2) === 45 &&
+			value.charCodeAt(labelStart + 3) === 45
+		) {
+			return false;
+		}
+		labels++;
+		if (code !== 46) break;
+		labelStart = ++index;
+	}
+
+	// The last label, which must not be a number: all digits, or `0x` followed by hex digits.
+	const last = value.slice(labelStart, index);
+
+	if (NUMERIC_LABEL_PATTERN.test(last)) return false;
+	if (requireTld && (labels < 2 || !TLD_PATTERN.test(last))) return false;
+	if (value.charCodeAt(index) === 58) {
+		const portStart = ++index;
+		let port = 0;
+
+		for (let code = value.charCodeAt(index); code >= 48 && code <= 57; code = value.charCodeAt(++index)) port = port * 10 + code - 48;
+		if (index === portStart || index - portStart > 5 || port > 65535) return false;
+	}
+	if (index === value.length) return true;
+
+	const delimiter = value.charCodeAt(index);
+
+	if (delimiter !== 47 && delimiter !== 63 && delimiter !== 35) return false;
+	// The path, query and fragment: the parser percent-encodes whatever needs it, and never fails on printable ASCII.
+	for (index++; index < value.length; index++) {
+		const code = value.charCodeAt(index);
+
+		if (code <= 32 || code >= 127) return false;
+	}
+
+	return true;
+}
+
 /**
  * Checks whether a value is an absolute URL with an allowed scheme, parsing it with the WHATWG `URL` parser (`globalThis.URL`).
  *
@@ -278,9 +367,13 @@ function isEncodingOf(host: string, hostname: string): boolean {
 export function isUrl(value: unknown, options: IsUrlOptions = {}): value is string {
 	const { protocols, requireTld = false } = options;
 	if (protocols !== undefined && !Array.isArray(protocols)) throw new TypeError(`isUrl: \`protocols\` must be an array of strings, got ${typeof protocols}`);
-	if (typeof value !== 'string' || URL_FORBIDDEN_CHARACTER.test(value)) return false;
+	if (typeof value !== 'string') return false;
 
 	const UrlParser = getUrlConstructor();
+
+	// The common case, decided without the (much more expensive) parser; anything less plain takes the full check below.
+	if (protocols === undefined && UrlParser === NATIVE_URL && isPlainWebUrl(value, Boolean(requireTld))) return true;
+	if (URL_FORBIDDEN_CHARACTER.test(value)) return false;
 	// A successful parse reads the scheme up to the first `:` and lower-cases it, so the scheme checks can run before the (much more
 	// expensive) parse. Without any `:` the parse fails, whatever these checks conclude.
 	const schemeEnd = value.indexOf(':');
@@ -1051,9 +1144,53 @@ interface Node {
 	readonly missing?: ((value: unknown) => boolean) | undefined;
 	/**
 	 * Whether the schema gives `undefined` a meaning of its own (a default, an optional value), so that its issues for a missing
-	 * property are genuine (a default that fails a later check) instead of being summed up as `Missing required property`.
+	 * property are genuine (a default that fails a later check) instead of being summed up as `Missing required property`. A function,
+	 * asked during a parse only, so that wrapping a {@link lazy} parser never resolves it early.
 	 */
-	readonly handlesMissing?: boolean | undefined;
+	readonly handlesMissing?: (() => boolean) | undefined;
+	/**
+	 * How far an invalid value is from matching, for {@link union} to report the closest member only: for an object schema, the share of
+	 * its properties with a primitive value that fail (below 1; nested objects are not parsed, which keeps scoring cheap), and 2 for a
+	 * value that is not an object. Lower is closer; schemas without a score count as 1, so an object member that fits the type wins.
+	 */
+	readonly score?: ((value: unknown) => number) | undefined;
+}
+
+/**
+ * Always `true`: the {@link Node.handlesMissing} of the schemas that handle `undefined` themselves.
+ * @returns {boolean} `true`
+ */
+function always(): boolean {
+	return true;
+}
+
+/**
+ * Whether a schema gives `undefined` a meaning of its own (see {@link Node.handlesMissing}).
+ * @param {Node} node - The compiled schema
+ * @returns {boolean} Whether it handles missing values
+ */
+function handlesMissing(node: Node): boolean {
+	return node.handlesMissing !== undefined && node.handlesMissing();
+}
+
+/**
+ * Whether `value` is missing for `node`: `undefined`, or a value the schema counts as missing (a blank string, see {@link blankAsUndefined}).
+ * @param {Node} node - The compiled schema
+ * @param {unknown} value - The value
+ * @returns {boolean} Whether the value is missing
+ */
+function isAbsent(node: Node, value: unknown): boolean {
+	return value === undefined || (node.missing !== undefined && node.missing(value));
+}
+
+/**
+ * How far `value` is from matching `node` (see {@link Node.score}).
+ * @param {Node} node - The compiled schema
+ * @param {unknown} value - A value the schema rejects
+ * @returns {number} The score, lower being closer
+ */
+function scoreOf(node: Node, value: unknown): number {
+	return node.score === undefined ? 1 : node.score(value);
 }
 
 /**
@@ -1073,15 +1210,14 @@ interface CompiledParser<T> extends StandardSchemaV1<unknown, T> {
 	/**
 	 * The compiled schema, so that nesting a parser skips the Standard Schema adapter. A plain string key (like `'~standard'`), not a
 	 * symbol: a computed key would keep the exported parser constants, and everything they reference, in every bundle of the module.
+	 * Copies of this module read each other's nodes, so the key carries the version of the {@link Node} protocol: change it with any
+	 * incompatible change to `Node`, and parsers of other versions are then used through `~standard` instead.
 	 */
-	readonly '~tink': Node;
+	readonly '~tink.1': Node;
 }
 
 /** Guards, foreign Standard Schema validators and object schemas, compiled on first use. */
 const compiled = new WeakMap<object, Node>();
-
-/** Whether `new Function` works here: unknown until the first object schema is compiled, `false` under a CSP without `'unsafe-eval'`. */
-let jit: boolean | undefined;
 
 /**
  * A parser: a [Standard Schema](https://standardschema.dev) validator whose output may differ from its input (a number parsed from a
@@ -1211,15 +1347,15 @@ function compile(caller: string, name: string, schema: unknown, ancestors: objec
 }
 
 /**
- * Returns the compiled schema of a parser created by this module (or by another copy of it): an OWN `'~tink'` property holding a
- * node, so neither a polluted `Object.prototype` nor an object schema with a `'~tink'` key passes for a parser.
+ * Returns the compiled schema of a parser created by this module (or by another copy of it): an OWN `'~tink.1'` property holding a
+ * node, so neither a polluted `Object.prototype` nor an object schema with a `'~tink.1'` key passes for a parser.
  * @param {object} schema - A function or a non-null object
  * @returns {Node | undefined} The node, or `undefined` for anything else
  */
 function nodeOf(schema: object): Node | undefined {
-	if (!hasOwn.call(schema, '~tink')) return undefined;
+	if (!hasOwn.call(schema, '~tink.1')) return undefined;
 
-	const node = (schema as Partial<CompiledParser<unknown>>)['~tink'];
+	const node = (schema as Partial<CompiledParser<unknown>>)['~tink.1'];
 
 	return typeof node === 'object' && node !== null && typeof node.fast === 'function' && typeof node.run === 'function' ? node : undefined;
 }
@@ -1259,7 +1395,10 @@ function guardNode(guard: Guard<unknown>): Node {
 
 			return value;
 		},
-		guard
+		guard,
+		score: function scoreGuard(value: unknown): number {
+			return guardScore(guard, value);
+		}
 	};
 }
 
@@ -1348,7 +1487,34 @@ function objectNode(caller: string, name: string, schema: ObjectSchema, ancestor
 
 	const loop = objectLoop(keys, children);
 
-	return { fast: generateObject(keys, children, loop) ?? loop, run: objectRun(keys, children), guard: undefined };
+	return { fast: generateObject(keys, children, loop) ?? loop, run: objectRun(keys, children), guard: undefined, score: objectScore(keys, children) };
+}
+
+/**
+ * Builds the {@link Node.score} of an object schema: the share of its properties with a primitive (or missing) value that fail their
+ * schema, always below 1 (`failing / (keys + 1)`), or 2 for a value that is not an object. Object values are skipped: parsing them would cost a
+ * walk of their whole subtree, and nested unions would make scoring exponential.
+ * @param {ReadonlyArray<string>} keys - The keys
+ * @param {ReadonlyArray<Node>} children - The compiled schema of each key
+ * @returns {(value: unknown) => number} The score
+ */
+function objectScore(keys: ReadonlyArray<string>, children: ReadonlyArray<Node>): (value: unknown) => number {
+	return function scoreObject(value: unknown): number {
+		if (typeof value !== 'object' || value === null || Array.isArray(value)) return 2;
+
+		let failing = 0;
+
+		for (let index = 0; index < keys.length; index++) {
+			const key = keys[index];
+			const child = children[index];
+			const raw = hasOwn.call(value, key) ? (value as Record<string, unknown>)[key] : undefined;
+
+			if (typeof raw === 'object' && raw !== null) continue;
+			if (child.guard === undefined ? child.fast(raw) === FAIL : !child.guard(raw)) failing++;
+		}
+
+		return failing / (keys.length + 1);
+	};
 }
 
 /**
@@ -1394,68 +1560,53 @@ function objectLoop(keys: ReadonlyArray<string>, children: ReadonlyArray<Node>):
  * @returns {Fast | undefined} The generated parse, or `undefined` when code generation is disabled (CSP, Cloudflare Workers…)
  */
 function generateObject(keys: ReadonlyArray<string>, children: ReadonlyArray<Node>, loop: Fast): Fast | undefined {
-	if (jit === false) return undefined;
-
+	// The generated code ships as written, so its names are short: `v` the value, `o` the output, `r` a property's result, `i` its
+	// input, `c0`… the child parsers (or guards), `m0`… their `missing` hooks; the parameters are listed in the `generate` call below.
 	const literals = keys.map(function (key: string): string {
 		return JSON.stringify(key);
 	});
 	const lines = children.map(function (child: Node, index: number): string {
 		const key = literals[index];
+		const store = `if (r !== undefined || H.call(v, ${key})${child.missing === undefined ? '' : ` && !m${index}(i)`}) o[${key}] = r;`;
 
-		if (child.guard !== undefined) {
-			return `result = value[${key}]; if (!c${index}(result)) return FAIL; if (result !== undefined || hasOwn.call(value, ${key})) output[${key}] = result;`;
-		}
-		if (child.missing !== undefined) {
-			return `input = value[${key}]; result = c${index}(input); if (result === FAIL) return FAIL; if (result !== undefined || (hasOwn.call(value, ${key}) && !m${index}(input))) output[${key}] = result;`;
-		}
+		if (child.guard !== undefined) return `r = v[${key}]; if (!c${index}(r)) return F; ${store}`;
+		if (child.missing !== undefined) return `i = v[${key}]; r = c${index}(i); if (r === F) return F; ${store}`;
 
-		return `result = c${index}(value[${key}]); if (result === FAIL) return FAIL; if (result !== undefined || hasOwn.call(value, ${key})) output[${key}] = result;`;
+		return `r = c${index}(v[${key}]); if (r === F) return F; ${store}`;
 	});
 	const source = [
 		...children.map(function (child: Node, index: number): string {
-			return `const c${index} = children[${index}];${child.missing === undefined ? '' : ` const m${index} = missing[${index}];`}`;
+			return `const c${index} = C[${index}]${child.missing === undefined ? '' : `, m${index} = M[${index}]`};`;
 		}),
-		'return function fastObject(value) {',
-		"if (typeof value !== 'object' || value === null || isArray(value)) return FAIL;",
-		'const proto = getPrototypeOf(value);',
-		`if ((proto !== OP && proto !== null)${literals
+		'return function fastObject(v) {',
+		"if (typeof v !== 'object' || v === null || A(v)) return F;",
+		'const p = P(v);',
+		`if ((p !== O && p !== null)${literals
 			.map(function (key: string): string {
-				return ` || ${key} in OP`;
+				return ` || ${key} in O`;
 			})
-			.join('')}) return loop(value);`,
-		'const output = {};',
-		'let result, input;',
+			.join('')}) return L(v);`,
+		'const o = {};',
+		'let r, i;',
 		...lines,
-		'return output;',
+		'return o;',
 		'};'
 	].join('\n');
 
-	try {
-		const factory = new Function('FAIL', 'OP', 'isArray', 'getPrototypeOf', 'hasOwn', 'loop', 'children', 'missing', source) as (...args: unknown[]) => Fast;
-
-		jit = true;
-
-		return factory(
-			FAIL,
-			Object.prototype,
-			Array.isArray,
-			Object.getPrototypeOf,
-			hasOwn,
-			loop,
-			children.map(function (child: Node): AnyFunction {
-				return child.guard ?? child.fast;
-			}),
-			children.map(function (child: Node): unknown {
-				return child.missing;
-			})
-		);
-	} catch (error) {
-		// Code generation from strings is disallowed (a Content Security Policy without 'unsafe-eval', Cloudflare Workers…): stop trying.
-		// Any other error (a stack overflow while compiling deep inside a recursion) only sends this schema to the loop.
-		if (error instanceof EvalError) jit = false;
-
-		return undefined;
-	}
+	return generate(['F', 'O', 'A', 'P', 'H', 'L', 'C', 'M'], source, [
+		FAIL,
+		Object.prototype,
+		Array.isArray,
+		Object.getPrototypeOf,
+		hasOwn,
+		loop,
+		children.map(function (child: Node): AnyFunction {
+			return child.guard ?? child.fast;
+		}),
+		children.map(function (child: Node): unknown {
+			return child.missing;
+		})
+	]) as Fast | undefined;
 }
 
 /**
@@ -1487,7 +1638,7 @@ function objectRun(keys: ReadonlyArray<string>, children: ReadonlyArray<Node>): 
 			path.pop();
 			if (issues.length > before) {
 				// A missing property fails as such, unless its schema handles `undefined` (then a default can genuinely fail a later check).
-				if (!present && children[index].handlesMissing !== true) {
+				if (!present && !handlesMissing(children[index])) {
 					issues.length = before;
 					issues.push({ message: 'Missing required property', path: [...path, key] });
 				}
@@ -1551,7 +1702,7 @@ function validateWith(fast: Fast, run: Run, value: unknown): StandardSchemaResul
  */
 function toCompiledParser<T>(node: Node): Parser<T> {
 	return {
-		'~tink': node,
+		'~tink.1': node,
 		'~standard': {
 			version: 1,
 			vendor: 'tink',
@@ -1638,7 +1789,7 @@ export function safeParse<S extends Schema>(schema: S, value: unknown): ParseRes
 export function toParser<S extends Schema>(schema: S): Parser<SchemaOutput<S>> {
 	const node = compile('toParser', 'schema', schema, []);
 
-	return (schema as Partial<CompiledParser<unknown>>)['~tink'] === node ? (schema as Parser<SchemaOutput<S>>) : toCompiledParser(node);
+	return (schema as Partial<CompiledParser<unknown>>)['~tink.1'] === node ? (schema as Parser<SchemaOutput<S>>) : toCompiledParser(node);
 }
 
 /**
@@ -1674,12 +1825,14 @@ export function withDefault<S extends Schema>(
 
 	return toCompiledParser({
 		fast: function fastWithDefault(value: unknown): unknown {
-			return value === undefined ? fill() : node.fast(value);
+			return isAbsent(node, value) ? fill() : node.fast(value);
 		},
-		// Only reached when the fast parse failed, so never for `undefined`.
+		// Only reached when the fast parse failed, so never for a missing value.
 		run: node.run,
 		guard: undefined,
-		handlesMissing: true
+		missing: node.missing,
+		handlesMissing: always,
+		score: node.score
 	});
 }
 
@@ -1732,10 +1885,9 @@ export function transform<S extends Schema, U>(schema: S, fn: (value: SchemaOutp
 			return issues.length > before ? undefined : fn(output as SchemaOutput<S>);
 		},
 		guard: undefined,
-		// Read when a parse asks (a getter): on a `lazy` schema, reading it at construction would run the getter too early.
-		get handlesMissing(): boolean | undefined {
-			return node.handlesMissing;
-		}
+		missing: node.missing,
+		handlesMissing: node.handlesMissing,
+		score: node.score
 	});
 }
 
@@ -1770,10 +1922,9 @@ export function chain<A extends Schema, B extends Schema>(first: A, second: B): 
 			return issues.length > before ? undefined : rerun(tail, output, path, issues);
 		},
 		guard: undefined,
-		// Read when a parse asks (a getter): on a `lazy` schema, reading it at construction would run the getter too early.
-		get handlesMissing(): boolean | undefined {
-			return head.handlesMissing;
-		}
+		missing: head.missing,
+		handlesMissing: head.handlesMissing,
+		score: head.score
 	});
 }
 
@@ -1983,10 +2134,9 @@ export function nullable<S extends Schema>(schema: S): Parser<SchemaOutput<S> | 
 		// Only reached when the fast parse failed, so never for `null`.
 		run: node.run,
 		guard: undefined,
-		// Read when a parse asks (a getter): on a `lazy` schema, reading it at construction would run the getter too early.
-		get handlesMissing(): boolean | undefined {
-			return node.handlesMissing;
-		}
+		missing: node.missing,
+		handlesMissing: node.handlesMissing,
+		score: node.score
 	});
 }
 
@@ -1998,17 +2148,16 @@ export function nullable<S extends Schema>(schema: S): Parser<SchemaOutput<S> | 
 function optionalNode(node: Node): Node {
 	// A value the inner schema treats as missing (a blank string, for `blankAsUndefined`) is absent too, so `partial` and
 	// `optional(blankAsUndefined(...))` leave blank fields out instead of failing on them.
-	const missing = node.missing;
-
 	return {
 		fast: function fastOptional(value: unknown): unknown {
-			return value === undefined || (missing !== undefined && missing(value)) ? undefined : node.fast(value);
+			return isAbsent(node, value) ? undefined : node.fast(value);
 		},
-		// Only reached when the fast parse failed, so never for `undefined` or a missing value.
+		// Only reached when the fast parse failed, so never for a missing value.
 		run: node.run,
 		guard: undefined,
-		handlesMissing: true,
-		missing
+		missing: node.missing,
+		handlesMissing: always,
+		score: node.score
 	};
 }
 
@@ -2087,7 +2236,8 @@ export function exact<S extends ObjectSchema>(schema: S): Parser<SchemaOutput<S>
 
 			return output;
 		},
-		guard: undefined
+		guard: undefined,
+		score: node.score
 	});
 }
 
@@ -2105,9 +2255,33 @@ function alternatives(values: ReadonlyArray<string>): string {
 }
 
 /**
+ * Returns the member closest to matching `value` (see {@link Node.score}), the first one on a tie.
+ * @param {ReadonlyArray<Node>} nodes - The members (at least one)
+ * @param {unknown} value - The value
+ * @returns {Node} The closest member
+ */
+function closestOf(nodes: ReadonlyArray<Node>, value: unknown): Node {
+	let closest = nodes[0];
+	let best = scoreOf(closest, value);
+
+	for (let index = 1; index < nodes.length && best > 0; index++) {
+		const score = scoreOf(nodes[index], value);
+
+		if (score < best) {
+			closest = nodes[index];
+			best = score;
+		}
+	}
+
+	return closest;
+}
+
+/**
  * Creates a parser that returns the output of the first of `schemas` that accepts the value (`z.union()`). When none does, the issues
- * of the schema that came closest (fewest issues) are reported: for objects that differ by a field, that is the matching variant.
- * For objects tagged by a field, {@link discriminatedUnion} is faster and reports better.
+ * of the member that came closest are reported: for object members, the one with the fewest failing properties of a primitive value,
+ * which for objects that differ by a field is the matching variant. Each member is tried in turn, so a recursive union of members
+ * that are only told apart deep inside costs time exponential in the depth of a hostile value: tag such objects with a field and use
+ * {@link discriminatedUnion}, which is also faster and reports better.
  * @template S - The member schemas
  * @param {...S} schemas - The member schemas, tried in order (at least one)
  * @returns {Parser<SchemaOutput<S[number]>>} The parser
@@ -2137,26 +2311,35 @@ export function union<const S extends ReadonlyArray<Schema>>(...schemas: S): Par
 			return FAIL;
 		},
 		run: function runUnion(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
-			let closest: SchemaIssue[] | undefined;
-
-			for (let index = 0; index < nodes.length; index++) {
-				const attempt: SchemaIssue[] = [];
-				const output = nodes[index].run(value, path, attempt);
-
-				// A member that accepts the value on this second pass (it is not deterministic) wins.
-				if (attempt.length === 0) return output;
-				if (closest === undefined || attempt.length < closest.length) closest = attempt;
-			}
-			issues.push(...(closest as SchemaIssue[]));
-
-			return undefined;
+			// Only the closest member is reported (the first one on a tie): reporting every member, at every level of a recursive union,
+			// would take exponential time on invalid input.
+			return closestOf(nodes, value).run(value, path, issues);
 		},
 		guard: undefined,
-		// Read when a parse asks (a getter): on a `lazy` schema, reading it at construction would run the getter too early.
-		get handlesMissing(): boolean {
-			return nodes.some(function (node: Node): boolean {
-				return node.handlesMissing === true;
-			});
+		missing: nodes.some(function (node: Node): boolean {
+			return node.missing !== undefined;
+		})
+			? function isMissing(value: unknown): boolean {
+					// Missing when the member that wins (the first one to accept the value) says so, so that a blank string an earlier member
+					// accepts stays a value; when none accepts it, missing if any member says so (for the `Missing required property` report).
+					let flagged = false;
+
+					for (let index = 0; index < nodes.length; index++) {
+						const node = nodes[index];
+						const missing = node.missing !== undefined && node.missing(value);
+
+						if (node.fast(value) !== FAIL) return missing;
+						flagged ||= missing;
+					}
+
+					return flagged;
+				}
+			: undefined,
+		handlesMissing: function handlesMissingValues(): boolean {
+			return nodes.some(handlesMissing);
+		},
+		score: function scoreUnion(value: unknown): number {
+			return scoreOf(closestOf(nodes, value), value);
 		}
 	});
 }
@@ -2167,7 +2350,7 @@ export function union<const S extends ReadonlyArray<Schema>>(...schemas: S): Par
  * @template V - The variant object schemas, by discriminant value
  */
 export type DiscriminatedUnionOutput<K extends string, V extends { readonly [tag: string]: ObjectSchema }> = {
-	[T in keyof V & (string | number)]: { [P in K]: `${T}` } & SchemaOutput<V[T]> extends infer O ? { [P in keyof O]: O[P] } : never;
+	[T in keyof V & (string | number)]: { [P in K]: `${T}` } & Omit<SchemaOutput<V[T]>, K> extends infer O ? { [P in keyof O]: O[P] } : never;
 }[keyof V & (string | number)];
 
 /**
@@ -2253,7 +2436,16 @@ export function discriminatedUnion<const K extends string, const V extends { rea
 
 			return undefined;
 		},
-		guard: undefined
+		guard: undefined,
+		score: function scoreDiscriminated(value: unknown): number {
+			const node =
+				typeof value === 'object' && value !== null && !Array.isArray(value) && hasOwn.call(value, key)
+					? lookup.get((value as Record<string, unknown>)[key])
+					: undefined;
+
+			// A wrong or missing tag is further than any failure of the right variant.
+			return node === undefined ? Number.MAX_SAFE_INTEGER : scoreOf(node, value);
+		}
 	});
 }
 
@@ -2389,15 +2581,25 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 			}
 			reporting.add(value);
 			try {
-				return rerun(node, value, path, issues);
+				// The fast parse of this very value just failed: parsing it again first would double the cost at every level.
+				return node.run(value, path, issues);
 			} finally {
 				reporting.delete(value);
 			}
 		},
 		guard: undefined,
-		// Resolved when an object asks, which is during a parse (never before the first one).
-		get handlesMissing(): boolean | undefined {
-			return resolve().handlesMissing;
+		// The hooks resolve the schema when they are called, during a parse: wrapping this parser while the recursive schema is still
+		// being defined (`nullable(lazy(() => Tree))` inside `Tree`) must not call `getter` yet.
+		missing: function isMissing(value: unknown): boolean {
+			const node = resolve();
+
+			return node.missing !== undefined && node.missing(value);
+		},
+		handlesMissing: function handlesMissingValues(): boolean {
+			return handlesMissing(resolve());
+		},
+		score: function scoreLazy(value: unknown): number {
+			return scoreOf(resolve(), value);
 		}
 	});
 }
@@ -2437,11 +2639,11 @@ export function blankAsUndefined<S extends Schema>(schema: S): Parser<SchemaOutp
 			return node.run(isBlank(value) ? undefined : value, path, issues);
 		},
 		guard: undefined,
-		// Read when a parse asks (a getter): on a `lazy` schema, reading it at construction would run the getter too early.
-		get handlesMissing(): boolean | undefined {
-			return node.handlesMissing;
-		},
-		missing: isBlank
+		handlesMissing: node.handlesMissing,
+		missing: isBlank,
+		score: function scoreBlank(value: unknown): number {
+			return scoreOf(node, isBlank(value) ? undefined : value);
+		}
 	});
 }
 
@@ -2732,7 +2934,7 @@ function runDate(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): un
  * parse(asNumber, null); // throws ValidationError // z.coerce.number() gives 0
  */
 export const asNumber: Parser<number> = {
-	'~tink': { fast: fastNumber, run: runNumber, guard: undefined },
+	'~tink.1': { fast: fastNumber, run: runNumber, guard: undefined },
 	'~standard': {
 		version: 1,
 		vendor: 'tink',
@@ -2753,7 +2955,7 @@ export const asNumber: Parser<number> = {
  * parse(asInteger, '9007199254740993'); // throws ValidationError // would round to 9007199254740992
  */
 export const asInteger: Parser<number> = {
-	'~tink': { fast: fastInteger, run: runInteger, guard: undefined },
+	'~tink.1': { fast: fastInteger, run: runInteger, guard: undefined },
 	'~standard': {
 		version: 1,
 		vendor: 'tink',
@@ -2775,7 +2977,7 @@ export const asInteger: Parser<number> = {
  * parse(asBoolean, 'maybe'); // throws ValidationError
  */
 export const asBoolean: Parser<boolean> = {
-	'~tink': { fast: fastBoolean, run: runBoolean, guard: undefined },
+	'~tink.1': { fast: fastBoolean, run: runBoolean, guard: undefined },
 	'~standard': {
 		version: 1,
 		vendor: 'tink',
@@ -2799,7 +3001,7 @@ export const asBoolean: Parser<boolean> = {
  * parse(asDate, '2024-01-05T12:00:00'); // throws ValidationError // no offset: the time zone would be guessed
  */
 export const asDate: Parser<Date> = {
-	'~tink': { fast: fastDate, run: runDate, guard: undefined },
+	'~tink.1': { fast: fastDate, run: runDate, guard: undefined },
 	'~standard': {
 		version: 1,
 		vendor: 'tink',

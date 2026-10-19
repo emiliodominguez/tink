@@ -127,7 +127,7 @@ describe('two copies of the module', function () {
 
 describe('brand properties', function () {
 	it('should ignore a polluted Object.prototype["~tink"]', function () {
-		const results = polluted(Object.prototype, '~tink', { fast: String, run: String }, function () {
+		const results = polluted(Object.prototype, '~tink.1', { fast: String, run: String }, function () {
 			return [
 				attempt(function () {
 					return parse(isString, 'a');
@@ -138,7 +138,7 @@ describe('brand properties', function () {
 
 		expect(results).toEqual(['a', [{ message: 'Invalid value (got string)', path: ['admin'] }]]);
 		expect(
-			polluted(Object.prototype, '~tink', true, function () {
+			polluted(Object.prototype, '~tink.1', true, function () {
 				return attempt(function () {
 					return parse(isString, 'b');
 				});
@@ -166,8 +166,8 @@ describe('brand properties', function () {
 	});
 
 	it('should treat "~tink" and "~standard" keys of object schemas as ordinary keys', function () {
-		expect(parse({ '~tink': isString }, { '~tink': 'a' })).toEqual({ '~tink': 'a' });
-		expect(parse({ '~tink': { fast: isFunction } }, { '~tink': { fast: String } })).toEqual({ '~tink': { fast: String } });
+		expect(parse({ '~tink.1': isString }, { '~tink.1': 'a' })).toEqual({ '~tink.1': 'a' });
+		expect(parse({ '~tink.1': { fast: isFunction } }, { '~tink.1': { fast: String } })).toEqual({ '~tink.1': { fast: String } });
 		expect(parse({ '~standard': { validate: isString } }, { '~standard': { validate: 'x' } })).toEqual({ '~standard': { validate: 'x' } });
 		expect(parse({ '~standard': { version: isString, validate: isFunction } }, { '~standard': { version: '1', validate: String } })).toEqual({
 			'~standard': { version: '1', validate: String }
