@@ -30,6 +30,7 @@ import {
 	isUnion,
 	refine,
 	withMessage,
+	type FalsyNumber,
 	type FalsyPart,
 	type Guard,
 	type Infer,
@@ -168,7 +169,7 @@ describe('isTruthy / isFalsy', function () {
 	it('should compute the falsy part of a type', function () {
 		const checks: [
 			Equal<FalsyPart<string | undefined>, '' | undefined>,
-			Equal<FalsyPart<number>, number>,
+			Equal<FalsyPart<number>, FalsyNumber>,
 			Equal<FalsyPart<1 | 2>, never>,
 			Equal<FalsyPart<0 | 1>, 0>,
 			Equal<FalsyPart<boolean>, false>,
@@ -186,6 +187,21 @@ describe('isTruthy / isFalsy', function () {
 
 			expect(narrowed).toBeUndefined();
 		}
+	});
+
+	it('should keep wide types in the false branch', function () {
+		const values: Array<number | string> = [3, 'x'];
+
+		for (const value of values) {
+			if (!isFalsy(value)) {
+				const kept: Equal<typeof value, number | string> = true;
+
+				expect(kept).toBe(true);
+			}
+		}
+		const zeros: number[] = [0, 1, NaN].filter(isFalsy);
+
+		expect(zeros).toEqual([0, NaN]);
 	});
 });
 
@@ -818,5 +834,14 @@ describe('guards (regressions)', function () {
 		});
 		expect([isJsonValue(hidden), isJsonValue(inherited), isJsonValue([hidden])]).toEqual([false, false, false]);
 		expect(explain(isJsonValue, { a: hidden })).toEqual([{ message: 'Expected a JSON value (got [object Object])', path: ['a'] }]);
+	});
+
+	it('isJsonValue rejects arrays with their own toJSON, which the index walk would not reach', function () {
+		const list = Object.assign([1], {
+			toJSON: function () {
+				return 'x';
+			}
+		});
+		expect([isJsonValue(list), isJsonArray(list), isJsonValue({ list })]).toEqual([false, false, false]);
 	});
 });

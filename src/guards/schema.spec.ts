@@ -23,6 +23,16 @@ import {
 describe('isShape', function () {
 	const isUser = isShape({ id: isInteger, name: isString, email: isOptional(isString) });
 
+	it('should check own enumerable symbol keys, which the inferred type includes', function () {
+		const tag = Symbol('tag');
+		const isTagged = isShape({ [tag]: isString, a: isInteger });
+		expect([isTagged({ a: 1 }), isTagged({ a: 1, [tag]: 42 }), isTagged({ a: 1, [tag]: 'x' })]).toEqual([false, false, true]);
+		expect(explain(isTagged, { a: 1, [tag]: 42 })).toHaveLength(1);
+		expect(function () {
+			isShape({ [tag]: 1 as any });
+		}).toThrow(new TypeError('isShape: `shape.Symbol(tag)` must be a function, got number'));
+	});
+
 	it('should check own properties against their guards', function () {
 		expect(isUser({ id: 1, name: 'Ada' })).toBe(true);
 		expect(isUser({ id: 1, name: 'Ada', email: 'a@b.c', extra: true })).toBe(true);

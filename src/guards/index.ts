@@ -358,9 +358,17 @@ export function isDefined<T>(value: T): value is NonNullable<T> {
  */
 export type Falsy = false | 0 | 0n | '' | null | undefined;
 
+declare const falsyNumber: unique symbol;
+
 /**
- * The part of `T` that can be falsy, used by {@link isFalsy}: the {@link Falsy} members of `T`, plus `number` for a wide `number` (`0`,
- * `-0` and `NaN` are all falsy, and only `0` has a literal type), `''` for a wide `string` and `0n` for a wide `bigint`.
+ * A `number` that {@link isFalsy} found falsy (`0`, `-0` or `NaN`: only `0` has a literal type). The brand only exists in the type
+ * system and keeps it a subtype of `number`, so that the `false` branch of `isFalsy` still holds the other numbers.
+ */
+export type FalsyNumber = number & { readonly [falsyNumber]: true };
+
+/**
+ * The part of `T` that can be falsy, used by {@link isFalsy}: the {@link Falsy} members of `T`, plus {@link FalsyNumber} for a wide
+ * `number`, `''` for a wide `string` and `0n` for a wide `bigint`.
  * @template T - The type to narrow
  */
 export type FalsyPart<T> =
@@ -370,7 +378,7 @@ export type FalsyPart<T> =
 			? T
 			: T extends number
 				? number extends T
-					? T
+					? T & FalsyNumber
 					: never
 				: T extends string
 					? string extends T
@@ -402,7 +410,8 @@ export function isTruthy<T>(value: T): value is Exclude<T, Falsy> {
 
 /**
  * Checks whether a value is falsy (`false`, `0`, `-0`, `0n`, `''`, `null`, `undefined` or `NaN`), narrowing it to
- * {@link FalsyPart}: `string | undefined` becomes `'' | undefined`, and a wide `number` stays `number` (it may be `NaN`).
+ * {@link FalsyPart}: `string | undefined` becomes `'' | undefined`, and a wide `number` stays a `number` (it may be `NaN`). The `false`
+ * branch keeps every non-literal type: after `if (!isFalsy(count))`, a `count: number | string` is still `number | string`.
  * @template T - The type of the value
  * @param {T} value - The value to check
  * @returns {boolean} Whether the value is falsy
@@ -465,7 +474,12 @@ export function isPrimitive(value: unknown): value is Primitive {
  * isIterable({}); // => false
  */
 export function isIterable(value: unknown): value is Iterable<unknown> {
-	return value != null && typeof (value as { [Symbol.iterator]?: unknown })[Symbol.iterator] === 'function';
+	try {
+		return value != null && typeof (value as { [Symbol.iterator]?: unknown })[Symbol.iterator] === 'function';
+	} catch {
+		// A throwing getter or a revoked proxy.
+		return false;
+	}
 }
 
 /**
@@ -477,7 +491,12 @@ export function isIterable(value: unknown): value is Iterable<unknown> {
  * isAsyncIterable([1]); // => false
  */
 export function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
-	return value != null && typeof (value as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator] === 'function';
+	try {
+		return value != null && typeof (value as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator] === 'function';
+	} catch {
+		// A throwing getter or a revoked proxy.
+		return false;
+	}
 }
 
 /**
@@ -716,7 +735,8 @@ export function isNonEmptyArray(value: unknown): value is [unknown, ...unknown[]
 /**
  * Checks whether `key` is an OWN property key of `object` (string, number or symbol; enumerable or not), narrowing
  * `key` to `keyof T`. Inherited keys such as `'toString'` or `'__proto__'` are rejected, which makes it safe to use
- * before indexing with untrusted keys.
+ * before indexing with untrusted keys. Like every type predicate, the `false` branch removes the keys of `T` from the type of `key`,
+ * although optional keys that are absent and inherited ones (class methods) also return `false`: test `typeof key` there instead.
  * @template T - The object type
  * @param {T} object - The object whose keys are checked
  * @param {unknown} key - The candidate key
@@ -1222,11 +1242,17 @@ function isArrayPrototypePolluted(): boolean {
 export function isShape<S extends ShapeGuards>(shape: S, options?: IsShapeOptions): (value: unknown) => value is ShapeType<S> {
 	if (!isPlainObject(shape)) throw new TypeError(`isShape: \`shape\` must be a plain object, got ${typeName(shape)}`);
 
-	const keys = Object.keys(shape);
-	const guards = keys.map(function (key: string): Guard<unknown> {
-		const guard = shape[key];
+	// Own enumerable symbol keys too: the inferred type includes them.
+	const keys: PropertyKey[] = [
+		...Object.keys(shape),
+		...Object.getOwnPropertySymbols(shape).filter(function (key: symbol): boolean {
+			return Object.prototype.propertyIsEnumerable.call(shape, key);
+		})
+	];
+	const guards = keys.map(function (key: PropertyKey): Guard<unknown> {
+		const guard = (shape as Record<PropertyKey, Guard<unknown>>)[key];
 
-		assertFunction('isShape', `shape.${key}`, guard);
+		assertFunction('isShape', `shape.${String(key)}`, guard);
 
 		return guard;
 	});
@@ -2448,13 +2474,14 @@ export type JsonObject = { [key: string]: JsonValue };
 export type JsonValue = string | number | boolean | null | JsonArray | JsonObject;
 
 /**
- * Whether `JSON.stringify` would call a `toJSON` method of `value` that walking its own enumerable keys does not reach (a non-enumerable
- * or inherited one). An own enumerable `toJSON` is reported by the walk itself, as a function.
+ * Whether `JSON.stringify` would call a `toJSON` method of `value` that walking it does not reach: a non-enumerable or inherited one, or
+ * any `toJSON` of an array (whose walk only visits the indexes). An own enumerable `toJSON` of a plain object is reported by the walk
+ * itself, as a function.
  * @param {object} value - An array or a plain object
  * @returns {boolean} `true` when such a method would replace `value` in the JSON text
  */
 function hasHiddenToJSON(value: object): boolean {
-	return typeof (value as { toJSON?: unknown }).toJSON === 'function' && !Object.prototype.propertyIsEnumerable.call(value, 'toJSON');
+	return typeof (value as { toJSON?: unknown }).toJSON === 'function' && (Array.isArray(value) || !Object.prototype.propertyIsEnumerable.call(value, 'toJSON'));
 }
 
 /** Marks, on the stack of {@link walkJson}, the end of a container's children. */

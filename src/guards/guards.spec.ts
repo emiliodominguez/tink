@@ -389,6 +389,32 @@ describe('guards', function () {
 	});
 
 	describe('isIterable / isAsyncIterable', function () {
+		it('returns false instead of throwing for revoked proxies and throwing getters', function () {
+			const { proxy, revoke } = Proxy.revocable({}, {});
+			revoke();
+			const throwing = Object.defineProperties(
+				{},
+				{
+					[Symbol.iterator]: {
+						get: function () {
+							throw new Error('no');
+						}
+					},
+					[Symbol.asyncIterator]: {
+						get: function () {
+							throw new Error('no');
+						}
+					}
+				}
+			);
+			expect([guards.isIterable(proxy), guards.isAsyncIterable(proxy), guards.isIterable(throwing), guards.isAsyncIterable(throwing)]).toEqual([
+				false,
+				false,
+				false,
+				false
+			]);
+		});
+
 		it('isIterable accepts strings, arrays, maps, sets, generators and custom iterables', function () {
 			expect(guards.isIterable('abc')).toBe(true);
 			expect(guards.isIterable('')).toBe(true);
