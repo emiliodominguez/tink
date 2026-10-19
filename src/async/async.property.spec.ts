@@ -91,6 +91,8 @@ describe('Async helpers (properties)', function () {
 	});
 
 	describe('retry', function () {
+		// Every retry waits for a timer, even with a zero delay (it yields to the event loop), so the stress run's 1,000 cases need more
+		// than Jest's default 5 seconds.
 		it('succeeds iff the number of failures is <= retries, calling fn min(failures, retries) + 1 times', async function () {
 			await fc.assert(
 				fc.asyncProperty(fc.integer({ min: 0, max: 10 }), fc.integer({ min: 0, max: 10 }), async function (failures, retries) {
@@ -119,7 +121,7 @@ describe('Async helpers (properties)', function () {
 					expect(calls).toBe(Math.min(failures, retries) + 1);
 				})
 			);
-		});
+		}, 60_000);
 	});
 	describe('attemptAsync', function () {
 		it('never rejects and matches a try/catch reference', async function () {
