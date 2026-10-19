@@ -1,6 +1,7 @@
 import { createLRUCache, createPriorityQueue } from '../cache/index.js';
 import { debounce, defaultMemoizeKey, noop, type MemoizeCache, type Result } from '../functions/index.js';
 import { assertDelay, assertFunction, assertInteger, assertNumber, describe, draw, MAX_TIMEOUT } from '../utils/assert.js';
+import { assertOptionalSignal, detach, reasonOf } from '../utils/signal.js';
 import type { AbortSignalLike, AnyFunction, RandomGenerator } from '../utils/index.js';
 
 export type { Result } from '../functions/index.js';
@@ -93,27 +94,15 @@ export interface RetryOptions {
  * @returns {unknown} The rejection reason
  */
 function abortReason(signal: AbortSignalLike): unknown {
-	try {
-		return signal.reason ?? new AbortError();
-	} catch (error) {
-		// A signal whose `reason` getter throws still aborts: with that error.
-		return error;
-	}
+	return reasonOf(signal, createAbortError);
 }
 
 /**
- * Removes an abort listener once the operation it watched has settled. A signal whose `removeEventListener` throws keeps the listener,
- * which is then harmless (settling twice does nothing): the error must not stop the settling, or escape from a timer callback.
- * @param {AbortSignalLike | null | undefined} signal - The signal
- * @param {() => void} listener - The listener
- * @returns {void}
+ * Creates the reason of a signal aborted without one.
+ * @returns {AbortError} A new `AbortError`
  */
-function detach(signal: AbortSignalLike | null | undefined, listener: () => void): void {
-	try {
-		signal?.removeEventListener('abort', listener);
-	} catch {
-		// See above.
-	}
+function createAbortError(): AbortError {
+	return new AbortError();
 }
 
 /**
@@ -1814,23 +1803,6 @@ function createAbortController(caller: string): AbortControllerLike {
 	const Controller = (globalThis as { AbortController?: new () => AbortControllerLike }).AbortController;
 	if (typeof Controller !== 'function') throw new Error(`${caller}: \`AbortController\` is not available in this environment`);
 	return new Controller();
-}
-
-/**
- * Throws a `TypeError` unless `value` is `null`, `undefined` or looks like an abort signal (an object with `addEventListener` and
- * `removeEventListener` methods).
- * @param {string} caller - Name of the public function, used in the error message
- * @param {string} name - Name of the validated parameter
- * @param {unknown} value - The value to validate
- * @returns {void}
- * @throws {TypeError} when `value` is not a signal, `null` or `undefined`
- */
-function assertOptionalSignal(caller: string, name: string, value: unknown): asserts value is AbortSignalLike | null | undefined {
-	if (value === null || value === undefined) return;
-	const signal = value as Partial<AbortSignalLike>;
-	if (typeof value !== 'object' || typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function') {
-		throw new TypeError(`${caller}: \`${name}\` must be an AbortSignal, null or undefined, got ${describe(value)}`);
-	}
 }
 
 /**

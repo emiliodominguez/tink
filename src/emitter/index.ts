@@ -1,5 +1,6 @@
 import { AbortError, TimeoutError } from '../async/index.js';
 import { assertDelay, assertFunction } from '../utils/assert.js';
+import { assertOptionalSignal, detach, reasonOf } from '../utils/signal.js';
 import type { AbortSignalLike, AnyFunction } from '../utils/index.js';
 
 /**
@@ -27,17 +28,14 @@ export type EventHandler<P> = (payload: P) => void;
 /**
  * A listener registered with `on('*', ...)`: receives the event name and its payload. The `(event, payload)` pairs form a
  * discriminated union, so checking `event` narrows `payload`.
+ *
+ * `'*'` always registers such a listener. With an event map that has an index signature (`Record<string, T>`), `'*'` is also a key of
+ * the map, so a handler written for a `T` payload type-checks there too, although it receives `(event, payload)`: type it with
+ * `WildcardHandler` (generic wrappers over the event map, such as `class Bus<M> { on<K extends keyof M>(…) }`, rule out a stricter
+ * signature).
  * @template Events - The event map
  */
 export type WildcardHandler<Events extends EventMap> = (...args: { [K in keyof Events]-?: [event: K, payload: Events[K]] }[keyof Events]) => void;
-
-/**
- * The event names accepted by the payload overloads of `on`, `once` and `off`: every name but `'*'`, which always registers a wildcard
- * listener (also when an index signature makes `'*'` a key of the event map), so it is left to the {@link WildcardHandler} overloads.
- * Written on the name rather than on the handler, so that handlers of a union or generic event name keep their payload type.
- * @template K - The event name
- */
-export type NamedEvent<K extends PropertyKey> = K extends '*' ? never : K;
 
 /**
  * The argument list accepted by `emit` after the event name: the payload is optional when `P` is `void`, `undefined` or includes `undefined`.
@@ -59,6 +57,14 @@ export interface WaitForOptions<P> {
 }
 
 /**
+ * Creates the reason of a signal aborted without one.
+ * @returns {AbortError} A new `AbortError`
+ */
+function createAbortError(): AbortError {
+	return new AbortError();
+}
+
+/**
  * A strictly typed, synchronous event emitter. See {@link createEmitter} for the exact semantics.
  * @template Events - Maps each event name to its payload type
  */
@@ -66,15 +72,15 @@ export interface Emitter<Events extends EventMap> {
 	/** Listens to every event (`'*'`). Returns a function removing exactly this registration. */
 	on(event: '*', handler: WildcardHandler<Events>): Unsubscribe;
 	/** Listens to `event`. Returns a function removing exactly this registration. */
-	on<K extends keyof Events>(event: NamedEvent<K>, handler: EventHandler<Events[K]>): Unsubscribe;
+	on<K extends keyof Events>(event: K, handler: EventHandler<Events[K]>): Unsubscribe;
 	/** Like `on('*', handler)`, but the registration is removed before its first call. */
 	once(event: '*', handler: WildcardHandler<Events>): Unsubscribe;
 	/** Like `on`, but the registration is removed before its first call. */
-	once<K extends keyof Events>(event: NamedEvent<K>, handler: EventHandler<Events[K]>): Unsubscribe;
+	once<K extends keyof Events>(event: K, handler: EventHandler<Events[K]>): Unsubscribe;
 	/** Removes every registration of `handler` for wildcard listeners; returns whether anything was removed. */
 	off(event: '*', handler: WildcardHandler<Events>): boolean;
 	/** Removes every registration of `handler` for `event`; returns whether anything was removed. */
-	off<K extends keyof Events>(event: NamedEvent<K>, handler: EventHandler<Events[K]>): boolean;
+	off<K extends keyof Events>(event: K, handler: EventHandler<Events[K]>): boolean;
 	/** Synchronously calls the listeners of `event`, then the wildcard listeners. */
 	emit<K extends keyof Events>(event: K, ...args: EmitArgs<Events[K]>): void;
 	/** Removes the listeners of `event` (`'*'` for wildcard listeners), or every listener when called without argument. */
@@ -125,7 +131,7 @@ interface Listeners {
  * @template Events - Maps each event name to its payload type (`void` payloads can be emitted without argument)
  * @returns {Emitter<Events>} A new emitter
  * @throws {TypeError} from `on`/`once`/`off` when the handler is not a function, and (as a rejection) from `waitFor` when `filter` is not
- *   a function or `timeout` is not a number
+ *   a function, `timeout` is not a number or `signal` is not a signal
  * @throws {RangeError} from `emit` when the event is `'*'`, and (as a rejection) from `waitFor` when the event is `'*'` or `timeout` is
  *   neither a number between `0` and `2^31 - 1` nor `Infinity`
  * @example
@@ -279,10 +285,15 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 
 			if (listeners !== undefined) listeners.emitting++;
 			if (wildcards !== undefined) wildcards.emitting++;
-			if (list !== undefined) errors = run(event, list, false, withPayload, payload, errors);
-			if (wildcardList !== undefined) errors = run(event, wildcardList, true, withPayload, payload, errors);
-			if (listeners !== undefined) listeners.emitting--;
-			if (wildcards !== undefined) wildcards.emitting--;
+			// The counters always come back down, even when a stack overflow escapes from `run`: a raised counter would make every later
+			// `on` copy the listener list.
+			try {
+				if (list !== undefined) errors = run(event, list, false, withPayload, payload, errors);
+				if (wildcardList !== undefined) errors = run(event, wildcardList, true, withPayload, payload, errors);
+			} finally {
+				if (listeners !== undefined) listeners.emitting--;
+				if (wildcards !== undefined) wildcards.emitting--;
+			}
 
 			if (errors === undefined) return;
 			if (errors.length === 1) throw errors[0];
@@ -314,19 +325,23 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 				assertNotWildcard('waitFor', event);
 				assertDelay('waitFor', 'timeout', timeout, true);
 				if (filter !== undefined) assertFunction('waitFor', 'filter', filter);
+				assertOptionalSignal('waitFor', 'signal', signal);
 
 				if (signal?.aborted) {
-					reject(signal.reason ?? new AbortError());
+					reject(reasonOf(signal, createAbortError));
 					return;
 				}
 
+				// The abort listener first: when adding it throws, neither the event listener nor the timer is left behind.
+				signal?.addEventListener('abort', onAbort);
+
+				const unsubscribe = add(event, onEvent, false);
 				const timer =
 					timeout === Infinity
 						? undefined
 						: setTimeout(function () {
 								finish(reject, new TimeoutError(`waitFor: ${String(event)} was not emitted within ${timeout} ms`));
 							}, timeout);
-				const unsubscribe = add(event, onEvent, false);
 
 				/**
 				 * Settles the promise and releases the listener, the timer and the abort listener.
@@ -337,8 +352,8 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 				function finish(settle: (value: never) => void, value: unknown): void {
 					unsubscribe();
 					clearTimeout(timer);
-					signal?.removeEventListener('abort', onAbort);
 					settle(value as never);
+					detach(signal, onAbort);
 				}
 
 				/**
@@ -346,7 +361,7 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 				 * @returns {void}
 				 */
 				function onAbort(): void {
-					finish(reject, (signal as AbortSignalLike).reason ?? new AbortError());
+					finish(reject, reasonOf(signal as AbortSignalLike, createAbortError));
 				}
 
 				/**
@@ -366,9 +381,6 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 
 					if (accepted) finish(resolve, payload);
 				}
-
-				// `finish` removes it, so it never runs twice.
-				signal?.addEventListener('abort', onAbort);
 			});
 		}
 	};

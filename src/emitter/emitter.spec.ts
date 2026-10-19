@@ -53,14 +53,13 @@ function createSignal(): AbortSignalLike & { abort(reason?: unknown): void; list
 
 describe('createEmitter', function () {
 	describe('types', function () {
-		it('types handlers on "*" as wildcard handlers, even when an index signature makes "*" a key', function () {
+		it('calls "*" listeners with (event, payload), also when an index signature makes "*" a key', function () {
 			const counts = createEmitter<Record<string, number>>();
 			const received: unknown[][] = [];
-			// @ts-expect-error a '*' listener receives (event, payload), not the payload
+			// With an index signature, these payload handlers type-check (see WildcardHandler), yet receive the event name first.
 			counts.on('*', function (n: number) {
 				received.push([n]);
 			});
-			// @ts-expect-error same for once
 			counts.once('*', function (n: number) {
 				received.push([n]);
 			});
@@ -75,6 +74,29 @@ describe('createEmitter', function () {
 			});
 			counts.emit('count', 1);
 			expect(received).toEqual([['1'], ['count'], ['count'], ['count', 1]]);
+		});
+
+		it('accepts wrappers generic over the event map', function () {
+			class Bus<M extends Record<string, unknown>> {
+				private readonly events = createEmitter<M>();
+				on<K extends keyof M>(event: K, handler: EventHandler<M[K]>): Unsubscribe {
+					return this.events.on(event, handler);
+				}
+				off<K extends keyof M>(event: K, handler: EventHandler<M[K]>): boolean {
+					return this.events.off(event, handler);
+				}
+				emit<K extends keyof M>(event: K, payload: M[K]): void {
+					(this.events.emit as (event: K, payload: M[K]) => void)(event, payload);
+				}
+			}
+			const bus = new Bus<{ saved: number }>();
+			const seen: number[] = [];
+			function onSaved(id: number): void {
+				seen.push(id);
+			}
+			bus.on('saved', onSaved);
+			bus.emit('saved', 7);
+			expect([seen, bus.off('saved', onSaved)]).toEqual([[7], true]);
 		});
 
 		it('types handlers of union and generic event names after their payloads', function () {
@@ -603,6 +625,54 @@ describe('createEmitter', function () {
 	});
 
 	describe('waitFor', function () {
+		/**
+		 * A signal-like object whose methods or reason can throw, with a way to fire its listeners.
+		 */
+		function hostileSignal(overrides: { add?: boolean; remove?: boolean; reason?: boolean } = {}): AbortSignalLike & { fire(): void } {
+			const listeners: Array<() => void> = [];
+			const signal = {
+				aborted: false,
+				addEventListener(_type: string, listener: () => void): void {
+					if (overrides.add) throw new Error('add');
+					listeners.push(listener);
+				},
+				removeEventListener(): void {
+					if (overrides.remove) throw new Error('remove');
+					listeners.length = 0;
+				},
+				get reason(): unknown {
+					if (overrides.reason) throw new Error('reason');
+					return undefined;
+				},
+				fire(): void {
+					signal.aborted = true;
+					for (const listener of listeners.slice()) listener();
+				}
+			};
+			return signal as unknown as AbortSignalLike & { fire(): void };
+		}
+
+		it('settles and cleans up under signals whose methods or reason throw', async function () {
+			const events = createEmitter<{ x: number }>();
+			await expect(events.waitFor('x', { signal: hostileSignal({ add: true }), timeout: 50 })).rejects.toThrow('add');
+			expect(events.listenerCount('x')).toBe(0);
+			await expect(events.waitFor('x', { signal: {} as AbortSignalLike })).rejects.toThrow(
+				new TypeError('waitFor: `signal` must be an AbortSignal, null or undefined, got object')
+			);
+			expect(events.listenerCount('x')).toBe(0);
+
+			const removing = events.waitFor('x', { signal: hostileSignal({ remove: true }) });
+			events.emit('x', 1);
+			await expect(removing).resolves.toBe(1);
+			await expect(events.waitFor('x', { signal: hostileSignal({ remove: true }), timeout: 5 })).rejects.toBeInstanceOf(TimeoutError);
+
+			const signal = hostileSignal({ reason: true });
+			const aborted = events.waitFor('x', { signal });
+			signal.fire();
+			await expect(aborted).rejects.toThrow('reason');
+			expect(events.listenerCount('x')).toBe(0);
+		});
+
 		afterEach(function () {
 			jest.useRealTimers();
 		});
