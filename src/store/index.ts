@@ -77,6 +77,8 @@ function createNotifier(): Notifier {
 	// Mutated in place, except during a round, which iterates the array it started with: then it is copied on write.
 	let subscriptions: Subscription[] = [];
 	let notifying = false;
+	// Whether the current round already works on a copy (so that a round copies the list once, not once per change).
+	let copied = false;
 	// Set by every `notify` call before it is read.
 	let pending: boolean;
 
@@ -87,6 +89,8 @@ function createNotifier(): Notifier {
 	function round(): unknown[] | undefined {
 		const snapshot = subscriptions;
 		let errors: unknown[] | undefined;
+
+		copied = false;
 
 		for (const subscription of snapshot) {
 			if (!subscription.active) continue;
@@ -103,18 +107,28 @@ function createNotifier(): Notifier {
 		return errors;
 	}
 
+	/**
+	 * Before a change during a round, replaces the list the round iterates with a copy (once per round).
+	 * @returns {void}
+	 */
+	function copyOnWrite(): void {
+		if (!notifying || copied) return;
+		subscriptions = subscriptions.slice();
+		copied = true;
+	}
+
 	return {
 		subscribe(listener: () => void): Unsubscribe {
 			const subscription: Subscription = { listener, active: true };
 
-			if (notifying) subscriptions = subscriptions.slice();
+			copyOnWrite();
 			subscriptions.push(subscription);
 
 			return function (): void {
 				if (!subscription.active) return;
 
 				subscription.active = false;
-				if (notifying) subscriptions = subscriptions.slice();
+				copyOnWrite();
 				subscriptions.splice(subscriptions.indexOf(subscription), 1);
 			};
 		},
@@ -133,7 +147,12 @@ function createNotifier(): Notifier {
 
 				if (++rounds > MAX_ROUNDS) {
 					notifying = false;
-					throw new RangeError(`store: listeners changed the state during ${MAX_ROUNDS} consecutive notification rounds`);
+					const message = `store: listeners changed the state during ${MAX_ROUNDS} consecutive notification rounds`;
+					// The errors of the rounds run so far are kept as the cause, rather than lost.
+					if (errors === undefined) throw new RangeError(message);
+					throw new RangeError(message, {
+						cause: errors.length === 1 ? errors[0] : new AggregateError(errors, `store: ${errors.length} notification rounds threw`)
+					});
 				}
 
 				const roundErrors = round();
@@ -225,9 +244,14 @@ function derive<S, T>(source: ReadonlyStore<S>, selector: (state: S) => T, equal
 			assertFunction('subscribe', 'listener', listener);
 
 			if (!detach) {
-				notifiedValue = getState();
-				notifiedVersion = version;
-				detach = source.subscribe(onSourceChange);
+				const initial = getState();
+
+				// The selector may have subscribed to this store itself (directly, or through a listener of the source): attach once.
+				if (!detach) {
+					notifiedValue = initial;
+					notifiedVersion = version;
+					detach = source.subscribe(onSourceChange);
+				}
 			}
 
 			const unsubscribe = notifier.subscribe(listener);

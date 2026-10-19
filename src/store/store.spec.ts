@@ -686,3 +686,80 @@ describe('createStore', function () {
 		});
 	});
 });
+
+describe('createStore (re-entrancy)', function () {
+	it('attaches a selection once when its selector subscribes to it, so it detaches when unsubscribed', function () {
+		const root = createStore(0);
+		let calls = 0;
+		let inner: Unsubscribe | undefined;
+		let subscribed = false;
+		const selected: ReadonlyStore<number> = root.select(function (n: number): number {
+			calls++;
+			if (!subscribed) {
+				subscribed = true;
+				inner = selected.subscribe(function () {});
+			}
+			return n;
+		});
+		const outer = selected.subscribe(function () {});
+		(inner as Unsubscribe)();
+		outer();
+		calls = 0;
+		root.setState(1);
+		expect(calls).toBe(0);
+	});
+
+	it('keeps the errors of earlier rounds as the cause when the round limit trips', function () {
+		const root = createStore(0);
+		const lost = new Error('lost');
+		root.subscribe(function () {
+			root.setState(root.getState() + 1);
+			if (root.getState() === 50) throw lost;
+		});
+		let caught: unknown;
+		try {
+			root.setState(1);
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(RangeError);
+		expect((caught as RangeError).cause).toBe(lost);
+
+		const twice = createStore(0);
+		twice.subscribe(function () {
+			twice.setState(twice.getState() + 1);
+			if (twice.getState() === 10 || twice.getState() === 20) throw new Error(`round ${twice.getState()}`);
+		});
+		expect(function () {
+			twice.setState(1);
+		}).toThrow(
+			expect.objectContaining({
+				cause: expect.objectContaining({ errors: [new Error('round 10'), new Error('round 20')] })
+			})
+		);
+	});
+
+	it('lets a listener replace every subscription during a round', function () {
+		const root = createStore(0);
+		const calls: string[] = [];
+		const unsubscribes: Unsubscribe[] = [];
+		for (let i = 0; i < 3; i++) {
+			unsubscribes.push(
+				root.subscribe(function () {
+					calls.push(`old${i}`);
+					if (i === 0) {
+						for (const unsubscribe of unsubscribes.splice(0)) unsubscribe();
+						for (let j = 0; j < 3; j++) {
+							root.subscribe(function () {
+								calls.push(`new${j}`);
+							});
+						}
+					}
+				})
+			);
+		}
+		root.setState(1);
+		root.setState(2);
+		expect(calls).toEqual(['old0', 'new0', 'new1', 'new2']);
+	});
+});
