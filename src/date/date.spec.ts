@@ -2261,6 +2261,31 @@ describe('Date helpers', function () {
 	});
 
 	describe('skipped calendar days and repeated fractions of an hour', function () {
+		it('endOfWeek ends the week whose first day was skipped on its last day', function () {
+			withTimeZone('Pacific/Apia', function () {
+				// With weeks starting on Friday, the week of Saturday 2011-12-31 began on the skipped Friday 30th.
+				const saturday = new Date(2011, 11, 31, 12);
+				const end = helpers.endOfWeek(saturday, 5);
+				expect(helpers.toISOStringLocal(end)).toBe('2012-01-05T23:59:59.999+14:00');
+				expect(helpers.isSameWeek(end, saturday, 5)).toBe(true);
+			});
+		});
+
+		it('ends a day after its last instant when the clock was set back just after midnight', function () {
+			withTimeZone('America/St_Johns', function () {
+				// On 2010-11-07 at 00:01 the clock went back to 23:01 of November 6th: midnight happened twice.
+				const late = new Date('2010-11-07T03:00:00Z');
+				expect(helpers.toISOStringLocal(late)).toBe('2010-11-06T23:30:00.000-03:30');
+				expect(helpers.toISOStringLocal(helpers.endOfDay(late))).toBe('2010-11-06T23:59:59.999-03:30');
+				expect(helpers.toISOStringLocal(helpers.endOfMonth(new Date('2009-11-01T03:00:00Z')))).toBe('2009-10-31T23:59:59.999-03:30');
+				expect(helpers.toISOStringLocal(helpers.endOfDay(new Date(2010, 5, 1)))).toBe('2010-06-01T23:59:59.999-02:30');
+			});
+			withTimeZone('America/New_York', function () {
+				// The clock goes back at 02:00, not just after midnight: the day before still ends at its only midnight.
+				expect(helpers.toISOStringLocal(helpers.endOfDay(new Date(2024, 10, 2, 12)))).toBe('2024-11-02T23:59:59.999-04:00');
+			});
+		});
+
 		it('endOfYear ends on the last local day of the year when December 31st was skipped', function () {
 			withTimeZone('Pacific/Kiritimati', function () {
 				// Kiritimati skipped December 31st, 1994 (UTC-10 to UTC+14).

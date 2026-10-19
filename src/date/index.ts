@@ -582,6 +582,16 @@ function lastInstantOfDay(date: Date, days = 1): Date {
 	// Hour `24 * days` is the local midnight `days` days later: a single wall-clock conversion instead of `setDate()` then
 	// `setHours(0)`, so no intermediate wall-clock time can be moved by a DST gap.
 	date.setHours(24 * days, 0, 0, 0);
+
+	// Where the clock was set back just after midnight (St. John's and Moncton at 00:01, until 2010), midnight happens twice and the
+	// conversion gives the first one, after which the previous day comes back: the day ends just before the second midnight.
+	const shift = new Date(date.getTime() + 3 * MS_PER_HOUR).getTimezoneOffset() - date.getTimezoneOffset();
+
+	if (shift > 0) {
+		const second = new Date(date.getTime() + shift * MS_PER_MINUTE);
+
+		if (second.getDate() === date.getDate() && second.getHours() === 0 && second.getMinutes() === 0 && second.getSeconds() === 0) date.setTime(second.getTime());
+	}
 	date.setTime(date.getTime() - 1);
 
 	return ensureInRange(date);
@@ -915,7 +925,9 @@ export function startOfWeek(date: DateInput, weekStartsOn: WeekdayIndex = 0): Da
 export function endOfWeek(date: DateInput, weekStartsOn: WeekdayIndex = 0): Date {
 	assertWeekday('endOfWeek', weekStartsOn);
 
-	return lastInstantOfDay(startOfWeek(date, weekStartsOn), 7);
+	// Counted from the week's epoch day rather than from `startOfWeek`, which moves to the next day when the first one was skipped
+	// (Samoa, 2011-12-30): the instant before the first midnight of the next week.
+	return lastInstantOfDay(localMidnight(1970, 0, 1 + weekStartDay(toValidDate(date), weekStartsOn) + DAYS_PER_WEEK), 0);
 }
 
 /**
