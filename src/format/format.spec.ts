@@ -517,6 +517,7 @@ describe('Format helpers', function () {
 
 		it('should reject strings, non-iterables and non-string items', function () {
 			expect(function () {
+				// @ts-expect-error a bare string is rejected at compile time too
 				helpers.formatList('abc');
 			}).toThrow(new TypeError('formatList: `items` must be an iterable of strings, got string'));
 			expect(function () {
@@ -624,6 +625,15 @@ describe('Format helpers', function () {
 			expect(helpers.formatOrdinal(2 ** 57)).toBe('144,115,188,075,855,870th');
 			expect(helpers.formatOrdinal(-(2 ** 57))).toBe('-144,115,188,075,855,870th');
 			expect(helpers.formatOrdinal(2 ** 53)).toBe('9,007,199,254,740,992nd');
+		});
+
+		it('agrees with pluralRule above 2^53, which also reads the printed digits', function () {
+			expect(helpers.pluralRule(1e23, { type: 'ordinal' })).toBe('other');
+			expect(helpers.pluralRule(2 ** 57, { type: 'ordinal' })).toBe('other');
+			expect(helpers.formatNumber(2 ** 57, { locale: 'ru' })).toMatch(/870$/);
+			expect(helpers.pluralRule(2 ** 57, { locale: 'ru' })).toBe('many');
+			expect(helpers.pluralRule(2 ** 53 + 2, { type: 'ordinal' })).toBe('other');
+			expect(helpers.pluralRule(1.5)).toBe('other');
 		});
 
 		it('should use English suffixes for English locales', function () {

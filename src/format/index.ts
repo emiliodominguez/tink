@@ -533,7 +533,7 @@ export function formatUnit(value: number | bigint, unit: string, options: Format
  * formatList(new Set(['x'])); // => 'x'
  * formatList([]); // => ''
  */
-export function formatList(items: Iterable<string>, options: FormatListOptions = {}): string {
+export function formatList<T extends Iterable<string>>(items: T extends string ? never : T, options: FormatListOptions = {}): string {
 	if (typeof items === 'string' || !isIterable(items)) throw new TypeError(`formatList: \`items\` must be an iterable of strings, got ${describe(items)}`);
 
 	const list = Array.from(items);
@@ -638,21 +638,21 @@ export function formatOrdinal(n: number, options: FormatOrdinalOptions = {}): st
 	const rules = getFormatter('plural', Intl.PluralRules, locale, { type: 'ordinal' }, ORDINAL_MEMO);
 	const table = suffixes ?? (resolvedLanguage(rules) === 'en' ? ENGLISH_ORDINAL_SUFFIXES : GENERIC_ORDINAL_SUFFIXES);
 
-	return `${formatNumber(value, { locale })}${table[rules.select(ordinalSubject(value))] ?? table.other}`;
+	return `${formatNumber(value, { locale })}${table[rules.select(pluralSubject(value))] ?? table.other}`;
 }
 
 /**
- * The number whose ordinal category is that of `value` as PRINTED. Above `2^53` the printed digits (the shortest round-trip form,
- * `1e23` prints as `100…000`) differ from the exact double (`99999999999999991611392`) that `Intl.PluralRules` looks at, so the
- * category is taken from a safe integer with the same last six printed digits instead (and far from the small values that some locales
- * single out, such as Italian's 8, 11, 80 and 800).
- * @param {number} value - A finite integer
- * @returns {number} `value`, or a safe integer ending like it when it is not safe
+ * The number whose plural (cardinal or ordinal) category is that of `value` as PRINTED. Above `2^53` the printed digits (the shortest
+ * round-trip form, `1e23` prints as `100…000`) differ from the exact double (`99999999999999991611392`) that `Intl.PluralRules` looks
+ * at, so the category is taken from a safe integer with the same last six printed digits instead (and far from the small values that
+ * some locales single out, such as Italian's 8, 11, 80 and 800).
+ * @param {number} value - A finite number
+ * @returns {number} `value`, or a safe integer ending like it when it is an integer that is not safe
  * @example
- * ordinalSubject(1e23); // => 1e15
+ * pluralSubject(1e23); // => 1e15
  */
-function ordinalSubject(value: number): number {
-	if (Number.isSafeInteger(value)) return value;
+function pluralSubject(value: number): number {
+	if (!Number.isInteger(value) || Number.isSafeInteger(value)) return value;
 
 	const digits = new Intl.NumberFormat('en-US', { useGrouping: false }).format(Math.abs(value));
 	return 1e15 + Number(digits.slice(-6));
@@ -660,6 +660,7 @@ function ordinalSubject(value: number): number {
 
 /**
  * Returns the `Intl.PluralRules` category of a count — the key to pick the right message variant (`'one'`, `'few'`, `'other'`…).
+ * Above `2^53`, the category is that of the count as {@link formatNumber} prints it (like {@link formatOrdinal}).
  * @param {number} count - A finite number
  * @param {PluralRuleOptions} [options={}] - `locale` (default `'en-US'`), `type` (`'cardinal'`, the default, or `'ordinal'`) and other
  * `Intl.PluralRules` options (`minimumFractionDigits`: `1.0` is plural in English)
@@ -678,5 +679,5 @@ export function pluralRule(count: number, options: PluralRuleOptions = {}): Intl
 	assertFiniteNumber('pluralRule', count, 'count');
 	const { locale, ...rest } = options;
 
-	return getFormatter('plural', Intl.PluralRules, locale, rest, PLURAL_MEMO).select(count);
+	return getFormatter('plural', Intl.PluralRules, locale, rest, PLURAL_MEMO).select(pluralSubject(count));
 }
