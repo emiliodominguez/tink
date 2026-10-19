@@ -936,6 +936,29 @@ const smallJson: fc.Arbitrary<unknown> = fc.letrec(function (tie) {
 	};
 }).value;
 
+/** {@link smallJson} with `undefined` among the values (object members that JSON drops). */
+const withUndefined: fc.Arbitrary<unknown> = fc.letrec(function (tie) {
+	return {
+		value: fc.oneof(
+			{ depthSize: 'small', withCrossShrink: true },
+			fc.constantFrom<unknown>(0, 1, undefined, null),
+			fc.array(tie('value'), { maxLength: 3 }),
+			fc.dictionary(fc.constantFrom('a', 'b', 'c'), tie('value'), { maxKeys: 3 })
+		)
+	};
+}).value;
+
+/**
+ * Copies a value without its object members whose value is `undefined` (what `JSON.stringify` drops; array items are kept).
+ */
+function withoutUndefinedMembers(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(withoutUndefinedMembers);
+	if (!isPlainObject(value)) return value;
+	const copy = Object.create(Object.getPrototypeOf(value)) as Record<string, unknown>;
+	for (const key of Object.keys(value)) if (value[key] !== undefined) copy[key] = withoutUndefinedMembers(value[key]);
+	return copy;
+}
+
 /** A pair of JSON values: independent, or the second derived from the first. */
 const jsonPair = fc.oneof(
 	fc.tuple(fc.jsonValue({ maxDepth: 4 }), fc.jsonValue({ maxDepth: 4 })),
@@ -1107,6 +1130,16 @@ describe('structural sharing and JSON Patch (properties)', function () {
 				expect(patch.length === 0).toBe(helpers.isEqual(a, b));
 				// The patch survives JSON serialization (when `b` does: null-prototype objects come back with `Object.prototype`).
 				if (helpers.isEqual(JSON.parse(JSON.stringify(b)), b)) expect(helpers.isEqual(helpers.applyPatch(a, JSON.parse(JSON.stringify(patch))), b)).toBe(true);
+			})
+		);
+	});
+
+	it('applyPatch(a, createPatch(a, b)) equals b up to undefined object members', function () {
+		fc.assert(
+			fc.property(fc.tuple(withUndefined, withUndefined), function ([a, b]) {
+				const patch = helpers.createPatch(a, b);
+				expect(helpers.isEqual(withoutUndefinedMembers(helpers.applyPatch(a, patch)), withoutUndefinedMembers(b))).toBe(true);
+				expect(patch.length === 0).toBe(helpers.isEqual(withoutUndefinedMembers(a), withoutUndefinedMembers(b)));
 			})
 		);
 	});

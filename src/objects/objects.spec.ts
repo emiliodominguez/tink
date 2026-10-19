@@ -3661,6 +3661,9 @@ describe('structural sharing and JSON Patch', function () {
 			next.self = next;
 			const result = helpers.replaceEqualDeep(prev, next) as Record<string, unknown>;
 			expect(helpers.isEqual(result, next)).toBe(true);
+			// The reference back is kept from `next`, so the container on the cycle is rebuilt (not `prev`, though deeply equal).
+			expect(result).not.toBe(prev);
+			expect(result.self).toBe(next);
 			const changed: Record<string, unknown> = { a: 2 };
 			changed.self = changed;
 			const other = helpers.replaceEqualDeep(prev, changed) as Record<string, unknown>;
@@ -4192,9 +4195,10 @@ describe('JSON Patch (review regressions)', function () {
 		expect(helpers.createPatch(nested(800, 1), nested(800, 2))).toHaveLength(1);
 		const arrays = Date.now() - start;
 		start = Date.now();
-		const patch = helpers.createPatch(thread(1000, false), thread(1000, true));
+		// 600 levels: deep enough to expose a quadratic diff, shallow enough for the default stack of Node 22 under jest.
+		const patch = helpers.createPatch(thread(600, false), thread(600, true));
 		const threads = Date.now() - start;
-		expect(patch).toHaveLength(1000);
+		expect(patch).toHaveLength(600);
 		expect(arrays).toBeLessThan(1000);
 		expect(threads).toBeLessThan(250);
 	});
@@ -4246,6 +4250,173 @@ describe('JSON Patch (review regressions)', function () {
 			expect([removed[0], removed[1], removed[2]]).toEqual([1, undefined, 3]);
 		} finally {
 			delete proto[1];
+		}
+	});
+
+	it('reads operations and their fields as own properties only', function () {
+		const objectProto = Object.prototype as unknown as Record<string, unknown>;
+		const arrayProto = Array.prototype as unknown as Record<number, unknown>;
+		function failure(operations: ReadonlyArray<unknown>): unknown {
+			try {
+				return helpers.applyPatch({ a: 1 }, operations as helpers.JsonPatchOperation[]);
+			} catch (error) {
+				return error;
+			}
+		}
+		let results: unknown[];
+		objectProto.op = 'add';
+		objectProto.path = '/a';
+		objectProto.from = '/a';
+		objectProto.value = 'evil';
+		arrayProto[0] = { op: 'remove', path: '/a' };
+		try {
+			results = [
+				failure([{ op: 'add', path: '/b' }]),
+				failure([{ op: 'replace', path: '/a' }]),
+				failure([{ op: 'test', path: '/a' }]),
+				failure([{ op: 'move', path: '/b' }]),
+				failure([{ op: 'copy', path: '/b' }]),
+				failure([{ path: '/a', value: 1 }]),
+				failure([{ op: 'remove' }]),
+				failure(new Array(1)),
+				// eslint-disable-next-line no-sparse-arrays
+				failure([{ op: 'replace', path: '/a', value: 2 }, , { op: 'remove', path: '/a' }])
+			];
+		} finally {
+			delete objectProto.op;
+			delete objectProto.path;
+			delete objectProto.from;
+			delete objectProto.value;
+			delete arrayProto[0];
+		}
+		expect(results).toEqual([
+			new TypeError("applyPatch: `operations[0]` must have a `value` for 'add'"),
+			new TypeError("applyPatch: `operations[0]` must have a `value` for 'replace'"),
+			new TypeError("applyPatch: `operations[0]` must have a `value` for 'test'"),
+			new TypeError('applyPatch: `operations[0].from` must be a string, got undefined'),
+			new TypeError('applyPatch: `operations[0].from` must be a string, got undefined'),
+			new TypeError('applyPatch: `operations[0].op` must be a string, got undefined'),
+			new TypeError('applyPatch: `operations[0].path` must be a string, got undefined'),
+			new TypeError('applyPatch: `operations[0]` must be an object, got undefined'),
+			new TypeError('applyPatch: `operations[1]` must be an object, got undefined')
+		]);
+		// An own `value` of `undefined` is a value; own getters are read once.
+		expect(helpers.applyPatch({ a: 1 }, [{ op: 'replace', path: '/a', value: undefined }])).toEqual({ a: undefined });
+		let reads = 0;
+		const operation = {
+			get value(): number {
+				reads++;
+				return 2;
+			},
+			op: 'add',
+			path: '/b'
+		} as const;
+		expect(helpers.applyPatch({ a: 1 }, [operation])).toEqual({ a: 1, b: 2 });
+		expect(reads).toBe(1);
+	});
+
+	it('shifts array items in linear time per operation', function () {
+		const before = Array.from({ length: 100_000 }, function (_value, index) {
+			return index;
+		});
+		const after = [...before.slice(0, 1000), ...before.slice(3000)];
+		const patch = helpers.createPatch(before, after);
+		expect(patch).toHaveLength(2000);
+		const start = Date.now();
+		const removed = helpers.applyPatch(before, patch);
+		const elapsed = Date.now() - start;
+		expect(removed).toEqual(after);
+		// About 0.15 s (2 s with coverage instrumentation); shifting with the generic `copyWithin` took 5 s.
+		expect(elapsed).toBeLessThan(3000);
+	});
+
+	it('treats undefined object members as absent, as JSON does', function () {
+		expect(helpers.createPatch({ name: 'Ada', nickname: 'A' }, { name: 'Ada', nickname: undefined })).toEqual([{ op: 'remove', path: '/nickname' }]);
+		expect(helpers.createPatch({ a: 1 }, { a: 1, b: undefined })).toEqual([]);
+		expect(helpers.createPatch({ a: undefined }, { a: undefined })).toEqual([]);
+		expect(helpers.createPatch({ a: undefined }, {})).toEqual([]);
+		expect(helpers.createPatch({ a: undefined, b: 1 }, { b: 1, a: 2 })).toEqual([{ op: 'add', path: '/a', value: 2 }]);
+		expect(helpers.createPatch({ x: { a: undefined } }, { x: { a: { b: 1 } } })).toEqual([{ op: 'add', path: '/x/a', value: { b: 1 } }]);
+		// The patch survives JSON serialization.
+		const before = { name: 'Ada', nickname: 'A', age: undefined };
+		const after = { name: 'Ada', nickname: undefined, age: 36 };
+		expect(helpers.applyPatch(before, JSON.parse(JSON.stringify(helpers.createPatch(before, after))))).toEqual({ name: 'Ada', age: 36 });
+		// Array items are kept as they are.
+		expect(helpers.createPatch({ a: [1] }, { a: [1, undefined] })).toEqual([{ op: 'add', path: '/a/1', value: undefined }]);
+		expect(helpers.createPatch([1], [undefined])).toEqual([{ op: 'replace', path: '/0', value: undefined }]);
+		// Each value is read once.
+		let reads = 0;
+		const watched = {
+			get a(): number {
+				reads++;
+				return 1;
+			},
+			get b(): undefined {
+				reads++;
+				return undefined;
+			}
+		};
+		expect(helpers.createPatch(watched, { a: 2, b: 3 })).toEqual([
+			{ op: 'replace', path: '/a', value: 2 },
+			{ op: 'add', path: '/b', value: 3 }
+		]);
+		expect(helpers.createPatch({ a: 2, b: 3 }, watched)).toEqual([
+			{ op: 'replace', path: '/a', value: 1 },
+			{ op: 'remove', path: '/b' }
+		]);
+		expect(reads).toBe(4);
+	});
+
+	it('tests plain objects by their members, whatever their prototype', function () {
+		const bare = Object.assign(Object.create(null) as object, { b: 1, c: [Object.assign(Object.create(null) as object, { d: 2 })] });
+		expect(helpers.applyPatch({ a: bare }, [{ op: 'test', path: '/a', value: { b: 1, c: [{ d: 2 }] } }])).toEqual({ a: bare });
+		expect(helpers.applyPatch({ a: { b: 1 } }, [{ op: 'test', path: '/a', value: Object.assign(Object.create(null) as object, { b: 1 }) }])).toEqual({ a: { b: 1 } });
+		expect(function () {
+			helpers.applyPatch({ a: bare }, [{ op: 'test', path: '/a', value: { b: 1, c: [{ d: 3 }] } }]);
+		}).toThrow(helpers.JsonPatchError);
+		expect(function () {
+			helpers.applyPatch({ a: [1] }, [{ op: 'test', path: '/a', value: { 0: 1 } }]);
+		}).toThrow(helpers.JsonPatchError);
+		expect(function () {
+			helpers.applyPatch({ a: new Date(0) }, [{ op: 'test', path: '/a', value: {} }]);
+		}).toThrow(helpers.JsonPatchError);
+		class Box {
+			b = 1;
+		}
+		expect(function () {
+			helpers.applyPatch({ a: new Box() }, [{ op: 'test', path: '/a', value: { b: 1 } }]);
+		}).toThrow(helpers.JsonPatchError);
+		// isEqual itself still tells the prototypes apart.
+		expect(helpers.isEqual(bare, { b: 1, c: [{ d: 2 }] })).toBe(false);
+	});
+
+	it('hashes functions without calling their toString', function () {
+		function hostile(): void {}
+		hostile.toString = function (): string {
+			throw new Error('toString called');
+		};
+		function other(): void {}
+		expect(helpers.createPatch([hostile], [hostile, 1])).toEqual([{ op: 'add', path: '/1', value: 1 }]);
+		expect(helpers.createPatch([1, hostile], [hostile])).toEqual([{ op: 'remove', path: '/0' }]);
+		expect(helpers.createPatch([hostile], [other, 1])).toEqual([
+			{ op: 'replace', path: '/0', value: other },
+			{ op: 'add', path: '/1', value: 1 }
+		]);
+	});
+});
+
+describe('Object helpers read their options as own properties only', function () {
+	it('ignores options inherited from a polluted Object.prototype', function () {
+		const polluted = Object.prototype as Record<string, unknown>;
+		Object.assign(polluted, { arrays: 'concat', missing: 'skip', separator: '/', arrayLimit: 0, deep: true, compare: function () {} });
+		try {
+			expect(helpers.deepMergeWith({}, { a: [1] }, { a: [2] })).toEqual({ a: [2] });
+			expect(helpers.isMatch({ a: [1, 2] }, { a: [1] })).toBe(false);
+			expect(helpers.flattenObject({ a: { b: 1 } })).toEqual({ 'a.b': 1 });
+			expect(helpers.unflattenObject({ 'a.0': 1 })).toEqual({ a: [1] });
+			expect(Object.keys(helpers.sortKeys({ b: 1, a: { d: 1, c: 2 } }).a)).toEqual(['d', 'c']);
+		} finally {
+			for (const key of ['arrays', 'missing', 'separator', 'arrayLimit', 'deep', 'compare']) delete polluted[key];
 		}
 	});
 });

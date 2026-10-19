@@ -1,6 +1,6 @@
 import { isDate, isArrayBuffer, isError, isFunction, isMap, isObject, isPlainObject, isPromise, isRegExp, isSet, isWeakMap, isWeakSet } from '../guards/index.js';
 import { toCamelCase, toKebabCase, toSnakeCase } from '../strings/index.js';
-import { assertFunction, assertInteger, assertNumber, describe } from '../utils/assert.js';
+import { assertFunction, assertInteger, assertNumber, describe, ownOptions } from '../utils/assert.js';
 import type { AnyFunction, DeepReadonly, NestedKeyOf, PathValue, Primitive, UnionToIntersection } from '../utils/index.js';
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1582,7 +1582,7 @@ function mergeAll(settings: MergeSettings, target: object, sources: ReadonlyArra
  */
 function mergeSettings(caller: string, options: unknown, fill: boolean): MergeSettings {
 	if (!isObject(options)) throw new TypeError(`${caller}: \`options\` must be an object, got ${describe(options)}`);
-	const { arrays = 'replace', customizer, missing = 'undefined', deep } = options as DeepMergeOptions & DefaultsOptions;
+	const { arrays = 'replace', customizer, missing = 'undefined', deep } = ownOptions(options as DeepMergeOptions & DefaultsOptions);
 	if (arrays !== 'replace' && arrays !== 'concat' && arrays !== 'union') {
 		throw new RangeError(`${caller}: \`arrays\` must be 'replace', 'concat' or 'union', got ${JSON.stringify(arrays)}`);
 	}
@@ -1794,6 +1794,8 @@ type ComparisonStack = Array<[object, object, unknown?]> & {
 	proven?: WeakMap<object, object>;
 	/** For {@link isMatch}: the results of pairs with a large subtree, settled without assumptions. */
 	settled?: WeakMap<object, WeakMap<object, boolean>>;
+	/** For the `test` operation of {@link applyPatch}: plain objects compare their members whatever their prototype (`null` or not). */
+	json?: boolean;
 };
 
 /** How many nested object pairs an equal pair must have needed for {@link isEqual} to remember it (small subtrees are cheaper to redo). */
@@ -1935,6 +1937,17 @@ function sameKind(a: object, b: object): boolean {
 }
 
 /**
+ * Whether an object is a JSON object for the `test` operation of {@link applyPatch}: a plain object with an `Object.prototype` or
+ * `null` prototype (not a thenable).
+ * @param {object} value - The object
+ * @returns {boolean} Whether it is a plain object
+ */
+function isJsonObject(value: object): boolean {
+	const prototype = Object.getPrototypeOf(value);
+	return (prototype === null || prototype === Object.prototype) && isTree(value, prototype);
+}
+
+/**
  * Whether the pair `(a, b)` is already being compared further up (a cycle: it is then assumed equal).
  * @param {ComparisonStack} stack - The pairs being compared
  * @param {unknown} a - First value
@@ -1959,7 +1972,7 @@ function isComparing(stack: ComparisonStack, a: unknown, b: unknown): boolean {
 function equalWith(a: unknown, b: unknown, stack: ComparisonStack, key?: unknown): boolean {
 	if (stack.customizer !== undefined) return customEqual(a, b, stack, key, stack.customizer);
 	if (sameValueZero(a, b)) return true;
-	if (!isObject(a) || !isObject(b) || !sameKind(a, b)) return false;
+	if (!isObject(a) || !isObject(b) || !(sameKind(a, b) || (stack.json === true && isJsonObject(a) && isJsonObject(b)))) return false;
 	if (isComparing(stack, a, b)) {
 		stack.assumed = (stack.assumed ?? 0) + 1;
 		return true;
@@ -2152,7 +2165,7 @@ function matchWith(value: unknown, pattern: unknown, subset: boolean, stack: Com
  * isMatch({ when: new Date(0) }, { when: new Date(0) }); // => true
  */
 export function isMatch(value: unknown, pattern: unknown, options: IsMatchOptions = {}): boolean {
-	const arrays = options.arrays ?? 'exact';
+	const arrays = ownOptions(options).arrays ?? 'exact';
 	if (arrays !== 'exact' && arrays !== 'subset') throw new RangeError(`isMatch: \`arrays\` must be 'exact' or 'subset', got ${JSON.stringify(arrays)}`);
 	return matchWith(value, pattern, arrays === 'subset', []);
 }
@@ -2451,7 +2464,7 @@ export interface UnflattenOptions extends FlattenOptions {
  * @throws {RangeError} when the separator is empty
  */
 function readSeparator(caller: string, options: FlattenOptions): string {
-	const separator = options.separator ?? '.';
+	const separator = ownOptions(options).separator ?? '.';
 	if (typeof separator !== 'string') throw new TypeError(`${caller}: \`separator\` must be a string, got ${describe(separator)}`);
 	if (separator === '') throw new RangeError(`${caller}: \`separator\` must not be empty`);
 	return separator;
@@ -2565,8 +2578,9 @@ export function flattenObject(object: object, options: FlattenOptions = {}): Rec
  * unflattenObject({ 'a.0': 1, 'a.1': 2 }, { arrayLimit: 0 }); // => { a: { 0: 1, 1: 2 } }
  */
 export function unflattenObject(record: Readonly<Record<string, unknown>>, options: UnflattenOptions = {}): Record<string, unknown> {
-	const separator = readSeparator('unflattenObject', options);
-	const arrayLimit = options.arrayLimit ?? ARRAY_LIMIT;
+	const own = ownOptions(options);
+	const separator = readSeparator('unflattenObject', own);
+	const arrayLimit = own.arrayLimit ?? ARRAY_LIMIT;
 	assertInteger('unflattenObject', 'arrayLimit', arrayLimit, 0, true);
 	// Larger canonical integers are not array indices: they never create arrays.
 	const limit = Math.min(arrayLimit, MAX_ARRAY_LENGTH - 1);
@@ -2849,16 +2863,18 @@ function shareMembers(prev: object, next: object, prototype: object | null, stat
 /**
  * Structural sharing, as TanStack Query applies it to refetched data: returns `next`, except that every part of it deeply equal
  * ({@link isEqual}) to the part of `prev` at the same place is replaced by that part of `prev`, and `prev` itself is returned when
- * everything is equal. References to unchanged data therefore stay the same across updates, so `React.memo`, `useMemo` dependencies and
- * selectors only see what really changed.
+ * everything is equal (unless `next` is circular: see below). References to unchanged data therefore stay the same across updates, so
+ * `React.memo`, `useMemo` dependencies and selectors only see what really changed.
  * - Plain objects (`Object.prototype` or `null` prototype) and dense arrays without extra keys are walked: a container is rebuilt (same
  *   prototype, `next`'s key order) when anything inside it changed, and is `prev`'s when nothing did (whatever the key order). Own
  *   enumerable string and symbol keys are compared; `next`'s values are read once (getters run once) and stored as data properties.
  * - Any other value (`Date`, `Map`, `Set`, class instance, sparse array...) is a leaf: `prev`'s when {@link isEqual}, else `next`'s.
  *   Primitives are compared with `Object.is` (`-0` stays `-0`).
  * - Inputs are never mutated. Keys are defined, never assigned, so a `'__proto__'` key stays an own property.
- * - Linear in the size of `next`: a part shared by several paths is processed once per pair of parts. A circular `next` is supported:
- *   a reference back to an enclosing container is kept from `next` as is.
+ * - Linear in the size of the plain objects and arrays of `next`, plus what {@link isEqual} costs on the leaves (`Map` and `Set`
+ *   leaves holding objects compare in quadratic time): a part shared by several paths is processed once per pair of parts. A circular
+ *   `next` is supported: a reference back to an enclosing container is kept from `next` as is, so the containers on the cycle are
+ *   rebuilt and the result is not `prev` even when both are deeply equal.
  *
  * Recursion depth is bounded by the call stack (~thousands of levels): deeper input throws a `RangeError`.
  * @template T - The type of the new value
@@ -2977,9 +2993,10 @@ function textHash(text: string, seed: number): number {
  */
 function treeHash(value: unknown, state: PatchWalk): number {
 	if (typeof value !== 'object' || value === null) {
-		// `String` gives `0` for `-0` and `NaN` for every NaN, as `isEqual` compares them; a symbol only hashes its type. The seed tells
-		// the types apart (`'1'` from `1`).
-		return textHash(typeof value === 'symbol' ? '' : String(value), (typeof value).length * 31 + (typeof value).charCodeAt(0));
+		// `String` gives `0` for `-0` and `NaN` for every NaN, as `isEqual` compares them; a symbol or a function only hashes its type
+		// (`String` would run a function's own `toString`). The seed tells the types apart (`'1'` from `1`).
+		const type = typeof value;
+		return textHash(type === 'symbol' || type === 'function' ? '' : String(value), type.length * 31 + type.charCodeAt(0));
 	}
 	const known = state.hashes.get(value);
 	if (known !== undefined) return known;
@@ -3050,7 +3067,8 @@ function patchWalk(a: unknown, b: unknown, path: string, operations: JsonPatchOp
 }
 
 /**
- * {@link patchWalk} for two plain objects: removals and changes in the key order of `a`, then additions in the key order of `b`.
+ * {@link patchWalk} for two plain objects: removals and changes in the key order of `a`, then additions in the key order of `b`. A
+ * member whose value is `undefined` counts as absent, as in JSON. Each value is read once.
  * @param {object} a - The old object
  * @param {object} b - The new object
  * @param {string} path - Their JSON Pointer
@@ -3059,13 +3077,21 @@ function patchWalk(a: unknown, b: unknown, path: string, operations: JsonPatchOp
  * @returns {void}
  */
 function patchMembers(a: object, b: object, path: string, operations: JsonPatchOperation[], state: PatchWalk): void {
+	// The keys with a value on `a`'s side: `b`'s value was read (and handled) with them.
+	const present = new Set<string>();
 	for (const key of Object.keys(a)) {
+		const before = (a as Properties)[key];
+		if (before === undefined) continue;
+		present.add(key);
 		const location = path + '/' + escapePointer(key);
-		if (!Object.prototype.propertyIsEnumerable.call(b, key)) operations.push({ op: 'remove', path: location });
-		else patchWalk((a as Properties)[key], (b as Properties)[key], location, operations, state);
+		const after = Object.prototype.propertyIsEnumerable.call(b, key) ? (b as Properties)[key] : undefined;
+		if (after === undefined) operations.push({ op: 'remove', path: location });
+		else patchWalk(before, after, location, operations, state);
 	}
 	for (const key of Object.keys(b)) {
-		if (!Object.prototype.propertyIsEnumerable.call(a, key)) operations.push({ op: 'add', path: path + '/' + escapePointer(key), value: (b as Properties)[key] });
+		if (present.has(key)) continue;
+		const value = (b as Properties)[key];
+		if (value !== undefined) operations.push({ op: 'add', path: path + '/' + escapePointer(key), value });
 	}
 }
 
@@ -3099,18 +3125,23 @@ function patchItems(a: unknown[], b: unknown[], path: string, operations: JsonPa
 }
 
 /**
- * Computes a JSON Patch (RFC 6902) that turns `a` into `b`: `applyPatch(a, createPatch(a, b))` is deeply equal to `b` for JSON values.
+ * Computes a JSON Patch (RFC 6902) that turns `a` into `b`: `applyPatch(a, createPatch(a, b))` is deeply equal to `b` for JSON values
+ * (up to `undefined` object members, see below).
  * - Plain objects and dense arrays are walked like {@link replaceEqualDeep} does: object members are removed (in `a`'s key order),
  *   diffed, then added (in `b`'s key order). Arrays skip their common prefix and suffix, so inserting or removing ONE run of items
  *   (at the end, at the start or in between) gives one operation per item instead of rewriting every shifted index; the other items
  *   are diffed by index (finding the fewest operations for any edit needs quadratic time). Every other change is a `replace`.
  * - Values are compared with {@link isEqual}; other values than plain objects and dense arrays (dates, maps, class instances, sparse
  *   arrays...) are leaves, replaced whole. Only own enumerable string keys are diffed (JSON has no symbol keys).
+ * - An object member whose value is `undefined` counts as absent, as `JSON.stringify` drops it: one becoming `undefined` is removed,
+ *   and one added or kept as `undefined` gives no operation. An `undefined` array item is kept as it is: its operation has an
+ *   `undefined` `value`, which `JSON.stringify` drops (it writes `null` for the item of an array), so serialize such data as JSON first.
  * - Only `add`, `remove` and `replace` are emitted: detecting `move` and `copy` would cost quadratic time for rarely shorter patches.
  * - The `value` of an operation is the value in `b`, NOT a copy: clone it before mutating either.
- * - Linear time: array items are told apart by structural hashes computed once per object. A shared part is walked once per pair of
- *   parts when it has no changes, but a changed part reached through several paths appears in the patch once per path (a patch has
- *   no references).
+ * - Linear in the size of the plain objects and arrays, plus what {@link isEqual} costs on the leaves (`Map` and `Set` leaves holding
+ *   objects compare in quadratic time): array items are told apart by structural hashes computed once per object. A shared part is
+ *   walked once per pair of parts when it has no changes, but a changed part reached through several paths appears in the patch once
+ *   per path (a patch has no references).
  *
  * Recursion depth is bounded by the call stack (~thousands of levels): deeper input throws a `RangeError`.
  * @param {unknown} a - The old value
@@ -3329,13 +3360,13 @@ function addAt(state: PatchState, segments: ReadonlyArray<string>, value: unknow
 	const last = segments.length - 1;
 	if (Array.isArray(parent)) {
 		const index = arrayIndex(state, parent, segments, last, true);
-		const length = parent.length;
-		// The built-in `copyWithin` shifts the items in place, without `splice`'s call to a subclass constructor (`Symbol.species`) nor a
-		// method a subclass overrides; the array has no holes (see `ownContainer`), and the new last slot is defined first, so it never
-		// reads or writes through the prototype.
-		defineOwn(parent, length, undefined);
-		Array.prototype.copyWithin.call(parent, index + 1, index, length);
-		defineOwn(parent, index, value);
+		const items = parent as unknown[];
+		// A plain loop shifts the items in place, without `splice`'s call to a subclass constructor (`Symbol.species`) nor a method a
+		// subclass overrides: the array has no holes (see `ownContainer`) and the new last slot is defined first, so every slot read or
+		// assigned is an own writable data property, and nothing goes through the prototype (no setter, no polluted index).
+		defineOwn(items, items.length, undefined);
+		for (let slot = items.length - 1; slot > index; slot--) items[slot] = items[slot - 1];
+		defineOwn(items, index, value);
 	} else defineOwn(parent, segments[last], value);
 }
 
@@ -3360,9 +3391,35 @@ function changeAt(state: PatchState, segments: ReadonlyArray<string>, replacemen
 	const key = Array.isArray(parent) ? Number(segments[last]) : segments[last];
 	if (replacement !== undefined) defineOwn(parent, key, replacement[0]);
 	else if (typeof key === 'number') {
-		Array.prototype.copyWithin.call(parent as unknown[], key, key + 1);
-		(parent as unknown[]).length--;
+		// Every slot is an own writable data property (see `addAt`).
+		const items = parent as unknown[];
+		const end = items.length - 1;
+		for (let slot = key; slot < end; slot++) items[slot] = items[slot + 1];
+		items.length = end;
 	} else delete (parent as Properties)[key];
+}
+
+/**
+ * Reads a field of a patch operation, which must be an own property (`undefined` otherwise).
+ * @param {object} operation - The operation
+ * @param {string} field - The field
+ * @returns {unknown} Its value
+ */
+function ownField(operation: object, field: string): unknown {
+	return hasOwn(operation, field) ? (operation as Properties)[field] : undefined;
+}
+
+/**
+ * The comparison of the `test` operation: {@link isEqual}, except that a `null`-prototype plain object equals an `Object.prototype`
+ * one with the same members (RFC 6902 compares JSON values, which have no prototype).
+ * @param {unknown} a - The value in the document
+ * @param {unknown} b - The expected value
+ * @returns {boolean} Whether they are equal
+ */
+function jsonEqual(a: unknown, b: unknown): boolean {
+	const stack: ComparisonStack = [];
+	stack.json = true;
+	return equalWith(a, b, stack);
 }
 
 /**
@@ -3370,7 +3427,10 @@ function changeAt(state: PatchState, segments: ReadonlyArray<string>, replacemen
  * patch does not touch are shared with the result (only the plain objects and arrays on the changed paths are copied, once per call).
  * - All or nothing: when an operation fails, an error is thrown and no document is returned (the input is left as it was anyway).
  * - Supports `add` (an array index inserts, `-` appends; an object member is set), `remove`, `replace`, `move` (the location must not
- *   be inside `from`), `copy` and `test` (deep equality, {@link isEqual}). Operations apply in order, each to the result of the previous.
+ *   be inside `from`), `copy` and `test` (deep equality, {@link isEqual}, except that plain objects compare their members whatever their
+ *   prototype, `null` or `Object.prototype`). Operations apply in order, each to the result of the previous.
+ * - The operations and their fields (`op`, `path`, `from`, `value`) are read as own properties only, never through a prototype: a
+ *   hole in `operations` is not an object, and an inherited `value` is a missing one.
  * - JSON Pointers follow RFC 6901: `''` is the whole document, `~1` is `/` and `~0` is `~` inside a key; array indices are canonical
  *   (`0`, `12`, not `01` or `+1`) and within bounds.
  * - Only plain objects and arrays are walked, through their OWN members: `__proto__`, `constructor` and `prototype` are ordinary member
@@ -3405,10 +3465,12 @@ export function applyPatch<T>(document: T, operations: ReadonlyArray<JsonPatchOp
 	const state: PatchState = { root: document, owned: new Set(), index: 0, operation: undefined as unknown as JsonPatchOperation, op: '', pointer: '' };
 
 	for (let index = 0; index < length; index++) {
-		const operation: unknown = operations[index];
+		// Own items and fields only: a hole or a missing field must not be read from a polluted `Array.prototype` or `Object.prototype`.
+		const operation: unknown = hasOwn(operations, index) ? operations[index] : undefined;
 		if (typeof operation !== 'object' || operation === null) throw new TypeError(`applyPatch: \`operations[${index}]\` must be an object, got ${describe(operation)}`);
 		// Each field is read once (a getter could change its answer).
-		const { op, path: pointer } = operation as Record<string, unknown>;
+		const op = ownField(operation, 'op');
+		const pointer = ownField(operation, 'path');
 		if (!PATCH_OPERATIONS.has(op)) {
 			if (typeof op !== 'string') throw new TypeError(`applyPatch: \`operations[${index}].op\` must be a string, got ${describe(op)}`);
 			throw new RangeError(`applyPatch: \`operations[${index}].op\` must be 'add', 'remove', 'replace', 'move', 'copy' or 'test', got ${JSON.stringify(op)}`);
@@ -3420,7 +3482,7 @@ export function applyPatch<T>(document: T, operations: ReadonlyArray<JsonPatchOp
 		state.pointer = pointer as string;
 
 		if (op === 'move' || op === 'copy') {
-			const from = parsePointer(index, 'from', (operation as Record<string, unknown>).from);
+			const from = parsePointer(index, 'from', ownField(operation, 'from'));
 			const value = valueAt(state, from);
 			if (op === 'copy') {
 				// The copied container is about to have two locations (one of them maybe inside itself): none of the containers this call
@@ -3440,11 +3502,11 @@ export function applyPatch<T>(document: T, operations: ReadonlyArray<JsonPatchOp
 			continue;
 		}
 
-		if (!('value' in operation)) throw new TypeError(`applyPatch: \`operations[${index}]\` must have a \`value\` for '${op as string}'`);
-		const value = (operation as Record<string, unknown>).value;
+		if (!hasOwn(operation, 'value')) throw new TypeError(`applyPatch: \`operations[${index}]\` must have a \`value\` for '${op as string}'`);
+		const value = (operation as Properties).value;
 		if (op === 'add') addAt(state, path, value);
 		else if (op === 'replace') changeAt(state, path, [value]);
-		else if (!isEqual(valueAt(state, path), value)) patchFailure(state, 'the value is not equal to the expected one');
+		else if (!jsonEqual(valueAt(state, path), value)) patchFailure(state, 'the value is not equal to the expected one');
 	}
 
 	return state.root as T;
@@ -3660,7 +3722,7 @@ function sortKeysWith(value: unknown, compare: ((a: string, b: string) => number
  */
 export function sortKeys<T extends object>(object: T, options: SortKeysOptions = {}): T {
 	assertContainer('sortKeys', 'object', object);
-	const { compare, deep } = options;
+	const { compare, deep } = ownOptions(options);
 	if (compare !== undefined) assertFunction('sortKeys', 'compare', compare);
 	return sortKeysWith(object, compare, deep === true ? [] : undefined) as T;
 }

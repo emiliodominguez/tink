@@ -23,6 +23,15 @@ userPath({ tab: 'posts' });
 userPath({ id: true });
 const aboutBuilder: PathBuilder<'/about'> = compilePath('/about');
 const aboutPath: string = aboutBuilder();
+aboutBuilder({});
+// @ts-expect-error a pattern without parameters takes no primitive (the runtime throws)
+aboutBuilder(42);
+// @ts-expect-error nor a string
+aboutBuilder('x');
+// @ts-expect-error nor unknown parameters
+aboutBuilder({ id: 1 });
+// @ts-expect-error an optional parameter does not make a primitive acceptable either
+compilePath('/:lang?')(42);
 const dynamicParam: string | undefined = matchPath('/x/:y' as string, '/x/1')?.y;
 
 const sharedPatch: { a: number[] } = replaceEqualDeep({ a: [1] } as unknown, { a: [1, 2] });
@@ -49,4 +58,24 @@ const badName: PathParams<'/:1abc'> = {};
 const twoParams: PathParams<'/:a-:b'> = {};
 // @ts-expect-error `options` must be an object
 matchPath('/a', '/a', null);
-void [templated, badName, twoParams];
+// @ts-expect-error a repeated name (the runtime throws)
+compilePath('/:id/:id')({ id: 1 });
+// @ts-expect-error a splat and a parameter with the same name
+compilePath('/:id/*id')({ id: 1 });
+// @ts-expect-error a splat must be the last segment
+compilePath('/files/*path/raw')({ path: 'a' });
+// @ts-expect-error not even a trailing slash follows a splat
+compilePath('/files/*path/')({ path: 'a' });
+// @ts-expect-error an empty segment
+void matchPath('/a//:b', '/a/b')?.b;
+// @ts-expect-error an empty pattern segment at the end
+void matchPath('/:a//', '/a')?.a;
+// @ts-expect-error a `#`
+void matchPath('/a#:b', '/a')?.b;
+// @ts-expect-error a dot segment
+void matchPath('/:a/..', '/a')?.a;
+// @ts-expect-error a percent-encoded dot segment
+void matchPath('/:a/%2E?', '/a')?.a;
+const distinctNames: PathParams<'/:a/:ab/*b'> = { a: '1', ab: '2', b: '3' };
+const dotted: PathParams<'/.well-known/:file.json'> = { file: 'x' };
+void [templated, badName, twoParams, distinctNames, dotted];

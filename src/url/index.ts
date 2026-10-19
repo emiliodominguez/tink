@@ -121,12 +121,13 @@ function serializeValue(key: string, value: unknown): string {
  * - `null` values are skipped by default; with `skipNull: false` they are written as a bare key (`a`).
  * - Numbers, booleans and bigints use `String()`; dates use `toISOString()`.
  * - Arrays follow `arrayFormat`; an empty array writes nothing.
- * - Only own enumerable string keys are read, in object order unless `sort` is set.
+ * - Only own enumerable string keys are read, in object order unless `sort` is set. Only the own properties of `options` are read.
  * @param {QueryParamsOf<P>} input - The parameters
  * @param {BuildQueryStringOptions} [options={}] - `arrayFormat` (default `'repeat'`), `skipNull` (default `true`) and `sort` (default `false`)
  * @returns {string} The query string, `''` when nothing is written
  * @throws {RangeError} when `arrayFormat` is unknown or a `Date` is invalid
- * @throws {TypeError} when a value is not a string, number, boolean, bigint, `Date`, array of those, `null` or `undefined`
+ * @throws {TypeError} when a value is not a string, number, boolean, bigint, `Date`, array of those, `null` or `undefined`, or `options`
+ *   is not an object
  * @example
  * buildQueryString({ q: 'hello world', page: 2, tags: ['a', 'b'] }); // => 'q=hello%20world&page=2&tags=a&tags=b'
  * buildQueryString({ tags: ['a', 'b'] }, { arrayFormat: 'brackets' }); // => 'tags[]=a&tags[]=b'
@@ -156,7 +157,10 @@ function entriesOf(params: QueryParams): Array<[string, QueryParamValue]> {
  * @returns {string} The query string
  */
 function buildFromEntries(entries: Array<[string, QueryParamValue]>, options: BuildQueryStringOptions): string {
-	const { arrayFormat = 'repeat', skipNull = true, sort = false } = options;
+	if (typeof options !== 'object' || options === null) throw new TypeError(`buildQueryString: \`options\` must be an object, got ${describe(options)}`);
+
+	// Own options only (read once each): a polluted `Object.prototype.arrayFormat` or `sort` must not change the query string.
+	const { arrayFormat = 'repeat', skipNull = true, sort = false } = Object.assign(Object.create(null) as object, options) as BuildQueryStringOptions;
 
 	if (!ARRAY_FORMATS.has(arrayFormat)) throw new RangeError(`buildQueryString: \`arrayFormat\` must be 'repeat', 'comma' or 'brackets', got ${show(arrayFormat)}`);
 
@@ -278,8 +282,8 @@ export function parseFormData<V>(entries: Iterable<readonly [string, V]>): Recor
 	const collected = new Set<string>();
 
 	for (const entry of entries) {
-		// Like `Object.fromEntries`: an entry must be an object (`'ab'` would otherwise give `{ a: 'b' }`).
-		if (typeof entry !== 'object' || entry === null) {
+		// Like `Object.fromEntries`: an entry must be an object (`'ab'` would otherwise give `{ a: 'b' }`), and iterable.
+		if (typeof entry !== 'object' || entry === null || typeof (entry as Partial<Iterable<unknown>>)[Symbol.iterator] !== 'function') {
 			throw new TypeError(`parseFormData: every entry must be a [key, value] pair, got ${describe(entry)}`);
 		}
 
@@ -573,11 +577,11 @@ export interface IsSafeUrlOptions {
  *
  * HTML entities are NOT decoded: the check applies to the URL the browser receives, so set the value through the DOM (`a.href = url`,
  * `setAttribute`) or HTML-escape it (e.g. with `escapeHtml` from the strings module, which turns `javascript&colon;` into harmless text);
- * never concatenate it unescaped into markup.
+ * never concatenate it unescaped into markup. Only the own properties of `options` are read.
  * @param {string} url - The URL to check (any other value is unsafe)
  * @param {IsSafeUrlOptions} [options={}] - `protocols` (default `['http:', 'https:', 'mailto:', 'tel:']`) and `allowRelative` (default `true`)
  * @returns {boolean} Whether the URL has an allowed scheme, or no scheme and relative URLs are allowed
- * @throws {TypeError} when `options.protocols` is not an array of strings
+ * @throws {TypeError} when `options` is not an object, or `options.protocols` is not an array of strings
  * @throws {RangeError} when an entry of `options.protocols` is not a scheme followed by `:` (`'https'` instead of `'https:'`)
  * @example
  * isSafeUrl('https://example.com/a?b#c'); // => true
@@ -588,7 +592,10 @@ export interface IsSafeUrlOptions {
  * isSafeUrl('ftp://files.example.com', { protocols: ['https:', 'FTP:'] }); // => true
  */
 export function isSafeUrl(url: string, options: IsSafeUrlOptions = {}): boolean {
-	const { protocols = SAFE_PROTOCOLS, allowRelative = true } = options;
+	if (typeof options !== 'object' || options === null) throw new TypeError(`isSafeUrl: \`options\` must be an object, got ${describe(options)}`);
+
+	// Own options only (read once each): a polluted `Object.prototype.protocols` must not let `javascript:` through.
+	const { protocols = SAFE_PROTOCOLS, allowRelative = true } = Object.assign(Object.create(null) as object, options) as IsSafeUrlOptions;
 
 	if (!Array.isArray(protocols)) throw new TypeError(`isSafeUrl: \`options.protocols\` must be an array of strings, got ${describe(protocols)}`);
 
@@ -946,12 +953,15 @@ type TakeName<S extends string, Name extends string = ''> = S extends `${infer C
  */
 type IsName<N extends string> = N extends '' | `${Digit}${string}` ? false : [TakeName<N>] extends [N] ? true : false;
 
+/** A `.` as a pattern may write it. */
+type Dot = '.' | '%2e' | '%2E';
+
 /**
- * Whether a pattern segment (without its final `?`) is one {@link matchPath} rejects: a misplaced `?` or `*`, a parameter without a
- * valid name, two parameters, or an invalid splat name.
+ * Whether a pattern segment (without its final `?`) is one {@link matchPath} rejects: an empty one, a misplaced `?` or `*`, a
+ * parameter without a valid name, two parameters, an invalid splat name, or a static `.` or `..` (also percent-encoded).
  * @template S - The segment
  */
-type InvalidSegment<S extends string> = S extends `${string}?${string}`
+type InvalidSegment<S extends string> = S extends '' | `${string}?${string}`
 	? true
 	: S extends `*${infer Name}`
 		? Name extends ''
@@ -967,7 +977,9 @@ type InvalidSegment<S extends string> = S extends `${string}?${string}`
 					: IsName<TakeName<Rest>> extends true
 						? false
 						: true
-				: false;
+				: S extends Dot | `${Dot}${Dot}`
+					? true
+					: false;
 
 /**
  * A pattern segment without its final `?`.
@@ -976,10 +988,42 @@ type InvalidSegment<S extends string> = S extends `${string}?${string}`
 type WithoutMark<S extends string> = S extends `${infer Body}?` ? Body : S;
 
 /**
- * The `/`-separated segments of a route pattern, as a union.
+ * The `/`-separated segments of a route pattern, as a union (tail-recursive, so that long patterns stay within the compiler's limits).
  * @template P - The pattern
+ * @template Done - The segments read so far
  */
-type PatternSegments<P extends string> = P extends `${infer Head}/${infer Rest}` ? Head | PatternSegments<Rest> : P;
+type PatternSegments<P extends string, Done extends string = never> = P extends `${infer Head}/${infer Rest}` ? PatternSegments<Rest, Done | Head> : Done | P;
+
+/**
+ * Whether a parameter name appears twice in the `/`-separated segments of a route pattern (in order, without the leading `/`).
+ * @template S - The rest of the pattern
+ * @template Seen - The names met so far
+ */
+type HasRepeatedName<S extends string, Seen extends string = never> = S extends `${infer Head}/${infer Rest}`
+	? [SegmentName<WithoutMark<Head>> & Seen] extends [never]
+		? HasRepeatedName<Rest, Seen | SegmentName<WithoutMark<Head>>>
+		: true
+	: [SegmentName<WithoutMark<S>> & Seen] extends [never]
+		? false
+		: true;
+
+/**
+ * Whether a route pattern, without its leading `/`, is one {@link matchPath} accepts (see {@link ParamsOf} for what is checked).
+ * @template R - The pattern without its leading `/`
+ */
+type IsValidPattern<R extends string> = R extends '' // The root `/`.
+	? true
+	: R extends `${string}#${string}` | `/${string}` | `${string}//${string}` | `*${string}/${string}` | `${string}/*${string}/${string}`
+		? false
+		: R extends `${infer Body}/` // A trailing slash.
+			? IsValidBody<Body>
+			: IsValidBody<R>;
+
+/**
+ * Whether the segments of a route pattern (without its leading and trailing `/`) are valid, with distinct names.
+ * @template B - The segments
+ */
+type IsValidBody<B extends string> = true extends InvalidSegment<WithoutMark<PatternSegments<B>>> ? false : HasRepeatedName<B> extends true ? false : true;
 
 /**
  * The parameter a pattern segment (without its `?`) captures: the name of a splat (`'*'` for an unnamed one) or of a `:name`, `never`
@@ -1009,7 +1053,10 @@ type Flatten<T> = { [K in keyof T]: T[K] };
 /**
  * The parameters of a route pattern, each mapped to `V`: required for required segments, optional for `?` segments. A union of
  * patterns gives the union of their parameters; a pattern that is not fully known (`string`, `` `/users/${string}` ``) gives a record
- * of optional values; a pattern that {@link matchPath} rejects gives `never`.
+ * of optional values. A pattern gives `never` when {@link matchPath} rejects it for: no leading `/`, a `#`, an empty segment, a
+ * misplaced `?` or `*`, a parameter or splat without a valid name, two parameters in a segment, a repeated name, a splat that is not
+ * the last segment, or a static `.` or `..` segment (also written `%2E`). Only the runtime catches a dot part behind an encoded
+ * separator or a `\` (`/a%2F..`) and more than 256 segments.
  * @template P - The pattern
  * @template V - The value type
  */
@@ -1017,10 +1064,10 @@ type ParamsOf<P extends string, V> = P extends unknown
 	? // A key type with a `string` hole makes an index signature, which `{}` satisfies.
 		Record<never, never> extends Record<P, 1>
 		? Record<string, V | undefined>
-		: P extends `/${string}`
-			? true extends InvalidSegment<WithoutMark<PatternSegments<P>>>
-				? never
-				: Flatten<{ [K in RequiredNames<PatternSegments<P>>]: V } & { [K in OptionalNames<PatternSegments<P>>]?: V }>
+		: P extends `/${infer Rest}`
+			? IsValidPattern<Rest> extends true
+				? Flatten<{ [K in RequiredNames<PatternSegments<P>>]: V } & { [K in OptionalNames<PatternSegments<P>>]?: V }>
+				: never
 			: never
 	: never;
 
@@ -1028,7 +1075,9 @@ type ParamsOf<P extends string, V> = P extends unknown
  * The parameters {@link matchPath} captures from a route pattern, typed from the pattern itself: a `:name` or a splat is a required
  * `string`, and an optional one (in a segment ending with `?`) an optional `string`. An unnamed splat (`*`) is captured as `'*'`. A union
  * of patterns gives a union of parameter types, a pattern that is not fully known a record of optional strings, and a malformed pattern
- * (a parameter name starting with a digit, two parameters in a segment...) `never`.
+ * (a parameter name starting with a digit, a repeated name, an empty segment...) `never`: {@link matchPath}'s result is then typed
+ * `null`, and the builder of {@link compilePath} cannot be called. The types catch every malformed pattern the runtime rejects, except a
+ * dot part behind an encoded separator or a `\` (`'/a%2F..'`) and a pattern of more than 256 segments.
  * @template P - The pattern
  * @example
  * type A = PathParams<'/users/:id/posts/:postId?'>; // { id: string; postId?: string }
@@ -1037,10 +1086,17 @@ type ParamsOf<P extends string, V> = P extends unknown
 export type PathParams<P extends string> = ParamsOf<P, string>;
 
 /**
- * The parameters accepted by the builder of {@link compilePath}: the keys of {@link PathParams}, with a string or a finite number each.
+ * The parameters accepted by the builder of {@link compilePath}: the keys of {@link PathParams}, with a string or a finite number each
+ * (an object without keys for a pattern without parameters, so that a primitive is rejected).
  * @template P - The pattern
  */
-export type PathParamsInput<P extends string> = ParamsOf<P, string | number>;
+export type PathParamsInput<P extends string> = P extends unknown ? WithoutKeys<ParamsOf<P, string | number>> : never;
+
+/**
+ * `T`, or an object type accepting no keys (nor a primitive, unlike `{}`) when `T` has none.
+ * @template T - An object type
+ */
+type WithoutKeys<T> = [keyof T] extends [never] ? Readonly<Record<string, never>> : T;
 
 /**
  * The function {@link compilePath} returns: it builds a pathname from parameters (which may be omitted when the pattern requires none).
@@ -1053,8 +1109,9 @@ export type PathBuilder<P extends string> = Record<never, never> extends PathPar
  */
 export interface MatchPathOptions {
 	/**
-	 * Whether static text must match with the same case (`/Users` vs `/users`). Without it, only ASCII letters are folded (like a RegExp
-	 * `i` flag without `u`), so `/admin` does not match `/admın`. Parameters always keep their case. Defaults to `false`.
+	 * Whether static text must match with the same case (`/Users` vs `/users`). Without it, only ASCII letters are folded (unlike the
+	 * `i` flag of path-to-regexp's regular expressions, which also folds `é` and `É`): `/café` does not match `/CAFÉ`, and `/admin` does
+	 * not match `/admın`. Parameters always keep their case. Defaults to `false`.
 	 */
 	readonly caseSensitive?: boolean;
 	/**

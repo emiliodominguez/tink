@@ -136,6 +136,12 @@ describe('URL helpers', function () {
 			expect(function () {
 				helpers.parseFormData([null] as unknown as Iterable<[string, string]>);
 			}).toThrow(TypeError);
+			// An array-like object is not a pair either (like `Object.fromEntries`, which throws on it too).
+			expect(function () {
+				helpers.parseFormData([{ 0: 'a', 1: 'b' }] as unknown as Iterable<[string, string]>);
+			}).toThrow(new TypeError('parseFormData: every entry must be a [key, value] pair, got object'));
+			// Any iterable entry is read as a pair.
+			expect(helpers.parseFormData([new Set(['a', 'b'])] as unknown as Iterable<[string, string]>)).toEqual({ a: 'b' });
 		});
 	});
 
@@ -1303,5 +1309,71 @@ describe('route patterns (review regressions)', function () {
 		assertType<Equals<helpers.PathParams<'/a?b/:id'>, never>>(true);
 		assertType<Equals<helpers.PathParams<'/a*/:id'>, never>>(true);
 		assertType<Equals<helpers.PathParams<'/:a_1$/:b?'>, { a_1$: string; b?: string }>>(true);
+	});
+
+	it('types every malformed pattern the runtime rejects as never', function () {
+		const rejected = ['/:id/:id', '/:id/*id', '/*p/x', '/*p/', '/a//b', '//', '//a', '/a//', '/a/?', '/a#b', '/..', '/a/.?', '/%2E%2e'] as const;
+		for (const pattern of rejected) {
+			expect(function () {
+				helpers.matchPath(pattern as string, '/');
+			}).toThrow(RangeError);
+		}
+		assertType<Equals<helpers.PathParams<(typeof rejected)[number]>, never>>(true);
+		assertType<Equals<helpers.PathParams<'/:a?/'>, { a?: string }>>(true);
+		assertType<Equals<helpers.PathParams<'/.well-known/:a/:ab/*b'>, { a: string; ab: string; b: string }>>(true);
+		assertType<Equals<helpers.PathParamsInput<'/about'>, Readonly<Record<string, never>>>>(true);
+		assertType<Equals<helpers.PathParamsInput<'/a/:x' | '/about'>, { x: string | number } | Readonly<Record<string, never>>>>(true);
+		// Long patterns stay within the compiler's recursion limits.
+		type LongP = '/:p1/:p2/:p3/:p4/:p5/:p6/:p7/:p8/:p9/:p10/:p11/:p12/:p13/:p14/:p15/:p16/:p17/:p18/:p19/:p20/:p21/:p22/:p23/:p24/:p25/:p26/:p27/:p28/:p29/:p30';
+		type LongQ = '/:q1/:q2/:q3/:q4/:q5/:q6/:q7/:q8/:q9/:q10/:q11/:q12/:q13/:q14/:q15/:q16/:q17/:q18/:q19/:q20/:q21/:q22/:q23/:q24/:q25/:q26/:q27/:q28/:q29/:q30';
+		type LongR = '/:r1/:r2/:r3/:r4/:r5/:r6/:r7/:r8/:r9/:r10/:r11/:r12/:r13/:r14/:r15/:r16/:r17/:r18/:r19/:r20/:r21/:r22/:r23/:r24/:r25/:r26/:r27/:r28/:r29/:r30';
+		assertType<Equals<helpers.PathParams<`${LongP}${LongQ}${LongR}`>['p1' | 'q15' | 'r30'], string>>(true);
+		assertType<Equals<helpers.PathParams<`${LongP}${LongQ}${LongP}`>, never>>(true);
+	});
+
+	it('reads only the own properties of the query and safe-URL options', function () {
+		const proto = Object.prototype as unknown as Record<string, unknown>;
+		let results: unknown[];
+		proto.arrayFormat = 'comma';
+		proto.skipNull = false;
+		proto.sort = true;
+		proto.protocols = ['javascript:'];
+		proto.allowRelative = false;
+		try {
+			results = [
+				helpers.buildQueryString({ b: [1, 2], a: null }),
+				helpers.withQuery('/x', { b: [1, 2], a: null }),
+				helpers.isSafeUrl('javascript:alert(1)'),
+				helpers.isSafeUrl('https://example.com'),
+				helpers.isSafeUrl('/relative'),
+				helpers.sanitizeUrl('javascript:alert(1)')
+			];
+		} finally {
+			delete proto.arrayFormat;
+			delete proto.skipNull;
+			delete proto.sort;
+			delete proto.protocols;
+			delete proto.allowRelative;
+		}
+		expect(results).toEqual(['b=1&b=2', '/x?b=1&b=2', false, true, true, 'about:blank']);
+		// Own options still apply, getters included (read once).
+		let reads = 0;
+		const options = {
+			get arrayFormat(): 'brackets' {
+				reads++;
+				return 'brackets';
+			}
+		};
+		expect(helpers.buildQueryString({ a: [1] }, options)).toBe('a[]=1');
+		expect(reads).toBe(1);
+		expect(helpers.isSafeUrl('ftp://x', Object.assign(Object.create(null) as object, { protocols: ['ftp:'] }))).toBe(true);
+		for (const bad of [null, 'comma']) {
+			expect(function () {
+				helpers.buildQueryString({ a: 1 }, bad as never);
+			}).toThrow(new TypeError(`buildQueryString: \`options\` must be an object, got ${bad === null ? 'null' : 'string'}`));
+			expect(function () {
+				helpers.isSafeUrl('https://x', bad as never);
+			}).toThrow(new TypeError(`isSafeUrl: \`options\` must be an object, got ${bad === null ? 'null' : 'string'}`));
+		}
 	});
 });
