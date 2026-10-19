@@ -71,7 +71,7 @@ interface Subscription {
  * Every listener is called in each round even if some throw; errors are rethrown afterwards (the error itself, or an `AggregateError`
  * when there are several).
  * @returns {Notifier} A new notifier
- * @throws {RangeError} from `notify` when listeners keep changing the state for more than 100 consecutive rounds
+ * @throws {RangeError} from `notify` when listeners keep changing the state for 100 consecutive rounds
  */
 function createNotifier(): Notifier {
 	// Mutated in place, except during a round, which iterates the array it started with: then it is copied on write.
@@ -133,7 +133,7 @@ function createNotifier(): Notifier {
 
 				if (++rounds > MAX_ROUNDS) {
 					notifying = false;
-					throw new RangeError(`store: listeners changed the state during more than ${MAX_ROUNDS} consecutive notification rounds`);
+					throw new RangeError(`store: listeners changed the state during ${MAX_ROUNDS} consecutive notification rounds`);
 				}
 
 				const roundErrors = round();
@@ -178,6 +178,7 @@ function derive<S, T>(source: ReadonlyStore<S>, selector: (state: S) => T, equal
 	let value: T;
 	let version = 0;
 	let notifiedVersion = 0;
+	let notifiedValue: T;
 	let detach: Unsubscribe | undefined;
 
 	/**
@@ -208,11 +209,13 @@ function derive<S, T>(source: ReadonlyStore<S>, selector: (state: S) => T, equal
 	 * @returns {void}
 	 */
 	function onSourceChange(): void {
-		getState();
-		if (version !== notifiedVersion) {
-			notifiedVersion = version;
-			notifier.notify();
-		}
+		const current = getState();
+		if (version === notifiedVersion) return;
+		notifiedVersion = version;
+		// The value may have changed and changed back within the round (A, then B read by another listener, then A again).
+		if (equals(notifiedValue, current)) return;
+		notifiedValue = current;
+		notifier.notify();
 	}
 
 	const store: ReadonlyStore<T> = {
@@ -222,7 +225,7 @@ function derive<S, T>(source: ReadonlyStore<S>, selector: (state: S) => T, equal
 			assertFunction('subscribe', 'listener', listener);
 
 			if (!detach) {
-				getState();
+				notifiedValue = getState();
 				notifiedVersion = version;
 				detach = source.subscribe(onSourceChange);
 			}
@@ -270,7 +273,7 @@ function derive<S, T>(source: ReadonlyStore<S>, selector: (state: S) => T, equal
  * @param {StoreOptions<S>} [options] - `equals` (defaults to `Object.is`)
  * @returns {Store<S>} The store
  * @throws {TypeError} when `options.equals` is not a function, or (from `subscribe`/`select`) when a listener, selector or equality function is not a function
- * @throws {RangeError} from `setState` when listeners keep changing the state for more than 100 consecutive notification rounds
+ * @throws {RangeError} from `setState` when listeners keep changing the state for 100 consecutive notification rounds
  * @example
  * const counter = createStore({ count: 0, step: 1 });
  * const count = counter.select(function (s) { return s.count; });

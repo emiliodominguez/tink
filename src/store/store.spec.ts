@@ -423,7 +423,7 @@ describe('createStore', function () {
 
 			expect(function () {
 				store.setState(1);
-			}).toThrow(new RangeError('store: listeners changed the state during more than 100 consecutive notification rounds'));
+			}).toThrow(new RangeError('store: listeners changed the state during 100 consecutive notification rounds'));
 			expect(store.getState()).toBeGreaterThan(100);
 
 			stop();
@@ -435,6 +435,27 @@ describe('createStore', function () {
 	});
 
 	describe('select', function () {
+		it('does not notify when the value changed and changed back within one notification, even if it was read in between', function () {
+			const store = createStore({ v: 0 });
+			const derived: { current?: ReadonlyStore<number> } = {};
+			store.subscribe(function () {
+				derived.current?.getState();
+				if (store.getState().v === 1) store.setState({ v: 0 });
+			});
+			const selected = store.select(function (state) {
+				return state.v;
+			});
+			derived.current = selected;
+			const seen: number[] = [];
+			selected.subscribe(function () {
+				seen.push(selected.getState());
+			});
+			store.setState({ v: 1 });
+			expect(seen).toEqual([]);
+			store.setState({ v: 2 });
+			expect(seen).toEqual([2]);
+		});
+
 		it('returns the selected value and only notifies when it changes', function () {
 			const store = createStore(initial());
 			const count = store.select(function (s) {
