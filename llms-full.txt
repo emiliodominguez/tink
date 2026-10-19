@@ -30,8 +30,8 @@ Import: `import { … } from 'tinkit/arrays';`
 - `range(start: number, end?: number, step = 1): number[]` — Create an array of numbers progressing from `start` up to, but not including, `end`, with Python `range` semantics.
 - `zip<T extends Array<ReadonlyArray<unknown>>>(...arrays: T): Array<Zipped<T>>` — Combine arrays element-wise into tuples, truncating to the length of the shortest array.
 - `groupBy<T, K extends PropertyKey>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => K): Partial<Record<K, T[]>>` — Group the items of an array by the key returned by `keyFn`, preserving input order within each group.
-- `keyBy<T, K extends PropertyKey>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => K): Record<K, T>` — Index the items of an array by the key returned by `keyFn`; when several items share a key, the last one wins.
-- `countBy<T, K extends PropertyKey>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => K): Record<K, number>` — Count the items of an array per key returned by `keyFn`.
+- `keyBy<T, K extends PropertyKey>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => K): Partial<Record<K, T>>` — Index the items of an array by the key returned by `keyFn`; when several items share a key, the last one wins.
+- `countBy<T, K extends PropertyKey>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => K): Partial<Record<K, number>>` — Count the items of an array per key returned by `keyFn`.
 - `partition<T, S extends T>(array: ReadonlyArray<T>, predicate: (item: T, index: number) => item is S): [S[], Exclude<T, S>[]]` — Split an array in two: the items matching a type-guard `predicate`, and the others.
 - `uniqueBy<T>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => unknown): T[]` — Remove items whose key (as returned by `keyFn`, compared with SameValueZero) was already seen, keeping the first occurrence.
 - `sortBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: number) => SortKey | null | undefined, order: SortOrder = 'asc'): T[]` — Return a sorted copy of an array, ordered by the key `selector` returns for each item.
@@ -94,7 +94,7 @@ Import: `import { … } from 'tinkit/objects';`
 
 - `merge<T extends object, S extends object[]>(target: T, ...sources: S): MergeAll<T, S>` — Shallowly merges one or more source objects into a NEW object, left to right (later keys win, like `{ ...target, ...a, ...b }`).
 - `clone<T>(value: T): T` — Creates a shallow copy of a value.
-- `hasProperty<T extends object, K extends PropertyKey>(object: T, property: K): object is T & Record<K, unknown>` — Determines whether an object has an OWN property with the given key (inherited properties such as `toString` do not count).
+- `hasProperty<T extends object, K extends keyof T>(object: T, property: K): boolean` — Determines whether an object has an OWN property with the given key (inherited properties such as `toString` do not count).
 - `getProperty<T, K extends keyof T>(object: T, property: K): T[K]` — Gets the value of a property of an object (own or inherited, e.g. a class getter, or a string's `length`).
 - `setProperty<T extends object, K extends PropertyKey, V>(object: T, property: K, value: V): void` — Sets the value of a property of an object.
 - `deleteProperty<T, K extends keyof T>(object: T, property: K): void` — Deletes a property from an object.
@@ -170,7 +170,7 @@ Import: `import { … } from 'tinkit/guards';`
 - `isNil(value: unknown): value is null | undefined` — Checks whether a value is `null` or `undefined`.
 - `isDefined<T>(value: T): value is NonNullable<T>` — Checks whether a value is neither `null` nor `undefined`, narrowing `T` to `NonNullable<T>`.
 - `isTruthy<T>(value: T): value is Exclude<T, Falsy>` — Checks whether a value is truthy, narrowing it to `Exclude<T, Falsy>`: unlike `array.filter(Boolean)`, `array.filter(isTruthy)` narrows the element type.
-- `isFalsy<T>(value: T): value is FalsyPart<T>` — Checks whether a value is falsy (`false`, `0`, `-0`, `0n`, `''`, `null`, `undefined` or `NaN`), narrowing it to `FalsyPart`: `string \| undefined` becomes `'' \| undefined`, and a wide `number` stays `number` (it may be `NaN`).
+- `isFalsy<T>(value: T): value is FalsyPart<T>` — Checks whether a value is falsy (`false`, `0`, `-0`, `0n`, `''`, `null`, `undefined` or `NaN`), narrowing it to `FalsyPart`: `string \| undefined` becomes `'' \| undefined`, and a wide `number` stays a `number` (it may be `NaN`).
 - `isPlainObject(value: unknown): value is Record<PropertyKey, unknown>` — Checks whether a value is a plain object: an object whose prototype is exactly `Object.prototype` or `null` (object literals, `Object.create(null)`, `JSON.parse` output).
 - `isPrimitive(value: unknown): value is Primitive` — Checks whether a value is a primitive (`string`, `number`, `bigint`, `boolean`, `symbol`, `null` or `undefined`).
 - `isIterable(value: unknown): value is Iterable<unknown>` — Checks whether a value implements the iterable protocol (`value[Symbol.iterator]` is a function).
@@ -184,7 +184,7 @@ Import: `import { … } from 'tinkit/guards';`
 - `isSafeInteger(value: unknown): value is number` — Checks whether a value is a safe integer: an integer in `[-(2^53 - 1), 2^53 - 1]`, the range where every integer is exactly representable (so `n + 1 !== n`).
 - `isNonEmptyString(value: unknown): value is string` — Checks whether a value is a primitive string with at least one UTF-16 code unit.
 - `isNonEmptyArray<T>(value: T[] | null | undefined): value is [T, ...T[]]` — Checks whether a (mutable) array has at least one element, narrowing it to a non-empty tuple `[T, ...T[]]` so that `value[0]` is typed `T` (not `T \| undefined` under `noUncheckedIndexedAccess`).
-- `isKeyOf<T extends object>(object: T, key: unknown): key is keyof T` — Checks whether `key` is an OWN property key of `object` (string, number or symbol; enumerable or not), narrowing `key` to `keyof T`.
+- `isKeyOf<T extends object>(object: T, key: unknown): key is T extends unknown ? keyof T : never` — Checks whether `key` is an OWN property key of `object` (string, number or symbol; enumerable or not), narrowing `key` to `keyof T`.
 - `isOneOf<const T extends ReadonlyArray<unknown>>(values: T): (value: unknown) => value is T[number]` — Creates a guard that checks membership in a fixed list of values (compared with SameValueZero, like `Array#includes`, so `NaN` matches `NaN` and `0` matches `-0`), narrowing to the union of the list's element types.
 - `isInstanceOf<T>(constructor: abstract new (...args: never[]) => T): (value: unknown) => value is T` — Creates a guard that checks `value instanceof constructor` (so it honours `Symbol.hasInstance` and the prototype chain; it does not recognise instances from other realms).
 - `isArrayOf<T>(guard: Guard<T>): (value: unknown) => value is T[]` — Creates a guard that checks that a value is an array whose every element passes `guard`.
@@ -287,15 +287,15 @@ Import: `import { … } from 'tinkit/strings';`
 Query-string building and parsing, URL joining and query merging, without URL object types.
 Import: `import { … } from 'tinkit/url';`
 
-- `buildQueryString(params: QueryParams, options: BuildQueryStringOptions = {}): string` — Builds a query string (WITHOUT the leading `?`) from a record of parameters.
+- `buildQueryString<P extends QueryParamsOf<P>>(input: P & NotAnArray<P>, options: BuildQueryStringOptions = {}): string` — Builds a query string (WITHOUT the leading `?`) from a record of parameters.
 - `parseQueryString(query: string): ParsedQuery` — Parses a query string into a record.
 - `parseFormData<V>(entries: Iterable<readonly [string, V]>): Record<string, V | V[]>` — Turns form entries into a record the way `parseQueryString` reads a query string: a key sent several times (checkboxes, a multiple select) maps to an array of its values, in order, and a key ending in `[]` always maps to an array.
-- `withQuery(url: string, params: QueryParams, options: BuildQueryStringOptions = {}): string` — Adds parameters to a URL string that may already have a query and/or a `#fragment`.
+- `withQuery<P extends QueryParamsOf<P>>(url: string, input: P & NotAnArray<P>, options: BuildQueryStringOptions = {}): string` — Adds parameters to a URL string that may already have a query and/or a `#fragment`.
 - `joinUrl(...parts: string[]): string` — Joins URL parts with exactly one `/` between them.
 - `getQueryParam(url: string, key: string): string | undefined` — Reads the first value of a query parameter from a URL string (see `parseQueryString` for the decoding rules).
 - `isAbsoluteUrl(string: string): boolean` — Checks whether a string is an absolute URL, i.e. one that names its own host (or file) instead of being resolved against the current page.
 - `isSafeUrl(url: string, options: IsSafeUrlOptions = {}): boolean` — Checks that a user-supplied URL is safe to put in an `href` or `src`, with an ALLOWLIST of schemes rather than a denylist of dangerous ones (`javascript:`, `vbscript:`, `data:`...
-- `sanitizeUrl<F = string>(url: string, fallback: F = 'about:blank' as F, options: IsSafeUrlOptions = {}): string | F` — Returns the URL when `isSafeUrl` accepts it, else the fallback.
+- `sanitizeUrl(url: string, fallback?: undefined, options?: IsSafeUrlOptions): string` — Returns the URL when `isSafeUrl` accepts it, else the fallback.
 - `withTrailingSlash(url: string): string` — Makes the path of a URL end with `/`.
 - `withoutTrailingSlash(url: string): string` — Removes every trailing `/` from the path of a URL, keeping the query and fragment.
 - `withLeadingSlash(path: string): string` — Makes a path start with exactly one `/`.
@@ -314,9 +314,9 @@ Precise arithmetic, statistics, number theory and random numbers.
 Import: `import { … } from 'tinkit/math';`
 
 - `sum(numbers: ReadonlyArray<number>): number` — Calculates the sum of an array of numbers using Neumaier (improved Kahan–Babuška) compensated summation, which keeps the rounding error independent of the number of elements and makes the result (practically) independent of their order.
-- `round(number: number, decimals = 0): number` — Rounds a number to a given number of decimal places, using its decimal representation so that values like `1.005` round as written (`round(1.005, 2) === 1.01`).
+- `round(input: number, decimals = 0): number` — Rounds a number to a given number of decimal places, using its decimal representation so that values like `1.005` round as written (`round(1.005, 2) === 1.01`).
 - `average(numbers: ReadonlyArray<number>): number` — Calculates the arithmetic mean of an array of numbers (using the compensated `sum`, so numeric strings count as numbers).
-- `factorial(number: number): number` — Calculates the factorial of a non-negative integer, iteratively.
+- `factorial(number: number): number` — Calculates the factorial of a non-negative integer, iteratively (in doubles: from `27!` on, the rounding of each product can leave the result a few units in the last place away from the correctly rounded `n!`, while keeping `factorial(n + 1) === (n + 1) * factorial(n)`).
 - `max(numbers: ReadonlyArray<number>): number` — Finds the maximum value in an array of numbers, with the same semantics as `Math.max` (`-Infinity` for an empty array, `NaN` if any element is `NaN`, `0` preferred over `-0`), but without spreading the array, so it works on arrays of any length.
 - `min(numbers: ReadonlyArray<number>): number` — Finds the minimum value in an array of numbers, with the same semantics as `Math.min` (`Infinity` for an empty array, `NaN` if any element is `NaN`, `-0` preferred over `0`), but without spreading the array, so it works on arrays of any length.
 - `abs(number: number): number` — Finds the absolute value of a number.
@@ -401,13 +401,13 @@ Import: `import { … } from 'tinkit/async';`
 - `createDeferred<T>(): Deferred<T>` — Creates a promise that can be resolved or rejected from the outside.
 - `sleep(ms: number, options: SleepOptions = {}): Promise<void>` — Resolves after `ms` milliseconds.
 - `withTimeout<T>(promise: PromiseLike<T> | T, ms: number, message?: string): Promise<T>` — Races `promise` against a timer: resolves/rejects like `promise` if it settles within `ms` milliseconds, otherwise rejects with a `TimeoutError`.
-- `retry<T>(fn: (attempt: number) => Promise<T> | T, options: RetryOptions = {}, random: RandomGenerator = Math.random): Promise<T>` — Calls `fn` until it succeeds, retrying up to `options.retries` times with exponential backoff: the delay before retry `k` (1-based) is `min(delay * factor^(k - 1), maxDelay)`, optionally randomised with full jitter.
-- `mapWithConcurrency<T, R>(items: Iterable<T>, mapper: ConcurrentCallback<T, R>, options?: number | ConcurrencyOptions): Promise<R[]>` — Maps `items` with an async `mapper`, running at most `concurrency` mappers at the same time, and resolves with the results in input order.
-- `mapSettledWithConcurrency<T, R>(items: Iterable<T>, mapper: ConcurrentCallback<T, R>, options?: number | ConcurrencyOptions): Promise<Array<PromiseSettledResult<Awaited<R>>>>` — Like `mapWithConcurrency`, but never rejects because of a mapper: resolves with a `PromiseSettledResult` per item, in input order (like `Promise.allSettled`).
-- `filterWithConcurrency<T, S extends T>(items: Iterable<T>, predicate: (item: T, index: number, signal: AbortSignalLike | undefined) => item is S, options?: number | ConcurrencyOptions): Promise<S[]>` — Filters `items` with an async `predicate`, running at most `concurrency` predicates at the same time, and resolves with the items whose predicate returned (or resolved to) a truthy value, in input order.
+- `retry<T>(fn: (attempt: number) => PromiseLike<T> | T, options: RetryOptions = {}, random: RandomGenerator = Math.random): Promise<T>` — Calls `fn` until it succeeds, retrying up to `options.retries` times with exponential backoff: the delay before retry `k` (1-based) is `min(delay * factor^(k - 1), maxDelay)`, optionally randomised with full jitter.
+- `mapWithConcurrency<T, R, S extends AbortSignalLike = AbortSignalLike>(items: Iterable<T>, mapper: ConcurrentCallback<T, R, S>, options?: number | ConcurrencyOptions<S>): Promise<R[]>` — Maps `items` with an async `mapper`, running at most `concurrency` mappers at the same time, and resolves with the results in input order.
+- `mapSettledWithConcurrency<T, R, S extends AbortSignalLike = AbortSignalLike>(items: Iterable<T>, mapper: ConcurrentCallback<T, R, S>, options?: number | ConcurrencyOptions<S>): Promise<Array<PromiseSettledResult<Awaited<R>>>>` — Like `mapWithConcurrency`, but never rejects because of a mapper: resolves with a `PromiseSettledResult` per item, in input order (like `Promise.allSettled`).
+- `filterWithConcurrency<T, U extends T, S extends AbortSignalLike = AbortSignalLike>(items: Iterable<T>, predicate: (item: T, index: number, signal: S | undefined) => item is U, options?: number | ConcurrencyOptions<S>): Promise<U[]>` — Filters `items` with an async `predicate`, running at most `concurrency` predicates at the same time, and resolves with the items whose predicate returned (or resolved to) a truthy value, in input order.
 - `attemptAsync<T>(fnOrPromise: PromiseLike<T> | (() => PromiseLike<T> | T)): Promise<Result<T>>` — Awaits a promise (or calls a possibly async function and awaits its result) and captures the outcome as a `Result` tuple.
 - `createLimiter(concurrency: number, options: LimiterOptions = {}): Limiter` — Creates a limiter that runs at most `concurrency` tasks at the same time, starting waiting tasks in FIFO order (like `p-limit`).
-- `createQueue(options: QueueOptions = {}): Queue` — Creates a task queue that runs at most `concurrency` tasks at the same time, starting the waiting task with the highest `priority` first and tasks of equal priority in FIFO order (a stable binary heap, so `add` and every start are O(log n)).
+- `createQueue<S extends AbortSignalLike = never>(options: QueueOptions<S> = {}): Queue<S>` — Creates a task queue that runs at most `concurrency` tasks at the same time, starting the waiting task with the highest `priority` first and tasks of equal priority in FIFO order (a stable binary heap, so `add` and every start are O(log n)).
 - `createRateLimiter(options: RateLimiterOptions): RateLimiter` — Creates a rate limiter that starts at most `limit` calls within any window of `interval` milliseconds.
 - `pollUntil<T>(check: () => T | PromiseLike<T>, options: PollOptions = {}): Promise<Truthy<Awaited<T>>>` — Calls `check` immediately and then every `interval` ms (waiting for async checks to settle in between, so checks never overlap) until it returns (or resolves to) a truthy value, and resolves with that value.
 - `promiseAllObject<T extends object>(obj: T): Promise<{ -readonly [K in keyof T]: Awaited<T[K]> }>` — Like `Promise.all`, but for an object of promises (or values): resolves with an object with the same keys and the awaited values.
@@ -457,7 +457,7 @@ Animation easing curves, CSS-accurate cubic-bezier() and steps(), and an analyti
 Import: `import { … } from 'tinkit/easing';`
 
 - `easeOut(easing: EasingFunction): EasingFunction` — Turns an ease-in function into its ease-out counterpart by point reflection: `t => 1 - easing(1 - t)`.
-- `easeInOut(easing: EasingFunction): EasingFunction` — Builds a symmetric ease-in-out function from an ease-in function: the first half runs `easing` at double speed, the second half its reflection, so that `g(1 - t) === 1 - g(t)` and `g(0.5) === 0.5`.
+- `easeInOut(easing: EasingFunction): EasingFunction` — Builds a symmetric ease-in-out function from an ease-in function: the first half runs `easing` at double speed, the second half its reflection, so that `g(1 - t) = 1 - g(t)` (up to floating-point rounding) and, when `easing(1) === 1`, `g(0.5) === 0.5`.
 - `linear(t: number): number` — No easing: `t => t`.
 - `easeInQuad(t: number): number` — Quadratic ease-in: `t²`.
 - `easeOutQuad(t: number): number` — Quadratic ease-out.
@@ -508,7 +508,7 @@ Import: `import { … } from 'tinkit/format';`
 - `formatPercent(value: number, options: FormatPercentOptions = {}): string` — Formats a ratio as a percentage via `Intl.NumberFormat` with `style: 'percent'` (`0.256` is 25.6 %).
 - `formatCompact(value: number | bigint, options: FormatCompactOptions = {}): string` — Formats a number in compact notation (`1.2K`, `3.4M`, `1.2 thousand`) via `Intl.NumberFormat` with `notation: 'compact'`.
 - `formatUnit(value: number | bigint, unit: string, options: FormatUnitOptions = {}): string` — Formats a measurement via `Intl.NumberFormat` with `style: 'unit'`.
-- `formatList(items: Iterable<string>, options: FormatListOptions = {}): string` — Joins strings into a grammatical list via `Intl.ListFormat` (`'a, b, and c'`, `'a, b, or c'`).
+- `formatList(items: Iterable<string> & { readonly charAt?: never }, options: FormatListOptions = {}): string` — Joins strings into a grammatical list via `Intl.ListFormat` (`'a, b, and c'`, `'a, b, or c'`).
 - `formatDateTime(date: DateInput, options: FormatDateTimeOptions = {}): string` — Formats an instant via `Intl.DateTimeFormat`.
 - `formatRelativeTime(value: number, unit: Intl.RelativeTimeFormatUnit, options: FormatRelativeTimeOptions = {}): string` — Formats an explicit amount of a unit relative to now (`'in 3 days'`, `'2 hours ago'`) via `Intl.RelativeTimeFormat`.
 - `formatOrdinal(n: number, options: FormatOrdinalOptions = {}): string` — Formats an integer as an ordinal (`'1st'`, `'22nd'`, `'1,001st'`), picking the suffix from its `Intl.PluralRules` ordinal category.
