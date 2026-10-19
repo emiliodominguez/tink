@@ -853,8 +853,10 @@ export function toColorName(color: ColorInput, options: ColorNameOptions = {}): 
 		return undefined;
 	}
 	if (NAMED_LABS === undefined) {
-		NAMED_LABS = [];
-		for (const [name, packed] of table) NAMED_LABS.push([name, oklabOf({ r: packed >> 16, g: (packed >> 8) & 255, b: packed & 255 })]);
+		// Built aside and published whole, so the cache is never seen half filled.
+		const labs: Array<[name: string, lab: ReturnType<typeof oklabOf>]> = [];
+		for (const [name, packed] of table) labs.push([name, oklabOf({ r: packed >> 16, g: (packed >> 8) & 255, b: packed & 255 })]);
+		NAMED_LABS = labs;
 	}
 	const lab = oklabOf(rgba);
 	let best = '';

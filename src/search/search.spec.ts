@@ -481,7 +481,7 @@ describe('fuzzyMatch / fuzzySearch with ignoreDiacritics', function () {
 		// `'ﷺ'` decomposes to an 18-character phrase: the alignment used to be sized on it (331 ms and +796 MB for this call).
 		const started = Date.now();
 		const result = helpers.fuzzyMatch('ﷺ'.repeat(900), 'ﷺ'.repeat(920), options);
-		expect(Date.now() - started).toBeLessThan(250);
+		expect(Date.now() - started).toBeLessThan('__stryker__' in globalThis ? Infinity : 250);
 		expect(result).toEqual(helpers.fuzzyMatch('ﷺ'.repeat(900), 'ﷺ'.repeat(920)));
 		expect(helpers.fuzzyMatch('ﷺ', 'xﷺ', options)?.ranges).toEqual([[1, 2]]);
 		expect(helpers.fuzzyMatch('صلى', 'ﷺ', options)).toBeUndefined();

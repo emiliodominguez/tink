@@ -4794,6 +4794,69 @@ describe('Async helpers (locks, events, reduceAsync, minDelay)', function () {
 			expect(returned).toHaveBeenCalledTimes(1);
 		});
 
+		it('reads no further item after an abort between two steps', async function () {
+			const controller = new AbortController();
+			const log: string[] = [];
+			async function* items(): AsyncGenerator<number> {
+				try {
+					for (let i = 0; i < 3; i++) {
+						log.push(`produce ${i}`);
+						yield i;
+					}
+				} finally {
+					log.push('closed');
+				}
+			}
+			const reducer = jest.fn(function (sum: number, n: number) {
+				log.push(`reduce ${n}`);
+				// Aborted by a microtask, after this step settled and before the next item is requested.
+				if (n === 0) {
+					Promise.resolve().then(function () {
+						controller.abort('between steps');
+					});
+				}
+				return sum + n;
+			});
+			await expect(reduceAsync(items(), reducer, 0, { signal: controller.signal })).rejects.toBe('between steps');
+			expect(log).toEqual(['produce 0', 'reduce 0', 'closed']);
+		});
+
+		it('treats iterator results like for await does', async function () {
+			function source(results: unknown[]): AsyncIterable<number> {
+				return {
+					[Symbol.asyncIterator]: function () {
+						let index = 0;
+						return {
+							next: function () {
+								return Promise.resolve(results[index++] as IteratorResult<number>);
+							}
+						};
+					}
+				};
+			}
+			// `done` is read as a boolean: a truthy `1` ends the iteration (it used to loop forever).
+			await expect(
+				reduceAsync(
+					source([
+						{ done: false, value: 1 },
+						{ done: 1, value: 99 }
+					]),
+					function (sum: number, n: number) {
+						return sum + n;
+					},
+					5
+				)
+			).resolves.toBe(6);
+			// A result that is not an object is a TypeError.
+			await expect(reduceAsync(source([5]), jest.fn(), 0)).rejects.toThrow(
+				new TypeError('reduceAsync: the iterator returned a result that is not an object, got number')
+			);
+			await expect(reduceAsync(source([null]), jest.fn(), 0)).rejects.toThrow('got null');
+			// Functions are objects.
+			const result = Object.assign(function () {}, { done: true });
+			await expect(reduceAsync(source([result]), jest.fn(), 7)).resolves.toBe(7);
+		});
+
 		it('closes the source when the signal aborts just after an item was read, without reducing it', async function () {
 			const controller = new AbortController();
 			const returned = jest.fn(function () {

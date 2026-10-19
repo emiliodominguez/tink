@@ -1,5 +1,6 @@
 import fc from 'fast-check';
 import * as helpers from '.';
+import { clamp } from '../math/index.js';
 
 const dateArb = fc.date({ min: new Date(1900, 0, 1), max: new Date(2200, 0, 1), noInvalidDate: true });
 const weekdayArb = fc.integer({ min: 0, max: 6 }) as fc.Arbitrary<helpers.WeekdayIndex>;
@@ -533,6 +534,14 @@ describe('Date helpers (properties)', function () {
 					expect(clamped.getTime()).toBeLessThanOrEqual(max.getTime());
 					expect(helpers.clampDate(clamped, min, max).getTime()).toBe(clamped.getTime());
 					if (helpers.isBetween(date, min, max)) expect(clamped.getTime()).toBe(date.getTime());
+				})
+			);
+		});
+
+		it('clampDate agrees with clamp (math) on the timestamps, crossed bounds included', function () {
+			fc.assert(
+				fc.property(dateArb, dateArb, dateArb, function (date, min, max) {
+					expect(helpers.clampDate(date, min, max).getTime()).toBe(clamp(date.getTime(), min.getTime(), max.getTime()) + 0);
 				})
 			);
 		});
@@ -1391,6 +1400,28 @@ describe('Scheduling helpers (properties)', function () {
 				expect(start).toBeLessThanOrEqual(time);
 				expect(time - start).toBeLessThan(1000);
 			})
+		);
+	});
+});
+
+describe('fromUnixTime (properties)', function () {
+	it('keeps the written milliseconds and drops finer digits, toward zero', function () {
+		fc.assert(
+			fc.property(
+				// Up to 2^33 s (year 2242), where a double still tells microseconds apart: beyond, `x.000992` and `x.001` are one number.
+				fc.integer({ min: 0, max: 2 ** 33 }),
+				fc.integer({ min: 0, max: 999 }),
+				fc.integer({ min: 0, max: 999 }),
+				fc.boolean(),
+				function (whole, ms, micro, negative) {
+					const written = Number(`${negative ? '-' : ''}${whole}.${String(ms).padStart(3, '0')}${String(micro).padStart(3, '0')}`);
+					// The shortest representation of the double may drop trailing zeros or round the last digits, but never across a
+					// millisecond: the result is the written millisecond, truncated toward zero.
+					const expected = (negative ? -1 : 1) * (whole * 1000 + ms);
+					expect(helpers.fromUnixTime(written).getTime()).toBe(expected === 0 ? 0 : expected);
+				}
+			),
+			{ numRuns: 2000 }
 		);
 	});
 });

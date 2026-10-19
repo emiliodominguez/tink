@@ -4447,7 +4447,8 @@ function writeJson(value: JsonValue, indent: string, layout: JsonLayout): string
  * - A getter, `toJSON` method, replacer or proxy trap that throws writes `"[Throws: <message>]"` in place of the value, and an object
  *   deeper than `maxDepth` `"[Object]"` (`"[Array]"`). Nesting is capped at 1000 levels whatever `maxDepth` asks for (deeper objects
  *   become these markers too), so a hostile, deeply nested value can never make the call, or the writing of its text, overflow the
- *   stack (a call made from deep in the stack still gets a `"[Throws: …]"` marker where its stack ran out).
+ *   stack. A call made with little stack left gets a shallower text instead (the value is then walked again, half as deep, until its
+ *   text can be written), with the markers where it was cut.
  *
  * Only own properties are read: an array hole is `null` even when `Array.prototype` has an element there, and a key of a `replacer` list
  * that an object only inherits is left out; a `toJSON` method inherited from a polluted `Object.prototype` is ignored. Boxed primitives are written as their primitive. The cost is linear in the size of the
@@ -4492,19 +4493,32 @@ export function safeStringify(value: unknown, options: SafeStringifyOptions = {}
 		for (const key of replacer as ReadonlyArray<unknown>) if (typeof key === 'string' || typeof key === 'number') listed.add(String(key));
 		keys = sort ? [...listed].sort() : [...listed];
 	}
-	const walk: JsonWalk = {
-		replacer: typeof replacer === 'function' ? replacer : undefined,
-		keys,
-		stack: true,
-		maxDepth: Math.min(maxDepth, MAX_JSON_DEPTH),
-		ancestors: [],
-		onPath: new Set()
-	};
-	const tree = toJsonValue({ '': value }, '', walk);
 	// As `JSON.stringify`: at most 10 spaces (none for 0, a negative number or `NaN`), or the first 10 characters of a string.
 	const gap = typeof space === 'number' ? ' '.repeat(Math.min(10, Math.max(0, Math.trunc(space) || 0))) : (space ?? '').slice(0, 10);
-	if (tree === undefined) return undefined;
-	// The tree holds plain objects and arrays only: `JSON.stringify` writes it faster, unless a `toJSON` was planted on their prototypes
-	// or the keys must be written in another order than the tree's.
-	return keys === undefined && !sort && !('toJSON' in Array.prototype) ? JSON.stringify(tree, undefined, gap) : writeJson(tree, '', { gap, keys, sort });
+	let depth = Math.min(maxDepth, MAX_JSON_DEPTH);
+	for (;;) {
+		const walk: JsonWalk = { replacer: typeof replacer === 'function' ? replacer : undefined, keys, stack: true, maxDepth: depth, ancestors: [], onPath: new Set() };
+		const tree = toJsonValue({ '': value }, '', walk);
+		if (tree === undefined) return undefined;
+		try {
+			// The tree holds plain objects and arrays only: `JSON.stringify` writes it faster, unless a `toJSON` was planted on their
+			// prototypes or the keys must be written in another order than the tree's.
+			return keys === undefined && !sort && !('toJSON' in Array.prototype) ? JSON.stringify(tree, undefined, gap) : writeJson(tree, '', { gap, keys, sort });
+		} catch (error) {
+			// Called with little stack left, writing a deep tree can overflow it: the value is walked again, half as deep. Any other failure
+			// (a text longer than the engine's maximum string length) is thrown, as documented.
+			if (depth === 0 || !isStackOverflow(error)) throw error;
+			depth >>= 1;
+		}
+	}
+}
+
+/**
+ * Whether an error is the engine running out of call stack: a `RangeError` "Maximum call stack size exceeded" (V8, JavaScriptCore) or
+ * an `InternalError` "too much recursion" (SpiderMonkey).
+ * @param {unknown} error - The error
+ * @returns {boolean} Whether it reports a stack overflow
+ */
+function isStackOverflow(error: unknown): boolean {
+	return (error instanceof RangeError || (error instanceof Error && error.name === 'InternalError')) && /call stack|recursion/i.test(error.message);
 }

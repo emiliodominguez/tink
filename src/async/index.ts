@@ -3352,7 +3352,8 @@ export interface ReduceAsyncOptions {
 	 * Aborting it stops the reduction: no further item is read or reduced, a running `reducer` or a pending read of the next item stops
 	 * being awaited (neither is interrupted), the iterator is closed, and the promise rejects with the signal's `reason` (or an
 	 * {@link AbortError}). When the abort comes during a read, the close is requested without waiting for it: an async generator only runs
-	 * it once that read settles.
+	 * it once that read settles. Otherwise the promise rejects once the iterator is closed, as `for await` waits for it (an async generator
+	 * whose `finally` block never settles keeps it pending).
 	 */
 	signal?: AbortSignalLike | null;
 }
@@ -3402,6 +3403,11 @@ export async function reduceAsync<T, A>(
 				})();
 
 	for (;;) {
+		// Aborted between two steps (e.g. by a microtask after the reducer settled): no further item is read.
+		if (signal?.aborted) {
+			await closeIterator(iterator);
+			throw abortReason(signal);
+		}
 		let step: IteratorResult<T>;
 		try {
 			step = await abortable(iterator.next(), signal);
@@ -3410,12 +3416,16 @@ export async function reduceAsync<T, A>(
 			if (signal?.aborted) void closeIterator(iterator);
 			throw error;
 		}
+		// As `for await`: a result that is not an object is an error (the iterator is not closed), and `done` is read as a boolean.
+		if ((typeof step !== 'object' && typeof step !== 'function') || step === null)
+			throw new TypeError(`reduceAsync: the iterator returned a result that is not an object, got ${describe(step)}`);
+		const done = Boolean(step.done);
 		// Aborted while the last item was being read.
 		if (signal?.aborted) {
-			if (step.done !== true) await closeIterator(iterator);
+			if (!done) await closeIterator(iterator);
 			throw abortReason(signal);
 		}
-		if (step.done === true) return accumulator;
+		if (done) return accumulator;
 		try {
 			accumulator = await abortable(reducer(accumulator, step.value as Awaited<T>, index++), signal);
 		} catch (error) {

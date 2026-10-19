@@ -576,13 +576,25 @@ describe('Math helpers', function () {
 			expect(helpers.clamp(NaN, 0, 10)).toBeNaN();
 		});
 
-		it('should throw a RangeError when min > max or a bound is NaN', function () {
-			expect(function () {
-				helpers.clamp(1, 10, 0);
-			}).toThrow(RangeError);
+		it('should let the minimum win when the bounds cross, as CSS clamp() does', function () {
+			// Before the first layout: `containerWidth - panelWidth` is negative.
+			expect(helpers.clamp(120, 0, 0 - 300)).toBe(0);
+			expect(helpers.clamp(1, 10, 0)).toBe(10);
+			expect(helpers.clamp(-5, 10, 0)).toBe(10);
+			expect(helpers.clamp(50, 10, 0)).toBe(10);
+			expect(helpers.clamp(Infinity, 10, 0)).toBe(10);
+			expect(helpers.clamp(5, Infinity, -Infinity)).toBe(Infinity);
+			// `NaN` values still stay `NaN`.
+			expect(helpers.clamp(NaN, 10, 0)).toBeNaN();
+		});
+
+		it('should throw a RangeError when a bound is NaN', function () {
 			expect(function () {
 				helpers.clamp(1, NaN, 0);
-			}).toThrow(RangeError);
+			}).toThrow(new RangeError('clamp: `minimum` must not be NaN'));
+			expect(function () {
+				helpers.clamp(1, 0, NaN);
+			}).toThrow(new RangeError('clamp: `maximum` must not be NaN'));
 		});
 	});
 
@@ -1557,8 +1569,8 @@ describe('Math helpers', function () {
 				helpers.weightedAverage([1, 2], [1, -1]);
 			}).toThrow(new RangeError('weightedAverage: `weights[1]` must be a finite number >= 0, got -1'));
 			expect(function () {
-				helpers.clamp(1, 2, 1);
-			}).toThrow(new RangeError('clamp: `minimum` must not be greater than `maximum`, got 2 and 1'));
+				helpers.clamp(1, NaN, 1);
+			}).toThrow(new RangeError('clamp: `minimum` must not be NaN'));
 		});
 
 		it('names the right function and parameter for every validated argument', function () {

@@ -2765,6 +2765,37 @@ describe('persistStore', function () {
 		expect(storage.calls).toEqual(['get auth', 'set auth', 'remove auth']);
 	});
 
+	it('writes back the migrated state itself, whatever the store does with setState', function () {
+		const stored = '{"state":{"dark":true,"items":[1,2,3]},"version":0}';
+		function migrate(persisted: unknown): unknown {
+			return { theme: (persisted as { dark: boolean }).dark ? 'dark' : 'light', items: (persisted as { items: number[] }).items };
+		}
+		// A store that ignores (or defers) setState: the migrated data must not be replaced by its default state.
+		const ignoring = memoryStorage({ s: stored });
+		const inert = {
+			getState: function () {
+				return { theme: 'light', items: [] as number[] };
+			},
+			setState: function () {},
+			subscribe: function () {
+				return function () {};
+			}
+		};
+		persistStore(inert, { key: 's', storage: ignoring, version: 1, migrate });
+		expect(ignoring.data.get('s')).toBe('{"state":{"theme":"dark","items":[1,2,3]},"version":1}');
+
+		// A listener that throws during hydration: the error is reported, and the migrated state is still written back.
+		const throwing = memoryStorage({ s: stored });
+		const store = createStore({ theme: 'light', items: [] as number[] });
+		store.subscribe(function () {
+			throw new Error('listener');
+		});
+		const onError = jest.fn();
+		persistStore(store, { key: 's', storage: throwing, version: 1, migrate, onError });
+		expect(onError).toHaveBeenCalledWith(new Error('listener'));
+		expect(throwing.data.get('s')).toBe('{"state":{"theme":"dark","items":[1,2,3]},"version":1}');
+	});
+
 	it('migrates states of another version, and reports them without migrate', function () {
 		const stored = JSON.stringify({ state: { count: '3' }, version: 1 });
 		const migrated = createStore({ count: 0 });

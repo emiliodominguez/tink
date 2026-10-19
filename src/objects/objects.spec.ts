@@ -4316,7 +4316,10 @@ describe('JSON Patch (review regressions)', function () {
 	});
 
 	it('shifts array items in linear time per operation', function () {
-		const before = Array.from({ length: 100_000 }, function (_value, index) {
+		// Under mutation testing every operation is instrumented (about 500 times slower here), so the input is smaller and only the
+		// result is checked; the timing bound is meaningful in plain runs only.
+		const mutating = '__stryker__' in globalThis;
+		const before = Array.from({ length: mutating ? 5000 : 100_000 }, function (_value, index) {
 			return index;
 		});
 		const after = [...before.slice(0, 1000), ...before.slice(3000)];
@@ -4328,7 +4331,7 @@ describe('JSON Patch (review regressions)', function () {
 		expect(removed).toEqual(after);
 		// About 0.15 s; shifting with the generic `copyWithin` took 5 s. Coverage instrumentation slows the shifting loops (only) about
 		// twentyfold, so the bound is only meaningful without it.
-		expect(elapsed).toBeLessThan('__coverage__' in globalThis ? 15_000 : 1500);
+		expect(elapsed).toBeLessThan(mutating ? Infinity : '__coverage__' in globalThis ? 15_000 : 1500);
 	});
 
 	it('treats undefined object members as absent, as JSON does', function () {
@@ -4690,6 +4693,69 @@ describe('safeStringify', function () {
 		expect(helpers.safeStringify(value, { maxDepth: 1 })).toBe('{"a":{"b":"[Object]"},"list":["[Array]"]}');
 		expect(helpers.safeStringify(value, { maxDepth: 3 })).toBe(JSON.stringify(value));
 		expect(helpers.safeStringify([], { maxDepth: 0 })).toBe('[]');
+	});
+
+	it('never throws when called with little stack left: the text is cut shallower', function () {
+		let deep: Record<string, unknown> = { a: 1 };
+		for (let i = 0; i < 5000; i++) deep = { a: deep };
+		// The deepest recursion of a small frame available here.
+		let limit = 0;
+		function probe(n: number): void {
+			limit = n;
+			probe(n + 1);
+		}
+		try {
+			probe(0);
+		} catch {
+			// The stack ran out: `limit` frames fit.
+		}
+		let failures = 0;
+		let shallower = 0;
+		for (let headroom = 40; headroom < 4000; headroom += 41) {
+			// Set once safeStringify runs: a call with no stack left at all fails before entering any function, which no code can prevent.
+			let entered = false;
+			function replacer(_key: string, value: unknown): unknown {
+				entered = true;
+				return value;
+			}
+			function descend(n: number): string | undefined {
+				return n > 0 ? descend(n - 1) : helpers.safeStringify(deep, { replacer });
+			}
+			try {
+				const text = descend(limit - headroom) as string;
+				if (text.length < '{"a":'.length * 1000) shallower++;
+			} catch {
+				if (entered) failures++;
+			}
+		}
+		expect(failures).toBe(0);
+		// The retry path was taken at least once (some calls had too little stack for the full 1000 levels).
+		expect(shallower).toBeGreaterThan(0);
+	});
+
+	it('rethrows errors other than a stack overflow from writing the text', function () {
+		const original = JSON.stringify;
+		const spy = jest.spyOn(JSON, 'stringify').mockImplementation(function () {
+			throw new RangeError('Invalid string length');
+		});
+		expect(function () {
+			return helpers.safeStringify({ a: 1 });
+		}).toThrow(new RangeError('Invalid string length'));
+		spy.mockImplementation(function () {
+			throw new RangeError('Maximum call stack size exceeded');
+		});
+		// Every depth overflows: the walk is retried down to depth 0, and the last overflow is thrown.
+		expect(function () {
+			return helpers.safeStringify({ a: 1 });
+		}).toThrow(new RangeError('Maximum call stack size exceeded'));
+		spy.mockImplementation(function () {
+			throw Object.assign(new Error('too much recursion'), { name: 'InternalError' });
+		});
+		expect(function () {
+			return helpers.safeStringify({ a: 1 });
+		}).toThrow('too much recursion');
+		spy.mockRestore();
+		expect(JSON.stringify).toBe(original);
 	});
 
 	it('caps the nesting at 1000 levels, whatever maxDepth asks for', function () {

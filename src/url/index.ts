@@ -1945,7 +1945,7 @@ interface UrlLike {
 
 /**
  * A WHATWG `URL` instance: the global `URL` type when the type environment declares one (the DOM library or `@types/node`), else
- * {@link UrlLike}.
+ * `UrlLike`.
  */
 export type UrlObject = typeof globalThis extends { URL: abstract new (...args: never[]) => infer U } ? U : UrlLike;
 

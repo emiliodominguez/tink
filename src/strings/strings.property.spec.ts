@@ -1567,7 +1567,7 @@ describe('String helpers (property-based, text cleanup)', function () {
 	describe('toSafeFilename', function () {
 		/** The characters a safe name never holds (the separator lookalikes of Windows best-fit conversions included). */
 		// eslint-disable-next-line no-control-regex -- the forbidden characters
-		const FORBIDDEN = /[<>:"/\\|?*\x00-\x1f\x7f-\x9f؜‎‏‪-‮⁦-⁩⁄∕∖⧸⧹﹨／：＼]|\p{Cs}/u;
+		const FORBIDDEN = /[<>:"/\\|?*\x00-\x1f\x7f-\x9f؜‎‏‪-‮⁦-⁩⁄∕∖⧸⧹﹨／：＼＂＊＜＞？｜]|\p{Cs}/u;
 
 		/** Text with every kind of character the helper treats specially. */
 		const anyName = fc.string({
@@ -1594,6 +1594,9 @@ describe('String helpers (property-based, text cleanup)', function () {
 					'＼',
 					'﹨',
 					'：',
+					'＊',
+					'？',
+					'｜',
 					'¥',
 					'\u202e',
 					'é',

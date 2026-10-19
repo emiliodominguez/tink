@@ -1338,10 +1338,10 @@ describe('Date helpers', function () {
 			expect(helpers.clampDate(5, 5, 5).getTime()).toBe(5);
 		});
 
-		it('rejects min > max', function () {
-			expect(function () {
-				helpers.clampDate(min, max, min);
-			}).toThrow(new RangeError('clampDate: `min` must not be after `max`'));
+		it('lets min win when the bounds cross, like clamp', function () {
+			for (const date of [new Date(2023, 0, 1), new Date(2024, 5, 1), new Date(2025, 0, 1)]) {
+				expect(helpers.clampDate(date, max, min).getTime()).toBe(max.getTime());
+			}
 		});
 	});
 
@@ -3856,6 +3856,17 @@ describe('Date helpers (scheduling round)', function () {
 					expect(helpers.fromUnixTime(written).getTime()).toBe(base * 1000 + (base < 0 ? -ms : ms));
 				}
 			}
+			// Microsecond timestamps (Python, Postgres): the sub-millisecond digits are dropped, never rounded up.
+			expect(helpers.fromUnixTime(1700000000.000999).getTime()).toBe(1700000000000);
+			expect(helpers.fromUnixTime(-1700000000.000999).getTime()).toBe(-1700000000000);
+			expect(helpers.fromUnixTime(100000000000.00095).getTime()).toBe(100000000000000);
+			expect(helpers.fromUnixTime(-0.5).getTime()).toBe(-500);
+			expect(helpers.fromUnixTime(-0.0015).getTime()).toBe(-1);
+			// Exponent notation: tiny magnitudes are 0 ms, huge ones out of range.
+			expect(helpers.fromUnixTime(1e-7).getTime()).toBe(0);
+			expect(function () {
+				return helpers.fromUnixTime(1e21);
+			}).toThrow(RangeError);
 			// A real fraction of a millisecond is still truncated toward zero.
 			expect(helpers.fromUnixTime(1.0019).getTime()).toBe(1001);
 			expect(helpers.fromUnixTime(1.0009999).getTime()).toBe(1000);

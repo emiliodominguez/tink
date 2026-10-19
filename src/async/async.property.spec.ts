@@ -805,7 +805,9 @@ describe('Async helpers (properties: locks, events, reduceAsync, minDelay)', fun
 
 				// Drain: abort what can be aborted, release every holder (including those granted while draining).
 				for (const request of queue.slice()) {
-					if (request.signal) {
+					// Skips a request that an earlier abort let through (granted, it left the queue: aborting it now changes nothing, and
+					// `splice(-1, 1)` would drop the last waiter from the model).
+					if (request.signal && queue.includes(request)) {
 						request.signal.abort(new Error('aborted'));
 						queue.splice(queue.indexOf(request), 1);
 						modelDispatch();

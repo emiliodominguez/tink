@@ -223,6 +223,16 @@ describe('Math helpers (property-based)', function () {
 				})
 			);
 		});
+
+		it('should equal CSS clamp(MIN, VAL, MAX) = max(MIN, min(VAL, MAX)) for any bounds, crossed ones included', function () {
+			fc.assert(
+				fc.property(finiteDouble, finiteDouble, finiteDouble, function (value, minimum, maximum) {
+					// `+ 0` compares -0 and 0 as equal: clamp keeps an in-range -0, Math.max/Math.min may not.
+					expect(helpers.clamp(value, minimum, maximum) + 0).toBe(Math.max(minimum, Math.min(value, maximum)) + 0);
+					if (minimum > maximum) expect(helpers.clamp(value, minimum, maximum)).toBe(minimum);
+				})
+			);
+		});
 	});
 
 	describe('lerp / inverseLerp', function () {

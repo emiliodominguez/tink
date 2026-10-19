@@ -842,7 +842,7 @@ describe('parseNumber', function () {
 			const start = performance.now();
 			expect(helpers.parseNumber(`1e${huge}`)).toBeNaN();
 			expect(helpers.parseNumber(`1e-${huge}`)).toBe(0);
-			expect(performance.now() - start).toBeLessThan(600);
+			expect(performance.now() - start).toBeLessThan('__stryker__' in globalThis ? Infinity : 600);
 			const nines = '9'.repeat(20);
 			expect(helpers.parseNumber(`-1e-${nines}`)).toBe(-0);
 			expect(helpers.parseNumber(`0e${nines}`)).toBe(0);
@@ -1162,7 +1162,7 @@ describe('parseNumber', function () {
 			expect(helpers.parseNumber(`1${' K'.repeat(100_000)}`, { style: 'compact' })).toBeNaN();
 			expect(helpers.parseNumber(`${'('.repeat(100_000)}1${')'.repeat(100_000)}`)).toBeNaN();
 			expect(helpers.parseNumber(`0.${'0'.repeat(200_000)}1e200000`)).toBe(0.1);
-			expect(performance.now() - start).toBeLessThan(1000);
+			expect(performance.now() - start).toBeLessThan('__stryker__' in globalThis ? Infinity : 1000);
 		});
 	});
 });

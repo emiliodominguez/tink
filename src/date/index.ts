@@ -1620,7 +1620,8 @@ export function closestTo(target: DateInput, dates: Iterable<DateInput>): Date |
 /**
  * Returns the date of a Unix timestamp, in SECONDS since 1970-01-01T00:00:00Z (`date +%s`, JWT `exp`/`iat` claims, most APIs).
  * Fractions of a second are kept to the millisecond as written (`1.001` is 1001 ms, although `1.001 * 1000` is `1000.9999999999999` in
- * floating point), and finer fractions are truncated toward zero, like the `Date` constructor does (`1.0019` is 1001 ms).
+ * floating point), and finer fractions are truncated toward zero, like the `Date` constructor does (`1.0019` is 1001 ms,
+ * `1700000000.000999` is 1700000000000 ms).
  * @param {number} seconds - The finite number of seconds since the epoch (may be fractional or negative)
  * @returns {Date} A new date
  * @throws {TypeError} when `seconds` is not a number
@@ -1633,11 +1634,15 @@ export function closestTo(target: DateInput, dates: Iterable<DateInput>): Date |
 export function fromUnixTime(seconds: number): Date {
 	assertNumber('fromUnixTime', 'seconds', seconds, Number.isFinite(seconds), 'a finite number');
 
-	const ms = seconds * MS_PER_SECOND;
-	// A product within a few ulps of an integer is that integer: the milliseconds as written, which the rounding of the decimal fraction
-	// left just below it (truncating `1000.9999999999999` would lose one).
-	const whole = Math.round(ms);
-	return ensureInRange(new Date(Math.abs(ms - whole) <= Math.abs(ms) * 4 * Number.EPSILON ? whole : ms));
+	// The milliseconds as written: the decimal digits of the shortest representation of `seconds` (what `String` prints), cut after the
+	// third. Multiplying instead loses one where the binary fraction is just below the decimal one (`1.001 * 1000` is
+	// `1000.9999999999999`). Exponent notation is only printed for magnitudes below 1e-6 (0 ms) or beyond any valid date.
+	const text = String(seconds);
+	const point = text.indexOf('.');
+	if (point === -1 || text.includes('e')) return ensureInRange(new Date(seconds * MS_PER_SECOND));
+	const whole = Number(text.slice(0, point)) * MS_PER_SECOND;
+	const fraction = Number(text.slice(point + 1, point + 4).padEnd(3, '0'));
+	return ensureInRange(new Date(seconds < 0 ? whole - fraction : whole + fraction));
 }
 
 /**
@@ -2289,25 +2294,26 @@ export function isFuture(date: DateInput, now: DateInput = new Date()): boolean 
 }
 
 /**
- * Clamps a date into the closed range `[min, max]`.
+ * Clamps a date into the closed range `[min, max]`. When the bounds cross (`min` after `max`, e.g. a date picker's earliest date computed
+ * after its latest one), `min` wins, as in `clamp` (`math` module) and CSS `clamp()`.
  * @param {DateInput} date - The date to clamp
- * @param {DateInput} min - The lower bound
- * @param {DateInput} max - The upper bound (must not be before `min`)
- * @returns {Date} A new date: `min` if `date < min`, `max` if `date > max`, else a copy of `date`
+ * @param {DateInput} min - The lower bound (it wins over `max` when they cross)
+ * @param {DateInput} max - The upper bound
+ * @returns {Date} A new date: `min` if `date < min` (or the bounds cross), `max` if `date > max`, else a copy of `date`
  * @throws {TypeError} when a date argument is neither a `Date` nor a number
- * @throws {RangeError} when a date is invalid or `min` is after `max`
+ * @throws {RangeError} when a date is invalid
  * @example
  * clampDate(new Date(2025, 0, 1), new Date(2024, 0, 1), new Date(2024, 11, 31)); // => new Date(2024, 11, 31)
  * clampDate(new Date(2024, 5, 1), new Date(2024, 0, 1), new Date(2024, 11, 31)); // => new Date(2024, 5, 1)
+ * clampDate(new Date(2024, 5, 1), new Date(2024, 11, 31), new Date(2024, 0, 1)); // => new Date(2024, 11, 31)
  */
 export function clampDate(date: DateInput, min: DateInput, max: DateInput): Date {
 	const time = timeOf(date);
 	const lower = timeOf(min);
 	const upper = timeOf(max);
 
-	if (lower > upper) throw new RangeError('clampDate: `min` must not be after `max`');
-
-	return new Date(Math.min(Math.max(time, lower), upper));
+	// `max` first, so that `min` wins when the bounds cross.
+	return new Date(Math.max(Math.min(time, upper), lower));
 }
 
 /**

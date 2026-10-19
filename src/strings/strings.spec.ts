@@ -1669,7 +1669,7 @@ describe('compareNatural', function () {
 		expect(helpers.compareNatural(a, b)).toBe(-1);
 		expect(helpers.compareNatural('0'.repeat(1_000_000) + 'x', '0'.repeat(1_000_000) + 'y')).toBe(-1);
 		expect(helpers.compareNatural('a'.repeat(1_000_000), 'a'.repeat(1_000_000) + 'b', { ignoreCase: true })).toBe(-1);
-		expect(performance.now() - start).toBeLessThan(2000);
+		expect(performance.now() - start).toBeLessThan('__stryker__' in globalThis ? Infinity : 2000);
 	});
 });
 
@@ -1729,7 +1729,7 @@ describe('truncateMiddle', function () {
 		// Clusters longer than the first window: the window grows.
 		const accented = ('a' + '\u0301'.repeat(40)).repeat(5);
 		expect(helpers.truncateMiddle(accented, 2)).toBe('a' + '\u0301'.repeat(40) + '…a' + '\u0301'.repeat(40));
-		expect(performance.now() - start).toBeLessThan(2000);
+		expect(performance.now() - start).toBeLessThan('__stryker__' in globalThis ? Infinity : 2000);
 	});
 
 	it('should find the graphemes at the end of text without plain characters by splitting it all', function () {
@@ -2330,7 +2330,7 @@ describe('stripHtml', function () {
 		expect(helpers.stripHtml('<!--'.repeat(30_000))).toBe('');
 		expect(helpers.stripHtml('<!-'.repeat(30_000))).toBe('');
 		expect(helpers.stripHtml('</'.repeat(30_000) + 'x')).toBe('');
-		expect(Date.now() - started).toBeLessThan(1000);
+		expect(Date.now() - started).toBeLessThan('__stryker__' in globalThis ? Infinity : 1000);
 	});
 });
 
@@ -2435,6 +2435,8 @@ describe('toSafeFilename', function () {
 		expect(helpers.toSafeFilename('a∕b／c⧸d⁄e＼f')).toBe('a_b_c_d_e_f');
 		expect(helpers.toSafeFilename('a∕b⁄c／d⧸e∖f＼g⧹h﹨i：j')).toBe('a_b_c_d_e_f_g_h_i_j');
 		expect(helpers.toSafeFilename('..∕..∕win.ini')).toBe('.._.._win.ini');
+		// The full-width forms of the other forbidden characters best-fit to `" * < > ? |`.
+		expect(helpers.toSafeFilename('a＂b＊c＜d＞e？f｜g')).toBe('a_b_c_d_e_f_g');
 		expect(helpers.toSafeFilename('C：＼x', { replacement: '' })).toBe('Cx');
 		expect(function () {
 			helpers.toSafeFilename('a', { replacement: '／' });

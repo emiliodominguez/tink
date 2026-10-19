@@ -208,8 +208,9 @@ export function toError(value: unknown): Error {
  *   this function defines its shape.
  * - Never throws: circular references become `'[Circular]'`, bigints decimal strings, maps the array of their entries and sets the array
  *   of their values, a getter or `toJSON` that throws `'[Throws: <message>]'`, and objects deeper than `maxDepth` `'[Object]'`/`'[Array]'`.
- *   Nesting is capped at 1000 levels whatever `maxDepth` asks for (a longer chain of causes ends in these markers too), so that
- *   `JSON.stringify` can always write the result: a hostile, deeply nested error can make neither call overflow the stack.
+ *   Nesting is capped at 1000 levels whatever `maxDepth` asks for (a longer chain of causes ends in these markers too), so that a
+ *   hostile, deeply nested error cannot overflow the stack, here or when the result is passed to `JSON.stringify` with an ordinary amount
+ *   of stack left (a caller already deep in its stack can use `safeStringify` from the `objects` module, which retries shallower).
  * - An error-like value that is not an `Error` (any object with a string `message`, such as an already serialized error) is serialized
  *   the same way, so serializing twice changes nothing. Anything else becomes `{ name: 'Error', message: getErrorMessage(value) }`.
  * @param {unknown} value - The error (or anything caught)

@@ -358,4 +358,101 @@ describe('README examples', function () {
 		expect(validate.parse(flags, { ALLOWED_ORIGINS: '' })).toEqual({ ALLOWED_ORIGINS: [], FEATURE_FLAGS: {} });
 		expect(validate.safeParse(flags, { ALLOWED_ORIGINS: '', FEATURE_FLAGS: '{"__proto__":{"beta":true}}' })[0]).toBeInstanceOf(guards.ValidationError);
 	});
+
+	it('should match the pattern matching recipe', function () {
+		const { functions } = root;
+		const { _ } = functions;
+		type Shape = { kind: 'circle'; radius: number } | { kind: 'rect'; width: number; height: number };
+		const area = functions
+			.matcher<Shape>()
+			.with({ kind: 'circle' }, function (circle) {
+				return Math.round(Math.PI * circle.radius ** 2);
+			})
+			.with({ kind: 'rect' }, function (rect) {
+				return rect.width * rect.height;
+			})
+			.exhaustive();
+		expect(area({ kind: 'rect', width: 2, height: 3 })).toBe(6);
+		expect(area({ kind: 'circle', radius: 1 })).toBe(3);
+
+		const integer = functions.active(function (text: string) {
+			const n = Number.parseInt(text, 10);
+			return Number.isNaN(n) ? undefined : n;
+		});
+		function double(input: string): number {
+			return functions
+				.matchWith(input)
+				.with(integer, function (n) {
+					return n * 2;
+				})
+				.otherwise(function () {
+					return 0;
+				});
+		}
+		expect(double('21')).toBe(42);
+		expect(double('abc')).toBe(0);
+
+		function cell(row: number, column: number, alive: boolean): string {
+			return functions
+				.matchWith([row, column])
+				.with([0, _], function () {
+					return 'header';
+				})
+				.with([_, 0], function () {
+					return 'label';
+				})
+				.with(
+					_,
+					function () {
+						return alive;
+					},
+					function () {
+						return 'live';
+					}
+				)
+				.otherwise(function () {
+					return 'empty';
+				});
+		}
+		expect([cell(0, 3, false), cell(2, 0, true), cell(2, 2, true), cell(2, 2, false)]).toEqual(['header', 'label', 'live', 'empty']);
+	});
+
+	it('should match the "Files, money and schedules" recipe', function () {
+		const { arrays, date, encoding, errors, math } = root;
+		expect(
+			encoding.toCsv(
+				[
+					{ name: 'Ada', total: 12 },
+					{ name: '=HYPERLINK("http://x")', total: 3 }
+				],
+				{ formulaEscape: true }
+			)
+		).toBe('"name","total"\r\n"Ada","12"\r\n"\'=HYPERLINK(""http://x"")","3"');
+		expect(encoding.parseCsv('name,total\r\nAda,12\r\nGrace\r\n', { header: true })).toEqual([{ name: 'Ada', total: '12' }, { name: 'Grace' }]);
+		expect(math.allocate(1000, [1, 1, 1])).toEqual([334, 333, 333]);
+
+		const day = { start: new Date(2024, 0, 15, 9), end: new Date(2024, 0, 15, 17) };
+		const busy = [
+			{ start: new Date(2024, 0, 15, 10), end: new Date(2024, 0, 15, 11, 30) },
+			{ start: new Date(2024, 0, 15, 11), end: new Date(2024, 0, 15, 13) },
+			{ start: new Date(2024, 0, 15, 16, 45), end: new Date(2024, 0, 15, 18) }
+		];
+		expect(date.findGaps(day, busy, { minDuration: 30 * 60_000 })).toEqual([
+			{ start: new Date(2024, 0, 15, 9), end: new Date(2024, 0, 15, 10) },
+			{ start: new Date(2024, 0, 15, 13), end: new Date(2024, 0, 15, 16, 45) }
+		]);
+
+		expect(
+			arrays.toTree([
+				{ id: 1, parentId: null, name: 'root' },
+				{ id: 2, parentId: 1, name: 'child' }
+			])
+		).toEqual([{ id: 1, parentId: null, name: 'root', children: [{ id: 2, parentId: 1, name: 'child', children: [] }] }]);
+
+		expect(errors.serializeError(new Error('failed', { cause: new TypeError('bad input') }), { stack: false })).toEqual({
+			name: 'Error',
+			message: 'failed',
+			cause: { name: 'TypeError', message: 'bad input' }
+		});
+	});
 });

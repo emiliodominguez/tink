@@ -558,24 +558,31 @@ export function toDegrees(radians: number): number {
 
 /**
  * Restricts a value to the inclusive range `[minimum, maximum]`. `NaN` values stay `NaN`.
+ *
+ * When the bounds cross (`minimum > maximum`), `minimum` wins, as in CSS `clamp(MIN, VAL, MAX)` and lodash: layout code computes
+ * bounds such as `[0, containerWidth - panelWidth]` that cross before the first layout, or when the content is wider than its container.
  * @param {number} value - The value to clamp
- * @param {number} minimum - Lower bound
+ * @param {number} minimum - Lower bound (it wins over `maximum` when they cross)
  * @param {number} maximum - Upper bound
- * @returns {number} `minimum` if `value < minimum`, `maximum` if `value > maximum`, otherwise `value`
- * @throws {RangeError} when `minimum > maximum` or a bound is `NaN`
+ * @returns {number} `minimum` if `value < minimum` (or the bounds cross), `maximum` if `value > maximum`, otherwise `value`
+ * @throws {RangeError} when a bound is `NaN`
  * @throws {TypeError} when a bound is not a number
  * @example
  * clamp(15, 0, 10); // => 10
  * clamp(-5, 0, 10); // => 0
  * clamp(5, 0, 10); // => 5
  * Object.is(clamp(-0, 0, 10), -0); // => true
+ * const containerWidth = 0; // before the first layout
+ * clamp(120, 0, containerWidth - 300); // => 0
  */
 export function clamp(value: number, minimum: number, maximum: number): number {
 	assertNumber('clamp', 'minimum', minimum, true, 'a number');
 	assertNumber('clamp', 'maximum', maximum, true, 'a number');
-	if (!(minimum <= maximum)) throw new RangeError(`clamp: \`minimum\` must not be greater than \`maximum\`, got ${minimum} and ${maximum}`);
-	// Plain comparisons, not Math.min/Math.max: an in-range value is returned as is (`-0` stays `-0`), and `NaN` compares false.
-	return value < minimum ? minimum : value > maximum ? maximum : value;
+	if (Number.isNaN(minimum) || Number.isNaN(maximum)) throw new RangeError(`clamp: \`${Number.isNaN(minimum) ? 'minimum' : 'maximum'}\` must not be NaN`);
+	// Plain comparisons, not Math.min/Math.max: an in-range value is returned as is (`-0` stays `-0`), and `NaN` compares false. `maximum`
+	// is applied first, so `minimum` wins when the bounds cross.
+	const capped = value > maximum ? maximum : value;
+	return capped < minimum ? minimum : capped;
 }
 
 /**

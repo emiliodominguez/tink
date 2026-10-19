@@ -1,5 +1,5 @@
 import * as vm from 'vm';
-import { AssertionError, isArrayOf, isMatching, isOptional } from '../guards/index.js';
+import { AssertionError, isArrayOf, isInstanceOf, isMatching, isOptional } from '../guards/index.js';
 import { _, active, allPass, anyOf, anyPass, capture, captureAs, cons, match, matcher, matchWith, partialRight, type NonExhaustiveError } from '.';
 import * as helpers from '.';
 
@@ -2524,6 +2524,39 @@ describe('matchWith / matcher', function () {
 				.otherwise(String);
 			expect(result).toBe('inner x');
 		});
+
+		it('gives a re-entrant `with` on the same builder captures of its own', function () {
+			const state = matchWith({ a: 'outer', b: 1 });
+			let inner: unknown;
+			const result = state
+				.with(
+					{
+						a: capture(),
+						b: function (): boolean {
+							inner = state
+								.with({ a: captureAs('name') }, function ({ name }) {
+									return `inner ${name}`;
+								})
+								.otherwise(String);
+							return true;
+						}
+					},
+					function (a) {
+						return a;
+					}
+				)
+				.otherwise(String);
+			expect(result).toBe('outer');
+			expect(inner).toBe('inner outer');
+			// The builder still works (and reuses its log) afterwards.
+			expect(
+				state
+					.with({ b: capture() }, function (b) {
+						return b;
+					})
+					.otherwise(String)
+			).toBe(1);
+		});
 	});
 
 	describe('patterns (the semantics of isMatching)', function () {
@@ -2924,6 +2957,14 @@ describe('matchWith / matcher', function () {
 			expect(function () {
 				matcher().with({ a: capture(), b: capture() }, String);
 			}).toThrow(new TypeError('matcher: `pattern` must capture at most one anonymous value, got several'));
+			// The same capture held twice captures twice.
+			const shared = captureAs('x');
+			expect(function () {
+				matcher().with([shared, { y: shared }], String);
+			}).toThrow(new TypeError('matcher: `pattern` must capture each name once, got "x" twice'));
+			expect(function () {
+				anyOf([shared, 1], [1, shared], [shared, shared]);
+			}).toThrow(new TypeError('anyOf: `patterns[2]` must capture what `patterns[0]` captures ("x"), got "x", "x"'));
 		});
 
 		it('requires a string name', function () {
@@ -3002,6 +3043,51 @@ describe('matchWith / matcher', function () {
 			expect(function () {
 				anyOf([captureAs('b'), captureAs('a')], [captureAs('a'), captureAs('b')], anyOf({ a: captureAs('a'), b: captureAs('b') }));
 			}).not.toThrow();
+		});
+
+		it('builds and compiles patterns that share sub-patterns in time linear in their distinct parts', function () {
+			// Counts how often the shared leaf's keys are listed: once per scan or compilation of it, or 2^20 times if shared parts were expanded.
+			let reads = 0;
+			const leaf = new Proxy(
+				{ k: 1 },
+				{
+					ownKeys(target): (string | symbol)[] {
+						reads++;
+						return Reflect.ownKeys(target);
+					}
+				}
+			);
+			const start = performance.now();
+			let shared: unknown = anyOf({ leaf, n: captureAs('n') }, captureAs('n', 2));
+			for (let depth = 0; depth < 20; depth++) shared = anyOf([shared, 'a'], [shared, 'b']);
+			const built = reads;
+			const run = matcher()
+				.with(shared, function (selection: unknown) {
+					return (selection as { n: unknown }).n;
+				})
+				.otherwise(function () {
+					return 'no';
+				});
+			expect(built).toBeLessThan(100);
+			expect(reads - built).toBeLessThan(10);
+			expect(performance.now() - start).toBeLessThan(1000);
+			// (Matching retries the shared part for each alternative that fails after it, so these values take the first one below the top.)
+			let value: unknown = 2;
+			let other: unknown = { leaf: { k: 1 }, n: 'deep' };
+			for (let depth = 0; depth < 20; depth++) {
+				value = [value, depth === 19 ? 'b' : 'a'];
+				other = [other, 'a'];
+			}
+			expect(run(value)).toBe(2);
+			expect(run(other)).toBe('deep');
+			expect(run([value, 'c'])).toBe('no');
+			expect(
+				matchWith(other)
+					.with(shared, function (selection: unknown) {
+						return (selection as { n: unknown }).n;
+					})
+					.otherwise(String)
+			).toBe('deep');
 		});
 	});
 
@@ -3449,6 +3535,233 @@ describe('matchWith / matcher', function () {
 				return 0;
 			});
 			assertType<Equals<typeof fallback, (value: Event) => string | number>>();
+		});
+
+		it('only removes an `any` member with a pattern that matches anything', function () {
+			const parsed = JSON.parse('"b"');
+			const literal = matchWith(parsed).with('a', String);
+			assertType<Equals<typeof literal.exhaustive, NonExhaustiveError<any>>>();
+			expect(function () {
+				// @ts-expect-error `any` may be anything, not just 'a'
+				literal.exhaustive();
+			}).toThrow(AssertionError);
+			const guarded = matcher<any>().with(isString, String).with({ kind: 'a' }, String).with(anyOf(1, 2), String);
+			assertType<Equals<typeof guarded.exhaustive, NonExhaustiveError<any>>>();
+			// @ts-expect-error a guard narrowing to `string` does not handle `any`
+			guarded.exhaustive();
+			expect(literal.with(_, String).exhaustive()).toBe('b');
+			expect(guarded.with(capture(), String).exhaustive()(5)).toBe('5');
+			expect(matcher<unknown>().with(anyOf(1, _), String).exhaustive()(null)).toBe('null');
+			const nested = matchWith({ a: 1 } as { a: any; b?: number }).with({ a: 'x' }, String);
+			assertType<Equals<typeof nested.exhaustive, NonExhaustiveError<{ a: any; b?: number }>>>();
+			expect(nested.with({ a: _ }, String).exhaustive()).toBe('[object Object]');
+		});
+
+		it('keeps object types that admit arrays, strings, numbers or functions, which object patterns never match', function () {
+			const list = [1, 2] as { length: number };
+			const bySize = matchWith(list).with({ length: isNumber }, String);
+			assertType<Equals<typeof bySize.exhaustive, NonExhaustiveError<{ length: number }>>>();
+			expect(function () {
+				// @ts-expect-error an array (or a string) is a `{ length: number }`
+				bySize.exhaustive();
+			}).toThrow(AssertionError);
+			const named = matchWith(String as { name: string }).with({ name: isString }, String);
+			assertType<Equals<typeof named.exhaustive, NonExhaustiveError<{ name: string }>>>();
+			expect(function () {
+				// @ts-expect-error a function is a `{ name: string }`
+				named.exhaustive();
+			}).toThrow(AssertionError);
+			const anyObject = matchWith([1] as object).with({}, String);
+			assertType<Equals<typeof anyObject.exhaustive, NonExhaustiveError<object>>>();
+			expect(function () {
+				// @ts-expect-error an array is an `object`
+				anyObject.exhaustive();
+			}).toThrow(AssertionError);
+			// Object types that only plain objects satisfy are still split by key.
+			type Plain = { kind: 'a'; x: number } | { kind: 'b' };
+			expect(
+				matchWith({ kind: 'b' } as Plain)
+					.with({ kind: 'a' }, String)
+					.with({ kind: 'b' }, function (b) {
+						return b.kind;
+					})
+					.exhaustive()
+			).toBe('b');
+		});
+
+		it('only removes the member equal to a pattern that is a single value', function () {
+			const prefixed = matchWith('id-2' as `id-${string}`).with('id-1' as `id-${string}`, String);
+			assertType<Equals<typeof prefixed.exhaustive, NonExhaustiveError<`id-${string}`>>>();
+			expect(function () {
+				// @ts-expect-error `id-${string}` holds more values than 'id-1'
+				prefixed.exhaustive();
+			}).toThrow(AssertionError);
+			const upper = matcher<Uppercase<string>>().with('A' as Uppercase<string>, String);
+			assertType<Equals<typeof upper.exhaustive, NonExhaustiveError<Uppercase<string>>>>();
+			const numeric = matcher<`${number}`>().with('1' as `${number}`, String);
+			assertType<Equals<typeof numeric.exhaustive, NonExhaustiveError<`${number}`>>>();
+			const big = matcher<bigint>().with(1n as bigint, String);
+			assertType<Equals<typeof big.exhaustive, NonExhaustiveError<bigint>>>();
+			const loose = matcher<'a'>().with('a' as unknown, String);
+			assertType<Equals<typeof loose.exhaustive, NonExhaustiveError<'a'>>>();
+			expect(
+				matchWith(2n as 1n | 2n)
+					.with(1n, String)
+					.with(2n, function () {
+						return 'two';
+					})
+					.exhaustive()
+			).toBe('two');
+		});
+
+		it('removes nothing for a pattern typed object or {}, which may be a map or a class instance (compared by identity)', function () {
+			const map: object = new Map();
+			const byObject = matchWith({ a: 1 } as { a: number }).with(map, String);
+			assertType<Equals<typeof byObject.exhaustive, NonExhaustiveError<{ a: number }>>>();
+			expect(function () {
+				// @ts-expect-error a map matches no other value
+				byObject.exhaustive();
+			}).toThrow(AssertionError);
+			const byEmpty = matchWith({ a: 1 } as { a: number }).with({}, function () {
+				return 'any plain object';
+			});
+			assertType<Equals<typeof byEmpty.exhaustive, NonExhaustiveError<{ a: number }>>>();
+			expect(byEmpty.otherwise(String)).toBe('any plain object');
+		});
+
+		it('assumes plain data: a class getter is no own property, and a class-instance pattern compares by identity (use isInstanceOf)', function () {
+			class Circle {
+				get kind(): 'circle' {
+					return 'circle';
+				}
+			}
+			class Token {
+				readonly kind = 'eof' as const;
+			}
+			const shape = new Circle() as Circle | { kind: 'square' };
+			// Type-checks, as the types cannot tell a getter from an own property, but no case matches.
+			expect(function () {
+				matchWith(shape).with({ kind: 'circle' }, String).with({ kind: 'square' }, String).exhaustive();
+			}).toThrow(AssertionError);
+			expect(
+				matchWith(shape)
+					.with(isInstanceOf(Circle), function () {
+						return 'circle';
+					})
+					.with({ kind: 'square' }, String)
+					.exhaustive()
+			).toBe('circle');
+			const eof = new Token();
+			// Typed structurally, compared by identity.
+			expect(function () {
+				matchWith(new Token() as Token)
+					.with(eof, String)
+					.exhaustive();
+			}).toThrow(AssertionError);
+			expect(
+				matchWith(eof as Token)
+					.with(eof, String)
+					.exhaustive()
+			).toBe('[object Object]');
+		});
+
+		it('requires the function of an active pattern to accept every value at its position, and narrows nothing', function () {
+			function toFixed(n: number): string {
+				return n.toFixed(1);
+			}
+			const mixed = 'a' as string | number;
+			expect(function () {
+				matchWith(mixed)
+					.with(
+						active(toFixed),
+						// @ts-expect-error the value may be a string
+						String
+					)
+					.otherwise(String);
+			}).toThrow(TypeError);
+			expect(function () {
+				// @ts-expect-error the value may be a string
+				matcher<string | number>().with(active(toFixed), String, String);
+			}).not.toThrow();
+			type Pair = { b: 'x'; a: string } | { b: 'y'; a: number };
+			expect(function () {
+				matchWith({ b: 'y', a: 1 } as Pair)
+					.with(
+						{
+							a: active(function (text: string) {
+								return text.trim();
+							}),
+							b: 'x'
+						},
+						// @ts-expect-error `a` is tested before `b`, so the function also receives numbers
+						String
+					)
+					.otherwise(String);
+			}).toThrow(TypeError);
+			const optional = {} as { a?: string };
+			function trim(text: string): string {
+				return text.trim();
+			}
+			expect(function () {
+				matchWith(optional)
+					.with(
+						{ a: captureAs('a', active(trim)) },
+						// @ts-expect-error `a` may be missing (and the function then receives `undefined`)
+						String
+					)
+					.otherwise(String);
+			}).toThrow(TypeError);
+			expect(
+				matchWith(optional)
+					.with(
+						{
+							a: captureAs(
+								'a',
+								active(function (text?: string) {
+									return text?.trim();
+								})
+							)
+						},
+						function ({ a }) {
+							return a;
+						}
+					)
+					.otherwise(String)
+			).toBe('[object Object]');
+			const result = matchWith(mixed)
+				.with(
+					anyOf(
+						capture(isNumber),
+						active(function (value: string | number) {
+							return typeof value === 'string' ? value.toUpperCase() : undefined;
+						})
+					),
+					function (selection, value) {
+						assertType<Equals<typeof selection, number | string>>();
+						assertType<Equals<typeof value, string | number>>();
+						return selection;
+					}
+				)
+				.otherwise(String);
+			expect(result).toBe('A');
+			const unknownValue = matchWith({ a: '2' } as unknown)
+				.with({ a: active(Number) }, function (n, value) {
+					assertType<Equals<typeof n, number>>();
+					assertType<Equals<typeof value, { a: unknown }>>();
+					return n;
+				})
+				.otherwise(String);
+			expect(unknownValue).toBe(2);
+		});
+
+		it('captures nothing from a part of a pattern typed any', function () {
+			const loose: any = 'x';
+			const partial = matchWith({ a: 'x', b: 2 } as { a: 'x' | 'y'; b: number }).with({ a: loose, b: capture() }, function (b) {
+				assertType<Equals<typeof b, number>>();
+				return b;
+			});
+			assertType<Equals<typeof partial.exhaustive, NonExhaustiveError<{ a: 'x' | 'y'; b: number }>>>();
+			expect(partial.otherwise(String)).toBe(2);
 		});
 	});
 });

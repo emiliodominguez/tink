@@ -6,9 +6,9 @@
  * JSON values instead of text and never throws on hostile input: circular references become `'[Circular]'`, bigints decimal strings,
  * errors their {@link errorView} (`name`, `message`, `stack`, `cause`, …), maps the array of their entries and sets the array of their
  * values; a getter, `toJSON` method, replacer or proxy trap that throws becomes `'[Throws: <message>]'`, and a container nested deeper
- * than `maxDepth` becomes `'[Object]'` or `'[Array]'`. The callers clamp `maxDepth` to {@link MAX_JSON_DEPTH}, so that the tree can
- * always be written by `JSON.stringify` (whose own recursion can overflow on a tree a few thousand levels deep, even when the walker,
- * once optimized, built it without overflowing). Each container is also converted inside its own `try`, so a call stack that runs out
+ * than `maxDepth` becomes `'[Object]'` or `'[Array]'`. The callers clamp `maxDepth` to {@link MAX_JSON_DEPTH}, so that `JSON.stringify` can
+ * write the tree with an ordinary amount of stack left (its own recursion can overflow on a tree a few thousand levels deep, even when
+ * the walker, once optimized, built it without overflowing); `safeStringify` walks again, shallower, when even that overflows. Each container is also converted inside its own `try`, so a call stack that runs out
  * anyway (the call made from deep in the stack) ends as a `'[Throws: …]'` marker where it ran out instead of an exception.
  * @internal
  * @packageDocumentation

@@ -701,6 +701,26 @@ describe('matchWith / matcher (properties)', function () {
 		);
 	});
 
+	it('a pattern holding the same sub-pattern several times matches like the naive reference, one-shot or compiled', function () {
+		fc.assert(
+			fc.property(pattern, value, value, function (node, first, second) {
+				const shared = build(node);
+				const twice = [shared, { a: shared, b: anyOf(shared, 1) }];
+				const candidate = [first, { a: second, b: first }];
+				const expected = reference(node)(first) && reference(node)(second);
+				function yes(): boolean {
+					return true;
+				}
+				function no(): boolean {
+					return false;
+				}
+				expect(matchWith(candidate).with(twice, yes).otherwise(no)).toBe(expected);
+				expect(matcher<unknown>().with(twice, yes).otherwise(no)(candidate)).toBe(expected);
+				expect(isMatching(anyOf(twice))(candidate)).toBe(expected);
+			})
+		);
+	});
+
 	it('a capture matches what its pattern matches and passes the value it matched', function () {
 		const nothing = Symbol('nothing');
 		fc.assert(

@@ -1645,12 +1645,12 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 
 	/**
 	 * Reads, migrates and merges the stored state into the store. Never throws: errors go to `onError`.
-	 * @returns {boolean} Whether a stored state of another version was migrated and set on the store (it must then be written back)
+	 * @returns {void}
 	 */
-	function hydrate(): boolean {
+	function hydrate(): void {
 		try {
 			const text: unknown = (storage as PersistStorage).getItem(key as string);
-			if (text === null || text === undefined) return false;
+			if (text === null || text === undefined) return;
 			if (typeof text !== 'string') throw new TypeError(`persistStore: \`storage.getItem\` must return a string or null, got ${describe(text)}`);
 			stored = text;
 			const persisted = deserialize(text);
@@ -1664,25 +1664,35 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 				state = migrate(state, from);
 			}
 			const next = merge(state as P, getState.call(store));
+			// The storage still holds the old version: replace it with the migrated state now (not with whatever the store holds after
+			// `setState`, which a store may defer or ignore), or every load would migrate it again, and fail once `migrate` is gone.
+			if (from !== version) writeState(next);
 			// Wrapped: `setState` would call a function-valued state as an updater.
 			setState.call(store, function (): S {
 				return next;
 			});
-			return from !== version;
 		} catch (error) {
 			report(error);
-			return false;
 		}
 	}
 
 	/**
-	 * Writes the current (partialized) state, unless the storage already holds the same text. Never throws: errors go to `onError`.
+	 * Writes the store's current state (see {@link writeState}): the store listener, possibly debounced.
 	 * @returns {void}
 	 */
 	function write(): void {
 		timer = undefined;
+		writeState(getState.call(store));
+	}
+
+	/**
+	 * Writes a (partialized) state, unless the storage already holds the same text. Never throws: errors go to `onError`.
+	 * @param {S} current - The state to write
+	 * @returns {void}
+	 */
+	function writeState(current: S): void {
 		try {
-			const state = partialize(getState.call(store));
+			const state = partialize(current);
 			if (state === undefined) {
 				if (stored === null) return;
 				(storage as PersistStorage).removeItem(key as string);
@@ -1708,11 +1718,9 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 		else if (timer === undefined) timer = setTimeout(write, debounce);
 	}
 
-	const migrated = hydrate();
+	hydrate();
 	const unsubscribe: unknown = subscribe.call(store, onChange);
 	assertFunction('persistStore', 'store.subscribe()', unsubscribe);
-	// The storage still holds the old version: replace it now, or every load would migrate it again (and fail once `migrate` is gone).
-	if (migrated) write();
 
 	return function (): void {
 		if (!active) return;

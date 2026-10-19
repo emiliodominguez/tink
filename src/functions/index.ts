@@ -1680,11 +1680,13 @@ export type CapturePattern<Name extends string | undefined, P> = PatternHelper<[
 
 /**
  * A pattern created by {@link active}: it matches the values for which its function returns something other than `undefined`, and binds
- * that result. It narrows to the function's parameter type `A`, but never counts toward exhaustiveness.
+ * that result. It narrows nothing (the handler receives the value as typed at the pattern's position) and never counts toward
+ * exhaustiveness; in {@link matchWith} and {@link matcher}, every value its position may hold must be assignable to `A` (a compile error
+ * otherwise, since the function is called with whatever is there).
  * @template A - The parameter type of the function
  * @template R - The return type of the function (`undefined` for no match)
  */
-export type ActivePattern<A, R> = PatternHelper<['active', R]> & ((value: unknown) => value is A);
+export type ActivePattern<A, R> = PatternHelper<['active', A, R]> & ((value: unknown) => value is unknown);
 
 /**
  * A pattern created by {@link anyOf}: it matches what any of the patterns `P` matches (the first that does binds its captures).
@@ -1861,7 +1863,7 @@ function test(caller: string, pattern: unknown, value: unknown, log: unknown[] |
 		}
 	}
 	if (array ? !Array.isArray(value) || value.length !== pattern.length : typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-	if (depth === CYCLE_CHECK_DEPTH) scan(caller, pattern, [], []);
+	if (depth === CYCLE_CHECK_DEPTH) scan(caller, pattern, [], [], new Map());
 	if (array) {
 		const direct = !isArrayPrototypePolluted();
 
@@ -1959,38 +1961,49 @@ function testHelper(caller: string, record: PatternRecord, value: unknown, log: 
 
 /**
  * Lists what a pattern captures, in `log` (pairs of a name and `undefined`), as {@link test} would on a match, and checks that it is acyclic.
+ * Each object, array and helper is scanned once per `memo`, so a pattern that shares sub-patterns (`anyOf([x, 1], [x, 2])`, nested)
+ * costs time linear in its distinct parts, not in its expanded size.
  * @param {string} caller - Name of the public function, used in the error message
  * @param {unknown} pattern - The pattern
  * @param {unknown[]} log - Receives the captures
  * @param {unknown[]} ancestors - The object patterns around this one
+ * @param {Map<unknown, unknown[] | false>} memo - The parts already scanned: what each captures, or `false` when it holds no helper
  * @returns {boolean} Whether the pattern contains a pattern helper
  * @throws {TypeError} when the pattern contains itself
  */
-function scan(caller: string, pattern: unknown, log: unknown[], ancestors: unknown[]): boolean {
-	if (typeof pattern === 'function') {
-		const record = helperOf(pattern);
+function scan(caller: string, pattern: unknown, log: unknown[], ancestors: unknown[], memo: Map<unknown, unknown[] | false>): boolean {
+	const record = helperOf(pattern);
+	const array = Array.isArray(pattern);
 
-		if (record === undefined) return false;
-		if (record.kind === ACTIVE) log.push(undefined, undefined);
-		// The alternatives of `anyOf` capture the same names, so only the first one's are listed (the others are still checked for cycles).
-		for (let index = 0; index < record.patterns.length; index++) scan(caller, record.patterns[index], record.kind === ANY_OF && index > 0 ? [] : log, ancestors);
-		if (record.absorbs) log[log.length - 2] = record.name;
-		else if (record.kind === CAPTURE) log.push(record.name, undefined);
+	if (record === undefined && !array && !isPlainObject(pattern)) return false;
+
+	const known = memo.get(pattern);
+
+	if (known !== undefined) {
+		if (known === false) return false;
+		for (let index = 0; index < known.length; index++) log.push(known[index]);
 
 		return true;
 	}
 
-	const array = Array.isArray(pattern);
+	const start = log.length;
+	let found = record !== undefined;
 
-	if (!array && !isPlainObject(pattern)) return false;
-	if (ancestors.includes(pattern)) circularPattern(caller);
-	ancestors.push(pattern);
-
-	let found = false;
-
-	if (array) for (let index = 0; index < pattern.length; index++) found = scan(caller, pattern[index], log, ancestors) || found;
-	else for (const key of patternKeys(pattern)) found = scan(caller, (pattern as Record<PropertyKey, unknown>)[key], log, ancestors) || found;
-	ancestors.pop();
+	if (record !== undefined) {
+		if (record.kind === ACTIVE) log.push(undefined, undefined);
+		// The alternatives of `anyOf` capture the same names, so only the first one's are listed (the others are still checked for cycles).
+		for (let index = 0; index < record.patterns.length; index++) scan(caller, record.patterns[index], record.kind === ANY_OF && index > 0 ? [] : log, ancestors, memo);
+		if (record.absorbs) log[log.length - 2] = record.name;
+		else if (record.kind === CAPTURE) log.push(record.name, undefined);
+	} else {
+		// A part being scanned is not in `memo` yet: meeting it again is a cycle.
+		if (ancestors.includes(pattern)) circularPattern(caller);
+		ancestors.push(pattern);
+		if (array) for (let index = 0; index < pattern.length; index++) found = scan(caller, pattern[index], log, ancestors, memo) || found;
+		else for (const key of patternKeys(pattern as object)) found = scan(caller, (pattern as Record<PropertyKey, unknown>)[key], log, ancestors, memo) || found;
+		ancestors.pop();
+	}
+	memo.set(pattern, found && log.slice(start));
 
 	return found;
 }
@@ -2061,8 +2074,8 @@ export function _(_value: unknown): _value is unknown {
  *
  * Captures bind when they are part of a case's pattern (in its objects and arrays, or in {@link anyOf}, {@link cons} and other captures);
  * inside another guard (`isArrayOf(capture())`) or {@link isMatching}, a capture only tests its pattern. A pattern captures either one
- * anonymous value or named values: mixing them, or capturing several anonymous values (or a name twice), is a compile error, and throws a
- * `TypeError` when the case matches ({@link matcher}: when the case is added).
+ * anonymous value or named values: mixing them is a compile error; capturing several anonymous values, or a name twice, type-checks (the
+ * types merge them) but, like mixing, throws a `TypeError` when the case matches ({@link matcher}: when the case is added).
  * @template P - The captured pattern
  * @param {P} [pattern] - The pattern to capture (a value, a guard, or plain objects and arrays of those); omitted, it matches anything
  * @returns {CapturePattern<undefined, P>} The pattern
@@ -2090,7 +2103,8 @@ export function capture(...pattern: unknown[]): AnyFunction {
 /**
  * Creates a pattern that matches what `pattern` matches (anything, by default) and passes the matched value to the handler under `name`:
  * a case whose pattern holds named captures calls its handler (and `when` guard) with an object of the captured values (without a
- * prototype, so any name is safe) first and the whole matched value second. See {@link capture} for where captures bind.
+ * prototype, so any name is safe) first and the whole matched value second. See {@link capture} for where captures bind, and for which
+ * mistakes are compile errors (mixing with anonymous captures) and which only throw (a name captured twice).
  * @template N - The name
  * @template P - The captured pattern
  * @param {N} name - The name of the captured value
@@ -2135,10 +2149,12 @@ function capturing(caller: string, name: string | undefined, pattern: unknown[])
 /**
  * Creates an active pattern, F#'s `| Int n ->`: it matches the values for which `extract` returns something other than `undefined`, and
  * binds that result like an anonymous {@link capture} (wrap it in {@link captureAs} to name it). `extract` is called once per test, so
- * testing and extracting never compute twice. An active pattern is partial: it never makes a {@link matchWith} exhaustive.
- * @template A - The parameter type of `extract`, which the pattern narrows to
+ * testing and extracting never compute twice. An active pattern is partial: it never makes a {@link matchWith} exhaustive. It narrows
+ * nothing: in {@link matchWith} and {@link matcher}, `extract` must accept every value its position may hold while the case is tested
+ * (a compile error otherwise), whatever the parts of the pattern tested after it would say.
+ * @template A - The parameter type of `extract`
  * @template R - The return type of `extract` (`undefined` meaning no match)
- * @param {(value: A) => R} extract - Called with the value at the pattern's position (whatever it is: check its type when it may vary)
+ * @param {(value: A) => R} extract - Called with the value at the pattern's position (`undefined` for a missing property)
  * @returns {ActivePattern<A, R>} The pattern
  * @throws {TypeError} when `extract` is not a function
  * @example
@@ -2178,11 +2194,12 @@ export function anyOf<const P extends readonly unknown[]>(...patterns: P): AnyOf
 	if (patterns.length === 0) throw new RangeError('anyOf: expected at least one pattern, got 0');
 
 	let expected = '';
+	const memo = new Map<unknown, unknown[] | false>();
 
 	for (let index = 0; index < patterns.length; index++) {
 		const log: unknown[] = [];
 
-		scan('anyOf', patterns[index], log, []);
+		scan('anyOf', patterns[index], log, [], memo);
 
 		const names: string[] = [];
 
@@ -2281,26 +2298,42 @@ type IsPresent<M, K> = M extends Record<K & PropertyKey, unknown> ? true : false
 type Replace<M, K, X> = { [I in keyof M]: I extends K ? X : M[I] };
 
 /**
- * Whether a primitive pattern type stands for an unknown value of a wide type (`string`, `number`…), which covers none of its values.
- * @template P - The pattern type
+ * Whether a primitive pattern type is a single value (a literal, `null`, `undefined`, a `unique symbol`) rather than a set of values
+ * (`string`, `` `id-${string}` ``, `Uppercase<string>`, `` `${number}` ``, `bigint`…), of which a value equal to the pattern covers one.
+ * @template P - The pattern type (not a union)
  */
-type IsWide<P> = string extends P ? true : number extends P ? true : bigint extends P ? true : symbol extends P ? true : false;
+type IsUnit<P> = P extends string | number ? (Record<never, never> extends Record<P, 1> ? false : true) : bigint extends P ? false : symbol extends P ? false : true;
+
+/** The values that an object type may admit but an object pattern never matches (it only matches non-array objects). */
+type NonPlain = unknown[] | AnyFunction | string | number | boolean | bigint | symbol;
+
+/**
+ * `true` for each member of `T` assignable to `M` (so `true extends Admits<M, T>` when one is).
+ * @template M - The type
+ * @template T - The candidate values
+ */
+type Admits<M, T> = T extends M ? true : never;
 
 /**
  * The values of `M` that a case with pattern `P` may leave unhandled: the members that `P` matches entirely are removed (and products,
- * objects and tuples, lose the part `P` matches entirely); every other member is kept, so the result is never too small.
+ * objects and tuples, lose the part `P` matches entirely); every other member is kept, so the result is never too small. An `any` member
+ * is only removed by a pattern that matches anything.
  * @template M - The remaining values
  * @template P - The pattern
  */
-type Subtract<M, P> = M extends unknown ? SubtractMember<M, P> : never;
+type Subtract<M, P> = M extends unknown ? (0 extends 1 & M ? ([SubtractMember<unknown, P>] extends [never] ? never : M) : SubtractMember<M, P>) : never;
 
 /**
  * {@link Subtract} for one member `M` (`P` is distributed: a union-typed pattern is one of its members, so only what all of them cover goes).
+ * A pattern typed `unknown` or `any` removes nothing, nor does an object pattern that may not be plain (typed `object` or `{}`: it may be
+ * a map or a class instance, compared by identity) or a member that may not be a plain object (`{ length: number }` admits arrays and
+ * strings, which object patterns never match).
  * @template M - A remaining member
  * @template P - The pattern
  */
-type SubtractMember<M, P> =
-	P extends PatternHelper<infer K>
+type SubtractMember<M, P> = unknown extends P
+	? M
+	: P extends PatternHelper<infer K>
 		? SubtractHelper<M, K>
 		: P extends ((value: unknown) => value is infer T)
 			? [M] extends [T]
@@ -2311,18 +2344,22 @@ type SubtractMember<M, P> =
 				: P extends readonly unknown[]
 					? SubtractTuple<M, P>
 					: P extends object
-						? M extends AnyFunction | readonly unknown[]
+						? [object] extends [P]
 							? M
-							: M extends object
-								? // A member the pattern cannot match (a conflicting discriminant) is kept as is, cheaply.
-									[M & PatternType<P>] extends [never]
-									? M
-									: SubtractShape<M, P>
-								: M
-						: [M] extends [P]
-							? IsWide<P> extends true
+							: M extends AnyFunction | readonly unknown[]
 								? M
-								: never
+								: M extends object
+									? true extends Admits<M, NonPlain>
+										? M
+										: // A member the pattern cannot match (a conflicting discriminant) is kept as is, cheaply.
+											[M & PatternType<P>] extends [never]
+											? M
+											: SubtractShape<M, P>
+									: M
+						: [M] extends [P]
+							? IsUnit<P> extends true
+								? never
+								: M
 							: M;
 
 /**
@@ -2433,12 +2470,49 @@ type ConsBranches<M, A, Rest extends readonly unknown[], XA, XR> = [A] extends [
 		: ([XA] extends [never] ? never : [XA, ...Rest]) | (XR extends readonly unknown[] ? [A, ...XR] : never);
 
 /**
+ * The members of `W` whose properties a plain-object pattern `P` reads: non-array objects, a member without known keys (such as `object`,
+ * `{}` or `unknown`) as an object of unknown values at the keys of `P` (`any` stays `any`).
+ * @template W - The values at the pattern's position
+ * @template P - The object pattern
+ */
+type ObjectsIn<W, P> = unknown extends W
+	? 0 extends 1 & W
+		? W
+		: { [K in keyof P]: unknown }
+	: W extends AnyFunction | readonly unknown[]
+		? never
+		: W extends object
+			? [keyof W] extends [never]
+				? { [K in keyof P]: unknown }
+				: W
+			: never;
+
+/**
+ * The members of `W` whose elements an array or {@link cons} pattern reads: arrays (a member that may be any array as `unknown[]`).
+ * @template W - The values at the pattern's position
+ */
+type ArraysIn<W> = W extends readonly unknown[] ? W : unknown[] extends W ? unknown[] : never;
+
+/**
+ * The first element of each array of `V` (that {@link cons} reads).
+ * @template V - The arrays
+ */
+type HeadOf<V> = V extends readonly [infer A, ...unknown[]] ? A : V extends readonly (infer E)[] ? E : never;
+
+/**
+ * The other elements of each array of `V`, as an array (that {@link cons} reads).
+ * @template V - The arrays
+ */
+type TailOf<V> = V extends readonly [unknown, ...infer R] ? R : V extends readonly (infer E)[] ? E[] : never;
+
+/**
  * What a pattern `P` captures from values of type `V`: a union of `[name, type]` pairs, the name `undefined` for anonymous captures.
  * @template P - The pattern
  * @template V - The matched values
  */
-type Entries<P, V> =
-	P extends PatternHelper<infer K>
+type Entries<P, V> = 0 extends 1 & P
+	? never
+	: P extends PatternHelper<infer K>
 		? HelperEntries<K, V>
 		: P extends AnyFunction | Date
 			? never
@@ -2454,17 +2528,15 @@ type Entries<P, V> =
  * @template V - The matched values
  */
 type HelperEntries<K, V> = K extends ['capture', infer N, infer Q]
-	? Q extends PatternHelper<['active', infer R]>
+	? Q extends PatternHelper<['active', unknown, infer R]>
 		? [N, Exclude<R, undefined>]
 		: [N, Narrow<V, PatternType<Q>>] | Entries<Q, Narrow<V, PatternType<Q>>>
-	: K extends ['active', infer R]
+	: K extends ['active', unknown, infer R]
 		? [undefined, Exclude<R, undefined>]
 		: K extends ['anyOf', infer Ps extends readonly unknown[]]
 			? AlternativeEntries<Ps[number], V>
 			: K extends ['cons', infer H, infer T]
-				?
-						| Entries<H, V extends readonly [infer A, ...unknown[]] ? A : V extends readonly (infer E)[] ? E : never>
-						| Entries<T, V extends readonly [unknown, ...infer R] ? R : V extends readonly (infer E)[] ? E[] : never>
+				? Entries<H, HeadOf<V>> | Entries<T, TailOf<V>>
 				: never;
 
 /**
@@ -2473,6 +2545,42 @@ type HelperEntries<K, V> = K extends ['capture', infer N, infer Q]
  * @template V - The matched values
  */
 type AlternativeEntries<A, V> = A extends unknown ? Entries<A, Narrow<V, PatternType<A>>> : never;
+
+/**
+ * An {@link ActiveParameterError} for each {@link active} pattern of `P` whose function does not accept every value it may be called with,
+ * when `P` is tested against values of type `W`. Unlike {@link Entries}, `W` is not narrowed by the pattern: the function is called while
+ * testing, whatever the parts of the pattern tested after it (or the alternatives of an {@link anyOf} tried before it) would say.
+ * @template P - The pattern
+ * @template W - The values the pattern is tested against
+ */
+type ActiveErrors<P, W> = 0 extends 1 & P
+	? never
+	: P extends PatternHelper<infer K>
+		? HelperActiveErrors<K, W>
+		: P extends AnyFunction | Date
+			? never
+			: P extends readonly unknown[]
+				? { [I in keyof P]: P[I] extends Primitive ? never : ActiveErrors<P[I], PartOf<ArraysIn<W>, I>> }[number]
+				: P extends object
+					? { [K in keyof P]-?: P[K] extends Primitive ? never : ActiveErrors<P[K], PartOf<ObjectsIn<W, P>, K>> }[keyof P]
+					: never;
+
+/**
+ * {@link ActiveErrors} of a pattern helper.
+ * @template K - The helper's kind and type arguments
+ * @template W - The values the helper is tested against
+ */
+type HelperActiveErrors<K, W> = K extends ['active', infer A, unknown]
+	? [W] extends [A]
+		? never
+		: ActiveParameterError<A, W>
+	: K extends ['capture', unknown, infer Q]
+		? ActiveErrors<Q, W>
+		: K extends ['anyOf', infer Ps extends readonly unknown[]]
+			? ActiveErrors<Ps[number], W>
+			: K extends ['cons', infer H, infer T]
+				? ActiveErrors<H, HeadOf<ArraysIn<W>>> | ActiveErrors<T, TailOf<ArraysIn<W>>>
+				: never;
 
 /**
  * The type a handler (or `when` guard) must have for the captures `E` and the matched values `V`.
@@ -2495,12 +2603,17 @@ type Selections<E> = { [N in E extends [infer Name extends string, unknown] ? Na
 
 /**
  * The type a handler (or `when` guard) of a case with pattern `P` must have while the values `Remaining` are unhandled (a pattern typed
- * `any` captures nothing). Handlers are typed by a constraint, not inferred into: TypeScript would explore every branch of these
- * conditional types while inferring.
+ * `any` captures nothing), or {@link ActiveParameterError} when an active pattern's function does not accept its values. Handlers are
+ * typed by a constraint, not inferred into: TypeScript would explore every branch of these conditional types while inferring (and the
+ * error is not part of {@link Handler}, whose constraint TypeScript would then expand through every level of {@link Entries}).
  * @template P - The pattern
  * @template Remaining - The unhandled values
  */
-type CaseHandler<P, Remaining> = 0 extends 1 & P ? (value: Remaining) => unknown : Handler<Entries<P, Narrow<Remaining, PatternType<P>>>, Narrow<Remaining, PatternType<P>>>;
+type CaseHandler<P, Remaining> = 0 extends 1 & P
+	? (value: Remaining) => unknown
+	: [ActiveErrors<P, Remaining>] extends [never]
+		? Handler<Entries<P, Narrow<Remaining, PatternType<P>>>, Narrow<Remaining, PatternType<P>>>
+		: ActiveErrors<P, Remaining>;
 
 /**
  * The return type of a handler.
@@ -2522,6 +2635,17 @@ interface MixedCapturesError {
 }
 
 /**
+ * The (impossible) handler type of a pattern holding an {@link active} pattern whose function does not accept every value it may be
+ * called with.
+ * @template A - The parameter type of the function
+ * @template W - The values at the active pattern's position
+ */
+interface ActiveParameterError<A, W> {
+	/** Explains the error. */
+	readonly 'the function of an active pattern must accept every value at its position': { readonly parameter: A; readonly values: W };
+}
+
+/**
  * The type of `exhaustive` when some values are unhandled: calling it is a compile error naming them.
  * @template Remaining - The unhandled values
  */
@@ -2540,7 +2664,7 @@ export interface MatchBuilder<Remaining, Out> {
 	 * Adds a case: when the value matches `pattern` (as {@link isMatching} defines it) and no earlier case matched, `handler` is called
 	 * with the value (preceded by the captures, if `pattern` has any).
 	 * @template P - The pattern
-	 * @template H - The handler (its type is checked against the pattern: see {@link CaseHandler})
+	 * @template H - The handler (its type is checked against the pattern: see `CaseHandler`)
 	 * @param {P} pattern - The pattern
 	 * @param {Function} handler - Receives the captures (if any) and the value narrowed to the pattern
 	 * @returns {MatchBuilder} The builder, with the values `pattern` handles entirely removed from `Remaining`
@@ -2550,7 +2674,7 @@ export interface MatchBuilder<Remaining, Out> {
 	 * Adds a guarded case, F#'s `when`: the case only matches when `when`, called like the handler, returns a truthy value. A guarded case
 	 * removes nothing from `Remaining`.
 	 * @template P - The pattern
-	 * @template H - The handler (its type is checked against the pattern: see {@link CaseHandler})
+	 * @template H - The handler (its type is checked against the pattern: see `CaseHandler`)
 	 * @param {P} pattern - The pattern
 	 * @param {Function} when - The guard, receiving what the handler receives
 	 * @param {Function} handler - Receives the captures (if any) and the value narrowed to the pattern
@@ -2581,7 +2705,7 @@ export interface MatcherBuilder<In, Remaining, Out> {
 	/**
 	 * Adds a case (see {@link MatchBuilder}): `pattern` is compiled now.
 	 * @template P - The pattern
-	 * @template H - The handler (its type is checked against the pattern: see {@link CaseHandler})
+	 * @template H - The handler (its type is checked against the pattern: see `CaseHandler`)
 	 * @param {P} pattern - The pattern
 	 * @param {Function} handler - Receives the captures (if any) and the value narrowed to the pattern
 	 * @returns {MatcherBuilder} A new builder, with the values `pattern` handles entirely removed from `Remaining`
@@ -2590,7 +2714,7 @@ export interface MatcherBuilder<In, Remaining, Out> {
 	/**
 	 * Adds a guarded case (see {@link MatchBuilder}).
 	 * @template P - The pattern
-	 * @template H - The handler (its type is checked against the pattern: see {@link CaseHandler})
+	 * @template H - The handler (its type is checked against the pattern: see `CaseHandler`)
 	 * @param {P} pattern - The pattern
 	 * @param {Function} when - The guard, receiving what the handler receives
 	 * @param {Function} handler - Receives the captures (if any) and the value narrowed to the pattern
@@ -2648,7 +2772,7 @@ class MatchState {
 	readonly handler: AnyFunction | undefined;
 	/** The selection of the case that matched. */
 	readonly selection: unknown;
-	/** Scratch space for the captures of each case, created on the first test. */
+	/** Scratch space for the captures of each case, created on the first test (and `undefined` while a test uses it). */
 	log: unknown[] | undefined;
 
 	/**
@@ -2677,11 +2801,17 @@ class MatchState {
 		// Once a case matched, later patterns are neither tested nor read.
 		if (this.handler !== undefined) return this;
 
-		const log = this.log ?? (this.log = []);
+		const log = this.log ?? [];
 
+		// Taken while in use: a guard of the pattern that calls `with` on this state again (re-entrantly) gets a log of its own.
+		this.log = undefined;
 		// Only truncated when needed: setting `length` costs more than the rest of a simple test.
 		if (log.length !== 0) log.length = 0;
-		if (!test('matchWith', pattern, this.value, log, 0)) return this;
+
+		const matched = test('matchWith', pattern, this.value, log, 0);
+
+		this.log = log;
+		if (!matched) return this;
 
 		const selection = select('matchWith', log);
 
@@ -2728,18 +2858,30 @@ class MatchState {
  * once a case matched, the later ones are not tested. The handler runs when `exhaustive` or `otherwise` is called.
  *
  * Exhaustiveness rules: a case removes from the remaining type what its pattern matches entirely: union members (`boolean` is
- * `true | false`) equal to a literal, assignable to a guard's type predicate (guards are trusted, like TypeScript trusts them), or matched by
- * `_`; for objects and tuples, the part matched key by key, recursively, splitting a member into what each key leaves (so `[true, _]` and
- * `[false, _]` handle `[boolean, boolean]`, and `{ kind: 'a', payload: { type: 'x' } }` one variant of a nested union). Guarded cases,
- * {@link active} patterns, guards without a type predicate, dates, identity-compared objects and patterns of a wide type (a `string`
- * variable) remove nothing; `[]` and `cons(_, _)` together handle arrays. The remaining type only ever errs on the large side: a match it
- * cannot prove exhaustive needs `otherwise` (or a final `_` case).
+ * `true | false`) equal to a literal (a single value, unlike `` `id-${string}` `` or `Uppercase<string>`), assignable to a guard's type
+ * predicate (guards are trusted, like TypeScript trusts them), or matched by `_`; for objects and tuples, the part matched key by key,
+ * recursively, splitting a member into what each key leaves (so `[true, _]` and `[false, _]` handle `[boolean, boolean]`, and
+ * `{ kind: 'a', payload: { type: 'x' } }` one variant of a nested union). Guarded cases, {@link active} patterns, guards without a type
+ * predicate, dates, and patterns of a wide type remove nothing: a `string` variable, a pattern typed `unknown` or `any`, and one typed
+ * `object` or `{}` (it may be a map, compared by identity), so the empty pattern `{}` too (use `_`). Object patterns only match non-array
+ * objects, so they remove no member that arrays, strings, numbers or functions satisfy (`{ length: number }`, `{ name: string }`,
+ * `object`); an `any` value is only handled by a pattern that matches anything (`_`). `[]` and `cons(_, _)` together handle arrays. The
+ * remaining type only ever errs on the large side: a match it cannot prove exhaustive needs `otherwise` (or a final `_` case).
+ *
+ * Limits: exhaustiveness assumes values and object patterns are plain data: own enumerable properties, as from JSON or object literals,
+ * and no keys that their type does not declare (a pattern reads such a key as `undefined`). A discriminant that is a class getter or method
+ * never matches a key pattern, and a class instance used as a pattern is compared by identity (while its type is structural): match
+ * classes with `isInstanceOf(Class)` instead. Proxies are trusted: `matchWith` checks that a property is own before reading it, while
+ * compiled patterns ({@link isMatching}, and the parts of {@link matcher} patterns without helpers) may read it first, so a proxy whose
+ * traps disagree (`get` without `getOwnPropertyDescriptor`) may match differently in each. Captures: mixing anonymous and named captures is
+ * a compile error; several anonymous captures, or a name captured twice, only throw (see {@link capture}).
  * @template T - The type of the value
  * @param {T} value - The value to match
  * @returns {MatchBuilder<T, never>} The builder
  * @throws {AssertionError} from `exhaustive()`, when no case matched
  * @throws {TypeError} from `with` and `otherwise`, when a handler or guard is not a function, or the captures of the matching case mix
- * anonymous and named captures (or repeat one); from `with`, when the test reaches a cycle of the pattern
+ * anonymous and named captures (or capture several anonymous values, or a name twice); from `with`, when the test reaches a cycle of the
+ * pattern
  * @example
  * import { isString } from 'tinkit/guards';
  * type Event = { type: 'click'; x: number; button: number } | { type: 'key'; key: string };
@@ -2786,33 +2928,43 @@ interface MatcherCase {
 
 /**
  * Compiles the parts of a pattern that hold no pattern helper with {@link isMatching}, so that only the structure leading to helpers is
- * interpreted. The result is a copy: later changes to the pattern do not affect it.
+ * interpreted. The result is a copy: later changes to the pattern do not affect it. A part the pattern holds several times is prepared
+ * once (and shared by the copy), so the cost is linear in the distinct parts.
  * @param {unknown} pattern - An acyclic pattern
+ * @param {Map<unknown, unknown[] | false>} scanned - The memo of {@link scan} for this pattern
+ * @param {Map<unknown, unknown>} prepared - The parts already prepared, and their copies
  * @returns {unknown} The prepared pattern
  */
-function prepare(pattern: unknown): unknown {
-	if (typeof pattern === 'function') {
-		const record = helperOf(pattern);
+function prepare(pattern: unknown, scanned: Map<unknown, unknown[] | false>, prepared: Map<unknown, unknown>): unknown {
+	let copy = prepared.get(pattern);
 
-		if (record === undefined || record.kind === ACTIVE) return pattern;
+	if (copy !== undefined) return copy;
 
-		return register('matcher', { ...record, patterns: record.patterns.map(prepare) });
+	const record = helperOf(pattern);
+
+	if (record !== undefined) {
+		const patterns: unknown[] = [];
+
+		for (let index = 0; index < record.patterns.length; index++) patterns.push(prepare(record.patterns[index], scanned, prepared));
+		copy = record.kind === ACTIVE ? pattern : register('matcher', { ...record, patterns });
+	} else if (!scan('matcher', pattern, [], [], scanned)) {
+		copy = isDate(pattern) || Array.isArray(pattern) || isPlainObject(pattern) ? isMatching(pattern) : pattern;
+	} else if (Array.isArray(pattern)) {
+		copy = [];
+		for (let index = 0; index < pattern.length; index++) (copy as unknown[]).push(prepare(pattern[index], scanned, prepared));
+	} else {
+		copy = {};
+		// Defined, so that a `__proto__` key is copied as a key (a copy without prototype would make `isDate` take its slow path).
+		for (const key of patternKeys(pattern as object)) {
+			Object.defineProperty(copy, key, {
+				value: prepare((pattern as Record<PropertyKey, unknown>)[key], scanned, prepared),
+				enumerable: true,
+				writable: true,
+				configurable: true
+			});
+		}
 	}
-	if (!scan('matcher', pattern, [], [])) return isDate(pattern) || Array.isArray(pattern) || isPlainObject(pattern) ? isMatching(pattern) : pattern;
-	if (Array.isArray(pattern)) {
-		const copy: unknown[] = [];
-
-		for (let index = 0; index < pattern.length; index++) copy.push(prepare(pattern[index]));
-
-		return copy;
-	}
-
-	const copy = {};
-
-	// Defined, so that a `__proto__` key is copied as a key (a copy without prototype would make `isDate` take its slow path).
-	for (const key of patternKeys(pattern as object)) {
-		Object.defineProperty(copy, key, { value: prepare((pattern as Record<PropertyKey, unknown>)[key]), enumerable: true, writable: true, configurable: true });
-	}
+	prepared.set(pattern, copy);
 
 	return copy;
 }
@@ -2842,7 +2994,8 @@ class MatcherState {
 	with(pattern: unknown, ...functions: unknown[]): MatcherState {
 		const when = caseGuard('matcher', functions);
 		const log: unknown[] = [];
-		const helpers = scan('matcher', pattern, log, []);
+		const scanned = new Map<unknown, unknown[] | false>();
+		const helpers = scan('matcher', pattern, log, [], scanned);
 
 		// Fails as matching would, but now.
 		select('matcher', log);
@@ -2851,7 +3004,7 @@ class MatcherState {
 			...this.cases,
 			{
 				guard: helpers ? undefined : (isMatching(pattern) as (value: unknown) => boolean),
-				pattern: helpers ? prepare(pattern) : undefined,
+				pattern: helpers ? prepare(pattern, scanned, new Map()) : undefined,
 				captures: log.length > 0,
 				when,
 				handler: caseHandler(functions) as AnyFunction

@@ -2788,11 +2788,13 @@ export interface SafeFilenameOptions {
 /**
  * The characters {@link toSafeFilename} replaces: the ones Windows forbids (`< > : " / \ | ? *` and the C0 controls, which include NUL),
  * the slash, backslash and colon lookalikes that Windows' "best-fit" conversion to an ANSI code page turns into real ones (`\u2215 \u2044 \uff0f \u29f8`,
- * `\u2216 \uff3c \u29f9 \ufe68`, `\uff1a`), DEL and the C1 controls, the bidirectional controls that can disguise an extension (`'invoice\u202efdp.exe'`
+ * `\u2216 \uff3c \u29f9 \ufe68`, `\uff1a`) and the full-width forms of the other forbidden characters (`\uff02 \uff0a \uff1c \uff1e \uff1f \uff5c`),
+ * DEL and the C1 controls, the bidirectional controls that can disguise an extension (`'invoice\u202efdp.exe'`
  * displays as `invoiceexe.pdf`), and lone surrogates (which no file system encoding can store).
  */
-// eslint-disable-next-line no-control-regex -- control characters are what is removed
-const FILENAME_INVALID = /[<>:"/\\|?*\0-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\u2044\u2215\u2216\u29f8\u29f9\ufe68\uff0f\uff1a\uff3c\p{Cs}]+/gu;
+const FILENAME_INVALID =
+	// eslint-disable-next-line no-control-regex -- control characters are what is removed
+	/[<>:"/\\|?*\0-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\u2044\u2215\u2216\u29f8\u29f9\ufe68\uff02\uff0a\uff0f\uff1a\uff1c\uff1e\uff1f\uff3c\uff5c\p{Cs}]+/gu;
 
 /**
  * The Windows device names (case-insensitive), which cannot be file names even with an extension or spaces before it (`nul.txt`,
@@ -2859,7 +2861,8 @@ function trimDotsAndSpaces(string: string): string {
  * - each run of invalid characters (`< > : " / \ | ? *`, control characters, bidirectional controls and lone surrogates) becomes
  *   `replacement` (`'_'` by default), so the result never holds a path separator. So does each run of the lookalikes of `/`, `\` and
  *   `:` that Windows programs calling the ANSI APIs "best-fit" into real ones (the WorstFit attacks): U+2215 `∕`, U+2044 `⁄`,
- *   U+FF0F `／`, U+29F8 `⧸`, U+2216 `∖`, U+FF3C `＼`, U+29F9 `⧹`, U+FE68 `﹨` and U+FF1A `：`. Currency signs such as `¥` and `₩` are
+ *   U+FF0F `／`, U+29F8 `⧸`, U+2216 `∖`, U+FF3C `＼`, U+29F9 `⧹`, U+FE68 `﹨` and U+FF1A `：`, and the full-width forms of the other
+ *   forbidden characters, `＂ ＊ ＜ ＞ ？ ｜`, which become `" * < > ? |` the same way. Currency signs such as `¥` and `₩` are
  *   kept, as the legitimate characters they are, although the Japanese and Korean ANSI code pages map them to `\`: never pass the
  *   names to ANSI APIs there;
  * - dots and spaces at the end are removed (Windows drops them), so `'.'` and `'..'` cannot come out;
