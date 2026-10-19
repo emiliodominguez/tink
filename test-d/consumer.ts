@@ -23,12 +23,15 @@ import type { Infer } from 'tinkit/guards';
 import {
 	arrayOf,
 	asArray,
+	asBigInt,
 	asBoolean,
 	asDate,
 	asInteger,
 	asJson,
+	asList,
 	asNumber,
 	chain,
+	check,
 	discriminatedUnion,
 	exact,
 	isUrl,
@@ -42,7 +45,9 @@ import {
 	transform,
 	tuple,
 	union,
-	withDefault
+	withDefault,
+	withError,
+	withFallback
 } from 'tinkit/validate';
 import type { Parser, SchemaOutput } from 'tinkit/validate';
 import type { StandardSchemaV1 } from '@standard-schema/spec';
@@ -184,6 +189,17 @@ const category: Parser<Category> = lazy(function () {
 const patch: { name?: string | undefined; age?: number | undefined } = parse(partial({ name: isString, age: asInteger }), {});
 const strict: { x: number } = parse(exact({ x: asNumber }), {});
 const fieldErrors: Record<string, string[]> = issuesByPath([]);
+// The helpers for forms, query strings and environment variables keep the output type of their schema.
+const signUp = check({ password: isString, confirm: isString }, function (form) {
+	return form.password === form.confirm;
+});
+const formTypes: { password: string; confirm: string } = parse(signUp, {});
+const extras: { page: number; ids: bigint[]; origins: string[]; age: number } = parse(
+	{ page: withFallback(asInteger, 1), ids: asList(asBigInt), origins: asList(isUrl), age: withError(asInteger, 'Enter your age') },
+	{}
+);
+// @ts-expect-error the fallback must match the schema's output
+const badFallback = withFallback(asInteger, 'x');
 // A generic guard written in place keeps its type when the callback parameter is annotated.
 const tagLength: Parser<number> = transform(isOneOf(['a', 'bb']), function (tag: 'a' | 'bb'): number {
 	return tag.length;
@@ -198,4 +214,4 @@ const camel: { userId: number; createdAt: string } = toCamelCaseKeys({ user_id: 
 const snake = camel.user_id;
 export { a, b, c, keys, v, m, dm, p, o, r, f, g, everything, spec, output, wrong, camel, snake };
 export { figure, badFigure, envBack, envWrong, port, envSpec, badDefault };
-export { click, legacy, badEvent, parsedShapes, locales, category, patch, strict, fieldErrors, tagLength, area };
+export { click, legacy, badEvent, parsedShapes, locales, category, patch, strict, fieldErrors, tagLength, area, formTypes, extras, badFallback };
