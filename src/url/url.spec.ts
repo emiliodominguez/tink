@@ -128,6 +128,15 @@ describe('URL helpers', function () {
 				helpers.parseFormData(null as unknown as Iterable<[string, string]>);
 			}).toThrow(TypeError);
 		});
+
+		it('should reject entries that are not pairs', function () {
+			expect(function () {
+				helpers.parseFormData(['ab'] as unknown as Iterable<[string, string]>);
+			}).toThrow('parseFormData: every entry must be a [key, value] pair, got string');
+			expect(function () {
+				helpers.parseFormData([null] as unknown as Iterable<[string, string]>);
+			}).toThrow(TypeError);
+		});
 	});
 
 	describe('parseQueryString', function () {

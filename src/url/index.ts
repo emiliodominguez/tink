@@ -258,7 +258,7 @@ export function parseQueryString(query: string): ParsedQuery {
  * @template V - The value type (`FormDataEntryValue` for a `FormData`)
  * @param {Iterable<readonly [string, V]>} entries - The form entries
  * @returns {Record<string, V | V[]>} The fields
- * @throws {TypeError} when `entries` is not iterable
+ * @throws {TypeError} when `entries` is not iterable, or an entry is not a `[key, value]` pair
  * @example
  * const data = new FormData();
  * data.append('name', 'Ada');
@@ -277,7 +277,13 @@ export function parseFormData<V>(entries: Iterable<readonly [string, V]>): Recor
 	// The keys whose value is an array this function made: a value that is itself an array is never pushed into.
 	const collected = new Set<string>();
 
-	for (const [name, value] of entries) {
+	for (const entry of entries) {
+		// Like `Object.fromEntries`: an entry must be an object (`'ab'` would otherwise give `{ a: 'b' }`).
+		if (typeof entry !== 'object' || entry === null) {
+			throw new TypeError(`parseFormData: every entry must be a [key, value] pair, got ${describe(entry)}`);
+		}
+
+		const [name, value] = entry;
 		const rawKey = String(name);
 		const key = withoutBrackets(rawKey);
 
