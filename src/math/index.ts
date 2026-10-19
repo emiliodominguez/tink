@@ -185,8 +185,8 @@ const POWERS_OF_TEN: ReadonlyArray<number> = [1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1
  */
 export function average(numbers: ReadonlyArray<number>): number {
 	const total = sum(numbers);
-	if (total !== Infinity && total !== -Infinity) return total / numbers.length;
-	// The sum overflowed (or an element is infinite): the sum of the terms divided by the count cannot overflow when the mean is finite.
+	if (Number.isFinite(total)) return total / numbers.length;
+	// The sum overflowed (or an element is infinite, or overflowing terms met an infinite one as `Infinity - Infinity`): the sum of the terms divided by the count cannot overflow when the mean is finite.
 	const count = numbers.length;
 	return sum(
 		numbers.map(function (value) {
@@ -1094,8 +1094,8 @@ export function weightedAverage(values: ReadonlyArray<number>, weights: Readonly
 	});
 	const totalWeight = sum(scaledWeights);
 	const total = sum(products);
-	if (total !== Infinity && total !== -Infinity) return total / totalWeight;
-	// The sum of the products overflowed (or a value is infinite): dividing each product by the total weight first cannot overflow
+	if (Number.isFinite(total)) return total / totalWeight;
+	// The sum of the products overflowed (or a value is infinite, possibly meeting an overflow as `Infinity - Infinity`): dividing each product by the total weight first cannot overflow
 	// when the mean is finite.
 	return sum(
 		products.map(function (weighted) {

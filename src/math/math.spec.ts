@@ -921,6 +921,12 @@ describe('Math helpers', function () {
 			expect(helpers.weightedAverage([Infinity, 1], [1, 1])).toBe(Infinity);
 		});
 
+		it('average and weightedAverage keep an infinite element when the other terms overflow', function () {
+			expect(helpers.average([1e308, 1e308, -Infinity])).toBe(-Infinity);
+			expect(helpers.weightedAverage([1e308, 1e308, -Infinity], [1, 1, 1])).toBe(-Infinity);
+			expect(helpers.average([1e308, 1e308, NaN])).toBeNaN();
+		});
+
 		it('formatBytes rounds SI values as written in every unit, YB included', function () {
 			expect(helpers.formatBytes(305.035e24, { decimals: 2 })).toBe('305.04 YB');
 			expect(helpers.formatBytes(305.035e21, { decimals: 2 })).toBe('305.04 ZB');
