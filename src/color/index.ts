@@ -146,8 +146,11 @@ function toByte(value: number): number {
 	return value > 0 ? Math.round(value) : 0;
 }
 
-/** Cache of {@link linearChannel} results, indexed by channel value (filled on first use, at most 256 entries). */
-const LINEAR_CHANNELS: number[] = [];
+/**
+ * Cache of {@link linearChannel} results, by channel value (filled on first use, at most 256 entries). A `Map`, not an array: a missing
+ * array index would be looked up on a (possibly polluted) `Array.prototype`.
+ */
+const LINEAR_CHANNELS = new Map<number, number>();
 
 /**
  * Converts one 8-bit sRGB channel to linear light, as defined by WCAG 2.x.
@@ -157,11 +160,11 @@ const LINEAR_CHANNELS: number[] = [];
  * linearChannel(255); // => 1
  */
 function linearChannel(value: number): number {
-	let linear = LINEAR_CHANNELS[value];
+	let linear = LINEAR_CHANNELS.get(value);
 	if (linear === undefined) {
 		const unit = value / 255;
 		linear = unit <= 0.04045 ? unit / 12.92 : Math.pow((unit + 0.055) / 1.055, 2.4);
-		LINEAR_CHANNELS[value] = linear;
+		LINEAR_CHANNELS.set(value, linear);
 	}
 	return linear;
 }
@@ -275,7 +278,8 @@ function parseCssFunction(text: string): Rgba | undefined {
 	}
 
 	// The hue is a number or an angle. Legacy syntax requires percentages for saturation and lightness; the modern one also accepts plain numbers.
-	const perTurn = UNITS_PER_TURN[units[0]];
+	// Own units only: an unknown unit (`%` on a hue) must not be found on a polluted `Object.prototype`.
+	const perTurn = Object.hasOwn(UNITS_PER_TURN, units[0]) ? UNITS_PER_TURN[units[0]] : undefined;
 	if (perTurn === undefined || (units[1] !== '%' && (legacy || units[1] !== '')) || (units[2] !== '%' && (legacy || units[2] !== ''))) return undefined;
 	// Reduce the hue in its own unit first, so huge values cannot overflow when converted to degrees.
 	return hslValuesToRgb((modulo(values[0], perTurn) * 360) / perTurn, values[1], values[2], { r: 0, g: 0, b: 0, a });

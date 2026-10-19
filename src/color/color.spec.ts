@@ -717,3 +717,23 @@ describe('Color helpers', function () {
 		});
 	});
 });
+
+describe('Color helpers under prototype pollution', function () {
+	it('ignores inherited array indexes and object keys in their lookup tables', function () {
+		const indexes = Array.prototype as unknown as Record<number, unknown>;
+		const keys = Object.prototype as Record<string, unknown>;
+		indexes[0] = 'x';
+		indexes[255] = 0.5;
+		keys['%'] = 360;
+		try {
+			expect(helpers.contrastRatio('#000', '#fff')).toBe(21);
+			expect(function () {
+				helpers.parseColor('hsl(50% 100% 50%)');
+			}).toThrow(TypeError);
+		} finally {
+			delete indexes[0];
+			delete indexes[255];
+			delete keys['%'];
+		}
+	});
+});
