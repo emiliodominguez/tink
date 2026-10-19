@@ -172,9 +172,12 @@ function fromState(seedState: SeededRandomState): SeededRandom {
 		return low + below(high - low + 1);
 	};
 	rng.float = function float(min: number, max: number): number {
+		assertNumber('SeededRandom.float', 'min', min, Number.isFinite(min), 'a finite number');
+		assertNumber('SeededRandom.float', 'max', max, Number.isFinite(max), 'a finite number');
 		return randomBetween(min, max, generator);
 	};
 	rng.bool = function bool(probability: number = 0.5): boolean {
+		assertNumber('SeededRandom.bool', 'probability', probability, probability >= 0 && probability <= 1, 'a number in [0, 1]');
 		return randomBoolean(probability, generator);
 	};
 	rng.pick = function pick<T>(array: ReadonlyArray<T>): T | undefined {
@@ -191,19 +194,22 @@ function fromState(seedState: SeededRandomState): SeededRandom {
 		return Object.freeze([a >>> 0, b >>> 0, c >>> 0, d >>> 0] as const);
 	};
 	rng.restore = function restore(snapshot: SeededRandomState): void {
-		// An index loop (not `every`, which skips holes) so sparse arrays are rejected too.
+		// An index loop (not `every`, which skips holes) so sparse arrays are rejected too. Each word is read once: what is validated is
+		// what is installed, and a getter that throws leaves the state unchanged.
+		const words: number[] = [];
 		let valid = Array.isArray(snapshot) && snapshot.length === 4;
 		for (let i = 0; valid && i < 4; i++) {
 			const word: unknown = snapshot[i];
 			valid = Number.isInteger(word) && (word as number) >= 0 && (word as number) < UINT32_RANGE;
+			words.push(word as number);
 		}
 		if (!valid) {
 			throw new TypeError('SeededRandom.restore: `snapshot` must be an array of four unsigned 32-bit integers');
 		}
-		a = snapshot[0] | 0;
-		b = snapshot[1] | 0;
-		c = snapshot[2] | 0;
-		d = snapshot[3] | 0;
+		a = words[0] | 0;
+		b = words[1] | 0;
+		c = words[2] | 0;
+		d = words[3] | 0;
 	};
 	return Object.freeze(rng);
 }
@@ -277,9 +283,13 @@ export function randomBytes(length: number): Uint8Array {
  * fillRandom(globalThis.crypto, new Uint8Array(4)); // e.g. Uint8Array(4) [ 12, 250, 3, 97 ]
  */
 function fillRandom(crypto: CryptoLike, bytes: Uint8Array): Uint8Array {
-	for (let offset = 0; offset < bytes.length; offset += MAX_RANDOM_VALUES_BYTES) {
+	const length = bytes.length;
+
+	for (let offset = 0; offset < length; offset += MAX_RANDOM_VALUES_BYTES) {
 		crypto.getRandomValues(bytes.subarray(offset, offset + MAX_RANDOM_VALUES_BYTES));
 	}
+	// A source that detached (transferred) the buffer left it empty: nothing random would be returned, or a loop would never fill.
+	if (bytes.length !== length) throw new Error('crypto.getRandomValues detached the buffer it was asked to fill');
 	return bytes;
 }
 
@@ -298,8 +308,7 @@ export function randomUUID(): string {
 	if (candidate != null && typeof candidate.randomUUID === 'function') return candidate.randomUUID();
 
 	// Use our own buffer rather than the return value, which some `getRandomValues` polyfills leave undefined.
-	const bytes = new Uint8Array(16);
-	getCrypto('randomUUID').getRandomValues(bytes);
+	const bytes = fillRandom(getCrypto('randomUUID'), new Uint8Array(16));
 	bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
 	bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 10xx
 	let hex = '';
@@ -360,10 +369,9 @@ export function randomId(size: number = 21, alphabet: string = URL_ALPHABET): st
 const SECURE_WORDS = 256;
 
 /**
- * Random words drawn ahead of time by {@link secureRandom} from `secureSource` (allocated on first use), as bytes for
- * `getRandomValues` and as 32-bit words; `secureWords[secureOffset]` is the next unused word.
+ * Random words drawn ahead of time by {@link secureRandom} from `secureSource` (a new buffer for every refill), as 32-bit words;
+ * `secureWords[secureOffset]` is the next unused word.
  */
-let secureBytes: Uint8Array | undefined;
 let secureWords: Uint32Array;
 let secureOffset = SECURE_WORDS;
 let secureSource: CryptoLike | undefined;
@@ -389,11 +397,11 @@ let secureSource: CryptoLike | undefined;
 export function secureRandom(): number {
 	const crypto = getCrypto('secureRandom');
 	if (secureOffset === SECURE_WORDS || crypto !== secureSource) {
-		if (secureBytes === undefined) {
-			secureBytes = new Uint8Array(SECURE_WORDS * 4);
-			secureWords = new Uint32Array(secureBytes.buffer);
-		}
-		crypto.getRandomValues(secureBytes);
+		// A new buffer, committed only once filled: a source that throws part-way (or detaches the buffer) must leave no bytes it wrote,
+		// nor words already returned, to be served afterwards.
+		const bytes = fillRandom(crypto, new Uint8Array(SECURE_WORDS * 4));
+
+		secureWords = new Uint32Array(bytes.buffer);
 		secureSource = crypto;
 		secureOffset = 0;
 	}
@@ -450,7 +458,7 @@ function generateId(count: number, characters: string[], crypto: CryptoLike): st
 		const bytes = new Uint8Array(Math.min(Math.ceil((1.6 * mask * count) / length), MAX_RANDOM_VALUES_BYTES));
 		let accepted = 0;
 		while (accepted < count) {
-			crypto.getRandomValues(bytes);
+			fillRandom(crypto, bytes);
 			for (let i = 0; i < bytes.length && accepted < count; i++) {
 				const index = bytes[i] & mask;
 				if (index < length) indexes[accepted++] = index;
@@ -538,8 +546,11 @@ export function weightedRandom<T>(items: ReadonlyArray<T>, weights: ReadonlyArra
 	let largest = 0;
 	// Index of the last positive weight: there is one once the total weight is known to be positive.
 	let lastPositive = 0;
+	// Each weight is read once: the selection uses the validated values (a getter cannot turn a zero weight into a chosen one).
+	const values: number[] = [];
 	for (let i = 0; i < weights.length; i++) {
 		const weight = weights[i];
+		values.push(weight);
 		if (!(typeof weight === 'number' && weight >= 0 && weight < Infinity)) assertNumber('weightedRandom', `weights[${i}]`, weight, false, 'a finite number >= 0');
 		total += weight;
 		if (weight > largest) largest = weight;
@@ -555,7 +566,7 @@ export function weightedRandom<T>(items: ReadonlyArray<T>, weights: ReadonlyArra
 	// A zero-weight item can never satisfy `target < cumulative` before an earlier positive item did, so it is never chosen.
 	// The last positive item takes whatever remains, which also absorbs floating-point rounding at the top end.
 	for (let i = 0; i < lastPositive; i++) {
-		cumulative += weights[i] / largest;
+		cumulative += values[i] / largest;
 		if (target < cumulative) return items[i];
 	}
 	return items[lastPositive];

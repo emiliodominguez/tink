@@ -898,3 +898,84 @@ describe('random', function () {
 		});
 	});
 });
+
+describe('Random helpers (hostile sources)', function () {
+	const realCrypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto') as PropertyDescriptor;
+
+	function useCrypto(crypto: unknown): void {
+		Object.defineProperty(globalThis, 'crypto', { value: crypto, configurable: true, writable: true });
+	}
+
+	afterEach(function () {
+		Object.defineProperty(globalThis, 'crypto', realCrypto);
+	});
+
+	it('serves no byte of a refill that failed, nor zeros after a source detached the buffer', function () {
+		helpers.secureRandom();
+		useCrypto({
+			getRandomValues(array: Uint8Array): never {
+				array.fill(0);
+				throw new Error('quota');
+			}
+		});
+		expect(function () {
+			helpers.secureRandom();
+		}).toThrow('quota');
+		Object.defineProperty(globalThis, 'crypto', realCrypto);
+		const values = Array.from({ length: 5 }, helpers.secureRandom);
+		expect(
+			values.filter(function (value) {
+				return value === 0;
+			}).length
+		).toBeLessThan(5);
+
+		useCrypto({
+			getRandomValues(array: Uint8Array): Uint8Array {
+				(array.buffer as ArrayBuffer & { transfer(): ArrayBuffer }).transfer();
+				return array;
+			}
+		});
+		expect(helpers.secureRandom).toThrow(/detached/);
+		expect(function () {
+			helpers.randomBytes(10);
+		}).toThrow(/detached/);
+		expect(function () {
+			helpers.randomId(10, 'abc');
+		}).toThrow(/detached/);
+		Object.defineProperty(globalThis, 'crypto', realCrypto);
+		expect(new Set(Array.from({ length: 50 }, helpers.secureRandom)).size).toBeGreaterThan(40);
+	});
+
+	it('restore and weightedRandom read their inputs once', function () {
+		const rng = helpers.createRandom('seed');
+		const before = rng.state();
+		let reads = 0;
+		const flipping = [1, 2, 3, 4];
+		Object.defineProperty(flipping, 0, {
+			get(): unknown {
+				return reads++ === 0 ? 7 : 'zzz';
+			}
+		});
+		rng.restore(flipping as unknown as typeof before);
+		expect(rng.state()).toEqual([7, 2, 3, 4]);
+
+		let weightReads = 0;
+		const weights = [0, 1];
+		Object.defineProperty(weights, 0, {
+			get(): number {
+				return weightReads++ === 0 ? 0 : 5;
+			}
+		});
+		expect(helpers.weightedRandom(['zero', 'one'], weights, constant(0.1))).toBe('one');
+	});
+
+	it('names the seeded methods in their errors', function () {
+		const rng = helpers.createRandom(1);
+		expect(function () {
+			rng.float(NaN, 1);
+		}).toThrow(new RangeError('SeededRandom.float: `min` must be a finite number, got NaN'));
+		expect(function () {
+			rng.bool(2);
+		}).toThrow(new RangeError('SeededRandom.bool: `probability` must be a number in [0, 1], got 2'));
+	});
+});
