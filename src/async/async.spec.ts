@@ -2707,3 +2707,154 @@ describe('Async helpers (round 11)', function () {
 		});
 	});
 });
+
+describe('Async helpers (hostile signals)', function () {
+	/**
+	 * A signal-like object whose methods can be made to throw.
+	 */
+	function hostile(overrides: Partial<Record<'addEventListener' | 'removeEventListener', () => void>> & { reason?: () => unknown } = {}): AbortSignalLike & {
+		fire(): void;
+		listeners: Array<() => void>;
+	} {
+		const listeners: Array<() => void> = [];
+		const signal = {
+			aborted: false,
+			listeners,
+			addEventListener:
+				overrides.addEventListener ??
+				function (_type: string, listener: () => void) {
+					listeners.push(listener);
+				},
+			removeEventListener:
+				overrides.removeEventListener ??
+				function (_type: string, listener: () => void) {
+					listeners.splice(listeners.indexOf(listener), 1);
+				},
+			fire(): void {
+				signal.aborted = true;
+				for (const listener of listeners.slice()) listener();
+			}
+		};
+		if (overrides.reason !== undefined) Object.defineProperty(signal, 'reason', { get: overrides.reason });
+		return signal as unknown as AbortSignalLike & { fire(): void; listeners: Array<() => void> };
+	}
+
+	function boom(): never {
+		throw new Error('boom');
+	}
+
+	it('settles even when removeEventListener throws', async function () {
+		const signal = hostile({ removeEventListener: boom });
+		await expect(sleep(1, { signal })).resolves.toBeUndefined();
+		await expect(abortable(Promise.resolve(1), signal)).resolves.toBe(1);
+		await expect(mapWithConcurrency([1, 2], identity, { signal })).resolves.toEqual([1, 2]);
+		await expect(pollUntil(constant(1), { signal })).resolves.toBe(1);
+	});
+
+	it('rejects with the error of a throwing reason getter', async function () {
+		const signal = hostile({ reason: boom });
+		const sleeping = sleep(1000, { signal });
+		const queue = createQueue({ concurrency: 1 });
+		const blocker = createDeferred<void>();
+		void queue.add(function () {
+			return blocker.promise;
+		});
+		const waiting = queue.add(constant(1), { signal });
+		const mapped = mapWithConcurrency(
+			[1, 2, 3],
+			function () {
+				return new Promise(function () {});
+			},
+			{ concurrency: 1, signal }
+		);
+		signal.fire();
+		await expect(sleeping).rejects.toThrow('boom');
+		await expect(waiting).rejects.toThrow('boom');
+		await expect(mapped).rejects.toThrow('boom');
+		blocker.resolve();
+	});
+
+	it('leaves no timer behind when addEventListener throws', async function () {
+		const signal = hostile({ addEventListener: boom });
+		const before = process.getActiveResourcesInfo().filter(isTimeout).length;
+		await expect(sleep(5000, { signal })).rejects.toThrow('boom');
+		await expect(pollUntil(constant(true), { timeout: 5000, signal })).rejects.toThrow('boom');
+		expect(process.getActiveResourcesInfo().filter(isTimeout).length).toBe(before);
+	});
+
+	it('does not run a queued task whose add rejected, and keeps going when signals cannot be combined', async function () {
+		const queue = createQueue({ concurrency: 1, signal: new AbortController().signal });
+		const blocker = createDeferred<void>();
+		void queue.add(function () {
+			return blocker.promise;
+		});
+		const ran: string[] = [];
+		const rejected = queue.add(
+			function () {
+				ran.push('rejected');
+			},
+			{ signal: hostile({ addEventListener: boom }) }
+		);
+		await expect(rejected).rejects.toThrow('boom');
+		let calls = 0;
+		const failing = queue.add(
+			function () {
+				ran.push('uncombined');
+			},
+			{
+				signal: hostile({
+					addEventListener: function () {
+						if (++calls === 2) boom();
+					}
+				})
+			}
+		);
+		const later = queue.add(function () {
+			ran.push('later');
+		});
+		blocker.resolve();
+		await expect(failing).rejects.toThrow('boom');
+		await later;
+		expect(ran).toEqual(['later']);
+	});
+
+	it('detaches the listeners already added when combining signals fails', function () {
+		const first = hostile();
+		expect(function () {
+			anySignal([first, hostile({ addEventListener: boom })]);
+		}).toThrow('boom');
+		expect(first.listeners).toHaveLength(0);
+	});
+
+	it('rejects (never throws) for options whose reading throws, and validates in the same order as its siblings', async function () {
+		const options = Object.defineProperty({}, 'concurrency', { get: boom });
+		const result = mapWithConcurrency([1], identity, options);
+		await expect(result).rejects.toThrow('boom');
+		await expect(mapSettledWithConcurrency([], 'nope' as any, 0)).rejects.toBeInstanceOf(RangeError);
+	});
+
+	it('memoizeAsync resolves without an unhandled rejection when the cache cannot store', async function () {
+		const cache = { get: constant(undefined), has: constant(false), set: boom, delete: constant(true), clear: function () {} };
+		const memo = memoizeAsync(
+			async function (n: number) {
+				return n * 2;
+			},
+			{ cache: cache as any }
+		);
+		await expect(memo(2)).resolves.toBe(4);
+	});
+
+	function identity(value: number): number {
+		return value;
+	}
+
+	function constant<T>(value: T): () => T {
+		return function () {
+			return value;
+		};
+	}
+
+	function isTimeout(resource: string): boolean {
+		return resource === 'Timeout';
+	}
+});

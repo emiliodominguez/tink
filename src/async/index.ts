@@ -93,7 +93,27 @@ export interface RetryOptions {
  * @returns {unknown} The rejection reason
  */
 function abortReason(signal: AbortSignalLike): unknown {
-	return signal.reason ?? new AbortError();
+	try {
+		return signal.reason ?? new AbortError();
+	} catch (error) {
+		// A signal whose `reason` getter throws still aborts: with that error.
+		return error;
+	}
+}
+
+/**
+ * Removes an abort listener once the operation it watched has settled. A signal whose `removeEventListener` throws keeps the listener,
+ * which is then harmless (settling twice does nothing): the error must not stop the settling, or escape from a timer callback.
+ * @param {AbortSignalLike | null | undefined} signal - The signal
+ * @param {() => void} listener - The listener
+ * @returns {void}
+ */
+function detach(signal: AbortSignalLike | null | undefined, listener: () => void): void {
+	try {
+		signal?.removeEventListener('abort', listener);
+	} catch {
+		// See above.
+	}
 }
 
 /**
@@ -168,12 +188,13 @@ export function sleep(ms: number, options: SleepOptions = {}): Promise<void> {
 			reject(abortReason(signal as AbortSignalLike));
 		}
 
-		const timer = setTimeout(function () {
-			signal?.removeEventListener('abort', onAbort);
-			resolve();
-		}, ms);
-
+		// The listener first: when adding it throws, no timer is left behind.
 		signal?.addEventListener('abort', onAbort, { once: true });
+
+		const timer = setTimeout(function () {
+			resolve();
+			detach(signal, onAbort);
+		}, ms);
 	});
 }
 
@@ -321,11 +342,14 @@ function runConcurrently(
 	callback: ConcurrentCallback<unknown, unknown>,
 	options: number | ConcurrencyOptions | undefined
 ): Promise<unknown[]> {
-	const { concurrency = Infinity, signal, stopOnError = true } = typeof options === 'object' && options !== null ? options : { concurrency: options };
+	let concurrency: number;
+	let signal: AbortSignalLike | null | undefined;
+	let stopOnError: boolean;
 	let list: unknown[];
 
-	// Argument errors, an aborted signal and (on the fast path) synchronous throws become rejections.
+	// Argument errors (also from reading the options), an aborted signal and (on the fast path) synchronous throws become rejections.
 	try {
+		({ concurrency = Infinity, signal, stopOnError = true } = typeof options === 'object' && options !== null ? options : { concurrency: options });
 		assertInteger(caller, 'concurrency', concurrency, 1, true);
 		assertFunction(caller, name, callback);
 		assertOptionalSignal(caller, 'signal', signal);
@@ -373,8 +397,8 @@ function runConcurrently(
 		function finish(settle: (value: never) => void, value: unknown): void {
 			if (done) return;
 			done = true;
-			signal?.removeEventListener('abort', onAbort);
 			settle(value as never);
+			detach(signal, onAbort);
 		}
 
 		/**
@@ -523,15 +547,16 @@ export async function mapSettledWithConcurrency<T, R, S extends AbortSignalLike 
 	mapper: ConcurrentCallback<T, R, S>,
 	options?: number | ConcurrencyOptions<S>
 ): Promise<Array<PromiseSettledResult<Awaited<R>>>> {
-	assertFunction('mapSettledWithConcurrency', 'mapper', mapper);
-
 	return runConcurrently(
 		'mapSettledWithConcurrency',
 		'mapper',
 		items,
-		function (item, index, signal) {
-			return invoke(mapper, undefined, [item, index, signal]).then(fulfilled, rejected);
-		},
+		// An invalid mapper is passed on as is, so that the arguments are validated in the same order as by the sibling helpers.
+		typeof mapper === 'function'
+			? function (item, index, signal) {
+					return invoke(mapper, undefined, [item, index, signal]).then(fulfilled, rejected);
+				}
+			: (mapper as ConcurrentCallback<unknown, unknown>),
 		options
 	) as Promise<Array<PromiseSettledResult<Awaited<R>>>>;
 }
@@ -967,8 +992,8 @@ export function createQueue<S extends AbortSignalLike = never>(options: QueueOpt
 	 */
 	function drop(reason: unknown): void {
 		for (let task = waiting.pop(); task !== undefined; task = waiting.pop()) {
-			task.signal?.removeEventListener('abort', task.onAbort);
 			task.reject(reason);
+			detach(task.signal, task.onAbort);
 		}
 		notify();
 	}
@@ -1000,10 +1025,19 @@ export function createQueue<S extends AbortSignalLike = never>(options: QueueOpt
 				 * @returns {void}
 				 */
 				function run(): void {
-					signal?.removeEventListener('abort', onAbort);
+					detach(signal, onAbort);
 
-					// The task sees both signals; the combined one is detached from them once the task settles.
-					const [taskSignal, release] = signal && queueSignal ? combineSignals('createQueue', [signal, queueSignal]) : [signal ?? queueSignal ?? undefined, noop];
+					let taskSignal: AbortSignalLike | undefined;
+					let release: () => void;
+
+					// The task sees both signals; the combined one is detached from them once the task settles. When they cannot be combined
+					// (a signal whose `addEventListener` throws), that task fails and the queue goes on.
+					try {
+						[taskSignal, release] = signal && queueSignal ? combineSignals('createQueue', [signal, queueSignal]) : [signal ?? queueSignal ?? undefined, noop];
+					} catch (error) {
+						reject(error);
+						return;
+					}
 					running++;
 					(invoke(task, undefined, [taskSignal]) as Promise<T>).then(resolve, reject).then(function () {
 						release();
@@ -1027,8 +1061,9 @@ export function createQueue<S extends AbortSignalLike = never>(options: QueueOpt
 				if (!paused && running < concurrency && waiting.size === 0) {
 					run();
 				} else {
-					waiting.push(entry);
+					// The listener first: when adding it throws, the task is not queued (its promise rejects).
 					signal?.addEventListener('abort', onAbort, { once: true });
+					waiting.push(entry);
 				}
 			});
 		},
@@ -1348,12 +1383,7 @@ export function pollUntil<T>(check: () => T | PromiseLike<T>, options: PollOptio
 
 		let settled = false;
 		let pollTimer: ReturnType<typeof setTimeout> | undefined;
-		const deadlineTimer =
-			timeout === Infinity
-				? undefined
-				: setTimeout(function () {
-						finish(reject, new TimeoutError(`pollUntil: condition not met within ${timeout} ms`));
-					}, timeout);
+		let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 
 		/**
 		 * Settles the promise once and releases timers and the abort listener.
@@ -1366,8 +1396,8 @@ export function pollUntil<T>(check: () => T | PromiseLike<T>, options: PollOptio
 			settled = true;
 			clearTimeout(pollTimer);
 			clearTimeout(deadlineTimer);
-			signal?.removeEventListener('abort', onAbort);
 			settle(value as never);
+			detach(signal, onAbort);
 		}
 
 		/**
@@ -1400,8 +1430,13 @@ export function pollUntil<T>(check: () => T | PromiseLike<T>, options: PollOptio
 			);
 		}
 
-		// `finish` removes it, so it never runs twice.
+		// `finish` removes it, so it never runs twice. Added before the deadline timer: when adding it throws, no timer is left behind.
 		signal?.addEventListener('abort', onAbort);
+		if (timeout !== Infinity) {
+			deadlineTimer = setTimeout(function () {
+				finish(reject, new TimeoutError(`pollUntil: condition not met within ${timeout} ms`));
+			}, timeout);
+		}
 		poll();
 	});
 }
@@ -1677,7 +1712,11 @@ export function memoizeAsync<F extends AnyFunction>(fn: F, options: MemoizeAsync
 				function (value) {
 					if (inflight.get(id) !== started) return;
 					inflight.delete(id);
-					(cache.set as (key: unknown, value: unknown, options?: { ttl: number }) => unknown)(id, value, setOptions);
+					try {
+						(cache.set as (key: unknown, value: unknown, options?: { ttl: number }) => unknown)(id, value, setOptions);
+					} catch {
+						// The callers already have the value: a cache that cannot store it only makes the next call compute it again.
+					}
 				},
 				function () {
 					if (inflight.get(id) === started) inflight.delete(id);
@@ -1895,16 +1934,22 @@ function combineSignals(caller: string, inputs: AbortSignalLike[]): [AbortSignal
 	 */
 	function release(): void {
 		inputs.forEach(function (input, i) {
-			input.removeEventListener('abort', listeners[i]);
+			detach(input, listeners[i]);
 		});
 	}
 
 	if (aborted !== undefined) {
 		controller.abort(abortReason(aborted));
 	} else {
-		inputs.forEach(function (input, i) {
-			input.addEventListener('abort', listeners[i]);
-		});
+		try {
+			inputs.forEach(function (input, i) {
+				input.addEventListener('abort', listeners[i]);
+			});
+		} catch (error) {
+			// The listeners already added would keep the combined signal (and what it is attached to) alive.
+			release();
+			throw error;
+		}
 	}
 
 	return [controller.signal, release];
@@ -1954,12 +1999,12 @@ export function abortable<T>(promise: PromiseLike<T> | T, signal: AbortSignalLik
 
 		settled.then(
 			function (value) {
-				signal?.removeEventListener('abort', onAbort);
 				resolve(value);
+				detach(signal, onAbort);
 			},
 			function (error: unknown) {
-				signal?.removeEventListener('abort', onAbort);
 				reject(error);
+				detach(signal, onAbort);
 			}
 		);
 
