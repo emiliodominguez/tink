@@ -2,6 +2,16 @@ import * as helpers from '.';
 
 describe('Search helpers', function () {
 	describe('fuzzyMatch', function () {
+		it('treats combining marks as part of the word, so the next letter is not a word start', function () {
+			// NFD 'résumé': the 's' follows a combining acute accent, like the 's' after 'é' in NFC.
+			const decomposed = helpers.fuzzyMatch('s', 're\u0301sume\u0301')?.score as number;
+			const composed = helpers.fuzzyMatch('s', 'résumé')?.score as number;
+			// One less: the leading-gap penalty counts the extra code point of the decomposed 'é'.
+			expect(decomposed).toBe(composed - 1);
+			// Devanagari vowel signs are always marks: 'न' is inside the word 'हिन्दी'.
+			expect(helpers.fuzzyMatch('न', 'हिन्दी')?.score).toBe(helpers.fuzzyMatch('न', 'हकन')?.score);
+		});
+
 		it('scans the target at most once per needle character when rejecting an ASCII query', function () {
 			const indexOf = jest.spyOn(String.prototype, 'indexOf');
 			try {
@@ -175,6 +185,11 @@ describe('Search helpers', function () {
 	});
 
 	describe('fuzzySearch', function () {
+		it('reads caseSensitive like fuzzyMatch: only true is case-sensitive', function () {
+			expect(helpers.fuzzySearch(['a'], 'A', { caseSensitive: 'false' as unknown as boolean })).toHaveLength(1);
+			expect(helpers.fuzzySearch(['a'], 'A', { caseSensitive: true })).toHaveLength(0);
+		});
+
 		it('rejects array items without `key`, like any other non-string item', function () {
 			expect(function () {
 				helpers.fuzzySearch([['abc', 'xyz']] as never, 'a');

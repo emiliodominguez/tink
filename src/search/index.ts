@@ -14,8 +14,8 @@ const GAP_START = -3;
 const GAP_EXTENSION = -1;
 /** Largest penalty (one point per character) for the characters skipped before the first match. */
 const MAX_LEADING_PENALTY = 8;
-/** A letter or a digit, in any script. */
-const WORD = /[\p{L}\p{N}]/u;
+/** A letter, a combining mark (part of the letter before it: NFD accents, Indic vowel signs) or a digit, in any script. */
+const WORD = /[\p{L}\p{M}\p{N}]/u;
 
 /**
  * Options accepted by {@link fuzzyMatch}.
@@ -132,6 +132,8 @@ interface Workspace {
 	raw: Int32Array;
 	/** UTF-16 offset of every code point, plus the target length at the end. */
 	offsets: Int32Array;
+	/** Word-start bonus of every target position (see `bonus`), computed once per position rather than per cell. */
+	bonuses: Int8Array;
 	/** Two dynamic-programming rows. */
 	rows: [Float64Array, Float64Array];
 	/** Back pointers: position of the previous matched character, for every matched (query, target) pair. */
@@ -152,6 +154,7 @@ function allocate(length: number, cells: number): Workspace {
 		codes: new Int32Array(length),
 		raw: new Int32Array(length),
 		offsets: new Int32Array(length + 1),
+		bonuses: new Int8Array(length),
 		rows: [new Float64Array(length), new Float64Array(length)],
 		back: new Int32Array(cells)
 	};
@@ -184,8 +187,8 @@ function classify(code: number): number {
 }
 
 /**
- * Word-start bonus of a target position (computed only where a query character matches): the first character, a letter or digit
- * after any other character, or a camelCase hump.
+ * Word-start bonus of a target position: the first character, a letter or digit after any other character (a combining mark belongs
+ * to the letter before it), or a camelCase hump.
  * @param {Int32Array} raw - Code points of the target
  * @param {number} j - The position
  * @returns {number} `BOUNDARY` or `0`
@@ -277,7 +280,7 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean, cal
 	// The linear buffers first: the O(m·n) back-pointer matrix is only allocated once the subsequence check below has passed.
 	const small = length <= SHARED_LENGTH;
 	const workspace = small ? (shared ??= allocate(SHARED_LENGTH, SHARED_CELLS)) : allocate(length, 0);
-	const { codes, raw, offsets, rows } = workspace;
+	const { codes, raw, offsets, bonuses, rows } = workspace;
 	let n = 0;
 	// Greedy subsequence check (the alignment only exists if it passes), unless `contains` already did it.
 	let matched = query.needles === undefined ? 0 : m;
@@ -296,9 +299,10 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean, cal
 	// An explicit cap: past a few GiB, V8 aborts the process instead of throwing when allocating the matrix.
 	if (cells > MAX_CELLS) throw new RangeError(`${caller}: the query and text are too long to align (${m} × ${n} code points, more than ${MAX_CELLS} cells)`);
 	const back = small && cells <= SHARED_CELLS ? workspace.back : new Int32Array(cells);
+	for (let j = 0; j < n; j++) bonuses[j] = bonus(raw, j);
 
 	let [row, previousRow] = rows;
-	for (let j = 0; j < n; j++) row[j] = codes[j] === q[0] ? MATCH + bonus(raw, j) + (raw[j] === query.raw[0] ? EXACT_CASE : 0) - Math.min(j, MAX_LEADING_PENALTY) : -Infinity;
+	for (let j = 0; j < n; j++) row[j] = codes[j] === q[0] ? MATCH + bonuses[j] + (raw[j] === query.raw[0] ? EXACT_CASE : 0) - Math.min(j, MAX_LEADING_PENALTY) : -Infinity;
 	for (let i = 1; i < m; i++) {
 		const swap = previousRow;
 		previousRow = row;
@@ -312,7 +316,7 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean, cal
 			if (codes[j] === code) {
 				const consecutive = previousRow[j - 1] + CONSECUTIVE;
 				const isConsecutive = consecutive >= gap;
-				row[j] = (isConsecutive ? consecutive : gap) + MATCH + bonus(raw, j) + (raw[j] === exact ? EXACT_CASE : 0);
+				row[j] = (isConsecutive ? consecutive : gap) + MATCH + bonuses[j] + (raw[j] === exact ? EXACT_CASE : 0);
 				back[i * n + j] = isConsecutive ? j - 1 : gapFrom;
 			} else row[j] = -Infinity;
 			// Extend the gap for position j + 1, or open one after position j - 1.
@@ -399,8 +403,8 @@ export function fuzzyMatch(query: string, target: string, options: FuzzyMatchOpt
 
 /**
  * Fuzzy-filters and ranks `items` by how well they match `query` (see {@link fuzzyMatch} for the matching and scoring rules).
- * Results are sorted by descending score; ties keep the original order of `items`. An empty query matches every item with score `0`,
- * so the full list (up to `limit`) is returned in its original order.
+ * Results are sorted by descending score; ties keep the original order of `items`. An empty query matches every text with score `0`,
+ * so the full list (up to `limit`) is returned in its original order, except items for which `key` returns no text (an empty array).
  *
  * Cost: up to O(query length × text length) time and memory per searched text (see {@link fuzzyMatch}); cap the length of
  * untrusted queries.
@@ -423,7 +427,8 @@ export function fuzzyMatch(query: string, target: string, options: FuzzyMatchOpt
 export function fuzzySearch<T extends string>(items: Iterable<T>, query: string, options?: FuzzySearchOptions<T>): Array<FuzzySearchResult<T>>;
 export function fuzzySearch<T>(items: Iterable<T>, query: string, options: FuzzySearchOptions<T> & Required<Pick<FuzzySearchOptions<T>, 'key'>>): Array<FuzzySearchResult<T>>;
 export function fuzzySearch<T>(items: Iterable<T>, query: string, options: FuzzySearchOptions<T> = {}): Array<FuzzySearchResult<T>> {
-	const { key, limit = Infinity, threshold = -Infinity, caseSensitive = false } = options;
+	const { key, limit = Infinity, threshold = -Infinity } = options;
+	const caseSensitive = options.caseSensitive === true;
 	assertString('fuzzySearch', 'query', query);
 	if (key !== undefined) assertFunction('fuzzySearch', 'key', key);
 	assertInteger('fuzzySearch', 'limit', limit, 0, true);
