@@ -22,7 +22,8 @@ export interface LRUCacheOptions<K, V> {
 	ttl?: number;
 	/**
 	 * Clock used for expiry, in milliseconds. Defaults to `Date.now`. Inject a fake clock for deterministic tests. Expiry instants are
-	 * absolute (`setTime + ttl`), so a clock that jumps backwards extends the lifetime of the entries stored before the jump.
+	 * absolute (`setTime + ttl`), so a clock that jumps backwards extends the lifetime of the entries stored before the jump. It must
+	 * return a number other than `NaN` (or the operation reading it throws a `TypeError`, changing nothing) and must not use the cache.
 	 */
 	now?: () => number;
 	/** Called after an entry has been removed (the cache is already in its new state, so the callback may use it). */
@@ -190,7 +191,20 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	 * @returns {number} The current time
 	 */
 	function clock(): number {
-		return timed ? now() : 0;
+		return timed ? readNow() : 0;
+	}
+
+	/**
+	 * Reads the clock and checks the result: a `NaN`, string or bigint time would make expiry instants that every check reads differently.
+	 * @returns {number} The current time
+	 * @throws {TypeError} when `now()` does not return a number other than `NaN`
+	 */
+	function readNow(): number {
+		const time = now();
+
+		if (typeof time !== 'number' || time !== time) throw new TypeError(`createLRUCache: \`now()\` must return a number, got ${time !== time ? 'NaN' : describe(time)}`);
+
+		return time;
 	}
 
 	/**
@@ -279,7 +293,7 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	function lookup(key: K): Entry<K, V> | undefined {
 		const entry = store.get(key);
 
-		return entry !== undefined && entry.expiresAt !== Infinity && now() >= entry.expiresAt ? expire(entry) : entry;
+		return entry !== undefined && entry.expiresAt !== Infinity && readNow() >= entry.expiresAt ? expire(entry) : entry;
 	}
 
 	/**
@@ -316,7 +330,7 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 
 			// Same as `lookup`, keeping the time for `updateAgeOnGet` (an entry that cannot expire has no TTL to restart).
 			if (entry.expiresAt !== Infinity) {
-				const time = now();
+				const time = readNow();
 				if (time >= entry.expiresAt) return expire(entry);
 				if (updateAgeOnGet) entry.expiresAt = time + entry.ttl;
 			}
@@ -474,7 +488,7 @@ export interface PriorityQueue<T> extends Iterable<T> {
  * (FIFO), which plain binary heaps do not guarantee. That is what keeps task schedulers fair among tasks of the same priority.
  * `compare` is called during `push`, `pop`, `delete` and iteration, so it must not change the queue; it should be a consistent total
  * order, or the pop order is unspecified (though every value still comes out exactly once). When `compare` throws, the error propagates
- * and the queue keeps every value exactly once: a failed `push` has still queued its value, and a failed `pop` or `delete` keeps it.
+ * and the queue is left exactly as it was (a failed `push` adds nothing, a failed `pop` or `delete` removes nothing).
  * @template T - The value type
  * @param {(a: T, b: T) => number} compare - Orders two values (negative: `a` first, positive: `b` first, zero: insertion order)
  * @returns {PriorityQueue<T>} A new, empty queue
@@ -497,6 +511,8 @@ export function createPriorityQueue<T>(compare: (a: T, b: T) => number): Priorit
 	let values: T[] = [];
 	let order: number[] = [];
 	let inserted = 0;
+	// The path of the current `siftDown`, reused between calls.
+	const path: number[] = [];
 
 	/**
 	 * Whether `a` (inserted as number `rankA`) leaves before `b` (inserted as number `rankB`).
@@ -521,20 +537,24 @@ export function createPriorityQueue<T>(compare: (a: T, b: T) => number): Priorit
 	 * @returns {number} The index where it was placed
 	 */
 	function siftUp(i: number, value: T, rank: number): number {
-		try {
-			while (i > 0) {
-				const parent = (i - 1) >> 1;
+		// Every comparison first, then the moves: when `compare` throws, nothing has been changed.
+		let target = i;
 
-				if (!precedes(value, rank, values[parent], order[parent])) break;
-				values[i] = values[parent];
-				order[i] = order[parent];
-				i = parent;
-			}
-		} finally {
-			// Also when `compare` throws: the value fills the hole, so none is lost or left in two slots.
-			values[i] = value;
-			order[i] = rank;
+		while (target > 0) {
+			const parent = (target - 1) >> 1;
+
+			if (!precedes(value, rank, values[parent], order[parent])) break;
+			target = parent;
 		}
+		while (i > target) {
+			const parent = (i - 1) >> 1;
+
+			values[i] = values[parent];
+			order[i] = order[parent];
+			i = parent;
+		}
+		values[i] = value;
+		order[i] = rank;
 
 		return i;
 	}
@@ -549,22 +569,24 @@ export function createPriorityQueue<T>(compare: (a: T, b: T) => number): Priorit
 	function siftDown(i: number, value: T, rank: number): void {
 		const length = values.length;
 
-		try {
-			for (;;) {
-				let child = 2 * i + 1;
+		// Every comparison first (recording the path), then the moves: when `compare` throws, nothing has been changed.
+		path.length = 0;
+		for (let hole = i; ;) {
+			let child = 2 * hole + 1;
 
-				if (child >= length) break;
-				if (child + 1 < length && precedes(values[child + 1], order[child + 1], values[child], order[child])) child++;
-				if (!precedes(values[child], order[child], value, rank)) break;
-				values[i] = values[child];
-				order[i] = order[child];
-				i = child;
-			}
-		} finally {
-			// Also when `compare` throws (see `siftUp`).
-			values[i] = value;
-			order[i] = rank;
+			if (child >= length) break;
+			if (child + 1 < length && precedes(values[child + 1], order[child + 1], values[child], order[child])) child++;
+			if (!precedes(values[child], order[child], value, rank)) break;
+			path.push(child);
+			hole = child;
 		}
+		for (const child of path) {
+			values[i] = values[child];
+			order[i] = order[child];
+			i = child;
+		}
+		values[i] = value;
+		order[i] = rank;
 	}
 
 	/**
@@ -582,9 +604,11 @@ export function createPriorityQueue<T>(compare: (a: T, b: T) => number): Priorit
 			// The last value fills the hole; it may belong above or below it.
 			if (i < values.length && siftUp(i, value, rank) === i) siftDown(i, value, rank);
 		} catch (error) {
-			// `compare` threw: keep the value queued, since the caller never received it.
-			values.push(removed);
-			order.push(removedRank);
+			// `compare` threw before anything moved (at most `siftUp` placed the last value in the hole): restore the exact layout.
+			values[i] = removed;
+			order[i] = removedRank;
+			values.push(value);
+			order.push(rank);
 			throw error;
 		}
 

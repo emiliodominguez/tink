@@ -543,6 +543,34 @@ describe('createLRUCache', function () {
 	});
 
 	describe('clock reads', function () {
+		it('rejects a clock returning NaN, a string or a bigint, without changing the cache', function () {
+			for (const bad of [NaN, '1000', 5n]) {
+				const evicted: unknown[] = [];
+				let time: unknown = 0;
+				const cache = createLRUCache<string, string>({
+					max: 10,
+					now: function () {
+						return time as number;
+					},
+					onEvict: function (key, value) {
+						evicted.push([key, value]);
+					}
+				});
+				cache.set('a', 'old', { ttl: 100 });
+				time = bad;
+				expect(function () {
+					cache.set('a', 'new', { ttl: 1000 });
+				}).toThrow(
+					new TypeError(`createLRUCache: \`now()\` must return a number, got ${typeof bad === 'string' ? 'string' : typeof bad === 'bigint' ? 'bigint' : 'NaN'}`)
+				);
+				expect(function () {
+					cache.get('a');
+				}).toThrow(TypeError);
+				time = 50;
+				expect([cache.get('a'), evicted]).toEqual(['old', []]);
+			}
+		});
+
 		it('never reads the clock while no entry can expire', function () {
 			const now = jest.fn(function (): number {
 				return 0;
@@ -699,31 +727,19 @@ describe('createPriorityQueue', function () {
 		).toEqual(['a', 'c', 'd', 'e', 'f']);
 	});
 
-	it('keeps every value exactly once when compare throws during push, pop or delete', function () {
-		const operations: ReadonlyArray<[string, (queue: PriorityQueue<number>) => unknown, number[]]> = [
-			[
-				'push',
-				function (queue) {
-					return queue.push(0);
-				},
-				[0, 1, 2, 3, 4, 5, 6, 7]
-			],
-			[
-				'pop',
-				function (queue) {
-					return queue.pop();
-				},
-				[1, 2, 3, 4, 5, 6, 7]
-			],
-			[
-				'delete',
-				function (queue) {
-					return queue.delete(2);
-				},
-				[1, 2, 3, 4, 5, 6, 7]
-			]
+	it('leaves the queue exactly as it was when compare throws during push, pop or delete', function () {
+		const operations: ReadonlyArray<(queue: PriorityQueue<number>) => unknown> = [
+			function (queue) {
+				return queue.push(0);
+			},
+			function (queue) {
+				return queue.pop();
+			},
+			function (queue) {
+				return queue.delete(2);
+			}
 		];
-		for (const [, operation, expected] of operations) {
+		for (const operation of operations) {
 			for (let throwAt = 1; throwAt <= 4; throwAt++) {
 				let calls = 0;
 				let armed = false;
@@ -741,10 +757,11 @@ describe('createPriorityQueue', function () {
 				}
 				armed = false;
 				if (!threw) continue;
-				expect(queue.size).toBe(expected.length);
+				expect(queue.size).toBe(7);
+				expect(queue.peek()).toBe(1);
 				const drained: number[] = [];
 				for (let value = queue.pop(); value !== undefined; value = queue.pop()) drained.push(value);
-				expect(drained.sort(ascending)).toEqual(expected);
+				expect(drained).toEqual([1, 2, 3, 4, 5, 6, 7]);
 			}
 		}
 	});
