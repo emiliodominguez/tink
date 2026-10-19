@@ -1971,7 +1971,7 @@ export function compareNatural(a: string, b: string, options?: CompareNaturalOpt
 	if (a === b) return 0;
 
 	// A sort comparator: read inline (see `readOption`), and not at all without options.
-	const flag = options?.ignoreCase;
+	const flag = options === undefined ? undefined : options.ignoreCase;
 	const ignoreCase = flag === true && (flag !== (Object.prototype as CompareNaturalOptions).ignoreCase || Object.hasOwn(options as object, 'ignoreCase'));
 	const order = ignoreCase ? compareRuns(foldCase(a), foldCase(b)) : compareRuns(a, b);
 
