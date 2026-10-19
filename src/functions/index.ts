@@ -235,7 +235,9 @@ export type Curried<A extends unknown[], R> = number extends A['length']
  * invokes `fn` with all of them and the `this` of the final call. Extra arguments in the final call are forwarded too.
  *
  * `fn.length` does not count rest parameters or parameters with default values, so pass `arity` explicitly for such functions
- * (and an explicit tuple type argument if you want precise types).
+ * (and an explicit tuple type argument if you want precise types). TypeScript types optional parameters (`b?: number`, counted by
+ * `fn.length`) like defaulted ones (`b = 0`, not counted), so for either kind the inferred {@link Curried} type cannot know the arity:
+ * pass the tuple of the parameters you will collect (`curry<[number, number], number>(fn, 2)`).
  * @template A - The parameter types of `fn`
  * @template R - The return type of `fn`
  * @param {(...args: A) => R} fn - The function to curry
@@ -436,9 +438,11 @@ export type Memoized<F extends AnyFunction, C extends MemoizeCache<unknown, unkn
  * The default cache-key resolver used by {@link memoize} (and the `memoize` decorator). Keys of distinct primitives, and of values of
  * different kinds, never collide; plain data is compared by value and everything else by identity:
  *
- * - A single argument that is a primitive (other than `-0`), a function, or an object other than a plain object, an array or a `Date`
- *   is used as the key itself, so `1` and `'1'`, `undefined` and `null`, `NaN`, or two different class instances are all distinct keys.
- * - Anything else (zero or several arguments, a plain object, an array, a `Date`, or `-0`) is serialised like `JSON.stringify(args)`,
+ * - A single argument that is a primitive (other than `-0` and strings starting with `[`, which could equal a serialised key), a function,
+ *   or an object other than a plain object, an array or a `Date` is used as the key itself, so `1` and `'1'`, `undefined` and `null`,
+ *   `NaN`, or two different class instances are all distinct keys.
+ * - Anything else (zero or several arguments, a plain object, an array, a `Date`, `-0`, or a string starting with `[`) is serialised like
+ *   `JSON.stringify(args)`,
  *   except that every value JSON cannot represent gets a distinct marker string: bigints become `'<n>n'`; `NaN`, `Infinity`, `-Infinity`,
  *   `-0` and `undefined` (also nested, so `[undefined]` differs from `[null]` and `{ a: undefined }` from `{}`) become those words; a `Date`
  *   becomes `'Date(<time value>)'`; and functions, symbols and objects other than plain objects and arrays (class instances, errors,
@@ -1184,10 +1188,12 @@ type Predicate = (value: never, ...rest: never[]) => unknown;
 type GuardedType<P> = P extends { guard(value: unknown, ...rest: never[]): value is infer S }['guard'] ? S : unknown;
 
 /**
- * The intersection of the first-parameter types of a tuple of predicates: what every one of them accepts.
+ * The input type of a left-to-right, short-circuiting combination of predicates: the first-parameter type of each predicate, except that
+ * a later predicate's requirement is dropped when an earlier type guard already guarantees it (`allPass(isString, isShort)` accepts
+ * `unknown`: `isShort` only ever sees strings). Otherwise the requirements intersect.
  */
 type PredicatesInput<P extends readonly unknown[]> = P extends readonly [infer Head, ...infer Tail]
-	? (Head extends (value: infer V, ...rest: never[]) => unknown ? V : never) & PredicatesInput<Tail>
+	? (Head extends (value: infer V, ...rest: never[]) => unknown ? V : never) & (GuardedType<Head> extends PredicatesInput<Tail> ? unknown : PredicatesInput<Tail>)
 	: unknown;
 
 /**
@@ -1242,7 +1248,8 @@ function combinePredicates(caller: string, predicates: ReadonlyArray<UnknownFunc
  * an `Array.prototype.filter` callback.
  *
  * Type guards keep narrowing: combining `(v) => v is A` and `(v) => v is B` gives a guard for `A & B` (plain predicates add nothing).
- * The input type is the intersection of the predicates' parameter types.
+ * The input type is the intersection of the predicates' parameter types, except what an earlier type guard already guarantees: since
+ * evaluation stops at the first failure, `allPass(isString, isShort)` accepts `unknown` although `isShort` takes a `string`.
  * @template P - The tuple of predicate types
  * @param {...P} predicates - The predicates to combine
  * @returns {(value: PredicatesInput<P>, ...rest: unknown[]) => value is PredicatesInput<P> & AllGuarded<P>} The combined predicate
@@ -1589,7 +1596,9 @@ export function match<T extends object, K extends keyof T, H extends MatchHandle
 	if (typeof value !== 'object' || value === null) throw new TypeError(`match: \`value\` must be an object, got ${describe(value)}`);
 
 	const tag = String(value[key]);
-	const handler = (Object.hasOwn(handlers, tag) ? handlers[tag as keyof H] : Object.hasOwn(handlers, '_') ? handlers['_' as keyof H] : undefined) as unknown;
+	// A key present with an `undefined` value (allowed by the `Partial` handler types) counts as absent, so `_` handles that member.
+	const own = (Object.hasOwn(handlers, tag) ? handlers[tag as keyof H] : undefined) as unknown;
+	const handler = own === undefined && Object.hasOwn(handlers, '_') ? (handlers['_' as keyof H] as unknown) : own;
 
 	// The tag may come from untrusted data: quote at most 100 characters of it, so that the message stays safe to log.
 	if (handler === undefined) throw new AssertionError(`match: no handler for \`${String(key)}\` ${JSON.stringify(tag.slice(0, 100))}`);

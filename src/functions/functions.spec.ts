@@ -1914,13 +1914,26 @@ describe('Functions helpers (round 11)', function () {
 			);
 			assertType<Equals<typeof loose, unknown[]>>();
 			expect(loose).toEqual(['ab', null]);
-			// A plain predicate in allPass adds nothing, and the input type is what every predicate accepts.
-			const shortString = allPass(isString, function (value: string) {
+			// A plain predicate in allPass adds nothing. Its parameter type is not required when an earlier guard guarantees it (evaluation
+			// stops at the first failure), so the guard can filter a wider array; first in line, it is required.
+			/**
+			 * Whether a string is shorter than 2 characters.
+			 */
+			function isShort(value: string): boolean {
 				return value.length < 2;
+			}
+			const shortString = allPass(isString, isShort);
+			assertType<Equals<Parameters<typeof shortString>[0], unknown>>();
+			const shorts = ['a', 7, 'bc'].filter(shortString);
+			assertType<Equals<typeof shorts, string[]>>();
+			expect(shorts).toEqual(['a']);
+			const shortFirst = allPass(isShort, isString);
+			assertType<Equals<Parameters<typeof shortFirst>[0], string>>();
+			// Requirements that no earlier guard covers still intersect.
+			const both = allPass(isShort, function (value: { trim(): string }): boolean {
+				return value.trim() !== '';
 			});
-			assertType<Equals<Parameters<typeof shortString>[0], string>>();
-			const words: string[] = ['a', 'bc'];
-			expect(words.filter(shortString)).toEqual(['a']);
+			assertType<Equals<Parameters<typeof both>[0], string & { trim(): string }>>();
 		});
 
 		it('throws a TypeError naming the first non-function predicate', function () {
@@ -1935,6 +1948,21 @@ describe('Functions helpers (round 11)', function () {
 
 	describe('match', function () {
 		type Shape = { kind: 'circle'; radius: number } | { kind: 'square'; size: number } | { kind: 'rect'; width: number; height: number };
+
+		it('uses the `_` fallback for a member whose handler key is present but undefined', function () {
+			const shape: Shape = { kind: 'circle', radius: 1 };
+			expect(
+				match(shape, 'kind', {
+					circle: undefined,
+					_: function () {
+						return 0;
+					}
+				})
+			).toBe(0);
+			expect(function () {
+				match(shape, 'kind', { circle: undefined } as never);
+			}).toThrow('match: no handler for `kind` "circle"');
+		});
 
 		function area(shape: Shape): number {
 			return match(shape, 'kind', {
