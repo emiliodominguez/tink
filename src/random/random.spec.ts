@@ -717,6 +717,26 @@ describe('random', function () {
 	});
 
 	describe('randomGaussian', function () {
+		it('should not overflow when stdDev * z is finite, and return mean itself for stdDev 0', function () {
+			const draws = [0.5, 0.2499999];
+			const sample = helpers.randomGaussian(0, Number.MAX_VALUE, function () {
+				return draws.shift() as number;
+			});
+			expect(Number.isFinite(sample)).toBe(true);
+			expect(Object.is(helpers.randomGaussian(-0, 0, constant(0.5)), -0)).toBe(true);
+		});
+
+		it('should reject non-number draws, which comparisons would coerce to 0', function () {
+			for (const draw of [null, false, '', [], '0.5']) {
+				expect(function () {
+					helpers.randomGaussian(0, 1, constant(draw as any));
+				}).toThrow(RangeError);
+				expect(function () {
+					helpers.randomBoolean(0.5, constant(draw as any));
+				}).toThrow(RangeError);
+			}
+		});
+
 		it('should guard against log(0) when random() returns 0', function () {
 			expect(helpers.randomGaussian(5, 2, constant(0))).toBe(5);
 			expect(Number.isFinite(helpers.randomGaussian(0, 1, constant(1 - Number.EPSILON / 2)))).toBe(true);

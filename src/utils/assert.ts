@@ -110,6 +110,7 @@ export function draw(caller: string, random: RandomGenerator): number {
 	if (random === nativeRandom) return random();
 	assertFunction(caller, 'random', random);
 	const value = random();
-	if (!(value >= 0 && value < 1)) throw new RangeError(`${caller}: \`random()\` must return a number in [0, 1), got ${String(value)}`);
+	// `typeof` first: comparisons coerce, so `null`, `false`, `''` or `[]` would otherwise pass as 0.
+	if (!(typeof value === 'number' && value >= 0 && value < 1)) throw new RangeError(`${caller}: \`random()\` must return a number in [0, 1), got ${String(value)}`);
 	return value;
 }

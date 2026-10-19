@@ -580,7 +580,9 @@ export function randomGaussian(mean: number = 0, stdDev: number = 1, random: Ran
 	assertNumber('randomGaussian', 'stdDev', stdDev, stdDev >= 0 && stdDev < Infinity, 'a finite number >= 0');
 	const u1 = 1 - draw('randomGaussian', random);
 	const u2 = draw('randomGaussian', random);
-	return mean + stdDev * Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+	// The standard normal sample (|z| < 8.6) is formed first, so that `stdDev * z` overflows only when the result does; `stdDev = 0`
+	// returns `mean` itself (also `-0`).
+	return stdDev === 0 ? mean : mean + stdDev * (Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2));
 }
 
 /**
