@@ -376,7 +376,12 @@ export function range(start: number, end?: number, step = 1): number[] {
 	assertNumber('range', 'step', step, Number.isFinite(step) && step !== 0, 'a finite number other than 0');
 	const length = rangeLength(from, to, step);
 	const result: number[] = new Array<number>(length);
-	for (let i = 0; i < length; i++) result[i] = from + i * step;
+	if (length > 0 && !Number.isFinite(from + (length - 1) * step)) {
+		// `i * step` overflows near `Number.MAX_VALUE` (`range(-1.5e308, 1.5e308, 1e308)`): compute at half scale (same rounding).
+		for (let i = 0; i < length; i++) result[i] = 2 * (from / 2 + i * (step / 2));
+	} else {
+		for (let i = 0; i < length; i++) result[i] = from + i * step;
+	}
 	return result;
 }
 
@@ -390,20 +395,28 @@ export function range(start: number, end?: number, step = 1): number[] {
  * @throws {RangeError} when the range would exceed the maximum array length
  */
 function rangeLength(from: number, to: number, step: number): number {
-	const ratio = (to - from) / step;
+	let ratio = (to - from) / step;
+	// `to - from` overflows for spans beyond `Number.MAX_VALUE` (`range(-1.5e308, 1.5e308, 1e308)`); dividing first does not.
+	if (!Number.isFinite(ratio)) ratio = to / step - from / step;
 	const nearest = Math.round(ratio);
 	// `ratio` carries rounding errors (`2.1 / 0.3` is `7.000000000000001`); when it is an integer up to those errors,
 	// the range is meant to stop exactly one step before `end`, so the count must not be rounded up.
-	// (An exact integer ratio, the usual case, needs no tolerance.)
+	// (An exact integer ratio, the usual case, needs no tolerance.) The tolerance bounds those errors: half an ulp for each of
+	// `from` and `to` (relative to `step`) and a few for `step`, the subtraction and the division.
 	let length = Math.max(
 		0,
-		ratio === nearest || Math.abs(ratio - nearest) <= 4 * Number.EPSILON * ((Math.abs(from) + Math.abs(to)) / Math.abs(step) + Math.abs(ratio))
+		ratio === nearest || Math.abs(ratio - nearest) <= Number.EPSILON * ((Math.abs(from) + Math.abs(to)) / Math.abs(step) + 2 * Math.abs(ratio))
 			? nearest
 			: Math.ceil(ratio)
 	);
 	if (length > MAX_ARRAY_LENGTH) throw new RangeError(`range: the range would contain ${length} items, more than an array can hold`);
 	// Safety net for huge magnitudes, where `start + i * step` rounds onto (or past) `end`: the end stays exclusive.
-	while (length > 0 && (from + (length - 1) * step - to) * step >= 0) length--;
+	// (Compared by sign rather than with `(final - to) * step >= 0`, which underflows to `-0` for subnormal steps.)
+	for (; length > 0; length--) {
+		let final = from + (length - 1) * step;
+		if (!Number.isFinite(final)) final = 2 * (from / 2 + (length - 1) * (step / 2));
+		if (step > 0 ? final < to : final > to) break;
+	}
 	return length;
 }
 
@@ -462,14 +475,14 @@ export function groupBy<T, K extends PropertyKey>(array: ReadonlyArray<T>, keyFn
  * @template K
  * @param {ReadonlyArray<T>} array - The items to index
  * @param {(item: T, index: number) => K} keyFn - Returns the key of an item
- * @returns {Record<K, T>} An object mapping each key to the last item that produced it
+ * @returns {Partial<Record<K, T>>} An object mapping each key to the last item that produced it (keys no item produced are absent)
  * @throws {TypeError} when `keyFn` is not a function
  * @example
  * keyBy([{ id: 'a', v: 1 }, { id: 'a', v: 2 }], function (o) { return o.id; }); // => { a: { id: 'a', v: 2 } }
  */
-export function keyBy<T, K extends PropertyKey>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => K): Record<K, T> {
+export function keyBy<T, K extends PropertyKey>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => K): Partial<Record<K, T>> {
 	assertFunction('keyBy', 'keyFn', keyFn);
-	const result = nullObject() as Record<K, T>;
+	const result = nullObject() as Partial<Record<K, T>>;
 	for (let i = 0; i < array.length; i++) {
 		result[keyFn(array[i], i)] = array[i];
 	}
@@ -483,14 +496,14 @@ export function keyBy<T, K extends PropertyKey>(array: ReadonlyArray<T>, keyFn: 
  * @template K
  * @param {ReadonlyArray<T>} array - The items to count
  * @param {(item: T, index: number) => K} keyFn - Returns the key of an item
- * @returns {Record<K, number>} An object mapping each key to the number of items that produced it
+ * @returns {Partial<Record<K, number>>} An object mapping each key to the number of items that produced it (keys no item produced are absent)
  * @throws {TypeError} when `keyFn` is not a function
  * @example
  * countBy(['one', 'two', 'three'], function (s) { return s.length; }); // => { 3: 2, 5: 1 }
  */
-export function countBy<T, K extends PropertyKey>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => K): Record<K, number> {
+export function countBy<T, K extends PropertyKey>(array: ReadonlyArray<T>, keyFn: (item: T, index: number) => K): Partial<Record<K, number>> {
 	assertFunction('countBy', 'keyFn', keyFn);
-	const counts = nullObject() as Record<K, number>;
+	const counts = nullObject() as Partial<Record<K, number>>;
 	for (let i = 0; i < array.length; i++) {
 		const key = keyFn(array[i], i);
 		counts[key] = (counts[key] ?? 0) + 1;
@@ -714,6 +727,7 @@ export function sortBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: nu
  * shuffle([1, 2, 3, 4]); // e.g. [3, 1, 4, 2]
  */
 export function shuffle<T>(array: ReadonlyArray<T>, random: RandomGenerator = Math.random): T[] {
+	assertFunction('shuffle', 'random', random);
 	const result = Array.from(array);
 	for (let i = result.length - 1; i > 0; i--) {
 		const j = Math.floor(draw('shuffle', random) * (i + 1));
@@ -738,6 +752,7 @@ export function shuffle<T>(array: ReadonlyArray<T>, random: RandomGenerator = Ma
  * sample([]); // => undefined
  */
 export function sample<T>(array: ReadonlyArray<T>, random: RandomGenerator = Math.random): T | undefined {
+	assertFunction('sample', 'random', random);
 	if (array.length === 0) return undefined;
 	return array[Math.floor(draw('sample', random) * array.length)];
 }
@@ -966,7 +981,8 @@ export function sumBy<T>(array: ReadonlyArray<T>, selector: (item: T, index: num
 /**
  * Neumaier sum of the selected numbers divided by `divisor`, the division being applied to the running total and to the compensation
  * separately: this is the compensated sum itself for `divisor = 1`, and makes the mean of {@link averageBy} more accurate than dividing
- * the rounded sum (`0.1`, `0.2`, `0.3` average to `0.2`, not `0.19999999999999998`).
+ * the rounded sum (`0.1`, `0.2`, `0.3` average to `0.2`, not `0.19999999999999998`). When the running total overflows on finite
+ * values, the rest is added up already divided (like `average` from the math module), so a finite mean is not lost to `Infinity`.
  * @template T
  * @param {ReadonlyArray<T>} array - The items to add up
  * @param {(item: T, index: number) => number} selector - Returns the number contributed by an item
@@ -977,13 +993,23 @@ function scaledSum<T>(array: ReadonlyArray<T>, selector: (item: T, index: number
 	// Neumaier summation inlined (same algorithm and result as `sum`), so no intermediate array of keys is allocated.
 	let total = 0;
 	let compensation = 0;
+	// 1 until the running total overflows; `divisor` afterwards, when the terms are added up already divided.
+	let scale = 1;
 	for (let i = 0; i < array.length; i++) {
-		const value = +selector(array[i], i);
-		const next = total + value;
+		let value = +selector(array[i], i) / scale;
+		let next = total + value;
+		if (!Number.isFinite(next) && scale < divisor && Number.isFinite(total) && Number.isFinite(value)) {
+			scale = divisor;
+			total /= divisor;
+			compensation /= divisor;
+			value /= divisor;
+			next = total + value;
+		}
 		compensation += Math.abs(total) >= Math.abs(value) ? total - next + value : value - next + total;
 		total = next;
 	}
-	return Number.isFinite(total) ? total / divisor + compensation / divisor : total / divisor;
+	if (!Number.isFinite(total)) return total / scale / divisor;
+	return scale === 1 ? total / divisor + compensation / divisor : total + compensation;
 }
 
 /**
@@ -1052,8 +1078,11 @@ export function move<T>(array: ReadonlyArray<T>, from: number, to: number): T[] 
  */
 export function insertAt<T>(array: ReadonlyArray<T>, index: number, ...items: T[]): T[] {
 	const position = resolveIndex('insertAt', 'index', index, array.length, true);
-	const result = Array.from(array);
-	result.splice(position, 0, ...items);
+	// Copied with loops: `splice(position, 0, ...items)` would spread `items` onto the stack a second time.
+	const result = new Array<T>(array.length + items.length);
+	for (let i = 0; i < position; i++) result[i] = array[i];
+	for (let i = 0; i < items.length; i++) result[position + i] = items[i];
+	for (let i = position; i < array.length; i++) result[items.length + i] = array[i];
 	return result;
 }
 
@@ -2421,6 +2450,7 @@ export function zipWith<T extends Array<ReadonlyArray<unknown>>, R>(fn: (...valu
  */
 export function sampleSize<T>(array: ReadonlyArray<T>, n: number, random: RandomGenerator = Math.random): T[] {
 	assertInteger('sampleSize', 'n', n, 0);
+	assertFunction('sampleSize', 'random', random);
 	const length = array.length;
 	const count = Math.min(n, length);
 	const result = new Array<T>(count);

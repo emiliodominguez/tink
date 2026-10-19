@@ -449,6 +449,21 @@ describe('Arrays helpers', function () {
 	});
 
 	describe('range', function () {
+		it('should not snap the count of a non-integer ratio at large magnitudes', function () {
+			expect(helpers.range(1e15, 1e15 + 10, 3)).toEqual([1e15, 1e15 + 3, 1e15 + 6, 1e15 + 9]);
+			expect(helpers.range(1.7e15, 1.7e15 + 10, 3)).toHaveLength(4);
+		});
+
+		it('should handle spans and values beyond Number.MAX_VALUE', function () {
+			expect(helpers.range(1e308, -1e308, -1e308)).toEqual([1e308, 0]);
+			expect(helpers.range(-1.5e308, 1.5e308, 1e308)).toEqual([-1.5e308, -5e307, 5e307]);
+		});
+
+		it('should handle subnormal steps', function () {
+			expect(helpers.range(5e-324, 2e-323, 5e-324)).toEqual([5e-324, 1e-323, 1.5e-323]);
+			expect(helpers.range(0, -2e-323, -5e-324)).toEqual([0, -5e-324, -1e-323, -1.5e-323]);
+		});
+
 		it('should count from 0 with a single argument', function () {
 			expect(helpers.range(5)).toStrictEqual([0, 1, 2, 3, 4]);
 			expect(helpers.range(0)).toStrictEqual([]);
@@ -632,6 +647,19 @@ describe('Arrays helpers', function () {
 	});
 
 	describe('countBy', function () {
+		it('should type keys that no item produced as possibly absent, like groupBy', function () {
+			function parity(n: number): 'even' | 'odd' {
+				return n % 2 === 0 ? 'even' : 'odd';
+			}
+			const counts = helpers.countBy([2, 4], parity);
+			const index = helpers.keyBy([2, 4], parity);
+			// @ts-expect-error `odd` may be missing
+			const odd: number = counts.odd;
+			// @ts-expect-error `odd` may be missing
+			const item: number = index.odd;
+			expect([odd, item]).toEqual([undefined, undefined]);
+		});
+
 		it('should count items per key', function () {
 			const result = helpers.countBy(['one', 'two', 'three'], function (s) {
 				return s.length;
@@ -809,6 +837,22 @@ describe('Arrays helpers', function () {
 	});
 
 	describe('shuffle', function () {
+		it('should validate random even when nothing needs to be drawn', function () {
+			for (const call of [
+				function () {
+					helpers.shuffle([1], 42 as any);
+				},
+				function () {
+					helpers.sample([], 42 as any);
+				},
+				function () {
+					helpers.sampleSize([1, 2], 0, 42 as any);
+				}
+			]) {
+				expect(call).toThrow(TypeError);
+			}
+		});
+
 		it('should return a permutation without mutating the input', function () {
 			const input = [1, 2, 3, 4, 5];
 			const result = helpers.shuffle(input);
@@ -1183,6 +1227,17 @@ describe('Arrays helpers', function () {
 			expect(helpers.insertAt([], 0, 'x')).toStrictEqual(['x']);
 			expect(helpers.insertAt([[1]], 1, [2])).toStrictEqual([[1], [2]]);
 			expect(input).toStrictEqual([1, 2, 3]);
+		});
+
+		it('insertAt accepts as many items as a rest call can take, and fills holes with undefined', function () {
+			const items = Array.from({ length: 70_000 }, function (_, i) {
+				return i;
+			});
+			const result = helpers.insertAt([-1, -2], 1, ...items);
+			expect(result).toHaveLength(70_002);
+			expect([result[0], result[1], result[70_000], result[70_001]]).toEqual([-1, 0, 69_999, -2]);
+			// eslint-disable-next-line no-sparse-arrays
+			expect(helpers.insertAt([1, , 3], 1, 9)).toStrictEqual([1, 9, undefined, 3]);
 		});
 
 		it.each([4, -4, 1.5, NaN, Infinity])('insertAt throws a RangeError for index %p', function (index) {
@@ -2520,7 +2575,11 @@ describe('Arrays helpers (ordering, slicing, set algebra, combinatorics)', funct
 		it('averageBy uses compensated summation', function () {
 			expect(helpers.averageBy([{ n: 0.1 }, { n: 0.2 }, { n: 0.3 }], value)).toBe(0.2);
 			expect(helpers.averageBy([1, 2, 3, 4], self)).toBe(2.5);
-			expect(helpers.averageBy([1e308, 1e308], self)).toBe(Infinity);
+			expect(helpers.averageBy([1e308, 1e308], self)).toBe(1e308);
+			expect(helpers.averageBy([-1e308, -1e308, 1e308], self)).toBeCloseTo(-1e308 / 3, -290);
+			expect(helpers.averageBy([1e308, 1e308, -Infinity], self)).toBe(-Infinity);
+			expect(helpers.averageBy([Number.MAX_VALUE, Number.MAX_VALUE, Number.MAX_VALUE], self)).toBe(Infinity);
+			expect(helpers.sumBy([1e308, 1e308], self)).toBe(Infinity);
 			expect(helpers.averageBy([1, NaN], self)).toBeNaN();
 			expect(helpers.averageBy(['1', '2'] as any[], self)).toBe(1.5);
 		});
