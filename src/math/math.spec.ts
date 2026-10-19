@@ -992,7 +992,8 @@ describe('Math helpers', function () {
 		it('variance should return Infinity (not a negative number or NaN) when finite inputs overflow', function () {
 			expect(helpers.variance([1e308, -1e308])).toBe(Infinity);
 			expect(helpers.variance([1e308, -1e308, 1e308, 5])).toBe(Infinity);
-			expect(helpers.standardDeviation([-1e308, 1e308])).toBe(Infinity);
+			// The standard deviation itself (1e308) does not overflow.
+			expect(helpers.standardDeviation([-1e308, 1e308])).toBe(1e308);
 			expect(helpers.variance([1, Infinity])).toBeNaN();
 		});
 	});
@@ -1788,6 +1789,46 @@ describe('Math helpers', function () {
 			).toBe(2 ** 52 + 2 ** 30);
 			expect(helpers.randomIntBetween(0, 2 ** 53 - 1, constant(ALMOST_ONE))).toBe(2 ** 53 - 1);
 			expect(helpers.randomIntBetween(-(2 ** 33), 2 ** 33, constant(0))).toBe(-(2 ** 33));
+		});
+	});
+
+	describe('pass 3 regressions', function () {
+		it('standardDeviation stays finite when the variance overflows', function () {
+			expect(helpers.standardDeviation([1e200, -1e200])).toBe(1e200);
+			expect(helpers.standardDeviation([1e200, -1e200], { sample: true })).toBeCloseTo(Math.SQRT2 * 1e200, -185);
+			expect(Number.isFinite(helpers.standardDeviation([Number.MAX_VALUE, -Number.MAX_VALUE]))).toBe(true);
+		});
+
+		it('average agrees with averageBy', function () {
+			expect(helpers.average([0.1, 0.2, 0.3])).toBe(0.2);
+			expect(helpers.average([])).toBeNaN();
+		});
+
+		it('round, ceil and floor always return numbers', function () {
+			expect(helpers.round('2.5' as never)).toBe(3);
+			expect(helpers.ceil('1.1' as never, 2)).toBe(1.1);
+			expect(helpers.round([2.5] as never)).toBe(3);
+		});
+
+		it('clamp rejects non-number bounds with a TypeError', function () {
+			expect(function () {
+				helpers.clamp(5, '9' as never, 10);
+			}).toThrow(new TypeError('clamp: `minimum` must be a number, got string'));
+		});
+
+		it('weightedAverage validates the weights it uses', function () {
+			let reads = 0;
+			const flipping = {
+				valueOf(): number {
+					return reads++ < 1 ? 1 : -1;
+				}
+			};
+			expect(helpers.weightedAverage([10, 20], [flipping as never, 1])).toBe(15);
+		});
+
+		it('parseBytes accepts zero sizes with huge exponents', function () {
+			expect(helpers.parseBytes('0e999999999999999999999')).toBe(0);
+			expect(helpers.parseBytes('1e-1000000000000000000000')).toBe(0);
 		});
 	});
 });

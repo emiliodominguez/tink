@@ -96,6 +96,17 @@ function sortedCopy(numbers: ArrayLike<number>): ArrayLike<number> {
  * sum(['1', '2', '3'] as never); // => 6 // not '0123'
  */
 export function sum(numbers: ReadonlyArray<number>): number {
+	return scaledSum(numbers, 1);
+}
+
+/**
+ * The compensated (Neumaier) sum of `numbers` divided by `divisor`, the division being applied to the running total and to the
+ * compensation separately: the sum itself for `divisor = 1`, and a mean as accurate as `averageBy`'s (from the arrays module) otherwise.
+ * @param {ReadonlyArray<number>} numbers - The numbers to add up
+ * @param {number} divisor - What the sum is divided by
+ * @returns {number} The scaled sum (`total / divisor` alone when the total is not finite)
+ */
+function scaledSum(numbers: ReadonlyArray<number>, divisor: number): number {
 	let total = 0;
 	let compensation = 0;
 	// An index loop: several times faster than `for...of` here. There is deliberately no fast path for exact (e.g. integer) input:
@@ -107,7 +118,7 @@ export function sum(numbers: ReadonlyArray<number>): number {
 		compensation += Math.abs(total) >= Math.abs(value) ? total - next + value : value - next + total;
 		total = next;
 	}
-	return Number.isFinite(total) ? total + compensation : total;
+	return Number.isFinite(total) ? total / divisor + compensation / divisor : total / divisor;
 }
 
 /**
@@ -118,7 +129,7 @@ export function sum(numbers: ReadonlyArray<number>): number {
  * `round(-1.235, 2) === -1.24`. Note that this differs from `Math.round`, which rounds negative halves towards `+Infinity`.
  *
  * Negative `decimals` round to tens, hundreds, etc. Non-finite input (`NaN`, `±Infinity`) is returned as-is.
- * @param {number} number - The number to round
+ * @param {number} input - The number to round (converted with unary `+`)
  * @param {number} [decimals=0] - The number of decimal places to keep (integer, may be negative)
  * @returns {number} The rounded number
  * @throws {RangeError} when `decimals` is not an integer
@@ -130,8 +141,10 @@ export function sum(numbers: ReadonlyArray<number>): number {
  * round(1234, -2); // => 1200
  * round(1e-7, 2); // => 0
  */
-export function round(number: number, decimals = 0): number {
+export function round(input: number, decimals = 0): number {
 	assertNumber('round', 'decimals', decimals, Number.isInteger(decimals), 'an integer');
+	// Converted once with unary `+`, like the aggregates: the result is a number whichever path computes it.
+	const number = +input;
 	// Fast path: `number * 10 ** decimals` (exact power of ten, correctly rounded product) is within a few ulps of the
 	// decimal-shifted value, so unless it lies within a safety margin of a `.5` tie, both round to the same integer `k`, and
 	// `k / 10 ** decimals` (a correctly rounded division) is exactly the double nearest to the decimal `k e-decimals`.
@@ -184,10 +197,11 @@ const POWERS_OF_TEN: ReadonlyArray<number> = [1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1
  * average([]); // => NaN
  */
 export function average(numbers: ReadonlyArray<number>): number {
-	const total = sum(numbers);
-	if (Number.isFinite(total)) return total / numbers.length;
-	// The sum overflowed (or an element is infinite, or overflowing terms met an infinite one as `Infinity - Infinity`): the sum of the terms divided by the count cannot overflow when the mean is finite.
 	const count = numbers.length;
+	const mean = scaledSum(numbers, count);
+	if (Number.isFinite(mean) || count === 0) return mean;
+	// The sum overflowed (or an element is infinite, or overflowing terms met an infinite one as `Infinity - Infinity`): the sum of the
+	// terms divided by the count cannot overflow when the mean is finite.
 	return sum(
 		numbers.map(function (value) {
 			return +value / count;
@@ -368,8 +382,10 @@ export function floor(number: number, decimals = 0): number {
  * @example
  * roundDirected('ceil', Math.ceil, 1.1, 2); // => 1.1
  */
-function roundDirected(caller: string, method: (value: number) => number, number: number, decimals: number): number {
+function roundDirected(caller: string, method: (value: number) => number, input: number, decimals: number): number {
 	assertNumber(caller, 'decimals', decimals, Number.isInteger(decimals), 'an integer');
+	// Converted once (see `round`).
+	const number = +input;
 	// Fast path (see `round`): unless the scaled product lies within a safety margin of an integer, it rounds to the same integer `k` as
 	// the decimal-shifted value, and `k / 10 ** decimals` is the double nearest to `k e-decimals`.
 	const scale = POWERS_OF_TEN[decimals];
@@ -516,6 +532,7 @@ export function toDegrees(radians: number): number {
  * @param {number} maximum - Upper bound
  * @returns {number} `minimum` if `value < minimum`, `maximum` if `value > maximum`, otherwise `value`
  * @throws {RangeError} when `minimum > maximum` or a bound is `NaN`
+ * @throws {TypeError} when a bound is not a number
  * @example
  * clamp(15, 0, 10); // => 10
  * clamp(-5, 0, 10); // => 0
@@ -523,6 +540,8 @@ export function toDegrees(radians: number): number {
  * Object.is(clamp(-0, 0, 10), -0); // => true
  */
 export function clamp(value: number, minimum: number, maximum: number): number {
+	assertNumber('clamp', 'minimum', minimum, true, 'a number');
+	assertNumber('clamp', 'maximum', maximum, true, 'a number');
 	if (!(minimum <= maximum)) throw new RangeError(`clamp: \`minimum\` must not be greater than \`maximum\`, got ${minimum} and ${maximum}`);
 	// Plain comparisons, not Math.min/Math.max: an in-range value is returned as is (`-0` stays `-0`), and `NaN` compares false.
 	return value < minimum ? minimum : value > maximum ? maximum : value;
@@ -688,8 +707,17 @@ export function variance(numbers: ReadonlyArray<number>, options: VarianceOption
 	// The running sum of squared deviations (`n` times the variance) overflowed, or Welford's update turned that into `-Infinity` or
 	// `NaN`: redo it on values scaled by 2 ** -600 (exact), then scale the variance back in two exact steps, so that only a variance
 	// that really overflows is `Infinity`.
-	const scaledDistance = welford(numbers, 2 ** -600)[1];
-	return (scaledDistance / divisor) * 2 ** 600 * 2 ** 600;
+	return scaledVariance(numbers, divisor) * 2 ** 600 * 2 ** 600;
+}
+
+/**
+ * The variance of `numbers` scaled by `2 ** -1200` (computed on the values scaled by `2 ** -600`, exactly), for variances that overflow.
+ * @param {ReadonlyArray<number>} numbers - The numbers
+ * @param {number} divisor - `n` or `n - 1`
+ * @returns {number} The scaled variance
+ */
+function scaledVariance(numbers: ReadonlyArray<number>, divisor: number): number {
+	return welford(numbers, 2 ** -600)[1] / divisor;
 }
 
 /**
@@ -720,14 +748,19 @@ function welford(numbers: ReadonlyArray<number>, scale: number): [number, number
  * Population by default; pass `{ sample: true }` for the sample standard deviation.
  * @param {ReadonlyArray<number>} numbers - The numbers
  * @param {VarianceOptions} [options={}] - `sample`: compute the sample statistic instead of the population one
- * @returns {number} The standard deviation; `NaN` when the variance is undefined (see {@link variance})
+ * @returns {number} The standard deviation; `NaN` when the variance is undefined (see {@link variance}). It is finite for finite values, even
+ * when the variance overflows
  * @example
  * standardDeviation([2, 4, 4, 4, 5, 5, 7, 9]); // => 2
  * standardDeviation([1]); // => 0
  * standardDeviation([1], { sample: true }); // => NaN
  */
 export function standardDeviation(numbers: ReadonlyArray<number>, options: VarianceOptions = {}): number {
-	return Math.sqrt(variance(numbers, options));
+	const result = variance(numbers, options);
+	if (result !== Infinity) return Math.sqrt(result);
+	// The variance overflows although every value is finite, but its square root (at most half the range) does not: take the root of
+	// the scaled variance, then scale back by 2 ** 600.
+	return Math.sqrt(scaledVariance(numbers, options.sample === true ? numbers.length - 1 : numbers.length)) * 2 ** 600;
 }
 
 /**
@@ -1085,14 +1118,18 @@ export function weightedAverage(values: ReadonlyArray<number>, weights: Readonly
 		throw new RangeError(`weightedAverage: \`values\` and \`weights\` must have the same length, got ${values.length} and ${weights.length}`);
 	}
 	let largestWeight = 0;
+	// Each weight is read and converted once: the values validated are the values used.
+	const checkedWeights: number[] = [];
 	for (let i = 0; i < weights.length; i++) {
-		const weight = weights[i];
-		if (!(weight >= 0 && weight < Infinity)) assertNumber('weightedAverage', `weights[${i}]`, weight, false, 'a finite number >= 0');
+		const raw = weights[i];
+		const weight = typeof raw === 'number' ? raw : +raw;
+		if (!(weight >= 0 && weight < Infinity)) assertNumber('weightedAverage', `weights[${i}]`, raw, false, 'a finite number >= 0');
+		checkedWeights.push(weight);
 		largestWeight = Math.max(largestWeight, weight);
 	}
 	// Rescaling the weights into [0, 1] keeps the products and the total weight from overflowing or underflowing. A zero total weight
 	// (including empty arrays) needs no special case: `0 / 0` makes every scaled weight, and so the result, `NaN`.
-	const scaledWeights = weights.map(function (weight) {
+	const scaledWeights = checkedWeights.map(function (weight) {
 		return weight / largestWeight;
 	});
 	const products = values.map(function (value, index) {
@@ -1251,7 +1288,8 @@ export function parseBytes(value: string, options: ParseBytesOptions = {}): numb
 		const power = Math.max(SI_BYTE_UNITS.indexOf(unit), IEC_BYTE_UNITS.indexOf(unit));
 		const decimal = base === 1000 && unit.length < 3;
 		// SI multiples go into the decimal exponent, so the text is converted to a double only once.
-		if (power >= 0) bytes = Number(`${match[1]}e${Number(match[2] ?? 0) + (decimal ? 3 * power : 0)}`) * (decimal ? 1 : Math.pow(1024, power));
+		// (`BigInt` writes the exponent in full: a number of 1e21 or more would print as `1e+21`.)
+		if (power >= 0) bytes = Number(`${match[1]}e${BigInt(match[2] ?? 0) + BigInt(decimal ? 3 * power : 0)}`) * (decimal ? 1 : Math.pow(1024, power));
 	}
 	if (!Number.isFinite(bytes)) {
 		const shown = value.length > 50 ? `${value.slice(0, 50)}…` : value;
