@@ -7,7 +7,7 @@ describe('constraint guards (properties)', function () {
 	it('isIntegerInRange(min, max) agrees with the naive definition', function () {
 		fc.assert(
 			fc.property(fc.integer({ min: -50, max: 50 }), fc.nat(50), fc.oneof(fc.double(), fc.integer({ min: -120, max: 120 }), anything), function (min, span, value) {
-				const expected = Number.isInteger(value) && (value as number) >= min && (value as number) <= min + span;
+				const expected = Number.isSafeInteger(value) && (value as number) >= min && (value as number) <= min + span;
 
 				expect(isIntegerInRange(min, min + span)(value)).toBe(expected);
 				expect(explain(isIntegerInRange(min, min + span), value)).toHaveLength(expected ? 0 : 1);

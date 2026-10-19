@@ -1,5 +1,56 @@
 import * as vm from 'vm';
-import { explain, isDiscriminatedUnion, isFiniteNumber, isInteger, isIntegerInRange, isShape, isString, isStringMatching, isStringOfLength, type Infer } from '.';
+import {
+	explain,
+	isArrayOf,
+	isDiscriminatedUnion,
+	isFiniteNumber,
+	isInteger,
+	isIntegerInRange,
+	isShape,
+	isString,
+	isStringMatching,
+	isStringOfLength,
+	issuesByPath,
+	type Infer
+} from '.';
+
+describe('issuesByPath', function () {
+	it('should group messages by dotted path, in order', function () {
+		const isSignup = isShape({ email: isString, age: isIntegerInRange(13, 130), tags: isArrayOf(isString) });
+
+		expect(issuesByPath(explain(isSignup, { age: 7, tags: ['a', 1, 2] }))).toEqual({
+			email: ['Missing required property'],
+			age: ['Expected an integer between 13 and 130 (got 7)'],
+			'tags.1': ['Invalid value (got number)'],
+			'tags.2': ['Invalid value (got number)']
+		});
+		expect(
+			issuesByPath([
+				{ message: 'a', path: ['x'] },
+				{ message: 'b', path: [] },
+				{ message: 'c', path: ['x'] }
+			])
+		).toEqual({ x: ['a', 'c'], '': ['b'] });
+		expect(issuesByPath([])).toEqual({});
+	});
+
+	it('should stringify symbol and number segments, and keep __proto__ an ordinary key', function () {
+		const grouped = issuesByPath([
+			{ message: 'a', path: ['__proto__'] },
+			{ message: 'b', path: [Symbol('s'), 0] }
+		]);
+
+		expect(Object.getPrototypeOf(grouped)).toBeNull();
+		expect(grouped['__proto__']).toEqual(['a']);
+		expect(grouped['Symbol(s).0']).toEqual(['b']);
+	});
+
+	it('should validate its argument', function () {
+		expect(function () {
+			issuesByPath(null as never);
+		}).toThrow(new TypeError('issuesByPath: `issues` must be an array, got null'));
+	});
+});
 
 describe('isIntegerInRange', function () {
 	const isPort = isIntegerInRange(1, 65535);
@@ -10,7 +61,13 @@ describe('isIntegerInRange', function () {
 		expect(isPort(8080)).toBe(true);
 		expect(isIntegerInRange(-1, 1)(-0)).toBe(true);
 		expect(isIntegerInRange(1, Infinity)(Number.MAX_SAFE_INTEGER)).toBe(true);
-		expect(isIntegerInRange(-Infinity, 0)(-1e300)).toBe(true);
+		expect(isIntegerInRange(-Infinity, 0)(Number.MIN_SAFE_INTEGER)).toBe(true);
+	});
+
+	it('should reject integers beyond the safe range, even with infinite bounds', function () {
+		expect(isIntegerInRange(1, Infinity)(2 ** 60)).toBe(false);
+		expect(isIntegerInRange(-Infinity, 0)(-1e300)).toBe(false);
+		expect(isIntegerInRange(-Infinity, Infinity)(Number.MAX_SAFE_INTEGER + 1)).toBe(false);
 	});
 
 	it('should reject fractions, out-of-range values and non-numbers', function () {

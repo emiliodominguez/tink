@@ -812,8 +812,10 @@ export function isArrayOf<T>(guard: Guard<T>): (value: unknown) => value is T[] 
 		function isArrayOfGuarded(value: unknown): value is T[] {
 			if (!Array.isArray(value)) return false;
 
+			const direct = !isArrayPrototypePolluted();
+
 			for (let index = 0; index < value.length; index++) {
-				if (!guard(value[index])) return false;
+				if (!guard(direct || hasOwn.call(value, index) ? value[index] : undefined)) return false;
 			}
 
 			return true;
@@ -825,9 +827,12 @@ export function isArrayOf<T>(guard: Guard<T>): (value: unknown) => value is T[] 
 				return false;
 			}
 
+			const direct = !isArrayPrototypePolluted();
 			let passed = true;
 
-			for (let index = 0; index < value.length; index++) passed = collectChild(guard, value[index], index, path, issues) && passed;
+			for (let index = 0; index < value.length; index++) {
+				passed = collectChild(guard, direct || hasOwn.call(value, index) ? value[index] : undefined, index, path, issues) && passed;
+			}
 
 			return passed;
 		}
@@ -1181,6 +1186,18 @@ export interface IsShapeOptions {
 const hasOwn = Object.prototype.hasOwnProperty;
 
 /**
+ * Whether `Array.prototype` (or `Object.prototype`, which it inherits from) has an enumerable property: what prototype pollution adds,
+ * and what the holes of a sparse array would then read. Array guards read elements without an own-property check otherwise, which keeps
+ * that check (2.5 times the cost of reading an element) off the common path.
+ * @returns {boolean} Whether array elements must be read as own properties
+ */
+function isArrayPrototypePolluted(): boolean {
+	for (const key in Array.prototype) return typeof key === 'string';
+
+	return false;
+}
+
+/**
  * Creates a guard for objects with the given property guards: the TypeScript-only, zero-dependency equivalent of `z.object()`.
  * Each guard receives the OWN property value, or `undefined` when the property is missing or only inherited (so `toString` or a
  * polluted `Object.prototype` can never satisfy a shape). Properties whose guard accepts `undefined` (see {@link isOptional}) are
@@ -1411,7 +1428,9 @@ export function isTuple<const G extends ReadonlyArray<Guard<unknown>>>(...guards
 		function isTupleValue(value: unknown): value is { -readonly [K in keyof G]: Infer<G[K]> } {
 			if (!Array.isArray(value) || value.length !== elements.length) return false;
 
-			for (let index = 0; index < elements.length; index++) if (!elements[index](value[index])) return false;
+			const direct = !isArrayPrototypePolluted();
+
+			for (let index = 0; index < elements.length; index++) if (!elements[index](direct || hasOwn.call(value, index) ? value[index] : undefined)) return false;
 
 			return true;
 		},
@@ -1426,7 +1445,11 @@ export function isTuple<const G extends ReadonlyArray<Guard<unknown>>>(...guards
 
 			let passed = true;
 
-			for (let index = 0; index < elements.length; index++) passed = collectChild(elements[index], value[index], index, path, issues) && passed;
+			const direct = !isArrayPrototypePolluted();
+
+			for (let index = 0; index < elements.length; index++) {
+				passed = collectChild(elements[index], direct || hasOwn.call(value, index) ? value[index] : undefined, index, path, issues) && passed;
+			}
 
 			return passed;
 		}
@@ -1558,9 +1581,9 @@ export function isNumberInRange(min: number, max: number): (value: unknown) => v
 }
 
 /**
- * Creates a guard accepting integers between `min` and `max`, both inclusive (`z.number().int().min().max()`): ports, ages, page
- * numbers. The bounds may be fractional or infinite (`isIntegerInRange(1, Infinity)` is "a positive integer"). {@link explain} reports
- * the range.
+ * Creates a guard accepting safe integers between `min` and `max`, both inclusive (`z.number().int().min().max()`): ports, ages, page
+ * numbers. The bounds may be fractional or infinite (`isIntegerInRange(1, Infinity)` is "a positive safe integer"); integers beyond
+ * `Number.MAX_SAFE_INTEGER` are rejected, since they cannot be told apart from their neighbours. {@link explain} reports the range.
  * @param {number} min - The smallest accepted integer
  * @param {number} max - The largest accepted integer
  * @returns {(value: unknown) => boolean} A guard narrowing to `number`
@@ -1578,7 +1601,7 @@ export function isIntegerInRange(min: number, max: number): (value: unknown) => 
 	assertNumber('isIntegerInRange', 'max', max, max >= min, `a number >= min (${min})`);
 
 	return expecting(function isIntegerInBounds(value: unknown): value is number {
-		return Number.isInteger(value) && (value as number) >= min && (value as number) <= max;
+		return Number.isSafeInteger(value) && (value as number) >= min && (value as number) <= max;
 	}, `an integer between ${min} and ${max}`);
 }
 
@@ -2111,6 +2134,32 @@ export function ensure<T>(guard: Guard<T>, value: unknown): T {
 	if (issues.length > 0) throw new ValidationError(issues);
 
 	return value as T;
+}
+
+/**
+ * Groups issues by path, for showing errors next to form fields: each key is a path joined with dots (`'address.city'`, `'tags.1'`,
+ * `''` for the root), each value the messages at that path, in order. Works with {@link explain}'s result, a {@link ValidationError}'s
+ * `issues` and Standard Schema issues. The result has a `null` prototype, so a `__proto__` path is an ordinary key.
+ * @param {ReadonlyArray<SchemaIssue>} issues - The issues
+ * @returns {Record<string, string[]>} The messages by path
+ * @throws {TypeError} when `issues` is not an array
+ * @example
+ * const isSignup = isShape({ email: isString, age: isIntegerInRange(13, 130), tags: isArrayOf(isString) });
+ * issuesByPath(explain(isSignup, { age: 7, tags: ['a', 1] })); // => { email: ['Missing required property'], age: ['Expected an integer between 13 and 130 (got 7)'], 'tags.1': ['Invalid value (got number)'] }
+ * issuesByPath(explain(isString, 1)); // => { '': ['Invalid value (got number)'] }
+ */
+export function issuesByPath(issues: ReadonlyArray<SchemaIssue>): Record<string, string[]> {
+	if (!Array.isArray(issues)) throw new TypeError(`issuesByPath: \`issues\` must be an array, got ${typeName(issues)}`);
+
+	const grouped: Record<string, string[]> = Object.create(null);
+
+	for (const issue of issues) {
+		const key = issue.path.map(String).join('.');
+
+		(grouped[key] ??= []).push(issue.message);
+	}
+
+	return grouped;
 }
 
 /**
