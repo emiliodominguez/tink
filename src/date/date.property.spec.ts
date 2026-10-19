@@ -149,12 +149,14 @@ describe('Date helpers (properties)', function () {
 				expect(sm.getTime()).toBeLessThanOrEqual(time);
 				expect(em.getTime()).toBeGreaterThanOrEqual(time);
 				expect(sm.getDate()).toBe(1);
-				expect(em.getDate()).toBe(helpers.getDaysInMonth(date));
+				// The last day of the month or year can have been skipped (Kiritimati skipped 1994-12-31): the next instant is in the next one.
+				expect(helpers.isSameMonth(em.getTime() + 1, date)).toBe(false);
 				expect(helpers.isSameMonth(sm, date) && helpers.isSameMonth(em, date)).toBe(true);
 				expect(sy.getTime()).toBeLessThanOrEqual(sm.getTime());
 				expect(ey.getTime()).toBeGreaterThanOrEqual(em.getTime());
 				expect(ymd(sy)).toEqual([date.getFullYear(), 0, 1]);
-				expect(ymd(ey)).toEqual([date.getFullYear(), 11, 31]);
+				expect(ymd(ey).slice(0, 2)).toEqual([date.getFullYear(), 11]);
+				expect(helpers.isSameYear(ey.getTime() + 1, date)).toBe(false);
 			})
 		);
 	});
@@ -392,6 +394,8 @@ describe('Date helpers (properties)', function () {
 				fc.property(dateArb, fc.integer({ min: 0, max: 400 }), fc.integer({ min: 1, max: 10 }), function (start, span, step) {
 					const end = helpers.addDays(start, span);
 					const days = helpers.eachDayOfInterval(start, end, { step });
+					// A skipped calendar day (Samoa 2011-12-30) is listed once with the next one: covered by an example test instead.
+					fc.pre(helpers.eachDayOfInterval(start, end).length === helpers.diffInDays(end, start) + 1);
 
 					expect(days).toHaveLength(Math.floor(helpers.diffInDays(end, start) / step) + 1);
 					expect(helpers.isSameDay(days[0], start)).toBe(true);
@@ -455,7 +459,9 @@ describe('Date helpers (properties)', function () {
 					const anniversary = helpers.addYears(birth, n);
 
 					expect(helpers.getAge(birth, anniversary)).toBe(n);
-					if (n > 0) expect(helpers.getAge(birth, helpers.addDays(anniversary, -1))).toBe(n - 1);
+					const dayBefore = helpers.addDays(anniversary, -1);
+					// Unless that day was skipped (Samoa skipped 2011-12-30: `addDays` then lands on the anniversary itself).
+					if (n > 0 && helpers.diffInDays(anniversary, dayBefore) === 1) expect(helpers.getAge(birth, dayBefore)).toBe(n - 1);
 
 					fc.pre(helpers.diffInDays(other, birth) >= 0);
 
@@ -638,7 +644,9 @@ describe('Date helpers (properties)', function () {
 					const result = helpers.addDuration(date, duration);
 					// Same calendar day as month-then-day stepping, and the absolute time on top.
 					const expected = helpers.addDays(calendar, weeks * 7 + days);
-					fc.pre(timeOfDay(expected).join() === timeOfDay(date).join());
+					// Skip a DST gap at the target time, and an intermediate day that was skipped (Kiritimati skipped 1994-12-31): stepping in two
+					// conversions then differs from the single one of `addDuration`.
+					fc.pre(timeOfDay(expected).join() === timeOfDay(date).join() && calendar.getDate() === Math.min(date.getDate(), helpers.getDaysInMonth(calendar)));
 					expect(result.getTime()).toBe(expected.getTime() + time);
 					const negated = Object.fromEntries(
 						Object.entries(duration).map(function ([key, value]) {
@@ -853,5 +861,309 @@ describe('Date helpers (properties)', function () {
 				})
 			);
 		});
+	});
+});
+
+const MAX_TIME = 8.64e15;
+const HOUR = 3_600_000;
+const DAY = 24 * HOUR;
+const IANA_ZONES = Intl.supportedValuesOf('timeZone');
+const OFFSET_ZONES = ['+05:30', '-08:00', '+14', '-1200', '-00:00', '+05:45'];
+const zoneArb = fc.oneof({ weight: 9, arbitrary: fc.constantFrom(...IANA_ZONES) }, { weight: 1, arbitrary: fc.constantFrom(...OFFSET_ZONES) });
+/** Zones with many, unusual or historical transitions. */
+const TRICKY_ZONES = [
+	'America/New_York',
+	'Australia/Lord_Howe',
+	'America/Havana',
+	'America/St_Johns',
+	'Pacific/Apia',
+	'America/Sao_Paulo',
+	'Europe/Dublin',
+	'Asia/Beirut',
+	'Europe/Paris',
+	'Antarctica/Troll',
+	'Pacific/Kiritimati',
+	'America/Caracas',
+	'America/Toronto'
+];
+/** Any valid instant, or (as often) one between 1850 and 2050, where nearly all transitions are. */
+const instantArb = fc.oneof(fc.integer({ min: -MAX_TIME, max: MAX_TIME }), fc.integer({ min: Date.UTC(1850, 0, 1), max: Date.UTC(2050, 0, 1) }));
+
+/**
+ * The UTC offset of a zone at an instant, in milliseconds.
+ */
+function offsetMs(zone: string, time: number): number {
+	return Math.round(helpers.getTimeZoneOffset(zone, time) * 60_000);
+}
+
+/**
+ * The wall-clock fields as the UTC timestamp of the same fields (only for times not too close to the ends of the Date range).
+ */
+function wallOf(fields: helpers.WallClockTime): number {
+	const date = new Date(0);
+	date.setUTCFullYear(fields.year, fields.month - 1, fields.day);
+	date.setUTCHours(fields.hour ?? 0, fields.minute ?? 0, fields.second ?? 0, fields.millisecond ?? 0);
+	return date.getTime();
+}
+
+/**
+ * The fields of the wall-clock time written as the UTC timestamp `wall`.
+ */
+function fieldsOf(wall: number): helpers.WallClockTime {
+	const date = new Date(wall);
+	return {
+		year: date.getUTCFullYear(),
+		month: date.getUTCMonth() + 1,
+		day: date.getUTCDate(),
+		hour: date.getUTCHours(),
+		minute: date.getUTCMinutes(),
+		second: date.getUTCSeconds(),
+		millisecond: date.getUTCMilliseconds()
+	};
+}
+
+const referenceFormats = new Map<string, Intl.DateTimeFormat>();
+
+/**
+ * Reference wall-clock fields read directly from `Intl` (with eras and a localized weekday), independently of the module's arithmetic.
+ */
+function referenceParts(time: number, zone: string): helpers.ZonedDateTimeParts {
+	let format = referenceFormats.get(zone);
+	if (format === undefined) {
+		format = new Intl.DateTimeFormat('en-US', {
+			timeZone: zone,
+			era: 'short',
+			year: 'numeric',
+			month: 'numeric',
+			day: 'numeric',
+			weekday: 'short',
+			hour: 'numeric',
+			minute: 'numeric',
+			second: 'numeric',
+			fractionalSecondDigits: 3,
+			hourCycle: 'h23',
+			timeZoneName: 'longOffset'
+		});
+		referenceFormats.set(zone, format);
+	}
+	const parts: Record<string, string> = {};
+	for (const part of format.formatToParts(time)) parts[part.type] = part.value;
+	const offset = /^GMT(?:([+-])(\d\d):(\d\d)(?::(\d\d))?)?$/.exec(parts.timeZoneName) as RegExpExecArray;
+	const offsetSeconds = offset[1] === undefined ? 0 : (offset[1] === '-' ? -1 : 1) * (Number(offset[2]) * 3600 + Number(offset[3]) * 60 + Number(offset[4] ?? 0));
+	return {
+		year: parts.era === 'BC' ? 1 - Number(parts.year) : Number(parts.year),
+		month: Number(parts.month),
+		day: Number(parts.day),
+		hour: Number(parts.hour),
+		minute: Number(parts.minute),
+		second: Number(parts.second),
+		millisecond: Number(parts.fractionalSecond),
+		weekday: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(parts.weekday) as helpers.WeekdayIndex,
+		offset: offsetSeconds / 60
+	};
+}
+
+/**
+ * Every instant at which the offset of `zone` changes between 1890 and 2040 (found by weekly scanning, then bisection).
+ */
+function transitionsOf(zone: string): number[] {
+	const result: number[] = [];
+	const step = 7 * DAY;
+	for (let time = Date.UTC(1890, 0, 1); time < Date.UTC(2040, 0, 1); time += step) {
+		if (offsetMs(zone, time) === offsetMs(zone, time + step)) continue;
+		let low = time;
+		let high = time + step;
+		while (high - low > 1) {
+			const middle = Math.floor((low + high) / 2);
+			if (offsetMs(zone, middle) === offsetMs(zone, low)) low = middle;
+			else high = middle;
+		}
+		result.push(high);
+	}
+	return result;
+}
+
+describe('Time zone helpers (properties)', function () {
+	const transitions: Array<[string, number]> = [];
+
+	beforeAll(function () {
+		TRICKY_ZONES.forEach(function (zone) {
+			transitionsOf(zone).forEach(function (time) {
+				transitions.push([zone, time]);
+			});
+		});
+	});
+
+	/**
+	 * A zone and an instant within a few hours of one of its transitions.
+	 */
+	function nearTransitionArb(): fc.Arbitrary<[string, number]> {
+		return fc.tuple(fc.nat({ max: 1_000_000 }), fc.integer({ min: -3 * HOUR, max: 3 * HOUR })).map(function ([index, delta]): [string, number] {
+			const [zone, time] = transitions[index % transitions.length];
+			return [zone, time + delta];
+		});
+	}
+
+	it('finds transitions in the tricky zones', function () {
+		expect(transitions.length).toBeGreaterThan(1000);
+	});
+
+	it('getZonedParts and getTimeZoneOffset agree with the fields that Intl writes', function () {
+		fc.assert(
+			fc.property(fc.constantFrom(...IANA_ZONES), instantArb, function (zone, time) {
+				const parts = helpers.getZonedParts(time, zone);
+				expect(parts).toEqual(referenceParts(time, zone));
+				expect(helpers.getTimeZoneOffset(zone, time)).toBe(parts.offset);
+			}),
+			{ numRuns: 500 }
+		);
+	});
+
+	it('the wall clock is the instant plus the offset, in every zone', function () {
+		fc.assert(
+			fc.property(zoneArb, fc.integer({ min: -8.6e15, max: 8.6e15 }), function (zone, time) {
+				const parts = helpers.getZonedParts(time, zone);
+				expect(wallOf(parts) - time).toBe(Math.round(parts.offset * 60_000));
+				expect(parts.weekday).toBe(new Date(wallOf(parts)).getUTCDay());
+			}),
+			{ numRuns: 500 }
+		);
+	});
+
+	it('fromZonedTime(getZonedParts(t, zone), zone) is t', function () {
+		fc.assert(
+			fc.property(fc.oneof(fc.tuple(zoneArb, instantArb), nearTransitionArb()), function ([zone, time]) {
+				expect(helpers.fromZonedTime(helpers.getZonedParts(time, zone), zone).getTime()).toBe(time);
+			}),
+			{ numRuns: 500 }
+		);
+	});
+
+	it('fromZonedTime finds every occurrence of a wall-clock time and resolves gaps like Temporal (naive reference)', function () {
+		const wallArb = fc.oneof(
+			fc.tuple(zoneArb, fc.integer({ min: Date.UTC(1850, 0, 1), max: Date.UTC(2050, 0, 1) })),
+			// Wall-clock times around a transition, as read before it: inside the gaps and the repeated hours.
+			nearTransitionArb().map(function ([zone, time]): [string, number] {
+				return [zone, time + offsetMs(zone, time - 3 * HOUR)];
+			})
+		);
+		fc.assert(
+			fc.property(wallArb, function ([zone, wall]) {
+				const fields = fieldsOf(wall);
+				// Naive reference: try every offset in force within two days.
+				const offsets = new Set<number>();
+				for (let time = wall - 2 * DAY; time <= wall + 2 * DAY; time += HOUR / 4) offsets.add(offsetMs(zone, time));
+				const occurrences = [...offsets]
+					.map(function (offset) {
+						return wall - offset;
+					})
+					.filter(function (time) {
+						return wallOf(helpers.getZonedParts(time, zone)) === wall;
+					})
+					.sort(function (a, b) {
+						return a - b;
+					});
+				const earlier = helpers.fromZonedTime(fields, zone, { disambiguation: 'earlier' }).getTime();
+				const later = helpers.fromZonedTime(fields, zone, { disambiguation: 'later' }).getTime();
+				const compatible = helpers.fromZonedTime(fields, zone).getTime();
+				/**
+				 * Resolves the wall-clock time with `'reject'`.
+				 */
+				function reject(): number {
+					return helpers.fromZonedTime(fields, zone, { disambiguation: 'reject' }).getTime();
+				}
+				if (occurrences.length > 0) {
+					expect([earlier, later]).toEqual([occurrences[0], occurrences[occurrences.length - 1]]);
+					expect(compatible).toBe(earlier);
+					if (occurrences.length === 1) expect(reject()).toBe(earlier);
+					else expect(reject).toThrow(RangeError);
+				} else {
+					// A gap: 'later' (and 'compatible') moves forward by its length, 'earlier' back by it.
+					const gap = later - earlier;
+					expect(gap).toBeGreaterThan(0);
+					expect(compatible).toBe(later);
+					expect(wallOf(helpers.getZonedParts(later, zone)) - wall).toBe(gap);
+					expect(wall - wallOf(helpers.getZonedParts(earlier, zone))).toBe(gap);
+					expect(reject).toThrow(RangeError);
+				}
+			}),
+			{ numRuns: 300 }
+		);
+	});
+
+	it('startOfDayInTimeZone / endOfDayInTimeZone bound exactly the instants of the zone day', function () {
+		/**
+		 * The epoch day of the wall clock of `zone` at `time`.
+		 */
+		function dayOf(zone: string, time: number): number {
+			return Math.floor(wallOf(helpers.getZonedParts(time, zone)) / DAY);
+		}
+		fc.assert(
+			fc.property(fc.oneof(fc.tuple(zoneArb, fc.integer({ min: -8.6e15, max: 8.6e15 })), nearTransitionArb()), function ([zone, time]) {
+				const start = helpers.startOfDayInTimeZone(time, zone).getTime();
+				const end = helpers.endOfDayInTimeZone(time, zone).getTime();
+				const day = dayOf(zone, time);
+				expect(start).toBeLessThanOrEqual(time);
+				expect(end).toBeGreaterThanOrEqual(time);
+				expect([dayOf(zone, start), dayOf(zone, end)]).toEqual([day, day]);
+				expect(dayOf(zone, start - 1)).toBeLessThan(day);
+				expect(dayOf(zone, end + 1)).toBeGreaterThan(day);
+			}),
+			{ numRuns: 500 }
+		);
+	});
+
+	it('agree with the local-time helpers in the runtime time zone', function () {
+		const local = Intl.DateTimeFormat().resolvedOptions().timeZone;
+		const pieceArb = fc.constantFrom('YYYY', 'YY', 'MM', 'M', 'DD', 'D', 'HH', 'H', 'hh', 'h', 'mm', 'm', 'ss', 's', 'SSS', 'A', 'a', '-', ':', ' ', '[T]', '[Z]');
+		fc.assert(
+			fc.property(dateArb, fc.array(pieceArb, { maxLength: 8 }), function (date, pieces) {
+				const parts = helpers.getZonedParts(date, local);
+				expect([parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second, parts.millisecond, parts.weekday]).toEqual([
+					...ymd(date),
+					...timeOfDay(date),
+					date.getDay()
+				]);
+				expect(helpers.startOfDayInTimeZone(date, local).getTime()).toBe(helpers.startOfDay(date).getTime());
+				expect(helpers.endOfDayInTimeZone(date, local).getTime()).toBe(helpers.endOfDay(date).getTime());
+				const pattern = pieces.join('');
+				expect(helpers.formatInTimeZone(date, local, pattern)).toBe(helpers.formatDate(date, pattern));
+			}),
+			{ numRuns: 300 }
+		);
+	});
+
+	it('formatInTimeZone writes RFC 3339 timestamps that parse back to the same instant', function () {
+		fc.assert(
+			fc.property(zoneArb, fc.integer({ min: Date.parse('0001-01-02T00:00:00Z'), max: Date.UTC(9999, 11, 30) }), function (zone, time) {
+				// Offsets with seconds (local mean time) cannot be parsed by Date.
+				fc.pre(offsetMs(zone, time) % 60_000 === 0);
+				expect(Date.parse(helpers.formatInTimeZone(time, zone, 'YYYY-MM-DD[T]HH:mm:ss.SSSZ'))).toBe(time);
+			}),
+			{ numRuns: 500 }
+		);
+	});
+
+	it('getCalendarMonth matches a naive grid built with Date setters', function () {
+		fc.assert(
+			fc.property(fc.integer({ min: 1, max: 9999 }), fc.integer({ min: 0, max: 11 }), weekdayArb, fc.boolean(), function (year, monthIndex, weekStartsOn, fixedWeeks) {
+				const weeks = helpers.getCalendarMonth(year, monthIndex, { weekStartsOn, fixedWeeks });
+				const first = new Date(2000, 0, 1, 12);
+				first.setFullYear(year, monthIndex, 1);
+				const lead = (first.getDay() - weekStartsOn + 7) % 7;
+				const length = helpers.daysInMonth(year, monthIndex);
+				expect(weeks).toHaveLength(fixedWeeks ? 6 : Math.ceil((lead + length) / 7));
+				weeks.flat().forEach(function (cell, i) {
+					const expected = new Date(2000, 0, 1, 12);
+					expected.setFullYear(year, monthIndex, 1 - lead + i);
+					expected.setHours(0, 0, 0, 0);
+					expect(cell.getTime()).toBe(expected.getTime());
+				});
+				weeks.forEach(function (week) {
+					expect(week).toHaveLength(7);
+				});
+			}),
+			{ numRuns: 300 }
+		);
 	});
 });

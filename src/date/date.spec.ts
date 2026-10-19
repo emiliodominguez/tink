@@ -861,7 +861,7 @@ describe('Date helpers', function () {
 		it('addDays keeps the wall-clock time across the New York spring-forward (2023-03-12)', function () {
 			expect(parts(helpers.addDays(new Date(2023, 2, 11, 12), 1))).toEqual([2023, 2, 12, 12, 0, 0, 0]);
 			expect(parts(helpers.addDays(new Date(2023, 2, 11, 12), 2))).toEqual([2023, 2, 13, 12, 0, 0, 0]);
-			expect(parts(helpers.addDays(new Date(2023, 2, 13, 0, 30), -1))).toEqual([2023, 2, 12, 0, 30, 0, 0]);
+			expect(parts(helpers.addDays(new Date(2023, 2, 13, 0, 30), -1))).toEqual(parts(new Date(2023, 2, 12, 0, 30))); // 01:30 where midnight was skipped (Havana)
 			expect(helpers.diffInDays(new Date(2023, 2, 13), new Date(2023, 2, 12))).toBe(1);
 			expect(helpers.diffInDays(new Date(2023, 2, 12, 23, 59), new Date(2023, 2, 11, 0, 0))).toBe(1);
 		});
@@ -884,7 +884,7 @@ describe('Date helpers', function () {
 
 		it('start/end of day around the New York and Lord Howe transitions', function () {
 			[new Date(2023, 2, 12, 12), new Date(2023, 10, 5, 12), new Date(2023, 3, 2, 12), new Date(2023, 9, 1, 12)].forEach(function (date) {
-				expect(parts(helpers.startOfDay(date))).toEqual([...ymd(date), 0, 0, 0, 0]);
+				expect(parts(helpers.startOfDay(date))).toEqual(parts(new Date(date.getFullYear(), date.getMonth(), date.getDate())));
 				expect(parts(helpers.endOfDay(date))).toEqual([...ymd(date), 23, 59, 59, 999]);
 			});
 		});
@@ -907,7 +907,7 @@ describe('Date helpers', function () {
 		it('addMonths and startOfWeek across transitions', function () {
 			expect(parts(helpers.addMonths(new Date(2023, 1, 12, 12), 1))).toEqual([2023, 2, 12, 12, 0, 0, 0]);
 			expect(parts(helpers.addMonths(new Date(2023, 9, 5, 1, 30), 1))).toEqual([2023, 10, 5, 1, 30, 0, 0]);
-			expect(parts(helpers.startOfWeek(new Date(2023, 2, 15, 12)))).toEqual([2023, 2, 12, 0, 0, 0, 0]);
+			expect(parts(helpers.startOfWeek(new Date(2023, 2, 15, 12)))).toEqual(parts(new Date(2023, 2, 12)));
 			expect(parts(helpers.endOfWeek(new Date(2023, 10, 1, 12), 1))).toEqual([2023, 10, 5, 23, 59, 59, 999]);
 		});
 	});
@@ -952,7 +952,8 @@ describe('Date helpers', function () {
 
 			expect(Number.isInteger(days)).toBe(true);
 			expect(Math.abs(days + 100_000_000)).toBeLessThanOrEqual(1);
-			expect(helpers.diffInDays(8.64e15, -8.64e15)).toBe(200_000_000);
+			// The exact span depends on the time zone (see 'diffInDays spans the whole Date range in any time zone').
+			expect(Math.abs(helpers.diffInDays(8.64e15, -8.64e15) - 200_000_000)).toBeLessThanOrEqual(1);
 		});
 
 		it('accepts Dates created in another realm (vm context / iframe)', function () {
@@ -2404,6 +2405,837 @@ describe('Date helpers', function () {
 	});
 });
 
+/**
+ * Writes an instant as an RFC 3339 timestamp on the wall clock of a time zone.
+ */
+function inZone(date: Date | number, timeZone: string): string {
+	return helpers.formatInTimeZone(date, timeZone, 'YYYY-MM-DD[T]HH:mm:ss.SSSZ');
+}
+
+describe('Time zones', function () {
+	describe('isValidTimeZone', function () {
+		it('accepts IANA names known to Intl and UTC offsets', function () {
+			['UTC', 'utc', 'America/New_York', 'america/new_york', 'US/Eastern', 'Etc/GMT+12', 'Asia/Kathmandu'].forEach(function (zone) {
+				expect(helpers.isValidTimeZone(zone)).toBe(true);
+			});
+			['+05:30', '-0800', '+05', '-00:00', '+23:59', '-23'].forEach(function (zone) {
+				expect(helpers.isValidTimeZone(zone)).toBe(true);
+			});
+		});
+
+		it('rejects anything else without throwing', function () {
+			['Mars/Olympus_Mons', '', ' UTC', 'UTC ', '+5:30', '+24:00', '+05:60', '+05:30:00', '+05:', '05:30', '−05:00', 'x'.repeat(5000)].forEach(function (zone) {
+				expect(helpers.isValidTimeZone(zone)).toBe(false);
+			});
+			[42, null, undefined, {}, ['UTC'], new String('UTC')].forEach(function (zone) {
+				expect(helpers.isValidTimeZone(zone)).toBe(false);
+			});
+		});
+	});
+
+	describe('getTimeZoneOffset', function () {
+		it('returns minutes east of UTC at the given instant', function () {
+			expect(helpers.getTimeZoneOffset('America/New_York', Date.UTC(2024, 0, 15))).toBe(-300);
+			expect(helpers.getTimeZoneOffset('America/New_York', new Date(Date.UTC(2024, 6, 15)))).toBe(-240);
+			expect(helpers.getTimeZoneOffset('Asia/Kathmandu', 0)).toBe(330);
+			expect(helpers.getTimeZoneOffset('Asia/Kathmandu', Date.UTC(2024, 0, 1))).toBe(345);
+			expect(helpers.getTimeZoneOffset('Australia/Lord_Howe', Date.UTC(2024, 6, 1))).toBe(630);
+			expect(helpers.getTimeZoneOffset('Australia/Lord_Howe', Date.UTC(2024, 0, 1))).toBe(660);
+			expect(helpers.getTimeZoneOffset('Pacific/Kiritimati', Date.UTC(2024, 0, 1))).toBe(840);
+			expect(helpers.getTimeZoneOffset('UTC', Date.UTC(2024, 0, 1))).toBe(0);
+		});
+
+		it('switches exactly at the transition instant', function () {
+			// New York sprang forward at 2024-03-10 07:00 UTC.
+			expect(helpers.getTimeZoneOffset('America/New_York', Date.UTC(2024, 2, 10, 7) - 1)).toBe(-300);
+			expect(helpers.getTimeZoneOffset('America/New_York', Date.UTC(2024, 2, 10, 7))).toBe(-240);
+		});
+
+		it('defaults to now', function () {
+			expect(helpers.getTimeZoneOffset('Asia/Kolkata')).toBe(330);
+			expect(helpers.getTimeZoneOffset('-08:00')).toBe(-480);
+		});
+
+		it('returns local mean time offsets exactly, as fractional minutes', function () {
+			const paris = helpers.getTimeZoneOffset('Europe/Paris', Date.UTC(1900, 0, 1));
+			expect(paris).toBe(561 / 60);
+			expect(Math.round(paris * 60_000)).toBe(561_000);
+			expect(Math.round(helpers.getTimeZoneOffset('America/New_York', -8.64e15) * 60_000)).toBe(-(4 * 3600 + 56 * 60 + 2) * 1000);
+		});
+
+		it('parses fixed offsets, never returning -0', function () {
+			expect(helpers.getTimeZoneOffset('+05:30', 0)).toBe(330);
+			expect(helpers.getTimeZoneOffset('+0530', 0)).toBe(330);
+			expect(helpers.getTimeZoneOffset('-03', 0)).toBe(-180);
+			expect(Object.is(helpers.getTimeZoneOffset('-00:00', 0), 0)).toBe(true);
+			expect(Object.is(helpers.getTimeZoneOffset('-00', 0), 0)).toBe(true);
+		});
+
+		it('works at the ends of the Date range and with Dates from another realm', function () {
+			expect(helpers.getTimeZoneOffset('Pacific/Kiritimati', 8.64e15)).toBe(840);
+			expect(helpers.getTimeZoneOffset('America/New_York', vm.runInNewContext('new Date(Date.UTC(2024, 0, 1))'))).toBe(-300);
+		});
+
+		it('validates its arguments', function () {
+			expect(function () {
+				helpers.getTimeZoneOffset(5 as any, 0);
+			}).toThrow(new TypeError('getTimeZoneOffset: `timeZone` must be a string, got number'));
+			expect(function () {
+				helpers.getTimeZoneOffset('Mars/Base', 0);
+			}).toThrow(new RangeError('getTimeZoneOffset: `timeZone` must be an IANA time zone or a UTC offset (±HH:MM), got "Mars/Base"'));
+			expect(function () {
+				helpers.getTimeZoneOffset('x'.repeat(60), 0);
+			}).toThrow(new RangeError(`getTimeZoneOffset: \`timeZone\` must be an IANA time zone or a UTC offset (±HH:MM), got "${'x'.repeat(50)}…"`));
+			expect(function () {
+				helpers.getTimeZoneOffset('+25:00', 0);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.getTimeZoneOffset('UTC', '2024-01-01' as any);
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.getTimeZoneOffset('UTC', INVALID);
+			}).toThrow(new RangeError('Invalid date'));
+			expect(function () {
+				helpers.getTimeZoneOffset('UTC', 8.64e15 + 1);
+			}).toThrow(new RangeError('Invalid date'));
+		});
+	});
+
+	describe('getZonedParts', function () {
+		it('returns the wall-clock fields, month from 1 and weekday from 0', function () {
+			expect(helpers.getZonedParts(Date.UTC(2024, 2, 10, 7, 30, 15, 250), 'America/New_York')).toEqual({
+				year: 2024,
+				month: 3,
+				day: 10,
+				hour: 3,
+				minute: 30,
+				second: 15,
+				millisecond: 250,
+				weekday: 0,
+				offset: -240
+			});
+			expect(helpers.getZonedParts(Date.UTC(2024, 11, 31, 20), 'Asia/Tokyo')).toMatchObject({ year: 2025, month: 1, day: 1, hour: 5, weekday: 3 });
+			expect(helpers.getZonedParts(Date.UTC(2024, 0, 1, 0, 30), 'America/Los_Angeles')).toMatchObject({ year: 2023, month: 12, day: 31, hour: 16 });
+			expect(helpers.getZonedParts(Date.UTC(2024, 1, 29, 23), '+05:45')).toMatchObject({ month: 3, day: 1, hour: 4, minute: 45, offset: 345 });
+		});
+
+		it('keeps the seconds of local mean time offsets', function () {
+			expect(helpers.getZonedParts(Date.UTC(1900, 0, 1), 'Europe/Paris')).toMatchObject({ hour: 0, minute: 9, second: 21, offset: 561 / 60 });
+		});
+
+		it('tells the two occurrences of a repeated hour apart by their offset', function () {
+			const first = helpers.getZonedParts(Date.UTC(2024, 10, 3, 5, 30), 'America/New_York');
+			const second = helpers.getZonedParts(Date.UTC(2024, 10, 3, 6, 30), 'America/New_York');
+			expect({ ...first, offset: 0 }).toEqual({ ...second, offset: 0 });
+			expect([first.offset, second.offset]).toEqual([-240, -300]);
+		});
+
+		it('handles years before 1, after 9999 and the ends of the Date range', function () {
+			expect(helpers.getZonedParts(new Date('0000-03-01T00:30:00Z'), 'America/New_York')).toMatchObject({ year: 0, month: 2, day: 29 });
+			expect(helpers.getZonedParts(new Date('-000044-03-15T12:00:00Z'), 'UTC')).toMatchObject({ year: -44, month: 3, day: 15, weekday: 4 });
+			expect(helpers.getZonedParts(new Date('+012345-06-07T08:09:10Z'), 'Asia/Kolkata')).toMatchObject({ year: 12345, hour: 13, minute: 39 });
+			expect(helpers.getZonedParts(8.64e15, 'Pacific/Kiritimati')).toEqual({
+				year: 275760,
+				month: 9,
+				day: 13,
+				hour: 14,
+				minute: 0,
+				second: 0,
+				millisecond: 0,
+				weekday: 6,
+				offset: 840
+			});
+			expect(helpers.getZonedParts(-8.64e15, 'Asia/Manila')).toMatchObject({ year: -271821, month: 4, day: 19, hour: 8, minute: 3, second: 52, weekday: 1 });
+			expect(helpers.getZonedParts(-8.64e15, '+14:00')).toMatchObject({ year: -271821, month: 4, day: 20, hour: 14 });
+		});
+
+		it('does not depend on the runtime time zone', function () {
+			const instants = [Date.UTC(2024, 2, 10, 7, 30), Date.UTC(2011, 11, 30, 12), Date.UTC(1900, 0, 1), -8.64e15];
+			const reference = instants.map(function (time) {
+				return helpers.getZonedParts(time, 'America/Havana');
+			});
+			['UTC', 'Pacific/Apia', 'Australia/Lord_Howe', 'America/Havana'].forEach(function (zone) {
+				withTimeZone(zone, function () {
+					expect(
+						instants.map(function (time) {
+							return helpers.getZonedParts(time, 'America/Havana');
+						})
+					).toEqual(reference);
+				});
+			});
+		});
+
+		it('accepts Dates from another realm and returns a new object every time', function () {
+			const foreign = vm.runInNewContext('new Date(Date.UTC(2024, 0, 1, 12))');
+			expect(helpers.getZonedParts(foreign, 'UTC').hour).toBe(12);
+			expect(helpers.getZonedParts(0, 'UTC')).not.toBe(helpers.getZonedParts(0, 'UTC'));
+		});
+
+		it('validates its arguments', function () {
+			expect(function () {
+				helpers.getZonedParts(0, null as any);
+			}).toThrow(new TypeError('getZonedParts: `timeZone` must be a string, got null'));
+			expect(function () {
+				helpers.getZonedParts(0, 'Nowhere');
+			}).toThrow(new RangeError('getZonedParts: `timeZone` must be an IANA time zone or a UTC offset (±HH:MM), got "Nowhere"'));
+			expect(function () {
+				helpers.getZonedParts({} as any, 'UTC');
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.getZonedParts(NaN, 'UTC');
+			}).toThrow(new RangeError('Invalid date'));
+		});
+	});
+
+	describe('fromZonedTime', function () {
+		const NY = 'America/New_York';
+
+		it('returns the instant of a wall-clock time', function () {
+			expect(helpers.fromZonedTime({ year: 2024, month: 1, day: 15, hour: 9 }, NY).getTime()).toBe(Date.UTC(2024, 0, 15, 14));
+			expect(helpers.fromZonedTime({ year: 2024, month: 7, day: 4, hour: 12, minute: 30, second: 15, millisecond: 999 }, NY).getTime()).toBe(
+				Date.UTC(2024, 6, 4, 16, 30, 15, 999)
+			);
+			expect(helpers.fromZonedTime({ year: 2024, month: 1, day: 1 }, 'Asia/Kathmandu').getTime()).toBe(Date.UTC(2023, 11, 31, 18, 15));
+			expect(helpers.fromZonedTime({ year: 2024, month: 1, day: 1 }, '-03:30').getTime()).toBe(Date.UTC(2024, 0, 1, 3, 30));
+		});
+
+		it('resolves a skipped time like Temporal', function () {
+			const skipped = { year: 2024, month: 3, day: 10, hour: 2, minute: 30 };
+			expect(inZone(helpers.fromZonedTime(skipped, NY), NY)).toBe('2024-03-10T03:30:00.000-04:00');
+			expect(inZone(helpers.fromZonedTime(skipped, NY, { disambiguation: 'compatible' }), NY)).toBe('2024-03-10T03:30:00.000-04:00');
+			expect(inZone(helpers.fromZonedTime(skipped, NY, { disambiguation: 'later' }), NY)).toBe('2024-03-10T03:30:00.000-04:00');
+			expect(inZone(helpers.fromZonedTime(skipped, NY, { disambiguation: 'earlier' }), NY)).toBe('2024-03-10T01:30:00.000-05:00');
+			expect(function () {
+				helpers.fromZonedTime(skipped, NY, { disambiguation: 'reject' });
+			}).toThrow(
+				new RangeError('fromZonedTime: 2024-03-10T02:30:00.000 does not exist in America/New_York (the clocks were set forward); use another `disambiguation`')
+			);
+		});
+
+		it('resolves a repeated time like Temporal', function () {
+			const repeated = { year: 2024, month: 11, day: 3, hour: 1, minute: 30 };
+			expect(helpers.fromZonedTime(repeated, NY).getTime()).toBe(Date.UTC(2024, 10, 3, 5, 30));
+			expect(helpers.fromZonedTime(repeated, NY, { disambiguation: 'earlier' }).getTime()).toBe(Date.UTC(2024, 10, 3, 5, 30));
+			expect(helpers.fromZonedTime(repeated, NY, { disambiguation: 'later' }).getTime()).toBe(Date.UTC(2024, 10, 3, 6, 30));
+			expect(function () {
+				helpers.fromZonedTime(repeated, NY, { disambiguation: 'reject' });
+			}).toThrow(new RangeError('fromZonedTime: 2024-11-03T01:30:00.000 occurs twice in America/New_York (the clocks were set back); use another `disambiguation`'));
+			expect(helpers.fromZonedTime({ year: 2024, month: 11, day: 3, hour: 2 }, NY, { disambiguation: 'reject' }).getTime()).toBe(Date.UTC(2024, 10, 3, 7));
+		});
+
+		it('picks the occurrence with the given offset, whatever the disambiguation', function () {
+			const repeated = { year: 2024, month: 11, day: 3, hour: 1, minute: 30 };
+			expect(helpers.fromZonedTime({ ...repeated, offset: -300 }, NY).getTime()).toBe(Date.UTC(2024, 10, 3, 6, 30));
+			expect(helpers.fromZonedTime({ ...repeated, offset: -300 }, NY, { disambiguation: 'reject' }).getTime()).toBe(Date.UTC(2024, 10, 3, 6, 30));
+			expect(helpers.fromZonedTime({ ...repeated, offset: -240 }, NY, { disambiguation: 'later' }).getTime()).toBe(Date.UTC(2024, 10, 3, 5, 30));
+			// An offset that no occurrence has is ignored.
+			expect(helpers.fromZonedTime({ ...repeated, offset: 60 }, NY, { disambiguation: 'later' }).getTime()).toBe(Date.UTC(2024, 10, 3, 6, 30));
+			expect(helpers.fromZonedTime({ year: 2024, month: 1, day: 15, hour: 9, offset: -240 }, NY).getTime()).toBe(Date.UTC(2024, 0, 15, 14));
+			expect(function () {
+				helpers.fromZonedTime({ year: 2024, month: 3, day: 10, hour: 2, minute: 30, offset: -300 }, NY, { disambiguation: 'reject' });
+			}).toThrow(RangeError);
+		});
+
+		it('turns getZonedParts back into the same instant, repeated hours and local mean time included', function () {
+			[
+				[Date.UTC(2024, 10, 3, 5, 30), NY],
+				[Date.UTC(2024, 10, 3, 6, 30), NY],
+				[Date.parse('2010-11-07T03:00:00Z'), 'America/St_Johns'],
+				[Date.parse('2024-04-06T15:15:00Z'), 'Australia/Lord_Howe'],
+				[Date.UTC(1900, 0, 1, 0, 0, 0, 7), 'Europe/Paris'],
+				[-8.64e15, 'America/New_York'],
+				[8.64e15, 'Pacific/Kiritimati'],
+				[-8.64e15, '+14:00']
+			].forEach(function ([time, zone]) {
+				expect(helpers.fromZonedTime(helpers.getZonedParts(time as number, zone as string), zone as string).getTime()).toBe(time);
+			});
+		});
+
+		it('handles a 30-minute DST shift (Lord Howe Island)', function () {
+			const zone = 'Australia/Lord_Howe';
+			expect(inZone(helpers.fromZonedTime({ year: 2024, month: 10, day: 6, hour: 2, minute: 15 }, zone), zone)).toBe('2024-10-06T02:45:00.000+11:00');
+			expect(inZone(helpers.fromZonedTime({ year: 2024, month: 4, day: 7, hour: 1, minute: 45 }, zone), zone)).toBe('2024-04-07T01:45:00.000+11:00');
+			expect(inZone(helpers.fromZonedTime({ year: 2024, month: 4, day: 7, hour: 1, minute: 45 }, zone, { disambiguation: 'later' }), zone)).toBe(
+				'2024-04-07T01:45:00.000+10:30'
+			);
+		});
+
+		it('moves a time of a skipped calendar day to the next day (Samoa, 2011-12-30)', function () {
+			const zone = 'Pacific/Apia';
+			const friday = { year: 2011, month: 12, day: 30, hour: 12 };
+			expect(inZone(helpers.fromZonedTime(friday, zone), zone)).toBe('2011-12-31T12:00:00.000+14:00');
+			expect(inZone(helpers.fromZonedTime(friday, zone, { disambiguation: 'earlier' }), zone)).toBe('2011-12-29T12:00:00.000-10:00');
+		});
+
+		it('does not remap years 0-99 and handles negative years', function () {
+			expect(helpers.fromZonedTime({ year: 99, month: 1, day: 1 }, 'UTC').getUTCFullYear()).toBe(99);
+			expect(helpers.fromZonedTime({ year: 0, month: 2, day: 29 }, 'UTC').toISOString()).toBe('0000-02-29T00:00:00.000Z');
+			expect(helpers.fromZonedTime({ year: -44, month: 3, day: 15, hour: 12 }, 'UTC').toISOString()).toBe('-000044-03-15T12:00:00.000Z');
+		});
+
+		it('reaches the ends of the Date range exactly and rejects anything past them', function () {
+			expect(helpers.fromZonedTime({ year: 275760, month: 9, day: 13 }, 'UTC').getTime()).toBe(8.64e15);
+			expect(helpers.fromZonedTime({ year: 275760, month: 9, day: 12, hour: 20 }, NY).getTime()).toBe(8.64e15);
+			expect(helpers.fromZonedTime({ year: -271821, month: 4, day: 20 }, 'UTC').getTime()).toBe(-8.64e15);
+			expect(helpers.fromZonedTime({ year: -271821, month: 4, day: 20, hour: 14 }, '+14:00').getTime()).toBe(-8.64e15);
+			[
+				[{ year: 275760, month: 9, day: 13, millisecond: 1 }, 'UTC'],
+				[{ year: 275760, month: 9, day: 12, hour: 20, millisecond: 1 }, NY],
+				[{ year: -271821, month: 4, day: 19, hour: 23, minute: 59, second: 59, millisecond: 999 }, 'UTC'],
+				[{ year: 275761, month: 1, day: 1 }, 'UTC'],
+				[{ year: 1e20, month: 1, day: 1 }, 'UTC'],
+				[{ year: -1e20, month: 1, day: 1 }, NY],
+				[{ year: Number.MAX_VALUE, month: 1, day: 1 }, NY]
+			].forEach(function ([fields, zone]) {
+				expect(function () {
+					helpers.fromZonedTime(fields as helpers.WallClockTime, zone as string, { disambiguation: 'reject' });
+				}).toThrow(new RangeError('Resulting date is out of range'));
+			});
+		});
+
+		it('validates every field instead of rolling it over', function () {
+			const cases: Array<[unknown, Error]> = [
+				[null, new TypeError('fromZonedTime: `fields` must be an object, got null')],
+				['2024-01-01', new TypeError('fromZonedTime: `fields` must be an object, got string')],
+				[{ month: 1, day: 1 }, new TypeError('fromZonedTime: `fields.year` must be an integer, got undefined')],
+				[{ year: 2024.5, month: 1, day: 1 }, new RangeError('fromZonedTime: `fields.year` must be an integer, got 2024.5')],
+				[{ year: 2024, day: 1 }, new TypeError('fromZonedTime: `fields.month` must be an integer between 1 and 12, got undefined')],
+				[{ year: 2024, month: 0, day: 1 }, new RangeError('fromZonedTime: `fields.month` must be an integer between 1 and 12, got 0')],
+				[{ year: 2024, month: 13, day: 1 }, new RangeError('fromZonedTime: `fields.month` must be an integer between 1 and 12, got 13')],
+				[{ year: 2024, month: '1', day: 1 }, new TypeError('fromZonedTime: `fields.month` must be an integer between 1 and 12, got string')],
+				[{ year: 2023, month: 2, day: 29 }, new RangeError('fromZonedTime: `fields.day` must be an integer between 1 and 28, got 29')],
+				[{ year: 2024, month: 4, day: 0 }, new RangeError('fromZonedTime: `fields.day` must be an integer between 1 and 30, got 0')],
+				[{ year: 2024, month: 1, day: 1, hour: 24 }, new RangeError('fromZonedTime: `fields.hour` must be an integer between 0 and 23, got 24')],
+				[{ year: 2024, month: 1, day: 1, hour: -1 }, new RangeError('fromZonedTime: `fields.hour` must be an integer between 0 and 23, got -1')],
+				[{ year: 2024, month: 1, day: 1, minute: 60 }, new RangeError('fromZonedTime: `fields.minute` must be an integer between 0 and 59, got 60')],
+				[{ year: 2024, month: 1, day: 1, second: 60 }, new RangeError('fromZonedTime: `fields.second` must be an integer between 0 and 59, got 60')],
+				[{ year: 2024, month: 1, day: 1, second: 1.5 }, new RangeError('fromZonedTime: `fields.second` must be an integer between 0 and 59, got 1.5')],
+				[{ year: 2024, month: 1, day: 1, millisecond: 1000 }, new RangeError('fromZonedTime: `fields.millisecond` must be an integer between 0 and 999, got 1000')],
+				[{ year: 2024, month: 1, day: 1, hour: null }, new TypeError('fromZonedTime: `fields.hour` must be an integer between 0 and 23, got null')],
+				[{ year: 2024, month: 1, day: 1, offset: NaN }, new RangeError('fromZonedTime: `fields.offset` must be a finite number, got NaN')],
+				[{ year: 2024, month: 1, day: 1, offset: '60' }, new TypeError('fromZonedTime: `fields.offset` must be a finite number, got string')]
+			];
+			cases.forEach(function ([fields, error]) {
+				expect(function () {
+					helpers.fromZonedTime(fields as helpers.WallClockTime, 'UTC');
+				}).toThrow(error);
+			});
+			expect(function () {
+				helpers.fromZonedTime({ year: 2024, month: 1, day: 1 }, 'UTC', { disambiguation: 'first' as any });
+			}).toThrow(new RangeError('fromZonedTime: `disambiguation` must be one of compatible, earlier, later, reject, got first'));
+			expect(function () {
+				helpers.fromZonedTime({ year: 2024, month: 1, day: 1 }, 'Atlantis');
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.fromZonedTime({ year: 2024, month: 1, day: 1 }, undefined as any);
+			}).toThrow(new TypeError('fromZonedTime: `timeZone` must be a string, got undefined'));
+		});
+
+		it('ignores extra fields and reads each field once', function () {
+			const reads: string[] = [];
+			const fields = new Proxy(
+				{ year: 2024, month: 1, day: 15, hour: 9, weekday: 3 },
+				{
+					get: function (target: Record<string, number>, key: string) {
+						reads.push(key);
+						return target[key];
+					}
+				}
+			);
+			expect(helpers.fromZonedTime(fields as unknown as helpers.WallClockTime, NY).getTime()).toBe(Date.UTC(2024, 0, 15, 14));
+			expect(reads.sort()).toEqual(['day', 'hour', 'month', 'year']);
+		});
+	});
+
+	describe('formatInTimeZone', function () {
+		it('formats the wall clock of the zone with formatDate tokens', function () {
+			const instant = Date.UTC(2024, 0, 5, 14, 7, 9, 3);
+			expect(helpers.formatInTimeZone(instant, 'Asia/Kolkata', 'YYYY-MM-DD HH:mm:ss.SSS')).toBe('2024-01-05 19:37:09.003');
+			expect(helpers.formatInTimeZone(instant, 'America/Los_Angeles', 'D/M/YY h:mm a [in LA]')).toBe('5/1/24 6:07 am in LA');
+			expect(helpers.formatInTimeZone(instant, 'Pacific/Kiritimati', 'dddd YYYY-MM-DD hh A')).toBe('dddd 2024-01-06 04 AM');
+		});
+
+		it('writes the offset with Z and ZZ', function () {
+			const instant = Date.UTC(2024, 6, 4, 16);
+			expect(helpers.formatInTimeZone(instant, 'America/New_York', 'HH:mm Z ZZ')).toBe('12:00 -04:00 -0400');
+			expect(helpers.formatInTimeZone(instant, 'Asia/Kathmandu', 'Z|ZZ')).toBe('+05:45|+0545');
+			expect(helpers.formatInTimeZone(instant, 'UTC', 'Z|ZZ')).toBe('+00:00|+0000');
+			expect(helpers.formatInTimeZone(instant, '-00:00', 'Z')).toBe('+00:00');
+			expect(helpers.formatInTimeZone(instant, 'America/St_Johns', 'Z')).toBe('-02:30');
+			expect(helpers.formatInTimeZone(instant, 'UTC', 'HH:mm[Z]')).toBe('16:00Z');
+			expect(helpers.formatInTimeZone(instant, 'UTC', 'ZZZ')).toBe('+0000+00:00');
+			expect(helpers.formatDate(new Date(2024, 0, 5), 'D Z')).toBe('5 Z');
+		});
+
+		it('writes the seconds of local mean time offsets, so the text is the exact instant', function () {
+			expect(inZone(Date.UTC(1900, 0, 1), 'Europe/Paris')).toBe('1900-01-01T00:09:21.000+00:09:21');
+			expect(helpers.formatInTimeZone(Date.UTC(1900, 0, 1), 'Europe/Paris', 'ZZ')).toBe('+000921');
+			expect(inZone(-8.64e15, 'America/New_York')).toBe('-271821-04-19T19:03:58.000-04:56:02');
+		});
+
+		it('gives an RFC 3339 timestamp of the same instant', function () {
+			[Date.UTC(2024, 2, 10, 7, 30), Date.UTC(2024, 10, 3, 6, 30, 0, 5), 0].forEach(function (time) {
+				['America/New_York', 'Asia/Kolkata', 'Australia/Lord_Howe', 'UTC', '+05:45'].forEach(function (zone) {
+					expect(Date.parse(inZone(time, zone))).toBe(time);
+				});
+			});
+			expect(inZone(Date.UTC(2024, 10, 3, 5, 30), 'America/New_York')).toBe('2024-11-03T01:30:00.000-04:00');
+			expect(inZone(Date.UTC(2024, 10, 3, 6, 30), 'America/New_York')).toBe('2024-11-03T01:30:00.000-05:00');
+		});
+
+		it('writes years outside 0-9999 like formatDate', function () {
+			expect(helpers.formatInTimeZone(new Date('-000001-06-01T00:00:00Z'), 'UTC', 'YYYY YY')).toBe('-0001 01');
+			expect(helpers.formatInTimeZone(8.64e15, 'UTC', 'YYYY-MM-DD')).toBe('275760-09-13');
+		});
+
+		it('does not depend on the runtime time zone', function () {
+			const results = ['UTC', 'Pacific/Apia', 'America/Havana'].map(function (zone) {
+				let result = '';
+				withTimeZone(zone, function () {
+					result = inZone(Date.UTC(2024, 2, 10, 5), 'Europe/Paris');
+				});
+				return result;
+			});
+			expect(results).toEqual(['2024-03-10T06:00:00.000+01:00', '2024-03-10T06:00:00.000+01:00', '2024-03-10T06:00:00.000+01:00']);
+		});
+
+		it('tokenizes in linear time and only caches short patterns', function () {
+			const pattern = '['.repeat(200_000);
+			const start = performance.now();
+			expect(helpers.formatInTimeZone(0, 'UTC', pattern)).toBe(pattern);
+			expect(helpers.formatInTimeZone(0, 'UTC', `${pattern}Z`)).toBe(`${pattern}+00:00`);
+			expect(performance.now() - start).toBeLessThan(1000);
+			// Cached patterns give the same output.
+			expect(helpers.formatInTimeZone(0, 'UTC', 'YYYY Z')).toBe(helpers.formatInTimeZone(0, 'UTC', 'YYYY Z'));
+		});
+
+		it('validates its arguments', function () {
+			expect(function () {
+				helpers.formatInTimeZone(0, 'UTC', 5 as any);
+			}).toThrow(new TypeError('formatInTimeZone: `pattern` must be a string, got number'));
+			expect(function () {
+				helpers.formatInTimeZone(0, 'Narnia', 'YYYY');
+			}).toThrow(new RangeError('formatInTimeZone: `timeZone` must be an IANA time zone or a UTC offset (±HH:MM), got "Narnia"'));
+			expect(function () {
+				helpers.formatInTimeZone(INVALID, 'UTC', 'YYYY');
+			}).toThrow(new RangeError('Invalid date'));
+		});
+	});
+
+	describe('startOfDayInTimeZone / endOfDayInTimeZone', function () {
+		it('returns the first and last instants of the zone day', function () {
+			const time = Date.UTC(2024, 0, 5, 3);
+			expect(inZone(helpers.startOfDayInTimeZone(time, 'America/New_York'), 'America/New_York')).toBe('2024-01-04T00:00:00.000-05:00');
+			expect(inZone(helpers.endOfDayInTimeZone(time, 'America/New_York'), 'America/New_York')).toBe('2024-01-04T23:59:59.999-05:00');
+			expect(inZone(helpers.startOfDayInTimeZone(time, 'Asia/Tokyo'), 'Asia/Tokyo')).toBe('2024-01-05T00:00:00.000+09:00');
+			expect(inZone(helpers.endOfDayInTimeZone(time, '+05:30'), '+05:30')).toBe('2024-01-05T23:59:59.999+05:30');
+		});
+
+		it('lasts 23 or 25 hours on DST days', function () {
+			const spring = Date.UTC(2024, 2, 10, 12);
+			const fall = Date.UTC(2024, 10, 3, 12);
+			expect(helpers.endOfDayInTimeZone(spring, 'America/New_York').getTime() + 1 - helpers.startOfDayInTimeZone(spring, 'America/New_York').getTime()).toBe(
+				23 * 3_600_000
+			);
+			expect(helpers.endOfDayInTimeZone(fall, 'America/New_York').getTime() + 1 - helpers.startOfDayInTimeZone(fall, 'America/New_York').getTime()).toBe(25 * 3_600_000);
+		});
+
+		it('starts a day at the end of the gap when midnight was skipped', function () {
+			expect(inZone(helpers.startOfDayInTimeZone(Date.UTC(2024, 2, 10, 12), 'America/Havana'), 'America/Havana')).toBe('2024-03-10T01:00:00.000-04:00');
+			expect(inZone(helpers.endOfDayInTimeZone(Date.UTC(2024, 2, 9, 12), 'America/Havana'), 'America/Havana')).toBe('2024-03-09T23:59:59.999-05:00');
+			expect(inZone(helpers.startOfDayInTimeZone(Date.UTC(2018, 10, 4, 12), 'America/Sao_Paulo'), 'America/Sao_Paulo')).toBe('2018-11-04T01:00:00.000-02:00');
+			expect(inZone(helpers.startOfDayInTimeZone(Date.UTC(2024, 2, 31, 12), 'Asia/Beirut'), 'Asia/Beirut')).toBe('2024-03-31T01:00:00.000+03:00');
+		});
+
+		it('handles a repeated midnight that belongs to the new day (Havana)', function () {
+			// On 2024-11-03 the clock went back from 01:00 to 00:00.
+			expect(inZone(helpers.endOfDayInTimeZone(Date.UTC(2024, 10, 2, 16), 'America/Havana'), 'America/Havana')).toBe('2024-11-02T23:59:59.999-04:00');
+			expect(inZone(helpers.startOfDayInTimeZone(Date.UTC(2024, 10, 3, 16), 'America/Havana'), 'America/Havana')).toBe('2024-11-03T00:00:00.000-04:00');
+		});
+
+		it('ends a day at its second midnight when the day came back (St. John’s, 2010-11-07 at 00:01)', function () {
+			const zone = 'America/St_Johns';
+			const late = Date.parse('2010-11-07T03:00:00Z');
+			expect(inZone(late, zone)).toBe('2010-11-06T23:30:00.000-03:30');
+			expect(inZone(helpers.endOfDayInTimeZone(late, zone), zone)).toBe('2010-11-06T23:59:59.999-03:30');
+			expect(inZone(helpers.endOfDayInTimeZone(Date.parse('2010-11-06T12:00:00Z'), zone), zone)).toBe('2010-11-06T23:59:59.999-03:30');
+			expect(inZone(helpers.startOfDayInTimeZone(late, zone), zone)).toBe('2010-11-06T00:00:00.000-02:30');
+			expect(inZone(helpers.startOfDayInTimeZone(Date.parse('2010-11-07T12:00:00Z'), zone), zone)).toBe('2010-11-07T00:00:00.000-02:30');
+		});
+
+		it('ends the day before a skipped calendar day at its midnight (Samoa)', function () {
+			const zone = 'Pacific/Apia';
+			expect(inZone(helpers.endOfDayInTimeZone(Date.parse('2011-12-29T22:00:00Z'), zone), zone)).toBe('2011-12-29T23:59:59.999-10:00');
+			expect(inZone(helpers.startOfDayInTimeZone(Date.parse('2011-12-31T12:00:00Z'), zone), zone)).toBe('2012-01-01T00:00:00.000+14:00');
+			expect(helpers.endOfDayInTimeZone(Date.parse('2011-12-29T22:00:00Z'), zone).getTime() + 1).toBe(
+				helpers.startOfDayInTimeZone(Date.parse('2011-12-30T12:00:00Z'), zone).getTime()
+			);
+		});
+
+		it('starts a day at the end of a gap that began the day before (Toronto, 1919-03-30 23:30 → 00:30)', function () {
+			const zone = 'America/Toronto';
+			const transition = Date.parse('1919-03-31T04:30:00Z');
+			expect(inZone(helpers.startOfDayInTimeZone(Date.parse('1919-03-31T16:00:00Z'), zone), zone)).toBe('1919-03-31T00:30:00.000-04:00');
+			expect(helpers.startOfDayInTimeZone(transition, zone).getTime()).toBe(transition);
+			expect(inZone(helpers.endOfDayInTimeZone(Date.parse('1919-03-30T16:00:00Z'), zone), zone)).toBe('1919-03-30T23:29:59.999-05:00');
+			expect(helpers.endOfDayInTimeZone(transition - 1, zone).getTime()).toBe(transition - 1);
+			// Temporal's 'compatible' midnight is an hour later, 30 minutes after the day started.
+			expect(inZone(helpers.fromZonedTime({ year: 1919, month: 3, day: 31 }, zone), zone)).toBe('1919-03-31T01:00:00.000-04:00');
+		});
+
+		it('agrees with startOfDay / endOfDay in the runtime time zone', function () {
+			const local = Intl.DateTimeFormat().resolvedOptions().timeZone;
+			[new Date(2024, 2, 10, 12), new Date(2024, 10, 3, 12), new Date(2011, 11, 31, 12), new Date(2024, 3, 7, 1)].forEach(function (date) {
+				expect(helpers.startOfDayInTimeZone(date, local).getTime()).toBe(helpers.startOfDay(date).getTime());
+				expect(helpers.endOfDayInTimeZone(date, local).getTime()).toBe(helpers.endOfDay(date).getTime());
+			});
+		});
+
+		it('throws when the result is outside the Date range', function () {
+			expect(helpers.startOfDayInTimeZone(8.64e15, 'UTC').getTime()).toBe(8.64e15);
+			expect(helpers.endOfDayInTimeZone(-8.64e15, 'UTC').getTime()).toBe(-8.64e15 + 86_400_000 - 1);
+			expect(function () {
+				helpers.endOfDayInTimeZone(8.64e15, 'UTC');
+			}).toThrow(new RangeError('Resulting date is out of range'));
+			expect(function () {
+				helpers.startOfDayInTimeZone(-8.64e15, 'America/New_York');
+			}).toThrow(new RangeError('Resulting date is out of range'));
+			expect(function () {
+				helpers.endOfDayInTimeZone(8.64e15, 'Pacific/Kiritimati');
+			}).toThrow(new RangeError('Resulting date is out of range'));
+		});
+
+		it('validates its arguments', function () {
+			expect(function () {
+				helpers.startOfDayInTimeZone(0, 1 as any);
+			}).toThrow(new TypeError('startOfDayInTimeZone: `timeZone` must be a string, got number'));
+			expect(function () {
+				helpers.endOfDayInTimeZone(0, 'Moon/Tranquility');
+			}).toThrow(new RangeError('endOfDayInTimeZone: `timeZone` must be an IANA time zone or a UTC offset (±HH:MM), got "Moon/Tranquility"'));
+			expect(function () {
+				helpers.endOfDayInTimeZone(INVALID, 'UTC');
+			}).toThrow(new RangeError('Invalid date'));
+		});
+	});
+});
+
+describe('getCalendarMonth', function () {
+	it('returns the weeks of a month, padded with the neighbouring months', function () {
+		const weeks = helpers.getCalendarMonth(2024, 1);
+		expect(
+			weeks.map(function (week) {
+				return week.map(function (date) {
+					return helpers.formatDate(date, 'MM-DD HH:mm');
+				});
+			})
+		).toEqual([
+			['01-28 00:00', '01-29 00:00', '01-30 00:00', '01-31 00:00', '02-01 00:00', '02-02 00:00', '02-03 00:00'],
+			['02-04 00:00', '02-05 00:00', '02-06 00:00', '02-07 00:00', '02-08 00:00', '02-09 00:00', '02-10 00:00'],
+			['02-11 00:00', '02-12 00:00', '02-13 00:00', '02-14 00:00', '02-15 00:00', '02-16 00:00', '02-17 00:00'],
+			['02-18 00:00', '02-19 00:00', '02-20 00:00', '02-21 00:00', '02-22 00:00', '02-23 00:00', '02-24 00:00'],
+			['02-25 00:00', '02-26 00:00', '02-27 00:00', '02-28 00:00', '02-29 00:00', '03-01 00:00', '03-02 00:00']
+		]);
+	});
+
+	it('starts weeks on weekStartsOn and has 4 to 6 weeks, or always 6 with fixedWeeks', function () {
+		// February 2026 starts on a Sunday and has 28 days; March 2025 starts on a Saturday and has 31.
+		expect(helpers.getCalendarMonth(2026, 1)).toHaveLength(4);
+		expect(helpers.getCalendarMonth(2026, 1, { weekStartsOn: 1 })).toHaveLength(5);
+		expect(helpers.getCalendarMonth(2025, 2)).toHaveLength(6);
+		expect(helpers.getCalendarMonth(2025, 2, { weekStartsOn: 6 })).toHaveLength(5);
+		expect(helpers.getCalendarMonth(2026, 1, { fixedWeeks: true })).toHaveLength(6);
+		expect(ymd(helpers.getCalendarMonth(2026, 1, { fixedWeeks: true })[5][6])).toEqual([2026, 2, 14]);
+		expect(ymd(helpers.getCalendarMonth(2024, 1, { weekStartsOn: 1 })[0][0])).toEqual([2024, 0, 29]);
+		expect(ymd(helpers.getCalendarMonth(2024, 1, { weekStartsOn: 4 })[0][0])).toEqual([2024, 1, 1]);
+		expect(ymd(helpers.getCalendarMonth(2024, 1, { weekStartsOn: 5 })[0][0])).toEqual([2024, 0, 26]);
+	});
+
+	it('lists every day of every month once, in order, each at the start of its local day', function () {
+		for (let monthIndex = 0; monthIndex < 12; monthIndex++) {
+			for (let weekStartsOn = 0; weekStartsOn < 7; weekStartsOn++) {
+				const weeks = helpers.getCalendarMonth(2023, monthIndex, { weekStartsOn: weekStartsOn as helpers.WeekdayIndex });
+				const cells = weeks.flat();
+				const inMonth = cells.filter(function (date) {
+					return date.getMonth() === monthIndex;
+				});
+				expect(
+					inMonth.map(function (date) {
+						return date.getDate();
+					})
+				).toEqual(
+					Array.from({ length: helpers.daysInMonth(2023, monthIndex) }, function (_, i) {
+						return i + 1;
+					})
+				);
+				expect(cells[0].getDay()).toBe(weekStartsOn);
+				expect(weeks[0]).toContainEqual(inMonth[0]);
+				expect(weeks[weeks.length - 1]).toContainEqual(inMonth[inMonth.length - 1]);
+				cells.forEach(function (date, i) {
+					expect(date.getTime()).toBe(helpers.startOfDay(date).getTime());
+					if (i > 0) expect(helpers.diffInDays(date, cells[i - 1])).toBe(1);
+				});
+			}
+		}
+	});
+
+	it('starts a cell at the end of the gap when midnight was skipped', function () {
+		withTimeZone('America/Havana', function () {
+			const cell = helpers.getCalendarMonth(2024, 2)[2][0];
+			expect(helpers.toISOStringLocal(cell)).toBe('2024-03-10T01:00:00.000-04:00');
+		});
+		withTimeZone('Asia/Beirut', function () {
+			const cell = helpers.getCalendarMonth(2024, 2, { weekStartsOn: 1 })[4][6];
+			expect(helpers.toISOStringLocal(cell)).toBe('2024-03-31T01:00:00.000+03:00');
+		});
+	});
+
+	it('starts every local day at its first instant, even when the gap began the day before (Toronto, 1919-03-31)', function () {
+		withTimeZone('America/Toronto', function () {
+			const sunday = new Date(1919, 2, 31, 12);
+			expect(helpers.toISOStringLocal(helpers.getCalendarMonth(1919, 2)[5][1])).toBe('1919-03-31T00:30:00.000-04:00');
+			expect(helpers.toISOStringLocal(helpers.startOfDay(sunday))).toBe('1919-03-31T00:30:00.000-04:00');
+			expect(helpers.toISOStringLocal(helpers.startOfWeek(new Date(1919, 3, 2), 1))).toBe('1919-03-31T00:30:00.000-04:00');
+			expect(helpers.toISOStringLocal(helpers.endOfDay(new Date(1919, 2, 30, 12)))).toBe('1919-03-30T23:29:59.999-05:00');
+			expect(helpers.toISOStringLocal(helpers.endOfWeek(new Date(1919, 2, 29, 12)))).toBe('1919-03-29T23:59:59.999-05:00');
+			expect(helpers.toISOStringLocal(helpers.endOfWeek(new Date(1919, 2, 27, 12), 1))).toBe('1919-03-30T23:29:59.999-05:00');
+			expect(helpers.toISOStringLocal(helpers.parseISODate('1919-03-31') as Date)).toBe('1919-03-31T00:30:00.000-04:00');
+			expect(helpers.isSameDay(helpers.endOfDay(new Date(1919, 2, 30, 12)), new Date(1919, 2, 30, 12))).toBe(true);
+			// Months, years and quarters start at midnight, which exists on their first day.
+			expect(helpers.toISOStringLocal(helpers.startOfMonth(sunday))).toBe('1919-03-01T00:00:00.000-05:00');
+			expect(helpers.toISOStringLocal(helpers.startOfYear(sunday))).toBe('1919-01-01T00:00:00.000-05:00');
+		});
+		withTimeZone('America/Havana', function () {
+			// A day that starts with a gap: 2024-03-10 begins at 01:00 (00:00-00:59 were skipped).
+			expect(helpers.toISOStringLocal(helpers.startOfDay(new Date(2024, 2, 10, 12)))).toBe('2024-03-10T01:00:00.000-04:00');
+			expect(helpers.toISOStringLocal(helpers.endOfDay(new Date(2024, 2, 9, 12)))).toBe('2024-03-09T23:59:59.999-05:00');
+		});
+	});
+
+	it('gives a skipped calendar day the start of the next day (Samoa, 2011-12-30)', function () {
+		withTimeZone('Pacific/Apia', function () {
+			const week = helpers.getCalendarMonth(2011, 11)[4];
+			expect(
+				week.map(function (date) {
+					return helpers.toISOStringLocal(date, { milliseconds: false });
+				})
+			).toEqual([
+				'2011-12-25T00:00:00-10:00',
+				'2011-12-26T00:00:00-10:00',
+				'2011-12-27T00:00:00-10:00',
+				'2011-12-28T00:00:00-10:00',
+				'2011-12-29T00:00:00-10:00',
+				'2011-12-31T00:00:00+14:00',
+				'2011-12-31T00:00:00+14:00'
+			]);
+			expect(week[5].getTime()).toBe(week[6].getTime());
+			expect(week[5]).not.toBe(week[6]);
+		});
+	});
+
+	it('does not remap years 0-99 and throws past the Date range', function () {
+		expect(helpers.getCalendarMonth(5, 0)[1][0].getFullYear()).toBe(5);
+		expect(helpers.getCalendarMonth(0, 1).flat().length).toBeGreaterThanOrEqual(28);
+		expect(function () {
+			helpers.getCalendarMonth(275760, 8);
+		}).toThrow(new RangeError('Resulting date is out of range'));
+		expect(function () {
+			helpers.getCalendarMonth(-271821, 3);
+		}).toThrow(new RangeError('Resulting date is out of range'));
+		// Too large for the arithmetic: still an error, not an empty grid.
+		[1e300, -1e300, Number.MAX_SAFE_INTEGER, Number.MAX_VALUE].forEach(function (year) {
+			expect(function () {
+				helpers.getCalendarMonth(year, 0);
+			}).toThrow(new RangeError('Resulting date is out of range'));
+		});
+	});
+
+	it('validates its arguments', function () {
+		const cases: Array<[() => unknown, Error]> = [
+			[
+				function () {
+					return helpers.getCalendarMonth('2024' as any, 0);
+				},
+				new TypeError('getCalendarMonth: `year` must be an integer, got string')
+			],
+			[
+				function () {
+					return helpers.getCalendarMonth(2024.5, 0);
+				},
+				new RangeError('getCalendarMonth: `year` must be an integer, got 2024.5')
+			],
+			[
+				function () {
+					return helpers.getCalendarMonth(2024, 12);
+				},
+				new RangeError('getCalendarMonth: `monthIndex` must be an integer between 0 and 11, got 12')
+			],
+			[
+				function () {
+					return helpers.getCalendarMonth(2024, -1);
+				},
+				new RangeError('getCalendarMonth: `monthIndex` must be an integer between 0 and 11, got -1')
+			],
+			[
+				function () {
+					return helpers.getCalendarMonth(2024, undefined as any);
+				},
+				new TypeError('getCalendarMonth: `monthIndex` must be an integer between 0 and 11, got undefined')
+			],
+			[
+				function () {
+					return helpers.getCalendarMonth(2024, 0, { weekStartsOn: 7 as any });
+				},
+				new RangeError('getCalendarMonth: `weekStartsOn` must be an integer between 0 and 6, got 7')
+			],
+			[
+				function () {
+					return helpers.getCalendarMonth(2024, 0, { weekStartsOn: '1' as any });
+				},
+				new TypeError('getCalendarMonth: `weekStartsOn` must be an integer between 0 and 6, got string')
+			]
+		];
+		cases.forEach(function ([fn, error]) {
+			expect(fn).toThrow(error);
+		});
+		// Only `true` turns fixedWeeks on.
+		expect(helpers.getCalendarMonth(2026, 1, { fixedWeeks: 1 as any })).toHaveLength(4);
+		expect(helpers.getCalendarMonth(2026, 1, { weekStartsOn: undefined })).toHaveLength(4);
+	});
+});
+
+describe('Date helpers (review round)', function () {
+	it('rejects options that are not objects, and non-string patterns and locales, with tinkit TypeErrors', function () {
+		const cases: Array<[() => unknown, string]> = [
+			[
+				function () {
+					return helpers.fromZonedTime({ year: 2024, month: 1, day: 1 }, 'UTC', null as any);
+				},
+				'fromZonedTime: `options` must be an object, got null'
+			],
+			[
+				function () {
+					return helpers.getCalendarMonth(2024, 1, null as any);
+				},
+				'getCalendarMonth: `options` must be an object, got null'
+			],
+			[
+				function () {
+					return helpers.getCalendarMonth(2024, 1, 'fixed' as any);
+				},
+				'getCalendarMonth: `options` must be an object, got string'
+			],
+			[
+				function () {
+					return helpers.eachDayOfInterval(0, 0, null as any);
+				},
+				'eachDayOfInterval: `options` must be an object, got null'
+			],
+			[
+				function () {
+					return helpers.formatDuration(0, null as any);
+				},
+				'formatDuration: `options` must be an object, got null'
+			],
+			[
+				function () {
+					return helpers.toISOStringLocal(0, null as any);
+				},
+				'toISOStringLocal: `options` must be an object, got null'
+			],
+			[
+				function () {
+					return helpers.intervalsOverlap({ start: 0, end: 1 }, { start: 0, end: 1 }, null as any);
+				},
+				'intervalsOverlap: `options` must be an object, got null'
+			],
+			[
+				function () {
+					return helpers.formatDate(0, 5 as any);
+				},
+				'formatDate: `pattern` must be a string, got number'
+			],
+			[
+				function () {
+					return helpers.getRelativeTime(0, 0, 5 as any);
+				},
+				'getRelativeTime: `locale` must be a string, got number'
+			]
+		];
+		cases.forEach(function ([fn, message]) {
+			expect(fn).toThrow(new TypeError(message));
+		});
+	});
+
+	it('isValidTimeZone narrows to the TimeZone brand, which every zone parameter accepts like a string', function () {
+		const input: unknown = 'Asia/Tokyo';
+		if (!helpers.isValidTimeZone(input)) throw new Error('unreachable');
+		const zone: helpers.TimeZone = input;
+		const text: string = zone;
+		expect(helpers.getZonedParts(0, zone).hour).toBe(9);
+		expect(text).toBe('Asia/Tokyo');
+		const plain = 'Nowhere';
+		if (!helpers.isValidTimeZone(plain)) {
+			// A failed check keeps the string a string.
+			const still: string = plain;
+			expect(still).toBe('Nowhere');
+		}
+	});
+
+	it('endOfDay ends a day that comes back more than 3 hours after midnight at its second midnight (Alaska, 1867)', function () {
+		// On 1867-10-19 at 00:31:13 UTC, Alaska moved from Asian to American time: the clocks went back 24 hours, so October 18th
+		// came back in the afternoon of October 19th.
+		const transition = Date.parse('1867-10-19T00:31:13Z');
+		['America/Adak', 'America/Sitka'].forEach(function (zone) {
+			withTimeZone(zone, function () {
+				[transition, transition - 30 * 3_600_000, transition + 3_600_000].forEach(function (time) {
+					const end = helpers.endOfDay(time);
+					expect(end.getTime()).toBeGreaterThanOrEqual(time);
+					expect(helpers.isSameDay(end, time)).toBe(true);
+					expect(helpers.isSameDay(end.getTime() + 1, time)).toBe(false);
+					expect(end.getTime()).toBe(helpers.endOfDayInTimeZone(time, zone).getTime());
+				});
+			});
+		});
+	});
+
+	it('intervalToDuration and diffInMonths count across a skipped calendar day (Samoa 2011, Kiritimati 1994)', function () {
+		/**
+		 * Checks a duration and that it adds back to the end.
+		 */
+		function check(start: Date, end: Date, expected: helpers.IntervalDuration, months: number): void {
+			const duration = helpers.intervalToDuration(start, end);
+			expect(duration).toEqual(expected);
+			expect(helpers.addDuration(start, duration).getTime()).toBe(end.getTime());
+			expect(helpers.diffInMonths(end, start)).toBe(months);
+		}
+		withTimeZone('Pacific/Apia', function () {
+			// One month after November 30th is the skipped December 30th, which the clock shows as the 31st.
+			check(new Date(2011, 10, 30, 7, 25), new Date(2012, 0, 6, 20, 57), { years: 0, months: 1, days: 7, hours: 13, minutes: 32, seconds: 0, milliseconds: 0 }, 1);
+			check(new Date(2011, 9, 30, 19, 52), new Date(2012, 0, 20, 22, 20), { years: 0, months: 2, days: 21, hours: 2, minutes: 28, seconds: 0, milliseconds: 0 }, 2);
+			// Backwards: one month before January 30th is the skipped December 30th, shown as the 31st, the end's own day.
+			check(new Date(2012, 0, 30, 16, 17), new Date(2011, 11, 31, 6, 48), { years: 0, months: -1, days: 0, hours: -9, minutes: -29, seconds: 0, milliseconds: 0 }, 0);
+		});
+		withTimeZone('Pacific/Kiritimati', function () {
+			// Two months after October 31st is the skipped December 31st, shown as January 1st at 19:52: after the end.
+			check(new Date(1994, 9, 31, 19, 52), new Date(1995, 0, 1, 8, 2), { years: 0, months: 1, days: 30, hours: 12, minutes: 10, seconds: 0, milliseconds: 0 }, 1);
+			expect(helpers.diffInMonths(new Date(1994, 9, 31, 19, 52), new Date(1995, 0, 1, 8, 2))).toBe(-1);
+		});
+	});
+
+	it('diffInDays spans the whole Date range in any time zone', function () {
+		withTimeZone('UTC', function () {
+			expect(helpers.diffInDays(8.64e15, -8.64e15)).toBe(200_000_000);
+		});
+		withTimeZone('Europe/London', function () {
+			// London's local mean time (-00:01:15) puts the earliest instant on April 19th.
+			expect(helpers.diffInDays(8.64e15, -8.64e15)).toBe(200_000_001);
+		});
+		const days = helpers.diffInDays(8.64e15, -8.64e15);
+		expect(days).toBe(helpers.diffInDays(8.64e15, 0) - helpers.diffInDays(-8.64e15, 0));
+		expect(Math.abs(days - 200_000_000)).toBeLessThanOrEqual(1);
+	});
+});
+
 describe('Date helpers under prototype pollution', function () {
 	function polluted(key: string, value: unknown, fn: () => void): void {
 		(Object.prototype as Record<string, unknown>)[key] = value;
@@ -2424,5 +3256,83 @@ describe('Date helpers under prototype pollution', function () {
 		polluted('days', 5, function () {
 			expect(helpers.addDuration(0, {}).getTime()).toBe(0);
 		});
+	});
+
+	it('fromZonedTime and getCalendarMonth ignore inherited fields and options', function () {
+		polluted('hour', 5, function () {
+			expect(helpers.fromZonedTime({ year: 2024, month: 1, day: 1 }, 'UTC').getTime()).toBe(Date.UTC(2024, 0, 1));
+		});
+		polluted('offset', -300, function () {
+			expect(helpers.fromZonedTime({ year: 2024, month: 11, day: 3, hour: 1, minute: 30 }, 'America/New_York').getTime()).toBe(Date.UTC(2024, 10, 3, 5, 30));
+		});
+		polluted('year', 2000, function () {
+			expect(function () {
+				helpers.fromZonedTime({ month: 1, day: 1 } as helpers.WallClockTime, 'UTC');
+			}).toThrow(TypeError);
+		});
+		polluted('disambiguation', 'reject', function () {
+			expect(helpers.fromZonedTime({ year: 2024, month: 3, day: 10, hour: 2, minute: 30 }, 'America/New_York').getTime()).toBe(Date.UTC(2024, 2, 10, 7, 30));
+		});
+		polluted('fixedWeeks', true, function () {
+			expect(helpers.getCalendarMonth(2026, 1)).toHaveLength(4);
+		});
+		polluted('weekStartsOn', 1, function () {
+			expect(helpers.getCalendarMonth(2026, 1)[0][0].getDay()).toBe(0);
+		});
+	});
+
+	it('formatInTimeZone ignores inherited formatters', function () {
+		polluted('MM', 'polluted', function () {
+			expect(helpers.formatInTimeZone(Date.UTC(2024, 0, 5), 'UTC', '[x]MM-DD Z')).toBe('x01-05 +00:00');
+		});
+	});
+
+	it('time zone clocks and relative time formatters ignore inherited Intl options, and are not cached corrupted', function () {
+		const time = Date.UTC(2024, 0, 15, 12, 30);
+		const base = new Date(2024, 0, 10, 12);
+		const inherited: Record<string, unknown> = {
+			hour12: true,
+			calendar: 'islamic',
+			numberingSystem: 'arab',
+			era: 'long',
+			weekday: 'long',
+			timeZoneName: 'long',
+			year: 'numeric',
+			month: 'long',
+			style: 'narrow',
+			localeMatcher: 'lookup'
+		};
+		/**
+		 * Reads zones and a locale used nowhere else in this file, so that they are first cached under pollution.
+		 */
+		function read(): unknown[] {
+			return [
+				helpers.getZonedParts(time, 'Asia/Ulaanbaatar'),
+				helpers.formatInTimeZone(time, 'Africa/Nairobi', 'YYYY-MM-DD HH:mm:ss Z'),
+				helpers.getTimeZoneOffset('Asia/Dhaka', time),
+				helpers.startOfDayInTimeZone(time, 'America/Lima').getTime(),
+				helpers.getRelativeTime(new Date(2024, 0, 10, 9), base, 'en-GB')
+			];
+		}
+		const expected = [
+			{ year: 2024, month: 1, day: 15, hour: 20, minute: 30, second: 0, millisecond: 0, weekday: 1, offset: 480 },
+			'2024-01-15 15:30:00 +03:00',
+			360,
+			Date.UTC(2024, 0, 15, 5),
+			'3 hours ago'
+		];
+		Object.keys(inherited).forEach(function (key) {
+			(Object.prototype as Record<string, unknown>)[key] = inherited[key];
+		});
+		let underPollution: unknown[];
+		try {
+			underPollution = read();
+		} finally {
+			Object.keys(inherited).forEach(function (key) {
+				delete (Object.prototype as Record<string, unknown>)[key];
+			});
+		}
+		expect(underPollution).toEqual(expected);
+		expect(read()).toEqual(expected);
 	});
 });

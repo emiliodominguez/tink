@@ -5,6 +5,10 @@
  * - **Local time.** All calendar fields (year, month, day, weekday, hours…) are read and written in the
  *   runtime's LOCAL time zone, exactly like `Date#getDate()` / `Date#setDate()`. Nothing here uses UTC
  *   unless its name says so.
+ * - **Other time zones.** The functions that take a `timeZone` ({@link getZonedParts}, {@link fromZonedTime},
+ *   {@link formatInTimeZone}, {@link startOfDayInTimeZone}…) work on the wall clock of that zone instead, and their results do not
+ *   depend on the runtime's zone. A time zone is an IANA name known to `Intl` (`'America/New_York'`, `'UTC'`; the engine's own time
+ *   zone database is used, nothing is bundled) or a fixed UTC offset (`'+05:30'`, `'-08'`).
  * - **Pure.** Inputs are never mutated; every function that returns a date returns a NEW `Date` instance.
  * - **Inputs.** Every date parameter accepts a {@link DateInput}: a `Date` or a millisecond timestamp. Dates created in another
  *   realm (iframe, `vm` context) are accepted; objects that merely inherit from `Date.prototype` are not.
@@ -123,6 +127,71 @@ export interface ToISOStringLocalOptions {
 	milliseconds?: boolean;
 }
 
+/**
+ * A date and time as read on the wall clock of some time zone, without the zone: the input of {@link fromZonedTime}. Unlike
+ * `Date#getMonth()`, `month` counts from 1 (as in ISO 8601, `Intl` and Temporal); the module's 0-based parameters are always named
+ * `monthIndex`.
+ */
+export interface WallClockTime {
+	/** The year: any integer (`0` is 1 BC, `-1` is 2 BC; `99` is the year 99, not 1999). */
+	year: number;
+	/** The month, `1` (January) to `12` (December). */
+	month: number;
+	/** The day of the month, `1` to `28`-`31`. */
+	day: number;
+	/** The hour, `0` to `23` (default `0`). */
+	hour?: number;
+	/** The minute, `0` to `59` (default `0`). */
+	minute?: number;
+	/** The second, `0` to `59` (default `0`). */
+	second?: number;
+	/** The millisecond, `0` to `999` (default `0`). */
+	millisecond?: number;
+	/**
+	 * The UTC offset in minutes EAST of UTC (`330` for India), as returned by {@link getZonedParts}: when the wall-clock time occurs
+	 * twice, the occurrence with this offset is taken whatever the `disambiguation`. Ignored when no occurrence has it.
+	 */
+	offset?: number;
+}
+
+/**
+ * The wall-clock fields of an instant in a time zone, returned by {@link getZonedParts}. It is a complete {@link WallClockTime}, so
+ * {@link fromZonedTime} turns it back into the exact same instant (its `offset` picks the right occurrence of a repeated time).
+ */
+export interface ZonedDateTimeParts extends Required<WallClockTime> {
+	/** The day of the week, `0` (Sunday) to `6` (Saturday), like `Date#getDay()`. */
+	weekday: WeekdayIndex;
+}
+
+/**
+ * How {@link fromZonedTime} resolves a wall-clock time that does not exist (skipped when the clocks are set forward) or occurs twice
+ * (repeated when they are set back), with the semantics of Temporal:
+ * - `'compatible'` (default, like `Date` and `java.time`): a skipped time moves forward by the length of the gap, a repeated one takes
+ *   its earlier occurrence.
+ * - `'earlier'` / `'later'`: the earlier or later of the two candidate instants (for a skipped time: as read with the offset after or
+ *   before the gap, so `'earlier'` lands before the gap and `'later'` after it).
+ * - `'reject'`: throw a `RangeError`.
+ */
+export type Disambiguation = 'compatible' | 'earlier' | 'later' | 'reject';
+
+/**
+ * Options for {@link fromZonedTime}.
+ */
+export interface FromZonedTimeOptions {
+	/** How to resolve a skipped or repeated wall-clock time (default `'compatible'`). */
+	disambiguation?: Disambiguation;
+}
+
+/**
+ * Options for {@link getCalendarMonth}.
+ */
+export interface CalendarMonthOptions {
+	/** The first day of each week (column 0): 0 = Sunday … 6 = Saturday (default `0`). */
+	weekStartsOn?: WeekdayIndex;
+	/** `true` to always return 6 weeks (trailing days of the next month fill the grid), so the grid keeps its height (default `false`). */
+	fixedWeeks?: boolean;
+}
+
 const MS_PER_SECOND = 1000;
 const MS_PER_MINUTE = 60 * MS_PER_SECOND;
 const MS_PER_HOUR = 60 * MS_PER_MINUTE;
@@ -185,6 +254,12 @@ const MAX_INTERVAL_DATES = 1_000_000;
 const MAX_CACHE_ENTRIES = 64;
 
 /**
+ * Size bound of the cache of time zone clocks: more than the number of time zone names (about 600 with the links), so that a server
+ * serving users from every zone does not keep rebuilding `Intl.DateTimeFormat` instances (only valid zones are cached).
+ */
+const MAX_ZONE_CACHE_ENTRIES = 1024;
+
+/**
  * Keys longer than this are never cached, so the caches cannot retain attacker-sized patterns or locales (their size is
  * bounded by entries, not bytes).
  */
@@ -202,6 +277,29 @@ const TOKEN_REGEX = /YYYY|YY|SSS|MM|M|DD|D|HH|H|hh|h|mm|m|ss|s|A|a/g;
  * {@link compilePattern}): there, every `[` has a closing `]` and each match consumes all it scans, so tokenizing is linear.
  */
 const FORMAT_TOKEN_REGEX = new RegExp(`\\[([^\\]]*)]|${TOKEN_REGEX.source}`, 'g');
+
+/**
+ * The tokens of {@link formatInTimeZone}: {@link TOKEN_REGEX}'s plus the UTC offset tokens `ZZ` and `Z` (literals, unlike
+ * {@link FORMAT_TOKEN_REGEX}, so that bundlers can drop them).
+ */
+const ZONED_TOKEN_REGEX = /ZZ|Z|YYYY|YY|SSS|MM|M|DD|D|HH|H|hh|h|mm|m|ss|s|A|a/g;
+
+/**
+ * {@link ZONED_TOKEN_REGEX} plus a `[...]` group capturing literal text (see {@link FORMAT_TOKEN_REGEX}).
+ */
+const ZONED_FORMAT_TOKEN_REGEX = /\[([^\]]*)]|ZZ|Z|YYYY|YY|SSS|MM|M|DD|D|HH|H|hh|h|mm|m|ss|s|A|a/g;
+
+/**
+ * The largest absolute timestamp of a valid `Date` (±8.64e15 ms, 100 000 000 days either side of 1970-01-01).
+ */
+const MAX_TIME = 8.64e15;
+
+const DISAMBIGUATIONS: ReadonlyArray<string> = ['compatible', 'earlier', 'later', 'reject'];
+
+/**
+ * A UTC offset used as a time zone: `±HH`, `±HHMM` or `±HH:MM`, like Temporal's offset time zone identifiers.
+ */
+const OFFSET_ZONE_REGEX = /^([+-])([01]\d|2[0-3])(?::?([0-5]\d))?$/;
 
 /**
  * Left-pads the absolute value of an integer with zeros, keeping a leading minus sign for negatives.
@@ -229,59 +327,70 @@ function to12Hour(hours: number): number {
 }
 
 /**
+ * The wall-clock fields read by the token formatters: the local fields of a `Date` for {@link formatDate}, the fields returned by
+ * {@link getZonedParts} for {@link formatInTimeZone} (whose zone tokens also read `offset`).
+ */
+type WallClock = Omit<ZonedDateTimeParts, 'weekday' | 'offset'> & { offset?: number };
+
+/**
+ * A token formatter of {@link formatDate} or {@link formatInTimeZone}.
+ */
+type Formatter = (clock: WallClock) => string;
+
+/**
  * Token formatters for {@link formatDate}, keyed by token.
  */
-const FORMATTERS: Readonly<Record<string, (date: Date) => string>> = {
-	YYYY: function (date: Date): string {
-		return pad(date.getFullYear(), 4);
+const FORMATTERS: Readonly<Record<string, Formatter>> = {
+	YYYY: function (clock: WallClock): string {
+		return pad(clock.year, 4);
 	},
-	YY: function (date: Date): string {
-		return pad(Math.abs(date.getFullYear()) % 100, 2);
+	YY: function (clock: WallClock): string {
+		return pad(Math.abs(clock.year) % 100, 2);
 	},
-	MM: function (date: Date): string {
-		return pad(date.getMonth() + 1, 2);
+	MM: function (clock: WallClock): string {
+		return pad(clock.month, 2);
 	},
-	M: function (date: Date): string {
-		return String(date.getMonth() + 1);
+	M: function (clock: WallClock): string {
+		return String(clock.month);
 	},
-	DD: function (date: Date): string {
-		return pad(date.getDate(), 2);
+	DD: function (clock: WallClock): string {
+		return pad(clock.day, 2);
 	},
-	D: function (date: Date): string {
-		return String(date.getDate());
+	D: function (clock: WallClock): string {
+		return String(clock.day);
 	},
-	HH: function (date: Date): string {
-		return pad(date.getHours(), 2);
+	HH: function (clock: WallClock): string {
+		return pad(clock.hour, 2);
 	},
-	H: function (date: Date): string {
-		return String(date.getHours());
+	H: function (clock: WallClock): string {
+		return String(clock.hour);
 	},
-	hh: function (date: Date): string {
-		return pad(to12Hour(date.getHours()), 2);
+	hh: function (clock: WallClock): string {
+		return pad(to12Hour(clock.hour), 2);
 	},
-	h: function (date: Date): string {
-		return String(to12Hour(date.getHours()));
+	h: function (clock: WallClock): string {
+		return String(to12Hour(clock.hour));
 	},
-	mm: function (date: Date): string {
-		return pad(date.getMinutes(), 2);
+	mm: function (clock: WallClock): string {
+		return pad(clock.minute, 2);
 	},
-	m: function (date: Date): string {
-		return String(date.getMinutes());
+	m: function (clock: WallClock): string {
+		return String(clock.minute);
 	},
-	ss: function (date: Date): string {
-		return pad(date.getSeconds(), 2);
+	ss: function (clock: WallClock): string {
+		return pad(clock.second, 2);
 	},
-	s: function (date: Date): string {
-		return String(date.getSeconds());
+	s: function (clock: WallClock): string {
+		return String(clock.second);
 	},
-	SSS: function (date: Date): string {
-		return pad(date.getMilliseconds(), 3);
+	SSS: function (clock: WallClock): string {
+		return pad(clock.millisecond, 3);
 	},
-	A: function (date: Date): string {
-		return date.getHours() < 12 ? 'AM' : 'PM';
+	A: function (clock: WallClock): string {
+		return clock.hour < 12 ? 'AM' : 'PM';
 	},
-	a: function (date: Date): string {
-		return date.getHours() < 12 ? 'am' : 'pm';
+	a: function (clock: WallClock): string {
+		return clock.hour < 12 ? 'am' : 'pm';
 	}
 };
 
@@ -386,6 +495,17 @@ function assertOneOf(caller: string, name: string, value: unknown, allowed: Read
 }
 
 /**
+ * Asserts that an options argument is an object (a missing one defaults to `{}` before this check).
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {unknown} options - The options argument
+ * @returns {void}
+ * @throws {TypeError} when `options` is not an object (`null` included)
+ */
+function assertOptions(caller: string, options: unknown): void {
+	if (typeof options !== 'object' || options === null) throw new TypeError(`${caller}: \`options\` must be an object, got ${describe(options)}`);
+}
+
+/**
  * Returns the number of whole days between the Unix epoch and the given LOCAL calendar date, using UTC so that
  * the result is unaffected by daylight-saving transitions.
  * @param {Date} date - A valid date
@@ -452,7 +572,39 @@ function localMidnight(year: number, monthIndex: number, day: number): Date {
 	if (Number.isNaN(result.getTime())) result.setTime(new Date(2000, 0, 1).setFullYear(year, monthIndex, day));
 	result.setHours(0, 0, 0, 0);
 
-	return ensureInRange(result);
+	return ensureInRange(toDayStart(result));
+}
+
+/**
+ * Moves a local midnight obtained by a wall-clock conversion (`setHours(0)`…) to the first instant of its day. Where midnight was skipped,
+ * the conversion moves it forward by the length of the gap: right when the gap began at midnight (Havana: the day starts at 01:00), but
+ * past the start of the day when it began before (Toronto, 1919-03-30: 23:30 became 00:30, so March 31st started at 00:30, not 01:00).
+ * The start is then found by bisection, only on such days.
+ * @param {Date} date - A local midnight, possibly moved forward by a gap (or an invalid date), which is mutated
+ * @returns {Date} `date`, at the first instant of its local day
+ * @example
+ * toDayStart(new Date(2024, 0, 1)); // => new Date(2024, 0, 1) // midnight exists
+ */
+function toDayStart(date: Date): Date {
+	// Midnight exists (or the date is invalid, for which the comparisons are false).
+	if (!(date.getHours() * MS_PER_HOUR + msIntoHour(date) > 0)) return date;
+
+	const day = date.getDate();
+	// A gap is shorter than a day, so a day earlier is on the previous local day (whose day of the month differs), and every instant in
+	// between is on one of the two days.
+	let low = date.getTime() - MS_PER_DAY;
+	let high = date.getTime();
+
+	while (high - low > 1) {
+		const middle = Math.floor((low + high) / 2);
+
+		if (new Date(middle).getDate() === day) high = middle;
+		else low = middle;
+	}
+
+	date.setTime(high);
+
+	return date;
 }
 
 /**
@@ -564,11 +716,14 @@ function diffInCompleteUnits(later: DateInput, earlier: DateInput, unitMonths: n
 
 	if (end.getTime() < start.getTime()) return 0 - diffInCompleteUnits(start, end, unitMonths, unitDays);
 
-	// The calendar difference counts at most one unit too many (when the time of day or a clamped day is not reached yet).
-	const units = Math.floor(unitMonths === 0 ? diffInDays(end, start) / unitDays : calendarMonthDiff(end, start) / unitMonths);
+	// The calendar difference counts one unit too many when the time of day or a clamped day is not reached yet, and two when the
+	// day reached that way was skipped (Kiritimati's 1994-12-31): the clock shows the next day, which can be after `end`.
+	let units = Math.floor(unitMonths === 0 ? diffInDays(end, start) / unitDays : calendarMonthDiff(end, start) / unitMonths);
 
-	// A trial shift past the representable range (an invalid date) overshoots too.
-	return !(shiftCalendarUnchecked(start, units * unitMonths, units * unitDays).getTime() <= end.getTime()) ? units - 1 : units;
+	// A trial shift past the representable range (an invalid date) overshoots too. Zero units never do.
+	while (!(shiftCalendarUnchecked(new Date(start), units * unitMonths, units * unitDays).getTime() <= end.getTime())) units -= 1;
+
+	return units;
 }
 
 /**
@@ -597,13 +752,16 @@ function lastInstantOfDay(date: Date, days = 1): Date {
 	// Hour `24 * days` is the local midnight `days` days later: a single wall-clock conversion instead of `setDate()` then
 	// `setHours(0)`, so no intermediate wall-clock time can be moved by a DST gap.
 	date.setHours(24 * days, 0, 0, 0);
+	toDayStart(date);
 
-	// Where the clock was set back just after midnight (St. John's and Moncton at 00:01, until 2010), midnight happens twice and the
-	// conversion gives the first one, after which the previous day comes back: the day ends just before the second midnight.
-	const shift = new Date(date.getTime() + 3 * MS_PER_HOUR).getTimezoneOffset() - date.getTimezoneOffset();
+	// Where the clock was set back after midnight far enough to show it again (St. John's and Moncton at 00:01, until 2010; Alaska by
+	// 24 hours in the afternoon of 1867-10-19), midnight happens twice and the conversion gives the first one, after which the previous
+	// day comes back: the day ends just before the second midnight. The offset a day later (like `wallInstants`) catches every such
+	// change, and is exact to the millisecond (`getTimezoneOffset()` drops the seconds of local mean time offsets).
+	const shift = localOffset(date) - localOffset(new Date(date.getTime() + MS_PER_DAY));
 
 	if (shift > 0) {
-		const second = new Date(date.getTime() + shift * MS_PER_MINUTE);
+		const second = new Date(date.getTime() + shift);
 
 		// Only when the previous day came back in between (not when the repeated hour starts the new day, as in Havana at 01:00).
 		if (
@@ -620,6 +778,18 @@ function lastInstantOfDay(date: Date, days = 1): Date {
 	return ensureInRange(date);
 }
 
+/**
+ * Returns the UTC offset of the local wall clock at a date, exact to the millisecond: computed from the local fields, since `Date.UTC`
+ * would remap the years 0-99 and `getTimezoneOffset()` drops the seconds of historical local mean time offsets.
+ * @param {Date} date - A date
+ * @returns {number} The offset in milliseconds east of UTC (`NaN` for an invalid date)
+ * @example
+ * localOffset(new Date(0)) === -new Date(0).getTimezoneOffset() * 60_000; // => true // outside local mean time
+ */
+function localOffset(date: Date): number {
+	return epochDay(date) * MS_PER_DAY + date.getHours() * MS_PER_HOUR + msIntoHour(date) - date.getTime();
+}
+
 declare const validDate: unique symbol;
 
 /**
@@ -627,6 +797,14 @@ declare const validDate: unique symbol;
  * fails the check is still a `Date`, so `if (!isValidDate(date))` keeps `date` typed as one.
  */
 export type ValidDate = Date & { readonly [validDate]: true };
+
+declare const validTimeZone: unique symbol;
+
+/**
+ * A string known to be a time zone that this module accepts, as narrowed by {@link isValidTimeZone}. The brand only exists in the type
+ * system: every `timeZone` parameter takes any `string` (and validates it), and a string that fails the check is still a `string`.
+ */
+export type TimeZone = string & { readonly [validTimeZone]: true };
 
 /**
  * Checks whether a value is a `Date` instance holding a valid time (i.e. not `new Date(NaN)`). It narrows `value` to
@@ -850,7 +1028,8 @@ export function diffInMonths(later: DateInput, earlier: DateInput): number {
 }
 
 /**
- * Returns the start of the local day (00:00:00.000).
+ * Returns the start of the local day: 00:00:00.000, or where midnight was skipped by a DST change, the first instant of the day (01:00 in
+ * Havana on 2024-03-10; 00:30 in Toronto on 1919-03-31, where the clocks went from 23:30 to 00:30, whereas `setHours(0)` gives 01:00).
  * @param {DateInput} date - The date
  * @returns {Date} A new date at the start of the same local day
  * @throws {TypeError} when a date argument is neither a `Date` nor a number
@@ -863,12 +1042,12 @@ export function startOfDay(date: DateInput): Date {
 
 	result.setHours(0, 0, 0, 0);
 
-	return ensureInRange(result);
+	return ensureInRange(toDayStart(result));
 }
 
 /**
  * Returns the last millisecond of the local day (23:59:59.999). Computed as the start of the next day minus 1 ms,
- * so it is correct even in zones whose clocks are set back around midnight.
+ * so it is correct even in zones whose clocks are set back or forward around midnight.
  * @param {DateInput} date - The date
  * @returns {Date} A new date at the end of the same local day
  * @throws {TypeError} when a date argument is neither a `Date` nor a number
@@ -881,7 +1060,8 @@ export function endOfDay(date: DateInput): Date {
 }
 
 /**
- * Returns the first day of the local month at 00:00:00.000.
+ * Returns the first day of the local month at the start of the day: 00:00:00.000, or the first instant of the day where midnight was
+ * skipped (see {@link startOfDay}; Cairo, 2014-08-01, started at 01:00).
  * @param {DateInput} date - The date
  * @returns {Date} A new date at the start of the month
  * @throws {TypeError} when a date argument is neither a `Date` nor a number
@@ -895,7 +1075,7 @@ export function startOfMonth(date: DateInput): Date {
 	// Hour `-24 * n` of the current day is the midnight `n` days earlier: a single wall-clock conversion.
 	result.setHours(-24 * (result.getDate() - 1), 0, 0, 0);
 
-	return ensureInRange(result);
+	return ensureInRange(toDayStart(result));
 }
 
 /**
@@ -914,7 +1094,8 @@ export function endOfMonth(date: DateInput): Date {
 }
 
 /**
- * Returns the start (00:00:00.000, local) of the week containing `date`.
+ * Returns the start of the week containing `date`: its first day (local time) at 00:00:00.000, or the first instant of that day where
+ * midnight was skipped (see {@link startOfDay}).
  * @param {DateInput} date - The date
  * @param {WeekdayIndex} [weekStartsOn=0] - The first day of the week: 0 = Sunday … 6 = Saturday
  * @returns {Date} A new date at the start of the week
@@ -932,7 +1113,7 @@ export function startOfWeek(date: DateInput, weekStartsOn: WeekdayIndex = 0): Da
 	// Hour `-24 * n` of the current day is the midnight `n` days earlier: a single wall-clock conversion.
 	result.setHours(-24 * ((result.getDay() - weekStartsOn + 7) % 7), 0, 0, 0);
 
-	return ensureInRange(result);
+	return ensureInRange(toDayStart(result));
 }
 
 /**
@@ -954,7 +1135,8 @@ export function endOfWeek(date: DateInput, weekStartsOn: WeekdayIndex = 0): Date
 }
 
 /**
- * Returns January 1st of the local year at 00:00:00.000.
+ * Returns January 1st of the local year at the start of the day: 00:00:00.000, or the first instant of the day where midnight was
+ * skipped (see {@link startOfDay}).
  * @param {DateInput} date - The date
  * @returns {Date} A new date at the start of the year
  * @throws {TypeError} when a date argument is neither a `Date` nor a number
@@ -968,7 +1150,7 @@ export function startOfYear(date: DateInput): Date {
 	result.setMonth(0, 1);
 	result.setHours(0, 0, 0, 0);
 
-	return ensureInRange(result);
+	return ensureInRange(toDayStart(result));
 }
 
 /**
@@ -1251,40 +1433,64 @@ export function maxDate(dates: Iterable<DateInput>): Date | undefined {
  * @param {DateInput} date - The date to format
  * @param {string} pattern - The format pattern
  * @returns {string} The formatted date
- * @throws {TypeError} when a date argument is neither a `Date` nor a number
+ * @throws {TypeError} when a date argument is neither a `Date` nor a number, or `pattern` is not a string
  * @throws {RangeError} when `date` is invalid
  * @example
  * formatDate(new Date(2024, 0, 5, 14, 7, 9, 3), 'YYYY-MM-DD HH:mm:ss.SSS'); // => '2024-01-05 14:07:09.003'
  * formatDate(new Date(2024, 0, 5, 14, 7), 'D/M/YY h:mm A [o\'clock]'); // => "5/1/24 2:07 PM o'clock"
  */
 export function formatDate(date: DateInput, pattern: string): string {
+	if (typeof pattern !== 'string') throw new TypeError(`formatDate: \`pattern\` must be a string, got ${describe(pattern)}`);
+
 	const d = toValidDate(date);
+	const clock: WallClock = {
+		year: d.getFullYear(),
+		month: d.getMonth() + 1,
+		day: d.getDate(),
+		hour: d.getHours(),
+		minute: d.getMinutes(),
+		second: d.getSeconds(),
+		millisecond: d.getMilliseconds()
+	};
+
+	return render(cached(compiledPatterns, pattern, compilePattern), clock);
+}
+
+/**
+ * Writes the wall-clock fields of `clock` with a compiled pattern.
+ * @param {CompiledPattern} parts - The literal texts and formatters of the pattern
+ * @param {WallClock} clock - The fields to write
+ * @returns {string} The formatted text
+ * @example
+ * render(['at ', FORMATTERS.HH], { year: 2024, month: 1, day: 5, hour: 9, minute: 0, second: 0, millisecond: 0 }); // => 'at 09'
+ */
+function render(parts: CompiledPattern, clock: WallClock): string {
 	let result = '';
 
-	for (const part of cached(compiledPatterns, pattern, compilePattern)) result += typeof part === 'string' ? part : part(d);
+	for (const part of parts) result += typeof part === 'string' ? part : part(clock);
 
 	return result;
 }
 
 /**
  * Returns `cache.get(key)`, computing and storing `create(key)` first when missing. The cache is cleared when it reaches
- * {@link MAX_CACHE_ENTRIES} entries, and keys longer than {@link MAX_CACHED_KEY_LENGTH} are not stored, so its size stays
- * bounded whatever the keys.
+ * `max` entries, and keys longer than {@link MAX_CACHED_KEY_LENGTH} are not stored, so its size stays bounded whatever the keys.
  * @template V - Type of the cached values
  * @param {Map<string, V>} cache - The cache
  * @param {string} key - The key
  * @param {(key: string) => V} create - Computes the value of a missing key
+ * @param {number} [max=MAX_CACHE_ENTRIES] - The largest number of entries
  * @returns {V} The cached value
  * @example
  * cached(new Map(), 'YYYY', compilePattern).length; // => 3
  */
-function cached<V>(cache: Map<string, V>, key: string, create: (key: string) => V): V {
+function cached<V>(cache: Map<string, V>, key: string, create: (key: string) => V, max = MAX_CACHE_ENTRIES): V {
 	let value = cache.get(key);
 
 	if (value === undefined) {
 		value = create(key);
 		if (key.length <= MAX_CACHED_KEY_LENGTH) {
-			if (cache.size >= MAX_CACHE_ENTRIES) cache.clear();
+			if (cache.size >= max) cache.clear();
 			cache.set(key, value);
 		}
 	}
@@ -1293,24 +1499,43 @@ function cached<V>(cache: Map<string, V>, key: string, create: (key: string) => 
 }
 
 /**
+ * A pattern split into literal texts and token formatters, in pattern order.
+ */
+type CompiledPattern = ReadonlyArray<string | Formatter>;
+
+/**
  * {@link formatDate} patterns already split by {@link compilePattern}.
  */
-const compiledPatterns = new Map<string, ReadonlyArray<string | ((date: Date) => string)>>();
+const compiledPatterns = new Map<string, CompiledPattern>();
 
 /**
  * Splits a {@link formatDate} pattern into literal strings and token formatters (cached by `formatDate`, so repeated
  * formatting with the same pattern does not run the tokenizing regex again).
  * @param {string} pattern - The format pattern
- * @returns {ReadonlyArray<string | ((date: Date) => string)>} The literal texts and formatters, in pattern order
+ * @returns {CompiledPattern} The literal texts and formatters, in pattern order
  * @example
  * compilePattern('[at] HH')[1]; // => 'at'
  */
-function compilePattern(pattern: string): ReadonlyArray<string | ((date: Date) => string)> {
-	const parts: Array<string | ((date: Date) => string)> = [];
+function compilePattern(pattern: string): CompiledPattern {
+	return compileWith(pattern, TOKEN_REGEX, FORMAT_TOKEN_REGEX, FORMATTERS);
+}
+
+/**
+ * Splits a pattern into literal strings and token formatters.
+ * @param {string} pattern - The format pattern
+ * @param {RegExp} tokenRegex - Matches the tokens ({@link TOKEN_REGEX} or {@link ZONED_TOKEN_REGEX})
+ * @param {RegExp} formatRegex - Matches the tokens and the `[...]` literals ({@link FORMAT_TOKEN_REGEX} or {@link ZONED_FORMAT_TOKEN_REGEX})
+ * @param {Readonly<Record<string, Formatter>>} formatters - The formatters looked up before {@link FORMATTERS}, by token
+ * @returns {CompiledPattern} The literal texts and formatters, in pattern order
+ * @example
+ * compileWith('[at] HH', TOKEN_REGEX, FORMAT_TOKEN_REGEX, FORMATTERS)[1]; // => 'at'
+ */
+function compileWith(pattern: string, tokenRegex: RegExp, formatRegex: RegExp, formatters: Readonly<Record<string, Formatter>>): CompiledPattern {
+	const parts: Array<string | Formatter> = [];
 	// Every `[` after the last `]` is unclosed, so that tail cannot hold a `[...]` group: it is tokenized without that alternative,
 	// which would otherwise rescan to the end of the pattern from each `[` (quadratic time on `'['.repeat(n)`).
 	const head = pattern.lastIndexOf(']') + 1;
-	const end = tokenize(parts, pattern, head, pattern.length, TOKEN_REGEX, tokenize(parts, pattern, 0, head, FORMAT_TOKEN_REGEX, 0));
+	const end = tokenize(parts, pattern, head, pattern.length, tokenRegex, formatters, tokenize(parts, pattern, 0, head, formatRegex, formatters, 0));
 	parts.push(pattern.slice(end));
 
 	return parts;
@@ -1318,19 +1543,29 @@ function compilePattern(pattern: string): ReadonlyArray<string | ((date: Date) =
 
 /**
  * Appends to `parts` the tokens of `pattern.slice(start, stop)` found by `regex`, each preceded by the literal text since `end`.
- * @param {Array<string | ((date: Date) => string)>} parts - The compiled pattern so far
+ * @param {Array<string | Formatter>} parts - The compiled pattern so far
  * @param {string} pattern - The whole pattern
  * @param {number} start - Start of the tokenized slice
  * @param {number} stop - End of the tokenized slice
- * @param {RegExp} regex - {@link FORMAT_TOKEN_REGEX} or {@link TOKEN_REGEX}
+ * @param {RegExp} regex - A token regex, with or without the `[...]` literal alternative
+ * @param {Readonly<Record<string, Formatter>>} formatters - The formatters looked up before {@link FORMATTERS}, by token
  * @param {number} end - End of the text already in `parts`
  * @returns {number} End of the text in `parts` after the last token
  * @example
- * tokenize([], 'D [D]', 0, 5, FORMAT_TOKEN_REGEX, 0); // => 5
+ * tokenize([], 'D [D]', 0, 5, FORMAT_TOKEN_REGEX, FORMATTERS, 0); // => 5
  */
-function tokenize(parts: Array<string | ((date: Date) => string)>, pattern: string, start: number, stop: number, regex: RegExp, end: number): number {
+function tokenize(
+	parts: Array<string | Formatter>,
+	pattern: string,
+	start: number,
+	stop: number,
+	regex: RegExp,
+	formatters: Readonly<Record<string, Formatter>>,
+	end: number
+): number {
 	for (const match of pattern.slice(start, stop).matchAll(regex)) {
-		parts.push(pattern.slice(end, start + match.index), match[1] ?? FORMATTERS[match[0]]);
+		// Own keys only: every token of `regex` is an own key of `formatters` or of `FORMATTERS` (never one of a polluted prototype).
+		parts.push(pattern.slice(end, start + match.index), match[1] ?? (Object.hasOwn(formatters, match[0]) ? formatters : FORMATTERS)[match[0]]);
 		end = start + match.index + match[0].length;
 	}
 
@@ -1385,6 +1620,20 @@ export function parseISODate(value: string): Date | undefined {
 const relativeTimeFormats = new Map<string, Intl.RelativeTimeFormat>();
 
 /**
+ * Copies `Intl` constructor options into a null-prototype object: `Intl` reads every option it knows with a plain property lookup, so a
+ * polluted `Object.prototype` (`hour12`, `calendar`, `numberingSystem`, `style`…) would otherwise change, or break, the formatters,
+ * which are cached.
+ * @template T - Type of the options
+ * @param {T} options - The options
+ * @returns {T} A null-prototype copy
+ * @example
+ * Object.getPrototypeOf(intlOptions<Intl.RelativeTimeFormatOptions>({ numeric: 'auto' })); // => null
+ */
+function intlOptions<T extends object>(options: T): T {
+	return Object.assign(Object.create(null) as T, options);
+}
+
+/**
  * Creates an `Intl.RelativeTimeFormat` with `numeric: 'auto'` for `locale`.
  * @param {string} locale - A BCP 47 locale
  * @returns {Intl.RelativeTimeFormat} The formatter
@@ -1393,7 +1642,7 @@ const relativeTimeFormats = new Map<string, Intl.RelativeTimeFormat>();
  * relativeTimeFormat('en').format(-1, 'day'); // => 'yesterday'
  */
 function relativeTimeFormat(locale: string): Intl.RelativeTimeFormat {
-	return new Intl.RelativeTimeFormat(locale, { numeric: 'auto' });
+	return new Intl.RelativeTimeFormat(locale, intlOptions<Intl.RelativeTimeFormatOptions>({ numeric: 'auto' }));
 }
 
 /**
@@ -1408,7 +1657,7 @@ function relativeTimeFormat(locale: string): Intl.RelativeTimeFormat {
  * @param {string} [locale='en'] - A BCP 47 locale passed to `Intl.RelativeTimeFormat` (formatters are cached per locale, for the 64 most recent
  * locales of at most 1024 characters)
  * @returns {string} The relative time phrase
- * @throws {TypeError} when a date argument is neither a `Date` nor a number
+ * @throws {TypeError} when a date argument is neither a `Date` nor a number, or `locale` is not a string
  * @throws {RangeError} when either date is invalid or the locale is malformed
  * @example
  * const base = new Date(2024, 0, 10, 12);
@@ -1417,6 +1666,8 @@ function relativeTimeFormat(locale: string): Intl.RelativeTimeFormat {
  * getRelativeTime(new Date(2024, 3, 10, 12), base); // => 'in 3 months'
  */
 export function getRelativeTime(date: DateInput, baseDate: DateInput = new Date(), locale = 'en'): string {
+	if (typeof locale !== 'string') throw new TypeError(`getRelativeTime: \`locale\` must be a string, got ${describe(locale)}`);
+
 	const target = toValidDate(date);
 	const base = toValidDate(baseDate);
 	const formatter = cached(relativeTimeFormats, locale, relativeTimeFormat);
@@ -1448,13 +1699,15 @@ export function getRelativeTime(date: DateInput, baseDate: DateInput = new Date(
  * @param {DateInput} end - The last day of the interval (must not be before `start`)
  * @param {EachDayOfIntervalOptions} [options={}] - `step`: the number of days between consecutive results (default `1`)
  * @returns {Date[]} A new array of new dates, in ascending order; its first element is the start of `start`'s day
- * @throws {TypeError} when a date argument is neither a `Date` nor a number, or `step` is not a number
+ * @throws {TypeError} when a date argument is neither a `Date` nor a number, `options` is not an object, or `step` is not a number
  * @throws {RangeError} when a date is invalid, `start` is after `end`, `step` is not a positive integer, or a result is out of range
  * @example
  * eachDayOfInterval(new Date(2024, 0, 30, 18), new Date(2024, 1, 2, 9)); // => [new Date(2024, 0, 30), new Date(2024, 0, 31), new Date(2024, 1, 1), new Date(2024, 1, 2)]
  * eachDayOfInterval(new Date(2024, 0, 1), new Date(2024, 0, 10), { step: 3 }); // => [new Date(2024, 0, 1), new Date(2024, 0, 4), new Date(2024, 0, 7), new Date(2024, 0, 10)]
  */
 export function eachDayOfInterval(start: DateInput, end: DateInput, options: EachDayOfIntervalOptions = {}): Date[] {
+	assertOptions('eachDayOfInterval', options);
+
 	const { step = 1 } = options;
 
 	return eachUnit('eachDayOfInterval', start, end, 4, step, 0, Infinity);
@@ -1507,7 +1760,8 @@ export function getQuarter(date: DateInput): Quarter {
 }
 
 /**
- * Returns the first day of the local quarter at 00:00:00.000.
+ * Returns the first day of the local quarter at the start of the day: 00:00:00.000, or the first instant of the day where midnight was
+ * skipped (see {@link startOfDay}).
  * @param {DateInput} date - The date
  * @returns {Date} A new date at the start of the quarter
  * @throws {TypeError} when a date argument is neither a `Date` nor a number
@@ -1734,7 +1988,7 @@ export function clampDate(date: DateInput, min: DateInput, max: DateInput): Date
  * @param {FormatDurationOptions} [options={}] - `units`: the units allowed in the output (default all: `d`, `h`, `m`,
  * `s`, `ms`); `largest`: the maximum number of non-zero units to show (default unlimited)
  * @returns {string} The formatted duration
- * @throws {TypeError} when `ms` or `largest` is not a number, or `units` is not an array
+ * @throws {TypeError} when `ms` or `largest` is not a number, `units` is not an array, or `options` is not an object
  * @throws {RangeError} when `ms` is not finite, `units` is empty or contains an unknown unit, or `largest` is not a positive integer
  * @example
  * formatDuration(93_784_005); // => '1d 2h 3m 4s 5ms'
@@ -1747,6 +2001,7 @@ export function clampDate(date: DateInput, min: DateInput, max: DateInput): Date
 export function formatDuration(ms: number, options: FormatDurationOptions = {}): string {
 	assertNumber('formatDuration', 'ms', ms, Number.isFinite(ms), 'a finite number');
 
+	assertOptions('formatDuration', options);
 	const { units = DURATION_UNITS, largest = Infinity } = options;
 
 	if (!Array.isArray(units)) throw new TypeError(`formatDuration: \`units\` must be an array of duration units, got ${describe(units)}`);
@@ -1946,13 +2201,22 @@ export function intervalToDuration(start: DateInput, end: DateInput): IntervalDu
 	// Trial shifts may land past the representable range (an invalid date): that counts as too far.
 	let reached = shiftCalendarUnchecked(new Date(from), months, 0);
 
-	// One month too far (the day or the time of day is not reached yet) in the direction of travel.
-	if (!(sign * (reached.getTime() - target) <= 0)) {
+	// One month too far (the day or the time of day is not reached yet) in the direction of travel, or two when the day reached was
+	// skipped (Kiritimati's 1994-12-31) and the clock shows the next one. Zero months never are.
+	while (!(sign * (reached.getTime() - target) <= 0)) {
 		months -= sign;
-		reached = shiftCalendar(new Date(from), months, 0);
+		reached = shiftCalendarUnchecked(new Date(from), months, 0);
 	}
 
-	let days = diffInDays(to, reached);
+	// Counted from the calendar day that the months lead to (clamped to the end of the month), not from the day that the clock shows
+	// there, which is the next one when that day was skipped (Samoa's 2011-12-30).
+	const totalMonths = from.getMonth() + months;
+	const year = from.getFullYear() + Math.floor(totalMonths / 12);
+	const month = mod(totalMonths, 12);
+	let days = epochDay(to) - daysFromCivil(year, month, Math.min(from.getDate(), daysInMonth(year, month)));
+
+	// Backwards onto a skipped day, the clock shows the next one, possibly `to`'s day: no day to go back then (never a day forward).
+	if (sign * days < 0) days = 0;
 
 	reached = shiftCalendarUnchecked(new Date(from), months, days);
 
@@ -1990,7 +2254,7 @@ export function intervalToDuration(start: DateInput, end: DateInput): IntervalDu
  * @param {DateInput} date - The date to format
  * @param {ToISOStringLocalOptions} [options={}] - `milliseconds`: `false` to leave out the `.SSS` fraction (default `true`)
  * @returns {string} The local timestamp with its offset
- * @throws {TypeError} when a date argument is neither a `Date` nor a number
+ * @throws {TypeError} when a date argument is neither a `Date` nor a number, or `options` is not an object
  * @throws {RangeError} when `date` is invalid, or (within minutes of the limits of the `Date` range, where the offset has seconds) the
  * time at the rounded offset is out of range
  * @example
@@ -1999,12 +2263,12 @@ export function intervalToDuration(start: DateInput, end: DateInput): IntervalDu
  * toISOStringLocal(new Date(2026, 9, 18, 9, 30, 15), { milliseconds: false }).slice(0, 19); // => '2026-10-18T09:30:15'
  */
 export function toISOStringLocal(date: DateInput, options: ToISOStringLocalOptions = {}): string {
+	assertOptions('toISOStringLocal', options);
+
 	const local = toValidDate(date);
 	const time = local.getTime();
 	const year = local.getFullYear();
-	// The offset of the wall clock, from the local fields: `Date.UTC` would remap the years 0-99, and `getTimezoneOffset()` drops the
-	// seconds of historical offsets.
-	const offsetMs = epochDay(local) * MS_PER_DAY + local.getHours() * MS_PER_HOUR + msIntoHour(local) - time;
+	const offsetMs = localOffset(local);
 	const offset = Math.round(offsetMs / MS_PER_MINUTE);
 	const minutes = Math.abs(offset);
 	const suffix = offset === 0 ? 'Z' : `${offset < 0 ? '-' : '+'}${pad(Math.floor(minutes / 60), 2)}:${pad(minutes % 60, 2)}`;
@@ -2442,7 +2706,7 @@ function intervalBounds(name: string, interval: Interval): [number, number] {
  * @param {Interval} b - The second interval
  * @param {IntervalsOverlapOptions} [options={}] - `inclusive`: treat both intervals as closed (default `false`)
  * @returns {boolean} `true` when the intervals share at least one instant
- * @throws {TypeError} when an interval is not an object, or a bound is neither a `Date` nor a number
+ * @throws {TypeError} when an interval or `options` is not an object, or a bound is neither a `Date` nor a number
  * @throws {RangeError} when a bound is invalid or an interval's `start` is after its `end`
  * @example
  * const morning = { start: new Date(2024, 0, 1, 9), end: new Date(2024, 0, 1, 12) };
@@ -2452,6 +2716,8 @@ function intervalBounds(name: string, interval: Interval): [number, number] {
  * intervalsOverlap(morning, { start: new Date(2024, 0, 1, 11), end: new Date(2024, 0, 1, 13) }); // => true
  */
 export function intervalsOverlap(a: Interval, b: Interval, options: IntervalsOverlapOptions = {}): boolean {
+	assertOptions('intervalsOverlap', options);
+
 	const [aStart, aEnd] = intervalBounds('a', a);
 	const [bStart, bEnd] = intervalBounds('b', b);
 
@@ -2462,16 +2728,16 @@ export function intervalsOverlap(a: Interval, b: Interval, options: IntervalsOve
  * {@link FORMATTERS}' tokens, by formatter (to recognise the tokens of a compiled pattern in {@link parseDate}). Built on first use: a
  * module-level call would be kept by bundlers even when `parseDate` is not imported.
  */
-let tokens: Map<(date: Date) => string, string> | undefined;
+let tokens: Map<Formatter, string> | undefined;
 
 /**
  * Returns the token of one of {@link FORMATTERS}' formatters.
- * @param {(date: Date) => string} formatter - The formatter
+ * @param {Formatter} formatter - The formatter
  * @returns {string} Its token
  */
-function tokenOf(formatter: (date: Date) => string): string {
+function tokenOf(formatter: Formatter): string {
 	tokens ??= new Map(
-		Object.keys(FORMATTERS).map(function (token: string): [(date: Date) => string, string] {
+		Object.keys(FORMATTERS).map(function (token: string): [Formatter, string] {
 			return [FORMATTERS[token], token];
 		})
 	);
@@ -2644,4 +2910,604 @@ export function isSameQuarter(a: DateInput, b: DateInput): boolean {
 	const right = toValidDate(b);
 
 	return left.getFullYear() === right.getFullYear() && Math.floor(left.getMonth() / 3) === Math.floor(right.getMonth() / 3);
+}
+
+/**
+ * What {@link zoneClock} creates to read the wall clock of an IANA time zone: an `Intl.DateTimeFormat` writing the day of the month and
+ * the time, and the fields that the numbers of its output are, in order.
+ */
+type ZoneClock = readonly [Intl.DateTimeFormat, ReadonlyArray<string>];
+
+/**
+ * A time zone resolved by {@link resolveTimeZone}: a fixed UTC offset in milliseconds, or the clock of an IANA zone.
+ */
+type ResolvedZone = number | ZoneClock;
+
+/**
+ * The clocks created by {@link zoneClock}, by time zone (constructing an `Intl.DateTimeFormat` is much more expensive than formatting
+ * with it).
+ */
+const zoneClocks = new Map<string, ZoneClock>();
+
+/**
+ * The runs of digits of a formatted date.
+ */
+const DIGITS_REGEX = /\d+/g;
+
+/**
+ * {@link formatInTimeZone} patterns already split by {@link compileZonedPattern}.
+ */
+const compiledZonedPatterns = new Map<string, CompiledPattern>();
+
+/**
+ * The formatters of the UTC offset tokens of {@link formatInTimeZone}.
+ */
+const OFFSET_FORMATTERS: Readonly<Record<string, Formatter>> = {
+	Z: function (clock: WallClock): string {
+		return formatOffset(clock.offset as number, ':');
+	},
+	ZZ: function (clock: WallClock): string {
+		return formatOffset(clock.offset as number, '');
+	}
+};
+
+/**
+ * Writes a UTC offset as `±HH:MM` (or `±HHMM` with an empty separator), with seconds (`±HH:MM:SS`) when it has some, like the local
+ * mean time offsets in use before standard time (Paris: `+00:09:21` until 1911).
+ * @param {number} offset - The offset in minutes east of UTC (a whole number of seconds)
+ * @param {string} separator - `':'` or `''`
+ * @returns {string} The offset text
+ * @example
+ * formatOffset(-210, ':'); // => '-03:30'
+ */
+function formatOffset(offset: number, separator: string): string {
+	const seconds = Math.round(Math.abs(offset) * 60);
+	const rest = seconds % 60;
+	const text = pad(Math.floor(seconds / 3600), 2) + separator + pad(Math.floor(seconds / 60) % 60, 2);
+
+	return (offset < 0 ? '-' : '+') + (rest === 0 ? text : text + separator + pad(rest, 2));
+}
+
+/**
+ * Splits a {@link formatInTimeZone} pattern into literal strings and token formatters.
+ * @param {string} pattern - The format pattern
+ * @returns {CompiledPattern} The literal texts and formatters, in pattern order
+ * @example
+ * compileZonedPattern('HH Z').length; // => 5
+ */
+function compileZonedPattern(pattern: string): CompiledPattern {
+	return compileWith(pattern, ZONED_TOKEN_REGEX, ZONED_FORMAT_TOKEN_REGEX, OFFSET_FORMATTERS);
+}
+
+/**
+ * Creates the clock that {@link offsetAt} reads an IANA time zone's wall clock with: a formatter of the day of the month and the 24-hour
+ * time, with ASCII digits (`numberingSystem: 'latn'`) in the proleptic Gregorian calendar (`calendar: 'gregory'`), from null-prototype
+ * options (see {@link intlOptions}); and the order of those fields in its output, read once from `formatToParts` (so that `offsetAt` can
+ * use the much faster `format` without assuming the locale's pattern).
+ * @param {string} timeZone - The time zone name
+ * @returns {ZoneClock} The clock
+ * @throws {RangeError} when the engine does not know the time zone
+ */
+function zoneClock(timeZone: string): ZoneClock {
+	const format = new Intl.DateTimeFormat(
+		'en-US',
+		intlOptions<Intl.DateTimeFormatOptions>({
+			timeZone,
+			calendar: 'gregory',
+			numberingSystem: 'latn',
+			hourCycle: 'h23',
+			day: 'numeric',
+			hour: 'numeric',
+			minute: 'numeric',
+			second: 'numeric'
+		})
+	);
+	const fields = format
+		.formatToParts(0)
+		.map(function (part: Intl.DateTimeFormatPart): string {
+			return part.type;
+		})
+		.filter(function (type: string): boolean {
+			return type !== 'literal';
+		});
+
+	return [format, fields];
+}
+
+/**
+ * Validates a time zone argument and resolves it to a fixed offset or a (cached) clock. UTC offsets are parsed here rather than
+ * passed to `Intl`, which only accepts them in recent engines, so they work the same everywhere.
+ * @param {string} caller - Name of the public function, used in the error messages
+ * @param {string} timeZone - The time zone: an IANA name or a `±HH:MM` offset
+ * @returns {ResolvedZone} The offset in milliseconds, or the formatter
+ * @throws {TypeError} when `timeZone` is not a string
+ * @throws {RangeError} when `timeZone` is neither a time zone known to the engine nor a valid offset
+ * @example
+ * resolveTimeZone('getZonedParts', '-03:30'); // => -12_600_000
+ */
+function resolveTimeZone(caller: string, timeZone: string): ResolvedZone {
+	if (typeof timeZone !== 'string') throw new TypeError(`${caller}: \`timeZone\` must be a string, got ${describe(timeZone)}`);
+
+	if (timeZone[0] === '+' || timeZone[0] === '-') {
+		const match = OFFSET_ZONE_REGEX.exec(timeZone);
+
+		// `+ 0` turns the `-0` of `'-00:00'` into `0`.
+		if (match !== null) return (match[1] === '-' ? -1 : 1) * (Number(match[2]) * MS_PER_HOUR + Number(match[3] ?? 0) * MS_PER_MINUTE) + 0;
+	} else if (/^[a-z]/i.test(timeZone)) {
+		// IANA names start with a letter: anything else is rejected here, whatever the engine accepts (recent ones take `'−05:00'`).
+		try {
+			return cached(zoneClocks, timeZone, zoneClock, MAX_ZONE_CACHE_ENTRIES);
+		} catch {
+			// Not a time zone known to the engine: reported below.
+		}
+	}
+
+	const shown = timeZone.length > 50 ? `${timeZone.slice(0, 50)}…` : timeZone;
+
+	throw new RangeError(`${caller}: \`timeZone\` must be an IANA time zone or a UTC offset (±HH:MM), got ${JSON.stringify(shown)}`);
+}
+
+/**
+ * Returns the UTC offset of a time zone at an instant.
+ * @param {ResolvedZone} zone - The time zone
+ * @param {number} time - A valid timestamp
+ * @returns {number} The offset in milliseconds east of UTC: a whole number of seconds, which historical local mean time offsets have
+ * @example
+ * offsetAt(resolveTimeZone('offsetAt', 'Asia/Kolkata'), 0); // => 19_800_000
+ */
+function offsetAt(zone: ResolvedZone, time: number): number {
+	if (typeof zone === 'number') return zone;
+
+	const [format, order] = zone;
+	const date = new Date(time);
+	const numbers = format.format(date).match(DIGITS_REGEX) as RegExpMatchArray;
+	const fields: Record<string, number> = Object.create(null) as Record<string, number>;
+
+	for (let i = 0; i < order.length; i++) fields[order[i]] = Number(numbers[i]);
+
+	const utcDay = date.getUTCDate();
+	// Offsets are shorter than a day, so the wall clock shows the UTC day, the next or the previous one: the day of the month is one
+	// more for the next day, or less (back to 1) at the end of a month, and the other way round for the previous day.
+	const days = fields.day === utcDay ? 0 : fields.day > utcDay === (Math.abs(fields.day - utcDay) === 1) ? 1 : -1;
+
+	// Offsets are whole seconds, so the milliseconds cancel out.
+	return days * MS_PER_DAY + fields.hour * MS_PER_HOUR + fields.minute * MS_PER_MINUTE + fields.second * MS_PER_SECOND - mod(time, MS_PER_DAY) + mod(time, MS_PER_SECOND);
+}
+
+/**
+ * Returns the proleptic Gregorian calendar date of an epoch day number, using pure integer arithmetic (Howard Hinnant's
+ * `civil_from_days`, the inverse of {@link daysFromCivil}), so it works where a `Date` cannot hold that day.
+ * @param {number} days - The epoch day number (days since 1970-01-01)
+ * @returns {[number, number, number]} `[year, month (1-12), day]`
+ * @example
+ * civilFromDays(-1); // => [1969, 12, 31]
+ */
+function civilFromDays(days: number): [number, number, number] {
+	const z = days + 719468;
+	const era = Math.floor(z / 146097);
+	const dayOfEra = z - era * 146097;
+	const yearOfEra = Math.floor((dayOfEra - Math.floor(dayOfEra / 1460) + Math.floor(dayOfEra / 36524) - Math.floor(dayOfEra / 146096)) / 365);
+	const dayOfYear = dayOfEra - (365 * yearOfEra + Math.floor(yearOfEra / 4) - Math.floor(yearOfEra / 100));
+	const marchBasedMonth = Math.floor((5 * dayOfYear + 2) / 153);
+	const month = marchBasedMonth < 10 ? marchBasedMonth + 3 : marchBasedMonth - 9;
+
+	return [yearOfEra + era * 400 + (month <= 2 ? 1 : 0), month, dayOfYear - Math.floor((153 * marchBasedMonth + 2) / 5) + 1];
+}
+
+/**
+ * Returns the wall-clock fields of an instant in a time zone.
+ * @param {ResolvedZone} zone - The time zone
+ * @param {number} time - A valid timestamp
+ * @returns {ZonedDateTimeParts} The fields
+ * @example
+ * zonedParts(0, 0).year; // => 1970
+ */
+function zonedParts(zone: ResolvedZone, time: number): ZonedDateTimeParts {
+	const offset = offsetAt(zone, time);
+	// The wall clock as the UTC timestamp of the same fields, kept as a number (exact below 2^53): a `Date` could not hold it at the
+	// ends of the range.
+	const wall = time + offset;
+	const days = Math.floor(wall / MS_PER_DAY);
+	const intoDay = wall - days * MS_PER_DAY;
+	const [year, month, day] = civilFromDays(days);
+
+	return {
+		year,
+		month,
+		day,
+		hour: Math.floor(intoDay / MS_PER_HOUR),
+		minute: Math.floor(intoDay / MS_PER_MINUTE) % 60,
+		second: Math.floor(intoDay / MS_PER_SECOND) % 60,
+		millisecond: intoDay % MS_PER_SECOND,
+		// 1970-01-01 (epoch day 0) was a Thursday.
+		weekday: mod(days + 4, DAYS_PER_WEEK) as WeekdayIndex,
+		offset: offset / MS_PER_MINUTE
+	};
+}
+
+/**
+ * Returns the epoch day number of the calendar day that the wall clock of a time zone shows at an instant.
+ * @param {ResolvedZone} zone - The time zone
+ * @param {number} time - A valid timestamp
+ * @returns {number} The epoch day number
+ * @example
+ * zonedDay(0, -3_600_000); // => -1
+ */
+function zonedDay(zone: ResolvedZone, time: number): number {
+	return Math.floor((time + offsetAt(zone, time)) / MS_PER_DAY);
+}
+
+/**
+ * Finds the instants at which the wall clock of a time zone shows a given time, like Temporal's `GetPossibleEpochNanoseconds`: with the
+ * offsets in force a day before and a day after, each candidate is kept when the zone has that offset at that instant.
+ * @param {ResolvedZone} zone - The time zone
+ * @param {number} wall - The wall-clock time, as the UTC timestamp of the same fields (may be outside the `Date` range)
+ * @returns {[number, number, boolean]} `[earlier, later, exists]`: a time shown once gives the same instant twice; a repeated one its two
+ * occurrences; a skipped one (`exists` is `false`) the instants that the time denotes with the offsets after and before the gap (so the
+ * first is before the gap and the second after it). Out-of-range candidates do not exist.
+ * @example
+ * wallInstants(0, 0); // => [0, 0, true]
+ */
+function wallInstants(zone: ResolvedZone, wall: number): [number, number, boolean] {
+	const before = offsetAt(zone, Math.min(Math.max(wall - MS_PER_DAY, -MAX_TIME), MAX_TIME));
+	const after = offsetAt(zone, Math.min(Math.max(wall + MS_PER_DAY, -MAX_TIME), MAX_TIME));
+	const first = wall - before;
+	const second = wall - after;
+	const firstExists = Math.abs(first) <= MAX_TIME && offsetAt(zone, first) === before;
+	const secondExists = before !== after && Math.abs(second) <= MAX_TIME && offsetAt(zone, second) === after;
+
+	// Both: the clock was set back (the offset decreased), so the first is the earlier. Neither: it was set forward, so `second` is.
+	if (firstExists === secondExists) return firstExists ? [first, second, true] : [second, first, false];
+
+	return firstExists ? [first, first, true] : [second, second, true];
+}
+
+/**
+ * Checks whether a string is a time zone that the functions of this module accept: an IANA time zone name known to the engine's `Intl`
+ * (`'Europe/Paris'`, `'UTC'`, legacy links such as `'US/Eastern'`; case-insensitive), or a fixed UTC offset written `±HH:MM`, `±HHMM` or
+ * `±HH` (`'+05:30'`, `'-08'`). Valid zones are cached, so checking first and then using the zone costs nothing extra. It narrows `value` to
+ * {@link TimeZone} (a branded `string`) when it returns `true`, and leaves its type alone otherwise.
+ * @param {unknown} value - The value to check
+ * @returns {boolean} `true` for a usable time zone (`false` for anything that is not a string)
+ * @example
+ * isValidTimeZone('America/New_York'); // => true
+ * isValidTimeZone('+05:30'); // => true
+ * isValidTimeZone('Mars/Olympus_Mons'); // => false
+ * isValidTimeZone('+25:00'); // => false
+ */
+export function isValidTimeZone(value: unknown): value is TimeZone {
+	try {
+		resolveTimeZone('isValidTimeZone', value as string);
+
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Returns the UTC offset of a time zone at an instant, in minutes EAST of UTC: `330` in India, `-300` in New York in winter and `-240`
+ * in summer. Beware: that is the opposite sign of `Date#getTimezoneOffset()` (minutes WEST), and the same sign as ISO 8601 and Temporal.
+ *
+ * Historical local mean time offsets, in use before a place adopted standard time, have seconds: they are returned exactly, as
+ * fractional minutes (`9.35` for Paris's `+00:09:21` before 1911); `Math.round(offset * 60_000)` gives the exact milliseconds.
+ * (`Date#getTimezoneOffset()` drops those seconds.)
+ *
+ * Unlike the other functions taking a `timeZone`, the zone comes first: the instant is optional (it defaults to now, the usual question
+ * being "what is the offset there now?"), and that is the order of date-fns-tz's `getTimezoneOffset(timeZone, date)`, so code moving
+ * from it keeps its calls.
+ * @param {string} timeZone - An IANA time zone or a UTC offset (see {@link isValidTimeZone})
+ * @param {DateInput} [date=new Date()] - The instant
+ * @returns {number} The offset in minutes east of UTC
+ * @throws {TypeError} when `timeZone` is not a string, or `date` is neither a `Date` nor a number
+ * @throws {RangeError} when `timeZone` is not a valid time zone or `date` is invalid
+ * @example
+ * getTimeZoneOffset('Asia/Kolkata'); // => 330
+ * getTimeZoneOffset('America/New_York', Date.UTC(2024, 0, 15)); // => -300
+ * getTimeZoneOffset('America/New_York', Date.UTC(2024, 6, 15)); // => -240
+ * getTimeZoneOffset('Europe/Paris', Date.UTC(1900, 0, 1)); // => 9.35
+ */
+export function getTimeZoneOffset(timeZone: string, date: DateInput = new Date()): number {
+	const zone = resolveTimeZone('getTimeZoneOffset', timeZone);
+
+	return offsetAt(zone, timeOf(date)) / MS_PER_MINUTE;
+}
+
+/**
+ * Returns the wall-clock fields of an instant in a time zone: what a clock on the wall there shows. Unlike date-fns-tz's `toZonedTime`,
+ * which returns a `Date` shifted so that its LOCAL fields show that time (a different instant, whose fields are wrong when that time
+ * falls in a DST gap of the runtime's own zone), the fields are plain numbers that do not depend on the runtime's zone.
+ *
+ * `month` counts from 1, `weekday` from 0 (Sunday), and `offset` is the UTC offset in minutes east of UTC (see
+ * {@link getTimeZoneOffset}), which identifies the occurrence of a repeated time: {@link fromZonedTime} turns the result back into the
+ * same instant. Every valid date works, with years before 1 (`0` is 1 BC) and after 9999.
+ * @param {DateInput} date - The instant
+ * @param {string} timeZone - An IANA time zone or a UTC offset (see {@link isValidTimeZone})
+ * @returns {ZonedDateTimeParts} A new object with the wall-clock fields
+ * @throws {TypeError} when `timeZone` is not a string, or `date` is neither a `Date` nor a number
+ * @throws {RangeError} when `timeZone` is not a valid time zone or `date` is invalid
+ * @example
+ * getZonedParts(Date.UTC(2024, 2, 10, 7, 30), 'America/New_York'); // => { year: 2024, month: 3, day: 10, hour: 3, minute: 30, second: 0, millisecond: 0, weekday: 0, offset: -240 }
+ * getZonedParts(Date.UTC(2024, 11, 31, 20), 'Asia/Tokyo').day; // => 1 // already January 1st in Tokyo
+ * getZonedParts(0, '+05:30').hour; // => 5
+ */
+export function getZonedParts(date: DateInput, timeZone: string): ZonedDateTimeParts {
+	const zone = resolveTimeZone('getZonedParts', timeZone);
+
+	return zonedParts(zone, timeOf(date));
+}
+
+/**
+ * Reads a field of a {@link WallClockTime}: an own property only (an inherited one, from a polluted `Object.prototype`, is ignored),
+ * read once, which must be an integer between `min` and `max`.
+ * @param {WallClockTime} fields - The wall-clock fields
+ * @param {string} name - The field
+ * @param {number} min - The smallest valid value
+ * @param {number} max - The largest valid value
+ * @param {number} [fallback] - The value of a missing field (a missing field without fallback is invalid)
+ * @returns {number} The value
+ * @throws {TypeError} when the field is not a number
+ * @throws {RangeError} when the field is not an integer between `min` and `max`
+ * @example
+ * wallField({ year: 2024, month: 13, day: 1 }, 'month', 1, 12); // throws RangeError
+ */
+function wallField(fields: WallClockTime, name: keyof WallClockTime, min: number, max: number, fallback?: number): number {
+	const value = Object.hasOwn(fields, name) ? fields[name] : undefined;
+
+	if (value === undefined && fallback !== undefined) return fallback;
+
+	assertNumber(
+		'fromZonedTime',
+		`fields.${name}`,
+		value,
+		Number.isInteger(value) && (value as number) >= min && (value as number) <= max,
+		`an integer between ${min} and ${max}`
+	);
+
+	return value;
+}
+
+/**
+ * Returns the instant at which the wall clock of a time zone shows the given date and time: the inverse of {@link getZonedParts}
+ * (date-fns-tz's `fromZonedTime`, Temporal's `ZonedDateTime.from`), e.g. "9:00 on March 10th in New York" as a `Date`.
+ *
+ * Around a change of UTC offset, a wall-clock time may not exist (skipped when the clocks are set forward: 02:30 on a spring-forward
+ * night in New York) or occur twice (repeated when they are set back: 01:30 on a fall-back night). `disambiguation` resolves those
+ * cases like Temporal (see {@link Disambiguation}); the default, `'compatible'`, moves a skipped time forward by the length of the gap
+ * (02:30 becomes 03:30) and takes the first occurrence of a repeated one. When `fields` has an `offset` (as {@link getZonedParts}
+ * returns), the occurrence with that offset wins, so `fromZonedTime(getZonedParts(date, zone), zone)` is always `date`.
+ *
+ * Every field is validated: `month` counts from 1, and a day that the month does not have (`{ month: 2, day: 30 }`), a 24th hour or a
+ * 60th second are rejected rather than rolled over. Extra fields (such as `weekday`) are ignored.
+ * @param {WallClockTime} fields - `year`, `month` (1-12) and `day`, then optional `hour`, `minute`, `second`, `millisecond` (default `0`)
+ * and `offset` (minutes east of UTC, to pick an occurrence)
+ * @param {string} timeZone - An IANA time zone or a UTC offset (see {@link isValidTimeZone})
+ * @param {FromZonedTimeOptions} [options={}] - `disambiguation`: `'compatible'` (default), `'earlier'`, `'later'` or `'reject'`
+ * @returns {Date} A new date
+ * @throws {TypeError} when `timeZone` is not a string, `fields` or `options` is not an object, or a field is not a number
+ * @throws {RangeError} when `timeZone` is not a valid time zone, a field is out of range, `disambiguation` is unknown, the time is
+ * skipped or repeated with `'reject'`, or the result is outside the representable range
+ * @example
+ * fromZonedTime({ year: 2024, month: 1, day: 15, hour: 9 }, 'America/New_York'); // => new Date(Date.UTC(2024, 0, 15, 14))
+ * fromZonedTime({ year: 2024, month: 3, day: 10, hour: 2, minute: 30 }, 'America/New_York'); // => new Date(Date.UTC(2024, 2, 10, 7, 30)) // 03:30, after the gap
+ * fromZonedTime({ year: 2024, month: 11, day: 3, hour: 1, minute: 30 }, 'America/New_York', { disambiguation: 'later' }); // => new Date(Date.UTC(2024, 10, 3, 6, 30)) // the second 01:30
+ * fromZonedTime({ year: 2024, month: 3, day: 10, hour: 2, minute: 30 }, 'America/New_York', { disambiguation: 'reject' }); // throws RangeError
+ * fromZonedTime({ year: 2023, month: 2, day: 29 }, 'UTC'); // throws RangeError
+ */
+export function fromZonedTime(fields: WallClockTime, timeZone: string, options: FromZonedTimeOptions = {}): Date {
+	const zone = resolveTimeZone('fromZonedTime', timeZone);
+
+	if (typeof fields !== 'object' || fields === null) throw new TypeError(`fromZonedTime: \`fields\` must be an object, got ${describe(fields)}`);
+	assertOptions('fromZonedTime', options);
+
+	// Own options and fields only, each read once.
+	const disambiguation = (Object.hasOwn(options, 'disambiguation') ? options.disambiguation : undefined) ?? 'compatible';
+
+	assertOneOf('fromZonedTime', 'disambiguation', disambiguation, DISAMBIGUATIONS);
+
+	const year = Object.hasOwn(fields, 'year') ? fields.year : undefined;
+
+	assertInteger('fromZonedTime', 'fields.year', year as number);
+
+	const month = wallField(fields, 'month', 1, 12);
+	const day = wallField(fields, 'day', 1, daysInMonth(year as number, month - 1));
+	const hour = wallField(fields, 'hour', 0, 23, 0);
+	const minute = wallField(fields, 'minute', 0, 59, 0);
+	const second = wallField(fields, 'second', 0, 59, 0);
+	const millisecond = wallField(fields, 'millisecond', 0, 999, 0);
+	const offset = Object.hasOwn(fields, 'offset') ? fields.offset : undefined;
+
+	if (offset !== undefined) assertNumber('fromZonedTime', 'fields.offset', offset, Number.isFinite(offset), 'a finite number');
+
+	const wall = daysFromCivil(year as number, month - 1, day) * MS_PER_DAY + hour * MS_PER_HOUR + minute * MS_PER_MINUTE + second * MS_PER_SECOND + millisecond;
+
+	// Offsets are shorter than a day: no instant can show a time this far out (this also keeps huge years away from the arithmetic).
+	if (!(Math.abs(wall) <= MAX_TIME + MS_PER_DAY)) throw new RangeError('Resulting date is out of range');
+
+	const [earlier, later, exists] = wallInstants(zone, wall);
+	const preferred = offset === undefined ? NaN : wall - Math.round(offset * MS_PER_MINUTE);
+
+	if (exists && (preferred === earlier || preferred === later)) return new Date(preferred);
+
+	const result = ensureInRange(new Date(disambiguation === 'later' || (disambiguation === 'compatible' && !exists) ? later : earlier));
+
+	if (disambiguation === 'reject' && !(exists && earlier === later)) {
+		const text = `${pad(year as number, 4)}-${pad(month, 2)}-${pad(day, 2)}T${pad(hour, 2)}:${pad(minute, 2)}:${pad(second, 2)}.${pad(millisecond, 3)}`;
+
+		throw new RangeError(
+			`fromZonedTime: ${text} ${exists ? 'occurs twice' : 'does not exist'} in ${timeZone} (the clocks were set ${exists ? 'back' : 'forward'}); use another \`disambiguation\``
+		);
+	}
+
+	return result;
+}
+
+/**
+ * Formats an instant as read on the wall clock of a time zone, with the token language of {@link formatDate} (`YYYY`, `MM`, `DD`, `HH`,
+ * `mm`, `ss`, `SSS`, `A`… and `[literal]` text) plus two UTC offset tokens:
+ *
+ * | Token | Output |
+ * |-------|--------|
+ * | `Z` | `+05:30`, `-04:00`, `+00:00` |
+ * | `ZZ` | `+0530`, `-0400`, `+0000` |
+ *
+ * With `'YYYY-MM-DD[T]HH:mm:ss.SSSZ'`, the result is an RFC 3339 timestamp for the years 0-9999 and whole-minute offsets. Note that a
+ * bare `Z` is a token here (but not in `formatDate`): write a literal Z as `[Z]`. Historical local mean time offsets have seconds
+ * (Paris: `+00:09:21` until 1911), which the offset tokens then write in full, like Temporal's `ZonedDateTime#offset`, so that the
+ * wall-clock fields and the offset always denote the exact instant. Rounding them to the minute, as Temporal's `toString()` does
+ * (`00:09:21+00:09`), would denote another instant unless the wall-clock fields were shifted too, and then `HH:mm:ss` would no longer
+ * show the wall clock. Such offsets, and years outside 0-9999, are beyond RFC 3339 (`Date.parse` cannot read them); for a timestamp that
+ * always parses, in the runtime's zone, see {@link toISOStringLocal}. The result does not depend on the runtime's time zone. Patterns are
+ * tokenized in linear time and cached like `formatDate`'s.
+ * @param {DateInput} date - The instant to format
+ * @param {string} timeZone - An IANA time zone or a UTC offset (see {@link isValidTimeZone})
+ * @param {string} pattern - The format pattern
+ * @returns {string} The formatted date
+ * @throws {TypeError} when `timeZone` or `pattern` is not a string, or `date` is neither a `Date` nor a number
+ * @throws {RangeError} when `timeZone` is not a valid time zone or `date` is invalid
+ * @example
+ * formatInTimeZone(Date.UTC(2024, 0, 5, 14, 7), 'Asia/Kolkata', 'YYYY-MM-DD HH:mm Z'); // => '2024-01-05 19:37 +05:30'
+ * formatInTimeZone(Date.UTC(2024, 6, 4, 16), 'America/New_York', 'D/M/YYYY h:mm A ZZ'); // => '4/7/2024 12:00 PM -0400'
+ * formatInTimeZone(Date.UTC(2024, 0, 5, 14, 7), 'UTC', 'YYYY-MM-DD[T]HH:mm:ss.SSSZ'); // => '2024-01-05T14:07:00.000+00:00'
+ */
+export function formatInTimeZone(date: DateInput, timeZone: string, pattern: string): string {
+	const zone = resolveTimeZone('formatInTimeZone', timeZone);
+
+	if (typeof pattern !== 'string') throw new TypeError(`formatInTimeZone: \`pattern\` must be a string, got ${describe(pattern)}`);
+
+	return render(cached(compiledZonedPatterns, pattern, compileZonedPattern), zonedParts(zone, timeOf(date)));
+}
+
+/**
+ * Returns the first instant of the calendar day that the wall clock of a time zone shows at `date`: normally its 00:00:00.000 there, but
+ * the end of the gap where midnight was skipped (in Havana, 2024-03-10 starts at 01:00; in Toronto, 1919-03-31 started at 00:30, the
+ * clocks having gone from 23:30 to 00:30, where date-fns-tz and Temporal's `'compatible'` midnight give 01:00) and the first midnight
+ * where it was repeated. The result does not depend on the runtime's time zone.
+ * @param {DateInput} date - The instant
+ * @param {string} timeZone - An IANA time zone or a UTC offset (see {@link isValidTimeZone})
+ * @returns {Date} A new date
+ * @throws {TypeError} when `timeZone` is not a string, or `date` is neither a `Date` nor a number
+ * @throws {RangeError} when `timeZone` is not a valid time zone, `date` is invalid, or the result is outside the representable range
+ * @example
+ * startOfDayInTimeZone(Date.UTC(2024, 0, 5, 3), 'America/New_York'); // => new Date(Date.UTC(2024, 0, 4, 5)) // January 4th, 00:00 -05:00
+ * startOfDayInTimeZone(Date.UTC(2024, 2, 10, 12), 'America/Havana'); // => new Date(Date.UTC(2024, 2, 10, 5)) // 01:00 -04:00: midnight was skipped
+ */
+export function startOfDayInTimeZone(date: DateInput, timeZone: string): Date {
+	const zone = resolveTimeZone('startOfDayInTimeZone', timeZone);
+	const day = zonedDay(zone, timeOf(date));
+
+	return ensureInRange(new Date(zonedDayStart(zone, day, wallInstants(zone, day * MS_PER_DAY))));
+}
+
+/**
+ * Returns the first instant of a calendar day of a time zone: its first midnight, or where midnight was skipped, the end of the gap. That
+ * is not always midnight moved forward by the length of the gap, as Temporal's `'compatible'` would give: when the gap began before
+ * midnight (Toronto, 1919-03-30: 23:30 became 00:30), the day started at 00:30, not 01:00. The end of the gap is then found by bisection.
+ * @param {ResolvedZone} zone - The time zone
+ * @param {number} day - The epoch day number
+ * @param {[number, number, boolean]} instants - What {@link wallInstants} returns for the day's midnight
+ * @returns {number} The timestamp of the first instant of the day (outside the `Date` range when the day does not start in it)
+ * @example
+ * zonedDayStart(0, 1, wallInstants(0, 86_400_000)); // => 86_400_000
+ */
+function zonedDayStart(zone: ResolvedZone, day: number, instants: [number, number, boolean]): number {
+	const [earlier, later, exists] = instants;
+
+	if (exists) return earlier;
+
+	// Bisect between the instants before and after the gap (an instant past an end of the range reads as that end).
+	let low = earlier;
+	let high = later;
+
+	while (high - low > 1) {
+		const middle = Math.floor((low + high) / 2);
+
+		if (zonedDay(zone, Math.min(Math.max(middle, -MAX_TIME), MAX_TIME)) >= day) high = middle;
+		else low = middle;
+	}
+
+	return high;
+}
+
+/**
+ * Returns the last millisecond of the calendar day that the wall clock of a time zone shows at `date`: the instant before the next day
+ * starts there (normally 23:59:59.999). Where the clocks were set back just after midnight, so that the day came back for a while
+ * (St. John's, 2010-11-07 at 00:01), it is the instant before the second midnight, like {@link endOfDay}. The result does not depend on
+ * the runtime's time zone.
+ * @param {DateInput} date - The instant
+ * @param {string} timeZone - An IANA time zone or a UTC offset (see {@link isValidTimeZone})
+ * @returns {Date} A new date
+ * @throws {TypeError} when `timeZone` is not a string, or `date` is neither a `Date` nor a number
+ * @throws {RangeError} when `timeZone` is not a valid time zone, `date` is invalid, or the result is outside the representable range
+ * @example
+ * endOfDayInTimeZone(Date.UTC(2024, 0, 5, 3), 'America/New_York'); // => new Date(Date.UTC(2024, 0, 5, 4, 59, 59, 999)) // January 4th, 23:59:59.999 -05:00
+ */
+export function endOfDayInTimeZone(date: DateInput, timeZone: string): Date {
+	const zone = resolveTimeZone('endOfDayInTimeZone', timeZone);
+	const day = zonedDay(zone, timeOf(date));
+	const instants = wallInstants(zone, (day + 1) * MS_PER_DAY);
+	const [earlier, later] = instants;
+	// The next day starts at its (first) midnight, or after the gap where midnight was skipped. When midnight is repeated because the
+	// previous day came back (not when the repeated hour belongs to the new day, as in Havana), the day ends before the second one.
+	const next = instants[2] && earlier !== later && zonedDay(zone, later - 1) === day ? later : zonedDayStart(zone, day + 1, instants);
+
+	return ensureInRange(new Date(next - 1));
+}
+
+/**
+ * Returns the grid of a month as every date picker shows it: an array of weeks, each an array of 7 dates at the start of their LOCAL
+ * day (normally 00:00; where midnight was skipped, the end of the gap, like {@link startOfDay}: 01:00 in Havana or Beirut on the night
+ * the clocks go forward), from the week containing the 1st to the week containing the last day. The leading and trailing cells belong to
+ * the previous and next months (check with `cell.getMonth() === monthIndex`). With `fixedWeeks`, there are always 6 weeks, so the grid
+ * does not change height from month to month; otherwise 4 to 6.
+ *
+ * A calendar day that the time zone skipped entirely (Samoa's Friday, December 30th, 2011, in `Pacific/Apia`) has no instant of its
+ * own: its cell holds the start of the next day (the same instant as the following cell, as Temporal's `PlainDate#toZonedDateTime`
+ * gives), so every week keeps 7 columns, the column still gives the weekday, and picking that cell selects the next existing day. Its
+ * `getDate()` reads the next day's number: label cells by position when that matters.
+ * @param {number} year - The integer year (0-99 are NOT remapped to 1900-1999)
+ * @param {number} monthIndex - The zero-based month (0 = January … 11 = December), as in `new Date(year, monthIndex)`
+ * @param {CalendarMonthOptions} [options={}] - `weekStartsOn`: the first day of each week (default `0`, Sunday); `fixedWeeks`: always
+ * return 6 weeks (default `false`)
+ * @returns {Date[][]} A new array of weeks of 7 new dates
+ * @throws {TypeError} when `year`, `monthIndex` or `weekStartsOn` is not a number, or `options` is not an object
+ * @throws {RangeError} when `year` is not an integer, `monthIndex` is not an integer between 0 and 11, `weekStartsOn` is not an integer
+ * between 0 and 6, or a date of the grid is outside the representable range
+ * @example
+ * const weeks = getCalendarMonth(2024, 1); // February 2024 began on a Thursday
+ * weeks.length; // => 5
+ * weeks[0]; // => [new Date(2024, 0, 28), new Date(2024, 0, 29), new Date(2024, 0, 30), new Date(2024, 0, 31), new Date(2024, 1, 1), new Date(2024, 1, 2), new Date(2024, 1, 3)]
+ * getCalendarMonth(2024, 1, { weekStartsOn: 1 })[0][0]; // => new Date(2024, 0, 29) // a Monday
+ * getCalendarMonth(2026, 1).length; // => 4 // February 2026 began on a Sunday
+ * getCalendarMonth(2026, 1, { fixedWeeks: true }).length; // => 6
+ */
+export function getCalendarMonth(year: number, monthIndex: number, options: CalendarMonthOptions = {}): Date[][] {
+	assertInteger('getCalendarMonth', 'year', year);
+	assertNumber('getCalendarMonth', 'monthIndex', monthIndex, Number.isInteger(monthIndex) && monthIndex >= 0 && monthIndex <= 11, 'an integer between 0 and 11');
+	assertOptions('getCalendarMonth', options);
+
+	// Own options only, each read once.
+	const weekStartsOn = (Object.hasOwn(options, 'weekStartsOn') ? options.weekStartsOn : undefined) ?? 0;
+	const fixedWeeks = Object.hasOwn(options, 'fixedWeeks') && options.fixedWeeks === true;
+
+	assertWeekday('getCalendarMonth', weekStartsOn);
+
+	const first = daysFromCivil(year, monthIndex, 1);
+	// 1970-01-01 (epoch day 0) was a Thursday (weekday 4).
+	const lead = mod(first + 4 - weekStartsOn, DAYS_PER_WEEK);
+	const start = first - lead;
+	// The 4 to 6 weeks spanned by the leading days and the month, written so that a year too large for the arithmetic (`NaN`) still gives
+	// 4 weeks, whose first date then throws, rather than an empty grid.
+	const end = lead + daysInMonth(year, monthIndex);
+	const count = fixedWeeks ? 6 : 4 + Number(end > 28) + Number(end > 35);
+	const weeks: Date[][] = [];
+
+	for (let week = 0; week < count; week++) {
+		const cells: Date[] = [];
+
+		for (let column = 0; column < DAYS_PER_WEEK; column++) cells.push(localMidnight(1970, 0, 1 + start + week * DAYS_PER_WEEK + column));
+		weeks.push(cells);
+	}
+
+	return weeks;
 }
