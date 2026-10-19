@@ -1,5 +1,6 @@
 import { createLRUCache, createPriorityQueue } from '../cache/index.js';
 import { debounce, defaultMemoizeKey, noop, type MemoizeCache, type Result } from '../functions/index.js';
+import { isError } from '../guards/index.js';
 import { assertDelay, assertFunction, assertInteger, assertNumber, describe, draw, MAX_TIMEOUT } from '../utils/assert.js';
 import { assertOptionalSignal, detach, reasonOf } from '../utils/signal.js';
 import type { AbortSignalLike, AnyFunction, RandomGenerator } from '../utils/index.js';
@@ -1772,6 +1773,666 @@ export async function sequence<T>(tasks: Iterable<() => PromiseLike<T> | T>): Pr
 	}
 
 	return results;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// createBatcher
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * The batch function of {@link createBatcher}: receives the distinct keys of one batch (a new array on every call) and returns, or
+ * resolves to, an array (or array-like object, not a string) of exactly one value per key, in the same order. An `Error` instance at
+ * a position rejects the callers of that key only.
+ * @template K - The key type
+ * @template V - The value type
+ */
+export type BatchLoadFunction<K, V> = (keys: K[]) => PromiseLike<ArrayLike<V | Error> & object> | (ArrayLike<V | Error> & object);
+
+/**
+ * Options accepted by {@link createBatcher}.
+ * @template K - The key type
+ * @template V - The value type
+ */
+export interface BatcherOptions<K, V> {
+	/**
+	 * How long a batch collects keys, in milliseconds from its first key (`0` to `2^31 - 1`). By default a batch is dispatched as soon
+	 * as the microtask queue has drained, like DataLoader: it holds every key requested in the current tick, also from promise callbacks
+	 * and after any number of `await`s (GraphQL resolvers at the same depth). In Node, Bun and Deno that is a `process.nextTick` queued
+	 * from a microtask; elsewhere (browsers, workers) a `setTimeout(0)` macrotask, which costs about a millisecond (up to 4 when timers
+	 * nest), negligible next to the I/O a batch performs. Set `delay` to collect keys for longer, across timers and I/O.
+	 */
+	delay?: number;
+	/**
+	 * Largest number of distinct keys passed to one call of the batch function (an integer >= 1, or `Infinity`, the default). A full
+	 * batch is sealed (further keys start a new batch) and dispatched without waiting for `delay`.
+	 */
+	maxBatchSize?: number;
+	/**
+	 * Maps a key to its identity, compared with SameValueZero like `Map` keys: the keys of one identity are requested once per batch,
+	 * and share their cache entry. Defaults to the key itself, so object keys are compared by reference; pass, for example,
+	 * `function (key) { return key.id; }`, or `defaultMemoizeKey` from the functions module to compare plain data by value.
+	 */
+	key?: (key: K) => unknown;
+	/**
+	 * Whether resolved values are kept across batches:
+	 * - `false` (the default): every batch requests its keys again, so no value is ever stale and nothing grows.
+	 * - `true`: an unbounded `Map`, for a short-lived batcher only (one per request, the way DataLoader is meant to be used).
+	 * - a `Map`-like store, such as `createLRUCache({ max, ttl })` from the cache module, to bound both memory and staleness.
+	 *
+	 * With a cache, a key already requested and not yet settled is joined instead of requested again (single flight). Only values are
+	 * stored, never errors: a failed key is requested again by its next `load`.
+	 */
+	cache?: boolean | MemoizeCache<unknown, V>;
+}
+
+/**
+ * Options accepted by {@link Batcher.load} and {@link Batcher.loadMany}.
+ */
+export interface BatcherLoadOptions {
+	/**
+	 * Stops waiting: the promise rejects with the signal's `reason` (or an {@link AbortError}). A key that no other caller waits for is
+	 * removed from its batch when the batch has not been dispatched yet, so it is never requested; a dispatched batch is not affected.
+	 * A batcher adds one listener per signal, however many keys wait on it, and removes it once none does.
+	 */
+	signal?: AbortSignalLike | null;
+}
+
+/**
+ * A request batcher as returned by {@link createBatcher}. Its methods do not use `this`, so they can be passed around on their own.
+ * @template K - The key type
+ * @template V - The value type
+ */
+export interface Batcher<K, V> {
+	/**
+	 * Requests the value of `key`: from the cache when it holds one, otherwise through the next call of the batch function.
+	 * @throws {TypeError} (as a rejection) when `options` is not an object, `signal` is not a signal, or the batch function returns
+	 * something other than one value per key
+	 * @throws {unknown} (as a rejection) the `Error` at the key's position, the error of the batch function, the error of the `key`
+	 * function or of the cache, or the abort reason of `signal`
+	 */
+	load(key: K, options?: BatcherLoadOptions): Promise<V>;
+	/**
+	 * Requests the values of several keys (through the same batch, when they fit in one) and resolves with them in the same order.
+	 * Rejects like `Promise.all`, as soon as one key fails (unlike DataLoader's `loadMany`, which resolves with `Error` values: use
+	 * `Promise.allSettled(keys.map(load))` for that).
+	 * @throws {TypeError} (as a rejection) when `keys` is not iterable, `options` is not an object or `signal` is not a signal
+	 */
+	loadMany(keys: Iterable<K>, options?: BatcherLoadOptions): Promise<V[]>;
+	/**
+	 * Forgets the cached value of `key`, and makes a request for it that is already in flight leave its (possibly stale) value out of
+	 * the cache (its callers still get it). A request not dispatched yet cannot be stale: it is kept, and caches its value. Does nothing
+	 * without a cache.
+	 */
+	clear(key: K): void;
+	/** Like {@link Batcher.clear}, for every key. */
+	clearAll(): void;
+	/**
+	 * Stores `value` as the cached value of `key` (replacing any), for instance the record returned by an update. Callers waiting for
+	 * `key` in a batch not dispatched yet get `value` at once, and the key leaves the batch (it is not requested); a request already in
+	 * flight still settles its callers, but leaves its value out of the cache. Does nothing without a cache.
+	 * @throws {TypeError} when `value` is an `Error` (errors are never cached)
+	 */
+	prime(key: K, value: V): void;
+}
+
+/**
+ * The keys collected for one call of the batch function.
+ */
+interface Batch {
+	/** One entry per key identity, in the order of their first request. */
+	readonly entries: Map<unknown, BatchEntry>;
+	/** The `delay` timer, until the batch is dispatched or sealed. */
+	timer: ReturnType<typeof setTimeout> | undefined;
+	/** Whether the batch function has been called with the batch. */
+	dispatched: boolean;
+}
+
+/**
+ * A key of a {@link Batch}, shared by every caller requesting its identity.
+ */
+interface BatchEntry {
+	/** The first key requested with this identity: the one passed to the batch function. */
+	readonly key: unknown;
+	readonly id: unknown;
+	readonly batch: Batch;
+	readonly deferred: Deferred<unknown>;
+	/** Callers that have not aborted. */
+	waiters: number;
+}
+
+/**
+ * The callers of a batcher waiting on one abort signal, and the single listener that stops them all.
+ */
+interface SignalGroup {
+	readonly stops: Set<(reason: unknown) => void>;
+	readonly listener: () => void;
+}
+
+/**
+ * Whether `value` has the methods of a {@link MemoizeCache}.
+ * @param {unknown} value - The value
+ * @returns {boolean} `true` for a `Map`-like store
+ */
+function isCacheLike(value: unknown): value is MemoizeCache<unknown, unknown> {
+	const cache = value as Partial<MemoizeCache<unknown, unknown>>;
+
+	return (
+		typeof value === 'object' &&
+		value !== null &&
+		typeof cache.get === 'function' &&
+		typeof cache.has === 'function' &&
+		typeof cache.set === 'function' &&
+		typeof cache.delete === 'function' &&
+		typeof cache.clear === 'function'
+	);
+}
+
+/**
+ * Reads the values a batch function returned: exactly `count` of them, each read once.
+ * @param {unknown} values - What the batch function returned (or resolved to)
+ * @param {number} count - The number of keys in the batch
+ * @returns {unknown[]} The values, in key order
+ * @throws {TypeError} when `values` is not an array or array-like object of `count` values
+ */
+function readValues(values: unknown, count: number): unknown[] {
+	if (typeof values !== 'object' || values === null) {
+		throw new TypeError(`createBatcher: \`batchLoad\` must return an array of ${count} values (one per key), got ${describe(values)}`);
+	}
+
+	const { length } = values as ArrayLike<unknown>;
+
+	if (length !== count) {
+		throw new TypeError(
+			`createBatcher: \`batchLoad\` must return an array of ${count} values (one per key), got ${typeof length === 'number' ? `${length} values` : 'object'}`
+		);
+	}
+
+	const results: unknown[] = [];
+
+	for (let index = 0; index < count; index++) results.push((values as ArrayLike<unknown>)[index]);
+
+	return results;
+}
+
+/**
+ * Calls `fn` once the microtask queue has drained (see {@link BatcherOptions.delay}): from a `process.nextTick` callback queued by a
+ * microtask where the runtime has one (Node runs it after every pending promise reaction, including those queued meanwhile), and from
+ * a `setTimeout(0)` macrotask elsewhere. The lookup happens at call time, so nothing runs when the module loads.
+ * @param {() => void} fn - The callback
+ * @returns {void}
+ */
+function afterMicrotasks(fn: () => void): void {
+	Promise.resolve().then(function () {
+		try {
+			const host = (globalThis as unknown as { process?: { nextTick?: unknown } }).process;
+			const nextTick = host?.nextTick;
+
+			if (typeof nextTick === 'function') {
+				(nextTick as (callback: () => void) => void).call(host, fn);
+				return;
+			}
+		} catch {
+			// A `process` whose `nextTick` cannot be read or called: fall back to a timer.
+		}
+		setTimeout(fn, 0);
+	});
+}
+
+/**
+ * Reads the `signal` of the options of {@link Batcher.load} or {@link Batcher.loadMany}, once.
+ * @param {string} caller - Name of the method, used in error messages
+ * @param {unknown} options - The options
+ * @returns {AbortSignalLike | null | undefined} The signal
+ * @throws {TypeError} when `options` is not an object (or `undefined`), or `signal` is not a signal
+ */
+function signalOption(caller: string, options: unknown): AbortSignalLike | null | undefined {
+	if (options === undefined) return undefined;
+	if (typeof options !== 'object' || options === null) throw new TypeError(`${caller}: \`options\` must be an object, got ${describe(options)}`);
+
+	const { signal } = options as BatcherLoadOptions;
+
+	assertOptionalSignal(caller, 'signal', signal);
+
+	return signal;
+}
+
+/**
+ * Creates a request batcher, DataLoader-style: every key requested with `load` while a batch is open goes to ONE call of `batchLoad`,
+ * which returns one value per key, and each caller gets the value of its own key. N lookups (an N+1 query in a GraphQL resolver, one
+ * request per row of a list) become one round trip.
+ * - A batch collects the keys requested until the microtask queue drains, like DataLoader (see `delay` to wait longer).
+ * - Each key identity (see `key`) is requested once per batch, however many callers ask for it.
+ * - An `Error` instance in the results rejects that key only. A batch function that throws, rejects, or returns anything but an array
+ *   (or array-like object) of exactly one value per key rejects every key of the batch (with its error, or a `TypeError`).
+ * - `maxBatchSize` splits large batches.
+ * - A caller's `signal` stops its wait, and removes its key from a batch not yet dispatched when no other caller waits for it.
+ *
+ * Nothing is cached across batches by default, unlike DataLoader, whose default unbounded cache serves stale values forever (and
+ * grows without bound) as soon as a loader outlives its request. Pass `cache: true` for a per-request batcher, or a bounded store such
+ * as `createLRUCache({ max, ttl })`; `clear`, `clearAll` and `prime` then keep it up to date after writes. The batch function may call
+ * `load` itself: those keys go to a new batch. To cap how many batches run at once, call the batch function through
+ * {@link createLimiter}.
+ * @template K - The key type
+ * @template V - The value type
+ * @param {BatchLoadFunction<K, V>} batchLoad - Receives the distinct keys of a batch and returns (a promise of) one value per key, in order
+ * @param {BatcherOptions<K, V>} [options] - `delay`, `maxBatchSize` (Infinity), `key` and `cache` (false)
+ * @returns {Batcher<K, V>} The batcher, with `load`, `loadMany`, `clear`, `clearAll` and `prime`
+ * @throws {TypeError} when `batchLoad` or `key` is not a function, `options` is not an object, `delay` or `maxBatchSize` is not a
+ * number, or `cache` is neither a boolean nor a `Map`-like store
+ * @throws {RangeError} when `delay` is not between `0` and `2^31 - 1`, or `maxBatchSize` is not an integer >= 1 or `Infinity`
+ * @example
+ * const calls: number[][] = [];
+ * const users = createBatcher(async function (ids: number[]) {
+ *   calls.push(ids);
+ *   return ids.map(function (id) { return { id, name: `user ${id}` }; });
+ * });
+ * async function resolveAfter(awaits: number, id: number) { for (let i = 0; i < awaits; i++) await null; return users.load(id); }
+ * const [first, second, again] = await Promise.all([users.load(1), resolveAfter(3, 2), resolveAfter(1, 1)]);
+ * second; // => { id: 2, name: 'user 2' }
+ * first === again; // => true
+ * calls; // => [[1, 2]] // one call, each key once
+ * @example
+ * import { createLRUCache } from 'tinkit/cache';
+ * const posts = createBatcher(
+ *   async function (ids: number[]) { return ids.map(function (id) { return id > 0 ? `post ${id}` : new RangeError(`no post ${id}`); }); },
+ *   { maxBatchSize: 100, cache: createLRUCache({ max: 1000, ttl: 60_000 }) }
+ * );
+ * await posts.loadMany([1, 2]); // => ['post 1', 'post 2']
+ * await posts.load(-1); // throws RangeError // only this key fails
+ * posts.prime(3, 'post 3 (edited)');
+ * await posts.load(3); // => 'post 3 (edited)'
+ */
+export function createBatcher<K, V>(batchLoad: BatchLoadFunction<K, V>, options: BatcherOptions<K, V> = {}): Batcher<K, V> {
+	if (typeof options !== 'object' || options === null) throw new TypeError(`createBatcher: \`options\` must be an object, got ${describe(options)}`);
+
+	const { delay, maxBatchSize = Infinity, key: keyOf, cache: cacheOption = false } = options;
+
+	assertFunction('createBatcher', 'batchLoad', batchLoad);
+	if (delay !== undefined) assertDelay('createBatcher', 'delay', delay);
+	assertInteger('createBatcher', 'maxBatchSize', maxBatchSize, 1, true);
+	if (keyOf !== undefined) assertFunction('createBatcher', 'key', keyOf);
+	if (typeof cacheOption !== 'boolean' && !isCacheLike(cacheOption)) {
+		throw new TypeError(`createBatcher: \`cache\` must be a boolean or a Map-like cache, got ${describe(cacheOption)}`);
+	}
+
+	const cache = cacheOption === true ? new Map<unknown, unknown>() : cacheOption === false ? undefined : (cacheOption as MemoizeCache<unknown, unknown>);
+	// With a cache: the entry of every key requested and not settled yet, dispatched or not (single flight). Only the entry still
+	// registered here when its batch settles writes its value to the cache.
+	const inflight = new Map<unknown, BatchEntry>();
+	// One abort listener per signal, whatever the number of keys waiting on it: adding and removing one listener per key costs a scan
+	// of the signal's listener list each, which is quadratic for a `loadMany` of many keys.
+	const groups = new WeakMap<AbortSignalLike, SignalGroup>();
+	let pending: Batch | undefined;
+
+	/**
+	 * Computes the identity of a key.
+	 * @param {unknown} key - The key
+	 * @returns {unknown} Its identity
+	 */
+	function identify(key: unknown): unknown {
+		return keyOf === undefined ? key : keyOf(key as K);
+	}
+
+	/**
+	 * Calls the batch function with the keys of a batch, and settles their entries with the outcome.
+	 * @param {Batch} batch - The batch
+	 * @returns {void}
+	 */
+	function dispatch(batch: Batch): void {
+		if (pending === batch) pending = undefined;
+		batch.dispatched = true;
+
+		// Keys whose callers all aborted (or were primed) have left the batch: when none is left, there is nothing to request.
+		const entries = Array.from(batch.entries.values());
+
+		if (entries.length === 0) return;
+
+		let values: unknown;
+		let direct: boolean;
+
+		try {
+			values = (batchLoad as (keys: unknown[]) => unknown)(
+				entries.map(function (entry) {
+					return entry.key;
+				})
+			);
+			// An array is read as it is: resolving it like a promise would look up a `then` method, which a polluted prototype supplies.
+			direct = Array.isArray(values) || ArrayBuffer.isView(values);
+		} catch (error) {
+			fail(entries, error);
+			return;
+		}
+		if (direct) {
+			complete(entries, values);
+			return;
+		}
+		Promise.resolve(values).then(
+			function (resolved) {
+				complete(entries, resolved);
+			},
+			function (error: unknown) {
+				fail(entries, error);
+			}
+		);
+	}
+
+	/**
+	 * Settles the entries of a batch with the values the batch function returned.
+	 * @param {BatchEntry[]} entries - The entries
+	 * @param {unknown} values - The values
+	 * @returns {void}
+	 */
+	function complete(entries: BatchEntry[], values: unknown): void {
+		let results: unknown[];
+
+		try {
+			results = readValues(values, entries.length);
+		} catch (error) {
+			fail(entries, error);
+			return;
+		}
+		entries.forEach(function (entry, index) {
+			const value = results[index];
+			const current = settle(entry);
+
+			if (isError(value)) {
+				entry.deferred.reject(value);
+				return;
+			}
+			// Stored before the callers resume, so that their next `load` finds it.
+			if (current) store(entry.id, value);
+			entry.deferred.resolve(value);
+		});
+	}
+
+	/**
+	 * Rejects every entry of a batch.
+	 * @param {BatchEntry[]} entries - The entries
+	 * @param {unknown} error - The rejection reason
+	 * @returns {void}
+	 */
+	function fail(entries: BatchEntry[], error: unknown): void {
+		for (const entry of entries) {
+			settle(entry);
+			entry.deferred.reject(error);
+		}
+	}
+
+	/**
+	 * Unregisters a settling entry from the requests in flight.
+	 * @param {BatchEntry} entry - The entry
+	 * @returns {boolean} Whether it was still registered (only then may its value be cached)
+	 */
+	function settle(entry: BatchEntry): boolean {
+		if (inflight.get(entry.id) !== entry) return false;
+		inflight.delete(entry.id);
+
+		return true;
+	}
+
+	/**
+	 * Writes a value to the cache.
+	 * @param {unknown} id - The key identity
+	 * @param {unknown} value - The value
+	 * @returns {void}
+	 */
+	function store(id: unknown, value: unknown): void {
+		try {
+			(cache as MemoizeCache<unknown, unknown>).set(id, value);
+		} catch {
+			// The callers get the value anyway: a cache that cannot store it only makes the next `load` request it again.
+		}
+	}
+
+	/**
+	 * Unregisters the dispatched request for a key, so that its (possibly stale) value is not cached. A request not dispatched yet
+	 * cannot be stale: it stays.
+	 * @param {unknown} id - The key identity
+	 * @returns {void}
+	 */
+	function forget(id: unknown): void {
+		if (inflight.get(id)?.batch.dispatched) inflight.delete(id);
+	}
+
+	/**
+	 * Returns the entry a new caller of `key` waits for: the request in flight (with a cache), the entry in the open batch, or a new
+	 * entry, opening a batch when none is open.
+	 * @param {unknown} key - The key
+	 * @param {unknown} id - Its identity
+	 * @returns {BatchEntry} The entry, counting the caller among its waiters
+	 */
+	function join(key: unknown, id: unknown): BatchEntry {
+		let entry = cache === undefined ? pending?.entries.get(id) : inflight.get(id);
+
+		if (entry === undefined) {
+			let batch = pending;
+
+			if (batch === undefined) {
+				const opened: Batch = { entries: new Map(), timer: undefined, dispatched: false };
+
+				batch = pending = opened;
+				if (delay === undefined) {
+					afterMicrotasks(function () {
+						dispatch(opened);
+					});
+				} else {
+					opened.timer = setTimeout(dispatch, delay, opened);
+				}
+			}
+			entry = { key, id, batch, deferred: createDeferred<unknown>(), waiters: 0 };
+			batch.entries.set(id, entry);
+			if (cache !== undefined) inflight.set(id, entry);
+			// A full batch is sealed: later keys open a new one. With a `delay`, it goes in a microtask rather than when its timer fires.
+			if (batch.entries.size >= maxBatchSize) {
+				const full = batch;
+
+				pending = undefined;
+				if (full.timer !== undefined) {
+					clearTimeout(full.timer);
+					Promise.resolve().then(function () {
+						dispatch(full);
+					});
+				}
+			}
+		}
+		entry.waiters++;
+
+		return entry;
+	}
+
+	/**
+	 * Removes an aborted caller from an entry, and the entry from its batch when nobody else waits for it and the batch has not been
+	 * dispatched yet (an entry already settled by `prime` has left it).
+	 * @param {BatchEntry} entry - The entry
+	 * @returns {void}
+	 */
+	function leave(entry: BatchEntry): void {
+		if (--entry.waiters > 0 || entry.batch.dispatched || entry.batch.entries.get(entry.id) !== entry) return;
+		entry.batch.entries.delete(entry.id);
+		settle(entry);
+	}
+
+	/**
+	 * Registers a caller waiting on `signal`, adding the batcher's listener to the signal for its first caller.
+	 * @param {AbortSignalLike} signal - The signal
+	 * @param {(reason: unknown) => void} stop - Stops the caller
+	 * @returns {void}
+	 * @throws {unknown} the error of a throwing `addEventListener` (the caller is not registered then)
+	 */
+	function watch(signal: AbortSignalLike, stop: (reason: unknown) => void): void {
+		const existing = groups.get(signal);
+
+		if (existing !== undefined) {
+			existing.stops.add(stop);
+			return;
+		}
+
+		const stops = new Set([stop]);
+		const group: SignalGroup = {
+			stops,
+			listener: function onAbort(): void {
+				if (groups.get(signal) === group) groups.delete(signal);
+
+				const reason = abortReason(signal);
+				const stopped = Array.from(stops);
+
+				// Emptied first: a hostile signal calling the listener again stops nobody twice.
+				stops.clear();
+				for (const each of stopped) each(reason);
+			}
+		};
+
+		groups.set(signal, group);
+		try {
+			signal.addEventListener('abort', group.listener, { once: true });
+		} catch (error) {
+			if (groups.get(signal) === group) groups.delete(signal);
+			stops.clear();
+			throw error;
+		}
+	}
+
+	/**
+	 * Unregisters a caller that settled, removing the listener once no caller waits on the signal.
+	 * @param {AbortSignalLike} signal - The signal
+	 * @param {(reason: unknown) => void} stop - The caller's stop function
+	 * @returns {void}
+	 */
+	function unwatch(signal: AbortSignalLike, stop: (reason: unknown) => void): void {
+		const group = groups.get(signal);
+
+		if (group === undefined || !group.stops.delete(stop) || group.stops.size > 0) return;
+		groups.delete(signal);
+		detach(signal, group.listener);
+	}
+
+	/**
+	 * Requests the value of a key, once the options have been read and checked.
+	 * @param {unknown} key - The key
+	 * @param {AbortSignalLike | null | undefined} signal - The caller's signal
+	 * @returns {Promise<unknown>} The value
+	 */
+	function request(key: unknown, signal: AbortSignalLike | null | undefined): Promise<unknown> {
+		return new Promise<unknown>(function (resolve, reject) {
+			// Checked for every key: the `key` function or the cache of an earlier key of a `loadMany` may have aborted it.
+			if (signal?.aborted) throw abortReason(signal);
+
+			const id = identify(key);
+
+			if (cache !== undefined) {
+				// Read once, then `has` only for a cached `undefined` (an expiring cache could drop the entry between the two).
+				const cached = cache.get(id);
+
+				if (cached !== undefined || cache.has(id)) {
+					resolve(cached);
+					return;
+				}
+			}
+			if (signal === null || signal === undefined) {
+				resolve(join(key, id).deferred.promise);
+				return;
+			}
+
+			// Again: the `key` function or the cache may have aborted it, and a listener added now would never be called.
+			if (signal.aborted) throw abortReason(signal);
+
+			const entry = join(key, id);
+			let stopped = false;
+
+			/**
+			 * Stops waiting (once): rejects, and leaves the entry.
+			 * @param {unknown} reason - The rejection reason
+			 * @returns {void}
+			 */
+			function stop(reason: unknown): void {
+				if (stopped) return;
+				stopped = true;
+				reject(reason);
+				leave(entry);
+			}
+
+			try {
+				watch(signal, stop);
+			} catch (error) {
+				// The key leaves its batch again (unless another caller waits for it).
+				stop(error);
+				return;
+			}
+			entry.deferred.promise.then(
+				function (value) {
+					unwatch(signal, stop);
+					resolve(value);
+				},
+				function (error: unknown) {
+					unwatch(signal, stop);
+					reject(error);
+				}
+			);
+		});
+	}
+
+	return {
+		load(key: K, loadOptions?: BatcherLoadOptions): Promise<V> {
+			let signal: AbortSignalLike | null | undefined;
+
+			try {
+				signal = signalOption('Batcher.load', loadOptions);
+			} catch (error) {
+				return Promise.reject(error);
+			}
+
+			return request(key, signal) as Promise<V>;
+		},
+		loadMany(keys: Iterable<K>, loadOptions?: BatcherLoadOptions): Promise<V[]> {
+			let list: K[];
+			let signal: AbortSignalLike | null | undefined;
+
+			try {
+				if (keys === null || keys === undefined || typeof (keys as Partial<Iterable<K>>)[Symbol.iterator] !== 'function') {
+					throw new TypeError(`Batcher.loadMany: \`keys\` must be an iterable, got ${describe(keys)}`);
+				}
+				signal = signalOption('Batcher.loadMany', loadOptions);
+				list = Array.from(keys);
+			} catch (error) {
+				return Promise.reject(error);
+			}
+
+			return Promise.all(
+				list.map(function (key) {
+					return request(key, signal);
+				})
+			) as Promise<V[]>;
+		},
+		clear(key: K): void {
+			if (cache === undefined) return;
+
+			const id = identify(key);
+
+			cache.delete(id);
+			forget(id);
+		},
+		clearAll(): void {
+			if (cache === undefined) return;
+			cache.clear();
+			for (const id of inflight.keys()) forget(id);
+		},
+		prime(key: K, value: V): void {
+			if (isError(value)) throw new TypeError('Batcher.prime: `value` must not be an Error (errors are never cached)');
+			if (cache === undefined) return;
+
+			const id = identify(key);
+			const entry = inflight.get(id);
+
+			cache.set(id, value);
+			if (entry === undefined) return;
+			// A request in flight must not overwrite the primed value; one not dispatched yet is answered now and not made at all.
+			inflight.delete(id);
+			if (!entry.batch.dispatched) {
+				entry.batch.entries.delete(id);
+				entry.deferred.resolve(value);
+			}
+		}
+	};
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

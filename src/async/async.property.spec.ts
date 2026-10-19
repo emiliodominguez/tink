@@ -3,6 +3,7 @@ import {
 	abortable,
 	anySignal,
 	attemptAsync,
+	createBatcher,
 	createDeferred,
 	createLimiter,
 	createQueue,
@@ -572,6 +573,105 @@ describe('Async helpers (round 11 properties)', function () {
 					).size
 				);
 			})
+		);
+	});
+});
+
+describe('createBatcher (properties)', function () {
+	it('gives every caller the value of its own key, with batches of distinct keys within maxBatchSize, whatever the interleaving', async function () {
+		await fc.assert(
+			fc.asyncProperty(
+				fc.array(fc.record({ key: fc.integer({ min: 0, max: 8 }), ticks: fc.integer({ min: 0, max: 3 }) }), { maxLength: 30 }),
+				fc.oneof(fc.integer({ min: 1, max: 5 }), fc.constant(Infinity)),
+				fc.boolean(),
+				fc.integer({ min: 2, max: 5 }),
+				async function (requests, maxBatchSize, cache, modulus) {
+					const batches: number[][] = [];
+					const batcher = createBatcher(
+						async function (keys: number[]) {
+							batches.push(keys.slice());
+							await yieldTicks(keys.length % 3);
+							return keys.map(function (key) {
+								return key % modulus === 0 ? new Error(`bad ${key}`) : key * 10;
+							});
+						},
+						{ maxBatchSize, cache }
+					);
+					const outcomes = await Promise.all(
+						requests.map(async function (request) {
+							await yieldTicks(request.ticks);
+							return batcher.load(request.key).then(
+								function (value) {
+									return value;
+								},
+								function (error: Error) {
+									return error.message;
+								}
+							);
+						})
+					);
+
+					expect(outcomes).toEqual(
+						requests.map(function (request) {
+							return request.key % modulus === 0 ? `bad ${request.key}` : request.key * 10;
+						})
+					);
+					const requested = new Map<number, number>();
+					for (const batch of batches) {
+						expect(batch.length).toBeGreaterThan(0);
+						expect(batch.length).toBeLessThanOrEqual(maxBatchSize);
+						expect(new Set(batch).size).toBe(batch.length);
+						for (const key of batch) requested.set(key, (requested.get(key) ?? 0) + 1);
+					}
+					for (const request of requests) expect(requested.has(request.key)).toBe(true);
+					// With a cache, a value is requested once for good: only failed keys are requested again.
+					if (cache) for (const [key, count] of requested) if (key % modulus !== 0) expect(count).toBe(1);
+				}
+			)
+		);
+	});
+
+	it('requests exactly the keys some caller still waits for, in first-request order', async function () {
+		await fc.assert(
+			fc.asyncProperty(
+				fc.array(fc.record({ key: fc.integer({ min: 0, max: 6 }), abort: fc.boolean() }), { maxLength: 20 }),
+				fc.boolean(),
+				async function (requests, cache) {
+					const batches: number[][] = [];
+					const batcher = createBatcher(
+						function (keys: number[]) {
+							batches.push(keys.slice());
+							return keys;
+						},
+						{ cache }
+					);
+					const signals = requests.map(function () {
+						return new CountingSignal();
+					});
+					const loads = requests.map(function (request, index) {
+						return batcher.load(request.key, { signal: signals[index] });
+					});
+					requests.forEach(function (request, index) {
+						if (request.abort) signals[index].abort(new Error('aborted'));
+					});
+					const outcomes = await Promise.allSettled(loads);
+
+					const order: number[] = [];
+					for (const request of requests) if (!order.includes(request.key)) order.push(request.key);
+					const wanted = order.filter(function (key) {
+						return requests.some(function (request) {
+							return request.key === key && !request.abort;
+						});
+					});
+					expect(batches).toEqual(wanted.length === 0 ? [] : [wanted]);
+					outcomes.forEach(function (outcome, index) {
+						expect(outcome).toEqual(
+							requests[index].abort ? { status: 'rejected', reason: new Error('aborted') } : { status: 'fulfilled', value: requests[index].key }
+						);
+					});
+					for (const signal of signals) expect(signal.listeners.size).toBe(0);
+				}
+			)
 		);
 	});
 });

@@ -3,6 +3,7 @@ import {
 	abortable,
 	anySignal,
 	attemptAsync,
+	createBatcher,
 	createDeferred,
 	createLimiter,
 	createQueue,
@@ -2857,4 +2858,1026 @@ describe('Async helpers (hostile signals)', function () {
 	function isTimeout(resource: string): boolean {
 		return resource === 'Timeout';
 	}
+});
+
+describe('createBatcher', function () {
+	afterEach(function () {
+		jest.useRealTimers();
+	});
+
+	/**
+	 * A batch function that records its calls and maps each key to `value <key>`.
+	 */
+	function recorder<K = number>(): { calls: K[][]; batchLoad: (keys: K[]) => Promise<string[]> } {
+		const calls: K[][] = [];
+		return {
+			calls,
+			batchLoad: async function (keys: K[]): Promise<string[]> {
+				calls.push(keys.slice());
+				return keys.map(function (key) {
+					return `value ${String(key)}`;
+				});
+			}
+		};
+	}
+
+	function boom(): never {
+		throw new Error('boom');
+	}
+
+	/** Waits until the batches opened so far are dispatched (by default, in a `process.nextTick` once the microtask queue drained). */
+	function nextTurn(): Promise<void> {
+		return new Promise(function (resolve) {
+			setImmediate(resolve);
+		});
+	}
+
+	describe('batching', function () {
+		it('sends the keys requested in the same tick to one call, each key once, in first-request order', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad);
+			const results = await Promise.all([batcher.load(3), batcher.load(1), batcher.load(3), batcher.load(2)]);
+			expect(results).toEqual(['value 3', 'value 1', 'value 3', 'value 2']);
+			expect(calls).toEqual([[3, 1, 2]]);
+		});
+
+		it('gives callers of one key the same value', async function () {
+			const batcher = createBatcher(async function (keys: number[]) {
+				return keys.map(function (key) {
+					return { key };
+				});
+			});
+			const [a, b] = await Promise.all([batcher.load(1), batcher.load(1)]);
+			expect(a).toBe(b);
+		});
+
+		it('passes a new array to every call', async function () {
+			const seen: number[][] = [];
+			const batcher = createBatcher(function (keys: number[]) {
+				seen.push(keys);
+				const values = keys.slice();
+				keys.length = 0;
+				return values;
+			});
+			await expect(Promise.all([batcher.load(1), batcher.load(2)])).resolves.toEqual([1, 2]);
+			await expect(batcher.load(3)).resolves.toBe(3);
+			expect(seen[0]).not.toBe(seen[1]);
+		});
+
+		it('dispatches once the microtask queue has drained, not synchronously', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad);
+			const pending = batcher.load(1);
+			expect(calls).toEqual([]);
+			await flush();
+			expect(calls).toEqual([]);
+			await nextTurn();
+			expect(calls).toEqual([[1]]);
+			await pending;
+		});
+
+		it('starts a new batch for keys requested after the dispatch', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad);
+			await batcher.load(1);
+			await batcher.load(1);
+			expect(calls).toEqual([[1], [1]]);
+		});
+
+		it('accepts a synchronous batch function', async function () {
+			const batcher = createBatcher(function (keys: string[]) {
+				return keys.map(function (key) {
+					return key.length;
+				});
+			});
+			await expect(batcher.loadMany(['a', 'bbb'])).resolves.toEqual([1, 3]);
+		});
+
+		it('accepts array-like results (typed arrays included) and reads holes as undefined', async function () {
+			const arrayLike = createBatcher(function (keys: number[]) {
+				return { length: keys.length, 0: 'zero', 1: 'one' } as ArrayLike<string>;
+			});
+			await expect(arrayLike.loadMany([0, 1])).resolves.toEqual(['zero', 'one']);
+			const typed = createBatcher(function (keys: number[]) {
+				return Float64Array.from(keys, Math.sqrt);
+			});
+			await expect(typed.loadMany([4, 9])).resolves.toEqual([2, 3]);
+			// eslint-disable-next-line no-sparse-arrays
+			const holes = createBatcher(function (_keys: number[]) {
+				return new Array<string>(2);
+			});
+			await expect(holes.loadMany([1, 2])).resolves.toEqual([undefined, undefined]);
+		});
+
+		it('compares keys with SameValueZero by default', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad);
+			await Promise.all([batcher.load(NaN), batcher.load(NaN), batcher.load(0), batcher.load(-0), batcher.load('0' as unknown as number)]);
+			expect(calls).toHaveLength(1);
+			expect(calls[0]).toHaveLength(3);
+			expect(calls[0][0]).toBeNaN();
+			expect(calls[0].slice(1)).toEqual([0, '0']);
+		});
+
+		it('compares object keys by reference by default, and by the `key` function when given', async function () {
+			const byReference = recorder<{ id: number }>();
+			const batcher = createBatcher(byReference.batchLoad);
+			await Promise.all([batcher.load({ id: 1 }), batcher.load({ id: 1 })]);
+			expect(byReference.calls[0]).toHaveLength(2);
+
+			const byId = recorder<{ id: number; tag: string }>();
+			const keyed = createBatcher(byId.batchLoad, {
+				key: function (key) {
+					return key.id;
+				}
+			});
+			const first = { id: 1, tag: 'first' };
+			await Promise.all([keyed.load(first), keyed.load({ id: 1, tag: 'second' }), keyed.load({ id: 2, tag: 'third' })]);
+			expect(byId.calls).toHaveLength(1);
+			expect(byId.calls[0][0]).toBe(first);
+			expect(byId.calls[0].map(String)).toHaveLength(2);
+		});
+
+		it('rejects the load when the `key` function throws, without affecting the batch', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, {
+				key: function (key: number) {
+					if (key < 0) throw new RangeError('negative');
+					return key;
+				}
+			});
+			const results = await Promise.allSettled([batcher.load(1), batcher.load(-1)]);
+			expect(results[0]).toEqual({ status: 'fulfilled', value: 'value 1' });
+			expect((results[1] as PromiseRejectedResult).reason).toBeInstanceOf(RangeError);
+			expect(calls).toEqual([[1]]);
+		});
+
+		it('handles a batch function that calls load itself (re-entrancy): those keys go to a new batch', async function () {
+			const calls: number[][] = [];
+			const nested: Array<Promise<number>> = [];
+			const batcher = createBatcher(function (keys: number[]): number[] {
+				calls.push(keys.slice());
+				if (keys[0] === 1) nested.push(batcher.load(10), batcher.load(1));
+				return keys.map(function (key) {
+					return key * 2;
+				});
+			});
+			await expect(batcher.load(1)).resolves.toBe(2);
+			await expect(Promise.all(nested)).resolves.toEqual([20, 2]);
+			expect(calls).toEqual([[1], [10, 1]]);
+		});
+
+		it('settles a batch that resolves late without mixing it with later batches', async function () {
+			const gates: Array<ReturnType<typeof createDeferred<void>>> = [];
+			const batcher = createBatcher(async function (keys: number[]) {
+				const gate = createDeferred<void>();
+				gates.push(gate);
+				await gate.promise;
+				return keys.map(function (key) {
+					return key + 0.5;
+				});
+			});
+			const first = batcher.load(1);
+			await nextTurn();
+			const second = batcher.load(2);
+			await nextTurn();
+			expect(gates).toHaveLength(2);
+			gates[1].resolve();
+			await expect(second).resolves.toBe(2.5);
+			expect(await stateOf(first)).toBe('pending');
+			gates[0].resolve();
+			await expect(first).resolves.toBe(1.5);
+		});
+
+		it('can be destructured (methods do not use `this`)', async function () {
+			const { load, loadMany } = createBatcher(recorder().batchLoad);
+			await expect(Promise.all([load(1), loadMany([2, 3])])).resolves.toEqual(['value 1', ['value 2', 'value 3']]);
+		});
+	});
+
+	describe('delay and maxBatchSize', function () {
+		it('collects keys requested after awaits when `delay` is set', async function () {
+			jest.useFakeTimers();
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, { delay: 20 });
+			const first = batcher.load(1);
+			await flush();
+			const second = batcher.load(2);
+			jest.advanceTimersByTime(19);
+			expect(calls).toEqual([]);
+			jest.advanceTimersByTime(1);
+			expect(calls).toEqual([[1, 2]]);
+			await expect(Promise.all([first, second])).resolves.toEqual(['value 1', 'value 2']);
+		});
+
+		it('waits for a macrotask with `delay: 0`', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, { delay: 0 });
+			const first = batcher.load(1);
+			await nextTurn();
+			const second = batcher.load(2);
+			await expect(Promise.all([first, second])).resolves.toEqual(['value 1', 'value 2']);
+			expect(calls).toEqual([[1, 2]]);
+		});
+
+		it('splits batches at maxBatchSize distinct keys', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, { maxBatchSize: 2 });
+			const results = await batcher.loadMany([1, 1, 2, 3, 2, 4, 5]);
+			expect(results).toEqual(['value 1', 'value 1', 'value 2', 'value 3', 'value 2', 'value 4', 'value 5']);
+			// Without a cache, a key of a sealed batch requested again goes to the open batch.
+			expect(calls).toEqual([
+				[1, 2],
+				[3, 2],
+				[4, 5]
+			]);
+		});
+
+		it('dispatches a full batch without waiting for its delay', async function () {
+			jest.useFakeTimers();
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, { delay: 1000, maxBatchSize: 2 });
+			const all = batcher.loadMany([1, 2, 3]);
+			await flush();
+			expect(calls).toEqual([[1, 2]]);
+			jest.advanceTimersByTime(1000);
+			expect(calls).toEqual([[1, 2], [3]]);
+			await expect(all).resolves.toEqual(['value 1', 'value 2', 'value 3']);
+			expect(jest.getTimerCount()).toBe(0);
+		});
+
+		it('accepts maxBatchSize: 1 (no batching, still deduplicated within a tick with a cache)', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, { maxBatchSize: 1, cache: true });
+			await batcher.loadMany([1, 2, 1]);
+			expect(calls).toEqual([[1], [2]]);
+		});
+	});
+
+	describe('errors', function () {
+		it('rejects only the key whose value is an Error instance (other realms included)', async function () {
+			const foreign = Object.create(null, { [Symbol.toStringTag]: { value: 'Error' } });
+			const batcher = createBatcher(async function (keys: number[]) {
+				return keys.map(function (key) {
+					return key === 2 ? new RangeError('no 2') : key === 3 ? (foreign as Error) : `ok ${key}`;
+				});
+			});
+			const results = await Promise.allSettled([batcher.load(1), batcher.load(2), batcher.load(2), batcher.load(3)]);
+			expect(results[0]).toEqual({ status: 'fulfilled', value: 'ok 1' });
+			expect((results[1] as PromiseRejectedResult).reason).toEqual(new RangeError('no 2'));
+			expect((results[2] as PromiseRejectedResult).reason).toBe((results[1] as PromiseRejectedResult).reason);
+			expect((results[3] as PromiseRejectedResult).reason).toBe(foreign);
+		});
+
+		it('rejects every key with the error of a batch function that throws synchronously or rejects', async function () {
+			const error = new Error('db down');
+			const throwing = createBatcher(function (_keys: number[]): number[] {
+				throw error;
+			});
+			const rejecting = createBatcher(async function (_keys: number[]): Promise<number[]> {
+				throw error;
+			});
+			for (const batcher of [throwing, rejecting]) {
+				const results = await Promise.allSettled([batcher.load(1), batcher.load(2)]);
+				expect(results).toEqual([
+					{ status: 'rejected', reason: error },
+					{ status: 'rejected', reason: error }
+				]);
+			}
+		});
+
+		it('rejects every key with a TypeError when the result has the wrong length', async function () {
+			const short = createBatcher(async function (_keys: number[]) {
+				return [1];
+			});
+			const results = await Promise.allSettled([short.load(1), short.load(2)]);
+			for (const result of results) {
+				expect((result as PromiseRejectedResult).reason).toEqual(
+					new TypeError('createBatcher: `batchLoad` must return an array of 2 values (one per key), got 1 values')
+				);
+			}
+			const long = createBatcher(async function (_keys: number[]) {
+				return [1, 2];
+			});
+			await expect(long.load(1)).rejects.toThrow('must return an array of 1 values (one per key), got 2 values');
+		});
+
+		it.each([
+			['undefined', undefined, 'got undefined'],
+			['null', null, 'got null'],
+			['a string', 'ab', 'got string'],
+			['a number', 2, 'got number'],
+			['a function with a length', function (_a: unknown, _b: unknown) {}, 'got function'],
+			['a Map', new Map([[1, 'one']]), 'got object'],
+			['an object with a non-numeric length', { length: '1', 0: 'x' }, 'got object']
+		])('rejects every key with a TypeError when the result is %s', async function (_name, value, message) {
+			const batcher = createBatcher(function (_keys: number[]) {
+				return value as unknown as number[];
+			});
+			const results = await Promise.allSettled([batcher.load(1)]);
+			expect((results[0] as PromiseRejectedResult).reason).toBeInstanceOf(TypeError);
+			expect((results[0] as PromiseRejectedResult).reason.message).toContain(message);
+		});
+
+		it('rejects every key when reading the result throws (length or element getters), without resolving some keys first', async function () {
+			const lengthThrows = createBatcher(function (_keys: number[]) {
+				return {
+					get length(): number {
+						return boom();
+					}
+				} as ArrayLike<number>;
+			});
+			await expect(lengthThrows.load(1)).rejects.toThrow('boom');
+			const elementThrows = createBatcher(function (_keys: number[]) {
+				return new Proxy([1, 2], {
+					get(target, property, receiver) {
+						return property === '1' ? boom() : Reflect.get(target, property, receiver);
+					}
+				});
+			});
+			const results = await Promise.allSettled([elementThrows.load(1), elementThrows.load(2)]);
+			expect(
+				results.map(function (result) {
+					return result.status;
+				})
+			).toEqual(['rejected', 'rejected']);
+		});
+
+		it('rejects every key when the result is a thenable whose `then` throws', async function () {
+			const batcher = createBatcher(function (_keys: number[]) {
+				return {
+					get then(): never {
+						return boom();
+					}
+				} as unknown as PromiseLike<number[]>;
+			});
+			await expect(batcher.load(1)).rejects.toThrow('boom');
+		});
+
+		it('keeps working after a failed batch', async function () {
+			let fail = true;
+			const batcher = createBatcher(async function (keys: number[]) {
+				if (fail) throw new Error('first');
+				return keys;
+			});
+			await expect(batcher.load(1)).rejects.toThrow('first');
+			fail = false;
+			await expect(batcher.load(1)).resolves.toBe(1);
+		});
+	});
+
+	describe('cache', function () {
+		it('requests keys again by default (no cache)', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad);
+			await batcher.load(1);
+			batcher.prime(1, 'primed');
+			batcher.clear(1);
+			batcher.clearAll();
+			await expect(batcher.load(1)).resolves.toBe('value 1');
+			expect(calls).toEqual([[1], [1]]);
+		});
+
+		it('caches resolved values across batches with `cache: true`', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, { cache: true });
+			await batcher.loadMany([1, 2]);
+			await expect(batcher.loadMany([2, 3, 1])).resolves.toEqual(['value 2', 'value 3', 'value 1']);
+			expect(calls).toEqual([[1, 2], [3]]);
+		});
+
+		it('caches undefined values', async function () {
+			let count = 0;
+			const batcher = createBatcher(
+				async function (keys: number[]) {
+					count++;
+					return keys.map(function () {
+						return undefined;
+					});
+				},
+				{ cache: true }
+			);
+			await batcher.load(1);
+			await expect(batcher.load(1)).resolves.toBeUndefined();
+			expect(count).toBe(1);
+		});
+
+		it('joins a request in flight instead of requesting the key again (single flight)', async function () {
+			const gate = createDeferred<void>();
+			const calls: number[][] = [];
+			const batcher = createBatcher(
+				async function (keys: number[]) {
+					calls.push(keys.slice());
+					await gate.promise;
+					return keys;
+				},
+				{ cache: true }
+			);
+			const first = batcher.load(1);
+			await nextTurn();
+			const second = batcher.load(1);
+			await nextTurn();
+			gate.resolve();
+			await expect(Promise.all([first, second])).resolves.toEqual([1, 1]);
+			expect(calls).toEqual([[1]]);
+		});
+
+		it('never caches errors, so a failed key is requested again', async function () {
+			const { calls, batchLoad } = recorder();
+			let failing = true;
+			const batcher = createBatcher(
+				async function (keys: number[]) {
+					if (failing)
+						return keys.map(function () {
+							return new Error('nope');
+						});
+					return batchLoad(keys);
+				},
+				{ cache: true }
+			);
+			await expect(batcher.load(1)).rejects.toThrow('nope');
+			failing = false;
+			await expect(batcher.load(1)).resolves.toBe('value 1');
+			const throwing = createBatcher(
+				async function (keys: number[]) {
+					if (failing) throw new Error('down');
+					return keys;
+				},
+				{ cache: true }
+			);
+			failing = true;
+			await expect(throwing.load(1)).rejects.toThrow('down');
+			failing = false;
+			await expect(throwing.load(1)).resolves.toBe(1);
+			expect(calls).toEqual([[1]]);
+		});
+
+		it('clear(key) and clearAll() forget cached values', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, { cache: true });
+			await batcher.loadMany([1, 2, 3]);
+			batcher.clear(1);
+			await batcher.loadMany([1, 2]);
+			batcher.clearAll();
+			await batcher.loadMany([2, 3]);
+			expect(calls).toEqual([[1, 2, 3], [1], [2, 3]]);
+		});
+
+		it('clear(key) during a request in flight keeps its value out of the cache (callers still get it)', async function () {
+			const gate = createDeferred<void>();
+			let version = 0;
+			const calls: number[][] = [];
+			const batcher = createBatcher(
+				async function (keys: number[]) {
+					calls.push(keys.slice());
+					const seen = version;
+					if (calls.length === 1) await gate.promise;
+					return keys.map(function (key) {
+						return `${key}@${seen}`;
+					});
+				},
+				{ cache: true }
+			);
+			const stale = batcher.load(1);
+			await nextTurn();
+			version = 1;
+			batcher.clear(1);
+			gate.resolve();
+			await expect(stale).resolves.toBe('1@0');
+			await expect(batcher.load(1)).resolves.toBe('1@1');
+			await expect(batcher.load(1)).resolves.toBe('1@1');
+			expect(calls).toEqual([[1], [1]]);
+		});
+
+		it('clearAll() during requests in flight keeps their values out of the cache', async function () {
+			const { calls, batchLoad } = recorder();
+			const gate = createDeferred<void>();
+			const batcher = createBatcher(
+				async function (keys: number[]) {
+					await gate.promise;
+					return batchLoad(keys);
+				},
+				{ cache: true }
+			);
+			const loading = batcher.loadMany([1, 2]);
+			await nextTurn();
+			batcher.clearAll();
+			gate.resolve();
+			await loading;
+			await batcher.loadMany([1, 2]);
+			expect(calls).toEqual([
+				[1, 2],
+				[1, 2]
+			]);
+		});
+
+		it('clear(key) before the dispatch still caches the value (a request not sent yet is not stale)', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, { cache: true });
+			const loading = batcher.load(1);
+			batcher.clear(1);
+			batcher.clearAll();
+			await loading;
+			await batcher.load(1);
+			expect(calls).toEqual([[1]]);
+		});
+
+		it('prime(key, value) stores a value, and wins over a request in flight', async function () {
+			const gate = createDeferred<void>();
+			const calls: number[][] = [];
+			const batcher = createBatcher(
+				async function (keys: number[]) {
+					calls.push(keys.slice());
+					await gate.promise;
+					return keys.map(function (key) {
+						return `fetched ${key}`;
+					});
+				},
+				{ cache: true }
+			);
+			batcher.prime(1, 'primed 1');
+			await expect(batcher.load(1)).resolves.toBe('primed 1');
+			const inflight = batcher.load(2);
+			await nextTurn();
+			batcher.prime(2, 'primed 2');
+			gate.resolve();
+			await expect(inflight).resolves.toBe('fetched 2');
+			await expect(batcher.load(2)).resolves.toBe('primed 2');
+			expect(calls).toEqual([[2]]);
+		});
+
+		it('prime rejects Error values', function () {
+			const batcher = createBatcher(recorder().batchLoad, { cache: true });
+			expect(function () {
+				batcher.prime(1, new Error('x') as unknown as string);
+			}).toThrow(new TypeError('Batcher.prime: `value` must not be an Error (errors are never cached)'));
+			expect(function () {
+				createBatcher(recorder().batchLoad).prime(1, new Error('x') as unknown as string);
+			}).toThrow(TypeError);
+		});
+
+		it('uses the key identity for the cache', async function () {
+			const { calls, batchLoad } = recorder<{ id: number }>();
+			const batcher = createBatcher(batchLoad, {
+				cache: true,
+				key: function (key) {
+					return key.id;
+				}
+			});
+			await batcher.load({ id: 1 });
+			await batcher.load({ id: 1 });
+			batcher.prime({ id: 2 }, 'two');
+			await expect(batcher.load({ id: 2 })).resolves.toBe('two');
+			batcher.clear({ id: 1 });
+			await batcher.load({ id: 1 });
+			expect(calls).toHaveLength(2);
+		});
+
+		it('accepts a Map-like store such as an LRU cache, with its eviction and expiry', async function () {
+			let now = 0;
+			const store = createLRUCache<unknown, string>({
+				max: 2,
+				ttl: 100,
+				now: function () {
+					return now;
+				}
+			});
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, { cache: store });
+			await batcher.loadMany([1, 2, 3]);
+			expect(Array.from(store.keys()).sort()).toEqual([2, 3]);
+			await batcher.load(1);
+			now = 1000;
+			await batcher.load(1);
+			expect(calls).toEqual([[1, 2, 3], [1], [1]]);
+		});
+
+		it('rejects the load when the cache throws on read, and ignores a cache that cannot store', async function () {
+			const readFails = { get: boom, has: boom, set: boom, delete: boom, clear: boom };
+			await expect(createBatcher(recorder().batchLoad, { cache: readFails }).load(1)).rejects.toThrow('boom');
+			const writeFails = {
+				get: function (): undefined {
+					return undefined;
+				},
+				has: function () {
+					return false;
+				},
+				set: boom,
+				delete: boom,
+				clear: boom
+			};
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, { cache: writeFails });
+			await expect(batcher.load(1)).resolves.toBe('value 1');
+			await expect(batcher.load(1)).resolves.toBe('value 1');
+			expect(calls).toEqual([[1], [1]]);
+			expect(function () {
+				batcher.clear(1);
+			}).toThrow('boom');
+			expect(function () {
+				batcher.prime(1, 'x');
+			}).toThrow('boom');
+		});
+	});
+
+	describe('signal', function () {
+		it('rejects at once for an already-aborted signal, without requesting the key', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, { cache: true });
+			batcher.prime(1, 'cached');
+			const controller = new AbortController();
+			controller.abort();
+			await expect(batcher.load(1, { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+			await expect(batcher.load(2, { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+			await nextTurn();
+			expect(calls).toEqual([]);
+		});
+
+		it('removes a key nobody else waits for from a batch not dispatched yet', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad);
+			const controller = new AbortController();
+			const aborted = batcher.load(1, { signal: controller.signal });
+			const kept = batcher.load(2);
+			controller.abort(new AbortError('gone'));
+			await expect(aborted).rejects.toThrow('gone');
+			await expect(kept).resolves.toBe('value 2');
+			expect(calls).toEqual([[2]]);
+		});
+
+		it('keeps a key other callers still wait for', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad);
+			const controller = new AbortController();
+			const aborted = batcher.load(1, { signal: controller.signal });
+			const kept = batcher.load(1);
+			controller.abort();
+			await expect(aborted).rejects.toMatchObject({ name: 'AbortError' });
+			await expect(kept).resolves.toBe('value 1');
+			expect(calls).toEqual([[1]]);
+		});
+
+		it('does not call the batch function when every key left the batch', async function () {
+			jest.useFakeTimers();
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, { delay: 10 });
+			const controller = new AbortController();
+			const loads = batcher.loadMany([1, 2], { signal: controller.signal });
+			controller.abort();
+			await expect(loads).rejects.toMatchObject({ name: 'AbortError' });
+			jest.advanceTimersByTime(10);
+			await flush();
+			expect(calls).toEqual([]);
+			const microtask = createBatcher(batchLoad);
+			const other = new AbortController();
+			const load = microtask.load(1, { signal: other.signal });
+			other.abort();
+			await expect(load).rejects.toMatchObject({ name: 'AbortError' });
+			await flush();
+			expect(calls).toEqual([]);
+		});
+
+		it('removes an aborted key from the requests in flight of a cache, so it is requested next time', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, { cache: true, delay: 0 });
+			const controller = new AbortController();
+			const aborted = batcher.load(1, { signal: controller.signal });
+			controller.abort();
+			await expect(aborted).rejects.toMatchObject({ name: 'AbortError' });
+			await expect(batcher.load(1)).resolves.toBe('value 1');
+			expect(calls).toEqual([[1]]);
+		});
+
+		it('only stops waiting once the batch is dispatched: other callers and the cache still get the value', async function () {
+			const gate = createDeferred<void>();
+			const calls: number[][] = [];
+			const batcher = createBatcher(
+				async function (keys: number[]) {
+					calls.push(keys.slice());
+					await gate.promise;
+					return keys;
+				},
+				{ cache: true }
+			);
+			const controller = new AbortController();
+			const aborted = batcher.load(1, { signal: controller.signal });
+			const kept = batcher.load(1);
+			await nextTurn();
+			controller.abort();
+			await expect(aborted).rejects.toMatchObject({ name: 'AbortError' });
+			gate.resolve();
+			await expect(kept).resolves.toBe(1);
+			await expect(batcher.load(1)).resolves.toBe(1);
+			expect(calls).toEqual([[1]]);
+		});
+
+		it('removes its listener once the load settles (resolved or rejected)', async function () {
+			const signal = new CountingSignal();
+			const batcher = createBatcher(async function (keys: number[]) {
+				return keys.map(function (key) {
+					return key > 0 ? key : new Error('negative');
+				});
+			});
+			await expect(batcher.load(1, { signal })).resolves.toBe(1);
+			await expect(batcher.load(-1, { signal })).rejects.toThrow('negative');
+			expect(signal.listenerCount).toBe(0);
+			await expect(batcher.loadMany([1, 2, 3], { signal: null })).resolves.toEqual([1, 2, 3]);
+		});
+
+		it('rejects with a TypeError for an invalid signal', async function () {
+			const batcher = createBatcher(recorder().batchLoad);
+			await expect(batcher.load(1, { signal: {} as AbortSignalLike })).rejects.toThrow(
+				new TypeError('Batcher.load: `signal` must be an AbortSignal, null or undefined, got object')
+			);
+		});
+
+		it('survives hostile signals', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad);
+			const addThrows = { aborted: false, addEventListener: boom, removeEventListener: function () {} };
+			await expect(batcher.load(1, { signal: addThrows })).rejects.toThrow('boom');
+			const callsAtOnce = {
+				aborted: false,
+				reason: 'sync abort',
+				addEventListener: function (_type: string, listener: () => void) {
+					listener();
+				},
+				removeEventListener: function () {}
+			};
+			await expect(batcher.load(2, { signal: callsAtOnce })).rejects.toBe('sync abort');
+			const removeThrows = { aborted: false, addEventListener: function () {}, removeEventListener: boom };
+			await expect(batcher.load(3, { signal: removeThrows })).resolves.toBe('value 3');
+			const listeners: Array<() => void> = [];
+			const reasonThrows = {
+				aborted: false,
+				get reason(): unknown {
+					return boom();
+				},
+				addEventListener: function (_type: string, listener: () => void) {
+					listeners.push(listener);
+				},
+				removeEventListener: boom
+			};
+			const late = batcher.load(4, { signal: reasonThrows });
+			listeners[0]();
+			await expect(late).rejects.toThrow('boom');
+			// A listener left behind by a throwing `removeEventListener` is harmless when it fires after the load settled.
+			const settled = batcher.load(5, { signal: reasonThrows });
+			await expect(settled).resolves.toBe('value 5');
+			listeners[1]();
+			expect(calls).toEqual([[3], [5]]);
+		});
+
+		it('counts a caller once when a hostile signal calls its listener twice, or calls it and then throws', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad);
+			const twice = {
+				aborted: false,
+				reason: 'twice',
+				addEventListener: function (_type: string, listener: () => void) {
+					listener();
+					listener();
+				},
+				removeEventListener: function () {}
+			};
+			const callThenThrow = {
+				aborted: false,
+				reason: 'first',
+				addEventListener: function (_type: string, listener: () => void) {
+					listener();
+					throw new Error('then throws');
+				},
+				removeEventListener: function () {}
+			};
+			const kept = batcher.load(1);
+			await expect(batcher.load(1, { signal: twice })).rejects.toBe('twice');
+			await expect(batcher.load(1, { signal: callThenThrow })).rejects.toBe('first');
+			await expect(kept).resolves.toBe('value 1');
+			expect(calls).toEqual([[1]]);
+		});
+	});
+
+	describe('loadMany', function () {
+		it('resolves in key order and rejects like Promise.all', async function () {
+			const batcher = createBatcher(async function (keys: number[]) {
+				return keys.map(function (key) {
+					return key === 0 ? new RangeError('zero') : 10 / key;
+				});
+			});
+			await expect(batcher.loadMany([1, 2, 5])).resolves.toEqual([10, 5, 2]);
+			await expect(batcher.loadMany([])).resolves.toEqual([]);
+			await expect(batcher.loadMany(new Set([2, 0]))).rejects.toBeInstanceOf(RangeError);
+		});
+
+		it('rejects with a TypeError for a non-iterable, and with the error of a throwing iterator', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad);
+			await expect(batcher.loadMany(null as unknown as number[])).rejects.toThrow(new TypeError('Batcher.loadMany: `keys` must be an iterable, got null'));
+			await expect(batcher.loadMany(undefined as unknown as number[])).rejects.toThrow('got undefined');
+			await expect(batcher.loadMany({ length: 1, 0: 1 } as unknown as number[])).rejects.toThrow('got object');
+			const throwing = (function* () {
+				yield 1;
+				boom();
+			})();
+			await expect(batcher.loadMany(throwing)).rejects.toThrow('boom');
+			await nextTurn();
+			expect(calls).toEqual([]);
+		});
+	});
+
+	describe('argument validation', function () {
+		it('rejects invalid arguments with the library message format', function () {
+			const { batchLoad } = recorder();
+			expect(function () {
+				createBatcher(42 as unknown as typeof batchLoad);
+			}).toThrow(new TypeError('createBatcher: `batchLoad` must be a function, got number'));
+			expect(function () {
+				createBatcher(batchLoad, { delay: -1 });
+			}).toThrow(RangeError);
+			expect(function () {
+				createBatcher(batchLoad, { delay: '5' as unknown as number });
+			}).toThrow(TypeError);
+			expect(function () {
+				createBatcher(batchLoad, { delay: NaN });
+			}).toThrow(RangeError);
+			expect(function () {
+				createBatcher(batchLoad, { maxBatchSize: 0 });
+			}).toThrow(new RangeError('createBatcher: `maxBatchSize` must be an integer >= 1 or Infinity, got 0'));
+			expect(function () {
+				createBatcher(batchLoad, { maxBatchSize: 1.5 });
+			}).toThrow(RangeError);
+			expect(function () {
+				createBatcher(batchLoad, { key: 'id' as unknown as () => unknown });
+			}).toThrow(new TypeError('createBatcher: `key` must be a function, got string'));
+			expect(function () {
+				createBatcher(batchLoad, { cache: {} as Map<unknown, string> });
+			}).toThrow(new TypeError('createBatcher: `cache` must be a boolean or a Map-like cache, got object'));
+			expect(function () {
+				createBatcher(batchLoad, { cache: null as unknown as boolean });
+			}).toThrow('got null');
+			expect(function () {
+				createBatcher(batchLoad, { cache: 1 as unknown as boolean });
+			}).toThrow('got number');
+		});
+
+		it('accepts Infinity for maxBatchSize and the largest timer delay', function () {
+			const { batchLoad } = recorder();
+			expect(createBatcher(batchLoad, { maxBatchSize: Infinity, delay: 2 ** 31 - 1, cache: false })).toBeDefined();
+			expect(createBatcher(batchLoad, { cache: new Map() })).toBeDefined();
+		});
+	});
+
+	describe('review regressions', function () {
+		it('adds one abort listener per signal, however many keys wait on it, and removes it once none does', async function () {
+			const signal = new CountingSignal();
+			const batcher = createBatcher(function (keys: number[]) {
+				return keys;
+			});
+			const loading = batcher.loadMany([1, 2, 3], { signal });
+			const single = batcher.load(4, { signal });
+			expect(signal.listenerCount).toBe(1);
+			await expect(Promise.all([loading, single])).resolves.toEqual([[1, 2, 3], 4]);
+			expect(signal.listenerCount).toBe(0);
+		});
+
+		it('stays linear for a loadMany of 40,000 keys sharing a signal, and for aborting them all', async function () {
+			const batcher = createBatcher(function (keys: number[]) {
+				return keys;
+			});
+			const keys = Array.from({ length: 40_000 }, function (_, index) {
+				return index;
+			});
+			const controller = new AbortController();
+			let start = performance.now();
+			await expect(batcher.loadMany(keys, { signal: controller.signal })).resolves.toHaveLength(40_000);
+			expect(performance.now() - start).toBeLessThan(2000);
+			start = performance.now();
+			const aborted = batcher.loadMany(keys, { signal: controller.signal });
+			controller.abort(new AbortError('stop'));
+			await expect(aborted).rejects.toThrow('stop');
+			expect(performance.now() - start).toBeLessThan(2000);
+		});
+
+		it('batches keys requested after any number of awaits in the same tick (like DataLoader)', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad);
+			async function resolver(awaits: number, key: number): Promise<string> {
+				for (let i = 0; i < awaits; i++) await null;
+				return batcher.load(key);
+			}
+			await expect(Promise.all([0, 1, 2, 3, 15].map(resolver))).resolves.toEqual(['value 0', 'value 1', 'value 2', 'value 3', 'value 4']);
+			expect(calls).toEqual([[0, 1, 2, 3, 4]]);
+		});
+
+		it.each([
+			['no process.nextTick', { value: undefined, configurable: true, writable: true }],
+			['a process.nextTick that cannot be read', { get: boom, configurable: true }]
+		])('falls back to a setTimeout(0) with %s, still after the microtask queue drained', async function (_name, descriptor) {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad);
+			const original = Object.getOwnPropertyDescriptor(process, 'nextTick') as PropertyDescriptor;
+			let results: Promise<string[]>;
+			Object.defineProperty(process, 'nextTick', descriptor);
+			try {
+				results = Promise.all(
+					[0, 1, 2].map(async function (awaits) {
+						for (let i = 0; i < awaits; i++) await null;
+						return batcher.load(awaits);
+					})
+				);
+				await flush();
+			} finally {
+				Object.defineProperty(process, 'nextTick', original);
+			}
+			expect(calls).toEqual([]);
+			await expect(results).resolves.toEqual(['value 0', 'value 1', 'value 2']);
+			expect(calls).toEqual([[0, 1, 2]]);
+		});
+
+		it('prime answers the callers of a key not dispatched yet with the primed value, and drops the key from the batch', async function () {
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, { cache: true });
+			const primed = batcher.load(1);
+			const fetched = batcher.load(2);
+			batcher.prime(1, 'primed 1');
+			await expect(Promise.all([primed, fetched])).resolves.toEqual(['primed 1', 'value 2']);
+			await expect(batcher.load(1)).resolves.toBe('primed 1');
+			expect(calls).toEqual([[2]]);
+			// Every key primed: the batch function is not called at all.
+			const only = batcher.load(3);
+			batcher.prime(3, 'primed 3');
+			await expect(only).resolves.toBe('primed 3');
+			await nextTurn();
+			expect(calls).toEqual([[2]]);
+		});
+
+		it('an abort right after prime does not remove another entry of the key from the batch', async function () {
+			const { calls, batchLoad } = recorder();
+			const store = new Map<unknown, string>();
+			const batcher = createBatcher(batchLoad, { cache: store });
+			const controller = new AbortController();
+			const first = batcher.load(1, { signal: controller.signal });
+			batcher.prime(1, 'primed');
+			// The cache drops the primed value: a new caller opens a new entry for the key, in the same batch.
+			store.clear();
+			const second = batcher.load(1);
+			controller.abort(new AbortError('late'));
+			await expect(first).rejects.toThrow('late');
+			await expect(second).resolves.toBe('value 1');
+			expect(calls).toEqual([[1]]);
+		});
+
+		it('works with a polluted Object.prototype.then (no internal object is resolved like a promise)', async function () {
+			const batcher = createBatcher(function (keys: number[]) {
+				return keys.map(function (key) {
+					return key * 2;
+				});
+			});
+			Object.defineProperty(Object.prototype, 'then', { value: function () {}, configurable: true, writable: true });
+			let result: Promise<number>;
+			try {
+				result = withTimeout(batcher.load(21), 1000);
+				await nextTurn();
+			} finally {
+				delete (Object.prototype as { then?: unknown }).then;
+			}
+			await expect(result).resolves.toBe(42);
+		});
+
+		it('validates the options of createBatcher, load and loadMany with library errors, reading the signal once', async function () {
+			const { batchLoad } = recorder();
+			expect(function () {
+				createBatcher(batchLoad, null as unknown as object);
+			}).toThrow(new TypeError('createBatcher: `options` must be an object, got null'));
+			const batcher = createBatcher(batchLoad);
+			await expect(batcher.load(1, null as unknown as object)).rejects.toThrow(new TypeError('Batcher.load: `options` must be an object, got null'));
+			await expect(batcher.loadMany([1], 'x' as unknown as object)).rejects.toThrow(new TypeError('Batcher.loadMany: `options` must be an object, got string'));
+			await expect(batcher.loadMany([1], { signal: {} as AbortSignalLike })).rejects.toThrow(
+				new TypeError('Batcher.loadMany: `signal` must be an AbortSignal, null or undefined, got object')
+			);
+			let reads = 0;
+			const options = {
+				get signal(): AbortSignalLike {
+					reads++;
+					return new CountingSignal();
+				}
+			};
+			await expect(batcher.loadMany([1, 2, 3], options)).resolves.toEqual(['value 1', 'value 2', 'value 3']);
+			expect(reads).toBe(1);
+		});
+
+		it('rejects the remaining keys of a loadMany whose key function aborts the signal', async function () {
+			const controller = new AbortController();
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, {
+				key: function (key: number) {
+					if (key === 2) controller.abort(new AbortError('aborted by key 2'));
+					return key;
+				}
+			});
+			await expect(batcher.loadMany([1, 2, 3], { signal: controller.signal })).rejects.toThrow('aborted by key 2');
+			await nextTurn();
+			expect(calls).toEqual([]);
+		});
+	});
 });
