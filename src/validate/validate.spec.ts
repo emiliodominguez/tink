@@ -1,3 +1,4 @@
+import { isNumber, isString } from '../guards/index.js';
 import * as helpers from '.';
 
 const NON_STRINGS: unknown[] = [undefined, null, 0, 1, NaN, true, {}, [], Symbol('x'), 1n, new String('a'), function () {}];
@@ -1070,5 +1071,38 @@ describe('isUrl IDNA mapping', function () {
 
 	it('follows the runtime IDNA mapping of `ẞ`', function () {
 		expect(helpers.isUrl('https://ẞa.com')).toBe(new original('https://ẞa.com').hostname.startsWith('xn--'));
+	});
+});
+
+describe('validate (helper review regressions)', function () {
+	it('lazy schemas wrapped by nullable, union and transform resolve on the first parse, not when wrapped', function () {
+		type List = { v: number; next: List | null };
+		const list: helpers.Parser<List> = helpers.lazy(function () {
+			return { v: isNumber, next: helpers.nullable(list) };
+		});
+		expect(helpers.parse(list, { v: 1, next: { v: 2, next: null } })).toEqual({ v: 1, next: { v: 2, next: null } });
+		const nested: helpers.Parser<number> = helpers.lazy(function () {
+			return helpers.union(isNumber, nested);
+		});
+		expect(helpers.parse(nested, 1)).toBe(1);
+		let calls = 0;
+		const counted = helpers.lazy(function () {
+			calls++;
+			return { x: helpers.asInteger };
+		});
+		const wrapped = helpers.transform(helpers.nullable(helpers.blankAsUndefined(helpers.chain(counted, counted))), function (value) {
+			return value;
+		});
+		expect(calls).toBe(0);
+		expect(helpers.parse(wrapped, { x: '3' })).toEqual({ x: 3 });
+		expect(calls).toBe(1);
+	});
+
+	it('partial and optional leave blank fields out when their schema treats blanks as missing', function () {
+		const form = { name: helpers.blankAsUndefined(isString), age: helpers.blankAsUndefined(helpers.asInteger) };
+		expect(helpers.parse(helpers.partial(form), { name: '', age: ' ' })).toEqual({});
+		expect(helpers.parse(helpers.partial(form), { name: 'Ada', age: '36' })).toEqual({ name: 'Ada', age: 36 });
+		expect(helpers.parse(helpers.optional(helpers.blankAsUndefined(isString)), '')).toBeUndefined();
+		expect(helpers.safeParse(form, { name: '', age: '1' })[0]?.issues).toEqual([{ message: 'Missing required property', path: ['name'] }]);
 	});
 });

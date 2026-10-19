@@ -161,6 +161,8 @@ const NUMERIC_PATTERN = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]
  * A valid address is not a safe string: the local part may contain shell, SQL, HTML-attribute and template metacharacters
  * (`` ` ``, `|`, `'`, `$`, `{`, `}`, `&`, `=`, `#`, `%`...), e.g. `'{{7*7}}@x.com'` and ``"`id`@x.com"`` are valid. Escape or parameterize it
  * for its destination (never interpolate it into a shell command, query or template).
+ * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
+ * non-matching string, test `typeof value === 'string'` there.
  * @param {unknown} value - The value to check
  * @returns {boolean} `true` when `value` is a string holding a valid email address
  * @example
@@ -244,7 +246,8 @@ function isEncodingOf(host: string, hostname: string): boolean {
  * (`http:example.com` is rejected), and `http(s)` URLs must have a non-empty host.
  *
  * The host is also checked against the text, so that for an accepted URL the host a client connects to is the one a reader (or a
- * string-based allow/deny list) sees: `new URL(value).hostname` is the written host, lower-cased, or its punycode form for
+ * string-based allow/deny list) sees (except for bracketed IPv6 literals, which the parser writes in canonical form: `[0::1]` becomes
+ * `[::1]`, so compare those after parsing): `new URL(value).hostname` is the written host, lower-cased, or its punycode form for
  * internationalized names (`münchen.de`, `例え.jp`; each non-ASCII label must stay a punycode label, so `https://ẞa.com`, which older IDNA case
  * folding turns into `ssa.com`, is rejected there). So the following are also rejected: invisible characters anywhere (format characters
  * such as U+00AD soft hyphen, U+200B zero-width space or bidi controls, and other default-ignorable code points such as U+034F or
@@ -253,6 +256,8 @@ function isEncodingOf(host: string, hostname: string): boolean {
  * NFKC normalization changes (fullwidth `ｅ`, circled `ⓔ`, ...), ideographic full stops (`。`), or a numeric form other than
  * dotted-decimal IPv4 (`http://0x7f.1`, `http://2130706433`, `http://127.1` all mean `127.0.0.1`).
  * Credentials are allowed: in `https://good.com@evil.com` the host is `evil.com`, as for every parser.
+ * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
+ * non-matching string, test `typeof value === 'string'` there.
  * @param {unknown} value - The value to check
  * @param {IsUrlOptions} [options={}] - `protocols` (default `['http', 'https']`): allowed schemes;
  * `requireTld` (default `false`): require a host ending in a top-level domain, which rejects `localhost`, IP addresses and host-less URLs
@@ -322,6 +327,8 @@ export function isUrl(value: unknown, options: IsUrlOptions = {}): value is stri
  * Checks whether a value is a UUID as defined by RFC 9562 (which obsoletes RFC 4122), in the hyphenated 8-4-4-4-12 form,
  * case-insensitively. Versions 1–8 must carry the RFC variant (`10xx`, i.e. the first digit of the 4th group is `8`, `9`, `a` or `b`);
  * the special nil (`00000000-…`) and max (`ffffffff-…`) UUIDs are accepted too. Braces and `urn:uuid:` prefixes are not.
+ * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
+ * non-matching string, test `typeof value === 'string'` there.
  * @param {unknown} value - The value to check
  * @param {UuidVersion} [version] - Only accept this version (`1`–`8`, `'nil'` or `'max'`); any of them when omitted
  * @returns {boolean} `true` when `value` is a string holding a matching UUID
@@ -351,6 +358,8 @@ export function isUuid(value: unknown, version?: UuidVersion): value is string {
 /**
  * Checks whether a value is an IPv4 address in dotted-decimal form: exactly four decimal octets in `[0, 255]`.
  * Leading zeros (`01.2.3.4`, ambiguous with octal), shorthand forms (`127.1`), hex and surrounding white space are rejected.
+ * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
+ * non-matching string, test `typeof value === 'string'` there.
  * @param {unknown} value - The value to check
  * @returns {boolean} `true` when `value` is a string holding an IPv4 address
  * @example
@@ -371,6 +380,8 @@ export function isIPv4(value: unknown): value is string {
  *
  * Zone ids (`fe80::1%eth0`) are rejected: they are only meaningful on the local host and are not part of the address itself.
  * Brackets (`[::1]`) are rejected as well.
+ * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
+ * non-matching string, test `typeof value === 'string'` there.
  * @param {unknown} value - The value to check
  * @returns {boolean} `true` when `value` is a string holding an IPv6 address
  * @example
@@ -436,6 +447,8 @@ function isHexDigit(code: number): boolean {
 
 /**
  * Checks whether a value is an IPv4 or an IPv6 address (see {@link isIPv4} and {@link isIPv6}).
+ * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
+ * non-matching string, test `typeof value === 'string'` there.
  * @param {unknown} value - The value to check
  * @returns {boolean} `true` when `value` is a string holding an IP address
  * @example
@@ -450,6 +463,8 @@ export function isIP(value: unknown): value is string {
 /**
  * Checks whether a value is a CSS hex colour: `#rgb`, `#rrggbb` and, unless `alpha` is `false`, `#rgba` and `#rrggbbaa`, in any letter case.
  * The leading `#` is required. Every accepted string is also accepted by `parseHex` from the color module (which additionally allows omitting the `#`).
+ * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
+ * non-matching string, test `typeof value === 'string'` there.
  * @param {unknown} value - The value to check
  * @param {IsHexColorOptions} [options={}] - `alpha` (default `true`): accept the forms with an alpha channel
  * @returns {boolean} `true` when `value` is a string holding a hex colour
@@ -479,6 +494,8 @@ function matchSemver(value: unknown): RegExpExecArray | null {
 /**
  * Checks whether a value is a semantic version, using the official regular expression from semver.org (SemVer 2.0.0):
  * `MAJOR.MINOR.PATCH`, optional `-pre.release` identifiers and optional `+build.metadata`. No leading `v`, no leading zeros in numeric parts.
+ * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
+ * non-matching string, test `typeof value === 'string'` there.
  * @param {unknown} value - The value to check
  * @returns {boolean} `true` when `value` is a string holding a semantic version
  * @example
@@ -636,6 +653,8 @@ function isCalendarDate(match: RegExpExecArray | null): boolean {
 /**
  * Checks whether a value is an ISO 8601 / RFC 3339 calendar date in the `YYYY-MM-DD` form that is an actual date
  * (`2023-02-29` and `2024-04-31` are rejected; leap years are handled).
+ * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
+ * non-matching string, test `typeof value === 'string'` there.
  * @param {unknown} value - The value to check
  * @returns {boolean} `true` when `value` is a string holding a valid calendar date
  * @example
@@ -655,6 +674,8 @@ export function isIsoDateString(value: unknown): value is string {
  *
  * Leap seconds (`23:59:60`) are rejected, as JavaScript dates cannot represent them. A space instead of `T`, missing seconds
  * and missing offsets (local times) are rejected too.
+ * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
+ * non-matching string, test `typeof value === 'string'` there.
  * @param {unknown} value - The value to check
  * @returns {boolean} `true` when `value` is a string holding a valid RFC 3339 date-time
  * @example
@@ -700,6 +721,8 @@ export function luhnCheck(digits: string): boolean {
 /**
  * Checks whether a value looks like a payment card number: 12 to 19 digits, not all zeros, optionally grouped with single spaces or dashes
  * between digits, that pass the Luhn checksum (see {@link luhnCheck}). The issuer (IIN range) is not checked.
+ * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
+ * non-matching string, test `typeof value === 'string'` there.
  * @param {unknown} value - The value to check
  * @returns {boolean} `true` when `value` is a string holding a plausible card number
  * @example
@@ -717,6 +740,8 @@ export function isCreditCardNumber(value: unknown): value is string {
 
 /**
  * Checks whether a value is a string that `JSON.parse` accepts (any JSON text, including `'1'`, `'"text"'` and `'null'`).
+ * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
+ * non-matching string, test `typeof value === 'string'` there.
  * @param {unknown} value - The value to check
  * @returns {boolean} `true` when `value` is a string holding valid JSON
  * @example
@@ -743,6 +768,8 @@ export function isJsonString(value: unknown): value is string {
  * Only canonical encodings are accepted (RFC 4648 §3.5): the bits of the last character that encode no data must be zero, so every byte
  * sequence has a single valid (padded or unpadded) spelling — `'YQ=='` is valid, `'YR=='`, which also decodes to `'a'`, is not. Strings
  * that pass can therefore be compared as text (tokens, signatures, cache keys) without decoding them first.
+ * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
+ * non-matching string, test `typeof value === 'string'` there.
  * @param {unknown} value - The value to check
  * @param {IsBase64Options} [options={}] - `urlSafe` (default `false`): use the `-` / `_` alphabet;
  * `padding` (default `'optional'`): whether `=` padding is `'optional'`, `'required'` or `'forbidden'`
@@ -790,6 +817,8 @@ function sextet(code: number): number {
 /**
  * Checks whether a value is a URL slug: lowercase ASCII letters and digits in runs separated by single hyphens,
  * with no leading or trailing hyphen. Every non-empty result of `toSlug` from the strings module is a slug.
+ * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
+ * non-matching string, test `typeof value === 'string'` there.
  * @param {unknown} value - The value to check
  * @returns {boolean} `true` when `value` is a string holding a slug
  * @example
@@ -809,6 +838,8 @@ export function isSlug(value: unknown): value is string {
  *
  * Rejected: the empty string, white space anywhere, hex/octal/binary literals (`0x1f`), numeric separators (`1_000`),
  * `Infinity`, `NaN`, and values that overflow to `±Infinity` (`1e400`).
+ * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
+ * non-matching string, test `typeof value === 'string'` there.
  * @param {unknown} value - The value to check
  * @returns {boolean} `true` when `value` is a string holding a finite decimal number
  * @example
@@ -1701,7 +1732,10 @@ export function transform<S extends Schema, U>(schema: S, fn: (value: SchemaOutp
 			return issues.length > before ? undefined : fn(output as SchemaOutput<S>);
 		},
 		guard: undefined,
-		handlesMissing: node.handlesMissing
+		// Read when a parse asks (a getter): on a `lazy` schema, reading it at construction would run the getter too early.
+		get handlesMissing(): boolean | undefined {
+			return node.handlesMissing;
+		}
 	});
 }
 
@@ -1736,7 +1770,10 @@ export function chain<A extends Schema, B extends Schema>(first: A, second: B): 
 			return issues.length > before ? undefined : rerun(tail, output, path, issues);
 		},
 		guard: undefined,
-		handlesMissing: head.handlesMissing
+		// Read when a parse asks (a getter): on a `lazy` schema, reading it at construction would run the getter too early.
+		get handlesMissing(): boolean | undefined {
+			return head.handlesMissing;
+		}
 	});
 }
 
@@ -1946,7 +1983,10 @@ export function nullable<S extends Schema>(schema: S): Parser<SchemaOutput<S> | 
 		// Only reached when the fast parse failed, so never for `null`.
 		run: node.run,
 		guard: undefined,
-		handlesMissing: node.handlesMissing
+		// Read when a parse asks (a getter): on a `lazy` schema, reading it at construction would run the getter too early.
+		get handlesMissing(): boolean | undefined {
+			return node.handlesMissing;
+		}
 	});
 }
 
@@ -1956,14 +1996,19 @@ export function nullable<S extends Schema>(schema: S): Parser<SchemaOutput<S> | 
  * @returns {Node} The optional schema
  */
 function optionalNode(node: Node): Node {
+	// A value the inner schema treats as missing (a blank string, for `blankAsUndefined`) is absent too, so `partial` and
+	// `optional(blankAsUndefined(...))` leave blank fields out instead of failing on them.
+	const missing = node.missing;
+
 	return {
 		fast: function fastOptional(value: unknown): unknown {
-			return value === undefined ? undefined : node.fast(value);
+			return value === undefined || (missing !== undefined && missing(value)) ? undefined : node.fast(value);
 		},
-		// Only reached when the fast parse failed, so never for `undefined`.
+		// Only reached when the fast parse failed, so never for `undefined` or a missing value.
 		run: node.run,
 		guard: undefined,
-		handlesMissing: true
+		handlesMissing: true,
+		missing
 	};
 }
 
@@ -2107,9 +2152,12 @@ export function union<const S extends ReadonlyArray<Schema>>(...schemas: S): Par
 			return undefined;
 		},
 		guard: undefined,
-		handlesMissing: nodes.some(function (node: Node): boolean {
-			return node.handlesMissing === true;
-		})
+		// Read when a parse asks (a getter): on a `lazy` schema, reading it at construction would run the getter too early.
+		get handlesMissing(): boolean {
+			return nodes.some(function (node: Node): boolean {
+				return node.handlesMissing === true;
+			});
+		}
 	});
 }
 
@@ -2389,7 +2437,10 @@ export function blankAsUndefined<S extends Schema>(schema: S): Parser<SchemaOutp
 			return node.run(isBlank(value) ? undefined : value, path, issues);
 		},
 		guard: undefined,
-		handlesMissing: node.handlesMissing,
+		// Read when a parse asks (a getter): on a `lazy` schema, reading it at construction would run the getter too early.
+		get handlesMissing(): boolean | undefined {
+			return node.handlesMissing;
+		},
 		missing: isBlank
 	});
 }
