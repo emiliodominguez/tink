@@ -4,6 +4,8 @@ import {
 	isLazy,
 	isLiteral,
 	isMatching,
+	isNull,
+	isNullable,
 	isNumber,
 	isObject,
 	isOptional,
@@ -11,6 +13,7 @@ import {
 	isString,
 	isUnion,
 	issuesByPath,
+	refine,
 	type Guard,
 	type SchemaIssue
 } from '../guards/index.js';
@@ -449,8 +452,72 @@ describe('recursive unions told apart deep inside', function () {
 			}).toThrow(v8);
 		});
 
+		it('should rethrow an overflow of the code even after checking a deep value', function () {
+			const isTree: Guard<unknown> = isLazy(function () {
+				return isShape({ next: isOptional(isTree) });
+			});
+			let deep: object = {};
+
+			for (let level = 0; level < 150; level++) deep = { next: deep };
+
+			// The tree is checked 150 deep before the predicate overflows the stack at the root.
+			const recursing = isLazy(function () {
+				return isShape({
+					tree: isTree,
+					bug: refine(isString, function forever(text: string): boolean {
+						return forever(text);
+					})
+				});
+			});
+
+			expect(function () {
+				recursing({ tree: deep, bug: 'x' });
+			}).toThrow(RangeError);
+		});
+
+		it('should report a value too deep to parse where another copy of tinkit reports through a lazy parser', function () {
+			const [parser] = chains(v8);
+			const node = (parser as unknown as Record<string, { run(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown }>)['~tink.1'];
+			const issues: SchemaIssue[] = [];
+			const path: PropertyKey[] = ['root'];
+
+			node.run(nest(150), path, issues);
+			expect(issues).toEqual([{ message: 'Value is nested too deeply', path: ['root'] }]);
+			expect(path).toEqual(['root']);
+		});
+
+		it('should rethrow an overflow that only the explaining pass meets', function () {
+			let leafChecks = 0;
+
+			/**
+			 * Rejects the leaf on the check, and throws when `explain` asks again for its issues.
+			 * @param {unknown} value - The value
+			 * @returns {boolean} `false`
+			 */
+			function isLeaf(value: unknown): value is never {
+				if (value === 'leaf' && ++leafChecks > 1) throw v8;
+
+				return false;
+			}
+			const isChain: Guard<unknown> = isLazy(function () {
+				return isShape({ next: isUnion(isLeaf, isChain) });
+			});
+
+			expect(function () {
+				explain(isChain, nest(3));
+			}).toThrow(v8);
+		});
+
 		it('should rethrow other errors', function () {
 			const [parser, guard] = chains(other);
+			// The fast parse fails on `b` before reaching `a`: the error is first thrown under the reporting parse of the lazy parser.
+			const reported = lazy(function () {
+				return { b: isString, a: throwing(other) };
+			});
+
+			expect(function () {
+				safeParse(reported, { b: 1, a: 'x' });
+			}).toThrow(other);
 
 			expect(function () {
 				safeParse(parser, nest(150));
@@ -554,6 +621,21 @@ describe('recursive unions told apart deep inside', function () {
 		expect(isNode([b, a])).toBe(true);
 		expect(explain(isNode, [a, b])).toEqual([]);
 		expect(parse(node, [a, b])).toEqual((parse(node, [b, a]) as unknown[]).reverse());
+	});
+
+	it('should score a union that reaches its own lazy schema again on the same value', function () {
+		const isList: Guard<unknown> = isLazy(function () {
+			return isUnion(arrayOfGuard(isNull), isNullable(isList));
+		});
+		const list: Parser<unknown> = lazy(function () {
+			return union(arrayOf(isNull), nullable(list));
+		});
+		const invalid = [{ message: 'Invalid value (got object)', path: [] }];
+
+		expect(isList({})).toBe(false);
+		expect(explain(isList, {})).toEqual(invalid);
+		expect(issuesOf(isList, {})).toEqual(invalid);
+		expect(issuesOf(list, {})).toEqual([{ message: 'Expected an array (got object)', path: [] }]);
 	});
 
 	it('should remember a truthy result of a guard that is not a boolean as a pass', function () {

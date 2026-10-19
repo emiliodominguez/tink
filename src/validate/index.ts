@@ -2796,6 +2796,9 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 	// right now: meeting one again means a cycle.
 	const memo = new Map<object, unknown>();
 	const reporting = new Set<object>();
+	// The values being scored: a union that reaches this parser again on the same value (`lazy(() => union(a, nullable(self)))`) would
+	// score it forever.
+	const scoring = new Set<unknown>();
 
 	/**
 	 * Returns the compiled schema, calling `getter` on first use.
@@ -2826,7 +2829,7 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 			const cycles = scope.cycles;
 
 			// The outermost lazy parser of a fast parse scopes the memos of the parsers it reaches to its call.
-			if (++scope.depth > scope.deepest) scope.deepest = scope.depth;
+			scope.depth++;
 			try {
 				const output = node.fast(value);
 
@@ -2836,6 +2839,11 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 
 				return output;
 			} catch (error) {
+				// Recorded inline, without a call, since a call can overflow again: the first lazy schema to see the error is the deepest.
+				if (scope.thrown !== error) {
+					scope.thrown = error;
+					scope.thrownAt = scope.depth;
+				}
 				// A value too deep to parse fails; the reporting parse then reports it (see `execute`).
 				if (scope.depth === 1 && isTooDeep(error)) return FAIL;
 				memo.delete(value);
@@ -2854,11 +2862,29 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 				return undefined;
 			}
 			hold(reporting).add(value);
+
+			const length = path.length;
+
 			// A parser of another copy of tinkit may report through this one: the scope keeps `reporting` until this call returns.
-			if (++scope.depth > scope.deepest) scope.deepest = scope.depth;
+			scope.depth++;
 			try {
 				// The fast parse of this very value just failed: parsing it again first would double the cost at every level.
 				return node.run(value, path, issues);
+			} catch (error) {
+				// Recorded inline, without a call, since a call can overflow again: the first lazy schema to see the error is the deepest.
+				if (scope.thrown !== error) {
+					scope.thrown = error;
+					scope.thrownAt = scope.depth;
+				}
+				// Reporting for another copy of tinkit: the value too deep to parse is reported here, where the depth is known.
+				if (scope.depth === 1 && isTooDeep(error)) {
+					// The error skipped the `pop` of every key pushed below this value.
+					path.length = length;
+					issues.push({ message: 'Value is nested too deeply', path: path.slice() });
+
+					return undefined;
+				}
+				throw error;
 			} finally {
 				reporting.delete(value);
 				if (--scope.depth === 0) release();
@@ -2874,7 +2900,13 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 			return handlesMissing(resolve());
 		},
 		score: function scoreLazy(value: unknown): number {
-			return scoreOf(resolve(), value);
+			if (scoring.has(value)) return 1;
+			scoring.add(value);
+			try {
+				return scoreOf(resolve(), value);
+			} finally {
+				scoring.delete(value);
+			}
 		}
 	});
 }

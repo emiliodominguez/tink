@@ -2103,6 +2103,9 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 	// right now: meeting one again means a cycle.
 	const memo = new Map<object, unknown>();
 	const explaining = new Set<object>();
+	// The values being scored: a union that reaches this guard again on the same value (`isLazy(() => isUnion(a, isNullable(self)))`)
+	// would score it forever.
+	const scoring = new Set<unknown>();
 
 	/**
 	 * Returns the guard, calling `getter` on first use.
@@ -2137,7 +2140,7 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 
 			const cycles = scope.cycles;
 
-			if (++scope.depth > scope.deepest) scope.deepest = scope.depth;
+			scope.depth++;
 			try {
 				const passed = guard(value);
 
@@ -2147,6 +2150,11 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 
 				return passed;
 			} catch (error) {
+				// Recorded inline, without a call, since a call can overflow again: the first lazy schema to see the error is the deepest.
+				if (scope.thrown !== error) {
+					scope.thrown = error;
+					scope.thrownAt = scope.depth;
+				}
 				// The outermost check rejects a value too deep to check; inside `explain`, or another lazy guard, the error goes on up.
 				if (scope.depth === 1 && isTooDeep(error)) return false;
 				memo.delete(value);
@@ -2164,18 +2172,34 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 
 				return false;
 			}
-			// Explainers only run inside `explain` (or a parse of the validate module), whose scope keeps `explaining` until it ends.
+			// Explainers only run inside `explain` (or a parse of the validate module), whose scope keeps `explaining` until it ends: the
+			// depth counts the nesting (see `isTooDeep`), and never drops to 0 here.
 			hold(explaining).add(value);
+			scope.depth++;
 			try {
 				return collect(guard, value, path, issues);
+			} catch (error) {
+				// Recorded inline, without a call, since a call can overflow again: the first lazy schema to see the error is the deepest.
+				if (scope.thrown !== error) {
+					scope.thrown = error;
+					scope.thrownAt = scope.depth;
+				}
+				throw error;
 			} finally {
 				explaining.delete(value);
+				scope.depth--;
 			}
 		}
 	);
 
 	scored(lazyGuard, function scoreLazy(value: unknown): number {
-		return guardScore(resolve(), value);
+		if (scoring.has(value)) return 1;
+		scoring.add(value);
+		try {
+			return guardScore(resolve(), value);
+		} finally {
+			scoring.delete(value);
+		}
 	});
 
 	return lazyGuard;

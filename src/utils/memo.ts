@@ -19,8 +19,9 @@ export const PENDING: object = {};
  */
 export const scope = {
 	depth: 0,
-	/** The deepest `depth` reached since the scope opened: a stack overflow counts as a value too deep only when it is large. */
-	deepest: 0,
+	/** The last error a lazy schema saw thrown, and the `depth` of the first (so deepest) one to see it: see {@link isTooDeep}. */
+	thrown: undefined as unknown,
+	thrownAt: 0,
 	/** How many times a lazy schema met an object it was already checking (a cycle): results that did are not remembered. */
 	cycles: 0
 };
@@ -53,7 +54,8 @@ export function hold<C extends Map<object, unknown> | Set<object>>(collection: C
 export function release(): void {
 	for (let index = 0; index < held.length; index++) held[index].clear();
 	held.length = 0;
-	scope.deepest = 0;
+	scope.thrown = undefined;
+	scope.thrownAt = 0;
 }
 
 /**
@@ -68,12 +70,12 @@ function isStackOverflow(error: unknown): boolean {
 
 /**
  * Whether `error`, caught by the outermost check (or parse), means the value is nested too deeply to check: a stack overflow, raised
- * after lazy schemas nested at least {@link TOO_DEEP} deep. An overflow at a shallower nesting comes from the code (a guard or a
+ * while lazy schemas were nested at least {@link TOO_DEEP} deep (lazy schemas record the depth at which they first see an error). An overflow at a shallower nesting comes from the code (a guard or a
  * transform that recurses forever, or a check started near the stack limit), and is rethrown.
  * @param {unknown} error - The thrown value
  * @returns {boolean} `true` for a value too deep to check
  * @internal
  */
 export function isTooDeep(error: unknown): boolean {
-	return scope.deepest >= TOO_DEEP && isStackOverflow(error);
+	return scope.thrown === error && scope.thrownAt >= TOO_DEEP && isStackOverflow(error);
 }
