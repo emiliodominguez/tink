@@ -8,7 +8,7 @@
 
 **Strictly typed utilities for everyday JavaScript, with the edge cases handled.**
 
-~600 tree-shakeable helpers · 20 modules · zero dependencies · a median of 490 B per import
+~600 tree-shakeable helpers · 20 modules · zero dependencies · a median of 499 B per import
 
 ```bash
 npm install tinkit
@@ -78,7 +78,7 @@ const env = parse(
 ); // { PORT: number; DEBUG: boolean; MODE: 'dev' | 'prod'; DATABASE_URL: string }, every other variable stripped
 ```
 
-`asNumber('')` fails instead of returning `0`, `asInteger` rejects integers that would lose precision, and `asDate` rejects `'2023-02-29'` and offset-less local times. Every parser is a Standard Schema validator, and zod schemas can be nested inside. `union`, `discriminatedUnion`, `recordOf`, `tuple`, `lazy`, `exact` and `partial` cover the rest of zod's shapes; `asArray`, `asList`, `blankAsUndefined` and `asJson` handle repeated query parameters, comma-separated lists, empty form fields and JSON in environment variables; `check` adds rules across fields, `withFallback` replaces a bad value instead of failing, `asBigInt` reads 64-bit ids, and `issuesByPath` turns issues into per-field messages.
+`asNumber('')` fails instead of returning `0`, `asInteger` rejects integers that would lose precision, and `asDate` rejects `'2023-02-29'` and offset-less local times. Every parser is a Standard Schema validator, and zod schemas can be nested inside. `union`, `discriminatedUnion`, `recordOf`, `tuple`, `lazy`, `exact` and `partial` cover the rest of zod's shapes; `asArray`, `asList`, `blankAsUndefined` and `asJson` handle repeated query parameters, comma-separated lists, empty form fields and JSON in environment variables; `check` adds rules across fields, `withError` words the message a form shows, `withFallback` replaces a bad value instead of failing, `asBigInt` reads 64-bit ids, and `issuesByPath` turns issues into per-field messages.
 
 ## Hostile input is a non-event
 
@@ -137,7 +137,7 @@ More examples, including dates, text and decorators, are in [Recipes](./docs/REC
 
 ## Numbers
 
-- **Size:** a median of 490 B per import, 3.4 kB at most, 64 kB gzipped for all 20 modules. The cost of every export is in [docs/SIZES.md](./docs/SIZES.md).
+- **Size:** a median of 499 B per import, 3.7 kB at most, 66 kB gzipped for all 20 modules. The cost of every export is in [docs/SIZES.md](./docs/SIZES.md).
 - **Speed:** benchmarked at 10, 1k and 100k items against the popular libraries with the same helpers. Results are in [docs/PERFORMANCE.md](./docs/PERFORMANCE.md) (`yarn bench`).
 
 ## How it's tested

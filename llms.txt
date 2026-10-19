@@ -1,6 +1,6 @@
 # tink (tinkit)
 
-> Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities (20 modules, 603 exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, fuzzy search, caches, emitters and stores. Property-tested and mutation-tested.
+> Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities (20 modules, 608 exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, fuzzy search, caches, emitters and stores. Property-tested and mutation-tested.
 
 Key facts for code generation:
 - ESM only, zero dependencies, Node >= 20.19 or any modern browser/runtime. TypeScript types ship in the package.
@@ -13,31 +13,31 @@ Key facts for code generation:
 
 ## Modules
 
-- [arrays](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#arrays): Collection helpers: set algebra, grouping, chunking, sorting, sampling. Import from `tinkit/arrays`.
-- [objects](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#objects): Shallow/deep cloning, merging, equality, path access and object reshaping. Import from `tinkit/objects`.
-- [guards](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#guards): Runtime type predicates that narrow `unknown` values, composable into path-aware, Standard Schema-compatible validators. Import from `tinkit/guards`.
-- [strings](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#strings): Unicode-aware transformations, case conversion, escaping, templating and text metrics. Import from `tinkit/strings`.
-- [url](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#url): Query-string building and parsing, URL joining and query merging, without URL object types. Import from `tinkit/url`.
-- [math](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#math): Precise arithmetic, statistics, number theory and random numbers. Import from `tinkit/math`.
-- [functions](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#functions): Function composition, currying, memoization and rate limiting. Import from `tinkit/functions`.
-- [async](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#async): Promise utilities: retries, timeouts, polling, limiters, keyed Promise.all and async debounce. Import from `tinkit/async`.
-- [color](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#color): Hex/RGB/HSL conversion, mixing, lightening and WCAG contrast checks. Import from `tinkit/color`.
-- [search](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#search): Fuzzy matching and ranking with highlight ranges, for command palettes and filter-as-you-type UIs. Import from `tinkit/search`.
-- [easing](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#easing): Animation easing curves, CSS-accurate cubic-bezier() and steps(), and an analytic spring. Import from `tinkit/easing`.
-- [format](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#format): Deterministic, cached Intl formatting: numbers, currency, percent, compact, units, lists, dates, ordinals. Import from `tinkit/format`.
-- [validate](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#validate): Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates, and zod-like parsing with coercion, defaults and transforms. Import from `tinkit/validate`.
-- [date](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#date): DST-safe, non-mutating local-time date arithmetic, formatting and parsing. Import from `tinkit/date`.
-- [iterables](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#iterables): Lazy, generator-based pipelines over any (async) iterable, with exact pull counts and early-exit cleanup. Import from `tinkit/iterables`.
-- [cache](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#cache): O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock; plugs into memoize. Import from `tinkit/cache`.
-- [emitter](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#emitter): Typed event emitter with wildcard listeners, waitFor and error isolation. Import from `tinkit/emitter`.
-- [store](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#store): Tiny state store compatible with React useSyncExternalStore, with derived selectors. Import from `tinkit/store`.
-- [random](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#random): Seeded deterministic PRNG plus cryptographically secure ids, UUIDs and bytes. Import from `tinkit/random`.
-- [decorators](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md#decorators): Class decorators for TypeScript (legacy and TC39 standard) and Babel. Import from `tinkit/decorators`.
+- [arrays](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#arrays): Collection helpers: set algebra, grouping, chunking, sorting, sampling. Import from `tinkit/arrays`.
+- [objects](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#objects): Shallow/deep cloning, merging, equality, path access and object reshaping. Import from `tinkit/objects`.
+- [guards](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#guards): Runtime type predicates that narrow `unknown` values, composable into path-aware, Standard Schema-compatible validators. Import from `tinkit/guards`.
+- [strings](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#strings): Unicode-aware transformations, case conversion, escaping, templating and text metrics. Import from `tinkit/strings`.
+- [url](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#url): Query-string building and parsing, URL joining and query merging, without URL object types. Import from `tinkit/url`.
+- [math](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#math): Precise arithmetic, statistics, number theory and random numbers. Import from `tinkit/math`.
+- [functions](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#functions): Function composition, currying, memoization and rate limiting. Import from `tinkit/functions`.
+- [async](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#async): Promise utilities: retries, timeouts, polling, limiters, keyed Promise.all and async debounce. Import from `tinkit/async`.
+- [color](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#color): Hex/RGB/HSL conversion, mixing, lightening and WCAG contrast checks. Import from `tinkit/color`.
+- [search](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#search): Fuzzy matching and ranking with highlight ranges, for command palettes and filter-as-you-type UIs. Import from `tinkit/search`.
+- [easing](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#easing): Animation easing curves, CSS-accurate cubic-bezier() and steps(), and an analytic spring. Import from `tinkit/easing`.
+- [format](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#format): Deterministic, cached Intl formatting: numbers, currency, percent, compact, units, lists, dates, ordinals. Import from `tinkit/format`.
+- [validate](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#validate): Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates, and zod-like parsing with coercion, defaults and transforms. Import from `tinkit/validate`.
+- [date](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#date): DST-safe, non-mutating local-time date arithmetic, formatting and parsing. Import from `tinkit/date`.
+- [iterables](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#iterables): Lazy, generator-based pipelines over any (async) iterable, with exact pull counts and early-exit cleanup. Import from `tinkit/iterables`.
+- [cache](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#cache): O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock; plugs into memoize. Import from `tinkit/cache`.
+- [emitter](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#emitter): Typed event emitter with wildcard listeners, waitFor and error isolation. Import from `tinkit/emitter`.
+- [store](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#store): Tiny state store compatible with React useSyncExternalStore, with derived selectors. Import from `tinkit/store`.
+- [random](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#random): Seeded deterministic PRNG plus cryptographically secure ids, UUIDs and bytes. Import from `tinkit/random`.
+- [decorators](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#decorators): Class decorators for TypeScript (legacy and TC39 standard) and Babel. Import from `tinkit/decorators`.
 
 ## Docs
 
 - [Full API index with signatures](llms-full.txt): every export with its signature and summary.
-- [API reference](https://github.com/emiliodominguez/js-helpers/blob/main/docs/API.md)
-- [Migrating from lodash](https://github.com/emiliodominguez/js-helpers/blob/main/docs/MIGRATING-FROM-LODASH.md): lodash → tink mapping with behavioural notes and sizes.
-- [Import cost of every helper](https://github.com/emiliodominguez/js-helpers/blob/main/docs/SIZES.md)
-- [Security policy](https://github.com/emiliodominguez/js-helpers/blob/main/SECURITY.md)
+- [API reference](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md)
+- [Migrating from lodash](https://github.com/emiliodominguez/tinkit/blob/main/docs/MIGRATING-FROM-LODASH.md): lodash → tink mapping with behavioural notes and sizes.
+- [Import cost of every helper](https://github.com/emiliodominguez/tinkit/blob/main/docs/SIZES.md)
+- [Security policy](https://github.com/emiliodominguez/tinkit/blob/main/SECURITY.md)
