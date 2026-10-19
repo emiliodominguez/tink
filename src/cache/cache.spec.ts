@@ -1,5 +1,5 @@
 import { memoize, type MemoizeCache } from '../functions/index.js';
-import { createLRUCache, createPriorityQueue, type LRUCache, type LRUEvictionReason } from '.';
+import { createLRUCache, createPriorityQueue, type LRUCache, type LRUEvictionReason, type PriorityQueue } from '.';
 
 function fakeClock(start = 0) {
 	const clock = {
@@ -697,6 +697,56 @@ describe('createPriorityQueue', function () {
 				return item.id;
 			})
 		).toEqual(['a', 'c', 'd', 'e', 'f']);
+	});
+
+	it('keeps every value exactly once when compare throws during push, pop or delete', function () {
+		const operations: ReadonlyArray<[string, (queue: PriorityQueue<number>) => unknown, number[]]> = [
+			[
+				'push',
+				function (queue) {
+					return queue.push(0);
+				},
+				[0, 1, 2, 3, 4, 5, 6, 7]
+			],
+			[
+				'pop',
+				function (queue) {
+					return queue.pop();
+				},
+				[1, 2, 3, 4, 5, 6, 7]
+			],
+			[
+				'delete',
+				function (queue) {
+					return queue.delete(2);
+				},
+				[1, 2, 3, 4, 5, 6, 7]
+			]
+		];
+		for (const [, operation, expected] of operations) {
+			for (let throwAt = 1; throwAt <= 4; throwAt++) {
+				let calls = 0;
+				let armed = false;
+				const queue = createPriorityQueue(function (a: number, b: number): number {
+					if (armed && ++calls === throwAt) throw new Error('boom');
+					return a - b;
+				});
+				for (const n of [1, 2, 3, 4, 5, 6, 7]) queue.push(n);
+				armed = true;
+				let threw = false;
+				try {
+					operation(queue);
+				} catch {
+					threw = true;
+				}
+				armed = false;
+				if (!threw) continue;
+				expect(queue.size).toBe(expected.length);
+				const drained: number[] = [];
+				for (let value = queue.pop(); value !== undefined; value = queue.pop()) drained.push(value);
+				expect(drained.sort(ascending)).toEqual(expected);
+			}
+		}
 	});
 
 	it('clears every value', function () {

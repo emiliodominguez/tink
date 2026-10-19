@@ -473,7 +473,8 @@ export interface PriorityQueue<T> extends Iterable<T> {
  * The queue is stable: values that compare equal (`0`, or `NaN`, which is treated as equal like `sort` does) leave in insertion order
  * (FIFO), which plain binary heaps do not guarantee. That is what keeps task schedulers fair among tasks of the same priority.
  * `compare` is called during `push`, `pop`, `delete` and iteration, so it must not change the queue; it should be a consistent total
- * order, or the pop order is unspecified (though every value still comes out exactly once).
+ * order, or the pop order is unspecified (though every value still comes out exactly once). When `compare` throws, the error propagates
+ * and the queue keeps every value exactly once: a failed `push` has still queued its value, and a failed `pop` or `delete` keeps it.
  * @template T - The value type
  * @param {(a: T, b: T) => number} compare - Orders two values (negative: `a` first, positive: `b` first, zero: insertion order)
  * @returns {PriorityQueue<T>} A new, empty queue
@@ -520,16 +521,20 @@ export function createPriorityQueue<T>(compare: (a: T, b: T) => number): Priorit
 	 * @returns {number} The index where it was placed
 	 */
 	function siftUp(i: number, value: T, rank: number): number {
-		while (i > 0) {
-			const parent = (i - 1) >> 1;
+		try {
+			while (i > 0) {
+				const parent = (i - 1) >> 1;
 
-			if (!precedes(value, rank, values[parent], order[parent])) break;
-			values[i] = values[parent];
-			order[i] = order[parent];
-			i = parent;
+				if (!precedes(value, rank, values[parent], order[parent])) break;
+				values[i] = values[parent];
+				order[i] = order[parent];
+				i = parent;
+			}
+		} finally {
+			// Also when `compare` throws: the value fills the hole, so none is lost or left in two slots.
+			values[i] = value;
+			order[i] = rank;
 		}
-		values[i] = value;
-		order[i] = rank;
 
 		return i;
 	}
@@ -544,18 +549,22 @@ export function createPriorityQueue<T>(compare: (a: T, b: T) => number): Priorit
 	function siftDown(i: number, value: T, rank: number): void {
 		const length = values.length;
 
-		for (;;) {
-			let child = 2 * i + 1;
+		try {
+			for (;;) {
+				let child = 2 * i + 1;
 
-			if (child >= length) break;
-			if (child + 1 < length && precedes(values[child + 1], order[child + 1], values[child], order[child])) child++;
-			if (!precedes(values[child], order[child], value, rank)) break;
-			values[i] = values[child];
-			order[i] = order[child];
-			i = child;
+				if (child >= length) break;
+				if (child + 1 < length && precedes(values[child + 1], order[child + 1], values[child], order[child])) child++;
+				if (!precedes(values[child], order[child], value, rank)) break;
+				values[i] = values[child];
+				order[i] = order[child];
+				i = child;
+			}
+		} finally {
+			// Also when `compare` throws (see `siftUp`).
+			values[i] = value;
+			order[i] = rank;
 		}
-		values[i] = value;
-		order[i] = rank;
 	}
 
 	/**
@@ -565,11 +574,19 @@ export function createPriorityQueue<T>(compare: (a: T, b: T) => number): Priorit
 	 */
 	function removeAt(i: number): T {
 		const removed = values[i];
+		const removedRank = order[i];
 		const value = values.pop() as T;
 		const rank = order.pop() as number;
 
-		// The last value fills the hole; it may belong above or below it.
-		if (i < values.length && siftUp(i, value, rank) === i) siftDown(i, value, rank);
+		try {
+			// The last value fills the hole; it may belong above or below it.
+			if (i < values.length && siftUp(i, value, rank) === i) siftDown(i, value, rank);
+		} catch (error) {
+			// `compare` threw: keep the value queued, since the caller never received it.
+			values.push(removed);
+			order.push(removedRank);
+			throw error;
+		}
 
 		return removed;
 	}
