@@ -345,9 +345,10 @@ function isPlainWebUrl(value: string, requireTld: boolean): boolean {
  *
  * The host is also checked against the text, so that for an accepted URL the host a client connects to is the one a reader (or a
  * string-based allow/deny list) sees (except for bracketed IPv6 literals, which the parser writes in canonical form: `[0::1]` becomes
- * `[::1]`, so compare those after parsing): `new URL(value).hostname` is the written host, lower-cased, or its punycode form for
- * internationalized names (`münchen.de`, `例え.jp`; each non-ASCII label must stay a punycode label, so `https://ẞa.com`, which older IDNA case
- * folding turns into `ssa.com`, is rejected there). So the following are also rejected: invisible characters anywhere (format characters
+ * `[::1]`, so compare those after parsing): for `http(s)` and the other special schemes, `new URL(value).hostname` is the written host,
+ * lower-cased, or its punycode form for internationalized names (`münchen.de`, `例え.jp`; each non-ASCII label must stay a punycode label,
+ * so `https://ẞa.com`, which older IDNA case folding turns into `ssa.com`, is rejected there; the parser percent-encodes the non-ASCII
+ * hosts of other schemes, `foo://例え.jp`, instead). So the following are also rejected: invisible characters anywhere (format characters
  * such as U+00AD soft hyphen, U+200B zero-width space or bidi controls, and other default-ignorable code points such as U+034F or
  * variation selectors), a backslash in the authority (`http://evil.com\@good.com`, which parsers disagree on), and host names with
  * a `%` (percent-decoded by the parser), an empty label (`https://a..b`, `https://.`; one trailing dot is allowed), characters that
@@ -1485,14 +1486,16 @@ function standardNode(schema: StandardSchemaLike): Node {
 }
 
 /**
- * Sets `output[key]`, as an own property even for `__proto__` (a plain assignment would replace the prototype instead).
+ * Sets `output[key]` as an own property. A key the output inherits is defined rather than assigned: `__proto__` would replace the
+ * prototype, an inherited setter (a polluted prototype) would run, and an inherited read-only property (a frozen `Object.prototype`
+ * keeps `toString` read-only) would make the assignment throw.
  * @param {Record<string, unknown>} output - The object being built
  * @param {string} key - The key
  * @param {unknown} value - The value
  * @returns {void}
  */
 function assign(output: Record<string, unknown>, key: string, value: unknown): void {
-	if (key === '__proto__') Object.defineProperty(output, key, { value, enumerable: true, writable: true, configurable: true });
+	if (key in output) Object.defineProperty(output, key, { value, enumerable: true, writable: true, configurable: true });
 	else output[key] = value;
 }
 
@@ -1854,7 +1857,8 @@ export function toParser<S extends Schema>(schema: S): Parser<SchemaOutput<S>> {
  * Creates a parser that returns `fallback` when the value is `undefined` (missing), and parses it with `schema` otherwise (`.default()`
  * in zod). `null` is not missing: it goes to `schema`. When `fallback` is a function it is called for every missing value, so mutable
  * defaults are never shared between results (wrap a function default in another function: `withDefault(isFunction, () => noop)`);
- * keep it free of side effects, since an invalid input is parsed twice. The fallback itself is not validated.
+ * keep it free of side effects, since an invalid input is parsed again to report it (more than twice inside a union). The fallback itself
+ * is not validated.
  * @template S - The schema
  * @param {S} schema - The schema for present values
  * @param {SchemaOutput<S> | (() => SchemaOutput<S>)} fallback - The default, or a function returning it
@@ -1949,8 +1953,8 @@ export function optional<S extends Schema>(schema: S): Parser<SchemaOutput<S> | 
 
 /**
  * Creates a parser that parses the value with `schema`, then maps the output with `fn` (`.transform()` in zod). `fn` only runs when
- * `schema` succeeded; keep it free of side effects, since an invalid input is parsed twice. To validate the transformed value,
- * {@link chain} a schema after it.
+ * `schema` succeeded; keep it free of side effects, since an invalid input is parsed again to report it (more than twice inside a union).
+ * To validate the transformed value, {@link chain} a schema after it.
  * @template S - The schema
  * @template U - The transformed type
  * @param {S} schema - The schema applied first
@@ -2159,7 +2163,7 @@ export function arrayOf<S extends Schema>(schema: S): Parser<SchemaOutput<S>[]> 
 function parseElements(node: Node, elements: ReadonlyArray<unknown>): unknown {
 	const { guard, fast } = node;
 	const output: unknown[] = [];
-	const direct = !isArrayPrototypePolluted();
+	const direct = readsHolesAsUndefined(elements);
 
 	for (let index = 0; index < elements.length; index++) {
 		let element = direct || hasOwn.call(elements, index) ? elements[index] : undefined;
@@ -2185,7 +2189,7 @@ function parseElements(node: Node, elements: ReadonlyArray<unknown>): unknown {
  */
 function reportElements(node: Node, elements: ReadonlyArray<unknown>, path: PropertyKey[], issues: SchemaIssue[]): unknown[] {
 	const output: unknown[] = [];
-	const direct = !isArrayPrototypePolluted();
+	const direct = readsHolesAsUndefined(elements);
 
 	for (let index = 0; index < elements.length; index++) {
 		path.push(index);
@@ -2206,6 +2210,17 @@ function isArrayPrototypePolluted(): boolean {
 	for (const key in Array.prototype) return typeof key === 'string';
 
 	return false;
+}
+
+/**
+ * Whether the elements of `elements` can be read directly (a hole then reads `undefined`): it inherits from this realm's unpolluted
+ * `Array.prototype`. Arrays of other realms, or with another prototype, are read as own properties, since what their holes read is
+ * not known.
+ * @param {ReadonlyArray<unknown>} elements - An array
+ * @returns {boolean} Whether a direct read is safe
+ */
+function readsHolesAsUndefined(elements: ReadonlyArray<unknown>): boolean {
+	return Object.getPrototypeOf(elements) === Array.prototype && !isArrayPrototypePolluted();
 }
 
 /**
@@ -2328,7 +2343,7 @@ export function tuple<const S extends ReadonlyArray<Schema>>(...schemas: S): Par
 			if (!Array.isArray(value) || value.length !== nodes.length) return FAIL;
 
 			const output: unknown[] = [];
-			const direct = !isArrayPrototypePolluted();
+			const direct = readsHolesAsUndefined(value);
 
 			for (let index = 0; index < nodes.length; index++) {
 				const element = nodes[index].fast(direct || hasOwn.call(value, index) ? value[index] : undefined);
@@ -2349,7 +2364,7 @@ export function tuple<const S extends ReadonlyArray<Schema>>(...schemas: S): Par
 			}
 
 			const output: unknown[] = [];
-			const direct = !isArrayPrototypePolluted();
+			const direct = readsHolesAsUndefined(value);
 
 			for (let index = 0; index < nodes.length; index++) {
 				path.push(index);
@@ -2794,6 +2809,7 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 	if (typeof getter !== 'function') throw new TypeError(`lazy: \`getter\` must be a function, got ${describe(getter)}`);
 
 	let resolved: Node | undefined;
+	let resolving = false;
 	// The output for each object parsed by this parser during the current parse (see `utils/memo.ts`), and the objects being reported
 	// right now: meeting one again means a cycle.
 	const memo = new Map<object, unknown>();
@@ -2807,53 +2823,73 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 	 * @returns {Node} The compiled schema
 	 */
 	function resolve(): Node {
-		if (resolved === undefined) resolved = compile('lazy', 'getter()', getter(), []);
+		if (resolved === undefined) {
+			// A getter that returns this very parser, or parses with it while it resolves, would recurse until the stack overflows.
+			if (resolving) throw new TypeError('lazy: `getter` must not resolve to (or parse with) this lazy schema itself');
+			resolving = true;
+			try {
+				resolved = compile('lazy', 'getter()', getter(), []);
+			} finally {
+				resolving = false;
+			}
+			if (resolved.fast === fastLazy) {
+				resolved = undefined;
+				throw new TypeError('lazy: `getter` must not resolve to (or parse with) this lazy schema itself');
+			}
+		}
 
 		return resolved;
 	}
 
+	/**
+	 * The fast parse of the lazy schema.
+	 * @param {unknown} value - The value to parse
+	 * @returns {unknown} The output, or {@link FAIL}
+	 */
+	function fastLazy(value: unknown): unknown {
+		const node = resolve();
+
+		if (typeof value !== 'object' || value === null) return node.fast(value);
+
+		const known = memo.get(value);
+
+		if (known === PENDING) {
+			scope.cycles++;
+
+			return FAIL;
+		}
+		if (known !== undefined || memo.has(value)) return known;
+		hold(memo).set(value, PENDING);
+
+		const cycles = scope.cycles;
+
+		// The outermost lazy parser of a fast parse scopes the memos of the parsers it reaches to its call.
+		scope.depth++;
+		try {
+			const output = node.fast(value);
+
+			// An output that met a cycle depends on the path that led here (which objects were being parsed): it is not remembered.
+			if (scope.cycles === cycles) memo.set(value, output);
+			else memo.delete(value);
+
+			return output;
+		} catch (error) {
+			// Recorded inline, without a call, since a call can overflow again: the first lazy schema to see the error is the deepest.
+			if (scope.thrown !== error) {
+				scope.thrown = error;
+				scope.thrownAt = scope.depth;
+			}
+			// A value too deep to parse fails; the reporting parse then reports it (see `execute`).
+			if (scope.depth === 1 && isTooDeep(error)) return FAIL;
+			memo.delete(value);
+			throw error;
+		} finally {
+			if (--scope.depth === 0) release();
+		}
+	}
+
 	return toCompiledParser({
-		fast: function fastLazy(value: unknown): unknown {
-			const node = resolve();
-
-			if (typeof value !== 'object' || value === null) return node.fast(value);
-
-			const known = memo.get(value);
-
-			if (known === PENDING) {
-				scope.cycles++;
-
-				return FAIL;
-			}
-			if (known !== undefined || memo.has(value)) return known;
-			hold(memo).set(value, PENDING);
-
-			const cycles = scope.cycles;
-
-			// The outermost lazy parser of a fast parse scopes the memos of the parsers it reaches to its call.
-			scope.depth++;
-			try {
-				const output = node.fast(value);
-
-				// An output that met a cycle depends on the path that led here (which objects were being parsed): it is not remembered.
-				if (scope.cycles === cycles) memo.set(value, output);
-				else memo.delete(value);
-
-				return output;
-			} catch (error) {
-				// Recorded inline, without a call, since a call can overflow again: the first lazy schema to see the error is the deepest.
-				if (scope.thrown !== error) {
-					scope.thrown = error;
-					scope.thrownAt = scope.depth;
-				}
-				// A value too deep to parse fails; the reporting parse then reports it (see `execute`).
-				if (scope.depth === 1 && isTooDeep(error)) return FAIL;
-				memo.delete(value);
-				throw error;
-			} finally {
-				if (--scope.depth === 0) release();
-			}
-		},
+		fast: fastLazy,
 		run: function runLazy(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
 			const node = resolve();
 

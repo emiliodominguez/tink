@@ -1,3 +1,4 @@
+import * as vm from 'vm';
 import {
 	explain,
 	isArrayOf,
@@ -22,6 +23,7 @@ import {
 	lazy,
 	nullable,
 	optional,
+	recordOf,
 	parse,
 	parseJson,
 	safeParse,
@@ -316,5 +318,59 @@ describe('numeric discriminants', function () {
 		const value: Infer<typeof isVersion> = { v: '1', name: 'a' };
 
 		expect(isVersion(value)).toBe(true);
+	});
+});
+
+describe('reporting recursive values', function () {
+	it('reports an invalid deep lazy value in linear time', function () {
+		let calls = 0;
+		function isNumberCounted(value: unknown): value is number {
+			calls++;
+			return typeof value === 'number';
+		}
+		const tree: Schema = lazy(function () {
+			return { v: isNumberCounted, kids: arrayOf(tree) };
+		});
+		let node: unknown = { v: 'bad', kids: [] };
+		for (let i = 0; i < 800; i++) node = { v: 1, kids: [node] };
+		expect(safeParse(tree, node)[0]?.issues).toHaveLength(1);
+		expect(calls).toBeLessThan(10_000);
+	});
+
+	it('rejects a lazy schema that resolves to itself', function () {
+		const self: Schema = lazy(function () {
+			return self;
+		});
+		expect(function () {
+			safeParse(self, 1);
+		}).toThrow(new TypeError('lazy: `getter` must not resolve to (or parse with) this lazy schema itself'));
+
+		const reentrant: Schema = lazy(function () {
+			parse(reentrant, 1);
+			return isString;
+		});
+		expect(function () {
+			parse(reentrant, 'x');
+		}).toThrow(new TypeError('lazy: `getter` must not resolve to (or parse with) this lazy schema itself'));
+	});
+});
+
+describe('outputs and arrays under hardened or foreign prototypes', function () {
+	it('defines keys that the output would inherit read-only', function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		const original = Object.getOwnPropertyDescriptor(Object.prototype, 'toString') as PropertyDescriptor;
+		Object.defineProperty(Object.prototype, 'toString', { ...original, writable: false });
+		try {
+			expect(safeParse(recordOf(isString), JSON.parse('{"toString":"x"}'))).toEqual([undefined, { toString: 'x' }]);
+			expect(typeof proto.toString).toBe('function');
+		} finally {
+			Object.defineProperty(Object.prototype, 'toString', original);
+		}
+	});
+
+	it('reads the holes of arrays from other realms as undefined', function () {
+		const foreign = vm.runInNewContext('Array.prototype[0] = "evil"; [, "b"]') as unknown[];
+		expect(safeParse(arrayOf(optional(isString)), foreign)).toEqual([undefined, [undefined, 'b']]);
+		expect(safeParse(tuple(optional(isString), isString), foreign)).toEqual([undefined, [undefined, 'b']]);
 	});
 });
