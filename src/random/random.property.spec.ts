@@ -265,3 +265,106 @@ describe('Random helpers (property-based)', function () {
 		});
 	});
 });
+
+describe('Time-ordered ids (property-based)', function () {
+	const time = fc.integer({ min: 0, max: 2 ** 48 - 1 });
+	/** Clock readings: arbitrary jumps (backwards included) and runs of identical milliseconds. */
+	const readings = fc.array(fc.oneof(time, fc.integer({ min: 1_700_000_000_000, max: 1_700_000_000_005 })), { minLength: 1, maxLength: 30 });
+	const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+
+	function clockOf(times: number[]): () => number {
+		let call = 0;
+		return function () {
+			return times[call++];
+		};
+	}
+
+	/** Reference ULID decoder: the 26 base32 digits as one 130-bit integer. */
+	function ulidValue(id: string): bigint {
+		let value = 0n;
+		for (const character of id) value = value * 32n + BigInt(CROCKFORD.indexOf(character.toUpperCase()));
+		return value;
+	}
+
+	/** The 42-bit counter of a version 7 UUID (rand_a, then the top 30 bits of rand_b). */
+	function counterOf(id: string): number {
+		const hex = id.replace(/-/g, '');
+		return (parseInt(hex.slice(13, 16), 16) & 0xfff) * 2 ** 30 + (parseInt(hex.slice(16, 24), 16) & 0x3fffffff);
+	}
+
+	it('uuidv7: strictly increasing, embedding the running maximum of the clock, the counter stepping by one within a millisecond', function () {
+		fc.assert(
+			fc.property(readings, seed, function (times, s) {
+				const next = helpers.createUuidv7({ now: clockOf(times), random: helpers.createRandom(s) });
+				let maximum = -1;
+				let previous = '';
+				for (const reading of times) {
+					const id = next();
+					expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+					expect(id > previous).toBe(true);
+					const stamp = helpers.uuidv7Timestamp(id);
+					// A 42-bit counter seeded at random practically never rolls over in 30 ids.
+					if (reading <= maximum) {
+						expect(stamp).toBe(maximum);
+						expect(counterOf(id)).toBe(counterOf(previous) + 1);
+					}
+					maximum = Math.max(maximum, reading);
+					expect(stamp).toBe(maximum);
+					previous = id;
+				}
+			})
+		);
+	});
+
+	it('ulid: strictly increasing, embedding the running maximum of the clock, the random part stepping by one within a millisecond', function () {
+		fc.assert(
+			fc.property(readings, seed, function (times, s) {
+				const next = helpers.createUlid({ now: clockOf(times), random: helpers.createRandom(s) });
+				let maximum = -1;
+				let previous = '';
+				for (const reading of times) {
+					const id = next();
+					expect(id).toMatch(/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+					expect(id > previous).toBe(true);
+					if (reading <= maximum) expect(ulidValue(id)).toBe(ulidValue(previous) + 1n);
+					maximum = Math.max(maximum, reading);
+					expect(helpers.ulidTimestamp(id)).toBe(maximum);
+					expect(ulidValue(id) >> 80n).toBe(BigInt(maximum));
+					previous = id;
+				}
+			})
+		);
+	});
+
+	it('should be reproducible: the same clock and seed give the same ids', function () {
+		fc.assert(
+			fc.property(readings, seed, function (times, s) {
+				const a = helpers.createUlid({ now: clockOf(times), random: helpers.createRandom(s) });
+				const b = helpers.createUlid({ now: clockOf(times), random: helpers.createRandom(s) });
+				const c = helpers.createUuidv7({ now: clockOf(times), random: helpers.createRandom(s) });
+				const d = helpers.createUuidv7({ now: clockOf(times), random: helpers.createRandom(s) });
+				for (let i = 0; i < times.length; i++) {
+					expect(a()).toBe(b());
+					expect(c()).toBe(d());
+				}
+			})
+		);
+	});
+
+	it('uuidv7Timestamp and ulidTimestamp should read any valid id like a reference decoder, in either letter case', function () {
+		const hex = fc.string({ unit: fc.constantFrom(...'0123456789abcdef'), minLength: 32, maxLength: 32 });
+		fc.assert(
+			fc.property(hex, fc.constantFrom('8', '9', 'a', 'b'), fc.boolean(), function (digits, variant, upper) {
+				const id = `${digits.slice(0, 8)}-${digits.slice(8, 12)}-7${digits.slice(13, 16)}-${variant}${digits.slice(17, 20)}-${digits.slice(20)}`;
+				expect(helpers.uuidv7Timestamp(upper ? id.toUpperCase() : id)).toBe(Number(BigInt(`0x${digits.slice(0, 12)}`)));
+			})
+		);
+		const base32 = fc.string({ unit: fc.constantFrom(...CROCKFORD), minLength: 25, maxLength: 25 });
+		fc.assert(
+			fc.property(fc.constantFrom(...'01234567'), base32, fc.boolean(), function (first, rest, lower) {
+				const id = first + rest;
+				expect(helpers.ulidTimestamp(lower ? id.toLowerCase() : id)).toBe(Number(ulidValue(id) >> 80n));
+			})
+		);
+	});
+});

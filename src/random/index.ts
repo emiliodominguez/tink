@@ -1,6 +1,6 @@
 import { sample, shuffle } from '../arrays/index.js';
 import { randomBetween } from '../math/index.js';
-import { assertNumber, describe, draw } from '../utils/assert.js';
+import { assertFunction, assertNumber, describe, draw } from '../utils/assert.js';
 import type { RandomGenerator } from '../utils/index.js';
 
 /**
@@ -269,20 +269,21 @@ function getCrypto(caller: string): CryptoLike {
  * randomBytes(16); // e.g. Uint8Array(16) [ 211, 7, 92, ... ]
  * randomBytes(16).length; // => 16
  */
-export function randomBytes(length: number): Uint8Array {
+export function randomBytes(length: number): Uint8Array<ArrayBuffer> {
 	assertNumber('randomBytes', 'length', length, Number.isSafeInteger(length) && length >= 0, 'a safe integer >= 0');
 	return fillRandom(getCrypto('randomBytes'), new Uint8Array(length));
 }
 
 /**
  * Fills an array with cryptographically secure random bytes, in chunks of at most 65,536 bytes (the WebCrypto per-call limit).
+ * @template T - The array type (kept, so that a `Uint8Array<ArrayBuffer>` stays one)
  * @param {CryptoLike} crypto - The source of random bytes
  * @param {Uint8Array} bytes - The array to fill (mutated)
  * @returns {Uint8Array} `bytes`
  * @example
  * fillRandom(globalThis.crypto, new Uint8Array(4)); // e.g. Uint8Array(4) [ 12, 250, 3, 97 ]
  */
-function fillRandom(crypto: CryptoLike, bytes: Uint8Array): Uint8Array {
+function fillRandom<T extends Uint8Array>(crypto: CryptoLike, bytes: T): T {
 	const length = bytes.length;
 
 	for (let offset = 0; offset < length; offset += MAX_RANDOM_VALUES_BYTES) {
@@ -311,12 +312,387 @@ export function randomUUID(): string {
 	const bytes = fillRandom(getCrypto('randomUUID'), new Uint8Array(16));
 	bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
 	bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 10xx
+	return formatUuid(bytes);
+}
+
+/** Lazily built table of the 256 two-digit lowercase hex strings. */
+let hexPairs: string[] | undefined;
+
+/**
+ * Formats 16 bytes as a lowercase, hyphenated UUID string (8-4-4-4-12 hex digits).
+ * @param {Uint8Array} bytes - The 16 bytes of the UUID
+ * @returns {string} The UUID string
+ * @example
+ * formatUuid(new Uint8Array(16)); // => '00000000-0000-0000-0000-000000000000'
+ */
+function formatUuid(bytes: Uint8Array): string {
+	if (hexPairs === undefined) {
+		hexPairs = [];
+		for (let i = 0; i < 256; i++) hexPairs.push((i < 16 ? '0' : '') + i.toString(16));
+	}
 	let hex = '';
 	for (let i = 0; i < 16; i++) {
 		if (i === 4 || i === 6 || i === 8 || i === 10) hex += '-';
-		hex += bytes[i].toString(16).padStart(2, '0');
+		hex += hexPairs[bytes[i]];
 	}
 	return hex;
+}
+
+/**
+ * Options accepted by {@link createUuidv7} and {@link createUlid}. They are read once, when the generator is created, and as own
+ * properties only: a `now` or `random` inherited from a polluted `Object.prototype` is ignored.
+ */
+export interface TimeIdOptions {
+	/**
+	 * Clock, in milliseconds since the Unix epoch. Defaults to `Date.now` (read on every call, so fake timers apply). Fractions are
+	 * floored. It must return a number in `[0, 2 ** 48)` (until the year 10889), or the call throws (`TypeError` for a non-number,
+	 * `RangeError` otherwise) and the generator's state is unchanged.
+	 */
+	readonly now?: () => number;
+	/**
+	 * Source of uniform numbers in `[0, 1)` for the random bits, one call per byte (`Math.floor(random() * 256)`). Defaults to the
+	 * platform CSPRNG (`crypto.getRandomValues`), never `Math.random`. Pass a seeded `createRandom(seed)` for reproducible ids in tests.
+	 */
+	readonly random?: RandomGenerator;
+}
+
+/** `2 ** 48`: timestamps of UUIDv7s and ULIDs are 48-bit unsigned integers (milliseconds), so they must stay below it. */
+const TIME_LIMIT = 281474976710656;
+
+/** `2 ** 30`: the low 30 bits of the UUIDv7 counter are stored in `rand_b`, the 12 bits above them in `rand_a`. */
+const COUNTER_LOW = 1073741824;
+
+/** Largest value of the 42-bit UUIDv7 counter. */
+const COUNTER_MAX = 4398046511103;
+
+/**
+ * Validates and parses the current time for a time-ordered id.
+ * @param {string} caller - Name of the generator, used in the error message
+ * @param {(() => number) | undefined} now - The injected clock, or `undefined` for `Date.now`
+ * @returns {number} The time, an integer in `[0, 2 ** 48)`
+ * @throws {TypeError} when the clock does not return a number
+ * @throws {RangeError} when it returns NaN or a number outside `[0, 2 ** 48)`
+ */
+function readTime(caller: string, now: (() => number) | undefined): number {
+	const time: unknown = now === undefined ? Date.now() : now();
+	// `typeof` first: a comparison would call an object's `valueOf`.
+	assertNumber(caller, 'now()', time, typeof time === 'number' && time >= 0 && time < TIME_LIMIT, 'a number in [0, 2 ** 48)');
+	return Math.floor(time);
+}
+
+/** Number of CSPRNG bytes drawn at once for time-ordered ids (each id takes 10). */
+const ID_POOL_SIZE = 1024;
+
+/**
+ * CSPRNG bytes drawn ahead of time for time-ordered ids from `idPoolSource` (a new buffer for every refill); `idPool[idPoolOffset]` is
+ * the next unused byte. A `getRandomValues` call costs far more than the few bytes an id needs, so they are drawn in batches, each byte
+ * handed out once (as `uuid` and `nanoid` do).
+ */
+let idPool: Uint8Array;
+let idPoolOffset = ID_POOL_SIZE;
+let idPoolSource: CryptoLike | undefined;
+
+/**
+ * Fills the end of an array (at most {@link ID_POOL_SIZE} bytes) with random bytes, from the CSPRNG (through a pool) or from an
+ * injected generator.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {Uint8Array} bytes - The array to fill (mutated)
+ * @param {number} start - Index of the first byte to fill
+ * @param {RandomGenerator | undefined} random - The injected generator, or `undefined` for the CSPRNG
+ * @returns {Uint8Array} `bytes`
+ * @throws {Error} when no generator is injected and no cryptographically secure random source is available
+ * @throws {RangeError} when the injected generator returns a value outside `[0, 1)`
+ */
+function randomInto(caller: string, bytes: Uint8Array, start: number, random: RandomGenerator | undefined): Uint8Array {
+	const length = bytes.length;
+	if (random === undefined) {
+		const crypto = getCrypto(caller);
+		if (idPoolOffset + length - start > ID_POOL_SIZE || crypto !== idPoolSource) {
+			// Committed only once filled, like the buffer of `secureRandom`.
+			idPool = fillRandom(crypto, new Uint8Array(ID_POOL_SIZE));
+			idPoolSource = crypto;
+			idPoolOffset = 0;
+		}
+		for (let i = start; i < length; i++) bytes[i] = idPool[idPoolOffset++];
+	} else {
+		for (let i = start; i < length; i++) bytes[i] = Math.floor(draw(caller, random) * 256);
+	}
+	return bytes;
+}
+
+/**
+ * Reads the options of a time-ordered id generator: each once, as own properties only, so that a `now` or `random` inherited from a
+ * polluted `Object.prototype` cannot replace the clock or the CSPRNG.
+ * @param {string} caller - Name of the factory, used in the error message
+ * @param {unknown} options - The options: `undefined` or an object
+ * @returns {Array} The validated clock and random source (`undefined` for the defaults)
+ * @throws {TypeError} when `options` is neither `undefined` nor an object, or `now` or `random` is neither `undefined` nor a function
+ */
+function timeIdOptions(caller: string, options: unknown): [(() => number) | undefined, RandomGenerator | undefined] {
+	if (options === undefined) return [undefined, undefined];
+	if (typeof options !== 'object' || options === null) throw new TypeError(`${caller}: \`options\` must be an object, got ${describe(options)}`);
+	const now: unknown = Object.hasOwn(options, 'now') ? (options as TimeIdOptions).now : undefined;
+	const random: unknown = Object.hasOwn(options, 'random') ? (options as TimeIdOptions).random : undefined;
+	if (now !== undefined) assertFunction(caller, 'now', now);
+	if (random !== undefined) assertFunction(caller, 'random', random);
+	return [now as (() => number) | undefined, random as RandomGenerator | undefined];
+}
+
+/**
+ * Creates a generator of RFC 9562 version 7 UUIDs: time-ordered UUIDs whose first 48 bits are the Unix time in milliseconds, so they
+ * sort by creation time as strings and as bytes, and make B-tree database keys that stay local (unlike random version 4 UUIDs).
+ *
+ * Layout: `unix_ts_ms` (48 bits) · version `7` (4) · `rand_a` (12) · variant `10` (2) · `rand_b` (62). Ids from one generator are strictly
+ * increasing, using RFC 9562 §6.2 "Method 1" (fixed-length dedicated counter): a 42-bit counter (all of `rand_a` and the top 30 bits of
+ * `rand_b`) is seeded with random bits whenever the millisecond changes and incremented within one, and the last 32 bits are fresh
+ * random bits in every id. So the first id of a millisecond has 74 fresh random bits, but the next ones of that millisecond differ from
+ * their neighbour only by a counter step and 32 random bits: they are hard to guess, not secret. Use {@link randomId} for secret
+ * tokens. Edge cases:
+ * - **Counter rollover** (more than 2 ** 41 ids per millisecond on average): the timestamp is advanced by 1 ms and the counter reseeded
+ *   (§6.2 allows this), so ids never repeat or go backwards.
+ * - **Clock moving backwards** (NTP step, VM migration, a fake clock): the generator keeps its last timestamp and keeps counting until the
+ *   clock catches up, so ordering survives; the embedded time then lags behind by the size of the step.
+ * - **Range**: a clock outside `[0, 2 ** 48)` throws, and so does a rollover at the last representable millisecond.
+ * @param {TimeIdOptions} [options={}] - `now` (default `Date.now`): the clock; `random` (default: the CSPRNG): the source of random bits
+ * @returns {Function} A generator returning a new lowercase, hyphenated version 7 UUID on each call
+ * @throws {TypeError} when `options` is not an object, or `now` or `random` is not a function (the generator then throws like
+ * {@link uuidv7} does)
+ * @example
+ * const next = createUuidv7({ now: function () { return 1700000000000; }, random: createRandom('seed') });
+ * const a = next();
+ * const b = next();
+ * a < b; // => true // same millisecond: the counter keeps them ordered
+ * uuidv7Timestamp(a); // => 1700000000000
+ */
+export function createUuidv7(options?: TimeIdOptions): () => string {
+	const [now, random] = timeIdOptions('createUuidv7', options);
+	return uuidv7Generator(now, random);
+}
+
+/**
+ * Builds a version 7 UUID generator (see {@link createUuidv7}).
+ * @param {(() => number) | undefined} now - The validated clock, or `undefined` for `Date.now`
+ * @param {RandomGenerator | undefined} random - The validated random source, or `undefined` for the CSPRNG
+ * @returns {Function} The generator
+ */
+function uuidv7Generator(now: (() => number) | undefined, random: RandomGenerator | undefined): () => string {
+	let last = -1;
+	let counter = 0;
+	// Scratch space: every byte that is read is written by the same call first (a re-entrant call from `now` or `random` may overwrite
+	// some of them, but the state is read only after those callbacks, so ids stay strictly increasing).
+	const bytes = new Uint8Array(16);
+	return function nextUuidv7(): string {
+		const time = readTime('uuidv7', now);
+		randomInto('uuidv7', bytes, 6, random);
+		let stamp = last;
+		let count = counter + 1;
+		if (time > last || count > COUNTER_MAX) {
+			if (time <= last && last === TIME_LIMIT - 1) throw new RangeError('uuidv7: the counter overflowed in the last representable millisecond');
+			stamp = Math.max(time, last + 1);
+			// A fresh 42-bit counter from the random bytes that will hold it.
+			count = (((bytes[6] & 0x0f) << 8) | bytes[7]) * COUNTER_LOW + (((bytes[8] & 0x3f) << 24) | (bytes[9] << 16) | (bytes[10] << 8) | bytes[11]);
+		}
+		// Committed only now: nothing below throws.
+		last = stamp;
+		counter = count;
+		const high = Math.floor(stamp / 4294967296);
+		const low = stamp >>> 0;
+		const counterHigh = Math.floor(count / COUNTER_LOW);
+		const counterLow = count % COUNTER_LOW;
+		bytes[0] = high >> 8;
+		bytes[1] = high;
+		bytes[2] = low >>> 24;
+		bytes[3] = low >>> 16;
+		bytes[4] = low >>> 8;
+		bytes[5] = low;
+		bytes[6] = 0x70 | (counterHigh >> 8); // version 7
+		bytes[7] = counterHigh;
+		bytes[8] = 0x80 | (counterLow >>> 24); // variant 10xx
+		bytes[9] = counterLow >>> 16;
+		bytes[10] = counterLow >>> 8;
+		bytes[11] = counterLow;
+		return formatUuid(bytes);
+	};
+}
+
+/** The generator behind {@link uuidv7}, created on first use. */
+let defaultUuidv7: (() => string) | undefined;
+
+/**
+ * Generates an RFC 9562 version 7 UUID: time-ordered (the first 48 bits are the current Unix time in milliseconds), strictly
+ * increasing across calls in this module instance, its random bits drawn from the CSPRNG (see {@link createUuidv7} for the layout and
+ * the handling of counter rollover and clocks that move backwards). Use {@link createUuidv7} to inject a clock or a seeded random source.
+ *
+ * Ids are hard to guess but not secret: the creation time is readable by anyone who sees the id ({@link uuidv7Timestamp}), and ids
+ * created in the same millisecond differ from their neighbour by a counter step and 32 random bits. Prefer {@link randomUUID} when the
+ * time must not leak, and {@link randomId} for secret tokens.
+ * @returns {string} A lowercase, hyphenated version 7 UUID, e.g. `'018f3f5e-1c2a-7b3c-9d4e-5f6a7b8c9d0e'`
+ * @throws {Error} when no cryptographically secure random source is available
+ * @throws {RangeError} when `Date.now()` is outside `[0, 2 ** 48)`
+ * @example
+ * uuidv7(); // e.g. '0192e4a1-7c3b-7d2e-8f41-6a5b4c3d2e1f'
+ * uuidv7() < uuidv7(); // => true
+ * /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(uuidv7()); // => true
+ */
+export function uuidv7(): string {
+	return (defaultUuidv7 ??= uuidv7Generator(undefined, undefined))();
+}
+
+/** A version 7 UUID in canonical (hyphenated) form, in either letter case. */
+const UUID_V7_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Quotes a rejected string for an error message, keeping at most its first 50 characters (so that an attacker-sized input does not
+ * end up whole in logs).
+ * @param {string} text - The string
+ * @returns {string} Its JSON representation, truncated with `…`
+ * @example
+ * quote('abc'); // => '"abc"'
+ */
+function quote(text: string): string {
+	return JSON.stringify(text.length > 50 ? `${text.slice(0, 50)}…` : text);
+}
+
+/**
+ * Reads the creation time back from a version 7 UUID (its first 48 bits).
+ * @param {string} id - A version 7 UUID in canonical hyphenated form (either letter case)
+ * @returns {number} The embedded Unix time in milliseconds (pass it to `new Date()` for a date)
+ * @throws {TypeError} when `id` is not a string
+ * @throws {SyntaxError} when `id` is not a version 7, RFC 9562 variant UUID
+ * @example
+ * uuidv7Timestamp('018bcfe5-6800-7000-8000-000000000000'); // => 1700000000000
+ * uuidv7Timestamp('018BCFE5-6800-7ABC-BDEF-0123456789AB'); // => 1700000000000
+ * uuidv7Timestamp('f47ac10b-58cc-4372-a567-0e02b2c3d479'); // throws SyntaxError // version 4
+ */
+export function uuidv7Timestamp(id: string): number {
+	if (typeof id !== 'string') throw new TypeError(`uuidv7Timestamp: \`id\` must be a string, got ${describe(id)}`);
+	if (!UUID_V7_PATTERN.test(id)) throw new SyntaxError(`uuidv7Timestamp: \`id\` must be a version 7 UUID, got ${quote(id)}`);
+	return parseInt(id.slice(0, 8) + id.slice(9, 13), 16);
+}
+
+/** Crockford's base32 alphabet, as used by ULIDs (no `I`, `L`, `O` or `U`). */
+const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+
+/** A ULID: 26 Crockford base32 characters in either letter case, the first at most `7` (48-bit timestamp). */
+const ULID_PATTERN = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/i;
+
+/**
+ * Writes a timestamp as the 10 Crockford base32 digits of a ULID.
+ * @param {number} time - An integer in `[0, 2 ** 48)`
+ * @returns {string} The digits, most significant first, zero-padded
+ * @example
+ * base32Time(33); // => '0000000011'
+ */
+function base32Time(time: number): string {
+	let text = '';
+	for (let i = 0; i < 10; i++) {
+		text = CROCKFORD[time % 32] + text;
+		time = Math.floor(time / 32);
+	}
+	return text;
+}
+
+/**
+ * Creates a generator of ULIDs (Universally Unique Lexicographically Sortable Identifiers, github.com/ulid/spec): 26 Crockford base32
+ * characters, a 48-bit millisecond timestamp (10 characters) followed by 80 random bits (16 characters). They sort by creation time,
+ * as strings, and are case-insensitive, URL-safe and shorter than UUIDs.
+ *
+ * Ids from one generator are strictly increasing, as in the spec's monotonic factory: within one millisecond (or while the clock is
+ * behind the last timestamp used, which is kept), the random part of the previous id is incremented by one instead of drawn again.
+ * Successive ids of one millisecond are therefore predictable from each other: use {@link randomId} for secret tokens. As the spec
+ * requires, generation fails rather than wrapping when the 80-bit random part would overflow within one millisecond.
+ * @param {TimeIdOptions} [options={}] - `now` (default `Date.now`): the clock; `random` (default: the CSPRNG): the source of random bits
+ * @returns {Function} A generator returning a new uppercase ULID on each call
+ * @throws {TypeError} when `options` is not an object, or `now` or `random` is not a function (the generator then throws like
+ * {@link ulid} does)
+ * @example
+ * const next = createUlid({ now: function () { return 1700000000000; }, random: createRandom('seed') });
+ * const a = next();
+ * const b = next();
+ * a < b; // => true
+ * a.slice(0, 10); // => '01HF7YAT00'
+ * ulidTimestamp(b); // => 1700000000000
+ */
+export function createUlid(options?: TimeIdOptions): () => string {
+	const [now, random] = timeIdOptions('createUlid', options);
+	return ulidGenerator(now, random);
+}
+
+/**
+ * Builds a ULID generator (see {@link createUlid}).
+ * @param {(() => number) | undefined} now - The validated clock, or `undefined` for `Date.now`
+ * @param {RandomGenerator | undefined} random - The validated random source, or `undefined` for the CSPRNG
+ * @returns {Function} The generator
+ */
+function ulidGenerator(now: (() => number) | undefined, random: RandomGenerator | undefined): () => string {
+	let last = -1;
+	let prefix = '';
+	// The 16 base32 digits (5 bits each) of the random part of the last id.
+	let digits: Uint8Array = new Uint8Array(16);
+	return function nextUlid(): string {
+		const time = readTime('ulid', now);
+		// Drawn first, and committed only after the state is checked again: a source that throws part-way leaves the previous state in
+		// place, and one that calls this generator re-entrantly cannot make it go backwards.
+		const fresh = time > last ? randomInto('ulid', new Uint8Array(16), 0, random) : undefined;
+		if (fresh !== undefined && time > last) {
+			// 256 is a multiple of 32, so each masked byte is a uniform digit.
+			for (let i = 0; i < 16; i++) fresh[i] &= 31;
+			digits = fresh;
+			last = time;
+			prefix = base32Time(time);
+		} else {
+			// Increment the 80-bit random part, checking for overflow before changing anything.
+			let index = 15;
+			while (index >= 0 && digits[index] === 31) index--;
+			if (index < 0) throw new RangeError('ulid: the random part overflowed within one millisecond');
+			digits[index]++;
+			digits.fill(0, index + 1);
+		}
+		let id = prefix;
+		for (let i = 0; i < 16; i++) id += CROCKFORD[digits[i]];
+		return id;
+	};
+}
+
+/** The generator behind {@link ulid}, created on first use. */
+let defaultUlid: (() => string) | undefined;
+
+/**
+ * Generates a ULID: 26 uppercase Crockford base32 characters, a 48-bit millisecond timestamp then 80 bits from the CSPRNG,
+ * lexicographically sortable by creation time and strictly increasing across calls in this module instance (monotonic, see
+ * {@link createUlid}). Use {@link createUlid} to inject a clock or a seeded random source.
+ * @returns {string} A ULID, e.g. `'01ARZ3NDEKTSV4RRFFQ69G5FAV'`
+ * @throws {Error} when a new millisecond needs random bits and no cryptographically secure random source is available (within a
+ * millisecond that already has random bits, the next id only increments them)
+ * @throws {RangeError} when `Date.now()` is outside `[0, 2 ** 48)`, or (with odds around `2 ** -80`) when the random part overflows
+ * within one millisecond
+ * @example
+ * ulid(); // e.g. '01JAQ7Z5B3XK8M2N4P6R8T0V2W'
+ * ulid() < ulid(); // => true
+ * /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(ulid()); // => true
+ */
+export function ulid(): string {
+	return (defaultUlid ??= ulidGenerator(undefined, undefined))();
+}
+
+/**
+ * Reads the creation time back from a ULID (its first 10 characters). The whole id is validated: 26 Crockford base32 characters in
+ * either letter case (without the `I`, `L`, `O`, `U` aliases), the first at most `7`.
+ * @param {string} id - A ULID
+ * @returns {number} The embedded Unix time in milliseconds (pass it to `new Date()` for a date)
+ * @throws {TypeError} when `id` is not a string
+ * @throws {SyntaxError} when `id` is not a valid ULID
+ * @example
+ * ulidTimestamp('01HF7YAT00ZZZZZZZZZZZZZZZZ'); // => 1700000000000
+ * ulidTimestamp('01hf7yat00zzzzzzzzzzzzzzzz'); // => 1700000000000
+ * ulidTimestamp('81HF7YAT00ZZZZZZZZZZZZZZZZ'); // throws SyntaxError // timestamp above 2 ** 48 - 1
+ */
+export function ulidTimestamp(id: string): number {
+	if (typeof id !== 'string') throw new TypeError(`ulidTimestamp: \`id\` must be a string, got ${describe(id)}`);
+	if (!ULID_PATTERN.test(id)) throw new SyntaxError(`ulidTimestamp: \`id\` must be a ULID, got ${quote(id)}`);
+	let time = 0;
+	for (let i = 0; i < 10; i++) time = time * 32 + CROCKFORD.indexOf(id[i].toUpperCase());
+	return time;
 }
 
 /**

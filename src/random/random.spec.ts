@@ -979,3 +979,502 @@ describe('Random helpers (hostile sources)', function () {
 		}).toThrow(new RangeError('SeededRandom.bool: `probability` must be a number in [0, 1], got 2'));
 	});
 });
+
+describe('Time-ordered ids', function () {
+	const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+	const ULID = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
+	const T = 1700000000000;
+	const MAX_TIME = 2 ** 48 - 1;
+
+	/** A clock returning the given times in turn (repeating the last one). */
+	function clock(...times: number[]): () => number {
+		let call = 0;
+		return function () {
+			return times[Math.min(call++, times.length - 1)];
+		};
+	}
+
+	/** A RandomGenerator yielding the given bytes in turn (each as `byte / 256`), then zeros. */
+	function byteSource(...bytes: number[]): () => number {
+		let call = 0;
+		return function () {
+			return (bytes[call++] ?? 0) / 256;
+		};
+	}
+
+	function strictlyIncreasing(ids: string[]): boolean {
+		return ids.every(function (id, i) {
+			return i === 0 || ids[i - 1] < id;
+		});
+	}
+
+	describe('uuidv7', function () {
+		it('should return strictly increasing version 7 UUIDs carrying the current time', function () {
+			const before = Date.now();
+			const ids = Array.from({ length: 2000 }, helpers.uuidv7);
+			const after = Date.now();
+			for (const id of ids) expect(id).toMatch(UUID_V7);
+			expect(strictlyIncreasing(ids)).toBe(true);
+			expect(helpers.uuidv7Timestamp(ids[0])).toBeGreaterThanOrEqual(before);
+			expect(helpers.uuidv7Timestamp(ids[ids.length - 1])).toBeLessThanOrEqual(after + 1);
+		});
+
+		it('should throw instead of falling back to Math.random when no CSPRNG is available', function () {
+			const mathRandom = jest.spyOn(Math, 'random');
+			withCrypto(undefined, function () {
+				expect(helpers.uuidv7).toThrow(/^uuidv7: no cryptographically secure/);
+				expect(helpers.ulid).toThrow(/^ulid: no cryptographically secure/);
+			});
+			expect(mathRandom).not.toHaveBeenCalled();
+			expect(helpers.uuidv7()).toMatch(UUID_V7);
+		});
+	});
+
+	describe('createUuidv7', function () {
+		it('should be reproducible with an injected clock and seeded random source', function () {
+			const next = helpers.createUuidv7({ now: clock(T), random: helpers.createRandom('seed') });
+			expect([next(), next(), next()]).toEqual(['018bcfe5-6800-78a8-b997-4b30ab30a6a8', '018bcfe5-6800-78a8-b997-4b31486ae9da', '018bcfe5-6800-78a8-b997-4b326eecb82d']);
+		});
+
+		it('should lay out the timestamp, version, counter, variant and random tail as documented', function () {
+			// Each id draws 10 bytes: 6 for the counter (used when it is seeded), then 4 for the tail.
+			const next = helpers.createUuidv7({
+				now: clock(T, T, T + 1),
+				random: byteSource(
+					...[0, 0, 0, 0, 0, 0, 1, 2, 3, 4],
+					...[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 5, 6, 7, 8],
+					...[0x15, 0x67, 0x89, 0xab, 0xcd, 0xef, 9, 10, 11, 12]
+				)
+			});
+			// Counter seeded at 0, then incremented (its random bytes unused); the tail is fresh for each id.
+			expect(next()).toBe('018bcfe5-6800-7000-8000-000001020304');
+			expect(next()).toBe('018bcfe5-6800-7000-8000-000105060708');
+			// A new millisecond reseeds the counter from the random bytes (version and variant bits masked in).
+			expect(next()).toBe('018bcfe5-6801-7567-89ab-cdef090a0b0c');
+		});
+
+		it('should carry the counter from rand_b into rand_a', function () {
+			const next = helpers.createUuidv7({ now: clock(T), random: byteSource(0x00, 0x00, 0x3f, 0xff, 0xff, 0xff) });
+			expect(next()).toBe('018bcfe5-6800-7000-bfff-ffff00000000');
+			expect(next()).toBe('018bcfe5-6800-7001-8000-000000000000');
+		});
+
+		it('should advance the timestamp by 1 ms when the counter rolls over', function () {
+			const next = helpers.createUuidv7({ now: clock(T), random: byteSource(0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x12, 0x34) });
+			const first = next();
+			expect(first).toBe('018bcfe5-6800-7fff-bfff-ffff00000000');
+			const second = next();
+			expect(second).toBe('018bcfe5-6801-7000-8000-000012340000');
+			expect(helpers.uuidv7Timestamp(second)).toBe(T + 1);
+			// The clock is still at T: the generator stays at T + 1 and counts on.
+			const third = next();
+			expect(third).toBe('018bcfe5-6801-7000-8000-000100000000');
+			expect(strictlyIncreasing([first, second, third])).toBe(true);
+		});
+
+		it('should throw on a rollover in the last representable millisecond, leaving its state unchanged', function () {
+			const next = helpers.createUuidv7({ now: clock(MAX_TIME), random: byteSource(0xff, 0xff, 0xff, 0xff, 0xff, 0xff) });
+			expect(next()).toBe('ffffffff-ffff-7fff-bfff-ffff00000000');
+			expect(next).toThrow(new RangeError('uuidv7: the counter overflowed in the last representable millisecond'));
+			expect(next).toThrow(RangeError);
+		});
+
+		it('should keep the last timestamp while the clock is behind it', function () {
+			const next = helpers.createUuidv7({ now: clock(T + 10, T + 5, T, T + 10, T + 11), random: helpers.createRandom(1) });
+			const ids = [next(), next(), next(), next(), next()];
+			expect(strictlyIncreasing(ids)).toBe(true);
+			expect(ids.map(helpers.uuidv7Timestamp)).toEqual([T + 10, T + 10, T + 10, T + 10, T + 11]);
+		});
+
+		it('should floor fractional times and accept the whole 48-bit range', function () {
+			expect(helpers.uuidv7Timestamp(helpers.createUuidv7({ now: clock(T + 0.999) })())).toBe(T);
+			expect(helpers.uuidv7Timestamp(helpers.createUuidv7({ now: clock(0) })())).toBe(0);
+			expect(helpers.uuidv7Timestamp(helpers.createUuidv7({ now: clock(MAX_TIME + 0.5) })())).toBe(MAX_TIME);
+		});
+
+		it('should reject clocks returning anything but a number in [0, 2 ** 48), without changing its state', function () {
+			const valueOf = jest.fn(function () {
+				return T;
+			});
+			const values: unknown[] = ['1', null, undefined, 1n, { valueOf }, NaN, -1, -0.5, 2 ** 48, Infinity, -Infinity];
+			let current: unknown = T;
+			const next = helpers.createUuidv7({
+				now: function () {
+					return current as number;
+				},
+				random: byteSource()
+			});
+			expect(next()).toBe('018bcfe5-6800-7000-8000-000000000000');
+			for (const value of values) {
+				current = value;
+				expect(next).toThrow(typeof value === 'number' ? RangeError : TypeError);
+			}
+			expect(valueOf).not.toHaveBeenCalled();
+			current = T;
+			expect(next()).toBe('018bcfe5-6800-7000-8000-000100000000');
+			current = '5';
+			expect(next).toThrow(new TypeError('uuidv7: `now()` must be a number in [0, 2 ** 48), got string'));
+			current = -1;
+			expect(next).toThrow(new RangeError('uuidv7: `now()` must be a number in [0, 2 ** 48), got -1'));
+		});
+
+		it('should reject random sources returning values outside [0, 1), without changing its state', function () {
+			let bad = false;
+			const next = helpers.createUuidv7({
+				now: clock(T),
+				random: function () {
+					return bad ? 1 : 0;
+				}
+			});
+			expect(next()).toBe('018bcfe5-6800-7000-8000-000000000000');
+			bad = true;
+			expect(next).toThrow(new RangeError('uuidv7: `random()` must return a number in [0, 1), got 1'));
+			bad = false;
+			expect(next()).toBe('018bcfe5-6800-7000-8000-000100000000');
+		});
+
+		it('should validate its options, reading each once', function () {
+			expect(function () {
+				helpers.createUuidv7({ now: 5 as never });
+			}).toThrow(new TypeError('createUuidv7: `now` must be a function, got number'));
+			expect(function () {
+				helpers.createUuidv7({ random: 'x' as never });
+			}).toThrow(new TypeError('createUuidv7: `random` must be a function, got string'));
+			expect(function () {
+				helpers.createUuidv7(null as never);
+			}).toThrow(TypeError);
+			let reads = 0;
+			const options = {
+				get now(): () => number {
+					reads++;
+					return reads === 1 ? clock(T) : (5 as never);
+				}
+			};
+			const next = helpers.createUuidv7(options);
+			expect(helpers.uuidv7Timestamp(next())).toBe(T);
+			expect(helpers.uuidv7Timestamp(next())).toBe(T);
+			expect(reads).toBe(1);
+		});
+
+		it('should keep independent state per generator', function () {
+			const a = helpers.createUuidv7({ now: clock(T + 5), random: byteSource() });
+			const b = helpers.createUuidv7({ now: clock(T), random: byteSource() });
+			expect(helpers.uuidv7Timestamp(a())).toBe(T + 5);
+			expect(b()).toBe('018bcfe5-6800-7000-8000-000000000000');
+		});
+	});
+
+	describe('CSPRNG byte pool of time-ordered ids', function () {
+		it('should draw bytes in batches of 1024, handing each out once', function () {
+			const real = globalThis.crypto;
+			const getRandomValues = jest.fn(function (array: Uint8Array<ArrayBuffer>) {
+				return real.getRandomValues(array);
+			});
+			const ids = withCrypto({ getRandomValues }, function () {
+				const next = helpers.createUuidv7({ now: clock(T) });
+				return Array.from({ length: 205 }, function () {
+					return next();
+				});
+			});
+			// 102 ids of 10 bytes fit in a batch of 1024 bytes.
+			expect(getRandomValues).toHaveBeenCalledTimes(3);
+			expect(new Set(ids).size).toBe(205);
+			expect(
+				new Set(
+					ids.map(function (id) {
+						return id.slice(-8);
+					})
+				).size
+			).toBeGreaterThan(200);
+		});
+
+		it('should start a new batch when the crypto object changes, and commit no batch that failed', function () {
+			const next = helpers.createUuidv7({ now: clock(T) });
+			next();
+			expect(withCrypto(scriptedCrypto([new Array(1024).fill(0xff)]), next).slice(-8)).toBe('ffffffff');
+			expect(
+				withCrypto(
+					{
+						getRandomValues(array: Uint8Array): never {
+							array.fill(0x11);
+							throw new Error('quota');
+						}
+					},
+					function () {
+						return outcomeOf(next);
+					}
+				)
+			).toBe('quota');
+			expect(next().slice(-8)).not.toBe('11111111');
+			expect(
+				withCrypto(
+					{
+						getRandomValues(array: Uint8Array): Uint8Array {
+							(array.buffer as ArrayBuffer & { transfer(): ArrayBuffer }).transfer();
+							return array;
+						}
+					},
+					function () {
+						return outcomeOf(helpers.ulid);
+					}
+				)
+			).toMatch(/detached/);
+		});
+
+		function outcomeOf(fn: () => string): string {
+			try {
+				return fn();
+			} catch (error) {
+				return (error as Error).message;
+			}
+		}
+	});
+
+	describe('uuidv7Timestamp', function () {
+		it('should read the 48-bit timestamp in either letter case', function () {
+			expect(helpers.uuidv7Timestamp('018bcfe5-6800-7000-8000-000000000000')).toBe(T);
+			expect(helpers.uuidv7Timestamp('018BCFE5-6800-7ABC-BDEF-0123456789AB')).toBe(T);
+			expect(helpers.uuidv7Timestamp('00000000-0000-7000-8000-000000000000')).toBe(0);
+			expect(helpers.uuidv7Timestamp('ffffffff-ffff-7fff-bfff-ffffffffffff')).toBe(MAX_TIME);
+		});
+
+		it('should reject anything but a canonical version 7, RFC 9562 variant UUID', function () {
+			for (const id of [
+				'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+				'018bcfe5-6800-7000-c000-000000000000',
+				'018bcfe5-6800-7000-0000-000000000000',
+				'018bcfe568007000800000000000000000',
+				'{018bcfe5-6800-7000-8000-000000000000}',
+				'018bcfe5-6800-7000-8000-000000000000\n',
+				' 018bcfe5-6800-7000-8000-000000000000',
+				'018bcfe5-6800-7000-8000-00000000000g',
+				'',
+				'018bcfe5-6800-7000-8000-0000000000000'
+			]) {
+				expect(function () {
+					helpers.uuidv7Timestamp(id);
+				}).toThrow(SyntaxError);
+			}
+			expect(function () {
+				helpers.uuidv7Timestamp('f47ac10b-58cc-4372-a567-0e02b2c3d479');
+			}).toThrow(new SyntaxError('uuidv7Timestamp: `id` must be a version 7 UUID, got "f47ac10b-58cc-4372-a567-0e02b2c3d479"'));
+			expect(function () {
+				helpers.uuidv7Timestamp('x'.repeat(10_000));
+			}).toThrow(new SyntaxError(`uuidv7Timestamp: \`id\` must be a version 7 UUID, got "${'x'.repeat(50)}…"`));
+			expect(function () {
+				helpers.uuidv7Timestamp(1 as never);
+			}).toThrow(new TypeError('uuidv7Timestamp: `id` must be a string, got number'));
+		});
+	});
+
+	describe('ulid', function () {
+		it('should return strictly increasing ULIDs carrying the current time', function () {
+			const before = Date.now();
+			const ids = Array.from({ length: 2000 }, helpers.ulid);
+			const after = Date.now();
+			for (const id of ids) expect(id).toMatch(ULID);
+			expect(strictlyIncreasing(ids)).toBe(true);
+			expect(helpers.ulidTimestamp(ids[0])).toBeGreaterThanOrEqual(before);
+			expect(helpers.ulidTimestamp(ids[ids.length - 1])).toBeLessThanOrEqual(after);
+		});
+	});
+
+	describe('createUlid', function () {
+		it('should be reproducible with an injected clock and seeded random source', function () {
+			const next = helpers.createUlid({ now: clock(T), random: helpers.createRandom('seed') });
+			expect([next(), next(), next()]).toEqual(['01HF7YAT00R8SQBGBG68C2NH8J', '01HF7YAT00R8SQBGBG68C2NH8K', '01HF7YAT00R8SQBGBG68C2NH8M']);
+		});
+
+		it('should increment the random part within a millisecond, carrying across digits', function () {
+			const digits = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 30, 31];
+			const next = helpers.createUlid({
+				now: clock(T, T, T, T + 1),
+				random: byteSource(
+					...digits,
+					...digits.map(function (digit) {
+						return digit + 32;
+					})
+				)
+			});
+			expect(next()).toBe('01HF7YAT000123456789ABCDYZ');
+			expect(next()).toBe('01HF7YAT000123456789ABCDZ0');
+			expect(next()).toBe('01HF7YAT000123456789ABCDZ1');
+			// Bytes are reduced modulo 32: the same digits again in the next millisecond.
+			expect(next()).toBe('01HF7YAT010123456789ABCDYZ');
+		});
+
+		it('should throw rather than wrap when the random part overflows, leaving its state unchanged', function () {
+			const next = helpers.createUlid({ now: clock(T, T, T, T + 1), random: byteSource(...new Array(16).fill(31)) });
+			expect(next()).toBe('01HF7YAT00ZZZZZZZZZZZZZZZZ');
+			expect(next).toThrow(new RangeError('ulid: the random part overflowed within one millisecond'));
+			expect(next).toThrow(RangeError);
+			expect(next()).toBe('01HF7YAT010000000000000000');
+		});
+
+		it('should keep the last timestamp while the clock is behind it', function () {
+			const next = helpers.createUlid({ now: clock(T + 10, T, T + 11), random: helpers.createRandom(2) });
+			const ids = [next(), next(), next()];
+			expect(strictlyIncreasing(ids)).toBe(true);
+			expect(ids.map(helpers.ulidTimestamp)).toEqual([T + 10, T + 10, T + 11]);
+		});
+
+		it('should encode the whole 48-bit range', function () {
+			expect(helpers.createUlid({ now: clock(0), random: byteSource() })()).toBe('00000000000000000000000000');
+			expect(helpers.createUlid({ now: clock(MAX_TIME), random: byteSource() })()).toBe('7ZZZZZZZZZ0000000000000000');
+		});
+
+		it('should validate its clock, random source and options', function () {
+			const next = helpers.createUlid({ now: clock(-1) });
+			expect(next).toThrow(new RangeError('ulid: `now()` must be a number in [0, 2 ** 48), got -1'));
+			const failing = helpers.createUlid({ now: clock(T), random: clock(0, -1) });
+			expect(failing).toThrow(new RangeError('ulid: `random()` must return a number in [0, 1), got -1'));
+			expect(function () {
+				helpers.createUlid({ random: {} as never });
+			}).toThrow(new TypeError('createUlid: `random` must be a function, got object'));
+		});
+	});
+
+	describe('ulidTimestamp', function () {
+		it('should read the 48-bit timestamp in either letter case', function () {
+			expect(helpers.ulidTimestamp('01HF7YAT00ZZZZZZZZZZZZZZZZ')).toBe(T);
+			expect(helpers.ulidTimestamp('01hf7yat00zzzzzzzzzzzzzzzz')).toBe(T);
+			expect(helpers.ulidTimestamp('7ZZZZZZZZZZZZZZZZZZZZZZZZZ')).toBe(MAX_TIME);
+			expect(helpers.ulidTimestamp('00000000000000000000000000')).toBe(0);
+		});
+
+		it('should reject anything but a valid ULID', function () {
+			for (const id of [
+				'81HF7YAT00ZZZZZZZZZZZZZZZZ',
+				'01HF7YAT00ZZZZZZZZZZZZZZZ',
+				'01HF7YAT00ZZZZZZZZZZZZZZZZZ',
+				'01HF7YAT00ZZZZZZZZZZZZZZZI',
+				'01HF7YAT00ZZZZZZZZZZZZZZZL',
+				'0OHF7YAT00ZZZZZZZZZZZZZZZZ',
+				'01HF7YAT00ZZZZZZZZZZZZZZZU',
+				'01HF7YAT00ZZZZZZZZZZZZZZZ-',
+				'01HF7YAT00ZZZZZZZZZZZZZZZZ\n',
+				''
+			]) {
+				expect(function () {
+					helpers.ulidTimestamp(id);
+				}).toThrow(SyntaxError);
+			}
+			expect(function () {
+				helpers.ulidTimestamp('81HF7YAT00ZZZZZZZZZZZZZZZZ');
+			}).toThrow(new SyntaxError('ulidTimestamp: `id` must be a ULID, got "81HF7YAT00ZZZZZZZZZZZZZZZZ"'));
+			expect(function () {
+				helpers.ulidTimestamp(undefined as never);
+			}).toThrow(new TypeError('ulidTimestamp: `id` must be a string, got undefined'));
+		});
+	});
+});
+
+describe('Time-ordered ids (re-entrant callbacks)', function () {
+	it('should stay strictly increasing when the clock or the random source calls the generator', function () {
+		for (const create of [helpers.createUlid, helpers.createUuidv7]) {
+			const ids: string[] = [];
+			let depth = 0;
+			const base = helpers.createRandom('re-entrant');
+			let time = 1700000000000;
+			const next: () => string = create({
+				now: function () {
+					if (depth === 0 && time % 2 === 0) {
+						depth++;
+						ids.push(next());
+						depth--;
+					}
+					return time;
+				},
+				random: function () {
+					if (depth === 0 && base() < 0.2) {
+						depth++;
+						ids.push(next());
+						depth--;
+					}
+					return base();
+				}
+			});
+			for (let i = 0; i < 200; i++) {
+				if (i % 7 === 0) time++;
+				ids.push(next());
+			}
+			const order = ids.slice().sort();
+			expect(ids.length).toBeGreaterThan(200);
+			expect(new Set(ids).size).toBe(ids.length);
+			// Inner calls complete before the outer one: the push order is the generation order.
+			expect(ids).toEqual(order);
+		}
+	});
+});
+
+describe('Time-ordered ids (polluted Object.prototype)', function () {
+	/** Runs `fn` with `values` defined on `Object.prototype` (as a prototype-pollution attack would), removing them afterwards. */
+	function polluted<T>(values: Record<string, unknown>, fn: () => T): T {
+		for (const [key, value] of Object.entries(values)) {
+			Object.defineProperty(Object.prototype, key, { value, configurable: true, writable: true });
+		}
+		try {
+			return fn();
+		} finally {
+			for (const key of Object.keys(values)) delete (Object.prototype as Record<string, unknown>)[key];
+		}
+	}
+
+	const hostile = {
+		now: function () {
+			return 1;
+		},
+		random: function () {
+			return 0;
+		}
+	};
+
+	it('should keep the CSPRNG and the real clock for uuidv7 and ulid (regression: inherited options replaced them)', function () {
+		polluted(hostile, function () {
+			const before = Date.now();
+			for (const [generate, timestamp] of [
+				[helpers.uuidv7, helpers.uuidv7Timestamp],
+				[helpers.ulid, helpers.ulidTimestamp],
+				[helpers.createUuidv7(), helpers.uuidv7Timestamp],
+				[helpers.createUuidv7({}), helpers.uuidv7Timestamp],
+				[helpers.createUlid({}), helpers.ulidTimestamp]
+			] as const) {
+				const ids = [generate(), generate(), generate()];
+				expect(timestamp(ids[0])).toBeGreaterThanOrEqual(before);
+				// With `random` returning 0, every random bit would be zero: the tails would be predictable.
+				expect(
+					ids.some(function (id) {
+						return /[1-9a-zA-Z]/.test(id.slice(-8));
+					})
+				).toBe(true);
+			}
+		});
+	});
+
+	it('should still read own options, including from objects without a prototype', function () {
+		const options = Object.create(null) as { now: () => number };
+		options.now = function () {
+			return 1700000000000;
+		};
+		expect(helpers.uuidv7Timestamp(helpers.createUuidv7(options)())).toBe(1700000000000);
+		expect(helpers.ulidTimestamp(helpers.createUlid({ now: options.now, random: undefined })())).toBe(1700000000000);
+	});
+
+	it('should reject an options argument that is not an object', function () {
+		expect(function () {
+			helpers.createUuidv7(null as never);
+		}).toThrow(new TypeError('createUuidv7: `options` must be an object, got null'));
+		expect(function () {
+			helpers.createUlid(5 as never);
+		}).toThrow(new TypeError('createUlid: `options` must be an object, got number'));
+		expect(function () {
+			helpers.createUlid(Date.now as never);
+		}).toThrow(new TypeError('createUlid: `options` must be an object, got function'));
+	});
+
+	it('should return random bytes over their own (non-shared) ArrayBuffer', function () {
+		const bytes = helpers.randomBytes(4);
+		expect(Object.prototype.toString.call(bytes.buffer)).toBe('[object ArrayBuffer]');
+		expect(bytes.byteLength).toBe(bytes.buffer.byteLength);
+	});
+});
