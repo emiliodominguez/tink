@@ -1,5 +1,5 @@
 import { clamp, lerp, modulo, round } from '../math/index.js';
-import { assertNumber, describe } from '../utils/assert.js';
+import { assertNumber, describe, show } from '../utils/assert.js';
 
 /**
  * An sRGB colour with 8-bit channels (`0`–`255`). Values produced by this module are always integers in that range.
@@ -759,7 +759,7 @@ export function getReadableTextColor(background: ColorInput, options: ReadableTe
  */
 export function meetsContrast(foreground: ColorInput, background: ColorInput, options: MeetsContrastOptions = {}): boolean {
 	const { level = 'AA', largeText = false } = options;
-	if (level !== 'AA' && level !== 'AAA') throw new RangeError(`meetsContrast: \`level\` must be 'AA' or 'AAA', got ${String(level)}`);
+	if (level !== 'AA' && level !== 'AAA') throw new RangeError(`meetsContrast: \`level\` must be 'AA' or 'AAA', got ${show(level)}`);
 	const threshold = level === 'AA' ? (largeText ? 3 : 4.5) : largeText ? 4.5 : 7;
 	return contrastRatio(foreground, background) >= threshold;
 }

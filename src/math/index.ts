@@ -1,4 +1,4 @@
-import { assertInteger, assertNumber, describe, draw } from '../utils/assert.js';
+import { assertInteger, assertNumber, describe, draw, show } from '../utils/assert.js';
 import type { RandomGenerator } from '../utils/index.js';
 
 /**
@@ -930,7 +930,7 @@ export interface FormatBytesOptions {
  * @throws {RangeError} when `base` is neither `1000` nor `1024`
  */
 function assertByteBase(caller: string, base: unknown): void {
-	if (base !== 1000 && base !== 1024) throw new RangeError(`${caller}: \`base\` must be 1000 or 1024, got ${String(base)}`);
+	if (base !== 1000 && base !== 1024) throw new RangeError(`${caller}: \`base\` must be 1000 or 1024, got ${show(base)}`);
 }
 
 const SI_BYTE_UNITS: ReadonlyArray<string> = ['B', 'kB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];

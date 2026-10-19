@@ -23,7 +23,7 @@
  */
 
 import { isDate } from '../guards/index.js';
-import { assertInteger as assertCount, assertNumber, describe } from '../utils/assert.js';
+import { assertInteger as assertCount, assertNumber, describe, show } from '../utils/assert.js';
 
 /**
  * A value that can be interpreted as a date: a `Date` instance or a millisecond timestamp.
@@ -382,7 +382,7 @@ function assertWeekday(caller: string, weekday: number, name = 'weekStartsOn'): 
  * @throws {RangeError} when `value` is not one of `allowed`
  */
 function assertOneOf(caller: string, name: string, value: unknown, allowed: ReadonlyArray<string>): void {
-	if (!allowed.includes(value as string)) throw new RangeError(`${caller}: \`${name}\` must be one of ${allowed.join(', ')}, got ${String(value)}`);
+	if (!allowed.includes(value as string)) throw new RangeError(`${caller}: \`${name}\` must be one of ${allowed.join(', ')}, got ${show(value)}`);
 }
 
 /**

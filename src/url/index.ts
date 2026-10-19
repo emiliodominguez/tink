@@ -1,4 +1,4 @@
-import { describe } from '../utils/assert.js';
+import { describe, show } from '../utils/assert.js';
 
 /**
  * A single query-string value. Dates are serialized with `toISOString()`, everything else with `String()`.
@@ -129,7 +129,7 @@ export function buildQueryString<P extends QueryParamsOf<P>>(input: P, options: 
 	const params = input as QueryParams;
 	const { arrayFormat = 'repeat', skipNull = true, sort = false } = options;
 
-	if (!ARRAY_FORMATS.has(arrayFormat)) throw new RangeError(`buildQueryString: \`arrayFormat\` must be 'repeat', 'comma' or 'brackets', got ${String(arrayFormat)}`);
+	if (!ARRAY_FORMATS.has(arrayFormat)) throw new RangeError(`buildQueryString: \`arrayFormat\` must be 'repeat', 'comma' or 'brackets', got ${show(arrayFormat)}`);
 
 	const keys = Object.keys(params);
 

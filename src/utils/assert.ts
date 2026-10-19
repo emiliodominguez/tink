@@ -26,6 +26,17 @@ export function describe(value: unknown): string {
 }
 
 /**
+ * Shows a rejected value in an error message: a primitive as `String` writes it, an object or function by its type only (converting
+ * it could call a throwing `toString`, or fail for a null-prototype object, turning the intended error into another one).
+ * @param {unknown} value - The value
+ * @returns {string} Its text for the message
+ * @internal
+ */
+export function show(value: unknown): string {
+	return typeof value === 'object' || typeof value === 'function' ? describe(value) : String(value);
+}
+
+/**
  * Throws a `TypeError` unless `value` is callable.
  * @param {string} caller - Name of the public function, used in the error message
  * @param {string} name - Name of the validated parameter
@@ -111,6 +122,6 @@ export function draw(caller: string, random: RandomGenerator): number {
 	assertFunction(caller, 'random', random);
 	const value = random();
 	// `typeof` first: comparisons coerce, so `null`, `false`, `''` or `[]` would otherwise pass as 0.
-	if (!(typeof value === 'number' && value >= 0 && value < 1)) throw new RangeError(`${caller}: \`random()\` must return a number in [0, 1), got ${String(value)}`);
+	if (!(typeof value === 'number' && value >= 0 && value < 1)) throw new RangeError(`${caller}: \`random()\` must return a number in [0, 1), got ${show(value)}`);
 	return value;
 }

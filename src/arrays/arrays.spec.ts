@@ -1,3 +1,4 @@
+import * as vm from 'vm';
 import * as helpers from '.';
 
 /**
@@ -736,6 +737,31 @@ describe('Arrays helpers', function () {
 	});
 
 	describe('sortBy', function () {
+		it('ranks invalid dates from another realm last, like local ones', function () {
+			const OtherDate = vm.runInNewContext('Date') as DateConstructor;
+			const invalid = new OtherDate(NaN);
+			const keys: Array<number | Date> = [3, invalid, 1, 2];
+			function self(key: number | Date): number | Date {
+				return key;
+			}
+			expect(helpers.sortBy(keys, self)).toEqual([1, 2, 3, invalid]);
+			expect(helpers.minBy([invalid, 3, 1], self)).toBe(1);
+			const later = new OtherDate(2000, 0, 2);
+			const earlier = new OtherDate(2000, 0, 1);
+			expect(helpers.sortBy([later, earlier], self)).toEqual([earlier, later]);
+		});
+
+		it('reports a bad direction or random value with a RangeError, even when it cannot be converted to a string', function () {
+			expect(function () {
+				helpers.sortBy([1], Number, Object.create(null));
+			}).toThrow(new RangeError("sortBy: `order` must be 'asc' or 'desc', got object"));
+			expect(function () {
+				helpers.shuffle([1, 2], function () {
+					return Object.create(null);
+				});
+			}).toThrow(new RangeError('shuffle: `random()` must return a number in [0, 1), got object'));
+		});
+
 		it('should sort by numeric keys ascending by default without mutating', function () {
 			const input = [{ n: 3 }, { n: 1 }, { n: 2 }];
 			const result = helpers.sortBy(input, function (o) {
@@ -1272,6 +1298,24 @@ describe('Arrays helpers', function () {
 	});
 
 	describe('sortedIndex / binarySearch', function () {
+		it('searches array-likes longer than 2 ** 31 in about 32 steps', function () {
+			// A virtual sorted sequence 0, 1, 2, … of 2 ** 32 - 1 items.
+			const naturals = new Proxy([] as number[], {
+				get(target, key) {
+					if (key === 'length') return 2 ** 32 - 1;
+					return typeof key === 'string' && /^\d+$/.test(key) ? Number(key) : Reflect.get(target, key);
+				}
+			});
+			let calls = 0;
+			function compare(a: number, b: number): number {
+				calls++;
+				return a - b;
+			}
+			expect(helpers.binarySearch(naturals, 3e9, compare)).toBe(3e9);
+			expect(helpers.sortedIndex(naturals, 2 ** 31 + 0.5, compare)).toBe(2 ** 31 + 1);
+			expect(calls).toBeLessThan(80);
+		});
+
 		it('sortedIndex returns the lowest insertion index', function () {
 			expect(helpers.sortedIndex([10, 20, 20, 30], 20)).toBe(1);
 			expect(helpers.sortedIndex([10, 20, 30], 5)).toBe(0);

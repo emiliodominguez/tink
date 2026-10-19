@@ -1,4 +1,4 @@
-import { assertInteger, describe, draw } from '../utils/assert.js';
+import { assertInteger, describe, draw, show } from '../utils/assert.js';
 import type { RandomGenerator } from '../utils/index.js';
 import { isNumericString } from '../validate/index.js';
 
@@ -1657,7 +1657,7 @@ export function toDelimitedCase(string: string, delimiter: string, options: Deli
 
 	if (typeof delimiter !== 'string') throw new TypeError(`toDelimitedCase: \`delimiter\` must be a string, got ${describe(delimiter)}`);
 
-	if (!WORD_CASES.has(wordCase)) throw new RangeError(`toDelimitedCase: \`options.case\` must be 'lower', 'upper', 'capital' or 'preserve', got ${String(wordCase)}`);
+	if (!WORD_CASES.has(wordCase)) throw new RangeError(`toDelimitedCase: \`options.case\` must be 'lower', 'upper', 'capital' or 'preserve', got ${show(wordCase)}`);
 
 	return joinWords(string, delimiter, wordCase);
 }

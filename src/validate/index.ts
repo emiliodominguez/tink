@@ -10,7 +10,7 @@ import {
 	type StandardSchemaResult,
 	type StandardSchemaV1
 } from '../guards/index.js';
-import { describe } from '../utils/assert.js';
+import { describe, show } from '../utils/assert.js';
 import type { AnyFunction } from '../utils/index.js';
 import { generate } from '../utils/jit.js';
 import { hold, isTooDeep, PENDING, release, scope } from '../utils/memo.js';
@@ -446,7 +446,7 @@ export function isUrl(value: unknown, options: IsUrlOptions = {}): value is stri
  */
 export function isUuid(value: unknown, version?: UuidVersion): value is string {
 	if (version !== undefined && version !== 'nil' && version !== 'max' && !(Number.isInteger(version) && version >= 1 && version <= 8)) {
-		throw new RangeError(`isUuid: \`version\` must be 1-8, 'nil' or 'max', got ${String(version)}`);
+		throw new RangeError(`isUuid: \`version\` must be 1-8, 'nil' or 'max', got ${show(version)}`);
 	}
 	if (typeof value !== 'string') return false;
 	if (version === 'nil' || version === 'max') return value.toLowerCase() === (version === 'nil' ? NIL_UUID : MAX_UUID);
@@ -891,7 +891,7 @@ export function isJsonString(value: unknown): value is string {
 export function isBase64(value: unknown, options: IsBase64Options = {}): value is string {
 	const { urlSafe = false, padding = 'optional' } = options;
 	if (padding !== 'optional' && padding !== 'required' && padding !== 'forbidden') {
-		throw new RangeError(`isBase64: \`padding\` must be 'optional', 'required' or 'forbidden', got ${String(padding)}`);
+		throw new RangeError(`isBase64: \`padding\` must be 'optional', 'required' or 'forbidden', got ${show(padding)}`);
 	}
 	if (typeof value !== 'string' || !(urlSafe ? BASE64_URL_PATTERN : BASE64_PATTERN).test(value)) return false;
 
@@ -1097,7 +1097,7 @@ export function parseJson(text: string, guardOrOptions?: Guard<unknown> | ParseJ
 	const proto = options?.proto ?? 'error';
 
 	if (proto !== 'error' && proto !== 'remove' && proto !== 'ignore') {
-		throw new RangeError(`parseJson: \`proto\` must be 'error', 'remove' or 'ignore', got ${String(proto)}`);
+		throw new RangeError(`parseJson: \`proto\` must be 'error', 'remove' or 'ignore', got ${show(proto)}`);
 	}
 	if (typeof text !== 'string') return [new TypeError(`parseJson: \`text\` must be a string, got ${describe(text)}`), undefined];
 

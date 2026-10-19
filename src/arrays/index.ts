@@ -1,6 +1,6 @@
-import { isIterable } from '../guards/index.js';
+import { isDate, isIterable } from '../guards/index.js';
 import { median } from '../math/index.js';
-import { assertFunction, assertInteger, assertNumber, describe, draw } from '../utils/assert.js';
+import { assertFunction, assertInteger, assertNumber, describe, draw, show } from '../utils/assert.js';
 import type { RandomGenerator } from '../utils/index.js';
 
 /**
@@ -586,7 +586,8 @@ export function uniqueBy<T>(array: ReadonlyArray<T>, keyFn: (item: T, index: num
  * @returns {number | string | bigint} The key itself, the timestamp of a `Date`, or `NaN` for a missing key
  */
 function toComparable(key: SortKey | null | undefined): number | string | bigint {
-	return key instanceof Date ? key.getTime() : (key ?? NaN);
+	// `isDate` also recognizes dates from other realms (iframes, `vm`), which `instanceof Date` does not.
+	return isDate(key) ? Date.prototype.getTime.call(key) : (key ?? NaN);
 }
 
 /**
@@ -635,7 +636,7 @@ function compareRanked(a: number | string | bigint, b: number | string | bigint,
  */
 function toDirection(caller: string, name: string, order: unknown, index?: number): number {
 	if (order === 'asc' || order === 'desc') return order === 'asc' ? 1 : -1;
-	throw new RangeError(`${caller}: \`${index === undefined ? name : `${name}[${index}]`}\` must be 'asc' or 'desc', got ${String(order)}`);
+	throw new RangeError(`${caller}: \`${index === undefined ? name : `${name}[${index}]`}\` must be 'asc' or 'desc', got ${show(order)}`);
 }
 
 /**
@@ -1140,7 +1141,8 @@ function searchBound<T>(caller: string, sortedArray: ReadonlyArray<T>, value: T,
 	let low = 0;
 	let high = sortedArray.length;
 	while (low < high) {
-		const middle = (low + high) >>> 1;
+		// Not `(low + high) >>> 1`, which wraps around past 2 ** 32 (array-likes and sparse arrays can be that long).
+		const middle = low + ((high - low) >>> 1);
 		const comparison = order(sortedArray[middle], value);
 		if (comparison < 0 || (upper && comparison === 0)) low = middle + 1;
 		else high = middle;
@@ -2047,7 +2049,8 @@ function sortedIndexByKey<T>(
 	let low = 0;
 	let high = sortedArray.length;
 	while (low < high) {
-		const middle = (low + high) >>> 1;
+		// Not `(low + high) >>> 1`, which wraps around past 2 ** 32 (array-likes and sparse arrays can be that long).
+		const middle = low + ((high - low) >>> 1);
 		const comparison = compareRanked(rank(selector(sortedArray[middle])), target, dir);
 		if (comparison < 0 || (upper && comparison === 0)) low = middle + 1;
 		else high = middle;
