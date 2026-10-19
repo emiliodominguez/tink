@@ -1,5 +1,5 @@
 import { assertFunction, assertInteger, assertNumber, describe, MAX_TIMEOUT } from '../utils/assert.js';
-import { AssertionError, isPlainObject } from '../guards/index.js';
+import { AssertionError, isDate, isPlainObject } from '../guards/index.js';
 import type { AnyFunction } from '../utils/index.js';
 
 /**
@@ -484,7 +484,20 @@ export function defaultMemoizeKey(...args: unknown[]): unknown {
  * @returns {boolean} `true` for plain data
  */
 function isPlainData(value: object): boolean {
-	return isPlainObject(value) || Array.isArray(value) || value instanceof Date;
+	return isPlainObject(value) || isArray(value) || isDate(value);
+}
+
+/**
+ * `Array.isArray`, returning `false` for a revoked proxy instead of throwing (such a value is then keyed by identity).
+ * @param {object} value - Any object
+ * @returns {boolean} `true` for an array
+ */
+function isArray(value: object): value is unknown[] {
+	try {
+		return Array.isArray(value);
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -579,7 +592,8 @@ function serializeKey(value: unknown, parents: object[]): string {
 			return '"undefined"';
 		case 'object': {
 			if (value === null) return 'null';
-			if (value instanceof Date) return `"Date(${value.getTime()})"`;
+			// `isDate` brand-checks (dates of other realms too, not a proxy of one), and the intrinsic `getTime` reads the time value itself.
+			if (isDate(value)) return `"Date(${Date.prototype.getTime.call(value)})"`;
 			if (!isPlainData(value)) break;
 			if (parents.includes(value)) throw new TypeError('defaultMemoizeKey: `args` must not contain circular structures');
 
@@ -616,7 +630,7 @@ function serializeKey(value: unknown, parents: object[]): string {
  * @param {F} fn - The function to memoize
  * @param {MemoizeOptions<F, C>} [options] - Optional `resolver` (custom key function) and `cache` (Map-like store)
  * @returns {Memoized<F, C>} The memoized function, exposing `.cache` and `.clear()`
- * @throws {TypeError} when `fn` or `options.resolver` is not a function
+ * @throws {TypeError} when `fn` or `options.resolver` is not a function, or `options.cache` is not a cache
  * @example
  * const square = memoize(function (n: number): number { return n * n; });
  * square(3); // => 9 // computed
@@ -637,6 +651,18 @@ export function memoize<F extends AnyFunction, C extends MemoizeCache<unknown, u
 
 	// Only `memoize` writes to the cache, so every stored value is a `ReturnType<F>` whatever the cache's declared value type.
 	const cache = (options.cache ?? new Map<unknown, ReturnType<F>>()) as MemoizeCache<unknown, ReturnType<F>>;
+	const methods = cache as unknown as Partial<Record<keyof MemoizeCache<unknown, unknown>, unknown>>;
+
+	if (
+		typeof cache !== 'object' ||
+		cache === null ||
+		typeof methods.get !== 'function' ||
+		typeof methods.set !== 'function' ||
+		typeof methods.has !== 'function' ||
+		typeof methods.clear !== 'function'
+	) {
+		throw new TypeError(`memoize: \`options.cache\` must have get, set, has and clear methods, got ${describe(cache)}`);
+	}
 	const call = fn as unknown as UnknownFunction;
 
 	/**
@@ -905,12 +931,14 @@ export function debounce<F extends AnyFunction>(fn: F, wait: number, options: De
 
 	const leading = options.leading ?? false;
 	const trailing = options.trailing ?? true;
-	const maxing = options.maxWait !== undefined;
+	// Read once: a getter returning another value later must not replace the validated one.
+	const requestedMaxWait = options.maxWait;
+	const maxing = requestedMaxWait !== undefined;
 
-	if (maxing) assertWait('debounce', 'maxWait', options.maxWait as number);
+	if (maxing) assertWait('debounce', 'maxWait', requestedMaxWait);
 	if (!leading && !trailing) throw new RangeError('debounce: at least one of `leading` or `trailing` must be true');
 
-	const maxWait = Math.max(options.maxWait ?? 0, wait);
+	const maxWait = Math.max(requestedMaxWait ?? 0, wait);
 	const call = fn as unknown as UnknownFunction;
 	let timer: TimerHandle | undefined;
 	let lastArgs: unknown[] | undefined;
@@ -946,7 +974,8 @@ export function debounce<F extends AnyFunction>(fn: F, wait: number, options: De
 
 		const sinceCall = time - lastCallTime;
 
-		return sinceCall >= wait || sinceCall < 0 || (maxing && time - lastInvokeTime >= maxWait);
+		// Negated comparisons: a clock returning `NaN` (or `±Infinity`) must invoke, not re-arm a timer forever.
+		return !(sinceCall < wait) || sinceCall < 0 || (maxing && !(time - lastInvokeTime < maxWait));
 	}
 
 	/**
@@ -1258,6 +1287,9 @@ function combinePredicates(caller: string, predicates: ReadonlyArray<UnknownFunc
  * Type guards keep narrowing: combining `(v) => v is A` and `(v) => v is B` gives a guard for `A & B` (plain predicates add nothing).
  * The input type is the intersection of the predicates' parameter types, except what an earlier type guard already guarantees: since
  * evaluation stops at the first failure, `allPass(isString, isShort)` accepts `unknown` although `isShort` takes a `string`.
+ * Like every type predicate, the `false` branch removes the guarded type: when a guard is combined with plain predicates, a value of that
+ * type that only failed a plain predicate also takes it (`if (!allPass(isString, isShort)(x))` leaves `x: number` for a long string), so
+ * test the guard alone there.
  * @template P - The tuple of predicate types
  * @param {...P} predicates - The predicates to combine
  * @returns {(value: PredicatesInput<P>, ...rest: unknown[]) => value is PredicatesInput<P> & AllGuarded<P>} The combined predicate
@@ -1601,7 +1633,8 @@ export type MatchResult<H> = { [P in keyof H]-?: H[P] extends (...args: never[])
  * match(result, 'ok', { true: function (success) { return success.value; }, _: function () { return 0; } }); // => 0
  */
 export function match<T extends object, K extends keyof T, H extends MatchHandlers<T, K>>(value: T, key: K, handlers: H): MatchResult<H> {
-	if (typeof value !== 'object' || value === null) throw new TypeError(`match: \`value\` must be an object, got ${describe(value)}`);
+	// Functions too: `T extends object` accepts callable members (a function with a `kind` property).
+	if ((typeof value !== 'object' && typeof value !== 'function') || value === null) throw new TypeError(`match: \`value\` must be an object, got ${describe(value)}`);
 
 	const tag = String(value[key]);
 	// A key present with an `undefined` value (allowed by the `Partial` handler types) counts as absent, so `_` handles that member.

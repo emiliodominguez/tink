@@ -1,3 +1,4 @@
+import * as vm from 'vm';
 import { AssertionError } from '../guards/index.js';
 import { allPass, anyPass, match, partialRight } from '.';
 import * as helpers from '.';
@@ -2133,5 +2134,73 @@ describe('Functions helpers (round 11)', function () {
 describe('defaultMemoizeKey nested numbers', function () {
 	it('serialises nested numbers and booleans, marking -0 and non-finite numbers', function () {
 		expect(helpers.defaultMemoizeKey({ a: -0, b: NaN, c: Infinity, d: 1.5, e: true })).toBe('[{"a":"-0","b":"NaN","c":"Infinity","d":1.5,"e":true}]');
+	});
+});
+
+describe('Functions helpers (hostile inputs)', function () {
+	afterEach(function () {
+		jest.useRealTimers();
+		jest.restoreAllMocks();
+	});
+
+	it('memoize keys proxies, revoked proxies and fake dates by identity, and dates of other realms by value', function () {
+		const fn = jest.fn(function (_argument: unknown) {
+			return 1;
+		});
+		const memo = helpers.memoize(fn);
+		const { proxy, revoke } = Proxy.revocable({}, {});
+		revoke();
+		for (const argument of [new Proxy(new Date(0), {}), Object.create(Date.prototype), proxy]) {
+			expect(memo(argument)).toBe(1);
+			expect(memo(argument)).toBe(1);
+		}
+		expect(fn).toHaveBeenCalledTimes(3);
+		const OtherDate = vm.runInNewContext('Date') as DateConstructor;
+		expect(helpers.defaultMemoizeKey([new OtherDate(0)])).toBe(helpers.defaultMemoizeKey([new Date(0)]));
+	});
+
+	it('memoize rejects a cache without the cache methods up front', function () {
+		expect(function () {
+			helpers.memoize(jest.fn(), { cache: 5 as any });
+		}).toThrow(new TypeError('memoize: `options.cache` must have get, set, has and clear methods, got number'));
+	});
+
+	it('debounce still invokes when the clock returns NaN', function () {
+		jest.useFakeTimers();
+		jest.spyOn(Date, 'now').mockReturnValue(NaN);
+		const fn = jest.fn();
+		const debounced = helpers.debounce(fn, 10);
+		debounced();
+		jest.advanceTimersByTime(50);
+		expect(fn).toHaveBeenCalledTimes(1);
+		expect(debounced.pending()).toBe(false);
+	});
+
+	it('debounce reads maxWait once', function () {
+		jest.useFakeTimers();
+		let reads = 0;
+		const options = {
+			get maxWait(): number {
+				return reads++ < 1 ? 50 : ('oops' as unknown as number);
+			}
+		};
+		const fn = jest.fn();
+		const debounced = helpers.debounce(fn, 100, options);
+		for (let i = 0; i < 15; i++) {
+			debounced();
+			jest.advanceTimersByTime(20);
+		}
+		expect(fn.mock.calls.length).toBeGreaterThanOrEqual(2);
+	});
+
+	it('match accepts a function carrying the tag', function () {
+		const tagged = Object.assign(function (): void {}, { kind: 'f' as const });
+		expect(
+			helpers.match(tagged, 'kind', {
+				f: function () {
+					return 1;
+				}
+			})
+		).toBe(1);
 	});
 });
