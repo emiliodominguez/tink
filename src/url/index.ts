@@ -1,3 +1,4 @@
+import { isDate } from '../guards/index.js';
 import { describe, show } from '../utils/assert.js';
 
 /**
@@ -23,6 +24,12 @@ export type QueryParams = Readonly<Record<string, QueryParamValue>>;
  * @template P - The parameters type
  */
 export type QueryParamsOf<P> = { readonly [K in keyof P]: QueryParamValue };
+
+/**
+ * `unknown` for parameter objects, `never` for arrays (whose indexes would become keys: `0=x&1=y`).
+ * @template P - The parameters type
+ */
+type NotAnArray<P> = P extends ReadonlyArray<unknown> ? never : unknown;
 
 /**
  * How {@link buildQueryString} serializes arrays:
@@ -96,10 +103,11 @@ function serializeValue(key: string, value: unknown): string {
 
 	if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
 
-	if (value instanceof Date) {
-		if (Number.isNaN(value.getTime())) throw new RangeError(`buildQueryString: \`params.${key}\` must be a valid Date, got Invalid Date`);
+	// `isDate` also recognizes dates of other realms; the intrinsics read the time value itself (not an overridden `getTime`).
+	if (isDate(value)) {
+		if (Number.isNaN(Date.prototype.getTime.call(value))) throw new RangeError(`buildQueryString: \`params.${key}\` must be a valid Date, got Invalid Date`);
 
-		return value.toISOString();
+		return Date.prototype.toISOString.call(value);
 	}
 
 	throw new TypeError(`buildQueryString: \`params.${key}\` must be a string, number, boolean, bigint or Date, got ${describe(value)}`);
@@ -125,24 +133,47 @@ function serializeValue(key: string, value: unknown): string {
  * buildQueryString({ tags: ['a', 'b,c'] }, { arrayFormat: 'comma' }); // => 'tags=a,b%2Cc'
  * buildQueryString({ b: 1, a: null, c: undefined }, { skipNull: false, sort: true }); // => 'a&b=1'
  */
-export function buildQueryString<P extends QueryParamsOf<P>>(input: P, options: BuildQueryStringOptions = {}): string {
-	const params = input as QueryParams;
+export function buildQueryString<P extends QueryParamsOf<P>>(input: P & NotAnArray<P>, options: BuildQueryStringOptions = {}): string {
+	return buildFromEntries(entriesOf(input as QueryParams), options);
+}
+
+/**
+ * Reads the own enumerable string keys of `params` and their values, once each (so that a getter or a `Proxy` cannot report one value
+ * to the checks and another to the query).
+ * @param {QueryParams} params - The parameters
+ * @returns {Array<[string, QueryParamValue]>} The entries, in key order
+ */
+function entriesOf(params: QueryParams): Array<[string, QueryParamValue]> {
+	return Object.keys(params).map(function (key: string): [string, QueryParamValue] {
+		return [key, params[key]];
+	});
+}
+
+/**
+ * {@link buildQueryString} from already read entries.
+ * @param {Array<[string, QueryParamValue]>} entries - The parameters, as `[key, value]` pairs
+ * @param {BuildQueryStringOptions} options - The options
+ * @returns {string} The query string
+ */
+function buildFromEntries(entries: Array<[string, QueryParamValue]>, options: BuildQueryStringOptions): string {
 	const { arrayFormat = 'repeat', skipNull = true, sort = false } = options;
 
 	if (!ARRAY_FORMATS.has(arrayFormat)) throw new RangeError(`buildQueryString: \`arrayFormat\` must be 'repeat', 'comma' or 'brackets', got ${show(arrayFormat)}`);
 
-	const keys = Object.keys(params);
-
-	if (sort) keys.sort();
+	if (sort) {
+		entries = entries.slice().sort(function (a: [string, QueryParamValue], b: [string, QueryParamValue]): number {
+			// Keys are distinct: never equal.
+			return a[0] < b[0] ? -1 : 1;
+		});
+	}
 
 	// Built by concatenation (no intermediate arrays): this runs once per key and value. A pair or an item can be empty, so the
 	// separators are tracked rather than inferred from the text built so far.
 	let query = '';
 	let separator = '';
 
-	for (let index = 0; index < keys.length; index++) {
-		const key = keys[index];
-		const value = params[key];
+	for (let index = 0; index < entries.length; index++) {
+		const [key, value] = entries[index];
 
 		if (value === undefined) continue;
 
@@ -167,7 +198,10 @@ export function buildQueryString<P extends QueryParamsOf<P>>(input: P, options: 
 		const itemSeparator = arrayFormat === 'comma' ? ',' : '&' + prefix;
 		let written = false;
 
-		for (const item of list) {
+		for (let position = 0; position < list.length; position++) {
+			// Holes are skipped, also when a polluted prototype would fill them in.
+			const item = Object.hasOwn(list, position) ? list[position] : undefined;
+
 			if (item == null) continue;
 
 			// The first item opens the key's pair; the next ones are appended with `,` or as pairs of their own.
@@ -305,16 +339,17 @@ function splitUrl(url: string): { base: string; query: string; hash: string } {
  * withQuery('/list', {}); // => '/list'
  * withQuery('/list?id[]=1&id=2', { 'id[]': [3] }); // => '/list?id%5B%5D=3'
  */
-export function withQuery<P extends QueryParamsOf<P>>(url: string, input: P, options: BuildQueryStringOptions = {}): string {
-	const params = input as QueryParams;
+export function withQuery<P extends QueryParamsOf<P>>(url: string, input: P & NotAnArray<P>, options: BuildQueryStringOptions = {}): string {
+	// Read once: the keys that replace existing pairs are exactly the keys written.
+	const entries = entriesOf(input as QueryParams);
 	const { base, query, hash } = splitUrl(url);
 	// Keys are compared without their `[]` suffix on both sides, so `a` and `a[]` replace each other.
 	const replaced = new Set<string>();
 
 	// Lone surrogates are written as U+FFFD (see `encodeComponent`), so both sides are compared in that form: otherwise a key with one
 	// would not replace its existing occurrences, and could be smuggled in twice.
-	for (const key of Object.keys(params)) {
-		if (params[key] !== undefined) replaced.add(withoutBrackets(key.replace(LONE_SURROGATES, '\ufffd')));
+	for (const [key, value] of entries) {
+		if (value !== undefined) replaced.add(withoutBrackets(key.replace(LONE_SURROGATES, '\ufffd')));
 	}
 
 	const pairs = query.split('&').filter(function (pair: string): boolean {
@@ -325,7 +360,7 @@ export function withQuery<P extends QueryParamsOf<P>>(url: string, input: P, opt
 
 		return !replaced.has(withoutBrackets(key));
 	});
-	const added = buildQueryString(params, options);
+	const added = buildFromEntries(entries, options);
 
 	if (added !== '') pairs.push(added);
 
@@ -595,9 +630,9 @@ export function sanitizeUrl(url: string, fallback?: undefined, options?: IsSafeU
  * @param {string} url - The user-supplied URL
  * @param {F} fallback - What to return instead of an unsafe URL
  * @param {IsSafeUrlOptions} [options={}] - See {@link isSafeUrl}
- * @returns {string | F} `url` or `fallback`
+ * @returns {string | Exclude<F, undefined>} `url` or `fallback` (`'about:blank'` for an `undefined` fallback)
  */
-export function sanitizeUrl<F>(url: string, fallback: F, options?: IsSafeUrlOptions): string | F;
+export function sanitizeUrl<F>(url: string, fallback: F, options?: IsSafeUrlOptions): string | Exclude<F, undefined>;
 /**
  * Implementation of {@link sanitizeUrl}.
  * @param {string} url - The user-supplied URL
@@ -750,7 +785,8 @@ function trimBase(base: string): string {
  */
 function isInside(url: string, root: string): boolean {
 	// Past the end, `charAt` gives `''`, which `includes` finds: the base itself is inside.
-	return url.startsWith(root) && '/?#'.includes(url.charAt(root.length));
+	// `\` counts as `/`, as browsers read it.
+	return url.startsWith(root) && '/\\?#'.includes(url.charAt(root.length));
 }
 
 /**

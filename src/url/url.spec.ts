@@ -1,3 +1,4 @@
+import * as vm from 'vm';
 import * as helpers from '.';
 
 describe('URL helpers', function () {
@@ -719,5 +720,58 @@ describe('url (helper review regressions)', function () {
 			helpers.isSafeUrl(123 as never, { protocols: ['https'] });
 		}).toThrow(RangeError);
 		expect(helpers.isSafeUrl(123 as never, { protocols: ['https:'] })).toBe(false);
+	});
+});
+
+describe('URL helpers (hostile inputs)', function () {
+	it('withQuery reads every parameter once, so a getter cannot add a key twice', function () {
+		let reads = 0;
+		const params = {
+			get next(): string | undefined {
+				return reads++ === 0 ? undefined : '/evil';
+			}
+		};
+		// Read once (as undefined): the existing pair stays and no second one is added.
+		expect(helpers.withQuery('/login?next=/home', params)).toBe('/login?next=/home');
+	});
+
+	it('serializes dates of other realms and ignores an overridden getTime', function () {
+		const OtherDate = vm.runInNewContext('Date') as DateConstructor;
+		expect(helpers.buildQueryString({ d: new OtherDate(0) })).toBe('d=1970-01-01T00%3A00%3A00.000Z');
+		class Lying extends Date {
+			override getTime(): number {
+				return 0;
+			}
+		}
+		expect(function () {
+			helpers.buildQueryString({ d: new Lying(NaN) });
+		}).toThrow(new RangeError('buildQueryString: `params.d` must be a valid Date, got Invalid Date'));
+	});
+
+	it('skips array holes even under a polluted prototype', function () {
+		const proto = Object.prototype as Record<number, unknown>;
+		proto[1] = 'polluted';
+		try {
+			// eslint-disable-next-line no-sparse-arrays
+			expect(helpers.buildQueryString({ ids: [1, , 3] })).toBe('ids=1&ids=3');
+		} finally {
+			delete proto[1];
+		}
+	});
+
+	it('rejects arrays as parameter objects at the type level', function () {
+		// @ts-expect-error indexes would become keys
+		expect(helpers.buildQueryString(['x', 'y'])).toBe('0=x&1=y');
+	});
+
+	it('treats a backslash after the base as a slash', function () {
+		expect(helpers.withBase('/app\\users', '/app')).toBe('/app\\users');
+		expect(helpers.withoutBase('/app\\users', '/app')).toBe('/users');
+	});
+
+	it('never types sanitizeUrl as possibly undefined', function () {
+		const fallback = undefined as string | undefined;
+		const url: string = helpers.sanitizeUrl('javascript:x', fallback);
+		expect(url).toBe('about:blank');
 	});
 });
