@@ -15,6 +15,7 @@ import {
 import {
 	arrayOf,
 	asInteger,
+	asJson,
 	blankAsUndefined,
 	chain,
 	discriminatedUnion,
@@ -22,6 +23,7 @@ import {
 	nullable,
 	optional,
 	parse,
+	parseJson,
 	safeParse,
 	transform,
 	tuple,
@@ -171,6 +173,16 @@ describe('brand properties', function () {
 		expect(parse({ '~standard': { validate: isString } }, { '~standard': { validate: 'x' } })).toEqual({ '~standard': { validate: 'x' } });
 		expect(parse({ '~standard': { version: isString, validate: isFunction } }, { '~standard': { version: '1', validate: String } })).toEqual({
 			'~standard': { version: '1', validate: String }
+		});
+	});
+});
+
+describe('JSON parsing under prototype pollution', function () {
+	it('should finish scanning for prototype keys when Object.prototype holds an object', function () {
+		polluted(Object.prototype, 'polluted', {}, function () {
+			expect(parseJson('{"a":"\\u0041"}')).toEqual([undefined, { a: 'A' }]);
+			expect(parseJson('{"constructor":1}', { proto: 'remove' })).toEqual([undefined, { constructor: 1 }]);
+			expect(safeParse(asJson({}), '{"a":"\\u00e9"}')).toEqual([undefined, {}]);
 		});
 	});
 });

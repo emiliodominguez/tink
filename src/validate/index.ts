@@ -1013,7 +1013,9 @@ function findProtoKey(root: object, remove: boolean): string | undefined {
 			if (!remove) return 'constructor.prototype';
 			delete node['constructor'];
 		}
-		for (const key in node) pushObject(stack, node[key]);
+		// Own keys only (all `JSON.parse` creates): `for…in` would also walk an object-valued key of a polluted `Object.prototype`, which
+		// holds itself through that very key, forever.
+		for (const key of Object.keys(node)) pushObject(stack, node[key]);
 	}
 
 	return undefined;
