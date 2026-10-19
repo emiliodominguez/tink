@@ -227,7 +227,7 @@ export function withTimeout<T>(promise: PromiseLike<T> | T, ms: number, message?
  * Every retry waits for at least one timer tick (`setTimeout(0)` for a zero delay), so even `retries: Infinity` with a synchronously
  * throwing `fn` never blocks the thread and stays abortable through `signal`.
  * @template T - The resolved value type
- * @param {(attempt: number) => Promise<T> | T} fn - The operation; receives the 1-based attempt number
+ * @param {(attempt: number) => PromiseLike<T> | T} fn - The operation; receives the 1-based attempt number
  * @param {RetryOptions} [options] - `retries` (3), `delay` (0), `factor` (2), `maxDelay` (Infinity), `jitter` (false), `shouldRetry`, `onRetry`, `signal`
  * @param {RandomGenerator} [random=Math.random] - Random source used for jitter
  * @returns {Promise<T>} The first successful result
@@ -241,7 +241,7 @@ export function withTimeout<T>(promise: PromiseLike<T> | T, ms: number, message?
  * await retry(flaky, { retries: 5, delay: 10, maxDelay: 2000, jitter: true }); // => 'ok'
  * calls; // => 3
  */
-export async function retry<T>(fn: (attempt: number) => Promise<T> | T, options: RetryOptions = {}, random: RandomGenerator = Math.random): Promise<T> {
+export async function retry<T>(fn: (attempt: number) => PromiseLike<T> | T, options: RetryOptions = {}, random: RandomGenerator = Math.random): Promise<T> {
 	const { retries = 3, delay = 0, factor = 2, maxDelay = Infinity, jitter = false, shouldRetry, onRetry, signal } = options;
 
 	assertFunction('retry', 'fn', fn);
@@ -280,15 +280,16 @@ export async function retry<T>(fn: (attempt: number) => Promise<T> | T, options:
 
 /**
  * Options accepted by {@link mapWithConcurrency}, {@link mapSettledWithConcurrency} and {@link filterWithConcurrency}.
+ * @template S - The signal type, passed on to the callbacks
  */
-export interface ConcurrencyOptions {
+export interface ConcurrencyOptions<S extends AbortSignalLike = AbortSignalLike> {
 	/** Maximum number of callbacks in flight (an integer >= 1, or `Infinity`). Defaults to `Infinity`. */
 	concurrency?: number;
 	/**
 	 * Aborting it stops starting new items and rejects straight away with the signal's `reason` (or an {@link AbortError}); callbacks
 	 * already running are not interrupted (their outcome is ignored), but they receive the signal as their third argument.
 	 */
-	signal?: AbortSignalLike | null;
+	signal?: S | null;
 	/**
 	 * `true` (the default): reject with the first error and start no further items. `false`: process every item, then reject with an
 	 * `AggregateError` holding every error (in the order they occurred) if any callback failed.
@@ -300,8 +301,9 @@ export interface ConcurrencyOptions {
  * A callback run by the `*WithConcurrency` helpers: receives the item, its index and the caller's abort signal.
  * @template T - The item type
  * @template R - The result type
+ * @template S - The signal type (that of the `signal` option)
  */
-export type ConcurrentCallback<T, R> = (item: T, index: number, signal: AbortSignalLike | undefined) => PromiseLike<R> | R;
+export type ConcurrentCallback<T, R, S extends AbortSignalLike = AbortSignalLike> = (item: T, index: number, signal: S | undefined) => PromiseLike<R> | R;
 
 /**
  * Runs `callback` on every element of `list` with bounded concurrency (see {@link ConcurrencyOptions}).
@@ -330,6 +332,8 @@ function runConcurrently(
 		if (signal?.aborted) throw abortReason(signal);
 
 		list = Array.from(items);
+		// Reading `items` runs user code (a generator), which may abort the signal before the listener is added.
+		if (signal?.aborted) throw abortReason(signal);
 
 		// Every item can start at once and nothing can stop the run early except a failure: map them directly (same behaviour as below,
 		// much cheaper than tracking slots).
@@ -469,7 +473,11 @@ function runConcurrently(
  * controller.abort(new AbortError('navigated away'));
  * await pages; // throws AbortError
  */
-export function mapWithConcurrency<T, R>(items: Iterable<T>, mapper: ConcurrentCallback<T, R>, options?: number | ConcurrencyOptions): Promise<R[]> {
+export function mapWithConcurrency<T, R, S extends AbortSignalLike = AbortSignalLike>(
+	items: Iterable<T>,
+	mapper: ConcurrentCallback<T, R, S>,
+	options?: number | ConcurrencyOptions<S>
+): Promise<R[]> {
 	return runConcurrently('mapWithConcurrency', 'mapper', items, mapper as ConcurrentCallback<unknown, unknown>, options) as Promise<R[]>;
 }
 
@@ -510,10 +518,10 @@ function rejected(reason: unknown): PromiseRejectedResult {
  * results[0]; // => { status: 'fulfilled', value: 1 }
  * results[1]; // => { status: 'rejected', reason: new Error('bad: x') }
  */
-export async function mapSettledWithConcurrency<T, R>(
+export async function mapSettledWithConcurrency<T, R, S extends AbortSignalLike = AbortSignalLike>(
 	items: Iterable<T>,
-	mapper: ConcurrentCallback<T, R>,
-	options?: number | ConcurrencyOptions
+	mapper: ConcurrentCallback<T, R, S>,
+	options?: number | ConcurrencyOptions<S>
 ): Promise<Array<PromiseSettledResult<Awaited<R>>>> {
 	assertFunction('mapSettledWithConcurrency', 'mapper', mapper);
 
@@ -545,11 +553,11 @@ export async function mapSettledWithConcurrency<T, R>(
  * async function isOnline(host: string): Promise<boolean> { await sleep(5); return host !== 'down.example'; }
  * await filterWithConcurrency(['a.example', 'down.example', 'b.example'], isOnline, { concurrency: 2 }); // => ['a.example', 'b.example']
  */
-export function filterWithConcurrency<T, S extends T>(
+export function filterWithConcurrency<T, U extends T, S extends AbortSignalLike = AbortSignalLike>(
 	items: Iterable<T>,
-	predicate: (item: T, index: number, signal: AbortSignalLike | undefined) => item is S,
-	options?: number | ConcurrencyOptions
-): Promise<S[]>;
+	predicate: (item: T, index: number, signal: S | undefined) => item is U,
+	options?: number | ConcurrencyOptions<S>
+): Promise<U[]>;
 /**
  * Filters `items` with an async `predicate`, with bounded concurrency (see the first overload).
  * @template T - The item type
@@ -560,7 +568,11 @@ export function filterWithConcurrency<T, S extends T>(
  * @example
  * await filterWithConcurrency([1, 2, 3, 4], async function (n) { return n % 2 === 0; }); // => [2, 4]
  */
-export function filterWithConcurrency<T>(items: Iterable<T>, predicate: ConcurrentCallback<T, unknown>, options?: number | ConcurrencyOptions): Promise<T[]>;
+export function filterWithConcurrency<T, S extends AbortSignalLike = AbortSignalLike>(
+	items: Iterable<T>,
+	predicate: ConcurrentCallback<T, unknown, S>,
+	options?: number | ConcurrencyOptions<S>
+): Promise<T[]>;
 /**
  * Filters `items` with an async `predicate`, with bounded concurrency (see the first overload).
  * @template T - The item type
@@ -782,34 +794,37 @@ export function createLimiter(concurrency: number, options: LimiterOptions = {})
 
 /**
  * Options accepted by {@link createQueue}.
+ * @template S - The signal type, passed on to the tasks
  */
-export interface QueueOptions {
+export interface QueueOptions<S extends AbortSignalLike = AbortSignalLike> {
 	/** Maximum number of tasks running at once (an integer >= 1, or `Infinity`). Defaults to `Infinity`. */
 	concurrency?: number;
 	/**
 	 * Aborting it removes every waiting task and rejects its promise with the signal's `reason` (or an {@link AbortError}), and so does
 	 * every later `add`. Running tasks are not interrupted: they receive the signal and settle on their own.
 	 */
-	signal?: AbortSignalLike | null;
+	signal?: S | null;
 }
 
 /**
  * Options accepted by {@link Queue.add}.
+ * @template S - The signal type, passed on to the task
  */
-export interface QueueAddOptions {
+export interface QueueAddOptions<S extends AbortSignalLike = AbortSignalLike> {
 	/** Tasks with a higher priority start first; tasks of equal priority start in the order they were added. Defaults to `0`. */
 	priority?: number;
 	/**
 	 * Aborting it before the task starts removes the task from the queue (it never runs) and rejects its promise with the signal's
 	 * `reason`. Once started, the task receives it (combined with the queue's signal, when both are set).
 	 */
-	signal?: AbortSignalLike | null;
+	signal?: S | null;
 }
 
 /**
  * A priority task queue as returned by {@link createQueue}.
+ * @template S - The type of the queue's signal
  */
-export interface Queue {
+export interface Queue<S extends AbortSignalLike = AbortSignalLike> {
 	/**
 	 * Adds a task and returns a promise that settles like it. The task is called with an abort signal (see {@link QueueAddOptions.signal})
 	 * when it starts: immediately and synchronously if a slot is free, nothing is waiting and the queue is not paused. Synchronous throws
@@ -817,7 +832,7 @@ export interface Queue {
 	 * @throws {TypeError} (as a rejection) when `task` is not a function, `priority` is not a number, or `signal` is not a signal
 	 * @throws {RangeError} (as a rejection) when `priority` is `NaN`
 	 */
-	add<T>(task: (signal: AbortSignalLike | undefined) => PromiseLike<T> | T, options?: QueueAddOptions): Promise<T>;
+	add<T, O extends QueueAddOptions = QueueAddOptions<never>>(task: (signal: QueueTaskSignal<S | SignalOption<O>>) => PromiseLike<T> | T, options?: O): Promise<T>;
 	/** Number of tasks waiting to start. */
 	readonly size: number;
 	/** Number of tasks running. */
@@ -835,6 +850,20 @@ export interface Queue {
 	/** Resolves as soon as no task is waiting or running (immediately if none is). Each call returns a new promise. */
 	onIdle(): Promise<void>;
 }
+
+/**
+ * The signal a {@link Queue} task receives: the queue's or the task's own, a platform signal combining both when both are set, or
+ * `undefined` when neither is.
+ * @template S - The types of the queue's and the task's signals
+ */
+export type QueueTaskSignal<S extends AbortSignalLike> = S | PlatformAbortSignal | undefined;
+
+/**
+ * The type of the `signal` of a {@link QueueAddOptions} object (`never` without one). Inferred from the options rather than from the
+ * task's parameter, so a task declared as `(signal: AbortSignal | undefined) => ...` does not widen it.
+ * @template O - The options type
+ */
+type SignalOption<O extends QueueAddOptions> = 'signal' extends keyof O ? NonNullable<O['signal']> : never;
 
 /**
  * A waiting {@link Queue} task.
@@ -900,7 +929,7 @@ function wake(waiters: Array<() => void>): Array<() => void> {
  * await waiting; // throws AbortError
  * queue.size; // => 0
  */
-export function createQueue(options: QueueOptions = {}): Queue {
+export function createQueue<S extends AbortSignalLike = never>(options: QueueOptions<S> = {}): Queue<S> {
 	const { concurrency = Infinity, signal: queueSignal } = options;
 
 	assertInteger('createQueue', 'concurrency', concurrency, 1, true);
@@ -953,7 +982,10 @@ export function createQueue(options: QueueOptions = {}): Queue {
 	);
 
 	return {
-		add<T>(task: (signal: AbortSignalLike | undefined) => PromiseLike<T> | T, addOptions: QueueAddOptions = {}): Promise<T> {
+		add<T, O extends QueueAddOptions = QueueAddOptions<never>>(
+			task: (signal: QueueTaskSignal<S | SignalOption<O>>) => PromiseLike<T> | T,
+			addOptions: O = {} as O
+		): Promise<T> {
 			return new Promise<T>(function (resolve, reject) {
 				const { priority = 0, signal } = addOptions;
 

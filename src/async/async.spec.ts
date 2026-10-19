@@ -267,6 +267,18 @@ describe('Async helpers', function () {
 	});
 
 	describe('retry', function () {
+		it('accepts a function returning a thenable, and resolves with its value type', async function () {
+			const thenable: PromiseLike<number> = {
+				then(onFulfilled) {
+					return Promise.resolve(42).then(onFulfilled);
+				}
+			};
+			const result: number = await retry(function () {
+				return thenable;
+			});
+			expect(result).toBe(42);
+		});
+
 		it('should keep a zero delay at zero when the backoff factor overflows', async function () {
 			let attempts = 0;
 			const result = await retry(
@@ -1602,6 +1614,58 @@ describe('Async helpers (round 11)', function () {
 	});
 
 	describe('mapWithConcurrency (options)', function () {
+		it('rejects when reading the items aborts the signal, and starts no item', async function () {
+			const controller = new AbortController();
+			const reason = new Error('stop');
+			const mapper = jest.fn(function (n: number) {
+				return n;
+			});
+			function* items(): Generator<number> {
+				yield 1;
+				controller.abort(reason);
+				yield 2;
+			}
+			await expect(mapWithConcurrency(items(), mapper, { concurrency: 1, signal: controller.signal })).rejects.toBe(reason);
+			expect(mapper).not.toHaveBeenCalled();
+		});
+
+		it('types the signal the callbacks receive after the signal option', async function () {
+			function platformOnly(signal: AbortSignal | undefined): number {
+				return signal === undefined ? 0 : 1;
+			}
+			const { signal } = new AbortController();
+			const mapped: number[] = await mapWithConcurrency(
+				[1],
+				function (_n, _index, received) {
+					return platformOnly(received);
+				},
+				{ signal }
+			);
+			const settled = await mapSettledWithConcurrency(
+				[1],
+				function (_n, _index, received) {
+					return platformOnly(received);
+				},
+				{ signal }
+			);
+			const kept: number[] = await filterWithConcurrency(
+				[1],
+				function (_n, _index, received) {
+					return platformOnly(received) === 1;
+				},
+				{ signal }
+			);
+			expect([mapped, settled, kept]).toEqual([[1], [{ status: 'fulfilled', value: 1 }], [1]]);
+			await mapWithConcurrency(
+				[1],
+				function (_n, _index, received) {
+					// @ts-expect-error a custom signal is not a platform AbortSignal
+					return platformOnly(received);
+				},
+				{ signal: new CountingSignal() }
+			);
+		});
+
 		it('accepts an options object and passes the signal to the mapper', async function () {
 			const signal = new CountingSignal();
 			const seen: unknown[] = [];
@@ -1884,6 +1948,22 @@ describe('Async helpers (round 11)', function () {
 	});
 
 	describe('createQueue', function () {
+		it('types the signal a task receives after the queue and task signals', async function () {
+			function platformOnly(signal: AbortSignal | undefined): number {
+				return signal === undefined ? 0 : 1;
+			}
+			const { signal } = new AbortController();
+			const results = await Promise.all([
+				createQueue({ signal }).add(platformOnly),
+				createQueue().add(platformOnly, { signal }),
+				createQueue({ signal }).add(platformOnly, { signal: new AbortController().signal }),
+				createQueue().add(platformOnly)
+			]);
+			expect(results).toEqual([1, 1, 1, 0]);
+			// @ts-expect-error a custom signal is not a platform AbortSignal
+			await createQueue({ signal: new CountingSignal() }).add(platformOnly);
+		});
+
 		it('runs tasks immediately while slots are free, and queues the rest', async function () {
 			const queue = createQueue({ concurrency: 2 });
 			const deferreds = [createDeferred<string>(), createDeferred<string>(), createDeferred<string>()];
