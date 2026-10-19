@@ -1783,6 +1783,118 @@ describe('iterables', function () {
 });
 
 describe('mapConcurrent', function () {
+	/**
+	 * Yields 1, then waits forever (an idle stream).
+	 */
+	async function* idle(): AsyncGenerator<number> {
+		yield 1;
+		await new Promise(function () {});
+	}
+
+	/**
+	 * An async iterator whose second pull never settles, with the given `return`.
+	 */
+	function stalled(onReturn: () => unknown): AsyncIterable<number> {
+		let pulls = 0;
+		return {
+			[Symbol.asyncIterator]: function () {
+				return {
+					next: function (): Promise<IteratorResult<number>> {
+						pulls++;
+						return pulls === 1 ? Promise.resolve({ done: false, value: 1 }) : new Promise(function () {});
+					},
+					return: onReturn as () => Promise<IteratorResult<number>>
+				};
+			}
+		};
+	}
+
+	it('rejects a pending read on abort while a source pull is pending', async function () {
+		const controller = new AbortController();
+		const iterator = helpers.mapConcurrent(
+			idle(),
+			function (value) {
+				return value;
+			},
+			{ concurrency: 1, signal: controller.signal }
+		);
+		expect(await iterator.next()).toEqual({ done: false, value: 1 });
+		const pending = iterator.next();
+		controller.abort(new Error('aborted'));
+		await expect(pending).rejects.toThrow('aborted');
+	});
+
+	it('lets an early exit finish while a source pull is pending, and still requests the close', async function () {
+		let exited = false;
+		for await (const value of helpers.mapConcurrent(
+			idle(),
+			function (item) {
+				return item;
+			},
+			1
+		)) {
+			expect(value).toBe(1);
+			break;
+		}
+		exited = true;
+		expect(exited).toBe(true);
+
+		const closes: string[] = [];
+		for await (const value of helpers.mapConcurrent(
+			stalled(function () {
+				closes.push('rejecting');
+				return Promise.reject(new Error('cannot close'));
+			}),
+			function (item) {
+				return item;
+			},
+			1
+		)) {
+			expect(value).toBe(1);
+			break;
+		}
+		for await (const value of helpers.mapConcurrent(
+			stalled(function () {
+				closes.push('throwing');
+				throw new Error('cannot close');
+			}),
+			function (item) {
+				return item;
+			},
+			1
+		)) {
+			expect(value).toBe(1);
+			break;
+		}
+		await new Promise(setImmediate);
+		expect(closes).toEqual(['rejecting', 'throwing']);
+	});
+
+	it('pulls nothing more once a mapping failed', async function () {
+		const pulled: number[] = [];
+		/**
+		 * Counts up forever, recording each pull.
+		 */
+		async function* counting(): AsyncGenerator<number> {
+			for (let index = 0; ; index++) {
+				pulled.push(index);
+				yield index;
+			}
+		}
+		await expect(
+			helpers.toArrayAsync(
+				helpers.mapConcurrent(
+					counting(),
+					async function (value) {
+						throw new Error(`fn ${value}`);
+					},
+					1
+				)
+			)
+		).rejects.toThrow('fn 0');
+		expect(pulled).toEqual([0]);
+	});
+
 	/** An infinite async source counting the items it produced, and whether it was closed. */
 	function counter() {
 		const stats = { produced: 0, closed: 0 };

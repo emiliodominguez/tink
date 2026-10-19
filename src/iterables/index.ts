@@ -1275,8 +1275,9 @@ async function* mappedConcurrently(
 			if (slot?.settled) {
 				slots.shift();
 				buffered--;
-				fill();
+				// A failed mapping ends the iteration: throw before `fill` would pull another item.
 				if (!slot.ok) throw slot.result;
+				fill();
 				yield slot.result;
 			} else if (exhausted && buffered === 0) {
 				if (sourceError) throw sourceError.error;
@@ -1290,9 +1291,35 @@ async function* mappedConcurrently(
 	} finally {
 		stopped = true;
 		signal?.removeEventListener('abort', onAbort);
-		// Close the source unless it finished or failed on its own (a pending pull is answered first, then the source closes).
-		if (!exhausted) await source.return?.();
+		// Close the source unless it finished or failed on its own. An async generator answers a pending pull before `return()`, which
+		// may never happen (an idle stream): the close is then requested without waiting for it, so that the consumer is not blocked.
+		if (!exhausted) {
+			if (pulling) closeLater(source);
+			else await source.return?.();
+		}
 	}
+}
+
+/**
+ * Requests that an async iterator close, without waiting for it (see {@link mapConcurrent}). A failure to close is ignored, like the
+ * outcome of a pull nobody waits for any more.
+ * @param {AsyncIterator<unknown>} source - The iterator to close
+ * @returns {void}
+ */
+function closeLater(source: AsyncIterator<unknown>): void {
+	try {
+		Promise.resolve(source.return?.()).then(undefined, ignore);
+	} catch {
+		// A synchronously throwing `return()`: nothing is waiting for it either.
+	}
+}
+
+/**
+ * Ignores a rejection.
+ * @returns {undefined} Always `undefined`
+ */
+function ignore(): undefined {
+	return undefined;
 }
 
 /**
@@ -1304,8 +1331,9 @@ async function* mappedConcurrently(
  * - Order: results come in source order by default; with `ordered: false` each comes as soon as it is ready.
  * - Errors: an error of `fn` is thrown when its result would have been yielded (in order) or as soon as it happens (unordered); an error
  *   of the source is thrown after the items pulled before it. The source is then closed and nothing more is pulled.
- * - Early exit (`break`, `return()`, an error) stops pulling and calls the source's `return()`. Mappings already running are not
- *   interrupted (their results are dropped, and their rejections handled), so pass `signal` to `fn` to cancel them.
+ * - Early exit (`break`, `return()`, an error) stops pulling and calls the source's `return()`, waiting for it unless a pull is still
+ *   pending (an async generator only closes once that pull is answered, which an idle source may never do). Mappings already running are
+ *   not interrupted (their results are dropped, and their rejections handled), so pass `signal` to `fn` to cancel them.
  * - `signal`: aborting stops pulling and makes the iterator throw the signal's `reason` at its next read, closing the source.
  * @template T - The source item type
  * @template U - The mapped item type
