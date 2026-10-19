@@ -1,3 +1,5 @@
+import * as util from 'util';
+import * as vm from 'vm';
 import * as decorators from '.';
 import { sleep } from '../async/index.js';
 import { createLRUCache, type LRUCache } from '../cache/index.js';
@@ -246,6 +248,18 @@ describe('Decorators', function () {
 			}).toThrow(TypeError);
 		});
 
+		it('should define the first assignment on the object assigned to, not on the one that holds the field', function () {
+			const { context, runInitializers } = fakeContext('field', 'x');
+			decorators.readonly(undefined, context);
+			const base: { x: number | undefined } = { x: undefined };
+			runInitializers(base);
+			const derived = Object.create(base) as { x: number | undefined };
+			derived.x = 5;
+			expect([derived.x, Object.prototype.hasOwnProperty.call(derived, 'x'), base.x]).toEqual([5, true, undefined]);
+			base.x = 1;
+			expect(base.x).toBe(1);
+		});
+
 		it.each([
 			['method', {}, 'methods'],
 			['accessor', {}, 'accessors'],
@@ -260,6 +274,46 @@ describe('Decorators', function () {
 	});
 
 	describe('log', function () {
+		it('never changes the outcome of the method when logging fails, and logs promises of other realms', async function () {
+			const log = jest.spyOn(console, 'log').mockImplementation(function () {});
+			try {
+				let ran = 0;
+				const method = decorators.log(function (_value: unknown): unknown {
+					ran++;
+					const { proxy, revoke } = Proxy.revocable({}, {});
+					revoke();
+					return proxy;
+				}, fakeContext('method', 'm').context);
+				const unprintable = {
+					[util.inspect.custom](): never {
+						throw new Error('inspect');
+					}
+				};
+				log.mockImplementation(function (_message: unknown, value: unknown) {
+					util.inspect(value);
+				});
+				expect(function () {
+					method(unprintable);
+				}).not.toThrow();
+				expect(ran).toBe(1);
+				log.mockImplementation(function () {});
+				const foreign = decorators.log(function (): unknown {
+					return vm.runInNewContext('Promise.resolve(42)');
+				}, fakeContext('method', 'f').context);
+				await expect(foreign()).resolves.toBe(42);
+				expect(
+					log.mock.calls.some(function (call) {
+						return call[0] === 'f method resolved:' && call[1] === 42;
+					})
+				).toBe(true);
+				expect(function () {
+					decorators.log(method, fakeContext('class', 'C').context);
+				}).toThrow(new TypeError('@log can only decorate methods, not classes'));
+			} finally {
+				log.mockRestore();
+			}
+		});
+
 		let logSpy: jest.SpyInstance;
 
 		beforeEach(function () {
@@ -551,6 +605,15 @@ describe('Decorators', function () {
 	});
 
 	describe('debounced', function () {
+		it('should keep inherited options, which debounce itself reads', function () {
+			jest.useFakeTimers();
+
+			const spy = jest.fn();
+			const wrapped = decorators.debounced(10, Object.create({ leading: true, trailing: false }))(spy, fakeContext('method', 'm').context);
+			wrapped.call(undefined, 1);
+			expect(spy.mock.calls).toEqual([[1]]);
+		});
+
 		it('should use the options it validated, whatever later happens to the object', function () {
 			jest.useFakeTimers();
 

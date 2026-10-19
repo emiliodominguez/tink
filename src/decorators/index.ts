@@ -168,7 +168,7 @@ function resolveDescriptor(obj: object, key: string | symbol): PropertyDescripto
 function decorateMethod(decoratorName: string, wrap: MethodWrapper, targetOrValue: unknown, keyOrContext: unknown, descriptor: unknown): unknown {
 	if (isStandardContext(keyOrContext)) {
 		if (keyOrContext.kind !== 'method' || typeof targetOrValue !== 'function') {
-			throw new TypeError(`@${decoratorName} can only decorate methods, not ${keyOrContext.kind}s`);
+			throw new TypeError(`@${decoratorName} can only decorate methods, not ${kindsOf(keyOrContext.kind)}`);
 		}
 
 		return wrap(targetOrValue as UnknownMethod, String(keyOrContext.name));
@@ -245,7 +245,9 @@ export function readonly(targetOrValue: unknown, keyOrContext: unknown, descript
 		const context = keyOrContext;
 
 		if (context.kind !== 'field' || context.private || typeof context.addInitializer !== 'function') {
-			throw new TypeError(`@readonly can only decorate public fields when used as a standard decorator, not ${context.private ? 'private ' : ''}${context.kind}s`);
+			throw new TypeError(
+				`@readonly can only decorate public fields when used as a standard decorator, not ${context.private ? 'private ' : ''}${kindsOf(context.kind)}`
+			);
 		}
 
 		context.addInitializer(function lockField(this: unknown): void {
@@ -265,8 +267,10 @@ export function readonly(targetOrValue: unknown, keyOrContext: unknown, descript
 				get: function (): undefined {
 					return undefined;
 				},
-				set: function (value: unknown): void {
-					Object.defineProperty(owner, name, { value, writable: false, configurable: false, enumerable: field.enumerable });
+				// On the object assigned to (like the legacy setter), not `owner`: an assignment through a subclass or an object inheriting
+				// from `owner` must not lock `owner`.
+				set: function (this: object, value: unknown): void {
+					Object.defineProperty(this, name, { value, writable: false, configurable: false, enumerable: field.enumerable });
 				}
 			});
 		});
@@ -309,6 +313,50 @@ export function readonly(targetOrValue: unknown, keyOrContext: unknown, descript
 // ---------------------------------------------------------------------------------------------------------------------
 
 /**
+ * The plural of a decorator context kind, for error messages (`'classes'`, `'getters'`, …).
+ * @param {string} kind - The context kind
+ * @returns {string} Its plural
+ */
+function kindsOf(kind: string): string {
+	return kind === 'class' ? 'classes' : `${kind}s`;
+}
+
+/**
+ * Logs with `console.log`, ignoring a failure: logging must not change what the method does (a value whose inspection throws).
+ * @param {string} message - The message
+ * @param {unknown} value - The logged value
+ * @returns {void}
+ */
+function safeLog(message: string, value: unknown): void {
+	try {
+		// eslint-disable-next-line no-console
+		console.log(message, value);
+	} catch {
+		// See above.
+	}
+}
+
+/**
+ * Whether a method result is a promise, from this realm or another one (but not any thenable: calling `then` can start work).
+ * @param {unknown} value - The result
+ * @returns {boolean} `true` for a promise
+ */
+function isNativePromise(value: unknown): value is Promise<unknown> {
+	try {
+		return (
+			value instanceof Promise ||
+			(typeof value === 'object' &&
+				value !== null &&
+				Object.prototype.toString.call(value) === '[object Promise]' &&
+				typeof (value as Promise<unknown>).then === 'function')
+		);
+	} catch {
+		// A revoked proxy, or a trap that throws.
+		return false;
+	}
+}
+
+/**
  * Wraps a method so that its calls and results are logged.
  * @param {UnknownMethod} method - The original method
  * @param {string} name - The method name
@@ -316,38 +364,33 @@ export function readonly(targetOrValue: unknown, keyOrContext: unknown, descript
  */
 function wrapLog(method: UnknownMethod, name: string): UnknownMethod {
 	return function logged(this: unknown, ...args: unknown[]): unknown {
-		// eslint-disable-next-line no-console
-		console.log(`${name} method called with arguments:`, args);
+		safeLog(`${name} method called with arguments:`, args);
 
 		let result: unknown;
 
 		try {
 			result = method.apply(this, args);
 		} catch (error) {
-			// eslint-disable-next-line no-console
-			console.log(`${name} method threw:`, error);
+			safeLog(`${name} method threw:`, error);
 			throw error;
 		}
 
 		// A promise is logged through a promise chained on it, which is returned: handlers attached to the original instead would mark
 		// a rejection nobody handles as handled. Other thenables are left alone, since calling `then` can start their work (query builders).
-		if (result instanceof Promise) {
+		if (isNativePromise(result)) {
 			return result.then(
 				function (value: unknown): unknown {
-					// eslint-disable-next-line no-console
-					console.log(`${name} method resolved:`, value);
+					safeLog(`${name} method resolved:`, value);
 					return value;
 				},
 				function (error: unknown): never {
-					// eslint-disable-next-line no-console
-					console.log(`${name} method rejected:`, error);
+					safeLog(`${name} method rejected:`, error);
 					throw error;
 				}
 			);
 		}
 
-		// eslint-disable-next-line no-console
-		console.log(`${name} method returned:`, result);
+		safeLog(`${name} method returned:`, result);
 
 		return result;
 	};
@@ -507,7 +550,8 @@ let wrapMemoizeDefault: MethodWrapper | undefined;
  * - Legacy decorators: the method is replaced by a lazy getter that, on first access through an instance, binds the method and caches
  *   it as a (non-enumerable, writable) own property of that instance. Accessing it through the prototype returns the unbound method,
  *   and `super.method` accesses from an overriding subclass bind without caching (so the override is not shadowed). On non-extensible
- *   (e.g. frozen) instances, a freshly bound method is returned on every access.
+ *   (e.g. frozen) instances, a freshly bound method is returned on every access. Read through a `Proxy` (a reactive store), it is
+ *   bound to the proxy, which is what the getter receives, and cached on the target through it.
  * - Standard decorators: an initializer binds the method on each new instance (unless a subclass overrides it); static methods get the
  *   lazy getter above, so a subclass inheriting one binds it to the subclass. Private methods are rejected.
  *   When combining decorators, put `@bound` first (outermost), so that it sees the final method.
@@ -545,7 +589,7 @@ export function bound(targetOrValue: unknown, keyOrContext: unknown, descriptor?
 		const context = keyOrContext;
 
 		if (context.kind !== 'method' || context.private || typeof targetOrValue !== 'function' || typeof context.addInitializer !== 'function') {
-			throw new TypeError(`@bound can only decorate public methods, not ${context.private ? 'private ' : ''}${context.kind}s`);
+			throw new TypeError(`@bound can only decorate public methods, not ${context.private ? 'private ' : ''}${kindsOf(context.kind)}`);
 		}
 
 		const method = targetOrValue as UnknownMethod;
@@ -709,7 +753,14 @@ export function throttled(wait: number, options?: ThrottleOptions): UniversalMet
  * @returns {O} The copy
  */
 function copyOptions<O>(options: O): O {
-	return typeof options === 'object' && options !== null ? { ...options } : options;
+	if (typeof options !== 'object' || options === null) return options;
+
+	// Every enumerable key, inherited ones included: the wrapped helpers read options by plain property access.
+	const copy: Record<string, unknown> = {};
+
+	for (const key in options) copy[key] = (options as Record<string, unknown>)[key];
+
+	return copy as O;
 }
 
 /**
@@ -826,7 +877,7 @@ export function once(targetOrValue: unknown, keyOrContext: unknown, descriptor?:
  * ```
  */
 export function retryable(options: RetryOptions = {}, random: RandomGenerator = Math.random): AsyncMethodDecorator {
-	const snapshot: RetryOptions = { ...options };
+	const snapshot: RetryOptions = copyOptions(options);
 
 	return createMethodDecorator('retryable', function (method: UnknownMethod): UnknownMethod {
 		return function retryableMethod(this: unknown, ...args: unknown[]): Promise<unknown> {
