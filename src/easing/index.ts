@@ -113,7 +113,7 @@ export function easeOut(easing: EasingFunction): EasingFunction {
 
 /**
  * Builds a symmetric ease-in-out function from an ease-in function: the first half runs `easing` at double speed, the second
- * half its reflection, so that `g(1 - t) === 1 - g(t)` and `g(0.5) === 0.5`.
+ * half its reflection, so that `g(1 - t) = 1 - g(t)` (up to floating-point rounding) and, when `easing(1) === 1`, `g(0.5) === 0.5`.
  * @param {EasingFunction} easing - The ease-in function
  * @returns {EasingFunction} `t => t < 0.5 ? easing(2t) / 2 : 1 - easing(2 - 2t) / 2`
  * @throws {TypeError} when `easing` is not a function
@@ -148,7 +148,8 @@ function inOut(easing: EasingFunction, t: number): number {
  * linear(0.3); // => 0.3
  */
 export function linear(t: number): number {
-	return t;
+	// `+ 0` turns -0 into 0.
+	return t + 0;
 }
 
 /**

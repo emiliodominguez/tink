@@ -17,11 +17,7 @@ for (const family of families) {
 
 describe('Easing helpers', function () {
 	describe('named easings', function () {
-		it.each(
-			named.filter(function ([name]) {
-				return name !== 'linear';
-			})
-		)('%s should map -0 to 0, never -0', function (_name, easing) {
+		it.each(named)('%s should map -0 to 0, never -0', function (_name, easing) {
 			expect(Object.is(easing(-0), -0)).toBe(false);
 		});
 
