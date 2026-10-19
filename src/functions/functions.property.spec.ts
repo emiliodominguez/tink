@@ -65,9 +65,12 @@ describe('Functions helpers (properties)', function () {
 		it('the empty composition is a two-sided identity', function () {
 			fc.assert(
 				fc.property(intFn, smallInt, function (f, x) {
-					expect(compose(compose(), f)(x)).toBe(f(x));
-					expect(compose(f, compose())(x)).toBe(f(x));
-					expect(pipe(pipe(), f)(x)).toBe(f(x));
+					// Typed: a generic identity applied first leaves the input type open, which the typed overloads reject.
+					const identity: (value: number) => number = compose();
+					expect(compose(identity, f)(x)).toBe(f(x));
+					expect(compose(f, identity)(x)).toBe(f(x));
+					expect(pipe(identity, f)(x)).toBe(f(x));
+					expect(pipe(f, pipe())(x)).toBe(f(x));
 					expect(compose()(x)).toBe(x);
 				})
 			);

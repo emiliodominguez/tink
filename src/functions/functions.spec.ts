@@ -235,6 +235,23 @@ describe('Functions helpers', function () {
 	});
 
 	describe('pipe', function () {
+		it('rejects a step whose input does not match the previous output, and still accepts spread arrays', function () {
+			function length(text: string): number {
+				return text.length;
+			}
+			function increment(n: number): number {
+				return n + 1;
+			}
+			// @ts-expect-error `increment` returns a number, `length` takes a string
+			helpers.pipe(increment, length);
+			// @ts-expect-error same, right to left
+			helpers.compose(length, increment);
+			const steps = [increment, increment];
+			expect(helpers.pipe(...steps)(0)).toBe(2);
+			expect(helpers.compose(...steps)(0)).toBe(2);
+			expect(helpers.pipe(increment, increment, increment, increment, increment, increment, increment, increment)(0)).toBe(8);
+		});
+
 		function inc(x: number): number {
 			return x + 1;
 		}
@@ -1947,6 +1964,12 @@ describe('Functions helpers (round 11)', function () {
 	});
 
 	describe('match', function () {
+		it('names the `_` fallback, not the untrusted tag, when the fallback is not a function', function () {
+			expect(function () {
+				helpers.match({ kind: 'x'.repeat(300) } as { kind: string }, 'kind', { _: 'oops' as any });
+			}).toThrow(new TypeError('match: `handlers._` must be a function, got string'));
+		});
+
 		type Shape = { kind: 'circle'; radius: number } | { kind: 'square'; size: number } | { kind: 'rect'; width: number; height: number };
 
 		it('uses the `_` fallback for a member whose handler key is present but undefined', function () {

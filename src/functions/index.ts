@@ -314,7 +314,7 @@ export function compose<A extends unknown[], R1, R2, R3, R4, R5, R>(
 	f2: (value: R1) => R2,
 	f1: (...args: A) => R1
 ): (...args: A) => R;
-export function compose<R = unknown>(...fns: AnyFunction[]): (...args: unknown[]) => R;
+export function compose<R = unknown, F extends AnyFunction[] = AnyFunction[]>(...fns: UncheckedChain<F>): (...args: unknown[]) => R;
 /**
  * Implementation of {@link compose} (see the first overload for the full documentation).
  * @param {...AnyFunction} fns - The functions to compose, applied right to left
@@ -325,6 +325,14 @@ export function compose(...fns: AnyFunction[]): (...args: unknown[]) => unknown 
 	// `fns` is a fresh rest array, so it can be reversed in place.
 	return chain(fns.reverse() as unknown as UnknownFunction[]);
 }
+
+/**
+ * The functions accepted by the untyped overloads of {@link pipe} and {@link compose}: a spread array, or more functions than the typed
+ * overloads cover. Up to six functions listed one by one, only the typed overloads apply, so that a step whose input does not match
+ * the previous output is a compile error instead of falling back to an untyped chain.
+ * @template F - The functions
+ */
+type UncheckedChain<F extends AnyFunction[]> = number extends F['length'] ? F : F['length'] extends 0 | 1 | 2 | 3 | 4 | 5 | 6 ? never : F;
 
 /**
  * Composes functions from left to right: `pipe(f, g, h)(...args)` is `h(g(f(...args)))`.
@@ -360,7 +368,7 @@ export function pipe<A extends unknown[], R1, R2, R3, R4, R5, R>(
 	f5: (value: R4) => R5,
 	f6: (value: R5) => R
 ): (...args: A) => R;
-export function pipe<R = unknown>(...fns: AnyFunction[]): (...args: unknown[]) => R;
+export function pipe<R = unknown, F extends AnyFunction[] = AnyFunction[]>(...fns: UncheckedChain<F>): (...args: unknown[]) => R;
 /**
  * Implementation of {@link pipe} (see the first overload for the full documentation).
  * @param {...AnyFunction} fns - The functions to chain, applied left to right
@@ -1602,7 +1610,8 @@ export function match<T extends object, K extends keyof T, H extends MatchHandle
 
 	// The tag may come from untrusted data: quote at most 100 characters of it, so that the message stays safe to log.
 	if (handler === undefined) throw new AssertionError(`match: no handler for \`${String(key)}\` ${JSON.stringify(tag.slice(0, 100))}`);
-	assertFunction('match', `handlers.${tag}`, handler);
+	// A tag without its own handler fell back to `_` (and may be untrusted): name the handler actually used.
+	assertFunction('match', `handlers.${own === undefined ? '_' : tag}`, handler);
 
 	return (handler as (value: T) => unknown)(value) as MatchResult<H>;
 }
