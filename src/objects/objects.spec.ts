@@ -3368,3 +3368,118 @@ describe('objects (helper review regressions)', function () {
 		expect([renamed[symbol], renamed.A]).toEqual([1, 2]);
 	});
 });
+
+describe('Objects helpers (pass 3 regressions)', function () {
+	it('terminates on a Proxy that is its own prototype, and treats Object.prototype of other realms as such', function () {
+		const looping: object = new Proxy(
+			{},
+			{
+				getPrototypeOf(): object {
+					return looping;
+				}
+			}
+		);
+		expect(helpers.getPath(looping as Record<string, unknown>, 'toString')).toBeUndefined();
+		const foreign = vm.runInNewContext('({ viewer: {} })') as { viewer: Record<string, unknown> };
+		expect(helpers.getPath(foreign, 'viewer.toString')).toBeUndefined();
+		expect(helpers.hasPath(foreign, 'viewer.__defineGetter__')).toBe(false);
+		expect(helpers.hasPath(Object.create(null) as Record<string, unknown>, 'toString')).toBe(false);
+		// A value no object of a prototype-less chain owns (a Proxy's get trap) is readable.
+		const answering = new Proxy(Object.create(null) as Record<string, unknown>, {
+			get(): number {
+				return 1;
+			}
+		});
+		expect(helpers.getPath(answering, 'toString')).toBe(1);
+	});
+
+	it('compares shared subtrees once', function () {
+		let node: object = { leaf: 1 };
+		for (let i = 0; i < 40; i++) node = { l: node, r: node };
+		const started = Date.now();
+		expect(helpers.isEqual(node, helpers.deepClone(node))).toBe(true);
+		expect(Date.now() - started).toBeLessThan(1000);
+	});
+
+	it('walks huge sparse arrays by their elements', function () {
+		const sparse: number[] = [];
+		sparse[0] = 1;
+		sparse[2 ** 32 - 2] = 2;
+		const copy: number[] = [];
+		copy[0] = 1;
+		copy[2 ** 32 - 2] = 2;
+		(sparse as unknown as Record<string, unknown>).extra = 'x';
+		expect(helpers.shallowEqual(sparse, copy)).toBe(true);
+		expect(helpers.sortKeys(sparse)[2 ** 32 - 2]).toBe(2);
+		expect(helpers.toCamelCaseKeys(sparse)[0]).toBe(1);
+		expect(helpers.isMatch(sparse, [2], { arrays: 'subset' })).toBe(true);
+	});
+
+	it('never reads the holes of an array through a polluted Array.prototype', function () {
+		const indexes = Array.prototype as unknown as Record<number, unknown>;
+		indexes[1] = 'x';
+		try {
+			// eslint-disable-next-line no-sparse-arrays
+			expect(helpers.stableStringify([1, , 3])).not.toBe(helpers.stableStringify([1, 'x', 3]));
+			// eslint-disable-next-line no-sparse-arrays
+			expect(Object.prototype.hasOwnProperty.call(helpers.sortKeys([1, , 3]), 1)).toBe(false);
+		} finally {
+			delete indexes[1];
+		}
+	});
+
+	it('sets keys inherited read-only on containers it creates', function () {
+		const original = Object.getOwnPropertyDescriptor(Object.prototype, 'valueOf') as PropertyDescriptor;
+		Object.defineProperty(Object.prototype, 'valueOf', { ...original, writable: false });
+		try {
+			expect(helpers.unflattenObject({ valueOf: 1 })).toEqual({ valueOf: 1 });
+			expect(helpers.setPath({}, 'a.valueOf', 1)).toEqual({ a: { valueOf: 1 } });
+		} finally {
+			Object.defineProperty(Object.prototype, 'valueOf', original);
+		}
+	});
+
+	it('turns an array built by earlier keys into an object for a non-index key', function () {
+		expect(helpers.unflattenObject({ 'a.0': 'x', 'a.length': 3 })).toEqual({ a: { 0: 'x', length: 3 } });
+		expect(helpers.unflattenObject(helpers.flattenObject({ list: { 0: 'x', length: 1 } }))).toEqual({ list: { 0: 'x', length: 1 } });
+	});
+
+	it('quotes class names that are not identifiers in stableStringify', function () {
+		const Strange = { ['1,"z":']: class {} }['1,"z":'];
+		expect(helpers.stableStringify({ k: new Strange() })).not.toBe(helpers.stableStringify({ k: 1, z: {} }));
+	});
+
+	it('rejects keys that are not keys in mapKeys, and entries that are not arrays in typedFromEntries', function () {
+		expect(function () {
+			helpers.mapKeys({ a: 1 }, function () {
+				return {} as never;
+			});
+		}).toThrow(TypeError);
+		expect(function () {
+			helpers.typedFromEntries(['ab'] as never);
+		}).toThrow(new TypeError('typedFromEntries: every entry must be a [key, value] array, got string'));
+	});
+
+	it('copies an Error whose getter deletes another property', function () {
+		const error = new Error('boom') as Error & { a?: unknown; b?: unknown };
+		// Copying `a` reads its `x` getter, which deletes `b` before `b` is reached.
+		error.a = {
+			get x(): number {
+				delete error.b;
+				return 1;
+			}
+		};
+		error.b = 2;
+		expect(function () {
+			helpers.deepClone(error);
+		}).not.toThrow();
+	});
+
+	it('narrows with hasProperty only for keys the type does not declare', function () {
+		const config: { port: number } = Object.create({ port: 80 }) as { port: number };
+		if (!helpers.hasProperty(config, 'port')) {
+			const port: number = config.port;
+			expect(port).toBe(80);
+		}
+	});
+});

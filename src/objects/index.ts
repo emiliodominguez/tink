@@ -244,6 +244,45 @@ function definePlain(object: object, key: PropertyKey, value: unknown): void {
 	else (object as Properties)[key] = value;
 }
 
+/** Above this length, arrays are walked through their own keys: a sparse array of length `2 ** 32 - 1` may hold only a few items. */
+const SPARSE_SCAN = 65536;
+
+/**
+ * The indexes of the own elements of an array, in order: what `forEach` visits, but never read through a (polluted) prototype, and
+ * without walking every hole of a huge sparse array.
+ * @param {ArrayLike<unknown>} array - The array
+ * @returns {number[]} The indexes of its own elements
+ */
+function presentIndexes(array: ArrayLike<unknown>): number[] {
+	const indexes: number[] = [];
+	if (array.length <= SPARSE_SCAN) {
+		for (let index = 0; index < array.length; index++) if (hasOwn(array, index)) indexes.push(index);
+		return indexes;
+	}
+	// Own integer keys are listed first, in ascending order.
+	for (const key of Object.keys(array)) {
+		const index = Number(key);
+		if (!(String(index) === key && index < array.length)) break;
+		indexes.push(index);
+	}
+	return indexes;
+}
+
+/** The longest prototype chain the read rule walks: a `Proxy` can report itself as its own prototype, forever. */
+const MAX_PROTOTYPE_DEPTH = 10_000;
+
+/**
+ * Whether `value` is the `Object.prototype` of another realm (an iframe, a `vm` context): an object without a prototype that owns the
+ * `__proto__` accessor.
+ * @param {unknown} value - A prototype chain member
+ * @returns {boolean} `true` for a foreign `Object.prototype`
+ */
+function isForeignObjectPrototype(value: unknown): boolean {
+	return (
+		typeof value === 'object' && value !== null && Object.getPrototypeOf(value) === null && typeof Object.getOwnPropertyDescriptor(value, '__proto__')?.get === 'function'
+	);
+}
+
 /**
  * Whether reading `key` from `object` must NOT resolve, which is the read rule shared by {@link getPath},
  * {@link getProperty}, {@link hasPath} and {@link pick}: `__proto__`, `constructor` and `prototype` never resolve (not even
@@ -269,10 +308,12 @@ function isUnreadable(object: unknown, key: PropertyKey): boolean {
  */
 function isObjectPrototypeKey(object: unknown, key: PropertyKey): boolean {
 	if (key === '__proto__' || key === 'constructor') return true;
-	for (let current = object; current !== Object.prototype; current = Object.getPrototypeOf(current)) {
-		if (current === null || hasOwn(current as object, key)) return false;
+	for (let current = object, depth = 0; current !== null; current = Object.getPrototypeOf(current), depth++) {
+		// An `Object.prototype` (of this realm or another one) holds the key; an endless chain (a lying `Proxy`) counts as unreadable.
+		if (current === Object.prototype || depth > MAX_PROTOTYPE_DEPTH || isForeignObjectPrototype(current)) return true;
+		if (hasOwn(current as object, key)) return false;
 	}
-	return true;
+	return false;
 }
 
 /**
@@ -497,7 +538,8 @@ export function clone<T>(value: T): T {
 
 /**
  * Determines whether an object has an OWN property with the given key (inherited properties such as `toString` do not count).
- * Acts as a type guard: on success `object` is narrowed to `T & Record<K, unknown>`.
+ * Acts as a type guard for keys `T` does not declare: on success `object` is narrowed to `T & Record<K, unknown>`. A key `T` declares
+ * narrows nothing (it may be inherited, so the `false` branch must keep `T`).
  * @template T - The object type
  * @template K - The key type
  * @param {T} object - The object to check
@@ -507,7 +549,23 @@ export function clone<T>(value: T): T {
  * hasProperty({ a: 1 }, 'a'); // => true
  * hasProperty({}, 'toString'); // => false // inherited
  */
-export function hasProperty<T extends object, K extends PropertyKey>(object: T, property: K): object is T & Record<K, unknown> {
+export function hasProperty<T extends object, K extends keyof T>(object: T, property: K): boolean;
+/**
+ * Checks whether `object` has `property` as an OWN property (see the first overload), narrowing `object` to have it.
+ * @template T - The object type
+ * @template K - The property key type
+ * @param {T} object - The object to inspect
+ * @param {K} property - The property key
+ * @returns {boolean} Whether the property is an own property
+ */
+export function hasProperty<T extends object, K extends PropertyKey>(object: T, property: K): object is T & Record<K, unknown>;
+/**
+ * Implementation of {@link hasProperty}.
+ * @param {object} object - The object to inspect
+ * @param {PropertyKey} property - The property key
+ * @returns {boolean} Whether the property is an own property
+ */
+export function hasProperty(object: object, property: PropertyKey): boolean {
 	return hasOwn(object, property);
 }
 
@@ -698,7 +756,12 @@ export function mapKeys<T extends object, K extends PropertyKey>(object: T, fn: 
 	const result = {} as Record<K, T[keyof T]>;
 	for (const key of ownEnumerableKeys(object)) {
 		const value = (object as Properties)[key] as T[keyof T];
-		definePlain(result, fn(value, key as keyof T, object), value);
+		const newKey: unknown = fn(value, key as keyof T, object);
+		// Like `mapEntries`: a key that is not one (an object, `undefined`) is an error, not silently `'[object Object]'`.
+		if (typeof newKey !== 'string' && typeof newKey !== 'number' && typeof newKey !== 'symbol') {
+			throw new TypeError(`mapKeys: \`fn\` must return a string, number or symbol, got ${describe(newKey)} for ${String(key)}`);
+		}
+		definePlain(result, newKey, value);
 	}
 	return result;
 }
@@ -821,10 +884,10 @@ function assignPath(
 			next = container;
 		} else if (!isObject(next) && !isFunction(next)) {
 			throw new TypeError(`${caller}: cannot set "${path}": "${segments.slice(0, index + 1).join(separator)}" is a ${typeof next}, not an object`);
-		} else if (owned !== undefined && Number(segments[index + 1]) > arrayLimit && CANONICAL_INDEX.test(segments[index + 1]) && Array.isArray(next)) {
-			// An array created by an earlier key would grow past the limit: it becomes a plain object (its keys are path segments,
-			// never `__proto__`, so assigning them is safe), still owned. `current` owns `segment` as a data property: plain assignment.
-			// (The numeric comparison comes first: it is cheap, and false for the usual segments, names and small indices.)
+		} else if (owned !== undefined && Array.isArray(next) && (Number(segments[index + 1]) > arrayLimit || !CANONICAL_INDEX.test(segments[index + 1]))) {
+			// An array created by an earlier key would grow past the limit, or get a key that is not an index (`length`, which arrays own,
+			// or a name): it becomes a plain object (its keys are path segments, never `__proto__`, so assigning them is safe), still
+			// owned. `current` owns `segment` as a data property: plain assignment.
 			next = Object.assign({}, next);
 			owned.add(next as object);
 			current[segment] = next;
@@ -836,7 +899,10 @@ function assignPath(
 	if (owned !== undefined && hasOwn(current, segments[last])) {
 		throw new TypeError(`${caller}: cannot set "${path}": "${segments.join(separator)}" already holds values set by other keys`);
 	}
-	current[segments[last]] = value;
+	// A container created here (every container of `unflattenObject`) gets an own data property even for an inherited key: an
+	// inherited setter would take the value, and a frozen `Object.prototype` (`toString`) would make the assignment throw.
+	if (fresh || owned !== undefined) definePlain(current, segments[last], value);
+	else current[segments[last]] = value;
 }
 
 /**
@@ -1041,7 +1107,8 @@ function rewriteRoot(caller: string, target: unknown, path: string, update: ((cu
  * @param {PathUpdateValue<T, P> | ((current: PathUpdateValue<T, P>) => PathUpdateValue<T, P>)} valueOrUpdater - The new value, or a function computing it from the current one
  * @returns {T} The new root (or `target` when nothing changes)
  * @throws {TypeError} when `target` is not a plain object or an array
- * @throws {RangeError} when the path has an empty segment, or a `__proto__`, `constructor` or `prototype` segment
+ * @throws {RangeError} when the path has an empty segment, or a `__proto__`, `constructor` or `prototype` segment, or so many segments
+ *   (thousands) that the copy, which recurses once per segment, overflows the stack
  * @throws {TypeError} when an intermediate value is a primitive or an object that is neither a plain object nor an array
  * @example
  * const state = { user: { name: 'Ada', visits: 1 }, todos: [{ done: false }] };
@@ -1077,7 +1144,8 @@ export function updatePath<T extends object, P extends string>(
  * @param {P} path - The dot-separated path, e.g. `'a.b'`
  * @returns {OmitAtPath<T, P>} The new root (or `target` when the path does not exist)
  * @throws {TypeError} when `target` is not a plain object or an array
- * @throws {RangeError} when the path has an empty segment, or a `__proto__`, `constructor` or `prototype` segment
+ * @throws {RangeError} when the path has an empty segment, or a `__proto__`, `constructor` or `prototype` segment, or so many segments
+ *   (thousands) that the copy, which recurses once per segment, overflows the stack
  * @throws {TypeError} when an intermediate object on the path is neither a plain object nor an array
  * @example
  * const config = { a: { b: 1, c: 2 }, d: { e: 3 } };
@@ -1231,7 +1299,9 @@ function copyWith(value: unknown, seen?: Map<object, unknown>): unknown {
 	// Errors keep all their own properties (`message` and `stack` are not enumerable), as they are defined (getters included).
 	for (const key of error ? Reflect.ownKeys(value) : ownEnumerableKeys(value)) {
 		if (error) {
-			const descriptor = Object.getOwnPropertyDescriptor(value, key) as PropertyDescriptor;
+			const descriptor = Object.getOwnPropertyDescriptor(value, key);
+			// A getter copied earlier may have deleted this property.
+			if (descriptor === undefined) continue;
 			if ('value' in descriptor) descriptor.value = copyChild(descriptor.value, seen);
 			// V8 defines `stack` as an own accessor reading an internal slot of the original, which the copy lacks: copy its value.
 			else if (key === 'stack') {
@@ -1706,7 +1776,19 @@ export type EqualityCustomizer = (a: unknown, b: unknown, context: EqualityConte
  * Pairs of objects currently being compared by {@link isEqual} (used to detect cycles), with the key under which each pair was
  * reached; {@link isEqualWith} attaches its customizer (and the matching `equals` function) to it.
  */
-type ComparisonStack = Array<[object, object, unknown?]> & { customizer?: EqualityCustomizer; equals?: (a: unknown, b: unknown) => boolean };
+type ComparisonStack = Array<[object, object, unknown?]> & {
+	customizer?: EqualityCustomizer;
+	equals?: (a: unknown, b: unknown) => boolean;
+	/** The number of object pairs compared so far (see `proven`). */
+	compared?: number;
+	/** How many times a pair under comparison was assumed equal (a cycle): results reached meanwhile only hold under that assumption. */
+	assumed?: number;
+	/** Pairs with a large subtree proven equal without assumptions: a subtree shared by several paths is then compared once. */
+	proven?: WeakMap<object, object>;
+};
+
+/** How many nested object pairs an equal pair must have needed for {@link isEqual} to remember it (small subtrees are cheaper to redo). */
+const PROVEN_SUBTREE = 64;
 
 /**
  * Compares two `Map`s: same size and every entry of `a` matches a distinct entry of `b` (keys and values deeply equal).
@@ -1869,11 +1951,21 @@ function equalWith(a: unknown, b: unknown, stack: ComparisonStack, key?: unknown
 	if (stack.customizer !== undefined) return customEqual(a, b, stack, key, stack.customizer);
 	if (sameValueZero(a, b)) return true;
 	if (!isObject(a) || !isObject(b) || !sameKind(a, b)) return false;
-	if (isComparing(stack, a, b)) return true;
+	if (isComparing(stack, a, b)) {
+		stack.assumed = (stack.assumed ?? 0) + 1;
+		return true;
+	}
+	if (stack.proven?.get(a) === b) return true;
+
+	const assumed = stack.assumed ?? 0;
+	const compared = (stack.compared = (stack.compared ?? 0) + 1);
 
 	stack.push([a, b]);
 	const result = objectsEqual(a, b, stack);
 	stack.pop();
+	// A value reached through several paths (`{ l: node, r: node }` at every level) would otherwise be compared once per path: an
+	// exponential number of times. An equality that assumed no pair equal holds anywhere, so the pairs with large subtrees are remembered.
+	if (result && (stack.compared as number) - compared > PROVEN_SUBTREE && (stack.assumed ?? 0) === assumed) (stack.proven ??= new WeakMap()).set(a, b);
 	return result;
 }
 
@@ -2000,8 +2092,8 @@ function matchWith(value: unknown, pattern: unknown, subset: boolean, stack: Com
 		const items = value as unknown[];
 		result = subset
 			? (pattern as unknown[]).every(function (expected) {
-					return items.some(function (item) {
-						return matchWith(item, expected, subset, stack);
+					return presentIndexes(items).some(function (index: number) {
+						return matchWith(items[index], expected, subset, stack);
 					});
 				})
 			: items.length === (pattern as unknown[]).length &&
@@ -2070,6 +2162,17 @@ export function shallowEqual(a: unknown, b: unknown): boolean {
 		if (tag !== getTag(b)) return false;
 		if (Array.isArray(a)) {
 			if (!Array.isArray(b) || a.length !== b.length) return false;
+			if (a.length > SPARSE_SCAN) {
+				// Huge (usually sparse) arrays: the same own elements, holes included.
+				const left = presentIndexes(a);
+				const right = presentIndexes(b);
+				return (
+					left.length === right.length &&
+					left.every(function (index: number, position: number): boolean {
+						return right[position] === index && sameValueZero(a[index], b[index]);
+					})
+				);
+			}
 			for (let index = 0; index < a.length; index++) {
 				const item = a[index];
 				if (!sameValueZero(item, b[index]) || (item === undefined && index in a !== index in b)) return false;
@@ -2220,7 +2323,12 @@ export function typedEntries<T extends object>(object: T): Array<EntryOf<T>> {
  */
 export function typedFromEntries<E extends readonly [PropertyKey, unknown]>(entries: Iterable<E>): FromEntries<E> {
 	const result = {};
-	for (const [key, value] of entries) definePlain(result, key, value);
+	for (const entry of entries) {
+		// Like `Object.fromEntries`: an entry must be an object (`'ab'` would otherwise give `{ a: 'b' }`).
+		if (typeof entry !== 'object' || entry === null) throw new TypeError(`typedFromEntries: every entry must be a [key, value] array, got ${describe(entry)}`);
+		const [key, value] = entry;
+		definePlain(result, key, value);
+	}
 	return result as FromEntries<E>;
 }
 
@@ -2763,7 +2871,7 @@ function sortKeysWith(value: unknown, compare: ((a: string, b: string) => number
 	let result: object;
 	if (Array.isArray(value)) {
 		const copy = new Array<unknown>(value.length);
-		for (let index = 0; index < value.length; index++) if (index in value) copy[index] = ancestors ? sortKeysWith(value[index], compare, ancestors) : value[index];
+		for (const index of presentIndexes(value)) copy[index] = ancestors ? sortKeysWith(value[index], compare, ancestors) : value[index];
 		result = copy;
 	} else {
 		result = emptyLike(value);
@@ -3082,7 +3190,7 @@ function renameKeys(caller: string, value: unknown, rename: (key: string) => str
 	let result: object;
 	if (Array.isArray(value)) {
 		const copy = new Array<unknown>(value.length);
-		for (let index = 0; index < value.length; index++) if (index in value) copy[index] = renameKeys(caller, value[index], rename, ancestors);
+		for (const index of presentIndexes(value)) copy[index] = renameKeys(caller, value[index], rename, ancestors);
 		result = copy;
 	} else {
 		result = emptyLike(value);
@@ -3232,10 +3340,11 @@ function encodeItems(items: ArrayLike<unknown>, ancestors: object[]): string {
 	let text = '[';
 	for (let index = 0; index < items.length; index++) {
 		if (index > 0) text += ',';
-		if (index in items) text += encodeValue(items[index], ancestors);
+		// Own elements only: a hole must not read a value from a polluted `Array.prototype`.
+		if (hasOwn(items, index)) text += encodeValue(items[index], ancestors);
 	}
 	// As in array literals, a trailing hole needs one more comma: otherwise `new Array(1)` would encode like `[]`.
-	if (items.length > 0 && !(items.length - 1 in items)) text += ',';
+	if (items.length > 0 && !hasOwn(items, items.length - 1)) text += ',';
 	return text + ']';
 }
 
@@ -3275,8 +3384,12 @@ function encodeSpecial(value: object, ancestors: object[]): string {
 	if (isBoxed) return `${getTag(value).slice(8, -1)}(${encodeValue(primitive, ancestors)})`;
 	const constructor = (Object.getPrototypeOf(value) as { constructor?: unknown } | null)?.constructor;
 	const name = typeof constructor === 'function' && constructor.name !== '' ? constructor.name : '?';
-	return name + encodeMembers(value, ancestors);
+	// A name that is not an identifier (a computed class name such as `'1,"z":'`) is quoted: written as is, it could read as other data.
+	return (name === '?' || IDENTIFIER.test(name) ? name : JSON.stringify(name)) + encodeMembers(value, ancestors);
 }
+
+/** A JavaScript identifier (ASCII or not): how class names are written in {@link stableStringify}'s output. */
+const IDENTIFIER = /^[\p{ID_Start}$_][\p{ID_Continue}$\u200c\u200d]*$/u;
 
 /**
  * Recursive worker of {@link stableStringify}.
