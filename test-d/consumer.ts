@@ -15,11 +15,36 @@ import {
 	toStandardSchema,
 	isDiscriminatedUnion,
 	isFiniteNumber,
-	isIntegerInRange
+	isIntegerInRange,
+	isOneOf,
+	issuesByPath
 } from 'tinkit/guards';
 import type { Infer } from 'tinkit/guards';
-import { arrayOf, asBoolean, asDate, asInteger, chain, isUrl, optional, parse, safeParse, toParser, transform, withDefault } from 'tinkit/validate';
-import type { SchemaOutput } from 'tinkit/validate';
+import {
+	arrayOf,
+	asArray,
+	asBoolean,
+	asDate,
+	asInteger,
+	asJson,
+	asNumber,
+	chain,
+	discriminatedUnion,
+	exact,
+	isUrl,
+	lazy,
+	optional,
+	parse,
+	partial,
+	recordOf,
+	safeParse,
+	toParser,
+	transform,
+	tuple,
+	union,
+	withDefault
+} from 'tinkit/validate';
+import type { Parser, SchemaOutput } from 'tinkit/validate';
 import type { StandardSchemaV1 } from '@standard-schema/spec';
 // The root entry pulls in every module's declarations.
 import * as everything from 'tinkit';
@@ -142,9 +167,28 @@ const envSpec: StandardSchemaV1<unknown, Env> = toParser(envSchema);
 // @ts-expect-error the default must match the schema's output
 const badDefault = withDefault(asInteger, 'x');
 
+// Unions, records, tuples and recursion keep precise output types.
+const event = discriminatedUnion('type', { click: { x: asInteger }, key: { code: isString }, 1: { legacy: asBoolean } });
+type Event = SchemaOutput<typeof event>;
+const click: Event = { type: 'click', x: 1 };
+const legacy: Event = { type: '1', legacy: true };
+// @ts-expect-error a key event has a code, not coordinates
+const badEvent: Event = { type: 'key', x: 1 };
+const shapes = { id: union(asInteger, isString), point: tuple(asNumber, asNumber), scores: recordOf(asInteger), tags: asArray(isString), meta: asJson({ v: asInteger }) };
+const parsedShapes: { id: number | string; point: [number, number]; scores: Record<string, number>; tags: string[]; meta: { v: number } } = parse(shapes, {});
+const locales: Partial<Record<'en' | 'fr', string>> = parse(recordOf(isString, isOneOf(['en', 'fr'])), {});
+type Category = { name: string; children: Category[] };
+const category: Parser<Category> = lazy(function () {
+	return { name: isString, children: arrayOf(category) };
+});
+const patch: { name?: string | undefined; age?: number | undefined } = parse(partial({ name: isString, age: asInteger }), {});
+const strict: { x: number } = parse(exact({ x: asNumber }), {});
+const fieldErrors: Record<string, string[]> = issuesByPath([]);
+
 // README tour: key transforms keep their value types.
 const camel: { userId: number; createdAt: string } = toCamelCaseKeys({ user_id: 1, created_at: '2024-01-01' });
 // @ts-expect-error the snake_case key no longer exists
 const snake = camel.user_id;
 export { a, b, c, keys, v, m, dm, p, o, r, f, g, everything, spec, output, wrong, camel, snake };
 export { figure, badFigure, envBack, envWrong, port, envSpec, badDefault };
+export { click, legacy, badEvent, parsedShapes, locales, category, patch, strict, fieldErrors };

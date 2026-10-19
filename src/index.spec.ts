@@ -275,4 +275,60 @@ describe('README examples', function () {
 		expect(box.calls).toBe(1);
 		expect(new SearchBox().score('abc')).toBe(3);
 	});
+
+	it('should match the parse examples (README and the forms recipe)', function () {
+		const { guards, url, validate } = root;
+		const environment = { PORT: '8080', MODE: 'prod', DATABASE_URL: 'https://db.example.com', HOME: '/root' };
+
+		expect(
+			validate.parse(
+				{
+					PORT: validate.withDefault(validate.chain(validate.asInteger, guards.isIntegerInRange(1, 65535)), 3000),
+					DEBUG: validate.withDefault(validate.asBoolean, false),
+					MODE: guards.isOneOf(['dev', 'prod']),
+					DATABASE_URL: validate.isUrl
+				},
+				environment
+			)
+		).toEqual({ PORT: 8080, DEBUG: false, MODE: 'prod', DATABASE_URL: 'https://db.example.com' });
+
+		const signup = {
+			email: validate.isEmail,
+			name: validate.blankAsUndefined(guards.isStringOfLength(1, 50)),
+			age: validate.blankAsUndefined(validate.optional(validate.asInteger)),
+			newsletter: validate.withDefault(validate.asBoolean, false)
+		};
+		const [error] = validate.safeParse(signup, { email: 'not-an-email', name: '  ', age: '' });
+
+		expect(guards.issuesByPath(error?.issues ?? [])).toEqual({ email: ['Invalid value (got string)'], name: ['Missing required property'] });
+		expect(validate.parse(signup, { email: 'ada@example.com', name: 'Ada', age: '', newsletter: 'on' })).toEqual({
+			email: 'ada@example.com',
+			name: 'Ada',
+			newsletter: true
+		});
+
+		const search = {
+			tag: validate.withDefault(validate.asArray(validate.isSlug), function () {
+				return [];
+			}),
+			page: validate.withDefault(validate.asInteger, 1),
+			sort: validate.withDefault(guards.isOneOf(['new', 'top']), 'new')
+		};
+
+		expect(validate.parse(search, url.parseQueryString('?tag=ts&tag=js&page=2'))).toEqual({ tag: ['ts', 'js'], page: 2, sort: 'new' });
+
+		const event = validate.discriminatedUnion('type', { click: { x: validate.asInteger, y: validate.asInteger }, key: { code: guards.isString } });
+
+		expect(validate.parse(event, { type: 'click', x: '10', y: '20', target: 'button' })).toEqual({ type: 'click', x: 10, y: 20 });
+
+		const flags = {
+			FEATURE_FLAGS: validate.withDefault(validate.asJson(validate.recordOf(guards.isBoolean)), function () {
+				return {};
+			})
+		};
+
+		expect(validate.parse(flags, { FEATURE_FLAGS: '{"beta":true}' })).toEqual({ FEATURE_FLAGS: { beta: true } });
+		expect(validate.parse(flags, {})).toEqual({ FEATURE_FLAGS: {} });
+		expect(validate.safeParse(flags, { FEATURE_FLAGS: '{"__proto__":{"beta":true}}' })[0]).toBeInstanceOf(guards.ValidationError);
+	});
 });

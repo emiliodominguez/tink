@@ -6,8 +6,10 @@ Zod-like schemas, without the dependency:
 
 - **`validate`: `parse` / `safeParse`** take a plain object of guards and parsers, return a typed output with unknown keys stripped, and report every issue with its path (`ValidationError`). Object schemas compile to specialized code on first use (falling back to a loop where `new Function` is blocked, e.g. by a CSP), and the bundled benchmarks parse nested records 1.6× faster than zod 4.
 - **Strict coercion:** `asNumber`, `asInteger`, `asBoolean` and `asDate` reject what `z.coerce` silently converts (`''` → `0`, `'false'` → `true`, `null` → `0`, `'2023-02-29'` → March 1st, unsafe integers).
-- **Combinators:** `withDefault`, `optional`, `transform`, `chain` (zod's `.pipe()`), `arrayOf`, and `toParser` to hand any schema to a Standard Schema consumer. Every parser is a Standard Schema validator, and Standard Schema validators (zod, valibot…) can be nested in a schema.
+- **Combinators:** `withDefault`, `optional`, `nullable`, `transform`, `chain` (zod's `.pipe()`), `arrayOf`, `tuple`, `recordOf` (with an optional key guard), `union`, `discriminatedUnion` (direct variant lookup, tag first in the output; 1.25× faster than zod on the bundled event benchmark), cycle-safe `lazy`, `exact` (reject unknown keys), `partial`, and `toParser` to hand any schema to a Standard Schema consumer. Every parser is a Standard Schema validator, and Standard Schema validators (zod, valibot, ArkType…) can be nested in a schema.
+- **Real-world input:** `asArray` (a repeated query parameter is a string or an array), `blankAsUndefined` (an empty form field counts as missing) and `asJson` (JSON in an environment variable, pollution-safe); `issuesByPath` (`guards`) turns issues into per-field messages.
 - **`guards`:** `isDiscriminatedUnion` (direct variant lookup, with the tag added to each variant's type), `isIntegerInRange`, `isStringOfLength` and `isStringMatching` (stateless with `g`/`y` regexes). Their failures are explained without echoing the rejected strings.
+- **Fixed:** `isArrayOf` and `isTuple` read the holes of a sparse array through a polluted `Array.prototype` or `Object.prototype`; holes are now always checked as `undefined`.
 
 ## 1.0.1
 

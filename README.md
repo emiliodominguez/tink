@@ -61,7 +61,7 @@ const [error, user] = parseJson(body, isUser); // never throws: a typed User, or
 const schema = toStandardSchema(isUser); // for your form or RPC library
 ```
 
-When the input needs converting as well as checking, `parse` takes a plain object of guards and parsers. Coercion is strict where `z.coerce` is not, and object schemas compile to specialized code, faster than zod 4 on the bundled benchmarks:
+When the input needs converting as well as checking, `parse` takes a plain object of guards and parsers. Coercion is strict where `z.coerce` is not, and object schemas compile to specialized code: 1.2–1.6× faster than zod 4 on the bundled record and event benchmarks (`yarn bench validate`):
 
 ```ts
 import { isIntegerInRange, isOneOf } from 'tinkit/guards';
@@ -78,7 +78,7 @@ const env = parse(
 ); // { PORT: number; DEBUG: boolean; MODE: 'dev' | 'prod'; DATABASE_URL: string }, every other variable stripped
 ```
 
-`asNumber('')` fails instead of returning `0`, `asInteger` rejects integers that would lose precision, and `asDate` rejects `'2023-02-29'` and offset-less local times. Every parser is a Standard Schema validator, and zod schemas can be nested inside.
+`asNumber('')` fails instead of returning `0`, `asInteger` rejects integers that would lose precision, and `asDate` rejects `'2023-02-29'` and offset-less local times. Every parser is a Standard Schema validator, and zod schemas can be nested inside. `union`, `discriminatedUnion`, `recordOf`, `tuple`, `lazy`, `exact` and `partial` cover the rest of zod's shapes; `asArray`, `blankAsUndefined` and `asJson` handle repeated query parameters, empty form fields and JSON in environment variables; `issuesByPath` turns issues into per-field messages.
 
 ## Hostile input is a non-event
 

@@ -17,7 +17,9 @@ import {
 	asBoolean,
 	asDate,
 	asInteger,
+	asNumber,
 	chain,
+	discriminatedUnion,
 	safeParse,
 	withDefault
 } from 'tinkit/validate';
@@ -164,6 +166,31 @@ const zodAccounts = z.array(
 const badAccounts = accounts.map(function (account, index) {
 	return index % 10 === 0 ? { ...account, id: 'x', profile: { city: 1 } } : account;
 });
+// A stream of tagged events: four variants, coerced fields, unknown keys to strip.
+const events = Array.from({ length: 100 }, function (_, index) {
+	return [
+		{ type: 'click', x: String(index), y: '20', extra: 1 },
+		{ type: 'key', code: 'Enter', repeat: 'false' },
+		{ type: 'scroll', delta: String(index / 2) },
+		{ type: 'resize', width: '800', height: '600' }
+	][index % 4];
+});
+const eventsSchema = arrayOf(
+	discriminatedUnion('type', {
+		click: { x: asInteger, y: asInteger },
+		key: { code: isString, repeat: asBoolean },
+		scroll: { delta: asNumber },
+		resize: { width: asInteger, height: asInteger }
+	})
+);
+const zodEvents = z.array(
+	z.discriminatedUnion('type', [
+		z.object({ type: z.literal('click'), x: z.coerce.number().int(), y: z.coerce.number().int() }),
+		z.object({ type: z.literal('key'), code: z.string(), repeat: z.stringbool() }),
+		z.object({ type: z.literal('scroll'), delta: z.coerce.number() }),
+		z.object({ type: z.literal('resize'), width: z.coerce.number().int(), height: z.coerce.number().int() })
+	])
+);
 
 /**
  * The usual "safe" JSON.parse snippet: try/catch plus a reviver dropping `__proto__` keys.
@@ -288,6 +315,17 @@ export default [
 		competitors: {
 			zod: function () {
 				return zodAccounts.safeParse(badAccounts);
+			}
+		}
+	},
+	{
+		name: 'safeParse: 100 tagged events (discriminated union, coerce, strip)',
+		fn: function () {
+			return safeParse(eventsSchema, events);
+		},
+		competitors: {
+			zod: function () {
+				return zodEvents.safeParse(events);
 			}
 		}
 	},

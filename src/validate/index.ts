@@ -986,8 +986,11 @@ export function parseJson(text: string, guardOrOptions?: Guard<unknown> | ParseJ
 	return [undefined, value];
 }
 
-/** What a {@link Fast} parse returns for an invalid value. */
-const FAIL = Symbol('tink.fail');
+/**
+ * What a {@link Fast} parse returns for an invalid value. A registered symbol, so that two copies of this module (two installed
+ * versions, or a duplicated bundle) agree on it when the parsers of one are nested in the schemas of the other.
+ */
+const FAIL = Symbol.for('tinkit.parse.fail');
 
 /**
  * Parses `value` without reporting anything: returns the output, or {@link FAIL} at the first problem. Valid values (the common case)
@@ -1010,6 +1013,28 @@ interface Node {
 	readonly run: Run;
 	/** The guard, when the schema is a guard (its output is then its input). */
 	readonly guard: Guard<unknown> | undefined;
+	/**
+	 * Whether a present property value counts as missing for this schema (see {@link blankAsUndefined}): an object then reports
+	 * `Missing required property` for it, and leaves the key out when the output is `undefined`.
+	 */
+	readonly missing?: ((value: unknown) => boolean) | undefined;
+	/**
+	 * Whether the schema gives `undefined` a meaning of its own (a default, an optional value), so that its issues for a missing
+	 * property are genuine (a default that fails a later check) instead of being summed up as `Missing required property`.
+	 */
+	readonly handlesMissing?: boolean | undefined;
+}
+
+/**
+ * Whether the property `key` of an object counts as present for `child`: an own property whose value `child` does not treat as missing.
+ * @param {Node} child - The property's compiled schema
+ * @param {object} value - The object
+ * @param {string} key - The key
+ * @param {unknown} raw - The property value (`undefined` when it is not own)
+ * @returns {boolean} Whether the property is present
+ */
+function isPresent(child: Node, value: object, key: string, raw: unknown): boolean {
+	return hasOwn.call(value, key) && (child.missing === undefined || !child.missing(raw));
 }
 
 /** A parser created by this module. */
@@ -1137,15 +1162,16 @@ function invalidSchema(caller: string, name: string, schema: unknown): TypeError
 function compile(caller: string, name: string, schema: unknown, ancestors: object[]): Node {
 	if ((typeof schema !== 'function' && typeof schema !== 'object') || schema === null) throw invalidSchema(caller, name, schema);
 
-	const own = (schema as Partial<CompiledParser<unknown>>)['~tink'];
+	const own = nodeOf(schema);
 
 	if (own !== undefined) return own;
 
 	let node = compiled.get(schema);
 
 	if (node !== undefined) return node;
-	if (typeof schema === 'function') node = guardNode(schema as Guard<unknown>);
-	else if (isStandardSchema(schema)) node = standardNode(schema);
+	// Standard Schema first: some validators are callable (ArkType's types), and calling them as guards would accept anything.
+	if (isStandardSchema(schema)) node = standardNode(schema);
+	else if (typeof schema === 'function') node = guardNode(schema as Guard<unknown>);
 	else if (isPlainObject(schema)) node = objectNode(caller, name, schema as ObjectSchema, ancestors);
 	else throw invalidSchema(caller, name, schema);
 	compiled.set(schema, node);
@@ -1154,14 +1180,31 @@ function compile(caller: string, name: string, schema: unknown, ancestors: objec
 }
 
 /**
- * Whether `value` looks like a Standard Schema validator.
- * @param {object} value - A non-null object
- * @returns {boolean} `true` when `value['~standard'].validate` is a function
+ * Returns the compiled schema of a parser created by this module (or by another copy of it): an OWN `'~tink'` property holding a
+ * node, so neither a polluted `Object.prototype` nor an object schema with a `'~tink'` key passes for a parser.
+ * @param {object} schema - A function or a non-null object
+ * @returns {Node | undefined} The node, or `undefined` for anything else
+ */
+function nodeOf(schema: object): Node | undefined {
+	if (!hasOwn.call(schema, '~tink')) return undefined;
+
+	const node = (schema as Partial<CompiledParser<unknown>>)['~tink'];
+
+	return typeof node === 'object' && node !== null && typeof node.fast === 'function' && typeof node.run === 'function' ? node : undefined;
+}
+
+/**
+ * Whether `value` is a Standard Schema validator: a `'~standard'` object of version 1 with a `validate` function. The property may
+ * be inherited (some libraries define it on a prototype), but not from a polluted `Object.prototype` or `Function.prototype`.
+ * @param {object} value - A function or a non-null object
+ * @returns {boolean} Whether `value` is a Standard Schema validator
  */
 function isStandardSchema(value: object): value is StandardSchemaLike {
 	const props = (value as Partial<StandardSchemaLike>)['~standard'];
 
-	return typeof props === 'object' && props !== null && typeof props.validate === 'function';
+	if (typeof props !== 'object' || props === null || props.version !== 1 || typeof props.validate !== 'function') return false;
+
+	return hasOwn.call(value, '~standard') || (!hasOwn.call(Object.prototype, '~standard') && !hasOwn.call(Function.prototype, '~standard'));
 }
 
 /**
@@ -1294,15 +1337,15 @@ function objectLoop(keys: ReadonlyArray<string>, children: ReadonlyArray<Node>):
 			const key = keys[index];
 			const child = children[index];
 			// Inherited properties never count, so a polluted `Object.prototype` cannot fill in a missing key.
-			const present = hasOwn.call(value, key);
-			let result = present ? (value as Record<string, unknown>)[key] : undefined;
+			const raw = hasOwn.call(value, key) ? (value as Record<string, unknown>)[key] : undefined;
+			let result = raw;
 
 			if (child.guard !== undefined) {
 				if (!child.guard(result)) return FAIL;
 			} else if ((result = child.fast(result)) === FAIL) {
 				return FAIL;
 			}
-			if (result !== undefined || present) assign(output, key, result);
+			if (result !== undefined || isPresent(child, value, key, raw)) assign(output, key, result);
 		}
 
 		return output;
@@ -1327,16 +1370,19 @@ function generateObject(keys: ReadonlyArray<string>, children: ReadonlyArray<Nod
 	});
 	const lines = children.map(function (child: Node, index: number): string {
 		const key = literals[index];
-		const read =
-			child.guard === undefined
-				? `result = c${index}(value[${key}]); if (result === FAIL) return FAIL;`
-				: `result = value[${key}]; if (!c${index}(result)) return FAIL;`;
 
-		return `${read} if (result !== undefined || hasOwn.call(value, ${key})) output[${key}] = result;`;
+		if (child.guard !== undefined) {
+			return `result = value[${key}]; if (!c${index}(result)) return FAIL; if (result !== undefined || hasOwn.call(value, ${key})) output[${key}] = result;`;
+		}
+		if (child.missing !== undefined) {
+			return `input = value[${key}]; result = c${index}(input); if (result === FAIL) return FAIL; if (result !== undefined || (hasOwn.call(value, ${key}) && !m${index}(input))) output[${key}] = result;`;
+		}
+
+		return `result = c${index}(value[${key}]); if (result === FAIL) return FAIL; if (result !== undefined || hasOwn.call(value, ${key})) output[${key}] = result;`;
 	});
 	const source = [
-		...children.map(function (_: Node, index: number): string {
-			return `const c${index} = children[${index}];`;
+		...children.map(function (child: Node, index: number): string {
+			return `const c${index} = children[${index}];${child.missing === undefined ? '' : ` const m${index} = missing[${index}];`}`;
 		}),
 		'return function fastObject(value) {',
 		"if (typeof value !== 'object' || value === null || isArray(value)) return FAIL;",
@@ -1347,14 +1393,14 @@ function generateObject(keys: ReadonlyArray<string>, children: ReadonlyArray<Nod
 			})
 			.join('')}) return loop(value);`,
 		'const output = {};',
-		'let result;',
+		'let result, input;',
 		...lines,
 		'return output;',
 		'};'
 	].join('\n');
 
 	try {
-		const factory = new Function('FAIL', 'OP', 'isArray', 'getPrototypeOf', 'hasOwn', 'loop', 'children', source) as (...args: unknown[]) => Fast;
+		const factory = new Function('FAIL', 'OP', 'isArray', 'getPrototypeOf', 'hasOwn', 'loop', 'children', 'missing', source) as (...args: unknown[]) => Fast;
 
 		jit = true;
 
@@ -1367,11 +1413,15 @@ function generateObject(keys: ReadonlyArray<string>, children: ReadonlyArray<Nod
 			loop,
 			children.map(function (child: Node): AnyFunction {
 				return child.guard ?? child.fast;
+			}),
+			children.map(function (child: Node): unknown {
+				return child.missing;
 			})
 		);
-	} catch {
-		// Code generation from strings is disallowed (a Content Security Policy without 'unsafe-eval', Cloudflare Workers…).
-		jit = false;
+	} catch (error) {
+		// Code generation from strings is disallowed (a Content Security Policy without 'unsafe-eval', Cloudflare Workers…): stop trying.
+		// Any other error (a stack overflow while compiling deep inside a recursion) only sends this schema to the loop.
+		if (error instanceof EvalError) jit = false;
 
 		return undefined;
 	}
@@ -1395,16 +1445,18 @@ function objectRun(keys: ReadonlyArray<string>, children: ReadonlyArray<Node>): 
 
 		for (let index = 0; index < keys.length; index++) {
 			const key = keys[index];
-			const present = hasOwn.call(value, key);
+			const raw = hasOwn.call(value, key) ? (value as Record<string, unknown>)[key] : undefined;
+			const present = isPresent(children[index], value, key, raw);
 			const before = issues.length;
 
 			path.push(key);
 
-			const result = rerun(children[index], present ? (value as Record<string, unknown>)[key] : undefined, path, issues);
+			const result = rerun(children[index], raw, path, issues);
 
 			path.pop();
 			if (issues.length > before) {
-				if (!present) {
+				// A missing property fails as such, unless its schema handles `undefined` (then a default can genuinely fail a later check).
+				if (!present && children[index].handlesMissing !== true) {
 					issues.length = before;
 					issues.push({ message: 'Missing required property', path: [...path, key] });
 				}
@@ -1595,7 +1647,8 @@ export function withDefault<S extends Schema>(
 		},
 		// Only reached when the fast parse failed, so never for `undefined`.
 		run: node.run,
-		guard: undefined
+		guard: undefined,
+		handlesMissing: true
 	});
 }
 
@@ -1611,16 +1664,7 @@ export function withDefault<S extends Schema>(
  * parse({ limit: optional(asInteger) }, { limit: '10' }); // => { limit: 10 }
  */
 export function optional<S extends Schema>(schema: S): Parser<SchemaOutput<S> | undefined> {
-	const node = compile('optional', 'schema', schema, []);
-
-	return toCompiledParser({
-		fast: function fastOptional(value: unknown): unknown {
-			return value === undefined ? undefined : node.fast(value);
-		},
-		// Only reached when the fast parse failed, so never for `undefined`.
-		run: node.run,
-		guard: undefined
-	});
+	return toCompiledParser(optionalNode(compile('optional', 'schema', schema, [])));
 }
 
 /**
@@ -1656,7 +1700,8 @@ export function transform<S extends Schema, U>(schema: S, fn: (value: SchemaOutp
 
 			return issues.length > before ? undefined : fn(output as SchemaOutput<S>);
 		},
-		guard: undefined
+		guard: undefined,
+		handlesMissing: node.handlesMissing
 	});
 }
 
@@ -1690,7 +1735,8 @@ export function chain<A extends Schema, B extends Schema>(first: A, second: B): 
 
 			return issues.length > before ? undefined : rerun(tail, output, path, issues);
 		},
-		guard: undefined
+		guard: undefined,
+		handlesMissing: head.handlesMissing
 	});
 }
 
@@ -1708,43 +1754,684 @@ export function chain<A extends Schema, B extends Schema>(first: A, second: B): 
  */
 export function arrayOf<S extends Schema>(schema: S): Parser<SchemaOutput<S>[]> {
 	const node = compile('arrayOf', 'schema', schema, []);
-	const { guard, fast } = node;
 
 	return toCompiledParser({
 		fast: function fastArray(value: unknown): unknown {
-			if (!Array.isArray(value)) return FAIL;
+			return Array.isArray(value) ? parseElements(node, value) : FAIL;
+		},
+		run: function runArray(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			if (Array.isArray(value)) return reportElements(node, value, path, issues);
+			issues.push({ message: `Expected an array (got ${describe(value)})`, path: path.slice() });
+
+			return undefined;
+		},
+		guard: undefined
+	});
+}
+
+/**
+ * Parses every element of an array with the same schema (the fast parse of {@link arrayOf} and {@link asArray}).
+ * @param {Node} node - The element schema
+ * @param {ReadonlyArray<unknown>} elements - The elements (holes are read as `undefined`)
+ * @returns {unknown} The new array of outputs, or {@link FAIL}
+ */
+function parseElements(node: Node, elements: ReadonlyArray<unknown>): unknown {
+	const { guard, fast } = node;
+	const output: unknown[] = [];
+	const direct = !isArrayPrototypePolluted();
+
+	for (let index = 0; index < elements.length; index++) {
+		let element = direct || hasOwn.call(elements, index) ? elements[index] : undefined;
+
+		if (guard !== undefined) {
+			if (!guard(element)) return FAIL;
+		} else if ((element = fast(element)) === FAIL) {
+			return FAIL;
+		}
+		output.push(element);
+	}
+
+	return output;
+}
+
+/**
+ * Parses every element of an array with the same schema, reporting the issues of each with its index.
+ * @param {Node} node - The element schema
+ * @param {ReadonlyArray<unknown>} elements - The elements
+ * @param {PropertyKey[]} path - The path of the array
+ * @param {SchemaIssue[]} issues - Where issues are pushed
+ * @returns {unknown[]} The new array of outputs
+ */
+function reportElements(node: Node, elements: ReadonlyArray<unknown>, path: PropertyKey[], issues: SchemaIssue[]): unknown[] {
+	const output: unknown[] = [];
+	const direct = !isArrayPrototypePolluted();
+
+	for (let index = 0; index < elements.length; index++) {
+		path.push(index);
+		output.push(rerun(node, direct || hasOwn.call(elements, index) ? elements[index] : undefined, path, issues));
+		path.pop();
+	}
+
+	return output;
+}
+
+/**
+ * Whether `Array.prototype` (or `Object.prototype`, which it inherits from) has an enumerable property: what prototype pollution adds,
+ * and what the holes of a sparse array would then read. Arrays are read element by element without an own-property check otherwise,
+ * which keeps that check (2.5 times the cost of reading an element) off the common path.
+ * @returns {boolean} Whether array elements must be read as own properties
+ */
+function isArrayPrototypePolluted(): boolean {
+	for (const key in Array.prototype) return typeof key === 'string';
+
+	return false;
+}
+
+/**
+ * Creates a parser like {@link arrayOf} that also accepts a single value, parsed as a one-element array: the shape of repeated query
+ * parameters (`?tag=a` gives `'a'`, `?tag=a&tag=b` gives `['a', 'b']`) and of multi-value form fields. `undefined` is not wrapped, so
+ * a missing key still fails: pair with {@link withDefault} for an empty default. An issue of a single value is reported at the
+ * value's own path, without an index.
+ * @template S - The element schema
+ * @param {S} schema - The schema of each element
+ * @returns {Parser<SchemaOutput<S>[]>} The parser
+ * @throws {TypeError} when `schema` is not a {@link Schema}
+ * @example
+ * import { parseQueryString } from 'tinkit/url';
+ * const query = { tag: withDefault(asArray(isSlug), function () { return []; }), page: withDefault(asInteger, 1) };
+ * parse(query, parseQueryString('?tag=ts&page=2')); // => { tag: ['ts'], page: 2 }
+ * parse(query, parseQueryString('?tag=ts&tag=js')); // => { tag: ['ts', 'js'], page: 1 }
+ * parse(query, parseQueryString('')); // => { tag: [], page: 1 }
+ */
+export function asArray<S extends Schema>(schema: S): Parser<SchemaOutput<S>[]> {
+	const node = compile('asArray', 'schema', schema, []);
+
+	return toCompiledParser({
+		fast: function fastAsArray(value: unknown): unknown {
+			if (Array.isArray(value)) return parseElements(node, value);
+			if (value === undefined) return FAIL;
+
+			const element = node.fast(value);
+
+			return element === FAIL ? FAIL : [element];
+		},
+		run: function runAsArray(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			if (Array.isArray(value)) return reportElements(node, value, path, issues);
+			if (value === undefined) {
+				issues.push({ message: 'Expected a value or an array (got undefined)', path: path.slice() });
+
+				return undefined;
+			}
+
+			return [node.run(value, path, issues)];
+		},
+		guard: undefined
+	});
+}
+
+/**
+ * Creates a parser for arrays of exactly `schemas.length` elements, each parsed with the schema at the same index (`z.tuple()`).
+ * @template S - The element schemas
+ * @param {...S} schemas - One schema per position
+ * @returns {Parser<{ -readonly [I in keyof S]: SchemaOutput<S[I]> }>} The parser, returning a new array
+ * @throws {TypeError} when a schema is not a {@link Schema}
+ * @example
+ * const point = tuple(asNumber, asNumber);
+ * parse(point, ['1.5', 2]); // => [1.5, 2]
+ * safeParse(point, [1])[0]?.issues; // => [{ message: 'Expected a tuple of 2 elements (got 1 elements)', path: [] }]
+ */
+export function tuple<const S extends ReadonlyArray<Schema>>(...schemas: S): Parser<{ -readonly [I in keyof S]: SchemaOutput<S[I]> }> {
+	const nodes = schemas.map(function (schema: Schema, index: number): Node {
+		return compile('tuple', `schemas[${index}]`, schema, []);
+	});
+
+	return toCompiledParser({
+		fast: function fastTuple(value: unknown): unknown {
+			if (!Array.isArray(value) || value.length !== nodes.length) return FAIL;
 
 			const output: unknown[] = [];
+			const direct = !isArrayPrototypePolluted();
 
-			for (let index = 0; index < value.length; index++) {
-				let element = value[index];
+			for (let index = 0; index < nodes.length; index++) {
+				const element = nodes[index].fast(direct || hasOwn.call(value, index) ? value[index] : undefined);
 
-				if (guard !== undefined) {
-					if (!guard(element)) return FAIL;
-				} else if ((element = fast(element)) === FAIL) {
-					return FAIL;
-				}
+				if (element === FAIL) return FAIL;
 				output.push(element);
 			}
 
 			return output;
 		},
-		run: function runArray(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
-			if (!Array.isArray(value)) {
-				issues.push({ message: `Expected an array (got ${describe(value)})`, path: path.slice() });
+		run: function runTuple(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			if (!Array.isArray(value) || value.length !== nodes.length) {
+				const got = Array.isArray(value) ? `${value.length} elements` : describe(value);
+
+				issues.push({ message: `Expected a tuple of ${nodes.length} elements (got ${got})`, path: path.slice() });
 
 				return undefined;
 			}
 
 			const output: unknown[] = [];
+			const direct = !isArrayPrototypePolluted();
 
-			for (let index = 0; index < value.length; index++) {
+			for (let index = 0; index < nodes.length; index++) {
 				path.push(index);
-				output.push(rerun(node, value[index], path, issues));
+				output.push(rerun(nodes[index], direct || hasOwn.call(value, index) ? value[index] : undefined, path, issues));
 				path.pop();
 			}
 
 			return output;
+		},
+		guard: undefined
+	});
+}
+
+/**
+ * Creates a parser that accepts `null` (returned as is) and parses any other value with `schema` (`.nullable()` in zod). For guards,
+ * the guards module's `isNullable` does the same.
+ * @template S - The schema
+ * @param {S} schema - The schema for non-null values
+ * @returns {Parser<SchemaOutput<S> | null>} The parser
+ * @throws {TypeError} when `schema` is not a {@link Schema}
+ * @example
+ * parse({ deletedAt: nullable(asDate) }, { deletedAt: null }); // => { deletedAt: null }
+ * parse({ deletedAt: nullable(asDate) }, { deletedAt: 0 }); // => { deletedAt: new Date(0) }
+ */
+export function nullable<S extends Schema>(schema: S): Parser<SchemaOutput<S> | null> {
+	const node = compile('nullable', 'schema', schema, []);
+
+	return toCompiledParser({
+		fast: function fastNullable(value: unknown): unknown {
+			return value === null ? null : node.fast(value);
+		},
+		// Only reached when the fast parse failed, so never for `null`.
+		run: node.run,
+		guard: undefined,
+		handlesMissing: node.handlesMissing
+	});
+}
+
+/**
+ * Wraps a compiled schema so that `undefined` is accepted and returned as is (see {@link optional} and {@link partial}).
+ * @param {Node} node - The schema for defined values
+ * @returns {Node} The optional schema
+ */
+function optionalNode(node: Node): Node {
+	return {
+		fast: function fastOptional(value: unknown): unknown {
+			return value === undefined ? undefined : node.fast(value);
+		},
+		// Only reached when the fast parse failed, so never for `undefined`.
+		run: node.run,
+		guard: undefined,
+		handlesMissing: true
+	};
+}
+
+/**
+ * Throws a `TypeError` unless `schema` is a plain object of schemas (not a guard, a parser or another Standard Schema validator).
+ * @param {string} caller - The public function name
+ * @param {string} name - The parameter name
+ * @param {unknown} schema - The value to check
+ * @returns {void}
+ * @throws {TypeError} when `schema` is not a plain object, or is a Standard Schema validator
+ */
+function assertObjectSchema(caller: string, name: string, schema: unknown): asserts schema is ObjectSchema {
+	if (!isPlainObject(schema) || isStandardSchema(schema)) {
+		throw new TypeError(`${caller}: \`${name}\` must be a plain object of schemas, got ${Array.isArray(schema) ? 'array' : describe(schema)}`);
+	}
+}
+
+/**
+ * Turns an object schema into one whose every property is optional (`.partial()` in zod): each schema is wrapped with
+ * {@link optional}. The result is a plain object schema again, so it can be spread, picked (`objects.pick`) or nested. Shallow:
+ * nested object schemas keep their required keys.
+ * @template S - The object schema
+ * @param {S} schema - The object schema
+ * @returns {{ -readonly [K in keyof S]: Parser<SchemaOutput<S[K]> | undefined> }} The new object schema
+ * @throws {TypeError} when `schema` is not a plain object of schemas
+ * @example
+ * import { isString } from 'tinkit/guards';
+ * const user = { name: isString, age: asInteger };
+ * const patch = partial(user);
+ * parse(patch, { age: '37' }); // => { age: 37 }
+ * parse(patch, {}); // => {}
+ */
+export function partial<S extends ObjectSchema>(schema: S): { -readonly [K in keyof S]: Parser<SchemaOutput<S[K]> | undefined> } {
+	assertObjectSchema('partial', 'schema', schema);
+
+	const output: Record<string, unknown> = {};
+
+	for (const key of Object.keys(schema)) assign(output, key, toCompiledParser(optionalNode(compile('partial', `schema.${key}`, schema[key], []))));
+
+	return output as { -readonly [K in keyof S]: Parser<SchemaOutput<S[K]> | undefined> };
+}
+
+/**
+ * Creates a parser like an object schema that also rejects unknown keys (`z.strictObject()`), reporting each with `Unknown property`,
+ * instead of stripping them. Only own enumerable string keys count.
+ * @template S - The object schema
+ * @param {S} schema - The object schema
+ * @returns {Parser<SchemaOutput<S>>} The parser
+ * @throws {TypeError} when `schema` is not a plain object of schemas
+ * @example
+ * const point = exact({ x: asNumber, y: asNumber });
+ * parse(point, { x: '1', y: 2 }); // => { x: 1, y: 2 }
+ * safeParse(point, { x: 1, y: 2, z: 3 })[0]?.issues; // => [{ message: 'Unknown property', path: ['z'] }]
+ */
+export function exact<S extends ObjectSchema>(schema: S): Parser<SchemaOutput<S>> {
+	assertObjectSchema('exact', 'schema', schema);
+
+	const node = compile('exact', 'schema', schema, []);
+	const known = new Set(Object.keys(schema));
+
+	return toCompiledParser({
+		fast: function fastExact(value: unknown): unknown {
+			const output = node.fast(value);
+
+			if (output === FAIL) return FAIL;
+			for (const key in value as object) if (hasOwn.call(value, key) && !known.has(key)) return FAIL;
+
+			return output;
+		},
+		run: function runExact(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			const output = rerun(node, value, path, issues);
+
+			if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+				for (const key in value) if (hasOwn.call(value, key) && !known.has(key)) issues.push({ message: 'Unknown property', path: [...path, key] });
+			}
+
+			return output;
+		},
+		guard: undefined
+	});
+}
+
+/**
+ * Lists strings for a message: `"a"`, `"a" or "b"`, `"a", "b" or "c"`.
+ * @param {ReadonlyArray<string>} values - The strings
+ * @returns {string} The list
+ */
+function alternatives(values: ReadonlyArray<string>): string {
+	const quoted = values.map(function (value: string): string {
+		return JSON.stringify(value);
+	});
+
+	return quoted.length === 1 ? quoted[0] : `${quoted.slice(0, -1).join(', ')} or ${quoted[quoted.length - 1]}`;
+}
+
+/**
+ * Creates a parser that returns the output of the first of `schemas` that accepts the value (`z.union()`). When none does, the issues
+ * of the schema that came closest (fewest issues) are reported: for objects that differ by a field, that is the matching variant.
+ * For objects tagged by a field, {@link discriminatedUnion} is faster and reports better.
+ * @template S - The member schemas
+ * @param {...S} schemas - The member schemas, tried in order (at least one)
+ * @returns {Parser<SchemaOutput<S[number]>>} The parser
+ * @throws {TypeError} when a member is not a {@link Schema}
+ * @throws {RangeError} when no schema is given
+ * @example
+ * const id = union(asInteger, isUuid);
+ * parse(id, '42'); // => 42
+ * parse(id, 'f47ac10b-58cc-4372-a567-0e02b2c3d479'); // => 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
+ * parse(id, 'x'); // throws ValidationError
+ */
+export function union<const S extends ReadonlyArray<Schema>>(...schemas: S): Parser<SchemaOutput<S[number]>> {
+	if (schemas.length === 0) throw new RangeError('union: expected at least one schema, got 0');
+
+	const nodes = schemas.map(function (schema: Schema, index: number): Node {
+		return compile('union', `schemas[${index}]`, schema, []);
+	});
+
+	return toCompiledParser({
+		fast: function fastUnion(value: unknown): unknown {
+			for (let index = 0; index < nodes.length; index++) {
+				const output = nodes[index].fast(value);
+
+				if (output !== FAIL) return output;
+			}
+
+			return FAIL;
+		},
+		run: function runUnion(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			let closest: SchemaIssue[] | undefined;
+
+			for (let index = 0; index < nodes.length; index++) {
+				const attempt: SchemaIssue[] = [];
+				const output = nodes[index].run(value, path, attempt);
+
+				// A member that accepts the value on this second pass (it is not deterministic) wins.
+				if (attempt.length === 0) return output;
+				if (closest === undefined || attempt.length < closest.length) closest = attempt;
+			}
+			issues.push(...(closest as SchemaIssue[]));
+
+			return undefined;
+		},
+		guard: undefined,
+		handlesMissing: nodes.some(function (node: Node): boolean {
+			return node.handlesMissing === true;
+		})
+	});
+}
+
+/**
+ * The output type of a {@link discriminatedUnion} parser: for each variant, its output with the discriminant set to the variant name.
+ * @template K - The discriminant key
+ * @template V - The variant object schemas, by discriminant value
+ */
+export type DiscriminatedUnionOutput<K extends string, V extends { readonly [tag: string]: ObjectSchema }> = {
+	[T in keyof V & (string | number)]: { [P in K]: `${T}` } & SchemaOutput<V[T]> extends infer O ? { [P in keyof O]: O[P] } : never;
+}[keyof V & (string | number)];
+
+/**
+ * Creates a parser for objects tagged by the OWN string property `key` (`z.discriminatedUnion()`): the variant named by the tag parses
+ * the object, and the output starts with the tag. Each variant is an object schema of the other properties (it may repeat the tag,
+ * whose schema is then ignored). The variant is looked up directly, so parsing stays fast with many variants, and an invalid value is
+ * reported against the right variant, or with the allowed tags when the tag is wrong. Tags are strings; inherited properties
+ * (`toString`, a polluted `Object.prototype`) never count.
+ * @template K - The discriminant key
+ * @template V - The variant object schemas, by discriminant value
+ * @param {K} key - The discriminant property, e.g. `'type'`
+ * @param {V} variants - A plain object mapping each discriminant value to the object schema of its variant (at least one)
+ * @returns {Parser<DiscriminatedUnionOutput<K, V>>} The parser
+ * @throws {TypeError} when `key` is not a string, `variants` is not a plain object, or a variant is not a plain object of schemas
+ * @throws {RangeError} when `variants` is empty
+ * @example
+ * import { isString } from 'tinkit/guards';
+ * const event = discriminatedUnion('type', {
+ *   click: { x: asInteger, y: asInteger },
+ *   key: { code: isString }
+ * });
+ * parse(event, { type: 'click', x: '10', y: '20', extra: 1 }); // => { type: 'click', x: 10, y: 20 }
+ * safeParse(event, { type: 'key' })[0]?.issues; // => [{ message: 'Missing required property', path: ['code'] }]
+ * safeParse(event, { type: 'scroll' })[0]?.issues; // => [{ message: 'Expected "click" or "key" (got string)', path: ['type'] }]
+ */
+export function discriminatedUnion<const K extends string, const V extends { readonly [tag: string]: ObjectSchema }>(
+	key: K,
+	variants: V
+): Parser<DiscriminatedUnionOutput<K, V>> {
+	if (typeof key !== 'string') throw new TypeError(`discriminatedUnion: \`key\` must be a string, got ${describe(key)}`);
+	if (!isPlainObject(variants)) {
+		throw new TypeError(`discriminatedUnion: \`variants\` must be a plain object, got ${Array.isArray(variants) ? 'array' : describe(variants)}`);
+	}
+
+	const tags = Object.keys(variants);
+
+	if (tags.length === 0) throw new RangeError('discriminatedUnion: `variants` must have at least one variant, got 0');
+
+	const lookup = new Map<unknown, Node>();
+
+	for (const tag of tags) {
+		const variant: unknown = variants[tag];
+
+		assertObjectSchema('discriminatedUnion', `variants.${tag}`, variant);
+
+		// The variant with the tag first: the output starts with it, and the object keeps its generated fast parse.
+		const tagged: Record<string, unknown> = {};
+
+		assign(tagged, key, function isTag(value: unknown): value is string {
+			return value === tag;
+		});
+		for (const name of Object.keys(variant)) if (name !== key) assign(tagged, name, variant[name]);
+		lookup.set(tag, compile('discriminatedUnion', `variants.${tag}`, tagged, []));
+	}
+
+	const expected = `Expected ${alternatives(tags)}`;
+
+	return toCompiledParser({
+		fast: function fastDiscriminated(value: unknown): unknown {
+			if (typeof value !== 'object' || value === null || Array.isArray(value)) return FAIL;
+
+			const node = hasOwn.call(value, key) ? lookup.get((value as Record<string, unknown>)[key]) : undefined;
+
+			return node === undefined ? FAIL : node.fast(value);
+		},
+		run: function runDiscriminated(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+				issues.push({ message: `Expected an object (got ${Array.isArray(value) ? 'array' : describe(value)})`, path: path.slice() });
+
+				return undefined;
+			}
+			if (!hasOwn.call(value, key)) {
+				issues.push({ message: 'Missing required property', path: [...path, key] });
+
+				return undefined;
+			}
+
+			const tag = (value as Record<string, unknown>)[key];
+			const node = lookup.get(tag);
+
+			if (node !== undefined) return node.run(value, path, issues);
+			issues.push({ message: `${expected} (got ${describe(tag)})`, path: [...path, key] });
+
+			return undefined;
+		},
+		guard: undefined
+	});
+}
+
+/**
+ * Creates a parser for plain objects used as dictionaries (`z.record()`): every own enumerable string key is kept, its value parsed
+ * with `schema`, and, when `keys` is given, the key itself checked by that guard. The output is a new object (an own `__proto__` key
+ * stays an own property). Class instances, maps and arrays are rejected; symbol keys are ignored.
+ * @template S - The value schema
+ * @template K - The key type
+ * @param {S} schema - The schema of every value
+ * @param {Guard<K>} [keys] - A guard every key must pass, e.g. `isOneOf(['en', 'fr'])` or `isStringMatching(/^[a-z]{2}$/)`
+ * @returns {Parser<string extends K ? Record<string, SchemaOutput<S>> : Partial<Record<K, SchemaOutput<S>>>>} The parser
+ * @throws {TypeError} when `schema` is not a {@link Schema}, or `keys` is neither a function nor `undefined`
+ * @example
+ * import { isOneOf, isString } from 'tinkit/guards';
+ * parse(recordOf(asInteger), { a: '1', b: 2 }); // => { a: 1, b: 2 }
+ * const translations = recordOf(isString, isOneOf(['en', 'fr']));
+ * safeParse(translations, { en: 'Hi', de: 'Hallo' })[0]?.issues; // => [{ message: 'Invalid key: Expected one of 2 allowed values (got string)', path: ['de'] }]
+ */
+export function recordOf<S extends Schema, K extends string = string>(
+	schema: S,
+	keys?: Guard<K>
+): Parser<string extends K ? Record<string, SchemaOutput<S>> : Partial<Record<K, SchemaOutput<S>>>> {
+	const node = compile('recordOf', 'schema', schema, []);
+
+	if (keys !== undefined && typeof keys !== 'function') throw new TypeError(`recordOf: \`keys\` must be a function, got ${describe(keys)}`);
+
+	return toCompiledParser({
+		fast: function fastRecord(value: unknown): unknown {
+			if (!isPlainObject(value)) return FAIL;
+
+			const { guard, fast } = node;
+			const output: Record<string, unknown> = {};
+
+			for (const name of Object.keys(value)) {
+				if (keys !== undefined && !keys(name)) return FAIL;
+
+				let result = value[name];
+
+				if (guard !== undefined) {
+					if (!guard(result)) return FAIL;
+				} else if ((result = fast(result)) === FAIL) {
+					return FAIL;
+				}
+				assign(output, name, result);
+			}
+
+			return output;
+		},
+		run: function runRecord(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			if (!isPlainObject(value)) {
+				issues.push({ message: `Expected a plain object (got ${Array.isArray(value) ? 'array' : describe(value)})`, path: path.slice() });
+
+				return undefined;
+			}
+
+			const output: Record<string, unknown> = {};
+
+			for (const name of Object.keys(value)) {
+				path.push(name);
+				if (keys !== undefined && !keys(name)) {
+					const found = explain(keys, name);
+
+					if (found.length === 0) issues.push({ message: 'Invalid key', path: path.slice() });
+					for (const issue of found) issues.push({ message: `Invalid key: ${issue.message}`, path: path.slice() });
+				}
+				assign(output, name, rerun(node, value[name], path, issues));
+				path.pop();
+			}
+
+			return output;
+		},
+		guard: undefined
+	});
+}
+
+/**
+ * Creates a parser for recursive schemas (`z.lazy()`): `getter` returns the schema, and is called once, on first use, so the schema
+ * can refer to the parser being defined. Annotate the result (`const tree: Parser<Tree> = lazy(...)`), since TypeScript cannot infer a
+ * recursive type. Cycle-safe: a value that reaches itself through the same lazy parser (`node.children = [node]`) is rejected with
+ * `Circular reference`, instead of overflowing the stack, so the output is always a finite tree.
+ * @template T - The output type
+ * @param {() => Schema} getter - Returns the schema (called once, on the first parse)
+ * @returns {Parser<T>} The parser
+ * @throws {TypeError} when `getter` is not a function, and on first use when it does not return a {@link Schema}
+ * @example
+ * import { isString } from 'tinkit/guards';
+ * type Comment = { text: string; replies: Comment[] };
+ * const comment: Parser<Comment> = lazy(function () {
+ *   return { text: isString, replies: withDefault(arrayOf(comment), function () { return []; }) };
+ * });
+ * parse(comment, { text: 'a', replies: [{ text: 'b' }] }); // => { text: 'a', replies: [{ text: 'b', replies: [] }] }
+ */
+export function lazy<T>(getter: () => Schema): Parser<T> {
+	if (typeof getter !== 'function') throw new TypeError(`lazy: \`getter\` must be a function, got ${describe(getter)}`);
+
+	let resolved: Node | undefined;
+	// The objects being parsed (or reported) by this parser right now: meeting one again means a cycle.
+	const parsing = new Set<object>();
+	const reporting = new Set<object>();
+
+	/**
+	 * Returns the compiled schema, calling `getter` on first use.
+	 * @returns {Node} The compiled schema
+	 */
+	function resolve(): Node {
+		if (resolved === undefined) resolved = compile('lazy', 'getter()', getter(), []);
+
+		return resolved;
+	}
+
+	return toCompiledParser({
+		fast: function fastLazy(value: unknown): unknown {
+			const node = resolve();
+
+			if (typeof value !== 'object' || value === null) return node.fast(value);
+			if (parsing.has(value)) return FAIL;
+			parsing.add(value);
+			try {
+				return node.fast(value);
+			} finally {
+				parsing.delete(value);
+			}
+		},
+		run: function runLazy(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			const node = resolve();
+
+			if (typeof value !== 'object' || value === null) return node.run(value, path, issues);
+			if (reporting.has(value)) {
+				issues.push({ message: 'Circular reference', path: path.slice() });
+
+				return undefined;
+			}
+			reporting.add(value);
+			try {
+				return rerun(node, value, path, issues);
+			} finally {
+				reporting.delete(value);
+			}
+		},
+		guard: undefined,
+		// Resolved when an object asks, which is during a parse (never before the first one).
+		get handlesMissing(): boolean | undefined {
+			return resolve().handlesMissing;
+		}
+	});
+}
+
+/**
+ * Whether `value` is a blank string: empty, or only whitespace (as `String#trim` defines it).
+ * @param {unknown} value - The value
+ * @returns {boolean} `true` for blank strings
+ */
+function isBlank(value: unknown): boolean {
+	return typeof value === 'string' && value.trim() === '';
+}
+
+/**
+ * Creates a parser that treats blank strings (empty, or only whitespace) as missing: what an empty HTML form field sends. The schema
+ * receives `undefined` instead, and in an object a blank property counts as absent: a required one fails with `Missing required
+ * property`, and an {@link optional} one is left out of the output. Wrap the outermost schema of the field
+ * (`blankAsUndefined(withDefault(asInteger, 1))`, not the other way around).
+ * @template S - The schema
+ * @param {S} schema - The schema applied after the conversion
+ * @returns {Parser<SchemaOutput<S>>} The parser
+ * @throws {TypeError} when `schema` is not a {@link Schema}
+ * @example
+ * import { isString } from 'tinkit/guards';
+ * const form = { age: blankAsUndefined(optional(asInteger)), name: blankAsUndefined(isString) };
+ * parse(form, { age: '', name: 'Ada' }); // => { name: 'Ada' }
+ * safeParse(form, { age: '36', name: '  ' })[0]?.issues; // => [{ message: 'Missing required property', path: ['name'] }]
+ */
+export function blankAsUndefined<S extends Schema>(schema: S): Parser<SchemaOutput<S>> {
+	const node = compile('blankAsUndefined', 'schema', schema, []);
+
+	return toCompiledParser({
+		fast: function fastBlank(value: unknown): unknown {
+			return node.fast(isBlank(value) ? undefined : value);
+		},
+		run: function runBlank(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			return node.run(isBlank(value) ? undefined : value, path, issues);
+		},
+		guard: undefined,
+		handlesMissing: node.handlesMissing,
+		missing: isBlank
+	});
+}
+
+/**
+ * Creates a parser for strings holding JSON (an environment variable, a form field, a message payload): the text is parsed with
+ * {@link parseJson}, so `__proto__` and `constructor.prototype` keys are rejected, and the result is parsed with `schema`, whose issues
+ * are reported below the string's path. The text never appears in issue messages (it may hold secrets).
+ * @template S - The schema of the parsed JSON
+ * @param {S} schema - The schema of the parsed value
+ * @returns {Parser<SchemaOutput<S>>} The parser
+ * @throws {TypeError} when `schema` is not a {@link Schema}
+ * @example
+ * import { isString } from 'tinkit/guards';
+ * const env = { FEATURES: asJson(arrayOf(isString)), LIMITS: asJson({ rpm: asInteger }) };
+ * parse(env, { FEATURES: '["beta"]', LIMITS: '{"rpm":"60"}' }); // => { FEATURES: ['beta'], LIMITS: { rpm: 60 } }
+ * safeParse(env, { FEATURES: '[beta]', LIMITS: '{}' })[0]?.issues; // => [{ message: 'Expected valid JSON (got string)', path: ['FEATURES'] }, { message: 'Missing required property', path: ['LIMITS', 'rpm'] }]
+ */
+export function asJson<S extends Schema>(schema: S): Parser<SchemaOutput<S>> {
+	const node = compile('asJson', 'schema', schema, []);
+
+	return toCompiledParser({
+		fast: function fastJson(value: unknown): unknown {
+			if (typeof value !== 'string') return FAIL;
+
+			const [error, parsed] = parseJson(value);
+
+			return error === undefined ? node.fast(parsed) : FAIL;
+		},
+		run: function runJson(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			if (typeof value !== 'string') return reject(value, path, issues, 'a JSON string');
+
+			const [error, parsed] = parseJson(value);
+
+			if (error === undefined) return node.run(parsed, path, issues);
+			// A forbidden key is reported as such; the engine's message for invalid JSON quotes the text, so it is not used.
+			issues.push({
+				message: error.message.startsWith('parseJson:') ? 'Expected JSON without "__proto__" or "constructor.prototype" keys' : 'Expected valid JSON (got string)',
+				path: path.slice()
+			});
+
+			return undefined;
 		},
 		guard: undefined
 	});
@@ -1983,7 +2670,7 @@ function runDate(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): un
 }
 
 /**
- * Parses finite numbers, and numeric strings (surrounding whitespace ignored) to numbers: `z.coerce.number()` without its traps.
+ * Parses finite numbers, and numeric strings (surrounding whitespace ignored, as `String#trim` defines it) to numbers: `z.coerce.number()` without its traps.
  * The empty string, `'abc'`, `'Infinity'`, `'0x1f'`, `NaN`, `null`, booleans and dates are rejected instead of becoming `0`, `1`,
  * `NaN` or a timestamp. For integers use {@link asInteger}; to check a range, {@link chain} a guard such as `isNumberInRange`.
  * @example
@@ -2005,7 +2692,7 @@ export const asNumber: Parser<number> = {
 } as CompiledParser<number>;
 
 /**
- * Parses safe integers, and strings of decimal digits with an optional sign (surrounding whitespace ignored), to numbers. Fractions
+ * Parses safe integers, and strings of decimal digits with an optional sign (surrounding whitespace ignored, as `String#trim` defines it), to numbers. Fractions
  * (`'1.5'`, `1.5`), exponents (`'1e3'`), the empty string and integers beyond `Number.MAX_SAFE_INTEGER` (which would silently lose
  * precision) are rejected.
  * @example
@@ -2027,7 +2714,7 @@ export const asInteger: Parser<number> = {
 
 /**
  * Parses booleans, the numbers `1` and `0`, and the strings `'true'`/`'false'`, `'yes'`/`'no'`, `'on'`/`'off'` and `'1'`/`'0'` (case and
- * surrounding whitespace ignored) to booleans: environment variables, query strings and checkboxes (an HTML checkbox sends `'on'`).
+ * surrounding whitespace, as `String#trim` defines it, ignored) to booleans: environment variables, query strings and checkboxes (an HTML checkbox sends `'on'`).
  * Anything else, the empty string included, is rejected: unlike `z.coerce.boolean()`, `'false'` is `false`.
  * @example
  * parse(asBoolean, 'false'); // => false // z.coerce.boolean() gives true
@@ -2048,8 +2735,9 @@ export const asBoolean: Parser<boolean> = {
 } as CompiledParser<boolean>;
 
 /**
- * Parses valid dates (returned as they are), timestamps in milliseconds, and ISO 8601 strings: RFC 3339 date-times with an offset
- * (see {@link isIsoDateTimeString}) and `YYYY-MM-DD` dates, read as UTC midnight like `new Date('2024-01-05')`. Invalid dates,
+ * Parses valid dates (returned as they are, not copied), timestamps in milliseconds, and ISO 8601 strings (surrounding whitespace
+ * ignored, as `String#trim` defines it): RFC 3339 date-times with an offset (see {@link isIsoDateTimeString}) and `YYYY-MM-DD` dates,
+ * read as UTC midnight like `new Date('2024-01-05')`. Invalid dates,
  * impossible calendar dates (`'2023-02-29'`), local date-times without an offset and loose formats (`'01/05/2024'`, `''`) are rejected,
  * so the result never depends on the machine's time zone.
  * @example

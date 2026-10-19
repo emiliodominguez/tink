@@ -108,6 +108,59 @@ isEmail(input); // narrows `unknown` to `string`
 ['1.0.0', '1.0.0-rc.1', '0.9.9'].sort(compareSemver); // ['0.9.9', '1.0.0-rc.1', '1.0.0']
 ```
 
+## Forms, query strings and environment variables
+
+`parse` and `safeParse` (validate module) take plain objects of guards and parsers. `formElement`, `showErrors` and `location` come from the application.
+
+```ts
+import { isBoolean, isOneOf, isString, isStringOfLength, issuesByPath } from 'tinkit/guards';
+import {
+	asArray,
+	asBoolean,
+	asInteger,
+	asJson,
+	blankAsUndefined,
+	discriminatedUnion,
+	isEmail,
+	isSlug,
+	optional,
+	parse,
+	recordOf,
+	safeParse,
+	withDefault
+} from 'tinkit/validate';
+import { parseQueryString } from 'tinkit/url';
+
+// Forms: a blank field counts as missing, and issues map to field names.
+const signup = { email: isEmail, name: blankAsUndefined(isStringOfLength(1, 50)), age: blankAsUndefined(optional(asInteger)), newsletter: withDefault(asBoolean, false) };
+const [error, user] = safeParse(signup, Object.fromEntries(new FormData(formElement)));
+if (error) showErrors(issuesByPath(error.issues)); // { email: ['Invalid value (got string)'], name: ['Missing required property'] }
+
+// Query strings: a repeated parameter arrives as an array, a single one as a string.
+const search = {
+	tag: withDefault(asArray(isSlug), function () {
+		return [];
+	}),
+	page: withDefault(asInteger, 1),
+	sort: withDefault(isOneOf(['new', 'top']), 'new')
+};
+parse(search, parseQueryString('?tag=ts&tag=js&page=2')); // { tag: ['ts', 'js'], page: 2, sort: 'new' }
+
+// Tagged payloads: one object schema per variant, the tag first in the output.
+const event = discriminatedUnion('type', { click: { x: asInteger, y: asInteger }, key: { code: isString } });
+parse(event, { type: 'click', x: '10', y: '20', target: 'button' }); // { type: 'click', x: 10, y: 20 }
+
+// JSON inside an environment variable, rejected if it carries a __proto__ key.
+const flags = parse(
+	{
+		FEATURE_FLAGS: withDefault(asJson(recordOf(isBoolean)), function () {
+			return {};
+		})
+	},
+	process.env
+);
+```
+
 ## Application building blocks: caching, events, state and lazy iterables
 
 The caching example wraps your application's `fetchUser` function. The remaining examples are self-contained.
