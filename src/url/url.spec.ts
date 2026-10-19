@@ -75,6 +75,45 @@ describe('URL helpers', function () {
 		});
 	});
 
+	describe('parseFormData', function () {
+		it('should collect repeated keys and bracket keys into arrays, keeping files', function () {
+			const data = new FormData();
+			const avatar = new Blob(['x']);
+
+			data.append('name', 'Ada');
+			data.append('topic', 'ts');
+			data.append('topic', 'js');
+			data.append('topic', 'go');
+			data.append('ids[]', '1');
+			data.append('avatar', avatar);
+
+			const fields = helpers.parseFormData(data);
+
+			expect(fields).toEqual({ name: 'Ada', topic: ['ts', 'js', 'go'], ids: ['1'], avatar: expect.any(Blob) });
+			expect(Object.getPrototypeOf(fields)).toBeNull();
+		});
+
+		it('should take any iterable of pairs, never pushing into a value that is an array', function () {
+			const first = ['a'];
+
+			expect(helpers.parseFormData(new URLSearchParams('a=1&a=2&b[]=3&b=4'))).toEqual({ a: ['1', '2'], b: ['3', '4'] });
+			expect(helpers.parseFormData(new Map([['list', first]]))).toEqual({ list: ['a'] });
+			expect(helpers.parseFormData([['list', first] as const, ['list', ['b']] as const])).toEqual({ list: [['a'], ['b']] });
+			expect(first).toEqual(['a']);
+			expect(helpers.parseFormData([['__proto__', 'x']])).toEqual(Object.assign(Object.create(null), { ['__proto__']: 'x' }));
+			expect(helpers.parseFormData([[1 as unknown as string, 'one']])).toEqual({ 1: 'one' });
+		});
+
+		it('should reject what is not iterable', function () {
+			expect(function () {
+				helpers.parseFormData({} as Iterable<[string, string]>);
+			}).toThrow('parseFormData: `entries` must be iterable (a FormData, URLSearchParams or [key, value] pairs), got object');
+			expect(function () {
+				helpers.parseFormData(null as unknown as Iterable<[string, string]>);
+			}).toThrow(TypeError);
+		});
+	});
+
 	describe('parseQueryString', function () {
 		it('should parse pairs, with or without a leading ?', function () {
 			expect(helpers.parseQueryString('?a=1&b=two')).toEqual({ a: '1', b: 'two' });

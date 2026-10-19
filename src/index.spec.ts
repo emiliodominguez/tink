@@ -307,6 +307,13 @@ describe('README examples', function () {
 			newsletter: true
 		});
 
+		const formData = new FormData();
+
+		formData.append('email', 'ada@example.com');
+		formData.append('name', 'Ada');
+		formData.append('age', '');
+		expect(validate.parse(signup, url.parseFormData(formData))).toEqual({ email: 'ada@example.com', name: 'Ada', newsletter: false });
+
 		const password = validate.check(
 			{ password: guards.isStringOfLength(8, 128), confirm: guards.isString },
 			function (form: { password: string; confirm: string }): boolean {

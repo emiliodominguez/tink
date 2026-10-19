@@ -202,6 +202,51 @@ export function parseQueryString(query: string): ParsedQuery {
 }
 
 /**
+ * Turns form entries into a record the way {@link parseQueryString} reads a query string: a key sent several times (checkboxes, a
+ * multiple select) maps to an array of its values, in order, and a key ending in `[]` always maps to an array. Takes a `FormData`
+ * (files stay `File` objects), a `URLSearchParams`, or any iterable of `[key, value]` pairs; `Object.fromEntries(new FormData(form))`
+ * would keep only the last value of a repeated key. The result has a `null` prototype, so a `__proto__` field is an own key; hand it to
+ * the validate module's `parse` to check and coerce it.
+ * @template V - The value type (`FormDataEntryValue` for a `FormData`)
+ * @param {Iterable<readonly [string, V]>} entries - The form entries
+ * @returns {Record<string, V | V[]>} The fields
+ * @throws {TypeError} when `entries` is not iterable
+ * @example
+ * const data = new FormData();
+ * data.append('name', 'Ada');
+ * data.append('topic', 'ts');
+ * data.append('topic', 'js');
+ * data.append('ids[]', '1');
+ * parseFormData(data); // => { name: 'Ada', topic: ['ts', 'js'], ids: ['1'] }
+ * parseFormData(new URLSearchParams('a=1&a=2')); // => { a: ['1', '2'] }
+ */
+export function parseFormData<V>(entries: Iterable<readonly [string, V]>): Record<string, V | V[]> {
+	if (entries == null || typeof (entries as Partial<Iterable<unknown>>)[Symbol.iterator] !== 'function') {
+		throw new TypeError(`parseFormData: \`entries\` must be iterable (a FormData, URLSearchParams or [key, value] pairs), got ${describe(entries)}`);
+	}
+
+	const result = Object.create(null) as Record<string, V | V[]>;
+	// The keys whose value is an array this function made: a value that is itself an array is never pushed into.
+	const collected = new Set<string>();
+
+	for (const [name, value] of entries) {
+		const rawKey = String(name);
+		const key = withoutBrackets(rawKey);
+
+		if (collected.has(key)) {
+			(result[key] as V[]).push(value);
+		} else if (key in result || key !== rawKey) {
+			result[key] = key in result ? [result[key] as V, value] : [value];
+			collected.add(key);
+		} else {
+			result[key] = value;
+		}
+	}
+
+	return result;
+}
+
+/**
  * Removes the `[]` suffix of a bracket key (`a[]` becomes `a`).
  * @param {string} key - A decoded query-string key
  * @returns {string} The key without its brackets

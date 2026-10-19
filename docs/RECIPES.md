@@ -133,11 +133,11 @@ import {
 	withDefault,
 	withFallback
 } from 'tinkit/validate';
-import { parseQueryString } from 'tinkit/url';
+import { parseFormData, parseQueryString } from 'tinkit/url';
 
-// Forms: a blank field counts as missing, and issues map to field names.
+// Forms: a blank field counts as missing, a repeated field (checkboxes) is an array, and issues map to field names.
 const signup = { email: isEmail, name: blankAsUndefined(isStringOfLength(1, 50)), age: blankAsUndefined(optional(asInteger)), newsletter: withDefault(asBoolean, false) };
-const [error, user] = safeParse(signup, Object.fromEntries(new FormData(formElement)));
+const [error, user] = safeParse(signup, parseFormData(new FormData(formElement)));
 if (error) showErrors(issuesByPath(error.issues)); // { email: ['Invalid value (got string)'], name: ['Missing required property'] }
 
 // Rules across fields: the issue goes on the field to highlight.
