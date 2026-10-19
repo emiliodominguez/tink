@@ -1064,3 +1064,253 @@ describe('String helpers (round 11 properties)', function () {
 		});
 	});
 });
+
+/** Reference for `compareNatural`: strings as token lists (BigInt numbers for digit runs, code units otherwise), then code units. */
+function naturalReference(a: string, b: string, ignoreCase: boolean): number {
+	function tokens(text: string): Array<bigint | number> {
+		return (text.match(/[0-9]+|[\s\S]/g) ?? []).map(function (token) {
+			return /^[0-9]/.test(token) ? BigInt(token) : token.charCodeAt(0);
+		});
+	}
+	const left = tokens(ignoreCase ? a.toLowerCase().replace(/ς/g, 'σ') : a);
+	const right = tokens(ignoreCase ? b.toLowerCase().replace(/ς/g, 'σ') : b);
+	for (let index = 0; index < Math.min(left.length, right.length); index++) {
+		const x = left[index];
+		const y = right[index];
+		// A number sits where the digit 0 does among the code units.
+		const slotX = typeof x === 'bigint' ? 48 : x;
+		const slotY = typeof y === 'bigint' ? 48 : y;
+		if (slotX !== slotY) return slotX < slotY ? -1 : 1;
+		if (x !== y) return x < y ? -1 : 1;
+	}
+	if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+	return a === b ? 0 : a < b ? -1 : 1;
+}
+
+/** Strings made of digit runs (with leading zeros), letters of both cases, punctuation and non-ASCII characters. */
+const naturalString = fc
+	.array(fc.constantFrom('0', '1', '2', '9', '00', '010', '10', '99', 'a', 'A', 'b', 'B', 'z', '.', '-', ' ', '_', 'é', 'É', 'İ', 'Σ', 'σ', 'ς', '\u{1F600}', '\u{FFFF}'), {
+		maxLength: 8
+	})
+	.map(function (parts) {
+		return parts.join('');
+	});
+
+const segmenterForTests = new Intl.Segmenter();
+
+/** The grapheme clusters of a string, by `Intl.Segmenter`. */
+function clustersOf(value: string): string[] {
+	return Array.from(segmenterForTests.segment(value), function (data) {
+		return data.segment;
+	});
+}
+
+/**
+ * Whole grapheme clusters that never merge with their neighbours, with their terminal widths (checked against string-width 8.3 by hand
+ * for the non-trivial ones).
+ */
+const MEASURED_CLUSTERS: ReadonlyArray<readonly [string, number]> = [
+	['a', 1],
+	['Z', 1],
+	[' ', 1],
+	['~', 1],
+	['é', 1],
+	['e\u{301}', 1],
+	['Ω', 1],
+	['±', 1],
+	['中', 2],
+	['각', 2],
+	['ｶ', 1],
+	['ｶ\u{ff9e}', 2],
+	['Ａ', 2],
+	['कि', 2],
+	['👍', 2],
+	['👍🏽', 2],
+	['☝🏽', 2],
+	['👨\u{200d}👩\u{200d}👧', 2],
+	['🇯🇵', 2],
+	['❤', 1],
+	['❤\u{fe0f}', 2],
+	['1\u{fe0f}\u{20e3}', 2],
+	['\u{200b}', 0],
+	['\t', 0],
+	['\x1b[31m', 0],
+	['\x1b]8;;https://example.com\x07', 0],
+	['\u{20000}', 2]
+];
+
+describe('String helpers (property-based, new helpers)', function () {
+	describe('compareNatural', function () {
+		it('should match a token-based reference (BigInt numbers)', function () {
+			fc.assert(
+				fc.property(naturalString, naturalString, fc.boolean(), function (a, b, ignoreCase) {
+					expect(helpers.compareNatural(a, b, { ignoreCase })).toBe(naturalReference(a, b, ignoreCase));
+				})
+			);
+		});
+
+		it('should be antisymmetric, and 0 only for equal strings', function () {
+			fc.assert(
+				fc.property(naturalString, naturalString, fc.boolean(), function (a, b, ignoreCase) {
+					const order = helpers.compareNatural(a, b, { ignoreCase });
+					expect([-1, 0, 1]).toContain(order);
+					expect(order).toBe(-helpers.compareNatural(b, a, { ignoreCase }) || 0);
+					expect(order === 0).toBe(a === b);
+				})
+			);
+		});
+
+		it('should be transitive', function () {
+			fc.assert(
+				fc.property(naturalString, naturalString, naturalString, fc.boolean(), function (a, b, c, ignoreCase) {
+					const [first, second, third] = [a, b, c].sort(function (x, y) {
+						return helpers.compareNatural(x, y, { ignoreCase });
+					});
+					expect(helpers.compareNatural(first, second, { ignoreCase })).toBeLessThanOrEqual(0);
+					expect(helpers.compareNatural(second, third, { ignoreCase })).toBeLessThanOrEqual(0);
+					expect(helpers.compareNatural(first, third, { ignoreCase })).toBeLessThanOrEqual(0);
+				})
+			);
+		});
+
+		it('should sort the same way whatever the input order', function () {
+			fc.assert(
+				fc.property(fc.array(naturalString, { maxLength: 20 }), fc.boolean(), function (list, ignoreCase) {
+					function compare(x: string, y: string): number {
+						return helpers.compareNatural(x, y, { ignoreCase });
+					}
+					expect(list.slice().reverse().sort(compare)).toEqual(list.slice().sort(compare));
+				})
+			);
+		});
+
+		it('should order plain non-negative integers numerically', function () {
+			fc.assert(
+				fc.property(fc.bigInt({ min: 0n, max: 10n ** 30n }), fc.bigInt({ min: 0n, max: 10n ** 30n }), function (x, y) {
+					expect(helpers.compareNatural(`file${x}.txt`, `file${y}.txt`)).toBe(x === y ? 0 : x < y ? -1 : 1);
+				})
+			);
+		});
+	});
+
+	describe('truncateMiddle', function () {
+		const text = fc.string({ unit: fc.constantFrom('a', 'b', '/', '.', 'é', 'e\u{301}', '👍🏽', '🇯🇵', '中', '\r\n'), maxLength: 30 });
+
+		it('should keep the first and last graphemes of the string, `length` in all, around the ellipsis', function () {
+			fc.assert(
+				fc.property(text, fc.nat(30), fc.double({ min: 0, max: 1, noNaN: true }), fc.constantFrom('…', '...', ''), function (value, length, position, ellipsis) {
+					const result = helpers.truncateMiddle(value, length, { position, ellipsis });
+					const parts = clustersOf(value);
+					if (parts.length <= length) {
+						expect(result).toBe(value);
+						return;
+					}
+					// Rounded down, except for the rounding error of the product.
+					const product = length * position;
+					const head = Math.abs(product - Math.round(product)) <= product * 2 ** -50 ? Math.round(product) : Math.floor(product);
+					expect(result).toBe(parts.slice(0, head).join('') + ellipsis + parts.slice(parts.length - (length - head)).join(''));
+				})
+			);
+		});
+
+		it('should split only the ends of long strings, with the same result as splitting them whole', function () {
+			// Pieces that join or look back across neighbours (regional indicators, ZWJ sequences, marks, jamo, CR LF, conjuncts, prepended
+			// characters, lone surrogates) mixed with plain ones, in strings longer than the windows the ends are split from.
+			const piece = fc.constantFrom(
+				'a',
+				' ',
+				'/',
+				'\r',
+				'\n',
+				'é',
+				'\u{301}',
+				'\u{200d}',
+				'\u{fe0f}',
+				'👍',
+				'🏽',
+				'👨',
+				'\u{1f1ef}',
+				'\u{1f1f5}',
+				'中',
+				'カ',
+				'각',
+				'\u{1100}',
+				'\u{1161}',
+				'\u{11a8}',
+				'क',
+				'\u{94d}',
+				'ि',
+				'ก',
+				'ำ',
+				'\u{600}',
+				'©',
+				'\u{20000}',
+				'\u{d800}',
+				'\u{dc00}'
+			);
+			const long = fc.array(fc.oneof(piece, fc.constantFrom('a', 'b', 'カ', '👍')), { minLength: 20, maxLength: 300 }).map(function (parts) {
+				return parts.join('');
+			});
+			fc.assert(
+				fc.property(long, fc.nat(12), fc.double({ min: 0, max: 1, noNaN: true }), function (value, length, position) {
+					const parts = clustersOf(value);
+					const product = length * position;
+					const head = Math.abs(product - Math.round(product)) <= product * 2 ** -50 ? Math.round(product) : Math.floor(product);
+					const expected = parts.length <= length ? value : parts.slice(0, head).join('') + '…' + parts.slice(parts.length - (length - head)).join('');
+					expect(helpers.truncateMiddle(value, length, { position })).toBe(expected);
+				})
+			);
+		});
+
+		it('should be truncate at position 1', function () {
+			fc.assert(
+				fc.property(text, fc.nat(30), function (value, length) {
+					expect(helpers.truncateMiddle(value, length, { position: 1, ellipsis: '...' })).toBe(helpers.truncate(value, length));
+				})
+			);
+		});
+	});
+
+	describe('stringWidth', function () {
+		it('should add up the widths of whole clusters', function () {
+			fc.assert(
+				fc.property(fc.array(fc.constantFrom(...MEASURED_CLUSTERS), { maxLength: 20 }), function (items) {
+					const text = items
+						.map(function ([cluster]) {
+							return cluster;
+						})
+						.join('');
+					const expected = items.reduce(function (total, [, width]) {
+						return total + width;
+					}, 0);
+					expect(helpers.stringWidth(text)).toBe(expected);
+				})
+			);
+		});
+
+		it('should not change when escape sequences are inserted between clusters', function () {
+			fc.assert(
+				fc.property(
+					fc.string({ unit: 'grapheme', maxLength: 20 }),
+					fc.constantFrom('\x1b[1m', '\x1b[0m', '\x1b[38;5;196m', '\x1b]8;;x\x1b\\'),
+					function (value, code) {
+						// eslint-disable-next-line no-control-regex -- strings without escape sequences of their own
+						fc.pre(!/[\x1b\x80-\x9f]/.test(value));
+						expect(helpers.stringWidth(clustersOf(value).join(code))).toBe(helpers.stringWidth(value));
+					}
+				)
+			);
+		});
+
+		it('should count printable ASCII by length, and never more than two columns per code point', function () {
+			fc.assert(
+				fc.property(fc.string({ unit: fc.integer({ min: 0x20, max: 0x7e }).map(String.fromCharCode) }), fc.string({ unit: 'binary' }), function (ascii, any) {
+					expect(helpers.stringWidth(ascii)).toBe(ascii.length);
+					const width = helpers.stringWidth(any);
+					expect(width).toBeGreaterThanOrEqual(0);
+					expect(width).toBeLessThanOrEqual(2 * Array.from(any).length);
+				})
+			);
+		});
+	});
+});

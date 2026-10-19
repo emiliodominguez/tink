@@ -1,4 +1,4 @@
-import { assertInteger, describe, draw, show } from '../utils/assert.js';
+import { assertInteger, assertNumber, describe, draw, show } from '../utils/assert.js';
 import type { RandomGenerator } from '../utils/index.js';
 import { isNumericString } from '../validate/index.js';
 
@@ -1862,4 +1862,470 @@ export function padEnd(string: string, width: number, fill: string = ' '): strin
  */
 export function padCenter(string: string, width: number, fill: string = ' '): string {
 	return pad('padCenter', string, width, fill, 0.5);
+}
+
+/**
+ * Options accepted by {@link compareNatural}.
+ */
+export interface CompareNaturalOptions {
+	/**
+	 * Compare letters case-insensitively (lower-cased with `String.prototype.toLowerCase`, locale-independent, final `ς` read as `σ`, as in
+	 * the other `ignoreCase` options of this module), so `'apple'`, `'Banana'` and
+	 * `'cherry'` sort in that order. Strings that only differ in case still never compare equal: they are ordered by code units, so
+	 * upper case first (`'File'` before `'file'`). Defaults to `false`: strings compare by UTF-16 code units, like `<` (`'Z'` before `'a'`).
+	 */
+	readonly ignoreCase?: boolean;
+}
+
+/**
+ * Whether a UTF-16 code unit is an ASCII digit.
+ * @param {number} code - The code unit (`NaN` past the end of a string)
+ * @returns {boolean} `true` for `0` to `9`
+ */
+function isDigit(code: number): boolean {
+	return code >= 48 && code <= 57;
+}
+
+/**
+ * Compares two strings as sequences of runs of ASCII digits, compared by numeric value (any length, leading zeros ignored), and single
+ * other code units, compared by value. A run of digits sorts where its first digit would, so before letters and after spaces and most
+ * punctuation. A string that is a prefix of the other (in this sense) sorts first.
+ * @param {string} a - The first string
+ * @param {string} b - The second string
+ * @returns {number} `-1`, `0` or `1`; `0` also for different strings whose numbers only differ in leading zeros (`'a01'` and `'a1'`)
+ */
+function compareRuns(a: string, b: string): number {
+	let i = 0;
+	let j = 0;
+
+	while (i < a.length && j < b.length) {
+		const x = a.charCodeAt(i);
+		const y = b.charCodeAt(j);
+
+		if (isDigit(x) && isDigit(y)) {
+			// Skip the leading zeros: the longer of the significant runs is the larger number, else the first different digit decides.
+			while (a.charCodeAt(i) === 48) i++;
+			while (b.charCodeAt(j) === 48) j++;
+
+			let endA = i;
+			let endB = j;
+
+			while (isDigit(a.charCodeAt(endA))) endA++;
+			while (isDigit(b.charCodeAt(endB))) endB++;
+
+			if (endA - i !== endB - j) return endA - i < endB - j ? -1 : 1;
+
+			for (; i < endA; i++, j++) {
+				const difference = a.charCodeAt(i) - b.charCodeAt(j);
+
+				if (difference !== 0) return difference < 0 ? -1 : 1;
+			}
+		} else if (x !== y) {
+			// A digit faces another character: digits are contiguous (U+0030 to U+0039), so comparing the code units places the whole run.
+			return x < y ? -1 : 1;
+		} else {
+			i++;
+			j++;
+		}
+	}
+
+	// The string with characters left is the longer one.
+	return i < a.length ? 1 : j < b.length ? -1 : 0;
+}
+
+/**
+ * Compares two strings in natural order, for `Array.prototype.sort`: runs of digits compare by their numeric value, so `'file2'` sorts
+ * before `'file10'` and `'v1.9'` before `'v1.10'`, and everything else compares by UTF-16 code units, like `<` (or case-insensitively,
+ * with `ignoreCase`).
+ *
+ * It is a consistent total order, so sorting gives the same result whatever the input order: it is antisymmetric and transitive, and only
+ * equal strings compare equal. Numbers that only differ in leading zeros (`'a01'` and `'a1'`) are tied, and ties are broken by code
+ * units, so zero-padded numbers come first (`'001'`, `'01'`, `'1'`). Digit runs of any length compare exactly (no conversion to a double
+ * that would merge `'9007199254740993'` with `'9007199254740992'`).
+ *
+ * Only ASCII digits form numbers: signs, decimal points and thousands separators are ordinary characters (`'1.5'` sorts before `'1.25'`,
+ * as versions do), and so are other scripts' digits. The order is deterministic: it depends on neither the locale nor the ICU version of
+ * the runtime. For a locale-aware order of words (`'é'` next to `'e'`), use `new Intl.Collator(locale, { numeric: true }).compare` instead,
+ * which ignores leading zeros (it ties `'01'` with `'1'`, so their order depends on the input order) and is not available everywhere.
+ * @param {string} a - The first string
+ * @param {string} b - The second string
+ * @param {CompareNaturalOptions} [options={}] - `ignoreCase` (default `false`)
+ * @returns {number} A negative number when `a` sorts first, a positive one when `b` does, `0` when they are equal (`-1`, `1` or `0`)
+ * @throws {TypeError} when `a` or `b` is not a string
+ * @example
+ * ['file10.txt', 'file2.txt', 'file1.txt'].sort(compareNatural); // => ['file1.txt', 'file2.txt', 'file10.txt']
+ * ['v1.10', 'v1.9', 'v1.9.1'].sort(compareNatural); // => ['v1.9', 'v1.9.1', 'v1.10']
+ * ['1', '01', '001', '2'].sort(compareNatural); // => ['001', '01', '1', '2']
+ * ['b', 'A2', 'a10', 'a2'].sort(compareNatural); // => ['A2', 'a2', 'a10', 'b']
+ * ['b', 'A2', 'a10', 'a2'].sort(function (a, b) { return compareNatural(a, b, { ignoreCase: true }); }); // => ['A2', 'a2', 'a10', 'b']
+ * compareNatural('img12.png', 'img2.png'); // => 1
+ */
+export function compareNatural(a: string, b: string, options: CompareNaturalOptions = {}): number {
+	assertString('compareNatural', 'a', a);
+	assertString('compareNatural', 'b', b);
+
+	if (a === b) return 0;
+
+	const order = options.ignoreCase === true ? compareRuns(foldCase(a), foldCase(b)) : compareRuns(a, b);
+
+	return order !== 0 ? order : a < b ? -1 : 1;
+}
+
+/**
+ * Options accepted by {@link truncateMiddle}.
+ */
+export interface TruncateMiddleOptions {
+	/** The text inserted in place of the removed middle (it is not counted in the length). Defaults to `'…'`. */
+	readonly ellipsis?: string;
+	/**
+	 * Where the cut goes, as the share of the kept graphemes taken from the start (rounded down, `0.29` of 100 being 29 despite the
+	 * floating-point product): `0` keeps only the end (`'…ndex.ts'`), `1` only the start (like `truncate(string, length, ellipsis)`; note
+	 * that the default ellipsis of {@link truncate} is `'...'`), and `0.5` (the default) half of each, the odd one at the end.
+	 */
+	readonly position?: number;
+}
+
+/**
+ * Shortens a string by removing its middle, so both ends stay visible (paths, URLs, identifiers, hashes): when the string is longer than
+ * `length` user-perceived characters (grapheme clusters), it keeps `length` of them, half from the start and half from the end by default,
+ * with the ellipsis between. As in {@link truncate}, the ellipsis is not counted in `length`, a string of at most `length` graphemes is
+ * returned unchanged, and no surrogate pair, emoji sequence or base character and its combining marks is ever split.
+ *
+ * Only the ends of the string are split into graphemes, so the cost depends on `length`, not on the length of the string: the end is
+ * split from a boundary that no grapheme rule looks across (two consecutive characters among ASCII, Latin-1, CJK ideographs, kana, Hangul
+ * syllables and emoji). Text without such a pair near its end (long runs of Thai or Devanagari, for example) is split up to its start.
+ * @param {string} string - The string to shorten
+ * @param {number} length - The number of graphemes to keep (a non-negative integer)
+ * @param {TruncateMiddleOptions} [options={}] - `ellipsis` (default `'…'`) and `position` (default `0.5`)
+ * @returns {string} The shortened string, or `string` itself when it has at most `length` graphemes
+ * @throws {RangeError} when `length` is not a non-negative integer, or `position` is not between 0 and 1
+ * @throws {TypeError} when `string` or `ellipsis` is not a string, or `length` or `position` is not a number
+ * @example
+ * truncateMiddle('/Users/ada/projects/tinkit/src/index.ts', 24); // => '/Users/ada/p…src/index.ts'
+ * truncateMiddle('0x71C7656EC7ab88b098defB751B7401B5f6d8976F', 10, { ellipsis: '...' }); // => '0x71C...8976F'
+ * truncateMiddle('/Users/ada/projects/tinkit/src/index.ts', 12, { position: 0 }); // => '…src/index.ts'
+ * truncateMiddle('👍🏽👍🏽👍🏽👍🏽', 2); // => '👍🏽…👍🏽'
+ * truncateMiddle('short', 10); // => 'short'
+ */
+export function truncateMiddle(string: string, length: number, options: TruncateMiddleOptions = {}): string {
+	assertString('truncateMiddle', 'string', string);
+	assertInteger('truncateMiddle', 'length', length);
+
+	const { ellipsis = '…', position = 0.5 } = options;
+
+	assertString('truncateMiddle', 'ellipsis', ellipsis);
+	assertNumber('truncateMiddle', 'position', position, position >= 0 && position <= 1, 'a number between 0 and 1');
+
+	// A string never has more graphemes than UTF-16 code units.
+	if (string.length <= length) return string;
+
+	// `length * position` can fall just below the integer it stands for (`100 * 0.29` is `28.999999999999996`): an error within the
+	// rounding of the product (and of `position` itself) is not a fraction to round down.
+	const product = length * position;
+	const nearest = Math.round(product);
+	const head = Math.abs(product - nearest) <= product * 2 ** -50 ? nearest : Math.floor(product);
+	const tail = length - head;
+
+	// When the first `head + 1` and the last `tail + 1` code units are graphemes on their own, the string has more than `length`
+	// graphemes (it has more than `length` code units) and the cuts fall between code units.
+	if (isSimpleText(string.slice(0, head + 1)) && isSimpleText(string.slice(string.length - tail - 1))) {
+		return string.slice(0, head) + ellipsis + string.slice(string.length - tail);
+	}
+
+	const front = leadingGraphemes(string, length);
+
+	if (front.length <= length) return string;
+
+	return front.slice(0, head).join('') + ellipsis + trailingGraphemes(string, tail).join('');
+}
+
+/**
+ * Splits the start of a string into graphemes, looking at a prefix that grows until it holds enough of them. A prefix is segmented as the
+ * whole string is, except for its last grapheme (a boundary only depends on what comes before it and on the code point right after it).
+ * @param {string} string - The string
+ * @param {number} count - How many graphemes are needed
+ * @returns {string[]} The first `count + 1` graphemes, or all of them when the string has at most `count + 1`
+ */
+function leadingGraphemes(string: string, count: number): string[] {
+	for (let size = 4 * count + 16; ; size *= 2) {
+		if (size >= string.length) return splitGraphemes(string, count).slice(0, count + 1);
+
+		const graphemes = splitGraphemes(string.slice(0, size), count + 1);
+
+		if (graphemes.length > count + 1) return graphemes.slice(0, count + 1);
+	}
+}
+
+/**
+ * Whether a code point is a grapheme on its own that no grapheme-break rule joins to a neighbour of the same kind or looks across: one that
+ * {@link isSimpleCode} accepts, a CJK ideograph (U+3400–4DBF, U+4E00–9FFF), a kana letter (U+3041–3096, U+30A1–30FA), a precomposed
+ * Hangul syllable (U+AC00–D7A3) or a pictograph of the emoji blocks (U+1F300–1FAFF, except the skin tones). All of them have the
+ * grapheme-break property Other or LV/LVT, and none is a regional indicator, an extending character or an Indic conjunct linker.
+ * @param {number} code - The code point (or a lone surrogate)
+ * @returns {boolean} Whether a boundary between two such code points is certain and independent of what comes before
+ */
+function isPlainPoint(code: number): boolean {
+	return (
+		isSimpleCode(code) ||
+		(code >= 0x3041 && code <= 0x3096) ||
+		(code >= 0x30a1 && code <= 0x30fa) ||
+		(code >= 0x3400 && code <= 0x4dbf) ||
+		(code >= 0x4e00 && code <= 0x9fff) ||
+		(code >= 0xac00 && code <= 0xd7a3) ||
+		(code >= 0x1f300 && code <= 0x1faff && !(code >= 0x1f3fb && code <= 0x1f3ff))
+	);
+}
+
+/**
+ * Whether a position of a string lies between two {@link isPlainPoint} code points.
+ * @param {string} string - The string
+ * @param {number} index - A position, from 1 to `string.length - 1`
+ * @returns {boolean} Whether the grapheme boundary there is certain, and the segmentation after it the same as the whole string's
+ */
+function isPlainBoundary(string: string, index: number): boolean {
+	const unit = string.charCodeAt(index - 1);
+	// The code point that ends at `index`: a surrogate pair, or a single code unit (possibly a lone surrogate).
+	const pair = unit >= 0xdc00 && unit <= 0xdfff && index >= 2 ? (string.codePointAt(index - 2) as number) : unit;
+
+	return isPlainPoint(pair > 0xffff ? pair : unit) && isPlainPoint(string.codePointAt(index) as number);
+}
+
+/**
+ * Splits the end of a string into graphemes: from a boundary between two {@link isPlainPoint} code points (where the segmentation of the
+ * whole string and of the rest of it agree), moved back until enough graphemes follow it, or from the start of the string.
+ * @param {string} string - The string
+ * @param {number} count - How many graphemes are needed
+ * @returns {string[]} The last `count` graphemes (all of them when there are fewer)
+ */
+function trailingGraphemes(string: string, count: number): string[] {
+	let graphemes: string[] = [];
+
+	for (let size = 4 * count + 16; graphemes.length < count; size *= 2) {
+		let start = Math.max(0, string.length - size);
+
+		while (start > 0 && !isPlainBoundary(string, start)) start--;
+
+		graphemes = splitGraphemes(string.slice(start));
+
+		if (start === 0) break;
+
+		size = Math.max(size, string.length - start);
+	}
+
+	return graphemes.slice(Math.max(0, graphemes.length - count));
+}
+
+/**
+ * The code points that East Asian Width (Unicode 17.0, UAX #11) classes as Wide or Fullwidth, as ranges: base-36 numbers, alternately the
+ * gap since the end of the previous range (from 0) and the length of the range minus one. Unassigned code points between two wide ones
+ * are included (they are mostly reserved for more ideographs and emoji), which takes 123 ranges down to 83.
+ */
+const WIDE_RANGES =
+	'3cw,2n,3i2,1,d,1,5a,3,3,0,2,0,eh,1,l,1,q,7,g,b,17,0,a,5,3,0,d,0,8,1,h,1,5,1,8,0,5,0,l,0,7,1,1,0,4,0,2,0,7,0,4,1,s,0,z,0,1,0,4,2,1,0,1p,2,o,0,e,0,nv,1,1f,0,4,0,mi,ce,2,ee,8,mly,wp,s,hv,8mb,6l8,e7,ls,9,m,1n,45,2n,3j,6,m49,d97,6bo,3a,5n1,0,5m,0,5a,0,2,9,2t,80,c,8,1,1x,1,l,c,16,4,4,c,g,3,0,3,1y,1,0,1,56,2,1q,d,3,1,n,i,0,q,1,d,0,2e,2c,1c,1x,6,0,3,2,2,a,b,1,7,8,6b,g,7v,1a,1,9,1,54,34,3s,zr,2t4t';
+
+/** The decoded {@link WIDE_RANGES}, as `[start, end, start, end...]` (inclusive), or `undefined` until first used. */
+let wideRanges: number[] | undefined;
+
+/**
+ * Whether a code point is East Asian Wide or Fullwidth (two terminal columns), by binary search in {@link WIDE_RANGES}.
+ * @param {number} code - The code point
+ * @returns {boolean} `true` for wide and fullwidth code points
+ */
+function isWide(code: number): boolean {
+	if (code < 0x1100) return false;
+
+	if (wideRanges === undefined) {
+		const numbers = WIDE_RANGES.split(',');
+		let next = 0;
+
+		wideRanges = [];
+
+		for (let index = 0; index < numbers.length; index += 2) {
+			const start = next + parseInt(numbers[index], 36);
+
+			next = start + parseInt(numbers[index + 1], 36);
+			wideRanges.push(start, next++);
+		}
+	}
+
+	// The last range starting at or before `code`.
+	let low = 0;
+	let high = wideRanges.length / 2 - 1;
+
+	while (low < high) {
+		const middle = (low + high + 1) >>> 1;
+
+		if (wideRanges[middle * 2] <= code) low = middle;
+		else high = middle - 1;
+	}
+
+	return wideRanges[low * 2] <= code && code <= wideRanges[low * 2 + 1];
+}
+
+/**
+ * An ANSI escape sequence, as terminals read them: a CSI sequence (`ESC [` or U+009B, parameter bytes, intermediate bytes and a final
+ * byte, such as the colour code `ESC [ 3 1 m`), a control string (`ESC ]` for an OSC such as a hyperlink, or `ESC P`, `ESC X`, `ESC ^`,
+ * `ESC _`, up to a BEL, `ESC \` or U+009C terminator, or up to the ESC, CAN or SUB that cancels it), or another escape (`ESC`,
+ * intermediate bytes and a final byte, such as `ESC ( B`). A CSI sequence or a control string that the string ends inside is removed to
+ * the end, since a terminal waits for the rest of it. Each pattern consumes characters that cannot start another one, so matching is linear.
+ */
+const ANSI_SEQUENCE =
+	// eslint-disable-next-line no-control-regex -- escape sequences start with control characters
+	/(?:\x1b\[|\x9b)[\x30-\x3f]*[\x20-\x2f]*(?:[\x40-\x7e]|$)|\x1b[\]PX^_][^\x07\x18\x1a\x1b\x9c]*(?:\x07|\x1b\\|\x9c|(?=[\x18\x1a\x1b])|$)|\x1b[\x20-\x2f]*[\x30-\x7e]/g;
+
+/** Printable ASCII only: one column per code unit. */
+const PRINTABLE_ASCII = /^[\x20-\x7e]*$/;
+
+/**
+ * Emoji clusters that are two columns wide although their first code point may be narrow: a flag (any pair of regional indicators), a
+ * keycap (`#`, `*` or a digit, with or without U+FE0F, then U+20E3), a pictograph followed by the emoji presentation selector U+FE0F,
+ * an emoji modifier base followed by a skin tone, or a ZWJ sequence of pictographs. (Pictographs that are wide on their own, which most
+ * emoji are, are found by {@link isWide}.)
+ */
+const NARROW_BASED_EMOJI =
+	/^(?:[\u{1f1e6}-\u{1f1ff}]{2}|[#*0-9]\ufe0f?\u20e3|\p{Extended_Pictographic}\ufe0f|\p{Emoji_Modifier_Base}\p{Emoji_Modifier})|\u200d\p{Extended_Pictographic}/u;
+
+/** A code point that takes up room: not a control, format, default-ignorable or non-spacing/enclosing mark code point, nor a lone surrogate. */
+const VISIBLE = /[^\p{Cc}\p{Cf}\p{Mn}\p{Me}\p{Cs}\p{Default_Ignorable_Code_Point}]/u;
+
+/** A spacing combining mark (e.g. Devanagari vowel signs), which takes up a column of its own after its base. */
+const SPACING_MARK = /\p{Mc}/u;
+
+/**
+ * The kind of a conjoining Hangul jamo.
+ * @param {number} code - A code point (`undefined` past the end of a list, which is no jamo)
+ * @returns {number} `1` for a leading consonant (L), `2` for a vowel (V), `3` for a trailing consonant (T), else `0`
+ */
+function jamoKind(code: number): number {
+	if ((code >= 0x1100 && code <= 0x115f) || (code >= 0xa960 && code <= 0xa97c)) return 1;
+	if ((code >= 0x1160 && code <= 0x11a7) || (code >= 0xd7b0 && code <= 0xd7c6)) return 2;
+	if ((code >= 0x11a8 && code <= 0x11ff) || (code >= 0xd7cb && code <= 0xd7fb)) return 3;
+
+	return 0;
+}
+
+/**
+ * Computes the width of a grapheme cluster that starts with a conjoining Hangul jamo, as `string-width` does: a leading consonant
+ * followed by a vowel (and optionally a trailing consonant) forms a 2-column syllable block, any other jamo keeps its own width (2 for a
+ * leading consonant, 1 for the others), and from the first code point that is not a jamo, every code point adds its own width.
+ * @param {number[]} points - The visible code points of the cluster
+ * @returns {number} The width in columns
+ */
+function jamoWidth(points: number[]): number {
+	let width = 0;
+
+	for (let index = 0; index < points.length; index++) {
+		const kind = jamoKind(points[index]);
+
+		if (kind === 0) {
+			for (; index < points.length; index++) width += isWide(points[index]) ? 2 : 1;
+		} else if (kind === 1 && jamoKind(points[index + 1]) === 2) {
+			width += 2;
+			index += jamoKind(points[index + 2]) === 3 ? 2 : 1;
+		} else {
+			width += kind === 1 ? 2 : 1;
+		}
+	}
+
+	return width;
+}
+
+/**
+ * Computes the terminal width of a grapheme cluster (see {@link stringWidth}).
+ * @param {string} grapheme - The grapheme cluster
+ * @returns {number} Its width in columns
+ */
+function graphemeWidth(grapheme: string): number {
+	const code = grapheme.codePointAt(0) as number;
+
+	// A single code point (most graphemes) is as wide as its class says.
+	if (grapheme.length === (code > 0xffff ? 2 : 1)) return VISIBLE.test(grapheme) ? (isWide(code) ? 2 : 1) : 0;
+
+	const start = grapheme.search(VISIBLE);
+
+	// Only zero-width code points.
+	if (start === -1) return 0;
+
+	if (jamoKind(grapheme.codePointAt(start) as number) !== 0) {
+		const points: number[] = [];
+
+		for (const char of grapheme.slice(start)) if (VISIBLE.test(char)) points.push(char.codePointAt(0) as number);
+
+		return jamoWidth(points);
+	}
+
+	let width = 0;
+	let first = true;
+
+	// The first visible code point (or the emoji sequence it starts), then the spacing marks and halfwidth/fullwidth forms (such as a
+	// halfwidth voiced sound mark) after it.
+	for (const char of grapheme.slice(start)) {
+		const point = char.codePointAt(0) as number;
+
+		if (first) width = isWide(point) || NARROW_BASED_EMOJI.test(grapheme) ? 2 : 1;
+		else if (SPACING_MARK.test(char) || (point >= 0xff00 && point <= 0xffef)) width += isWide(point) ? 2 : 1;
+
+		first = false;
+	}
+
+	return width;
+}
+
+/**
+ * Computes how many columns a string takes up in a monospace terminal, for aligning tables, progress bars and other command-line output.
+ * The string is measured per user-perceived character (grapheme cluster), with the rules of `string-width` (version 8):
+ * - ANSI escape sequences (colours, cursor movements, OSC 8 hyperlinks... as ECMA-48 defines them) are ignored;
+ * - East Asian Wide and Fullwidth characters (CJK ideographs, kana, Hangul syllables, fullwidth forms) and emoji are 2 columns, including
+ *   emoji sequences (flags, keycaps, skin tones, ZWJ sequences such as families) and text-style symbols with the emoji presentation selector
+ *   (`'❤️'`); every other character, including East Asian Ambiguous ones (`'±'`, Greek and Cyrillic letters), is 1 column;
+ * - C0 and C1 control characters (tabs, `\n` and `\r` included: the string is measured as one line), format characters, combining
+ *   marks, zero-width spaces and joiners, variation selectors and other default-ignorable code points are 0 columns. A spacing mark (as in
+ *   Devanagari `'कि'`) adds a column to its cluster. U+2028 and U+2029 (line and paragraph separators, which terminals do not treat as line
+ *   breaks) are 1 column, as in `string-width`;
+ * - conjoining Hangul jamo form 2-column syllable blocks (a leading consonant, a vowel and an optional trailing consonant); other jamo
+ *   keep their own width, so a run of leading consonants is 2 columns each.
+ *
+ * Every assigned code point measures as with `string-width` 8.3, and so do jamo clusters. Sequences differ in a few places:
+ * - any pair of regional indicators is a 2-column flag, not only the pairs that are country flags (`'🇦🇦'` is 2 here, 1 there);
+ * - an emoji sequence followed by a stray code point is still 2 columns: a keycap followed by a ZWJ or a combining mark (`'1️⃣'` + ZWJ
+ *   is 2 here, 1 there), an emoji with a skin tone and a stray selector;
+ * - escape sequences are found by their ECMA-48 syntax, so malformed and rare ones are removed differently: an `ESC` inside an OSC
+ *   cancels it (its text is not shown, as in terminals), an unterminated CSI sequence or control string at the end is removed to the end,
+ *   `ESC SP F` is removed whole, and `ESC 3 1 3` keeps its `13` (`ESC 3` is a complete escape).
+ *
+ * The width classes come from Unicode 17.0 (`EastAsianWidth.txt`, as a table of 83 ranges), while the grapheme clusters and the other
+ * character properties (marks, emoji) come from the runtime's own Unicode data (`Intl.Segmenter` and regular expressions). Without
+ * `Intl.Segmenter`, code points are measured one by one, so emoji sequences count each of their emoji. Terminals and fonts differ in
+ * places (emoji sequences that a font draws as several glyphs, ambiguous characters drawn wide in CJK locales), so this is the common
+ * case, not a guarantee.
+ * @param {string} string - The string to measure
+ * @returns {number} Its width in terminal columns
+ * @throws {TypeError} when `string` is not a string
+ * @example
+ * stringWidth('hello'); // => 5
+ * stringWidth('古池や'); // => 6
+ * stringWidth('\x1b[31mred\x1b[39m'); // => 3
+ * stringWidth('👨‍👩‍👧 🇯🇵'); // => 5
+ * stringWidth('e\u0301'); // => 1
+ * stringWidth('a\u200bb'); // => 2
+ */
+export function stringWidth(string: string): number {
+	assertString('stringWidth', 'string', string);
+
+	const text = string.includes('\x1b') || string.includes('\x9b') ? string.replace(ANSI_SEQUENCE, '') : string;
+
+	if (PRINTABLE_ASCII.test(text)) return text.length;
+
+	let width = 0;
+	const segmenter = getGraphemeSegmenter();
+
+	// Text that is not one grapheme per code unit goes through the segmenter in one pass: `splitGraphemes` segments each region of complex
+	// text on its own, which costs more here, where Latin, CJK and kana alternate at every character.
+	if (segmenter !== null && !isSimpleText(text)) {
+		for (const data of segmenter.segment(text)) width += graphemeWidth(data.segment);
+	} else {
+		for (const grapheme of splitGraphemes(text)) width += graphemeWidth(grapheme);
+	}
+
+	return width;
 }
