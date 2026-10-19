@@ -1,5 +1,7 @@
 import * as helpers from '.';
 
+const MAX = Number.MAX_VALUE;
+
 function constant(value: number) {
 	return function () {
 		return value;
@@ -935,6 +937,12 @@ describe('Math helpers', function () {
 
 		it('average and weightedAverage do not overflow when the mean is finite', function () {
 			expect(helpers.average([1e308, 1e308])).toBe(1e308);
+			// Regression: the terms were divided by the count one by one, and their roundings added up past MAX_VALUE.
+			expect(helpers.average([MAX, MAX, MAX])).toBe(MAX);
+			expect(helpers.average([-MAX, -MAX, -MAX])).toBe(-MAX);
+			expect(helpers.average([MAX, MAX, MAX, MAX, MAX, MAX, MAX])).toBe(MAX);
+			expect(helpers.average([MAX, MAX, -MAX, MAX])).toBe(MAX / 2);
+			expect(helpers.average(['1e308', 1e308, 1e308] as never)).toBe(1e308);
 			expect(helpers.average([1e308, 1e308, -1e308])).toBeCloseTo(1e308 / 3, -300);
 			expect(helpers.average([Infinity, 1])).toBe(Infinity);
 			expect(helpers.average([Infinity, -Infinity])).toBeNaN();
@@ -1830,5 +1838,672 @@ describe('Math helpers', function () {
 			expect(helpers.parseBytes('0e999999999999999999999')).toBe(0);
 			expect(helpers.parseBytes('1e-1000000000000000000000')).toBe(0);
 		});
+	});
+});
+
+/**
+ * Loads a fresh copy of the module while `Math.sumPrecise` is `native` (the module checks it once, on the first call).
+ */
+function loadWithSumPrecise(native: unknown): typeof helpers {
+	const math = Math as { sumPrecise?: unknown };
+	const original = Object.getOwnPropertyDescriptor(Math, 'sumPrecise');
+	let isolated: typeof helpers | undefined;
+
+	try {
+		math.sumPrecise = native;
+		jest.isolateModules(function () {
+			isolated = jest.requireActual<typeof helpers>('./index');
+		});
+		// The check runs on the first call: make it while the replacement is installed.
+		isolated!.sumPrecise([]);
+	} finally {
+		if (original === undefined) delete math.sumPrecise;
+		else Object.defineProperty(Math, 'sumPrecise', original);
+	}
+
+	return isolated!;
+}
+
+describe('sumPrecise', function () {
+	it('should return the correctly rounded sum', function () {
+		expect(helpers.sumPrecise([1, 2, 3, 4])).toBe(10);
+		expect(helpers.sumPrecise([0.1, 0.2, 0.3])).toBe(0.6);
+		expect(helpers.sumPrecise([1e20, 0.1, -1e20])).toBe(0.1);
+		expect(helpers.sumPrecise([1, 1e100, 1, -1e100])).toBe(2);
+		expect(helpers.sumPrecise([0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1])).toBe(1);
+		expect(helpers.sumPrecise([2 ** 53, 1, 1])).toBe(2 ** 53 + 2);
+		expect(helpers.sumPrecise([5e-324, 5e-324, -5e-324])).toBe(5e-324);
+	});
+
+	it('should round ties to even, and away from the tie when more partials follow', function () {
+		expect(helpers.sumPrecise([1, 2 ** -53])).toBe(1);
+		expect(helpers.sumPrecise([1 + 2 ** -52, 2 ** -53])).toBe(1 + 2 ** -51);
+		expect(helpers.sumPrecise([1, 2 ** -53, 2 ** -105])).toBe(1 + 2 ** -52);
+		expect(helpers.sumPrecise([1, 2 ** -53, -(2 ** -105)])).toBe(1);
+		expect(helpers.sumPrecise([-1, -(2 ** -53), -(2 ** -105)])).toBe(-1 - 2 ** -52);
+		expect(helpers.sumPrecise([-1, -(2 ** -53), 2 ** -105])).toBe(-1);
+	});
+
+	it('should break a tie between tiny partials (whose product underflows)', function () {
+		// 2 ** -553 is half an ulp of 2 ** -500, and 2 ** -600 tips the sum past the tie.
+		expect(helpers.sumPrecise([2 ** -500, 2 ** -553, 2 ** -600])).toBe(2 ** -500 + 2 ** -552);
+		expect(helpers.sumPrecise([-(2 ** -500), -(2 ** -553), -(2 ** -600)])).toBe(-(2 ** -500) - 2 ** -552);
+	});
+
+	it('should give -0 for an empty sum or only negative zeros, +0 for any other zero sum', function () {
+		expect(helpers.sumPrecise([])).toBe(-0);
+		expect(helpers.sumPrecise([-0])).toBe(-0);
+		expect(helpers.sumPrecise([-0, -0])).toBe(-0);
+		expect(helpers.sumPrecise([-0, 0])).toBe(0);
+		expect(helpers.sumPrecise([0])).toBe(0);
+		expect(helpers.sumPrecise([1, -1])).toBe(0);
+		expect(helpers.sumPrecise([-1, 1, -0])).toBe(0);
+		expect(helpers.sumPrecise('' as never)).toBe(-0);
+	});
+
+	it('should follow the Math.sumPrecise rules for NaN and infinities', function () {
+		expect(helpers.sumPrecise([NaN])).toBeNaN();
+		expect(helpers.sumPrecise([1, NaN, 2])).toBeNaN();
+		expect(helpers.sumPrecise([Infinity, -Infinity])).toBeNaN();
+		expect(helpers.sumPrecise([Infinity, NaN])).toBeNaN();
+		expect(helpers.sumPrecise([NaN, Infinity])).toBeNaN();
+		expect(helpers.sumPrecise([Infinity, 1])).toBe(Infinity);
+		expect(helpers.sumPrecise([Infinity, Infinity, -1e308])).toBe(Infinity);
+		expect(helpers.sumPrecise([1e308, -Infinity, 1e308])).toBe(-Infinity);
+		expect(helpers.sumPrecise([-0, -Infinity])).toBe(-Infinity);
+	});
+
+	it('should carry intermediate sums beyond Number.MAX_VALUE exactly', function () {
+		expect(helpers.sumPrecise([1e308, 1e308, -1e308])).toBe(1e308);
+		expect(helpers.sumPrecise([MAX, MAX, -MAX])).toBe(MAX);
+		expect(helpers.sumPrecise([-MAX, -MAX, MAX])).toBe(-MAX);
+		expect(helpers.sumPrecise([MAX, MAX, MAX, -MAX, -MAX])).toBe(MAX);
+		expect(helpers.sumPrecise([MAX, MAX, -MAX, -MAX, 1])).toBe(1);
+		expect(helpers.sumPrecise([2 ** 1023, 2 ** 1023, -(2 ** 1023)])).toBe(2 ** 1023);
+		expect(helpers.sumPrecise([2 ** 1023, 2 ** 1023, -(2 ** 1023), 2 ** -1074])).toBe(2 ** 1023);
+		// MAX + 2 ** 971 is 2 ** 1024.
+		expect(helpers.sumPrecise([MAX, 2 ** 971, -(2 ** 1023), -(2 ** 1022)])).toBe(2 ** 1022);
+		expect(helpers.sumPrecise([MAX, 2 ** 971, 2 ** 971, -MAX])).toBe(2 ** 972);
+		// 2 ** 1024 carried, then a partial with bits below the ulp of the result: rounded once, ties to even.
+		expect(helpers.sumPrecise([MAX, 2 ** 971, -(2 ** 1000 + 2 ** 948)])).toBe(MAX - 2 ** 1000 + 2 ** 971);
+		expect(helpers.sumPrecise([MAX, 2 ** 971, -(2 ** 1000 + 2 ** 970)])).toBe(MAX - 2 ** 1000 + 2 ** 971);
+		expect(helpers.sumPrecise([MAX, 2 ** 971, -(2 ** 1000 + 2 ** 970), -5e-324])).toBe(MAX - 2 ** 1000);
+		expect(helpers.sumPrecise([-MAX, -(2 ** 971), 2 ** 1000 + 2 ** 970, 5e-324])).toBe(2 ** 1000 - MAX);
+	});
+
+	it('should overflow to Infinity only when the exact sum rounds beyond the doubles', function () {
+		expect(helpers.sumPrecise([MAX, MAX])).toBe(Infinity);
+		expect(helpers.sumPrecise([-MAX, -MAX])).toBe(-Infinity);
+		expect(helpers.sumPrecise([MAX, MAX, MAX, -MAX])).toBe(Infinity);
+		expect(helpers.sumPrecise([MAX, MAX, MAX])).toBe(Infinity);
+		expect(helpers.sumPrecise([2 ** 1023, 2 ** 1023])).toBe(Infinity);
+		expect(helpers.sumPrecise([2 ** 1023, 2 ** 1023, 1])).toBe(Infinity);
+		// MAX + half an ulp is a tie, which rounds to even: Infinity, unless more of the sum lies below it.
+		expect(helpers.sumPrecise([MAX, 2 ** 970])).toBe(Infinity);
+		expect(helpers.sumPrecise([MAX, 2 ** 970, 5e-324])).toBe(Infinity);
+		expect(helpers.sumPrecise([MAX, 2 ** 970, -5e-324])).toBe(MAX);
+		expect(helpers.sumPrecise([-MAX, -(2 ** 970)])).toBe(-Infinity);
+		expect(helpers.sumPrecise([-MAX, -(2 ** 970), 5e-324])).toBe(-MAX);
+		expect(helpers.sumPrecise([MAX, 2 ** 969])).toBe(MAX);
+	});
+
+	it('should accept any iterable of numbers', function () {
+		expect(helpers.sumPrecise(new Set([1, 2, 3]))).toBe(6);
+		expect(helpers.sumPrecise(new Float64Array([0.1, 0.2]))).toBe(0.30000000000000004);
+		expect(
+			helpers.sumPrecise(
+				(function* () {
+					yield 1e20;
+					yield 1;
+					yield -1e20;
+				})()
+			)
+		).toBe(1);
+	});
+
+	it('should throw a TypeError for a non-iterable or an item that is not a number', function () {
+		expect(function () {
+			helpers.sumPrecise(null as never);
+		}).toThrow(new TypeError('sumPrecise: `numbers` must be an iterable, got null'));
+		expect(function () {
+			helpers.sumPrecise(undefined as never);
+		}).toThrow(new TypeError('sumPrecise: `numbers` must be an iterable, got undefined'));
+		expect(function () {
+			helpers.sumPrecise({ length: 1, 0: 1 } as never);
+		}).toThrow(new TypeError('sumPrecise: `numbers` must be an iterable, got object'));
+		expect(function () {
+			helpers.sumPrecise(['1'] as never);
+		}).toThrow(new TypeError('sumPrecise: `numbers[0]` must be a number, got string'));
+		expect(function () {
+			helpers.sumPrecise([1, 2n] as never);
+		}).toThrow(new TypeError('sumPrecise: `numbers[1]` must be a number, got bigint'));
+		expect(function () {
+			helpers.sumPrecise([NaN, new Number(1)] as never);
+		}).toThrow(new TypeError('sumPrecise: `numbers[1]` must be a number, got object'));
+		expect(function () {
+			helpers.sumPrecise('12' as never);
+		}).toThrow(TypeError);
+	});
+
+	it('should close the iterator when an item is rejected', function () {
+		let closed = false;
+		function* numbers(): Generator<unknown> {
+			try {
+				yield 1;
+				yield 'two';
+				yield 3;
+			} finally {
+				closed = true;
+			}
+		}
+		expect(function () {
+			helpers.sumPrecise(numbers() as Iterable<number>);
+		}).toThrow(TypeError);
+		expect(closed).toBe(true);
+	});
+
+	it('should delegate to a native Math.sumPrecise that passes the check, with validated items', function () {
+		const calls: unknown[] = [];
+		const isolated = loadWithSumPrecise(function (items: number[]) {
+			calls.push(items);
+			// Exact on the probes (this module's own sum), and recognizable on the items of the test.
+			const marked = (items.length === 2 && items[0] === 1 && items[1] === 2) || (items.length === 1 && items[0] === 3);
+			return marked ? 42 : helpers.sumPrecise(items);
+		});
+		calls.length = 0;
+		expect(isolated.sumPrecise([1, 2])).toBe(42);
+		expect(isolated.sumPrecise(new Float64Array([3]))).toBe(42);
+		expect(calls).toEqual([[1, 2], [3]]);
+		// Other iterables are streamed, not copied for the native function.
+		expect(isolated.sumPrecise(new Set([1, 2]))).toBe(3);
+		expect(calls).toHaveLength(2);
+		expect(function () {
+			isolated.sumPrecise([1, '2'] as never);
+		}).toThrow(new TypeError('sumPrecise: `numbers[1]` must be a number, got string'));
+		expect(calls).toHaveLength(2);
+	});
+
+	it('should not use a native Math.sumPrecise that fails the check or throws', function () {
+		const naive = loadWithSumPrecise(function (items: number[]) {
+			return items.reduce(function (total, value) {
+				return total + value;
+			}, -0);
+		});
+		expect(naive.sumPrecise([1e308, 1e308, -1e308])).toBe(1e308);
+		const noNegativeZero = loadWithSumPrecise(function () {
+			return 1e308;
+		});
+		expect(noNegativeZero.sumPrecise([1, 2])).toBe(3);
+		const throwing = loadWithSumPrecise(function () {
+			throw new Error('broken');
+		});
+		expect(throwing.sumPrecise([1, 2])).toBe(3);
+		const notAFunction = loadWithSumPrecise(42);
+		expect(notAFunction.sumPrecise([1, 2])).toBe(3);
+	});
+
+	it('should not use an inexact polyfill that gets the overflow and empty-sum cases right', function () {
+		// Regression: a compensated (Neumaier) sum with special cases for the two cases that used to be probed was trusted.
+		function compensated(items: number[]): number {
+			if (items.length === 0) return -0;
+			if (items.length === 3 && items[0] === 1e308 && items[1] === 1e308 && items[2] === -1e308) return 1e308;
+			let total = 0;
+			let compensation = 0;
+			for (const value of items) {
+				const next = total + value;
+				compensation += Math.abs(total) >= Math.abs(value) ? total - next + value : value - next + total;
+				total = next;
+			}
+			return total + compensation;
+		}
+		expect(compensated([1, 1e-20, -1e16])).toBe(-1e16);
+		const isolated = loadWithSumPrecise(compensated);
+		expect(isolated.sumPrecise([1, 1e-20, -1e16])).toBe(-9999999999999998);
+		expect(isolated.sumPrecise([5e-324, 5e-324, 5e-324])).toBe(1.5e-323);
+	});
+});
+
+describe('movingAverage', function () {
+	it('should average every window of consecutive values', function () {
+		expect(helpers.movingAverage([1, 2, 3, 4, 5], 3)).toEqual([2, 3, 4]);
+		expect(helpers.movingAverage([1, 2, 3, 4, 5], 1)).toEqual([1, 2, 3, 4, 5]);
+		expect(helpers.movingAverage([1, 2, 3, 4, 5], 5)).toEqual([3]);
+		expect(helpers.movingAverage([2, 4], 2)).toEqual([3]);
+	});
+
+	it('should return an empty array when there are fewer values than the window', function () {
+		expect(helpers.movingAverage([1, 2], 3)).toEqual([]);
+		expect(helpers.movingAverage([], 1)).toEqual([]);
+	});
+
+	it('should not drift: each average is the exact window sum, rounded once, divided by the window', function () {
+		expect(helpers.movingAverage([1e20, 1, 2, 3], 2)).toEqual([5e19, 1.5, 2.5]);
+		expect(helpers.movingAverage([0.1, 0.2, 0.3, 0.4], 3)).toEqual([0.6 / 3, 0.9 / 3]);
+		// An incremental float sum loses the 1s next to 1e17, and never gets them back (it starts and ends with 0 instead of 0.5 and 1).
+		const values = [1e17, 1, 1, -1e17, 1, 1, 1, 1];
+		expect(helpers.movingAverage(values, 4)).toEqual([0.5, -2.5e16, -2.5e16, -2.5e16, 1]);
+		const long = Array.from({ length: 10_000 }, function (_, index) {
+			return index % 2 === 0 ? 0.1 : 1e15;
+		});
+		const averages = helpers.movingAverage(long, 2);
+		expect(
+			averages.every(function (average) {
+				return average === (0.1 + 1e15) / 2;
+			})
+		).toBe(true);
+	});
+
+	it('should only let NaN and infinities affect the windows that hold them', function () {
+		expect(helpers.movingAverage([1, NaN, 3, 4], 2)).toEqual([NaN, NaN, 3.5]);
+		expect(helpers.movingAverage([Infinity, 1, 2], 2)).toEqual([Infinity, 1.5]);
+		expect(helpers.movingAverage([-Infinity, 1, 2], 2)).toEqual([-Infinity, 1.5]);
+		expect(helpers.movingAverage([Infinity, -Infinity, 2, 4], 2)).toEqual([NaN, -Infinity, 3]);
+		expect(helpers.movingAverage([NaN, Infinity, 1, 1], 2)).toEqual([NaN, Infinity, 1]);
+	});
+
+	it('should keep the sign of zero like sumPrecise', function () {
+		expect(helpers.movingAverage([-0, -0, 0, -0], 2)).toEqual([-0, 0, 0]);
+		expect(Object.is(helpers.movingAverage([-0], 1)[0], -0)).toBe(true);
+		expect(Object.is(helpers.movingAverage([1, -1], 2)[0], 0)).toBe(true);
+	});
+
+	it('should keep the averages of windows whose sum overflows finite', function () {
+		// Regression: the mean of overflowing windows was computed on rounded halves, 2 ulps below MAX here.
+		expect(helpers.movingAverage([MAX, MAX, MAX], 3)).toEqual([MAX]);
+		expect(helpers.movingAverage([-MAX, -MAX, -MAX, -MAX, -MAX], 4)).toEqual([-MAX, -MAX]);
+		expect(helpers.movingAverage([MAX, MAX, MAX], 2)).toEqual([MAX, MAX]);
+		expect(helpers.movingAverage([-MAX, -MAX], 2)).toEqual([-MAX]);
+		expect(helpers.movingAverage([1e308, 1e308, -1e308, 1e308], 2)).toEqual([1e308, 0, 0]);
+		const [average] = helpers.movingAverage([MAX, MAX, 1e308], 3);
+		expect(Math.abs(average - (MAX / 3) * 2 - 1e308 / 3) / average).toBeLessThan(4 * Number.EPSILON);
+		const [negative] = helpers.movingAverage([-MAX, -1e308, -1e308, -1e308], 4);
+		expect(Math.abs(negative + MAX / 4 + (1e308 / 4) * 3) / -negative).toBeLessThan(4 * Number.EPSILON);
+	});
+
+	it('should convert values once with unary plus, like the other aggregates', function () {
+		expect(helpers.movingAverage(['1', '2', '3'] as never, 2)).toEqual([1.5, 2.5]);
+		// eslint-disable-next-line no-sparse-arrays
+		expect(helpers.movingAverage([1, , 3] as never, 2)).toEqual([NaN, NaN]);
+		let reads = 0;
+		const values = new Proxy([1, 2, 3], {
+			get(target, key, receiver) {
+				if (key !== 'length') reads++;
+				return Reflect.get(target, key, receiver);
+			}
+		});
+		expect(helpers.movingAverage(values, 2)).toEqual([1.5, 2.5]);
+		expect(reads).toBe(3);
+		expect(function () {
+			helpers.movingAverage([1n] as never, 1);
+		}).toThrow(TypeError);
+	});
+
+	it('should validate the window', function () {
+		expect(function () {
+			helpers.movingAverage([1, 2], 0);
+		}).toThrow(new RangeError('movingAverage: `window` must be an integer >= 1, got 0'));
+		expect(function () {
+			helpers.movingAverage([1, 2], 1.5);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.movingAverage([1, 2], NaN);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.movingAverage([1, 2], Infinity);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.movingAverage([1, 2], '2' as never);
+		}).toThrow(new TypeError('movingAverage: `window` must be an integer >= 1, got string'));
+	});
+
+	it('should stay linear on long series and wide windows', function () {
+		const values = Array.from({ length: 20_000 }, function (_, index) {
+			return Math.sin(index) * 10 ** (index % 40);
+		});
+		const start = performance.now();
+		// Recomputing each window would take 10,000 additions per average.
+		expect(helpers.movingAverage(values, 10_000)).toHaveLength(10_001);
+		expect(performance.now() - start).toBeLessThan(2000);
+	});
+});
+
+describe('toSignificant', function () {
+	it('should round to the given number of significant digits', function () {
+		expect(helpers.toSignificant(123456, 2)).toBe(120000);
+		expect(helpers.toSignificant(123456, 1)).toBe(100000);
+		expect(helpers.toSignificant(0.000123456, 3)).toBe(0.000123);
+		expect(helpers.toSignificant(123.456, 4)).toBe(123.5);
+		expect(helpers.toSignificant(-123.456, 4)).toBe(-123.5);
+		expect(helpers.toSignificant(1.23456e25, 3)).toBe(1.23e25);
+		expect(helpers.toSignificant(1.5e-7, 1)).toBe(2e-7);
+		expect(helpers.toSignificant(9.876e-200, 2)).toBe(9.9e-200);
+		expect(helpers.toSignificant(Math.PI, 3)).toBe(3.14);
+	});
+
+	it('should round as written next to powers of ten, where the fast path does not apply', function () {
+		// 1e23 is the double 99999999999999991611392, which String writes as 1e+23.
+		expect(helpers.toSignificant(1e23, 1)).toBe(1e23);
+		expect(helpers.toSignificant(1e23, 2)).toBe(1e23);
+		expect(helpers.toSignificant(1000, 2)).toBe(1000);
+		expect(helpers.toSignificant(0.001, 1)).toBe(0.001);
+		expect(helpers.toSignificant(999.9999999999999, 3)).toBe(1000);
+		expect(helpers.toSignificant(1.0000000000000002, 2)).toBe(1);
+		expect(helpers.toSignificant(9.999999999999999e-5, 15)).toBe(0.0001);
+		expect(helpers.toSignificant(123.456e-30, 2)).toBe(1.2e-28);
+		expect(helpers.toSignificant(123.456e30, 2)).toBe(1.2e32);
+	});
+
+	it('should carry into a new digit', function () {
+		expect(helpers.toSignificant(-9.96, 2)).toBe(-10);
+		expect(helpers.toSignificant(999.5, 3)).toBe(1000);
+		expect(helpers.toSignificant(0.0995, 2)).toBe(0.1);
+		expect(helpers.toSignificant(9.5, 1)).toBe(10);
+	});
+
+	it('should round ties half away from zero, as written', function () {
+		expect(helpers.toSignificant(2.5, 1)).toBe(3);
+		expect(helpers.toSignificant(-2.5, 1)).toBe(-3);
+		expect(helpers.toSignificant(1.005, 3)).toBe(1.01);
+		expect(helpers.toSignificant(-1.005, 3)).toBe(-1.01);
+		expect(helpers.toSignificant(0.125, 2)).toBe(0.13);
+		expect(helpers.toSignificant(1.45, 2)).toBe(1.5);
+		expect(helpers.toSignificant(8.345e-10, 3)).toBe(8.35e-10);
+	});
+
+	it('should return numbers with at most `digits` significant digits unchanged', function () {
+		expect(helpers.toSignificant(0.1, 1)).toBe(0.1);
+		expect(helpers.toSignificant(120000, 2)).toBe(120000);
+		expect(helpers.toSignificant(1e21, 1)).toBe(1e21);
+		expect(helpers.toSignificant(0.1 + 0.2, 17)).toBe(0.30000000000000004);
+		expect(helpers.toSignificant(0.1 + 0.2, 100)).toBe(0.30000000000000004);
+		expect(helpers.toSignificant(0.1 + 0.2, 16)).toBe(0.3);
+		expect(helpers.toSignificant(MAX, 17)).toBe(MAX);
+	});
+
+	it('should keep zeros, NaN and infinities as they are', function () {
+		expect(helpers.toSignificant(0, 3)).toBe(0);
+		expect(helpers.toSignificant(-0, 3)).toBe(-0);
+		expect(helpers.toSignificant(NaN, 3)).toBeNaN();
+		expect(helpers.toSignificant(Infinity, 3)).toBe(Infinity);
+		expect(helpers.toSignificant(-Infinity, 3)).toBe(-Infinity);
+	});
+
+	it('should handle subnormal numbers and overflow past the largest double', function () {
+		expect(helpers.toSignificant(5e-324, 1)).toBe(5e-324);
+		expect(helpers.toSignificant(2.5e-323, 1)).toBe(3e-323);
+		expect(helpers.toSignificant(1.7976931348623157e308, 1)).toBe(Infinity);
+		expect(helpers.toSignificant(-1.7976931348623157e308, 2)).toBe(-Infinity);
+		expect(helpers.toSignificant(1.7976931348623157e308, 3)).toBe(Infinity);
+		// 1.797693134862316e308 is beyond the doubles too.
+		expect(helpers.toSignificant(1.7976931348623157e308, 16)).toBe(Infinity);
+		expect(helpers.toSignificant(1.7976931348623155e308, 16)).toBe(Infinity);
+		expect(helpers.toSignificant(1.7976931348623153e308, 16)).toBe(1.797693134862315e308);
+	});
+
+	it('should convert the number with unary plus, like round', function () {
+		expect(helpers.toSignificant('1234' as never, 2)).toBe(1200);
+		expect(helpers.toSignificant(null as never, 2)).toBe(0);
+		expect(function () {
+			helpers.toSignificant(1n as never, 2);
+		}).toThrow(TypeError);
+	});
+
+	it('should validate digits', function () {
+		for (const digits of [0, 101, 1.5, -1, NaN, Infinity]) {
+			expect(function () {
+				helpers.toSignificant(1, digits);
+			}).toThrow(new RangeError(`toSignificant: \`digits\` must be an integer between 1 and 100, got ${digits}`));
+		}
+		expect(function () {
+			helpers.toSignificant(1, '3' as never);
+		}).toThrow(new TypeError('toSignificant: `digits` must be an integer between 1 and 100, got string'));
+		expect(function () {
+			helpers.toSignificant(1, undefined as never);
+		}).toThrow(TypeError);
+	});
+});
+
+describe('histogram', function () {
+	it('should split the extent of the values into equal-width bins', function () {
+		expect(helpers.histogram([1, 2, 2, 3, 4], { bins: 3 })).toEqual([
+			{ x0: 1, x1: 2, count: 1 },
+			{ x0: 2, x1: 3, count: 2 },
+			{ x0: 3, x1: 4, count: 2 }
+		]);
+		expect(helpers.histogram([0, 10], { bins: 2 })).toEqual([
+			{ x0: 0, x1: 5, count: 1 },
+			{ x0: 5, x1: 10, count: 1 }
+		]);
+	});
+
+	it('should use correctly rounded edges', function () {
+		expect(
+			helpers.histogram([0, 1], { bins: 10 }).map(function (bin) {
+				return bin.x0;
+			})
+		).toEqual([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]);
+	});
+
+	it("should default to Sturges' rule", function () {
+		expect(helpers.histogram([1, 2, 3, 4, 5, 6, 7, 8])).toHaveLength(4);
+		expect(helpers.histogram([1, 2, 3, 4, 5, 6, 7, 8, 9])).toHaveLength(5);
+		expect(helpers.histogram([1, 2])).toEqual([
+			{ x0: 1, x1: 1.5, count: 1 },
+			{ x0: 1.5, x1: 2, count: 1 }
+		]);
+		expect(helpers.histogram([], { domain: [0, 1] })).toEqual([{ x0: 0, x1: 1, count: 0 }]);
+	});
+
+	it('should give a single bin when every value is equal', function () {
+		expect(helpers.histogram([7])).toEqual([{ x0: 7, x1: 7, count: 1 }]);
+		expect(helpers.histogram([7, 7, 7], { bins: 5 })).toEqual([{ x0: 7, x1: 7, count: 3 }]);
+		expect(helpers.histogram([7, 8], { bins: 5, domain: [7, 7] })).toEqual([{ x0: 7, x1: 7, count: 1 }]);
+		expect(helpers.histogram([7], { thresholds: [5, 7, 9] })).toEqual([{ x0: 7, x1: 7, count: 1 }]);
+	});
+
+	it('should return no bins for no values and no domain', function () {
+		expect(helpers.histogram([])).toEqual([]);
+		expect(helpers.histogram([], { bins: 3 })).toEqual([]);
+		expect(helpers.histogram([], { thresholds: [1, 2] })).toEqual([]);
+	});
+
+	it('should put values on an inner edge in the bin above, and the maximum in the last bin', function () {
+		expect(
+			helpers.histogram([0, 5, 10, 10], { bins: 2 }).map(function (bin) {
+				return bin.count;
+			})
+		).toEqual([1, 3]);
+		expect(
+			helpers.histogram([0, 4.999, 5], { thresholds: [5], domain: [0, 10] }).map(function (bin) {
+				return bin.count;
+			})
+		).toEqual([2, 1]);
+	});
+
+	it('should cover the domain and skip the values outside it', function () {
+		expect(helpers.histogram([-5, 0, 0.5, 1, 1.5], { bins: 2, domain: [0, 1] })).toEqual([
+			{ x0: 0, x1: 0.5, count: 1 },
+			{ x0: 0.5, x1: 1, count: 2 }
+		]);
+		expect(helpers.histogram([5, 25, 30, 31], { thresholds: [10, 20], domain: [0, 30] })).toEqual([
+			{ x0: 0, x1: 10, count: 1 },
+			{ x0: 10, x1: 20, count: 0 },
+			{ x0: 20, x1: 30, count: 2 }
+		]);
+	});
+
+	it('should ignore the thresholds outside the open domain, so edges can include the bounds', function () {
+		const expected = [
+			{ x0: 0, x1: 10, count: 1 },
+			{ x0: 10, x1: 20, count: 1 },
+			{ x0: 20, x1: 30, count: 1 }
+		];
+		expect(helpers.histogram([1, 11, 21], { thresholds: [0, 10, 20, 30], domain: [0, 30] })).toEqual(expected);
+		expect(helpers.histogram([1, 11, 21], { thresholds: [-10, 0, 10, 20, 30, 40], domain: [0, 30] })).toEqual(expected);
+		expect(helpers.histogram([1, 11, 21], { thresholds: [10, 20], domain: [0, 30] })).toEqual(expected);
+		// Without a domain, the extent of the values bounds the bins.
+		expect(helpers.histogram([3, 12, 17], { thresholds: [0, 10, 20] })).toEqual([
+			{ x0: 3, x1: 10, count: 1 },
+			{ x0: 10, x1: 17, count: 2 }
+		]);
+		expect(helpers.histogram([3, 12], { thresholds: [] })).toEqual([{ x0: 3, x1: 12, count: 2 }]);
+	});
+
+	it('should keep the edges finite and ordered for domains wider than Number.MAX_VALUE', function () {
+		expect(helpers.histogram([-1e308, 1e308, 0], { bins: 4 })).toEqual([
+			{ x0: -1e308, x1: -5e307, count: 1 },
+			{ x0: -5e307, x1: 0, count: 0 },
+			{ x0: 0, x1: 5e307, count: 1 },
+			{ x0: 5e307, x1: 1e308, count: 1 }
+		]);
+		const edges = helpers.histogram([0, 1e308], { bins: 10 }).map(function (bin) {
+			return bin.x0;
+		});
+		expect(edges).toHaveLength(10);
+		edges.forEach(function (edge, index) {
+			expect(Math.abs(edge - index * 1e307)).toBeLessThanOrEqual(index * 1e307 * Number.EPSILON);
+		});
+		const extreme = helpers.histogram([-MAX, MAX], { bins: 3 });
+		expect(extreme[0].x0).toBe(-MAX);
+		expect(extreme[2].x1).toBe(MAX);
+		expect(extreme[1].x0).toBeLessThan(extreme[1].x1);
+		expect(
+			extreme.map(function (bin) {
+				return bin.count;
+			})
+		).toEqual([1, 0, 1]);
+	});
+
+	it('should only accept finite numbers as values, read once', function () {
+		// Regression: values used to be converted with unary plus, so null, '' and [] counted as 0 and stretched the domain.
+		for (const [value, type] of [
+			[null, 'null'],
+			['', 'string'],
+			['1', 'string'],
+			['Infinity', 'string'],
+			[[], 'object'],
+			[true, 'boolean']
+		] as const) {
+			expect(function () {
+				helpers.histogram([5, value as never, 6]);
+			}).toThrow(new TypeError(`histogram: \`values[1]\` must be a finite number, got ${type}`));
+		}
+		expect(function () {
+			helpers.histogram([1, NaN]);
+		}).toThrow(new RangeError('histogram: `values[1]` must be a finite number, got NaN'));
+		expect(function () {
+			helpers.histogram([Infinity], { domain: [0, 1] });
+		}).toThrow(new RangeError('histogram: `values[0]` must be a finite number, got Infinity'));
+		expect(function () {
+			helpers.histogram(['x'] as never);
+		}).toThrow(new TypeError('histogram: `values[0]` must be a finite number, got string'));
+		expect(function () {
+			// eslint-disable-next-line no-sparse-arrays
+			helpers.histogram([1, , 2] as never);
+		}).toThrow(new TypeError('histogram: `values[1]` must be a finite number, got undefined'));
+		expect(function () {
+			helpers.histogram([1n] as never);
+		}).toThrow(new TypeError('histogram: `values[0]` must be a finite number, got bigint'));
+		let reads = 0;
+		const values = new Proxy([1, 2, 3], {
+			get(target, key, receiver) {
+				if (key !== 'length') reads++;
+				return Reflect.get(target, key, receiver);
+			}
+		});
+		expect(helpers.histogram(values, { bins: 1 })).toEqual([{ x0: 1, x1: 3, count: 3 }]);
+		expect(reads).toBe(3);
+	});
+
+	it('should validate bins', function () {
+		// Regression: 2 ** 31 - 1 bins made the runtime abort with an out-of-memory error.
+		for (const bins of [0, 1.5, -1, NaN, Infinity, 2 ** 20 + 1, 2 ** 31 - 1]) {
+			expect(function () {
+				helpers.histogram([1], { bins });
+			}).toThrow(new RangeError(`histogram: \`bins\` must be an integer between 1 and 1048576, got ${bins}`));
+		}
+		expect(function () {
+			helpers.histogram([1], { bins: '2' as never });
+		}).toThrow(new TypeError('histogram: `bins` must be an integer between 1 and 1048576, got string'));
+		expect(function () {
+			helpers.histogram([1], { bins: 2, thresholds: [1] } as never);
+		}).toThrow(new TypeError('histogram: `bins` and `thresholds` cannot be used together'));
+	});
+
+	it('should validate thresholds', function () {
+		expect(function () {
+			helpers.histogram([1], { thresholds: 5 as never });
+		}).toThrow(new TypeError('histogram: `thresholds` must be an array, got number'));
+		expect(function () {
+			helpers.histogram([1], { thresholds: [1, 3, 2] });
+		}).toThrow(new RangeError('histogram: `thresholds` must be strictly increasing, got 3 before 2'));
+		expect(function () {
+			helpers.histogram([1], { thresholds: [1, 1] });
+		}).toThrow(new RangeError('histogram: `thresholds` must be strictly increasing, got 1 before 1'));
+		expect(function () {
+			helpers.histogram([1], { thresholds: [1, NaN] });
+		}).toThrow(new RangeError('histogram: `thresholds[1]` must be a finite number, got NaN'));
+		expect(function () {
+			helpers.histogram([1], { thresholds: [-Infinity] });
+		}).toThrow(new RangeError('histogram: `thresholds[0]` must be a finite number, got -Infinity'));
+		expect(function () {
+			helpers.histogram([1], { thresholds: ['1'] as never });
+		}).toThrow(new TypeError('histogram: `thresholds[0]` must be a finite number, got string'));
+	});
+
+	it('should validate the domain', function () {
+		expect(function () {
+			helpers.histogram([1], { domain: 5 as never });
+		}).toThrow(new TypeError('histogram: `domain` must be an array of two numbers, got number'));
+		expect(function () {
+			helpers.histogram([1], { domain: [1, 2, 3] as never });
+		}).toThrow(new TypeError('histogram: `domain` must be an array of two numbers, got object'));
+		expect(function () {
+			helpers.histogram([1], { domain: [2, 1] });
+		}).toThrow(new RangeError('histogram: `domain` must be in increasing order, got [2, 1]'));
+		expect(function () {
+			helpers.histogram([1], { domain: [0, Infinity] });
+		}).toThrow(new RangeError('histogram: `domain[1]` must be a finite number, got Infinity'));
+		expect(function () {
+			helpers.histogram([1], { domain: ['0', 1] as never });
+		}).toThrow(new TypeError('histogram: `domain[0]` must be a finite number, got string'));
+	});
+
+	it('should read each option once', function () {
+		let reads = 0;
+		const options = {
+			get thresholds(): number[] {
+				reads++;
+				return reads === 1 ? [5] : [1, 0];
+			}
+		};
+		expect(helpers.histogram([0, 10], options)).toEqual([
+			{ x0: 0, x1: 5, count: 1 },
+			{ x0: 5, x1: 10, count: 1 }
+		]);
+		let thresholdReads = 0;
+		const thresholds = new Proxy([5], {
+			get(target, key, receiver) {
+				if (key === '0') thresholdReads++;
+				return Reflect.get(target, key, receiver);
+			}
+		});
+		helpers.histogram([0, 10], { thresholds });
+		expect(thresholdReads).toBe(1);
+	});
+
+	it('should place values in O(n log b)', function () {
+		const values = Array.from({ length: 50_000 }, function (_, index) {
+			return (index * 7919) % 100_003;
+		});
+		const start = performance.now();
+		// A linear scan of the bins would take 50,000 × 50,000 steps.
+		const bins = helpers.histogram(values, { bins: 50_000 });
+		expect(performance.now() - start).toBeLessThan(2000);
+		expect(
+			bins.reduce(function (total, bin) {
+				return total + bin.count;
+			}, 0)
+		).toBe(50_000);
 	});
 });

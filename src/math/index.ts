@@ -200,13 +200,18 @@ export function average(numbers: ReadonlyArray<number>): number {
 	const count = numbers.length;
 	const mean = scaledSum(numbers, count);
 	if (Number.isFinite(mean) || count === 0) return mean;
-	// The sum overflowed (or an element is infinite, or overflowing terms met an infinite one as `Infinity - Infinity`): the sum of the
-	// terms divided by the count cannot overflow when the mean is finite.
-	return sum(
+	// The sum overflowed (or an element is infinite, or overflowing terms met an infinite one as `Infinity - Infinity`): add up the terms
+	// scaled by a power of two at most `1 / count` (exactly, as far as the result is concerned), which cannot overflow, then scale back.
+	// Dividing each term by `count` instead rounds them all, and `average([M, M, M])` (with `M = Number.MAX_VALUE`) added up past `M`.
+	const scale = 2 ** -Math.ceil(Math.log2(count));
+	const scaled = scaledSum(
 		numbers.map(function (value) {
-			return +value / count;
-		})
+			return +value * scale;
+		}),
+		count
 	);
+	// No mean of finite values exceeds the largest double, but the last rounding can push it there.
+	return Number.isFinite(scaled) ? Math.min(Math.max(scaled / scale, -Number.MAX_VALUE), Number.MAX_VALUE) : scaled;
 }
 
 /**
@@ -1420,4 +1425,528 @@ function scaledInteger(value: number, shift: number): bigint {
 	const digits = point === -1 ? mantissa : mantissa.slice(0, point) + mantissa.slice(point + 1);
 	const fractionDigits = (point === -1 ? 0 : mantissa.length - point - 1) - Number(exponent);
 	return BigInt(digits) * 10n ** BigInt(shift - fractionDigits);
+}
+
+/**
+ * Rounds a number to `digits` significant figures. Like {@link round}, it works on the decimal representation (the shortest one that
+ * `String` writes), so values round as written (`toSignificant(1.005, 3) === 1.01`, where `Number((1.005).toPrecision(3))` is `1`) and
+ * ties are rounded half away from zero (`toSignificant(-2.5, 1) === -3`). The result is the double nearest to the rounded decimal, so it
+ * prints without noise (`toSignificant(0.000123456, 3)` is `0.000123`, not `0.00012300000000000001`).
+ *
+ * `±0`, `NaN` and `±Infinity` are returned as-is, as is a number that already has at most `digits` significant digits (doubles never need
+ * more than 17). Like {@link round}, a number that rounds up past `Number.MAX_VALUE` gives `±Infinity` (only the very largest doubles do:
+ * `toSignificant(1.7976931348623157e308, 1)` is `2e308`).
+ * @param {number} input - The number to round (converted with unary `+`)
+ * @param {number} digits - The number of significant digits to keep, an integer from 1 to 100 (the range of `toPrecision`)
+ * @returns {number} The rounded number
+ * @throws {RangeError} when `digits` is not an integer between 1 and 100
+ * @throws {TypeError} when `digits` is not a number
+ * @example
+ * toSignificant(123456, 2); // => 120000
+ * toSignificant(0.000123456, 3); // => 0.000123
+ * toSignificant(-9.96, 2); // => -10
+ * toSignificant(1.005, 3); // => 1.01 // as written: (1.005).toPrecision(3) is '1.00'
+ * toSignificant(2.5, 1); // => 3
+ * toSignificant(1.5, 0); // throws RangeError
+ */
+export function toSignificant(input: number, digits: number): number {
+	assertNumber('toSignificant', 'digits', digits, Number.isInteger(digits) && digits >= 1 && digits <= 100, 'an integer between 1 and 100');
+	// Converted once with unary `+`, like `round`.
+	const number = +input;
+	if (number === 0 || !Number.isFinite(number)) return number;
+	const magnitude = Math.abs(number);
+	// Fast path (see `round`): away from powers of ten, `floor(log10)` is the power of the first significant digit, of the value and of
+	// its shortest decimal form alike (they only differ within half an ulp of a power of ten). Scaling by an exact power of ten is then
+	// within a few ulps of the decimal shift, so unless the scaled value lies within a safety margin of a `.5` tie, it rounds to the same
+	// integer `k`, and `k` scaled back (a correctly rounded division or product) is the double nearest to the rounded decimal.
+	const logarithm = Math.log10(magnitude);
+	const power = Math.floor(logarithm);
+	const shift = digits - 1 - power;
+	if (logarithm - power > 1e-12 && power + 1 - logarithm > 1e-12 && shift >= -22 && shift <= 22) {
+		const factor = POWERS_OF_TEN[Math.abs(shift)];
+		const scaled = shift >= 0 ? magnitude * factor : magnitude / factor;
+		if (Math.abs(scaled - Math.floor(scaled) - 0.5) > scaled * 2 ** -46) {
+			const fast = shift >= 0 ? Math.round(scaled) / factor : Math.round(scaled) * factor;
+			return number < 0 ? -fast : fast;
+		}
+	}
+	const [mantissa, exponent = '0'] = String(magnitude).split('e');
+	const point = mantissa.indexOf('.');
+	const digitString = point === -1 ? mantissa : mantissa.slice(0, point) + mantissa.slice(point + 1);
+	// The number of digits before the decimal point in the full positional form, and the power of ten of the first significant digit
+	// (`0.000123` is written `0.000123`: one integer digit, then four zeros before the `1`).
+	const integerDigits = (point === -1 ? mantissa.length : point) + Number(exponent);
+	const leading = integerDigits - 1 - digitString.search(/[1-9]/);
+	const decimals = digits - 1 - leading;
+	// Already at most `digits` significant digits (`roundDecimalString` needs a digit to drop).
+	if (digitString.length - integerDigits <= decimals) return number;
+	const rounded = roundDecimalString(magnitude, decimals);
+	return number < 0 ? -rounded : rounded;
+}
+
+/**
+ * An exact sum of finite doubles: Shewchuk's non-overlapping partials, in increasing magnitude, plus a count of `2 ** 1024` carried out
+ * of them on overflow, so that the sum is `overflow * 2 ** 1024 + Σ partials` (the representation of the TC39 `Math.sumPrecise` polyfill).
+ */
+interface ExactSum {
+	/** Non-overlapping doubles, in increasing magnitude, none of them zero (the first `size` items; the array is not shrunk). */
+	partials: number[];
+	/** How many partials there are. */
+	size: number;
+	/** How many times `2 ** 1024` was carried out of the partials (negative for `-2 ** 1024`). */
+	overflow: number;
+}
+
+/**
+ * Adds a finite double to an exact sum (Shewchuk's `grow-expansion`, as in Python's `math.fsum`). When two partials add up beyond
+ * `Number.MAX_VALUE`, `2 ** 1024` is moved (exactly, in two halves) from the larger one into `total.overflow`, so nothing is lost.
+ * @param {ExactSum} total - The exact sum, updated in place
+ * @param {number} value - A finite double
+ * @returns {void}
+ */
+function addExact(total: ExactSum, value: number): void {
+	const partials = total.partials;
+	let x = value;
+	let used = 0;
+	for (let i = 0, size = total.size; i < size; i++) {
+		let y = partials[i];
+		if (Math.abs(x) < Math.abs(y)) {
+			y = x;
+			x = partials[i];
+		}
+		let high = x + y;
+		if (Math.abs(high) === Infinity) {
+			// `x` and `y` have the same sign and `|x| >= 2 ** 1023`, so both subtractions are exact.
+			const sign = high > 0 ? 1 : -1;
+			total.overflow += sign;
+			x = x - sign * 2 ** 1023 - sign * 2 ** 1023;
+			if (Math.abs(x) < Math.abs(y)) {
+				const larger = y;
+				y = x;
+				x = larger;
+			}
+			high = x + y;
+		}
+		// Fast two-sum (`|x| >= |y|`): `low` is the exact rounding error of `high`.
+		const low = y - (high - x);
+		if (low !== 0) partials[used++] = low;
+		x = high;
+	}
+	if (x !== 0) partials[used++] = x;
+	// Tracking the size is about twice as fast as shrinking the array.
+	total.size = used;
+}
+
+/**
+ * Rounds an exact sum to the nearest double (ties to even), `±Infinity` when it is beyond the doubles. The sum is not modified.
+ * @param {ExactSum} total - The exact sum
+ * @returns {number} The correctly rounded sum (`+0` for an exact zero)
+ */
+function roundExact(total: ExactSum): number {
+	let partials = total.partials;
+	const overflow = total.overflow;
+	let n = total.size - 1;
+	let high = 0;
+	let low = 0;
+	if (overflow !== 0) {
+		const next = n >= 0 ? partials[n] : 0;
+		n--;
+		// The partials add up to less than `2 ** 1024` in magnitude: beyond one carry, or with the largest partial of the same sign, the
+		// sum is out of range.
+		if (Math.abs(overflow) > 1 || next * overflow > 0) return overflow * Infinity;
+		// `overflow * 2 ** 1024 + next`, halved to stay in range (exactly, by a two-sum), then doubled back.
+		high = overflow * 2 ** 1023 + next / 2;
+		low = (next / 2 - (high - overflow * 2 ** 1023)) * 2;
+		if (Math.abs(high * 2) === Infinity) {
+			// `2 ** 1024 - 2 ** 970` (half an ulp above `Number.MAX_VALUE`) rounds to even, so to Infinity, unless the rest of the sum
+			// pulls it below the tie.
+			const belowTie = high === overflow * 2 ** 1023 && low === -overflow * 2 ** 970 && n >= 0 && partials[n] * overflow < 0;
+			return overflow * (belowTie ? Number.MAX_VALUE : Infinity);
+		}
+		if (low !== 0) {
+			partials = partials.slice(0, n + 1);
+			partials.push(low);
+			n++;
+			low = 0;
+		}
+		high *= 2;
+	}
+	// Add the partials from the largest down, until one is not absorbed exactly: the rest cannot change the rounding, except at a tie.
+	while (n >= 0) {
+		const x = high;
+		const y = partials[n--];
+		high = x + y;
+		low = y - (high - x);
+		if (low !== 0) break;
+	}
+	// `low` is half an ulp of `high` (a tie) and the next partial has the same sign: the exact sum is beyond the tie, round away.
+	// (Signs are compared, not multiplied: the product of two tiny partials underflows to 0.)
+	if (n >= 0 && low !== 0 && low < 0 === partials[n] < 0) {
+		const doubled = low * 2;
+		const away = high + doubled;
+		if (away - high === doubled) high = away;
+	}
+	return high;
+}
+
+/** The type of the native `Math.sumPrecise` (ES2026). */
+type SumPrecise = (items: Iterable<number>) => number;
+
+/**
+ * The native `Math.sumPrecise` once it passed the check of {@link nativeSumPrecise}, `null` when it is missing or failed it, `undefined`
+ * before the first call.
+ */
+let checkedSumPrecise: SumPrecise | null | undefined;
+
+/**
+ * Sums that only an exact implementation of `Math.sumPrecise` gets right, with their results: an intermediate overflow, subnormals (whose
+ * sum a scaled or extended-precision polyfill loses), a cancellation beyond the precision of a double, a rounding decided by a part 36
+ * orders of magnitude smaller (which compensated summation such as Kahan's or Neumaier's, and fixed-size double-double sums, get wrong),
+ * the `-0` of an empty sum, and `NaN` for opposite infinities.
+ */
+const SUM_PRECISE_PROBES: ReadonlyArray<readonly [number[], number]> = [
+	[[1e308, 1e308, -1e308], 1e308],
+	[[5e-324, 5e-324, 5e-324], 1.5e-323],
+	[[1, 1e100, 1, -1e100], 2],
+	[[1, 1e-20, -1e16], -9999999999999998],
+	[[], -0],
+	[[Infinity, -Infinity], NaN]
+];
+
+/**
+ * Returns the runtime's `Math.sumPrecise` when it gets every one of {@link SUM_PRECISE_PROBES} right. Requiring a native (built-in)
+ * function instead would be no safer (a polyfill can claim to be native through `toString`), and would refuse a correct polyfill. A
+ * function that passes is exact on the cases where inexact algorithms differ; its results are then the same as {@link sumPrecise}'s own.
+ * @returns {SumPrecise | null} The function, or `null`
+ */
+function nativeSumPrecise(): SumPrecise | null {
+	if (checkedSumPrecise === undefined) {
+		const candidate = (Math as { sumPrecise?: unknown }).sumPrecise;
+		checkedSumPrecise = null;
+		try {
+			const works =
+				typeof candidate === 'function' &&
+				SUM_PRECISE_PROBES.every(function ([items, expected]) {
+					return Object.is(candidate(items), expected);
+				});
+			if (works) checkedSumPrecise = candidate as SumPrecise;
+		} catch {
+			// A replacement that throws is not used.
+		}
+	}
+	return checkedSumPrecise;
+}
+
+/**
+ * Adds up numbers exactly, then rounds once: the result is the double nearest to the true sum (ties to even), whatever the order of the
+ * numbers and however much they cancel. This is TC39 `Math.sumPrecise` (ES2026), with its semantics, and Python's `math.fsum`, minus its
+ * `OverflowError`: intermediate sums beyond `Number.MAX_VALUE` are carried exactly (`sumPrecise([1e308, 1e308, -1e308])` is `1e308`).
+ * Where the runtime has a native `Math.sumPrecise` (checked once), it adds up arrays and typed arrays, with the same results.
+ *
+ * Unlike {@link sum}, which is compensated (its error is tiny, but can show in the last digit, typically when the true sum lies near a
+ * tie between two doubles), the result is exact up to that final rounding. Like `Math.sumPrecise`, and also unlike {@link sum}, nothing is
+ * converted: every item must be a number.
+ * - An empty iterable, or only `-0`s, give `-0` (the identity of addition); any other zero sum is `+0`.
+ * - Any `NaN`, or both `Infinity` and `-Infinity`, give `NaN`; otherwise an infinity gives that infinity.
+ * - A finite sum beyond the doubles gives `±Infinity`.
+ *
+ * Exactness costs time: in the order of 20 times as long as {@link sum} on everyday data. Each number goes through the partials of the
+ * exact sum (Shewchuk's algorithm), usually one to three of them; numbers spread over the whole range of doubles can make that a hundred.
+ * @param {Iterable<number>} numbers - The numbers to add up (any iterable: an array, a typed array, a generator...)
+ * @returns {number} The correctly rounded sum
+ * @throws {TypeError} when `numbers` is not iterable or an item is not a number
+ * @example
+ * sumPrecise([0.1, 0.2, 0.3]); // => 0.6
+ * sumPrecise([1, 1e-20, -1e16]); // => -9999999999999998 // sum gives -10000000000000000
+ * sumPrecise([1e308, 1e308, -1e308]); // => 1e308
+ * sumPrecise([]); // => -0
+ * sumPrecise(new Set([1, 2, 3])); // => 6
+ * sumPrecise(['1'] as never); // throws TypeError
+ */
+export function sumPrecise(numbers: Iterable<number>): number {
+	if (numbers == null || typeof (numbers as Partial<Iterable<number>>)[Symbol.iterator] !== 'function') {
+		throw new TypeError(`sumPrecise: \`numbers\` must be an iterable, got ${describe(numbers)}`);
+	}
+	// The native function adds up arrays (and typed arrays): copying their items, once validated, keeps this function's error messages and
+	// reads each item once. Other iterables (generators, sets...) are streamed through the partials instead, without a copy.
+	const native = Array.isArray(numbers) || ArrayBuffer.isView(numbers) ? nativeSumPrecise() : null;
+	const items: number[] = [];
+	const total: ExactSum = { partials: [], size: 0, overflow: 0 };
+	// `0` while every item is finite, else the sum of the infinite ones so far (`NaN` once a `NaN` or opposite infinities were seen).
+	let infinite = 0;
+	let negativeZero = true;
+	let index = 0;
+	for (const value of numbers) {
+		if (typeof value !== 'number') throw new TypeError(`sumPrecise: \`numbers[${index}]\` must be a number, got ${describe(value)}`);
+		index++;
+		if (native !== null) {
+			items.push(value);
+		} else if (value - value !== 0) {
+			// `Infinity - Infinity` and `NaN - NaN` are `NaN`.
+			infinite += value;
+		} else {
+			if (value !== 0 || 1 / value > 0) negativeZero = false;
+			// Once the sum is infinite (or `NaN`), the finite items cannot change it, but they still have to be numbers.
+			if (value !== 0 && infinite === 0) addExact(total, value);
+		}
+	}
+	if (native !== null) return native(items);
+	if (infinite !== 0) return infinite;
+	return negativeZero ? -0 : roundExact(total);
+}
+
+/**
+ * Computes the simple moving average of a series: the mean of every run of `window` consecutive values, in order. The result has
+ * `values.length - window + 1` elements (`[]` when there are fewer values than `window`), like pandas' `rolling(window).mean()` without
+ * its leading `NaN`s, and is computed in O(n), each value being added to and removed from a running sum once.
+ *
+ * The running sum is kept exactly (see {@link sumPrecise}), so there is no drift: each average is the window's exact sum, rounded once,
+ * divided by `window`, i.e. exactly `sumPrecise(window values) / window`, however long the series and whatever left the window before
+ * (`movingAverage([1e20, 1, 2, 3], 2)` ends with `2.5`, where an incremental float sum gives `0`). A `NaN` or an infinity only affects the
+ * windows that hold it (an incremental sum stays `NaN` forever), and windows whose sum exceeds `Number.MAX_VALUE` still get their finite
+ * average, rounded the same way (the exact sum, scaled down by a power of two, rounded once, divided by `window`).
+ * Values are converted once with unary `+`, like the other aggregates (numeric strings count as numbers).
+ * @param {ReadonlyArray<number>} values - The series
+ * @param {number} window - The number of values per average, a positive integer
+ * @returns {number[]} The averages, one per window position
+ * @throws {RangeError} when `window` is not a positive integer
+ * @throws {TypeError} when `window` is not a number
+ * @example
+ * movingAverage([1, 2, 3, 4, 5], 3); // => [2, 3, 4]
+ * movingAverage([1, 2], 3); // => []
+ * movingAverage([1e20, 1, 2, 3], 2); // => [5e19, 1.5, 2.5]
+ * movingAverage([1, NaN, 3, 4], 2); // => [NaN, NaN, 3.5]
+ * movingAverage([1, 2, 3], 0); // throws RangeError
+ */
+export function movingAverage(values: ReadonlyArray<number>, window: number): number[] {
+	assertInteger('movingAverage', 'window', window, 1);
+	const count = values.length;
+	const numbers = new Float64Array(count);
+	for (let i = 0; i < count; i++) numbers[i] = +values[i];
+	const result: number[] = [];
+	const total: ExactSum = { partials: [], size: 0, overflow: 0 };
+	// How many `NaN`s, infinities and negative zeros the window holds: they are kept out of the exact sum.
+	let nans = 0;
+	let positiveInfinities = 0;
+	let negativeInfinities = 0;
+	let negativeZeros = 0;
+	/**
+	 * Adds a value to the window, or removes it.
+	 * @param {number} value - The value
+	 * @param {number} sign - `1` to add it, `-1` to remove it
+	 * @returns {void}
+	 */
+	function update(value: number, sign: number): void {
+		if (value !== value) nans += sign;
+		else if (value === Infinity) positiveInfinities += sign;
+		else if (value === -Infinity) negativeInfinities += sign;
+		else if (value !== 0) addExact(total, sign * value);
+		else if (1 / value < 0) negativeZeros += sign;
+	}
+	for (let i = 0; i < count; i++) {
+		update(numbers[i], 1);
+		if (i >= window) update(numbers[i - window], -1);
+		if (i < window - 1) continue;
+		if (nans > 0 || (positiveInfinities > 0 && negativeInfinities > 0)) result.push(NaN);
+		else if (positiveInfinities > 0 || negativeInfinities > 0) result.push(positiveInfinities > 0 ? Infinity : -Infinity);
+		else if (negativeZeros === window) result.push(-0);
+		else result.push(exactMean(total, window));
+	}
+	return result;
+}
+
+/**
+ * Divides an exact sum by a count: the correctly rounded sum divided by `count` (one more rounding). When the sum is beyond the doubles
+ * but the mean is not, the same is done on the sum scaled by `2 ** -k` (`2 ** k >= 2 * (count + 2)`, so that both the scaled sum and
+ * the scaled carries stay in range; exact, except for bits far below the result's last place), and the result is scaled back (exactly,
+ * capped at `Number.MAX_VALUE`, which no mean of finite values exceeds).
+ * @param {ExactSum} total - The exact sum of `count` finite values
+ * @param {number} count - The number of values
+ * @returns {number} Their mean
+ */
+function exactMean(total: ExactSum, count: number): number {
+	const rounded = roundExact(total);
+	if (Number.isFinite(rounded)) return rounded / count;
+	// The carried part is at most `(count + 2) * 2 ** 1024` in magnitude (the partials add up to less than `2 ** 1025`).
+	const exponent = Math.ceil(Math.log2(count + 2)) + 1;
+	const scale = 2 ** -exponent;
+	const scaled: ExactSum = { partials: [], size: 0, overflow: 0 };
+	for (let i = 0; i < total.size; i++) addExact(scaled, total.partials[i] * scale);
+	addExact(scaled, total.overflow * 2 ** (1024 - exponent));
+	const mean = (roundExact(scaled) / count) * 2 ** exponent;
+	return Math.min(Math.max(mean, -Number.MAX_VALUE), Number.MAX_VALUE);
+}
+
+/**
+ * One bin of a {@link histogram}: the values `v` with `x0 <= v < x1` (`x0 <= v <= x1` for the last bin).
+ */
+export interface HistogramBin {
+	/** The inclusive lower bound. */
+	x0: number;
+	/** The upper bound: exclusive, except for the last bin. */
+	x1: number;
+	/** How many values fall in the bin. */
+	count: number;
+}
+
+/**
+ * Options accepted by {@link histogram}: equal-width `bins`, or explicit `thresholds` (not both), and an optional `domain`.
+ */
+export type HistogramOptions = HistogramBinsOptions | HistogramThresholdsOptions;
+
+/**
+ * Options of a {@link histogram} with equal-width bins.
+ */
+export interface HistogramBinsOptions {
+	/**
+	 * The number of bins, an integer from 1 to 2 ** 20: the domain is split into that many bins of equal width (exactly that many, unlike
+	 * d3's `thresholds(count)`, which picks round boundaries and only approaches the count).
+	 * @default Sturges' rule: `ceil(log2(n)) + 1` for `n` values
+	 */
+	readonly bins?: number;
+	/** Not allowed together with `bins`. */
+	readonly thresholds?: undefined;
+	/**
+	 * The range `[x0, x1]` covered by the bins (finite, `x0 <= x1`); values outside it are not counted.
+	 * @default the smallest and largest values
+	 */
+	readonly domain?: readonly [number, number];
+}
+
+/**
+ * Options of a {@link histogram} with explicit bin boundaries.
+ */
+export interface HistogramThresholdsOptions {
+	/** Not allowed together with `thresholds`. */
+	readonly bins?: undefined;
+	/**
+	 * The boundaries between bins, finite and strictly increasing. As in d3, the first bin starts at the domain's lower bound and the last
+	 * one ends at its upper bound; thresholds outside the open domain (including the bounds themselves) are ignored, so the edges of a
+	 * histogram can be passed with or without its bounds (`[0, 10, 20, 30]` and `[10, 20]` give the same bins over `[0, 30]`).
+	 */
+	readonly thresholds: ReadonlyArray<number>;
+	/**
+	 * The range `[x0, x1]` covered by the bins (finite, `x0 <= x1`); values outside it are not counted.
+	 * @default the smallest and largest values
+	 */
+	readonly domain?: readonly [number, number];
+}
+
+/**
+ * The largest `bins` count of {@link histogram}: 2 ** 20 (1,048,576) bins already take about 100 MB (an object, a count and two edges each),
+ * and are far more than any chart can show (a 4K screen is 3,840 pixels wide). An uncapped count, such as one read from a query string,
+ * could make the runtime abort with an out-of-memory error, which cannot be caught.
+ */
+const MAX_BINS = 1_048_576;
+
+/**
+ * Reads a bin boundary option (an element of `domain` or `thresholds`), which must be a finite number.
+ * @param {string} name - The name of the option element, for the error message
+ * @param {unknown} value - Its value
+ * @returns {number} The value
+ * @throws {RangeError} when `value` is a number that is not finite
+ * @throws {TypeError} when `value` is not a number
+ */
+function finiteBound(name: string, value: unknown): number {
+	assertNumber('histogram', name, value, Number.isFinite(value), 'a finite number');
+	return value;
+}
+
+/**
+ * Counts values into bins, like d3's `bin()`: equal-width `bins` (Sturges' rule by default) or explicit `thresholds`, over a `domain`
+ * that defaults to the extent of the values. Each bin `{ x0, x1, count }` holds the values `v` with `x0 <= v < x1`, except the last one,
+ * which also holds `x1` (so the largest value is counted). Values outside the domain are not counted.
+ *
+ * Unlike d3, the domain is not widened to round ("nice") boundaries and `bins` gives exactly that many bins (pass `thresholds` for round
+ * boundaries), a domain with `x0 === x1` (all values equal) gives a single bin, and non-finite values throw instead of being skipped
+ * silently: filter missing values out first. Only the counts are kept, not the values. Values must be numbers (nothing is converted: `null`
+ * or `''` would otherwise count as 0), each one read once and placed by binary search, so the cost is O(n log b) for `n` values and `b`
+ * bins. At most 2 ** 20 bins can be asked for: each one is allocated.
+ * @param {ReadonlyArray<number>} values - The values to count
+ * @param {HistogramOptions} [options={}] - `bins` or `thresholds`, and `domain`
+ * @returns {HistogramBin[]} The bins, in increasing order, edge to edge (`[]` for no values and no `domain`)
+ * @throws {RangeError} when a value is `NaN` or infinite, `bins` is not an integer from 1 to 2 ** 20, a threshold or a domain bound is
+ * not finite, the thresholds are not strictly increasing, or the domain's bounds are reversed
+ * @throws {TypeError} when a value is not a number, `bins` is not a number, `thresholds` or `domain` is not an array (a domain of two
+ * numbers), or both `bins` and `thresholds` are given
+ * @example
+ * histogram([1, 2, 2, 3, 4], { bins: 3 }); // => [{ x0: 1, x1: 2, count: 1 }, { x0: 2, x1: 3, count: 2 }, { x0: 3, x1: 4, count: 2 }]
+ * histogram([5, 25, 30], { thresholds: [10, 20], domain: [0, 30] }); // => [{ x0: 0, x1: 10, count: 1 }, { x0: 10, x1: 20, count: 0 }, { x0: 20, x1: 30, count: 2 }]
+ * histogram([0.1, 0.25, 0.3], { bins: 2, domain: [0, 1] }).map(function (bin) { return bin.count; }); // => [3, 0]
+ * histogram([]); // => []
+ * histogram([1, NaN]); // throws RangeError
+ */
+export function histogram(values: ReadonlyArray<number>, options: HistogramOptions = {}): HistogramBin[] {
+	const { bins, thresholds, domain } = options;
+	if (bins !== undefined && thresholds !== undefined) throw new TypeError('histogram: `bins` and `thresholds` cannot be used together');
+	if (bins !== undefined) assertNumber('histogram', 'bins', bins, Number.isInteger(bins) && bins >= 1 && bins <= MAX_BINS, `an integer between 1 and ${MAX_BINS}`);
+	// Each option element is read once: the values validated are the values used.
+	let inner: number[] | undefined;
+	if (thresholds !== undefined) {
+		if (!Array.isArray(thresholds)) throw new TypeError(`histogram: \`thresholds\` must be an array, got ${describe(thresholds)}`);
+		inner = [];
+		for (let i = 0; i < thresholds.length; i++) {
+			const threshold = finiteBound(`thresholds[${i}]`, thresholds[i]);
+			if (i > 0 && !(threshold > inner[i - 1])) {
+				throw new RangeError(`histogram: \`thresholds\` must be strictly increasing, got ${inner[i - 1]} before ${threshold}`);
+			}
+			inner.push(threshold);
+		}
+	}
+	let low = Infinity;
+	let high = -Infinity;
+	if (domain !== undefined) {
+		if (!Array.isArray(domain) || domain.length !== 2) throw new TypeError(`histogram: \`domain\` must be an array of two numbers, got ${describe(domain)}`);
+		low = finiteBound('domain[0]', domain[0]);
+		high = finiteBound('domain[1]', domain[1]);
+		if (low > high) throw new RangeError(`histogram: \`domain\` must be in increasing order, got [${low}, ${high}]`);
+	}
+	const count = values.length;
+	const numbers = new Float64Array(count);
+	for (let i = 0; i < count; i++) {
+		const value = values[i];
+		if (!Number.isFinite(value)) assertNumber('histogram', `values[${i}]`, value, false, 'a finite number');
+		numbers[i] = value;
+		if (domain === undefined) {
+			low = Math.min(low, value);
+			high = Math.max(high, value);
+		}
+	}
+	// No values and no domain: nothing to cover.
+	if (low > high) return [];
+	// The edges of the bins, from `low` to `high`.
+	const edges = [low];
+	if (inner !== undefined) {
+		for (const threshold of inner) if (threshold > low && threshold < high) edges.push(threshold);
+	} else if (low < high) {
+		const binCount = bins ?? Math.max(1, Math.ceil(Math.log2(count)) + 1);
+		// When the bounds are further apart than `Number.MAX_VALUE`, their halves are used (exactly: such bounds are far from the subnormals).
+		const scale = Number.isFinite(high - low) ? 1 : 0.5;
+		const start = low * scale;
+		const width = high * scale - start;
+		// `(width * i) / binCount` is correctly rounded (`0.3` rather than `0.30000000000000004` for 3 tenths), unless it can overflow.
+		const exact = Number.isFinite(width * binCount);
+		for (let i = 1; i < binCount; i++) {
+			const offset = exact ? (width * i) / binCount : (width / binCount) * i;
+			edges.push(Math.min((start + offset) / scale, high));
+		}
+	}
+	edges.push(high);
+	const counts = new Array<number>(edges.length - 1).fill(0);
+	for (let i = 0; i < count; i++) {
+		const value = numbers[i];
+		if (value < low || value > high) continue;
+		// The number of inner edges at or below the value is its bin (`high` itself lands in the last one).
+		let first = 0;
+		let last = edges.length - 2;
+		while (first < last) {
+			const middle = (first + last + 1) >>> 1;
+			if (edges[middle] <= value) first = middle;
+			else last = middle - 1;
+		}
+		counts[first]++;
+	}
+	return counts.map(function (binCount: number, index: number): HistogramBin {
+		return { x0: edges[index], x1: edges[index + 1], count: binCount };
+	});
 }

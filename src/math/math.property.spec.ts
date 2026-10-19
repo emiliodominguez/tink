@@ -983,3 +983,314 @@ describe('Math helpers (property-based)', function () {
 		});
 	});
 });
+
+/** The exact value of a double, as an integer multiple of 2 ** -1074 (the smallest subnormal). */
+function scaledExact(value: number): bigint {
+	const view = new DataView(new ArrayBuffer(8));
+	view.setFloat64(0, value);
+	const bits = view.getBigUint64(0);
+	const exponent = Number((bits >> 52n) & 0x7ffn);
+	const fraction = bits & ((1n << 52n) - 1n);
+	const magnitude = exponent === 0 ? fraction : (fraction | (1n << 52n)) << BigInt(exponent - 1);
+	return bits >> 63n === 1n ? -magnitude : magnitude;
+}
+
+/** The double nearest to `scaled * 2 ** -1074` (ties to even), `±Infinity` beyond the doubles. */
+function nearestDouble(scaled: bigint): number {
+	if (scaled === 0n) return 0;
+	const sign = scaled < 0n ? -1 : 1;
+	const magnitude = scaled < 0n ? -scaled : scaled;
+	const length = magnitude.toString(2).length;
+	if (length <= 53) return sign * Number(magnitude) * 2 ** -1074;
+	const shift = BigInt(length - 53);
+	let kept = magnitude >> shift;
+	const rest = magnitude - (kept << shift);
+	const half = 1n << (shift - 1n);
+	if (rest > half || (rest === half && (kept & 1n) === 1n)) kept++;
+	const exponent = length - 53 - 1074;
+	// Two scalings, each exact, so that neither the factor nor an intermediate result leaves the doubles before the final one.
+	return sign * Number(kept) * 2 ** Math.min(exponent, 1000) * 2 ** Math.max(exponent - 1000, 0);
+}
+
+/** Rational reference for `sumPrecise`: the exact sum of finite doubles, rounded once. */
+function exactSum(values: ReadonlyArray<number>): number {
+	return nearestDouble(
+		values.reduce(function (total, value) {
+			return total + scaledExact(value);
+		}, 0n)
+	);
+}
+
+/** Doubles of every magnitude, with the extremes and powers of two around the overflow and subnormal boundaries well represented. */
+const anyFiniteDouble = fc.oneof(
+	fc.double({ noNaN: true, noDefaultInfinity: true }),
+	fc.double({ min: -1e6, max: 1e6, noNaN: true }),
+	fc.constantFrom(Number.MAX_VALUE, -Number.MAX_VALUE, 2 ** 1023, -(2 ** 1023), 2 ** 970, -(2 ** 970), 2 ** 971, 5e-324, -5e-324, 1, -1, 0, -0, 0.1, 1e308),
+	fc.integer({ min: -1074, max: 1023 }).map(function (exponent) {
+		return 2 ** exponent;
+	})
+);
+
+/** The significant digits of the shortest decimal form of a positive number, without leading or trailing zeros. */
+function significantDigits(value: number): string {
+	return String(value)
+		.split('e')[0]
+		.replace('.', '')
+		.replace(/^0+|0+$/g, '');
+}
+
+/** Rational reference for `toSignificant`: the decimal `String(x)` rounded half away from zero to `digits` digits, as BigInts. */
+function significantReference(x: number, digits: number): number {
+	if (x === 0 || !Number.isFinite(x)) return x;
+	const [mantissa, exponent = '0'] = String(Math.abs(x)).split('e');
+	const [whole, fraction = ''] = mantissa.split('.');
+	// |x| = coefficient * 10 ** power, the coefficient without leading zeros.
+	const coefficient = BigInt(whole + fraction);
+	const power = Number(exponent) - fraction.length;
+	const length = coefficient.toString().length;
+	if (length <= digits) return x;
+	const dropped = 10n ** BigInt(length - digits);
+	const rounded = coefficient / dropped + ((coefficient % dropped) * 2n >= dropped ? 1n : 0n);
+	return Math.sign(x) * Number(`${rounded}e${power + length - digits}`);
+}
+
+describe('Math helpers (property-based, new aggregates)', function () {
+	describe('sumPrecise', function () {
+		it('should equal the exact sum rounded once (BigInt rational reference)', function () {
+			fc.assert(
+				fc.property(fc.array(anyFiniteDouble, { minLength: 1, maxLength: 30 }), function (values) {
+					const expected = exactSum(values);
+					const actual = helpers.sumPrecise(values);
+					// Zero sums: -0 only when every value is -0.
+					if (expected === 0) {
+						expect(actual).toBe(
+							values.every(function (value) {
+								return Object.is(value, -0);
+							})
+								? -0
+								: 0
+						);
+					} else {
+						expect(actual).toBe(expected);
+					}
+				})
+			);
+		});
+
+		it('should not depend on the order of the numbers', function () {
+			fc.assert(
+				fc.property(fc.array(anyFiniteDouble, { maxLength: 30 }), fc.integer(), function (values, seed) {
+					const shuffled = values.slice().sort(function (a, b) {
+						return ((Math.abs(a) * 7 + seed) % 3) - ((Math.abs(b) * 7 + seed) % 3) || 0;
+					});
+					expect(helpers.sumPrecise(shuffled)).toBe(helpers.sumPrecise(values));
+					expect(helpers.sumPrecise(values.slice().reverse())).toBe(helpers.sumPrecise(values));
+				})
+			);
+		});
+
+		it('should agree with sum on integers, where both are exact', function () {
+			fc.assert(
+				fc.property(fc.array(fc.integer({ min: -(2 ** 31), max: 2 ** 31 - 1 }), { minLength: 1, maxLength: 100 }), function (integers) {
+					expect(helpers.sumPrecise(integers)).toBe(helpers.sum(integers));
+				})
+			);
+		});
+
+		it('should follow the non-finite rules of Math.sumPrecise', function () {
+			fc.assert(
+				fc.property(fc.array(fc.oneof(anyFiniteDouble, fc.constantFrom(NaN, Infinity, -Infinity)), { maxLength: 20 }), function (values) {
+					const hasNaN = values.some(Number.isNaN);
+					const positive = values.includes(Infinity);
+					const negative = values.includes(-Infinity);
+					const actual = helpers.sumPrecise(values);
+					if (hasNaN || (positive && negative)) expect(actual).toBeNaN();
+					else if (positive) expect(actual).toBe(Infinity);
+					else if (negative) expect(actual).toBe(-Infinity);
+					else expect(Number.isNaN(actual)).toBe(false);
+				})
+			);
+		});
+	});
+
+	describe('average', function () {
+		it('should stay finite and between the extremes when the sum overflows', function () {
+			const huge = fc.double({ min: -Number.MAX_VALUE, max: Number.MAX_VALUE, noNaN: true }).filter(function (value) {
+				return Math.abs(value) > 1e300;
+			});
+			fc.assert(
+				fc.property(fc.array(fc.oneof(huge, fc.constant(Number.MAX_VALUE), fc.constant(-Number.MAX_VALUE)), { minLength: 1, maxLength: 20 }), function (values) {
+					const mean = helpers.average(values);
+					expect(mean).toBeGreaterThanOrEqual(Math.min(...values));
+					expect(mean).toBeLessThanOrEqual(Math.max(...values));
+				})
+			);
+		});
+	});
+
+	describe('movingAverage', function () {
+		it('should equal sumPrecise of each window divided by the window, whenever that sum is finite', function () {
+			fc.assert(
+				fc.property(
+					fc.array(fc.oneof(anyFiniteDouble, fc.constantFrom(NaN, Infinity, -Infinity, -0)), { maxLength: 40 }),
+					fc.integer({ min: 1, max: 8 }),
+					function (values, window) {
+						const averages = helpers.movingAverage(values, window);
+						expect(averages).toHaveLength(Math.max(0, values.length - window + 1));
+						averages.forEach(function (average, index) {
+							const slice = values.slice(index, index + window);
+							const total = helpers.sumPrecise(slice);
+							if (Number.isFinite(total) || !slice.every(Number.isFinite)) {
+								expect(average).toBe(total / window);
+							} else {
+								// The sum overflows, the mean does not: rounded twice like the other windows, so within an ulp of the
+								// exact mean (BigInt reference).
+								const exact = nearestDouble(
+									slice.reduce(function (sum, value) {
+										return sum + scaledExact(value);
+									}, 0n) / BigInt(window)
+								);
+								expect(Number.isFinite(average)).toBe(true);
+								expect(Math.abs(average - exact)).toBeLessThanOrEqual(Math.abs(exact) * Number.EPSILON);
+							}
+						});
+					}
+				)
+			);
+		});
+
+		it('should be close to the naive recomputation of every window', function () {
+			fc.assert(
+				fc.property(fc.array(finiteDouble, { maxLength: 60 }), fc.integer({ min: 1, max: 10 }), function (values, window) {
+					helpers.movingAverage(values, window).forEach(function (average, index) {
+						const slice = values.slice(index, index + window);
+						const naive =
+							slice.reduce(function (total, value) {
+								return total + value;
+							}, 0) / window;
+						const scale = slice.reduce(function (total, value) {
+							return total + Math.abs(value);
+						}, 0);
+						expect(Math.abs(average - naive)).toBeLessThanOrEqual(scale * window * Number.EPSILON);
+					});
+				})
+			);
+		});
+	});
+
+	describe('toSignificant', function () {
+		it('should round the decimal form half away from zero (BigInt reference)', function () {
+			fc.assert(
+				fc.property(anyFiniteDouble, fc.integer({ min: 1, max: 20 }), function (x, digits) {
+					expect(helpers.toSignificant(x, digits)).toBe(significantReference(x, digits));
+				})
+			);
+		});
+
+		it('should keep at most `digits` significant digits, keep the sign, and be idempotent', function () {
+			fc.assert(
+				fc.property(fc.double({ noNaN: true, noDefaultInfinity: true, min: -1e300, max: 1e300 }), fc.integer({ min: 1, max: 17 }), function (x, digits) {
+					const rounded = helpers.toSignificant(x, digits);
+					if (x !== 0) {
+						expect(significantDigits(Math.abs(rounded)).length).toBeLessThanOrEqual(digits);
+						expect(Math.sign(rounded)).toBe(Math.sign(x));
+					}
+					expect(helpers.toSignificant(rounded, digits)).toBe(rounded);
+					expect(helpers.toSignificant(x, 17)).toBe(x);
+				})
+			);
+		});
+
+		it('should take the fast path only where it agrees with the decimal reference (ties, powers of ten, short decimals)', function () {
+			// Short decimals, ties as written (…5 and …5 plus a tiny bit), powers of ten and their neighbours.
+			const decimalish = fc.oneof(
+				fc.tuple(fc.integer({ min: 1, max: 999_999 }), fc.integer({ min: -30, max: 30 })).map(function ([coefficient, exponent]) {
+					return Number(`${coefficient}e${exponent}`);
+				}),
+				fc.tuple(fc.integer({ min: 0, max: 99_999 }), fc.integer({ min: -25, max: 25 })).map(function ([coefficient, exponent]) {
+					return Number(`${coefficient}5e${exponent}`);
+				}),
+				fc.tuple(fc.integer({ min: -300, max: 300 }), fc.integer({ min: -2, max: 2 })).map(function ([exponent, ulps]) {
+					const power = Number(`1e${exponent}`);
+					return power + ulps * power * Number.EPSILON;
+				})
+			);
+			fc.assert(
+				fc.property(decimalish, fc.integer({ min: 1, max: 17 }), fc.boolean(), function (x, digits, negative) {
+					const value = negative ? -x : x;
+					expect(helpers.toSignificant(value, digits)).toBe(significantReference(value, digits));
+				})
+			);
+		});
+
+		it('should agree with toPrecision away from decimal ties', function () {
+			fc.assert(
+				fc.property(fc.double({ noNaN: true, noDefaultInfinity: true, min: -1e300, max: 1e300 }), fc.integer({ min: 1, max: 15 }), function (x, digits) {
+					const digitString = significantDigits(Math.abs(x));
+					// The first dropped digit of the shortest form is not a 5 followed by nothing: not a tie as written.
+					fc.pre(digitString.length <= digits || !/^5$/.test(digitString.slice(digits)));
+					// (`toPrecision` writes -0 as '0'.)
+					expect(helpers.toSignificant(x, digits)).toBe(x === 0 ? x : Number(x.toPrecision(digits)));
+				})
+			);
+		});
+	});
+
+	describe('histogram', function () {
+		const value = fc.double({ min: -1000, max: 1000, noNaN: true });
+
+		it('should count every value in the domain exactly once, in the bin whose range holds it', function () {
+			fc.assert(
+				fc.property(
+					fc.array(value, { maxLength: 60 }),
+					fc.oneof(
+						fc.record({ bins: fc.integer({ min: 1, max: 12 }) }),
+						fc.record({
+							thresholds: fc.uniqueArray(value, { maxLength: 6 }).map(function (list) {
+								return list.sort(function (a, b) {
+									return a - b;
+								});
+							})
+						})
+					),
+					fc.option(fc.tuple(value, value), { nil: undefined }),
+					function (values, binning, range) {
+						const domain = range === undefined ? undefined : ([Math.min(...range), Math.max(...range)] as [number, number]);
+						const bins = helpers.histogram(values, { ...binning, domain } as never);
+						const inDomain = values.filter(function (v) {
+							return domain === undefined || (v >= domain[0] && v <= domain[1]);
+						});
+						if (domain === undefined && values.length === 0) {
+							expect(bins).toEqual([]);
+							return;
+						}
+						// Edge to edge, from the lower to the upper bound, in order.
+						const low = domain?.[0] ?? Math.min(...values);
+						const high = domain?.[1] ?? Math.max(...values);
+						expect(bins[0].x0).toBe(low);
+						expect(bins[bins.length - 1].x1).toBe(high);
+						bins.forEach(function (bin, index) {
+							expect(bin.x0).toBeLessThanOrEqual(bin.x1);
+							if (index > 0) expect(bin.x0).toBe(bins[index - 1].x1);
+						});
+						if ('bins' in binning && low < high) expect(bins).toHaveLength(binning.bins);
+						// Brute-force placement: the last bin whose lower edge is at most the value.
+						const counts = bins.map(function () {
+							return 0;
+						});
+						for (const v of inDomain) {
+							let index = 0;
+							for (let i = 1; i < bins.length; i++) if (bins[i].x0 <= v) index = i;
+							counts[index]++;
+						}
+						expect(
+							bins.map(function (bin) {
+								return bin.count;
+							})
+						).toEqual(counts);
+					}
+				)
+			);
+		});
+	});
+});
