@@ -2010,7 +2010,8 @@ function signalOption(caller: string, options: unknown): AbortSignalLike | null 
  * Nothing is cached across batches by default, unlike DataLoader, whose default unbounded cache serves stale values forever (and
  * grows without bound) as soon as a loader outlives its request. Pass `cache: true` for a per-request batcher, or a bounded store such
  * as `createLRUCache({ max, ttl })`; `clear`, `clearAll` and `prime` then keep it up to date after writes. The batch function may call
- * `load` itself: those keys go to a new batch. To cap how many batches run at once, call the batch function through
+ * `load` itself: those keys go to a new batch, except, with a cache, keys of a batch still in flight, which join it (so awaiting one of
+ * the batch's own keys from inside the batch function never settles). To cap how many batches run at once, call the batch function through
  * {@link createLimiter}.
  * @template K - The key type
  * @template V - The value type
@@ -2310,14 +2311,15 @@ export function createBatcher<K, V>(batchLoad: BatchLoadFunction<K, V>, options:
 	 * Requests the value of a key, once the options have been read and checked.
 	 * @param {unknown} key - The key
 	 * @param {AbortSignalLike | null | undefined} signal - The caller's signal
+	 * @param {{ id: unknown }} [known] - The identity of the key, when already computed
 	 * @returns {Promise<unknown>} The value
 	 */
-	function request(key: unknown, signal: AbortSignalLike | null | undefined): Promise<unknown> {
+	function request(key: unknown, signal: AbortSignalLike | null | undefined, known?: { id: unknown }): Promise<unknown> {
 		return new Promise<unknown>(function (resolve, reject) {
 			// Checked for every key: the `key` function or the cache of an earlier key of a `loadMany` may have aborted it.
 			if (signal?.aborted) throw abortReason(signal);
 
-			const id = identify(key);
+			const id = known === undefined ? identify(key) : known.id;
 
 			if (cache !== undefined) {
 				// Read once, then `has` only for a cached `undefined` (an expiring cache could drop the entry between the two).
@@ -2385,6 +2387,7 @@ export function createBatcher<K, V>(batchLoad: BatchLoadFunction<K, V>, options:
 		},
 		loadMany(keys: Iterable<K>, loadOptions?: BatcherLoadOptions): Promise<V[]> {
 			let list: K[];
+			let ids: unknown[];
 			let signal: AbortSignalLike | null | undefined;
 
 			try {
@@ -2393,13 +2396,25 @@ export function createBatcher<K, V>(batchLoad: BatchLoadFunction<K, V>, options:
 				}
 				signal = signalOption('Batcher.loadMany', loadOptions);
 				list = Array.from(keys);
+				ids = list.map(identify);
 			} catch (error) {
 				return Promise.reject(error);
 			}
 
+			// A key listed twice is requested once, even when `maxBatchSize` seals its batch before the second occurrence.
+			const requests = new Map<unknown, Promise<unknown>>();
+
 			return Promise.all(
-				list.map(function (key) {
-					return request(key, signal);
+				list.map(function (key, index) {
+					const id = ids[index];
+					let promise = requests.get(id);
+
+					if (promise === undefined) {
+						promise = request(key, signal, { id });
+						requests.set(id, promise);
+					}
+
+					return promise;
 				})
 			) as Promise<V[]>;
 		},

@@ -891,7 +891,9 @@ export function isJsonString(value: unknown): value is string {
  * isBase64('YR=='); // => false
  */
 export function isBase64(value: unknown, options: IsBase64Options = {}): value is string {
-	const { urlSafe = false, padding = 'optional' } = options;
+	// Own properties only, like `fromBase64` of the encoding module: a polluted `Object.prototype` cannot switch the alphabet or the mode.
+	const urlSafe = hasOwn.call(options, 'urlSafe') ? options.urlSafe : false;
+	const padding = (hasOwn.call(options, 'padding') ? options.padding : undefined) ?? 'optional';
 	if (padding !== 'optional' && padding !== 'required' && padding !== 'forbidden') {
 		throw new RangeError(`isBase64: \`padding\` must be 'optional', 'required' or 'forbidden', got ${show(padding)}`);
 	}
@@ -3542,7 +3544,8 @@ function assertEnv(env: unknown): asserts env is object {
 
 	const methods = env as { get?: unknown; toObject?: unknown };
 
-	if (Object.keys(env).length === 0 && typeof methods.get === 'function' && typeof methods.toObject === 'function') {
+	// `Deno.env` has its methods on its own prototype: a plain object whose `Object.prototype` was polluted with both is no `Deno.env`.
+	if (Object.keys(env).length === 0 && Object.getPrototypeOf(env) !== Object.prototype && typeof methods.get === 'function' && typeof methods.toObject === 'function') {
 		throw new TypeError('parseEnv: `env` must be an object of variables, got an object with `get` and `toObject` methods (pass `Deno.env.toObject()`)');
 	}
 }

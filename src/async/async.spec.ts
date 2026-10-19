@@ -3085,12 +3085,8 @@ describe('createBatcher', function () {
 			const batcher = createBatcher(batchLoad, { maxBatchSize: 2 });
 			const results = await batcher.loadMany([1, 1, 2, 3, 2, 4, 5]);
 			expect(results).toEqual(['value 1', 'value 1', 'value 2', 'value 3', 'value 2', 'value 4', 'value 5']);
-			// Without a cache, a key of a sealed batch requested again goes to the open batch.
-			expect(calls).toEqual([
-				[1, 2],
-				[3, 2],
-				[4, 5]
-			]);
+			// A key listed twice is requested once, even once its batch is sealed.
+			expect(calls).toEqual([[1, 2], [3, 4], [5]]);
 		});
 
 		it('dispatches a full batch without waiting for its delay', async function () {
@@ -3864,6 +3860,20 @@ describe('createBatcher', function () {
 			};
 			await expect(batcher.loadMany([1, 2, 3], options)).resolves.toEqual(['value 1', 'value 2', 'value 3']);
 			expect(reads).toBe(1);
+		});
+
+		it('rejects a load whose key function aborts its signal, without requesting the key', async function () {
+			const controller = new AbortController();
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, {
+				key: function (key: number) {
+					controller.abort(new AbortError('aborted by the key function'));
+					return key;
+				}
+			});
+			await expect(batcher.load(1, { signal: controller.signal })).rejects.toThrow('aborted by the key function');
+			await nextTurn();
+			expect(calls).toEqual([]);
 		});
 
 		it('rejects the remaining keys of a loadMany whose key function aborts the signal', async function () {

@@ -900,6 +900,20 @@ describe('isJsonString', function () {
 });
 
 describe('isBase64', function () {
+	it('reads its options as own properties only', function () {
+		const polluted = Object.prototype as Record<string, unknown>;
+		polluted.urlSafe = true;
+		polluted.padding = 'forbidden';
+		try {
+			expect(helpers.isBase64('AA==')).toBe(true);
+			expect(helpers.isBase64('-_8')).toBe(false);
+			expect(helpers.isBase64('AA==', {})).toBe(true);
+		} finally {
+			delete polluted.urlSafe;
+			delete polluted.padding;
+		}
+	});
+
 	it.each(['', 'Zg==', 'Zm8=', 'Zm9v', 'Zm9vYg==', 'Zm9vYmE=', 'Zm9vYmFy', 'Zg', 'Zm8', '+/+/', 'AAAA'])('accepts %s by default', function (b64) {
 		expect(helpers.isBase64(b64)).toBe(true);
 	});
@@ -1416,6 +1430,16 @@ describe('parseEnv', function () {
 			expect(parseEnv({ get: optional(isString) }, { get: 'x', toObject: 'y' })).toEqual({ get: 'x' });
 			expect(parseEnv({ A: optional(isString) }, {})).toEqual({});
 			expect(parseEnv({ A: optional(isString) }, { get: function () {} })).toEqual({});
+			// A polluted `Object.prototype` does not make a plain object look like `Deno.env`.
+			const polluted = Object.prototype as Record<string, unknown>;
+			polluted.get = function () {};
+			polluted.toObject = function () {};
+			try {
+				expect(parseEnv({ A: optional(isString) }, {})).toEqual({});
+			} finally {
+				delete polluted.get;
+				delete polluted.toObject;
+			}
 		});
 	});
 
