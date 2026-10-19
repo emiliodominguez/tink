@@ -11,8 +11,8 @@
  *   like `TextEncoder#encode`, so it can be passed to `crypto.subtle` or `new Blob()`); inputs are never mutated.
  * - **Options.** Options are read once each, as own properties only (a polluted `Object.prototype` cannot switch an alphabet or a mode),
  *   and must have the documented types: `options` itself must be an object when given.
- * - **Strict decoding.** Malformed text throws a `SyntaxError` naming the first offending character and its index, like
- *   `Uint8Array.fromBase64`. {@link fromBase64} rejects anything that {@link toBase64} could not have produced (white space, stray
+ * - **Strict decoding.** Malformed text throws a `SyntaxError` naming the first offending character and its index (or the
+ *   length that cannot be valid), like `Uint8Array.fromBase64`. {@link fromBase64} rejects anything that {@link toBase64} could not have produced (white space, stray
  *   padding, non-zero unused bits), so base64 text can be compared as text: the same bytes always have the same spelling (up to optional
  *   padding). {@link fromHex} accepts both letter cases (digests from other tools are often uppercase), so compare hex after
  *   lowercasing it.
@@ -43,8 +43,8 @@ export interface ToBase64Options {
 }
 
 /**
- * Options accepted by {@link fromBase64}; the same as the validate module's `isBase64`, which accepts exactly the strings that
- * {@link fromBase64} decodes.
+ * Options accepted by {@link fromBase64}; the same as the validate module's `isBase64`, which, given the same valid options, accepts
+ * exactly the strings that {@link fromBase64} decodes.
  */
 export interface FromBase64Options {
 	/** Use the URL-safe alphabet (`-` and `_` instead of `+` and `/`, RFC 4648 §5). Defaults to `false`. */
@@ -276,7 +276,8 @@ export function toBase64(data: string | BytesInput, options?: ToBase64Options): 
 	const alphabet = urlSafe ? BASE64_URL : BASE64;
 	const length = bytes.length;
 	const full = length - (length % 3);
-	const codes = new Uint16Array(CHUNK + 4);
+	// Sized for the output when it is short: a zeroed 16 kB buffer would dominate the cost of a small input.
+	const codes = new Uint16Array(Math.min(CHUNK, (full / 3) * 4) + 4);
 	let count = 0;
 	let text = '';
 	for (let i = 0; i < full; i += 3) {
@@ -317,7 +318,7 @@ function fromCodes(codes: Uint16Array, count: number): string {
 
 /**
  * Decodes base64 (RFC 4648 §4) or base64url (§5) text, strictly: it accepts exactly the strings that the validate module's
- * `isBase64` accepts with the same options.
+ * `isBase64` accepts with the same (valid) options.
  *
  * Rejected: characters outside the chosen alphabet (including white space and line breaks, and the other alphabet's `+/` or `-_`),
  * `=` anywhere but at the end, padding that does not complete a multiple of 4 characters (or any padding when `'forbidden'`, missing
@@ -357,12 +358,12 @@ export function fromBase64(text: string, options?: FromBase64Options): Uint8Arra
 	const remainder = end % 4;
 	// A misplaced or missing padding is reported after any invalid character, which is likelier to be the actual problem.
 	let problem: string | undefined;
-	if (end < length ? padding === 'forbidden' : remainder !== 0 && padding === 'required') {
+	if (remainder === 1) {
+		problem = `must not end with a lone character (it would encode no whole byte), got ${end} data characters`;
+	} else if (end < length ? padding === 'forbidden' : remainder !== 0 && padding === 'required') {
 		problem = end < length ? `must not be padded, got "=" at index ${end}` : `must be padded to a multiple of 4 characters, got ${length}`;
 	} else if (end < length && length % 4 !== 0) {
 		problem = `must be padded to a multiple of 4 characters, got ${length}`;
-	} else if (remainder === 1) {
-		problem = `must not end with a lone character (it would encode no whole byte), got ${end} data characters`;
 	}
 
 	const table = decodeTable(urlSafe ? 1 : 0);
@@ -449,7 +450,7 @@ export function toHex(data: string | BytesInput): string {
 	const native = (Uint8Array.prototype as NativeUint8Array).toHex;
 	if (typeof native === 'function') return native.call(bytes);
 	const length = bytes.length;
-	const codes = new Uint16Array(CHUNK + 2);
+	const codes = new Uint16Array(Math.min(CHUNK, 2 * length) + 2);
 	let count = 0;
 	let text = '';
 	for (let i = 0; i < length; i++) {
@@ -663,7 +664,7 @@ export function decodeUtf8(bytes: BytesInput, options?: DecodeUtf8Options): stri
 function decodeUtf8Portable(bytes: Uint8Array, fatal: boolean): string {
 	const length = bytes.length;
 	// Two spare slots: a code point is flushed as a surrogate pair at most.
-	const units = new Uint16Array(CHUNK + 2);
+	const units = new Uint16Array(Math.min(CHUNK, length) + 2);
 	let count = 0;
 	let text = '';
 	let i = 0;

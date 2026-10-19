@@ -931,7 +931,7 @@ describe('Random helpers (hostile sources)', function () {
 
 		useCrypto({
 			getRandomValues(array: Uint8Array): Uint8Array {
-				(array.buffer as ArrayBuffer & { transfer(): ArrayBuffer }).transfer();
+				structuredClone(array.buffer, { transfer: [array.buffer as ArrayBuffer] });
 				return array;
 			}
 		});
@@ -1210,7 +1210,7 @@ describe('Time-ordered ids', function () {
 				withCrypto(
 					{
 						getRandomValues(array: Uint8Array): Uint8Array {
-							(array.buffer as ArrayBuffer & { transfer(): ArrayBuffer }).transfer();
+							structuredClone(array.buffer, { transfer: [array.buffer as ArrayBuffer] });
 							return array;
 						}
 					},

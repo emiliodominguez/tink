@@ -2545,7 +2545,8 @@ describe('Time zones', function () {
 				weekday: 6,
 				offset: 840
 			});
-			expect(helpers.getZonedParts(-8.64e15, 'Asia/Manila')).toMatchObject({ year: -271821, month: 4, day: 19, hour: 8, minute: 3, second: 52, weekday: 1 });
+			// Paris's local mean time (+00:09:21), unchanged across tzdata releases (Manila's changed in 2024b).
+			expect(helpers.getZonedParts(-8.64e15, 'Europe/Paris')).toMatchObject({ year: -271821, month: 4, day: 20, hour: 0, minute: 9, second: 21, weekday: 2 });
 			expect(helpers.getZonedParts(-8.64e15, '+14:00')).toMatchObject({ year: -271821, month: 4, day: 20, hour: 14 });
 		});
 

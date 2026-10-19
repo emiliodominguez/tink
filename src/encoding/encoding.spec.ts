@@ -126,7 +126,7 @@ describe('encoding', function () {
 			const buffer = new ArrayBuffer(8);
 			const view = new Uint8Array(buffer, 4);
 			const dataView = new DataView(buffer);
-			(buffer as ArrayBuffer & { transfer(): ArrayBuffer }).transfer();
+			structuredClone(buffer, { transfer: [buffer] }); // detaches it (ArrayBuffer#transfer needs Node 21)
 			expect(helpers.toBase64(view)).toBe('');
 			expect(helpers.toBase64(dataView)).toBe('');
 			expect(helpers.toBase64(buffer)).toBe('');
@@ -254,6 +254,17 @@ describe('encoding', function () {
 				expect(function () {
 					helpers.fromBase64('aGVsb');
 				}).toThrow(new SyntaxError('fromBase64: `text` must not end with a lone character (it would encode no whole byte), got 5 data characters'));
+				// Padding could not fix a lone character: that is the error, whatever the padding option.
+				for (const [input, options] of [
+					['A=', {}],
+					['A==', {}],
+					['A', { padding: 'required' }],
+					['A=', { padding: 'forbidden' }]
+				] as const) {
+					expect(function () {
+						helpers.fromBase64(input, options);
+					}).toThrow(new SyntaxError('fromBase64: `text` must not end with a lone character (it would encode no whole byte), got 1 data characters'));
+				}
 			});
 		});
 

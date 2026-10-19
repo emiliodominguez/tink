@@ -1425,7 +1425,9 @@ export function maxDate(dates: Iterable<DateInput>): Date | undefined {
  *
  * Text inside `[square brackets]` is output literally (without the brackets). Any other character is copied as is;
  * note that a bare `a`, `s`, `m`, `h`, `D`… IS a token, so wrap words in brackets: `'[at] HH:mm'`. A `[` without a closing `]`
- * is copied as is.
+ * is copied as is. `Z` is not a token here (unlike in moment or dayjs, and in {@link formatInTimeZone}): it is copied as is, so
+ * `'YYYY-MM-DD[T]HH:mm:ssZ'` would label local time as UTC; for a timestamp with its offset, use {@link toISOStringLocal}, or
+ * {@link formatInTimeZone} with the runtime's zone.
  *
  * Tokenizing takes time linear in the pattern length, so untrusted patterns cannot stall the event loop (the output is still
  * proportional to the pattern: cap its length if it comes from users). Compiled patterns of at most 1024 characters are cached
@@ -3194,8 +3196,8 @@ export function isValidTimeZone(value: unknown): value is TimeZone {
  * (`Date#getTimezoneOffset()` drops those seconds.)
  *
  * Unlike the other functions taking a `timeZone`, the zone comes first: the instant is optional (it defaults to now, the usual question
- * being "what is the offset there now?"), and that is the order of date-fns-tz's `getTimezoneOffset(timeZone, date)`, so code moving
- * from it keeps its calls.
+ * being "what is the offset there now?"), and that is the order of date-fns-tz's `getTimezoneOffset(timeZone, date)`, which however
+ * returns milliseconds: multiply by `60_000` when moving code from it.
  * @param {string} timeZone - An IANA time zone or a UTC offset (see {@link isValidTimeZone})
  * @param {DateInput} [date=new Date()] - The instant
  * @returns {number} The offset in minutes east of UTC
@@ -3343,8 +3345,10 @@ export function fromZonedTime(fields: WallClockTime, timeZone: string, options: 
 }
 
 /**
- * Formats an instant as read on the wall clock of a time zone, with the token language of {@link formatDate} (`YYYY`, `MM`, `DD`, `HH`,
- * `mm`, `ss`, `SSS`, `A`… and `[literal]` text) plus two UTC offset tokens:
+ * Formats an instant as read on the wall clock of a time zone, with the tokens of {@link formatDate} plus the UTC offset tokens `Z`
+ * and `ZZ`.
+ *
+ * The tokens of {@link formatDate} are `YYYY`, `MM`, `DD`, `HH`, `mm`, `ss`, `SSS`, `A`… and `[literal]` text; the offset tokens are:
  *
  * | Token | Output |
  * |-------|--------|
