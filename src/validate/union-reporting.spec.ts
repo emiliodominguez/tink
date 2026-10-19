@@ -13,7 +13,7 @@ import {
 	withMessage,
 	type SchemaIssue
 } from '../guards/index.js';
-import { asInteger, blankAsUndefined, exact, optional, parse, partial, safeParse, union, withDefault, type Schema } from '.';
+import { asInteger, blankAsUndefined, discriminatedUnion, exact, lazy, optional, parse, partial, safeParse, transform, union, withDefault, type Parser, type Schema } from '.';
 
 /**
  * Returns the issues `schema` reports for `value` (empty when it parses).
@@ -107,5 +107,78 @@ describe('parsers of other versions of this module', function () {
 
 		expect(parse({ n: legacy }, { n: 2 })).toEqual({ n: 4 });
 		expect(issuesOf({ n: legacy }, { n: 'x' })).toEqual([{ message: 'not a number', path: ['n'] }]);
+	});
+});
+
+describe('missing values in unions', function () {
+	it('should parse a valid value once, transforms included', function () {
+		let runs = 0;
+		const doubled = transform(isNumber, function (value: number): number {
+			runs++;
+
+			return value * 2;
+		});
+
+		expect(parse(withDefault(union(doubled, blankAsUndefined(isString)), 0), 5)).toBe(10);
+		expect(parse(optional(union(doubled, blankAsUndefined(isString))), 5)).toBe(10);
+		expect(runs).toBe(2);
+		expect(parse(withDefault(union(doubled, blankAsUndefined(isString)), 0), ' ')).toBe(0);
+		expect(parse(optional(union(isString, blankAsUndefined(asInteger))), '')).toBe('');
+	});
+
+	it('should parse an optional recursive union in linear time', function () {
+		let runs = 0;
+		const tagOf = transform(isLiteral('b'), function (tag: 'b'): 'b' {
+			runs++;
+
+			return tag;
+		});
+		type Link = { tag: 'a' | 'b'; next?: Link };
+		const link: Parser<Link> = union(
+			lazy<Link>(function () {
+				return { tag: isLiteral('a'), next: optional(link) };
+			}),
+			lazy<Link>(function () {
+				return { tag: tagOf, next: withDefault(link, { tag: 'a' }) };
+			})
+		);
+		let value: Link = { tag: 'a' };
+
+		for (let level = 0; level < 300; level++) value = { tag: 'b', next: value };
+
+		expect(parse(link, value)).toEqual(value);
+		expect(runs).toBe(300);
+	});
+});
+
+describe('scores of nested unions and wrong tags', function () {
+	it('should report the closest member of a nested guard union', function () {
+		const isEvent = isUnion(
+			isShape({ kind: isLiteral('x'), n: isNumber }),
+			isUnion(isShape({ type: isLiteral('a'), x: isNumber, y: isNumber }), isShape({ type: isLiteral('b'), s: isString }))
+		);
+
+		expect(explain(isEvent, { type: 'b', s: 1 })).toEqual([{ message: 'Invalid value (got number)', path: ['s'] }]);
+		expect(issuesOf(union(isNumber, isEvent), { type: 'b', s: 1 })).toEqual([{ message: 'Invalid value (got number)', path: ['s'] }]);
+	});
+
+	it('should report the allowed tags of a wrong tag before a member that rejects objects', function () {
+		const isTagged = isDiscriminatedUnion('type', { a: isShape({ n: isNumber }) });
+		const tagged = discriminatedUnion('type', { a: { n: isNumber } });
+		const tags = [{ message: 'Expected "a" (got string)', path: ['type'] }];
+
+		expect(explain(isUnion(isTagged, isString), { type: 'z' })).toEqual(tags);
+		expect(issuesOf(union(tagged, isString), { type: 'z' })).toEqual(tags);
+		expect(explain(isUnion(isString, isTagged), 1)).toEqual([{ message: 'Invalid value (got number)', path: [] }]);
+		expect(issuesOf(union(isString, tagged), 1)).toEqual([{ message: 'Invalid value (got number)', path: [] }]);
+	});
+});
+
+describe('object schemas with a ~tink.1 key', function () {
+	it('should stay object schemas', function () {
+		const schema = { '~tink.1': { fast: isNumber, run: isNumber } };
+
+		expect(parse(schema, { '~tink.1': { fast: 1, run: 2 } })).toEqual({ '~tink.1': { fast: 1, run: 2 } });
+		expect(issuesOf(schema, false)).toEqual([{ message: 'Expected an object (got boolean)', path: [] }]);
 	});
 });

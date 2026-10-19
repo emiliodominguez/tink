@@ -184,6 +184,13 @@ const category: Parser<Category> = lazy(function () {
 const patch: { name?: string | undefined; age?: number | undefined } = parse(partial({ name: isString, age: asInteger }), {});
 const strict: { x: number } = parse(exact({ x: asNumber }), {});
 const fieldErrors: Record<string, string[]> = issuesByPath([]);
+// A generic guard written in place keeps its type when the callback parameter is annotated.
+const tagLength: Parser<number> = transform(isOneOf(['a', 'bb']), function (tag: 'a' | 'bb'): number {
+	return tag.length;
+});
+const area: Parser<number> = transform(isShape({ w: isFiniteNumber, h: isFiniteNumber }), function (size: { w: number; h: number }): number {
+	return size.w * size.h;
+});
 
 // README tour: key transforms keep their value types.
 const camel: { userId: number; createdAt: string } = toCamelCaseKeys({ user_id: 1, created_at: '2024-01-01' });
@@ -191,4 +198,4 @@ const camel: { userId: number; createdAt: string } = toCamelCaseKeys({ user_id: 
 const snake = camel.user_id;
 export { a, b, c, keys, v, m, dm, p, o, r, f, g, everything, spec, output, wrong, camel, snake };
 export { figure, badFigure, envBack, envWrong, port, envSpec, badDefault };
-export { click, legacy, badEvent, parsedShapes, locales, category, patch, strict, fieldErrors };
+export { click, legacy, badEvent, parsedShapes, locales, category, patch, strict, fieldErrors, tagLength, area };

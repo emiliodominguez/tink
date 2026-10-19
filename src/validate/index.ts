@@ -13,6 +13,7 @@ import {
 import { describe } from '../utils/assert.js';
 import type { AnyFunction } from '../utils/index.js';
 import { generate } from '../utils/jit.js';
+import { hold, isStackOverflow, PENDING, release, scope } from '../utils/memo.js';
 import { guardScore } from '../utils/score.js';
 
 /**
@@ -230,14 +231,22 @@ function writtenHost(authority: string): string | undefined {
  * @returns {boolean} `true` when the labels correspond one to one
  */
 function isEncodingOf(host: string, hostname: string): boolean {
-	const written = host.split('.');
-	const parsed = hostname.split('.');
-	return (
-		written.length === parsed.length &&
-		written.every(function (label: string, index: number): boolean {
-			return NON_ASCII_PATTERN.test(label) ? parsed[index].startsWith('xn--') : parsed[index] === label.toLowerCase();
-		})
-	);
+	// The labels are walked in place: splitting both names costs more than the checks.
+	let start = 0;
+	let parsedStart = 0;
+
+	for (;;) {
+		const dot = host.indexOf('.', start);
+		const parsedDot = hostname.indexOf('.', parsedStart);
+		const end = dot < 0 ? host.length : dot;
+		const parsedEnd = parsedDot < 0 ? hostname.length : parsedDot;
+		const label = host.slice(start, end);
+
+		if (NON_ASCII_PATTERN.test(label) ? !hostname.startsWith('xn--', parsedStart) : hostname.slice(parsedStart, parsedEnd) !== label.toLowerCase()) return false;
+		if (dot < 0 || parsedDot < 0) return dot < 0 && parsedDot < 0;
+		start = dot + 1;
+		parsedStart = parsedDot + 1;
+	}
 }
 
 /** A host label that the URL parser reads as a number (decimal, or `0x` hex), making the host an IPv4 address. */
@@ -410,10 +419,11 @@ export function isUrl(value: unknown, options: IsUrlOptions = {}): value is stri
 	}
 
 	// A conforming parser never yields an empty http(s) host, but not every `globalThis.URL` implementation conforms.
-	if ((scheme === 'http' || scheme === 'https') && url.hostname === '') return false;
-	if (international && !isEncodingOf(host, url.hostname)) return false;
+	const hostname = url.hostname;
+	if ((scheme === 'http' || scheme === 'https') && hostname === '') return false;
+	if (international && !isEncodingOf(host, hostname)) return false;
 
-	return !requireTld || hasTld(url.hostname);
+	return !requireTld || hasTld(hostname);
 }
 
 /**
@@ -1180,7 +1190,17 @@ function handlesMissing(node: Node): boolean {
  * @returns {boolean} Whether the value is missing
  */
 function isAbsent(node: Node, value: unknown): boolean {
-	return value === undefined || (node.missing !== undefined && node.missing(value));
+	return value === undefined || flags(node, value);
+}
+
+/**
+ * Whether `node` counts the present value `value` as missing (see {@link Node.missing}).
+ * @param {Node} node - The compiled schema
+ * @param {unknown} value - The value
+ * @returns {boolean} `true` when the schema flags it
+ */
+function flags(node: Node, value: unknown): boolean {
+	return node.missing !== undefined && node.missing(value);
 }
 
 /**
@@ -1261,7 +1281,11 @@ export interface ObjectSchema {
  *   its output is returned;
  * - a plain object of schemas ({@link ObjectSchema}), nested as deep as needed.
  */
-export type Schema = Guard<unknown> | StandardSchemaLike | ObjectSchema;
+// The guard member is `value is any`, not `value is unknown`: as the constraint of a schema argument it is also the contextual type of a
+// generic guard written in place, and `unknown` would infer `isLiteral('b')` as a guard of `unknown` when a callback argument is annotated
+// (`transform(isLiteral('b'), function (tag: 'b') {…})`).
+// oxlint-disable-next-line typescript/no-explicit-any
+export type Schema = ((value: unknown) => value is any) | StandardSchemaLike | ObjectSchema;
 
 /**
  * The output type of a {@link Schema}: the guarded type of a guard, the output of a parser or Standard Schema validator, and for object
@@ -1356,8 +1380,18 @@ function nodeOf(schema: object): Node | undefined {
 	if (!hasOwn.call(schema, '~tink.1')) return undefined;
 
 	const node = (schema as Partial<CompiledParser<unknown>>)['~tink.1'];
+	const props = (schema as Partial<StandardSchemaLike>)['~standard'];
 
-	return typeof node === 'object' && node !== null && typeof node.fast === 'function' && typeof node.run === 'function' ? node : undefined;
+	// A parser also carries this module's `~standard` props: an object schema with a `~tink.1` key of guards stays an object schema.
+	return typeof node === 'object' &&
+		node !== null &&
+		typeof node.fast === 'function' &&
+		typeof node.run === 'function' &&
+		typeof props === 'object' &&
+		props !== null &&
+		props.vendor === 'tink'
+		? node
+		: undefined;
 }
 
 /**
@@ -1416,7 +1450,7 @@ function standardNode(schema: StandardSchemaLike): Node {
 	 * @returns {StandardSchemaResult<unknown>} Its result
 	 * @throws {TypeError} when the validator returns a promise
 	 */
-	function check(value: unknown): StandardSchemaResult<unknown> {
+	function callValidator(value: unknown): StandardSchemaResult<unknown> {
 		const result = props.validate(value) as StandardSchemaResult<unknown> | PromiseLike<unknown>;
 
 		if (typeof (result as PromiseLike<unknown>).then === 'function') {
@@ -1428,12 +1462,12 @@ function standardNode(schema: StandardSchemaLike): Node {
 
 	return {
 		fast: function fastStandard(value: unknown): unknown {
-			const result = check(value);
+			const result = callValidator(value);
 
 			return result.issues === undefined ? result.value : FAIL;
 		},
 		run: function runStandard(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
-			const result = check(value);
+			const result = callValidator(value);
 			const found = result.issues;
 
 			if (found === undefined) return result.value;
@@ -1675,9 +1709,35 @@ function rerun(node: Node, value: unknown, path: PropertyKey[], issues: SchemaIs
  * @returns {unknown} The output (meaningless when issues were added)
  */
 function execute(fast: Fast, run: Run, value: unknown, issues: SchemaIssue[]): unknown {
+	// The fast parse needs no scope of its own: each outermost lazy parser keeps its memo (see `utils/memo.ts`) for its own call, and
+	// fails a value too deep to parse.
 	const output = fast(value);
 
-	return output === FAIL ? run(value, [], issues) : output;
+	return output === FAIL ? report(run, value, issues) : output;
+}
+
+/**
+ * Runs the reporting parse of an invalid value, in a memo scope of its own (see `utils/memo.ts`). A value nested so deeply that parsing
+ * it overflows the stack fails with one issue at the root. Kept out of {@link execute}, which stays small enough to inline.
+ * @param {Run} run - The reporting parse
+ * @param {unknown} value - The value to parse
+ * @param {SchemaIssue[]} issues - Where issues are pushed
+ * @returns {unknown} The output (meaningless when issues were added)
+ */
+function report(run: Run, value: unknown, issues: SchemaIssue[]): unknown {
+	scope.depth++;
+	try {
+		return run(value, [], issues);
+	} catch (error) {
+		// Only the outermost parse turns it into an issue: a parse nested in a transform lets it reach the parse around it.
+		if (scope.depth !== 1 || !isStackOverflow(error)) throw error;
+		issues.length = 0;
+		issues.push({ message: 'Value is nested too deeply', path: [] });
+
+		return undefined;
+	} finally {
+		if (--scope.depth === 0) release();
+	}
 }
 
 /**
@@ -2279,9 +2339,8 @@ function closestOf(nodes: ReadonlyArray<Node>, value: unknown): Node {
 /**
  * Creates a parser that returns the output of the first of `schemas` that accepts the value (`z.union()`). When none does, the issues
  * of the member that came closest are reported: for object members, the one with the fewest failing properties of a primitive value,
- * which for objects that differ by a field is the matching variant. Each member is tried in turn, so a recursive union of members
- * that are only told apart deep inside costs time exponential in the depth of a hostile value: tag such objects with a field and use
- * {@link discriminatedUnion}, which is also faster and reports better.
+ * which for objects that differ by a field is the matching variant. Each member is tried in turn; for objects tagged by a field,
+ * {@link discriminatedUnion} looks the variant up instead, and reports better.
  * @template S - The member schemas
  * @param {...S} schemas - The member schemas, tried in order (at least one)
  * @returns {Parser<SchemaOutput<S[number]>>} The parser
@@ -2322,17 +2381,15 @@ export function union<const S extends ReadonlyArray<Schema>>(...schemas: S): Par
 			? function isMissing(value: unknown): boolean {
 					// Missing when the member that wins (the first one to accept the value) says so, so that a blank string an earlier member
 					// accepts stays a value; when none accepts it, missing if any member says so (for the `Missing required property` report).
+					// Most values are flagged by no member: they are answered without parsing them, which `optional` and `withDefault` would
+					// otherwise do twice at every level of a recursive union, running transforms twice.
 					let flagged = false;
 
-					for (let index = 0; index < nodes.length; index++) {
-						const node = nodes[index];
-						const missing = node.missing !== undefined && node.missing(value);
+					for (let index = 0; index < nodes.length && !flagged; index++) flagged = flags(nodes[index], value);
+					if (!flagged) return false;
+					for (let index = 0; index < nodes.length; index++) if (nodes[index].fast(value) !== FAIL) return flags(nodes[index], value);
 
-						if (node.fast(value) !== FAIL) return missing;
-						flagged ||= missing;
-					}
-
-					return flagged;
+					return true;
 				}
 			: undefined,
 		handlesMissing: function handlesMissingValues(): boolean {
@@ -2443,8 +2500,10 @@ export function discriminatedUnion<const K extends string, const V extends { rea
 					? lookup.get((value as Record<string, unknown>)[key])
 					: undefined;
 
-			// A wrong or missing tag is further than any failure of the right variant.
-			return node === undefined ? Number.MAX_SAFE_INTEGER : scoreOf(node, value);
+			if (node !== undefined) return scoreOf(node, value);
+
+			// A wrong or missing tag: further than any failure of the right variant (below 1), closer than a value that is not an object.
+			return typeof value === 'object' && value !== null && !Array.isArray(value) ? 1 : 2;
 		}
 	});
 }
@@ -2526,7 +2585,9 @@ export function recordOf<S extends Schema, K extends string = string>(
  * Creates a parser for recursive schemas (`z.lazy()`): `getter` returns the schema, and is called once, on first use, so the schema
  * can refer to the parser being defined. Annotate the result (`const tree: Parser<Tree> = lazy(...)`), since TypeScript cannot infer a
  * recursive type. Cycle-safe: a value that reaches itself through the same lazy parser (`node.children = [node]`) is rejected with
- * `Circular reference`, instead of overflowing the stack, so the output is always a finite tree.
+ * `Circular reference`, instead of overflowing the stack, and a value nested too deeply to parse fails with `Value is nested too
+ * deeply`. Inside a lazy parser, each object is parsed once by each lazy parser it reaches, which keeps a recursive {@link union}
+ * linear in the size of the value however its members differ: an object the value holds in two places parses to the same output.
  * @template T - The output type
  * @param {() => Schema} getter - Returns the schema (called once, on the first parse)
  * @returns {Parser<T>} The parser
@@ -2543,8 +2604,9 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 	if (typeof getter !== 'function') throw new TypeError(`lazy: \`getter\` must be a function, got ${describe(getter)}`);
 
 	let resolved: Node | undefined;
-	// The objects being parsed (or reported) by this parser right now: meeting one again means a cycle.
-	const parsing = new Set<object>();
+	// The output for each object parsed by this parser during the current parse (see `utils/memo.ts`), and the objects being reported
+	// right now: meeting one again means a cycle.
+	const memo = new Map<object, unknown>();
 	const reporting = new Set<object>();
 
 	/**
@@ -2562,12 +2624,26 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 			const node = resolve();
 
 			if (typeof value !== 'object' || value === null) return node.fast(value);
-			if (parsing.has(value)) return FAIL;
-			parsing.add(value);
+
+			const known = memo.get(value);
+
+			if (known !== undefined || memo.has(value)) return known === PENDING ? FAIL : known;
+			hold(memo).set(value, PENDING);
+			// The outermost lazy parser of a fast parse scopes the memos of the parsers it reaches to its call.
+			scope.depth++;
 			try {
-				return node.fast(value);
+				const output = node.fast(value);
+
+				memo.set(value, output);
+
+				return output;
+			} catch (error) {
+				// A value too deep to parse fails; the reporting parse then reports it (see `execute`).
+				if (scope.depth === 1 && isStackOverflow(error)) return FAIL;
+				memo.delete(value);
+				throw error;
 			} finally {
-				parsing.delete(value);
+				if (--scope.depth === 0) release();
 			}
 		},
 		run: function runLazy(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
@@ -2579,7 +2655,7 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 
 				return undefined;
 			}
-			reporting.add(value);
+			hold(reporting).add(value);
 			try {
 				// The fast parse of this very value just failed: parsing it again first would double the cost at every level.
 				return node.run(value, path, issues);
@@ -2591,9 +2667,7 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 		// The hooks resolve the schema when they are called, during a parse: wrapping this parser while the recursive schema is still
 		// being defined (`nullable(lazy(() => Tree))` inside `Tree`) must not call `getter` yet.
 		missing: function isMissing(value: unknown): boolean {
-			const node = resolve();
-
-			return node.missing !== undefined && node.missing(value);
+			return flags(resolve(), value);
 		},
 		handlesMissing: function handlesMissingValues(): boolean {
 			return handlesMissing(resolve());

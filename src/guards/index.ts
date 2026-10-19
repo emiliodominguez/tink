@@ -1,6 +1,7 @@
 import { assertFunction, assertNumber, describe as typeName } from '../utils/assert.js';
 import type { AnyFunction, Primitive, UnionToIntersection } from '../utils/index.js';
 import { generate } from '../utils/jit.js';
+import { hold, isStackOverflow, PENDING, release, scope } from '../utils/memo.js';
 import { guardScore, scored } from '../utils/score.js';
 
 /**
@@ -1413,8 +1414,7 @@ function shapeGuard(
 /**
  * Creates a guard that passes when ANY of `guards` passes, narrowing to the union of their types (`z.union()`). Guards run in order
  * and stop at the first match. {@link explain} reports the member closest to the value (for tagged objects, the matching variant).
- * A recursive union whose members are only told apart deep inside a value costs time exponential in its depth on hostile input: tag
- * such objects with a field and use {@link isDiscriminatedUnion}.
+ * For objects tagged by a field, {@link isDiscriminatedUnion} looks the variant up instead.
  * @template G - The member guards
  * @param {...G} guards - The member guards (at least one)
  * @returns {(value: unknown) => boolean} A guard narrowing to the union of the members' types
@@ -1432,7 +1432,28 @@ export function isUnion<const G extends ReadonlyArray<Guard<unknown>>>(...guards
 
 	const members = guards.slice();
 
-	return explainable(
+	/**
+	 * Returns the member closest to matching `value` (see `utils/score.ts`), the first one on a tie.
+	 * @param {unknown} value - A value every member rejects
+	 * @returns {Guard<unknown>} The closest member
+	 */
+	function closestOf(value: unknown): Guard<unknown> {
+		let closest = members[0];
+		let best = guardScore(closest, value);
+
+		for (let index = 1; index < members.length && best > 0; index++) {
+			const score = guardScore(members[index], value);
+
+			if (score < best) {
+				closest = members[index];
+				best = score;
+			}
+		}
+
+		return closest;
+	}
+
+	const union = explainable(
 		function isUnionMember(value: unknown): value is Infer<G[number]> {
 			for (let index = 0; index < members.length; index++) if (members[index](value)) return true;
 
@@ -1442,23 +1463,15 @@ export function isUnion<const G extends ReadonlyArray<Guard<unknown>>>(...guards
 			// Explainers also run on the valid children of an explained object.
 			for (let index = 0; index < members.length; index++) if (members[index](value)) return true;
 
-			// Report the member that came closest (see `utils/score.ts`; the first one on a tie): for tagged objects that is the matching variant.
-			// Explaining every member, at every level of a recursive union, would take exponential time on invalid input.
-			let closest = members[0];
-			let best = guardScore(closest, value);
-
-			for (let index = 1; index < members.length && best > 0; index++) {
-				const score = guardScore(members[index], value);
-
-				if (score < best) {
-					closest = members[index];
-					best = score;
-				}
-			}
-
-			return collect(closest, value, path, issues);
+			// Report the member that came closest: for tagged objects that is the matching variant. Explaining every member, at every level
+			// of a recursive union, would take exponential time on invalid input.
+			return collect(closestOf(value), value, path, issues);
 		}
 	);
+
+	return scored(union, function scoreUnion(value: unknown): number {
+		return guardScore(closestOf(value), value);
+	});
 }
 
 /**
@@ -1903,8 +1916,10 @@ export function isDiscriminatedUnion<const K extends string, const V extends Sha
 		function scoreVariant(value: unknown): number {
 			const guard = typeof value === 'object' && value !== null && !Array.isArray(value) ? variantOf(value) : undefined;
 
-			// A wrong or missing tag is further than any failure of the right variant.
-			return guard === undefined ? Number.MAX_SAFE_INTEGER : guardScore(guard, value);
+			if (guard !== undefined) return guardScore(guard, value);
+
+			// A wrong or missing tag: further than any failure of the right variant (below 1), closer than a value that is not an object.
+			return typeof value === 'object' && value !== null && !Array.isArray(value) ? 1 : 2;
 		}
 	);
 }
@@ -2063,7 +2078,9 @@ export function refine<T>(guard: Guard<T>, predicate: (value: T) => boolean, mes
  *
  * Cycle-safe: a value that reaches itself through the same lazy guard (`node.children = [node]`) is rejected, and {@link explain}
  * reports `Circular reference` where the lazy guard meets the value again, instead of overflowing the stack. Shared (non-circular) sub-values are fine.
- * Rejecting cycles also guarantees that recursive code consuming the narrowed value terminates.
+ * Rejecting cycles also guarantees that recursive code consuming the narrowed value terminates. Each object is checked once per check
+ * by each lazy guard, which keeps a recursive {@link isUnion} linear in the size of the value however its members differ, and a value
+ * nested so deeply that checking it would overflow the stack is rejected (explained as `Value is nested too deeply`).
  * @template T - The guarded type
  * @param {() => Guard<T>} getter - Returns the guard (called once, on the first check)
  * @returns {(value: unknown) => boolean} A guard narrowing to `T`
@@ -2082,8 +2099,9 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 	assertFunction('isLazy', 'getter', getter);
 
 	let resolved: Guard<T> | undefined;
-	// The objects being checked (or explained) by this guard right now: meeting one again means a cycle.
-	const checking = new Set<object>();
+	// The result for each object checked by this guard during the current check (see `utils/memo.ts`), and the objects being explained
+	// right now: meeting one again means a cycle.
+	const memo = new Map<object, unknown>();
 	const explaining = new Set<object>();
 
 	/**
@@ -2106,12 +2124,25 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 			const guard = resolve();
 
 			if (typeof value !== 'object' || value === null) return guard(value);
-			if (checking.has(value)) return false;
-			checking.add(value);
+
+			const known = memo.get(value);
+
+			if (known !== undefined) return known === true;
+			hold(memo).set(value, PENDING);
+			scope.depth++;
 			try {
-				return guard(value);
+				const passed = guard(value);
+
+				memo.set(value, passed);
+
+				return passed;
+			} catch (error) {
+				// The outermost check rejects a value too deep to check; inside `explain`, or another lazy guard, the error goes on up.
+				if (scope.depth === 1 && isStackOverflow(error)) return false;
+				memo.delete(value);
+				throw error;
 			} finally {
-				checking.delete(value);
+				if (--scope.depth === 0) release();
 			}
 		},
 		function explainLazy(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
@@ -2123,7 +2154,7 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 
 				return false;
 			}
-			explaining.add(value);
+			hold(explaining).add(value);
 			try {
 				return collect(guard, value, path, issues);
 			} finally {
@@ -2254,8 +2285,18 @@ export function explain(guard: Guard<unknown>, value: unknown): SchemaIssue[] {
 
 	const issues: SchemaIssue[] = [];
 
-	// Guards never consult the explainers, so valid values take the fast path and allocate nothing beyond the result.
-	if (!guard(value)) collect(guard, value, [], issues);
+	// The memos of the lazy guards (see `utils/memo.ts`) live until the end, so explaining reuses what checking found.
+	scope.depth++;
+	try {
+		// Guards never consult the explainers, so valid values take the fast path and allocate nothing beyond the result.
+		if (!guard(value)) collect(guard, value, [], issues);
+	} catch (error) {
+		if (scope.depth !== 1 || !isStackOverflow(error)) throw error;
+		issues.length = 0;
+		issues.push({ message: 'Value is nested too deeply', path: [] });
+	} finally {
+		if (--scope.depth === 0) release();
+	}
 
 	return issues;
 }

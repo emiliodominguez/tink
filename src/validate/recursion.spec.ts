@@ -1,4 +1,19 @@
-import { explain, isInteger, isLazy, isLiteral, isMatching, isNumber, isShape, isString, isUnion, issuesByPath, type Guard, type SchemaIssue } from '../guards/index.js';
+import {
+	explain,
+	isInteger,
+	isLazy,
+	isLiteral,
+	isMatching,
+	isNumber,
+	isObject,
+	isOptional,
+	isShape,
+	isString,
+	isUnion,
+	issuesByPath,
+	type Guard,
+	type SchemaIssue
+} from '../guards/index.js';
 import {
 	arrayOf,
 	asInteger,
@@ -254,5 +269,192 @@ describe('discriminated variants that list the tag', function () {
 		const a: SchemaOutput<typeof event> = { type: 'a', x: 1 };
 
 		expect(parse(event, { type: 'a', x: 1 })).toEqual(a);
+	});
+});
+
+describe('recursive unions told apart deep inside', function () {
+	let calls = 0;
+
+	/**
+	 * A number guard that counts its calls.
+	 * @param {unknown} value - The value
+	 * @returns {boolean} Whether `value` is a number
+	 */
+	function isCountedNumber(value: unknown): value is number {
+		calls++;
+
+		return typeof value === 'number';
+	}
+
+	type Link = { next?: Link; a?: string; b?: number };
+	// `next` is checked before the field that tells the members apart, so every member recurses before it can fail.
+	const link: Parser<Link> = lazy(function () {
+		return union({ next: optional(link), a: isString }, { next: optional(link), b: isCountedNumber });
+	});
+	const isLink: Guard<Link> = isLazy(function () {
+		return isUnion(isShape({ next: isOptional(isLink), a: isString }), isShape({ next: isOptional(isLink), b: isCountedNumber }));
+	});
+
+	/**
+	 * Builds a chain of `depth` links matching the second member around `leaf`.
+	 * @param {number} depth - The depth
+	 * @param {object} leaf - The innermost link
+	 * @returns {Link} The chain
+	 */
+	function chainOf(depth: number, leaf: object): Link {
+		let value = leaf as Link;
+
+		for (let level = 0; level < depth; level++) value = { next: value, b: level };
+
+		return value;
+	}
+
+	beforeEach(function () {
+		calls = 0;
+	});
+
+	it('should parse and report in linear time, not exponential', function () {
+		expect(parse(link, chainOf(500, { b: 0 }))).toEqual(chainOf(500, { b: 0 }));
+		expect(calls).toBeLessThan(2000);
+		calls = 0;
+		expect(issuesOf(link, chainOf(500, { c: 0 }))).toHaveLength(1);
+		expect(calls).toBeLessThan(4000);
+	});
+
+	it('should check and explain in linear time, not exponential', function () {
+		expect(isLink(chainOf(500, { b: 0 }))).toBe(true);
+		expect(calls).toBeLessThan(2000);
+		calls = 0;
+		expect(explain(isLink, chainOf(500, { c: 0 }))).toHaveLength(1);
+		expect(calls).toBeLessThan(4000);
+	});
+
+	it('should fail a value too deep to parse with one issue, and parse the next value afresh', function () {
+		const deep = chainOf(100_000, { b: 0 });
+
+		expect(issuesOf(link, deep)).toEqual([{ message: 'Value is nested too deeply', path: [] }]);
+		expect(isLink(deep)).toBe(false);
+		expect(explain(isLink, deep)).toEqual([{ message: 'Value is nested too deeply', path: [] }]);
+		expect(parse(link, chainOf(2, { b: 0 }))).toEqual(chainOf(2, { b: 0 }));
+		expect(isLink(chainOf(2, { b: 0 }))).toBe(true);
+	});
+
+	it('should let the reporting parse of a parse nested in a transform pass the overflow to the parse around it', function () {
+		const deep = chainOf(100_000, { b: 0 });
+		const inner = transform(isString, function () {
+			return parse(link, deep);
+		});
+
+		// The fast parse fails on `b` before reaching `a`: `a` is first parsed by the reporting parse.
+		expect(issuesOf({ b: isString, a: inner }, { b: 1, a: 'x' })).toEqual([{ message: 'Value is nested too deeply', path: [] }]);
+		expect(function () {
+			parse(inner, 'x');
+		}).toThrow('Value is nested too deeply');
+	});
+
+	it('should treat the overflow errors of every engine as such, whatever throws them', function () {
+		/**
+		 * Returns a guard that throws `error`.
+		 * @param {Error} error - The error
+		 * @returns {Guard<string>} The guard
+		 */
+		function throwing(error: Error): Guard<string> {
+			return function isNever(_value: unknown): _value is string {
+				throw error;
+			};
+		}
+		const v8 = new RangeError('Maximum call stack size exceeded');
+		const spiderMonkey = Object.assign(new Error('too much recursion'), { name: 'InternalError' });
+		const other = new RangeError('Invalid array length');
+		const overflowed = [{ message: 'Value is nested too deeply', path: [] }];
+
+		// The fast parse fails on `b` before reaching `a`: `a` is first parsed by the reporting parse.
+		expect(issuesOf({ b: isString, a: throwing(v8) }, { b: 1, a: 'x' })).toEqual(overflowed);
+		expect(issuesOf({ b: isString, a: throwing(spiderMonkey) }, { b: 1, a: 'x' })).toEqual(overflowed);
+		expect(function () {
+			safeParse({ b: isString, a: throwing(other) }, { b: 1, a: 'x' });
+		}).toThrow(other);
+		expect(
+			isLazy(function () {
+				return throwing(v8);
+			})({})
+		).toBe(false);
+		expect(function () {
+			isLazy(function () {
+				return throwing(other);
+			})({});
+		}).toThrow(other);
+		expect(explain(isShape({ a: throwing(spiderMonkey) }), { a: 1 })).toEqual(overflowed);
+		expect(function () {
+			explain(isShape({ a: throwing(other) }), { a: 1 });
+		}).toThrow(other);
+	});
+
+	it('should let a transform report a parse of its own while the parse around it reports', function () {
+		const valid = transform(isString, function (text: string): boolean {
+			return safeParse(asInteger, text)[0] === undefined;
+		});
+
+		expect(issuesOf({ b: isString, a: valid }, { b: 1, a: 'x' })).toEqual([{ message: 'Invalid value (got number)', path: ['b'] }]);
+	});
+
+	it('should parse an object held twice once, to the same output', function () {
+		let runs = 0;
+		const item: Parser<{ id: number }> = lazy(function () {
+			return transform({ id: isNumber }, function (value: { id: number }): { id: number } {
+				runs++;
+
+				return { ...value };
+			});
+		});
+		const list: Parser<{ id: number }[]> = lazy(function () {
+			return arrayOf(item);
+		});
+		const shared = { id: 1 };
+		const [first, second] = parse(list, [shared, shared]);
+
+		expect(first).toBe(second);
+		expect(runs).toBe(1);
+	});
+
+	it('should remember outputs that are undefined', function () {
+		const nothing: Parser<undefined> = lazy(function () {
+			return transform(isObject, function (): undefined {
+				return undefined;
+			});
+		});
+		const list: Parser<undefined[]> = lazy(function () {
+			return arrayOf(nothing);
+		});
+		const shared = {};
+
+		expect(parse(list, [shared, shared])).toEqual([undefined, undefined]);
+	});
+
+	it('should forget an object whose parse threw, and rethrow other errors', function () {
+		let throws = true;
+		const fragile: Parser<object> = lazy(function () {
+			return transform(isObject, function (value: object): object {
+				if (throws) throw new RangeError('Invalid array length');
+
+				return value;
+			});
+		});
+		const value = {};
+
+		expect(function () {
+			parse(fragile, value);
+		}).toThrow('Invalid array length');
+		throws = false;
+		expect(parse(fragile, value)).toBe(value);
+	});
+
+	it('should keep the memo of a lazy parser called outside a parse to that call', function () {
+		const value: Link = { b: 1 };
+		const node = (link as unknown as Record<string, { fast(value: unknown): unknown }>)['~tink.1'];
+
+		expect(node.fast(value)).toEqual({ b: 1 });
+		value.b = 2;
+		expect(node.fast(value)).toEqual({ b: 2 });
 	});
 });
