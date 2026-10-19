@@ -360,3 +360,146 @@ describe('Color helpers (property-based)', function () {
 		});
 	});
 });
+
+/** OKLCH colours, in and out of the sRGB gamut. */
+const oklch = fc.record({
+	l: fc.double({ min: 0, max: 1, noNaN: true }),
+	c: fc.double({ min: 0, max: 0.5, noNaN: true }),
+	h: fc.double({ min: 0, max: 360, maxExcluded: true, noNaN: true })
+});
+const perceptualSpace = fc.constantFrom<'oklab' | 'oklch'>('oklab', 'oklch');
+
+/**
+ * The deltaEOK distance between two OKLab colours.
+ */
+function deltaEOK(a: helpers.Oklab, b: helpers.Oklab): number {
+	return Math.hypot(a.l - b.l, a.a - b.a, a.b - b.b);
+}
+
+/**
+ * How far from the requested OKLCH lightness a gamut mapped 8-bit colour may land: one JND (0.02), plus half an 8-bit step, which is
+ * coarse in OKLab right above black (the first grey after black, #010101, has lightness 0.067).
+ */
+function lightnessTolerance(l: number): number {
+	return l < 0.1 ? 0.055 : 0.025;
+}
+
+/**
+ * The OKLab form of an OKLCH colour.
+ */
+function labOf(color: { l: number; c: number; h: number }): helpers.Oklab {
+	const radians = (color.h * Math.PI) / 180;
+	return { l: color.l, a: color.c * Math.cos(radians), b: color.c * Math.sin(radians) };
+}
+
+describe('OKLab / OKLCH (property-based)', function () {
+	it('sRGB -> OKLab / OKLCH -> sRGB should give back exactly the same 8-bit colour', function () {
+		fc.assert(
+			fc.property(rgba, function (color) {
+				expect(helpers.oklchToRgb(helpers.toOklch(color))).toEqual(color);
+				expect(helpers.oklabToRgb(helpers.toOklab(color))).toEqual(color);
+				expect(helpers.inGamut(helpers.toOklch(color))).toBe(true);
+			})
+		);
+	});
+
+	it('parseColor(toCssOklch(c)) should round-trip every 8-bit colour', function () {
+		fc.assert(
+			fc.property(cssRgba, function (color) {
+				expect(helpers.parseColor(helpers.toCssOklch(color))).toEqual(color);
+			})
+		);
+	});
+
+	it('toOklch should agree with toOklab in polar form, within its documented ranges', function () {
+		fc.assert(
+			fc.property(rgb, function (color) {
+				const lab = helpers.toOklab(color);
+				const lch = helpers.toOklch(color);
+				expect(lch.l).toBe(lab.l);
+				expect(lch.l).toBeGreaterThanOrEqual(0);
+				expect(lch.l).toBeLessThanOrEqual(1);
+				expect(lch.c).toBeCloseTo(Math.hypot(lab.a, lab.b), 15);
+				if (lch.c === 0) expect(lch.h).toBeNaN();
+				else {
+					expect(lch.h).toBeGreaterThanOrEqual(0);
+					expect(lch.h).toBeLessThan(360);
+					expect(deltaEOK(labOf(lch), lab)).toBeLessThan(1e-12);
+				}
+			})
+		);
+	});
+
+	it('gamut mapping should keep the lightness within one JND (plus 8-bit rounding), and in-gamut colours nearly unchanged', function () {
+		fc.assert(
+			fc.property(oklch, function (color) {
+				const mapped = helpers.toOklab(helpers.oklchToRgb(color));
+				expect(Math.abs(mapped.l - color.l)).toBeLessThan(lightnessTolerance(color.l));
+				// (Above black, where 8-bit steps are coarse in OKLab: see `lightnessTolerance`.)
+				if (color.l >= 0.1 && helpers.inGamut(color)) expect(deltaEOK(mapped, labOf(color))).toBeLessThan(0.01);
+			})
+		);
+	});
+
+	it('parseColor should parse oklch() and oklab() like oklchToRgb and oklabToRgb', function () {
+		fc.assert(
+			fc.property(oklch, fc.double({ min: -0.5, max: 0.5, noNaN: true }), function (color, b) {
+				const { l, c, h } = color;
+				expect(helpers.parseColor(`oklch(${l} ${c} ${h})`)).toEqual(helpers.oklchToRgb(color));
+				expect(helpers.parseColor(`oklch(${l * 100}% ${c * 250}% ${h / 360}turn)`)).toEqual(
+					helpers.oklchToRgb({ l: Math.min((l * 100) / 100, 1), c: (c * 250) / 250, h: (((h / 360) % 1) * 360) / 1 })
+				);
+				expect(helpers.parseColor(`oklab(${l} ${c} ${b} / 0.5)`)).toEqual({ ...helpers.oklabToRgb({ l, a: c, b }), a: 0.5 });
+			})
+		);
+	});
+
+	it('perceptual mix should return the endpoints at weights 0 and 1, and a colour mixed with itself', function () {
+		fc.assert(
+			fc.property(
+				rgba,
+				rgba,
+				perceptualSpace,
+				fc.constantFrom<helpers.HueInterpolation>('shorter', 'increasing', 'decreasing'),
+				weight,
+				function (a, b, mixSpace, hue, w) {
+					expect(helpers.mix(a, b, 0, { space: mixSpace, hue })).toEqual(a);
+					expect(helpers.mix(a, b, 1, { space: mixSpace, hue })).toEqual(b);
+					expect(helpers.mix(a, a, w, { space: mixSpace, hue })).toEqual(a);
+				}
+			)
+		);
+	});
+
+	it('oklab mix should be symmetric (within 8-bit rounding) and interpolate alpha linearly', function () {
+		fc.assert(
+			// Weights k / 1000, so that `1 - w` is exact enough: a fully transparent colour contributes nothing for any weight > 0,
+			// which makes the result jump at the tiniest weights.
+			fc.property(rgba, rgba, fc.integer({ min: 0, max: 1000 }), function (a, b, k) {
+				const w = k / 1000;
+				const forward = helpers.mix(a, b, w, { space: 'oklab' });
+				const backward = helpers.mix(b, a, 1 - w, { space: 'oklab' });
+				expect(Math.abs(forward.r - backward.r)).toBeLessThanOrEqual(1);
+				expect(Math.abs(forward.g - backward.g)).toBeLessThanOrEqual(1);
+				expect(Math.abs(forward.b - backward.b)).toBeLessThanOrEqual(1);
+				expect(forward.a).toBeCloseTo(a.a + (b.a - a.a) * w, 12);
+				expectNormalized(forward);
+			})
+		);
+	});
+
+	it('oklch lighten/darken should move the OKLCH lightness by the amount (within one JND), and not at all for 0', function () {
+		fc.assert(
+			fc.property(rgba, amount, function (color, by) {
+				expect(helpers.lighten(color, 0, { space: 'oklch' })).toEqual(color);
+				expect(helpers.darken(color, 0, { space: 'oklch' })).toEqual(color);
+				const l = helpers.toOklch(color).l;
+				const lighter = Math.min(1, l + by / 100);
+				const darker = Math.max(0, l - by / 100);
+				expect(Math.abs(helpers.toOklch(helpers.lighten(color, by, { space: 'oklch' })).l - lighter)).toBeLessThan(lightnessTolerance(lighter));
+				expect(Math.abs(helpers.toOklch(helpers.darken(color, by, { space: 'oklch' })).l - darker)).toBeLessThan(lightnessTolerance(darker));
+				expect(helpers.lighten(color, by, { space: 'oklch' }).a).toBe(color.a);
+			})
+		);
+	});
+});
