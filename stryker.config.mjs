@@ -13,6 +13,8 @@ export default {
 	thresholds: { high: 90, low: 80, break: null },
 	concurrency: 2,
 	timeoutMS: 5000,
+	// The instrumented initial run of the whole suite takes about 3.5 minutes on 8 cores: the default 5-minute limit fails under load.
+	dryRunTimeoutMinutes: 15,
 	tempDirName: '.stryker-tmp',
 	ignorePatterns: ['dist', 'coverage', 'docs', 'reports', 'bench', '.stryker-tmp*']
 };
