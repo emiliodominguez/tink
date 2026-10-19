@@ -196,7 +196,8 @@ export function average(numbers: ReadonlyArray<number>): number {
 }
 
 /**
- * Calculates the factorial of a non-negative integer, iteratively.
+ * Calculates the factorial of a non-negative integer, iteratively (in doubles: from `27!` on, the rounding of each product can leave the
+ * result a few units in the last place away from the correctly rounded `n!`, while keeping `factorial(n + 1) === (n + 1) * factorial(n)`).
  * Results above `170!` exceed `Number.MAX_VALUE`, so `Infinity` is returned for `number > 170`.
  * @param {number} number - A non-negative integer
  * @returns {number} `number!` (`Infinity` when `number > 170`)
@@ -388,7 +389,8 @@ function roundDirected(caller: string, method: (value: number) => number, number
 	// Ceiling a positive number or flooring a negative one moves its magnitude up when a non-zero digit is dropped.
 	const away = (method === Math.ceil) !== negative && /[1-9]/.test(digits.slice(-drop));
 	// A zero result keeps the sign of `number` (`ceil(-0.001, 2)` is `-0`, like `Math.ceil(-0.1)`).
-	const result = Number(`${away ? kept + 1n : kept}e${-decimals}`);
+	// (`BigInt` prints the exponent in full: `${1e21}` would be `1e+21`.)
+	const result = Number(`${away ? kept + 1n : kept}e${BigInt(-decimals)}`);
 	return negative ? -result : result;
 }
 
@@ -558,7 +560,11 @@ export function lerp(start: number, end: number, t: number): number {
  */
 export function inverseLerp(start: number, end: number, value: number): number {
 	if (start === end) return 0;
-	return (value - start) / (end - start);
+	const span = end - start;
+	const offset = value - start;
+	if (Number.isFinite(span) && Number.isFinite(offset)) return offset / span;
+	// A difference overflowed (`inverseLerp(-1e308, 1e308, 0)`): the halves do not, and their ratio is the same.
+	return (value / 2 - start / 2) / (end / 2 - start / 2);
 }
 
 /**
@@ -1344,15 +1350,20 @@ export function roundToStep(value: number, step: number): number {
 	// Beyond 2 ** 53 steps, every double is already (within its own precision) a multiple of `step`. Non-finite values (whose
 	// shifted string is `NaN`) are returned here too.
 	if (!(quotient < 2 ** 53)) return value;
-	// The number of steps. When the shifted value has more digits than a double holds exactly, the quotient of the doubles can be off:
-	// divide the exact decimal integers instead, rounding half away from zero (the count itself is below 2 ** 53, so exact as a double).
+	// The number of steps. Below 2 ** 52 the quotient of the (exact) shifted integers is off by less than the distance from any
+	// fraction `r / scaledStep` to one half, so `Math.round` is exact; from there on (and when the shifted value has more digits than a
+	// double holds), divide the exact decimal integers instead, rounding half away from zero (the count itself is below 2 ** 53).
 	let multiple = Math.round(quotient);
-	if (scaledValue >= 2 ** 53) {
+	if (scaledValue >= 2 ** 52) {
 		const exactValue = scaledInteger(magnitude, shift);
 		const exactStep = scaledInteger(step, shift);
 		multiple = Number(exactValue / exactStep + (2n * (exactValue % exactStep) >= exactStep ? 1n : 0n));
 	}
-	const rounded = round(multiple * step, stepDecimals);
+	// `multiple * step` in doubles can be off by an ulp, which reads as a non-multiple (`…480.36` for a step of 0.05): for a decimal
+	// step (one that round-trips through 15 significant digits), the result is built from the digits of the exact decimal product
+	// (correctly rounded by `Number`). Other steps are binary values (`1 / 3`), whose products are computed in binary.
+	const rounded =
+		Number(step.toPrecision(15)) === step ? Number(`${BigInt(multiple) * scaledInteger(step, stepDecimals)}e-${stepDecimals}`) : round(multiple * step, stepDecimals);
 	return negative ? -rounded : rounded;
 }
 

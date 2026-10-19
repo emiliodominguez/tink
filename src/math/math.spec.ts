@@ -295,6 +295,11 @@ describe('Math helpers', function () {
 	});
 
 	describe('ceil', function () {
+		it('should handle precisions of 1e21 digits and more', function () {
+			expect(helpers.ceil(5, -1e21)).toBe(Infinity);
+			expect(helpers.floor(-5, -1e21)).toBe(-Infinity);
+		});
+
 		it('should return the smallest integer greater than or equal to a number', function () {
 			expect(helpers.ceil(3.14)).toBe(4);
 			expect(helpers.ceil(-2.9)).toBe(-2);
@@ -594,6 +599,12 @@ describe('Math helpers', function () {
 	});
 
 	describe('inverseLerp', function () {
+		it('should not overflow for ranges wider than Number.MAX_VALUE', function () {
+			expect(helpers.inverseLerp(-1e308, 1e308, 0)).toBe(0.5);
+			expect(helpers.inverseLerp(-1e308, 1e308, 1e308)).toBe(1);
+			expect(helpers.mapRange(0, -1e308, 1e308, 0, 1)).toBe(0.5);
+		});
+
 		it('should return the interpolation factor', function () {
 			expect(helpers.inverseLerp(0, 10, 5)).toBe(0.5);
 			expect(helpers.inverseLerp(10, 20, 12.5)).toBe(0.25);
@@ -896,6 +907,16 @@ describe('Math helpers', function () {
 			expect(helpers.round(5e-324, 0)).toBe(0);
 			expect(Object.is(helpers.round(-5e-324, 0), -0)).toBe(true);
 			expect(helpers.round(1.7976931348623157e308, -308)).toBe(Infinity);
+		});
+
+		it('roundToStep finds the nearest multiple between 2 ** 52 and 2 ** 53, and returns it as a decimal multiple', function () {
+			expect(helpers.roundToStep(845493132055022.1, 0.7)).toBe(845493132055021.8);
+			expect(helpers.roundToStep(622277132369530.25, 0.5)).toBe(622277132369530);
+			expect(helpers.roundToStep(100446303783480.36, 0.05)).toBe(100446303783480.34);
+			expect(helpers.roundToStep(4219485185534389, 0.9)).toBe(4219485185534389);
+			expect(helpers.roundToStep(4.0451279852133525e30, 1e25)).toBe(4.04513e30);
+			// A binary step keeps binary products: 3 * (1 / 3) is 1.
+			expect(helpers.roundToStep(1, 1 / 3)).toBe(1);
 		});
 
 		it('roundToStep finds the nearest multiple when the shifted value exceeds 2 ** 53', function () {
