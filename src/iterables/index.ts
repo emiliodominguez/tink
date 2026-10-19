@@ -2,6 +2,7 @@ import { AbortError } from '../async/index.js';
 import { isAsyncIterable, isIterable } from '../guards/index.js';
 import { assertFunction, assertInteger, assertNumber, describe } from '../utils/assert.js';
 import type { AbortSignalLike } from '../utils/index.js';
+import { detach, reasonOf } from '../utils/signal.js';
 
 /**
  * The tuple of item types produced by {@link zip} for a tuple of input iterables.
@@ -567,7 +568,12 @@ function* zipped<T extends Array<Iterable<unknown>>>(iterables: T): Generator<Zi
 	let current = -1;
 	let threw = false;
 	try {
-		for (const iterable of iterables) iterators.push(iterable[Symbol.iterator]());
+		for (const iterable of iterables) {
+			const iterator: unknown = iterable[Symbol.iterator]();
+
+			if (typeof iterator !== 'object' || iterator === null) throw new TypeError(`zip: an iterator must be an object, got ${describe(iterator)}`);
+			iterators.push(iterator as Iterator<unknown>);
+		}
 		for (;;) {
 			const tuple = new Array<unknown>(iterators.length);
 			for (current = 0; current < iterators.length; current++) {
@@ -1182,6 +1188,7 @@ async function* mappedConcurrently(
 	let exhausted = false;
 	let stopped = false;
 	let sourceError: { error: unknown } | undefined;
+	let abortedWith: { reason: unknown } | undefined;
 	let wakeUp: (() => void) | undefined;
 
 	/**
@@ -1226,41 +1233,57 @@ async function* mappedConcurrently(
 		} catch (error) {
 			pull = Promise.reject(error);
 		}
-		pull.then(
-			function (step) {
-				pulling = false;
-				if (step.done) {
-					exhausted = true;
-				} else if (!stopped) {
-					const slot: MappedSlot = { settled: false, ok: false, result: undefined };
-					let outcome: unknown;
+		pull.then(function (step) {
+			let done: unknown;
+			let item: unknown;
 
-					buffered++;
-					if (ordered) slots.push(slot);
-					try {
-						outcome = fn(step.value, index++, signal);
-					} catch (error) {
-						outcome = Promise.reject(error);
-					}
-					Promise.resolve(outcome).then(
-						function (value) {
-							settle(slot, true, value);
-						},
-						function (error: unknown) {
-							settle(slot, false, error);
-						}
-					);
-					fill();
-				}
-				notify();
-			},
-			function (error: unknown) {
-				pulling = false;
-				exhausted = true;
-				sourceError = { error };
-				notify();
+			// The result is read like `for await` reads it: a non-object, or a `done` / `value` getter that throws, is the source failing.
+			try {
+				if (typeof step !== 'object' || step === null) throw new TypeError(`mapConcurrent: iterator result ${describe(step)} is not an object`);
+				done = step.done;
+				if (!done) item = step.value;
+			} catch (error) {
+				failSource(error);
+				return;
 			}
-		);
+			pulling = false;
+			if (done) {
+				exhausted = true;
+			} else if (!stopped) {
+				const slot: MappedSlot = { settled: false, ok: false, result: undefined };
+				let outcome: unknown;
+
+				buffered++;
+				if (ordered) slots.push(slot);
+				try {
+					outcome = fn(item, index++, signal);
+				} catch (error) {
+					outcome = Promise.reject(error);
+				}
+				Promise.resolve(outcome).then(
+					function (value) {
+						settle(slot, true, value);
+					},
+					function (error: unknown) {
+						settle(slot, false, error);
+					}
+				);
+				fill();
+			}
+			notify();
+		}, failSource);
+	}
+
+	/**
+	 * Records a failure of the source (it is not closed then) and wakes the consumer up, which throws it.
+	 * @param {unknown} error - The error
+	 * @returns {void}
+	 */
+	function failSource(error: unknown): void {
+		pulling = false;
+		exhausted = true;
+		sourceError = { error };
+		notify();
 	}
 
 	/**
@@ -1269,15 +1292,18 @@ async function* mappedConcurrently(
 	 */
 	function onAbort(): void {
 		stopped = true;
+		// Kept here rather than read back from `signal.aborted`, which a signal-like object may not have updated.
+		abortedWith ??= { reason: abortReason(signal as AbortSignalLike) };
 		notify();
 	}
-
-	signal?.addEventListener('abort', onAbort);
 
 	let failed = false;
 
 	try {
+		// Inside the `try`: when adding the listener throws, the source opened above is still closed.
+		signal?.addEventListener('abort', onAbort);
 		for (;;) {
+			if (abortedWith !== undefined) throw abortedWith.reason;
 			if (signal?.aborted) throw abortReason(signal);
 			fill();
 
@@ -1304,7 +1330,7 @@ async function* mappedConcurrently(
 		throw error;
 	} finally {
 		stopped = true;
-		signal?.removeEventListener('abort', onAbort);
+		detach(signal, onAbort);
 		// Close the source unless it finished or failed on its own. An async generator answers a pending pull before `return()`, which
 		// may never happen (an idle stream): the close is then requested without waiting for it, so that the consumer is not blocked.
 		// When the iteration fails, a failure to close is ignored so that the original error comes out (like `for await`).
@@ -1410,7 +1436,15 @@ export function mapConcurrent<T, U>(
  * @returns {unknown} The rejection reason
  */
 function abortReason(signal: AbortSignalLike): unknown {
-	return signal.reason ?? new AbortError();
+	return reasonOf(signal, createAbortError);
+}
+
+/**
+ * Creates the reason of a signal aborted without one.
+ * @returns {AbortError} A new `AbortError`
+ */
+function createAbortError(): AbortError {
+	return new AbortError();
 }
 
 /**

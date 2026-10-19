@@ -1,4 +1,5 @@
 import * as helpers from '.';
+import type { AbortSignalLike } from '../utils/index.js';
 
 /**
  * Wraps an iterable so that every `[Symbol.iterator]()`, `next()` and `return()` call is counted.
@@ -562,6 +563,29 @@ describe('iterables', function () {
 	});
 
 	describe('zip', function () {
+		it('rejects an iterator that is not an object before pulling anything', function () {
+			let pulled = 0;
+			const counted: Iterable<number> = {
+				[Symbol.iterator]() {
+					return {
+						next() {
+							pulled++;
+							return { done: false, value: 1 };
+						}
+					};
+				}
+			};
+			const broken = {
+				[Symbol.iterator]() {
+					return 42;
+				}
+			} as unknown as Iterable<number>;
+			expect(function () {
+				helpers.toArray(helpers.zip(counted, broken));
+			}).toThrow(new TypeError('zip: an iterator must be an object, got number'));
+			expect(pulled).toBe(0);
+		});
+
 		it('stops on any truthy done, like for...of', function () {
 			let i = 0;
 			const loose: Iterable<number> = {
@@ -1827,6 +1851,10 @@ describe('mapConcurrent', function () {
 		return value;
 	}
 
+	function boom(): never {
+		throw new Error('boom');
+	}
+
 	it('rejects with the error of a next() that throws synchronously, without closing that source', async function () {
 		const first = handWritten(function () {
 			throw new Error('sync next');
@@ -1839,6 +1867,68 @@ describe('mapConcurrent', function () {
 		});
 		await expect(helpers.toArrayAsync(helpers.mapConcurrent(later.iterable, identity, 2))).rejects.toThrow('second pull');
 		expect(later.log).toEqual(['next', 'next']);
+	});
+
+	it('rejects (without closing the source) for results that are not objects or whose done or value getters throw', async function () {
+		for (const result of [null, 42, Object.defineProperty({}, 'done', { get: boom }), Object.defineProperty({ done: false }, 'value', { get: boom })]) {
+			const source = handWritten(function () {
+				return Promise.resolve(result);
+			});
+			await expect(helpers.toArrayAsync(helpers.mapConcurrent(source.iterable, identity, 1))).rejects.toThrow();
+			expect(source.log).toEqual(['next']);
+		}
+	});
+
+	it('closes the source and ignores a throwing removeEventListener; closes it too when addEventListener throws', async function () {
+		function signal(add: boolean, remove: boolean): AbortSignalLike {
+			return {
+				aborted: false,
+				addEventListener: add ? boom : function () {},
+				removeEventListener: remove ? boom : function () {}
+			} as unknown as AbortSignalLike;
+		}
+		const finished = handWritten(function (pull) {
+			return Promise.resolve(pull < 2 ? { done: false, value: pull } : { done: true, value: undefined });
+		});
+		await expect(helpers.toArrayAsync(helpers.mapConcurrent(finished.iterable, identity, { concurrency: 1, signal: signal(false, true) }))).resolves.toEqual([0, 1]);
+		const broken = handWritten(function (pull) {
+			return Promise.resolve({ done: false, value: pull });
+		});
+		await expect(
+			(async function () {
+				for await (const value of helpers.mapConcurrent(broken.iterable, identity, { concurrency: 1, signal: signal(false, true) })) if (value === 0) break;
+			})()
+		).resolves.toBeUndefined();
+		expect(broken.log).toContain('return');
+		const unlistened = handWritten(function (pull) {
+			return Promise.resolve({ done: false, value: pull });
+		});
+		await expect(helpers.mapConcurrent(unlistened.iterable, identity, { concurrency: 1, signal: signal(true, false) }).next()).rejects.toThrow('boom');
+		expect(unlistened.log).toEqual(['return']);
+	});
+
+	it('stops on an abort event even when the signal-like object does not report aborted', async function () {
+		let listener: (() => void) | undefined;
+		const lying = {
+			aborted: false,
+			reason: new Error('stop'),
+			addEventListener(_type: string, callback: () => void) {
+				listener = callback;
+			},
+			removeEventListener() {}
+		} as unknown as AbortSignalLike;
+		const iterator = helpers.mapConcurrent(
+			(async function* () {
+				yield 1;
+				await new Promise(function () {});
+			})(),
+			identity,
+			{ concurrency: 1, signal: lying }
+		);
+		expect(await iterator.next()).toEqual({ done: false, value: 1 });
+		const pending = iterator.next();
+		listener?.();
+		await expect(pending).rejects.toThrow('stop');
 	});
 
 	it('accepts a next() that returns a plain result, like for await', async function () {
