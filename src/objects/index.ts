@@ -2741,6 +2741,716 @@ export function diff(a: object, b: object): ObjectDiff {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Structural sharing and JSON Patch
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Whether an object is a container that {@link replaceEqualDeep} and {@link createPatch} walk: a plain object (`Object.prototype` or
+ * `null` prototype, not a thenable) or a dense array without other own keys.
+ * @param {object} value - The object
+ * @param {unknown} prototype - Its prototype
+ * @returns {boolean} Whether its members are walked
+ */
+function isTree(value: object, prototype: unknown): boolean {
+	if (prototype === null) return !isPromise(value) && getTag(value) === '[object Object]';
+	return isOrdinary(value, prototype) && (!Array.isArray(value) || isSimpleArray(value));
+}
+
+/** The state of one {@link replaceEqualDeep} call. */
+interface SharingState {
+	/** The containers of `next` on the current path: meeting one again is a cycle. */
+	readonly ancestors: Set<object>;
+	/** The results of pairs with a large subtree, by `next` then `prev` container. */
+	done: WeakMap<object, WeakMap<object, object>> | undefined;
+	/** The number of container pairs walked so far. */
+	visited: number;
+}
+
+/**
+ * Recursive worker of {@link replaceEqualDeep}.
+ * @param {unknown} prev - The previous value
+ * @param {unknown} next - The new value
+ * @param {SharingState} state - The state of the call
+ * @returns {unknown} `next`, with its parts equal to those of `prev` replaced by them (`prev` itself when all are)
+ */
+function shareWith(prev: unknown, next: unknown, state: SharingState): unknown {
+	if (Object.is(prev, next)) return prev;
+	if (!isObject(prev) || !isObject(next)) return next;
+	const prototype = Object.getPrototypeOf(next);
+	if (Object.getPrototypeOf(prev) !== prototype) return next;
+	if (!isTree(next, prototype) || !isTree(prev, prototype)) return isEqual(prev, next) ? prev : next;
+	// A reference back to a container being processed (a cycle) is kept from `next`: its copy is not finished yet.
+	if (state.ancestors.has(next)) return next;
+	const known = state.done?.get(next)?.get(prev);
+	if (known !== undefined) return known;
+
+	const visited = ++state.visited;
+	state.ancestors.add(next);
+	const result = Array.isArray(next) ? shareItems(prev as unknown[], next, state) : shareMembers(prev, next, prototype, state);
+	state.ancestors.delete(next);
+	// A container shared by several paths (`{ l: node, r: node }` at every level) would otherwise be processed once per path: an
+	// exponential number of times. Results are remembered for the pairs with large subtrees (every result is valid wherever its pair is).
+	if (state.visited - visited > PROVEN_SUBTREE) {
+		const done = (state.done ??= new WeakMap());
+		let pairs = done.get(next);
+		if (pairs === undefined) done.set(next, (pairs = new WeakMap()));
+		pairs.set(prev, result);
+	}
+	return result;
+}
+
+/**
+ * {@link shareWith} for two dense arrays.
+ * @param {unknown[]} prev - The previous array
+ * @param {unknown[]} next - The new array
+ * @param {SharingState} state - The state of the call
+ * @returns {unknown[]} `prev` when every item is shared, else a new array
+ */
+function shareItems(prev: unknown[], next: unknown[], state: SharingState): unknown[] {
+	const length = next.length;
+	const previousLength = prev.length;
+	const items = new Array<unknown>(length);
+	let same = length === previousLength;
+	for (let index = 0; index < length; index++) {
+		const before = index < previousLength ? prev[index] : undefined;
+		const item = shareWith(before, next[index], state);
+		items[index] = item;
+		if (!Object.is(item, before)) same = false;
+	}
+	return same ? prev : items;
+}
+
+/**
+ * {@link shareWith} for two plain objects with the same prototype.
+ * @param {object} prev - The previous object
+ * @param {object} next - The new object
+ * @param {object | null} prototype - Their prototype (`Object.prototype` or `null`)
+ * @param {SharingState} state - The state of the call
+ * @returns {object} `prev` when it has the same keys and every value is shared, else a new object
+ */
+function shareMembers(prev: object, next: object, prototype: object | null, state: SharingState): object {
+	const keys = ownEnumerableKeys(next);
+	const values: unknown[] = [];
+	// With as many keys on both sides, every key of `next` being one of `prev` makes the key sets equal.
+	let same = keys.length === ownEnumerableKeys(prev).length;
+	for (const key of keys) {
+		const own = Object.prototype.propertyIsEnumerable.call(prev, key);
+		const before = own ? (prev as Properties)[key] : undefined;
+		const value = shareWith(before, (next as Properties)[key], state);
+		values.push(value);
+		if (!own || !Object.is(value, before)) same = false;
+	}
+	if (same) return prev;
+	const result: object = prototype === null ? Object.create(null) : {};
+	for (let index = 0; index < keys.length; index++) definePlain(result, keys[index], values[index]);
+	return result;
+}
+
+/**
+ * Structural sharing, as TanStack Query applies it to refetched data: returns `next`, except that every part of it deeply equal
+ * ({@link isEqual}) to the part of `prev` at the same place is replaced by that part of `prev`, and `prev` itself is returned when
+ * everything is equal. References to unchanged data therefore stay the same across updates, so `React.memo`, `useMemo` dependencies and
+ * selectors only see what really changed.
+ * - Plain objects (`Object.prototype` or `null` prototype) and dense arrays without extra keys are walked: a container is rebuilt (same
+ *   prototype, `next`'s key order) when anything inside it changed, and is `prev`'s when nothing did (whatever the key order). Own
+ *   enumerable string and symbol keys are compared; `next`'s values are read once (getters run once) and stored as data properties.
+ * - Any other value (`Date`, `Map`, `Set`, class instance, sparse array...) is a leaf: `prev`'s when {@link isEqual}, else `next`'s.
+ *   Primitives are compared with `Object.is` (`-0` stays `-0`).
+ * - Inputs are never mutated. Keys are defined, never assigned, so a `'__proto__'` key stays an own property.
+ * - Linear in the size of `next`: a part shared by several paths is processed once per pair of parts. A circular `next` is supported:
+ *   a reference back to an enclosing container is kept from `next` as is.
+ *
+ * Recursion depth is bounded by the call stack (~thousands of levels): deeper input throws a `RangeError`.
+ * @template T - The type of the new value
+ * @param {unknown} prev - The previous value
+ * @param {T} next - The new value
+ * @returns {T} A value deeply equal to `next`, sharing every unchanged part with `prev`
+ * @throws {RangeError} when the nesting is deeper than the call stack allows
+ * @example
+ * const prev = { user: { name: 'Ada', tags: ['x'] }, count: 1 };
+ * const next = replaceEqualDeep(prev, { user: { name: 'Ada', tags: ['x'] }, count: 2 });
+ * next; // => { user: { name: 'Ada', tags: ['x'] }, count: 2 }
+ * next.user === prev.user; // => true
+ * replaceEqualDeep(prev, { count: 1, user: { tags: ['x'], name: 'Ada' } }) === prev; // => true
+ * replaceEqualDeep([new Date(0), 1], [new Date(0), 2])[0]; // => new Date(0) // the Date of `prev`
+ */
+export function replaceEqualDeep<T>(prev: unknown, next: T): T {
+	return shareWith(prev, next, { ancestors: new Set(), done: undefined, visited: 0 }) as T;
+}
+
+/**
+ * A JSON Patch operation (RFC 6902). `path` and `from` are JSON Pointers (RFC 6901): `''` for the whole document, otherwise `/`
+ * followed by the keys (or array indices) separated by `/`, with `~` written `~0` and `/` written `~1` inside a key.
+ */
+export type JsonPatchOperation =
+	| { readonly op: 'add'; readonly path: string; readonly value: unknown }
+	| { readonly op: 'remove'; readonly path: string }
+	| { readonly op: 'replace'; readonly path: string; readonly value: unknown }
+	| { readonly op: 'move'; readonly from: string; readonly path: string }
+	| { readonly op: 'copy'; readonly from: string; readonly path: string }
+	| { readonly op: 'test'; readonly path: string; readonly value: unknown };
+
+/**
+ * Error thrown by {@link applyPatch} when a well-formed operation cannot be applied to the document: a location that does not exist,
+ * an array index out of bounds, a value that cannot be walked into, a failed `test`, a `move` into its own child, or a `remove` of the
+ * whole document. A malformed operation throws a `TypeError` or a `RangeError` instead.
+ * @example
+ * try {
+ *   applyPatch({ a: 1 }, [{ op: 'test', path: '/a', value: 2 }]);
+ * } catch (error) {
+ *   error instanceof JsonPatchError; // => true
+ *   (error as JsonPatchError).index; // => 0
+ * }
+ */
+export class JsonPatchError extends Error {
+	override name = 'JsonPatchError';
+	/** The position of the failed operation in the patch. */
+	readonly index: number;
+	/** The failed operation. */
+	readonly operation: JsonPatchOperation;
+
+	/**
+	 * @param {string} message - The error message
+	 * @param {number} index - The position of the failed operation in the patch
+	 * @param {JsonPatchOperation} operation - The failed operation
+	 */
+	constructor(message: string, index: number, operation: JsonPatchOperation) {
+		super(message);
+		this.index = index;
+		this.operation = operation;
+	}
+}
+
+/**
+ * Escapes a key for a JSON Pointer: `~` becomes `~0` and `/` becomes `~1`.
+ * @param {string} key - The key
+ * @returns {string} The pointer segment
+ */
+function escapePointer(key: string): string {
+	return key.includes('~') || key.includes('/') ? key.replace(/~/g, '~0').replace(/\//g, '~1') : key;
+}
+
+/** The state of one {@link createPatch} walk. */
+interface PatchWalk {
+	/** The containers of `a` and of `b` on the current path (cycle detection). */
+	readonly ancestorsA: Set<object>;
+	readonly ancestorsB: Set<object>;
+	/** Pairs of containers with a large subtree found identical. */
+	readonly same: WeakMap<object, WeakSet<object>>;
+	/** The structural hashes computed so far (see {@link treeHash}). */
+	readonly hashes: WeakMap<object, number>;
+	/** The number of container pairs walked so far. */
+	walked: number;
+}
+
+/**
+ * Mixes a 32-bit value into a running hash (a multiply-xorshift step).
+ * @param {number} running - The hash so far
+ * @param {number} value - The value to mix in
+ * @returns {number} The new hash
+ */
+function mixHash(running: number, value: number): number {
+	const mixed = Math.imul(running ^ value, 0x9e3779b1);
+	return mixed ^ (mixed >>> 15);
+}
+
+/**
+ * Hashes a text (FNV-1a over its UTF-16 code units).
+ * @param {string} text - The text
+ * @param {number} seed - Tells kinds of values apart
+ * @returns {number} The hash
+ */
+function textHash(text: string, seed: number): number {
+	let code = 0x811c9dc5 ^ seed;
+	for (let index = 0; index < text.length; index++) code = Math.imul(code ^ text.charCodeAt(index), 0x01000193);
+	return code;
+}
+
+/**
+ * A structural hash for {@link patchItems}: values that {@link isEqual} finds equal get equal hashes (so different hashes prove a
+ * difference), and each object is hashed once per call, so comparing array items costs linear time overall. Plain objects and dense
+ * arrays hash their members (object keys in any order); any other object hashes its tag only, and an object met again inside itself
+ * hashes as `0`. Equal hashes are confirmed with {@link isEqual}.
+ * @param {unknown} value - The value
+ * @param {PatchWalk} state - The state of the walk (holds the hashes)
+ * @returns {number} The hash
+ */
+function treeHash(value: unknown, state: PatchWalk): number {
+	if (typeof value !== 'object' || value === null) {
+		// `String` gives `0` for `-0` and `NaN` for every NaN, as `isEqual` compares them; a symbol only hashes its type. The seed tells
+		// the types apart (`'1'` from `1`).
+		return textHash(typeof value === 'symbol' ? '' : String(value), (typeof value).length * 31 + (typeof value).charCodeAt(0));
+	}
+	const known = state.hashes.get(value);
+	if (known !== undefined) return known;
+	state.hashes.set(value, 0);
+	const prototype = Object.getPrototypeOf(value);
+	let code: number;
+	if (!isTree(value, prototype)) code = textHash(getTag(value), 1);
+	else if (Array.isArray(value)) {
+		code = 2;
+		for (let index = 0; index < value.length; index++) code = mixHash(code, treeHash(value[index], state));
+	} else {
+		// Members are summed, so that the order of the keys does not matter.
+		let members = 0;
+		for (const key of Object.keys(value)) members = (members + mixHash(textHash(key, 3), treeHash((value as Properties)[key], state))) | 0;
+		code = mixHash(prototype === null ? 4 : 5, members);
+	}
+	state.hashes.set(value, code);
+	return code;
+}
+
+/**
+ * Whether two array items are deeply equal, for the trimming of {@link patchItems}.
+ * @param {unknown} a - The old item
+ * @param {unknown} b - The new item
+ * @param {PatchWalk} state - The state of the walk
+ * @returns {boolean} Whether they are equal
+ */
+function sameItem(a: unknown, b: unknown, state: PatchWalk): boolean {
+	return a === b || (treeHash(a, state) === treeHash(b, state) && isEqual(a, b));
+}
+
+/**
+ * Recursive worker of {@link createPatch}: appends the operations turning `a` into `b`, at `path`.
+ * @param {unknown} a - The old value
+ * @param {unknown} b - The new value
+ * @param {string} path - Their JSON Pointer
+ * @param {JsonPatchOperation[]} operations - The patch being built (mutated)
+ * @param {PatchWalk} state - The state of the walk
+ * @returns {void}
+ * @throws {TypeError} when a value contains a circular reference
+ */
+function patchWalk(a: unknown, b: unknown, path: string, operations: JsonPatchOperation[], state: PatchWalk): void {
+	if (a === b) return;
+	if (isObject(a) && isObject(b)) {
+		const prototype = Object.getPrototypeOf(a);
+		if (prototype === Object.getPrototypeOf(b) && isTree(a, prototype) && isTree(b, prototype)) {
+			const { ancestorsA, ancestorsB } = state;
+			if (ancestorsA.has(a) || ancestorsB.has(b)) throw new TypeError('createPatch: cannot diff circular structures');
+			if (state.same.get(a)?.has(b) === true) return;
+			ancestorsA.add(a);
+			ancestorsB.add(b);
+			const found = operations.length;
+			const walked = ++state.walked;
+			if (Array.isArray(a)) patchItems(a, b as unknown[], path, operations, state);
+			else patchMembers(a, b, path, operations, state);
+			ancestorsA.delete(a);
+			ancestorsB.delete(b);
+			// A pair shared by several paths would otherwise be walked once per path (see `diff`): equal pairs with large subtrees are remembered.
+			if (state.walked - walked > PROVEN_SUBTREE && operations.length === found) {
+				let pairs = state.same.get(a);
+				if (pairs === undefined) state.same.set(a, (pairs = new WeakSet()));
+				pairs.add(b);
+			}
+			return;
+		}
+	}
+	if (!isEqual(a, b)) operations.push({ op: 'replace', path, value: b });
+}
+
+/**
+ * {@link patchWalk} for two plain objects: removals and changes in the key order of `a`, then additions in the key order of `b`.
+ * @param {object} a - The old object
+ * @param {object} b - The new object
+ * @param {string} path - Their JSON Pointer
+ * @param {JsonPatchOperation[]} operations - The patch being built (mutated)
+ * @param {PatchWalk} state - The state of the walk
+ * @returns {void}
+ */
+function patchMembers(a: object, b: object, path: string, operations: JsonPatchOperation[], state: PatchWalk): void {
+	for (const key of Object.keys(a)) {
+		const location = path + '/' + escapePointer(key);
+		if (!Object.prototype.propertyIsEnumerable.call(b, key)) operations.push({ op: 'remove', path: location });
+		else patchWalk((a as Properties)[key], (b as Properties)[key], location, operations, state);
+	}
+	for (const key of Object.keys(b)) {
+		if (!Object.prototype.propertyIsEnumerable.call(a, key)) operations.push({ op: 'add', path: path + '/' + escapePointer(key), value: (b as Properties)[key] });
+	}
+}
+
+/**
+ * {@link patchWalk} for two dense arrays. When their lengths differ, the common prefix and suffix (deeply equal items, told apart by
+ * their {@link treeHash} first) are skipped, so inserting or removing items anywhere in one run gives just those `add` or `remove`
+ * operations; the items in between are diffed by index, then the extra items of `a` are removed (from the last) or those of `b` added.
+ * With equal lengths, trimming would give the same operations as diffing every index.
+ * @param {unknown[]} a - The old array
+ * @param {unknown[]} b - The new array
+ * @param {string} path - Their JSON Pointer
+ * @param {JsonPatchOperation[]} operations - The patch being built (mutated)
+ * @param {PatchWalk} state - The state of the walk
+ * @returns {void}
+ */
+function patchItems(a: unknown[], b: unknown[], path: string, operations: JsonPatchOperation[], state: PatchWalk): void {
+	let start = 0;
+	let endA = a.length;
+	let endB = b.length;
+	if (endA !== endB) {
+		while (start < endA && start < endB && sameItem(a[start], b[start], state)) start++;
+		while (endA > start && endB > start && sameItem(a[endA - 1], b[endB - 1], state)) {
+			endA--;
+			endB--;
+		}
+	}
+	const common = Math.min(endA, endB);
+	for (let index = start; index < common; index++) patchWalk(a[index], b[index], path + '/' + index, operations, state);
+	for (let index = endA - 1; index >= common; index--) operations.push({ op: 'remove', path: path + '/' + index });
+	for (let index = common; index < endB; index++) operations.push({ op: 'add', path: path + '/' + index, value: b[index] });
+}
+
+/**
+ * Computes a JSON Patch (RFC 6902) that turns `a` into `b`: `applyPatch(a, createPatch(a, b))` is deeply equal to `b` for JSON values.
+ * - Plain objects and dense arrays are walked like {@link replaceEqualDeep} does: object members are removed (in `a`'s key order),
+ *   diffed, then added (in `b`'s key order). Arrays skip their common prefix and suffix, so inserting or removing ONE run of items
+ *   (at the end, at the start or in between) gives one operation per item instead of rewriting every shifted index; the other items
+ *   are diffed by index (finding the fewest operations for any edit needs quadratic time). Every other change is a `replace`.
+ * - Values are compared with {@link isEqual}; other values than plain objects and dense arrays (dates, maps, class instances, sparse
+ *   arrays...) are leaves, replaced whole. Only own enumerable string keys are diffed (JSON has no symbol keys).
+ * - Only `add`, `remove` and `replace` are emitted: detecting `move` and `copy` would cost quadratic time for rarely shorter patches.
+ * - The `value` of an operation is the value in `b`, NOT a copy: clone it before mutating either.
+ * - Linear time: array items are told apart by structural hashes computed once per object. A shared part is walked once per pair of
+ *   parts when it has no changes, but a changed part reached through several paths appears in the patch once per path (a patch has
+ *   no references).
+ *
+ * Recursion depth is bounded by the call stack (~thousands of levels): deeper input throws a `RangeError`.
+ * @param {unknown} a - The old value
+ * @param {unknown} b - The new value
+ * @returns {JsonPatchOperation[]} The operations (empty when the values are equal)
+ * @throws {TypeError} when a walked container is circular
+ * @throws {RangeError} when the nesting is deeper than the call stack allows
+ * @example
+ * createPatch({ a: 1, b: { c: 2 } }, { b: { c: 3 }, d: [1] }); // => [{ op: 'remove', path: '/a' }, { op: 'replace', path: '/b/c', value: 3 }, { op: 'add', path: '/d', value: [1] }]
+ * createPatch([1, 2, 3], [0, 1, 2, 3]); // => [{ op: 'add', path: '/0', value: 0 }]
+ * createPatch(['a', 'b', 'c', 'd'], ['a', 'd']); // => [{ op: 'remove', path: '/2' }, { op: 'remove', path: '/1' }]
+ * createPatch({ 'a/b': 1 }, { 'a/b': 2 }); // => [{ op: 'replace', path: '/a~1b', value: 2 }]
+ * createPatch(1, 'x'); // => [{ op: 'replace', path: '', value: 'x' }]
+ */
+export function createPatch(a: unknown, b: unknown): JsonPatchOperation[] {
+	const operations: JsonPatchOperation[] = [];
+	patchWalk(a, b, '', operations, { ancestorsA: new Set(), ancestorsB: new Set(), same: new WeakMap(), hashes: new WeakMap(), walked: 0 });
+	return operations;
+}
+
+/** The operations {@link applyPatch} supports. */
+const PATCH_OPERATIONS: ReadonlySet<unknown> = new Set(['add', 'remove', 'replace', 'move', 'copy', 'test']);
+
+/** The state of one {@link applyPatch} call. */
+interface PatchState {
+	/** The document so far. */
+	root: unknown;
+	/** The containers this call created (copies of the document's), which it may modify in place: each is reachable through one path. */
+	owned: Set<object>;
+	/** The position of the current operation. */
+	index: number;
+	/** The current operation. */
+	operation: JsonPatchOperation;
+	/** Its `op` and `path`, as read once, for error messages. */
+	op: string;
+	pointer: string;
+}
+
+/**
+ * Throws the {@link JsonPatchError} of the current operation.
+ * @param {PatchState} state - The state of the call
+ * @param {string} problem - What went wrong
+ * @returns {never} Never returns
+ * @throws {JsonPatchError} always
+ */
+function patchFailure(state: PatchState, problem: string): never {
+	throw new JsonPatchError(
+		`applyPatch: \`operations[${state.index}]\` (${state.op} ${JSON.stringify(state.pointer)}) cannot be applied: ${problem}`,
+		state.index,
+		state.operation
+	);
+}
+
+/**
+ * Whether a path starts with another one (or is the same).
+ * @param {ReadonlyArray<string>} prefix - The shorter path
+ * @param {ReadonlyArray<string>} path - The path
+ * @returns {boolean} Whether every segment of `prefix` starts `path`
+ */
+function startsWithPath(prefix: ReadonlyArray<string>, path: ReadonlyArray<string>): boolean {
+	return (
+		prefix.length <= path.length &&
+		prefix.every(function (segment: string, position: number): boolean {
+			return segment === path[position];
+		})
+	);
+}
+
+/**
+ * The JSON Pointer of the first `count` segments, for error messages.
+ * @param {ReadonlyArray<string>} segments - The segments
+ * @param {number} count - How many to keep
+ * @returns {string} The pointer, quoted
+ */
+function pointerTo(segments: ReadonlyArray<string>, count: number): string {
+	return JSON.stringify(
+		segments
+			.slice(0, count)
+			.map(function (segment: string): string {
+				return '/' + escapePointer(segment);
+			})
+			.join('')
+	);
+}
+
+/**
+ * Parses a JSON Pointer of an operation.
+ * @param {number} index - The position of the operation, for error messages
+ * @param {string} field - `'path'` or `'from'`, for error messages
+ * @param {unknown} pointer - The pointer
+ * @returns {string[]} The unescaped segments (`[]` for the whole document)
+ * @throws {TypeError} when the pointer is not a string
+ * @throws {RangeError} when it does not start with `/` (and is not empty), or has a `~` not followed by `0` or `1`
+ */
+function parsePointer(index: number, field: string, pointer: unknown): string[] {
+	if (typeof pointer !== 'string') throw new TypeError(`applyPatch: \`operations[${index}].${field}\` must be a string, got ${describe(pointer)}`);
+	if (pointer === '') return [];
+	if (pointer[0] !== '/' || /~(?![01])/.test(pointer)) {
+		throw new RangeError(
+			`applyPatch: \`operations[${index}].${field}\` must be a JSON Pointer ('' or '/' followed by keys, with '~' escaped as '~0' and '/' as '~1'), got ${JSON.stringify(pointer)}`
+		);
+	}
+	const segments = pointer.slice(1).split('/');
+	// `~1` first: `~01` is the key `~1`, not `/`.
+	if (pointer.includes('~')) for (let position = 0; position < segments.length; position++) segments[position] = segments[position].replace(/~1/g, '/').replace(/~0/g, '~');
+	return segments;
+}
+
+/**
+ * The array index a segment designates.
+ * @param {PatchState} state - The state of the call
+ * @param {unknown[]} array - The array
+ * @param {ReadonlyArray<string>} segments - The path
+ * @param {number} position - The position of the segment in the path
+ * @param {boolean} insert - Whether the index is an insertion point (`-` and the length are then valid)
+ * @returns {number} The index
+ * @throws {JsonPatchError} when the segment is not a canonical index, or is out of bounds
+ */
+function arrayIndex(state: PatchState, array: unknown[], segments: ReadonlyArray<string>, position: number, insert: boolean): number {
+	const segment = segments[position];
+	const length = array.length;
+	if (segment === '-' && insert) return length;
+	if (!CANONICAL_INDEX.test(segment)) patchFailure(state, `${pointerTo(segments, position + 1)} is not an array index`);
+	const index = Number(segment);
+	if (index > length || (index === length && !insert)) patchFailure(state, `${pointerTo(segments, position + 1)} is out of bounds (length ${length})`);
+	return index;
+}
+
+/**
+ * Reads the member of a container designated by a segment, which must exist.
+ * @param {PatchState} state - The state of the call
+ * @param {unknown} container - The value at the first `position` segments
+ * @param {ReadonlyArray<string>} segments - The path
+ * @param {number} position - The position of the segment in the path
+ * @returns {unknown} The member
+ * @throws {JsonPatchError} when `container` is not a plain object or an array, or has no such member
+ */
+function memberOf(state: PatchState, container: unknown, segments: ReadonlyArray<string>, position: number): unknown {
+	if (Array.isArray(container)) {
+		const index = arrayIndex(state, container, segments, position, false);
+		// Own elements only: a hole must not read a value from a polluted `Array.prototype`.
+		return hasOwn(container, index) ? container[index] : undefined;
+	}
+	if (!isPlainObject(container)) patchFailure(state, `${pointerTo(segments, position)} is not an object or an array`);
+	// Own members only: `__proto__`, `constructor` or `toString` never reach a prototype.
+	if (!hasOwn(container, segments[position])) patchFailure(state, `${pointerTo(segments, position + 1)} does not exist`);
+	return container[segments[position]];
+}
+
+/**
+ * Reads the value at a path, which must exist.
+ * @param {PatchState} state - The state of the call
+ * @param {ReadonlyArray<string>} segments - The path
+ * @returns {unknown} The value
+ * @throws {JsonPatchError} when the path does not exist
+ */
+function valueAt(state: PatchState, segments: ReadonlyArray<string>): unknown {
+	let current = state.root;
+	for (let position = 0; position < segments.length; position++) current = memberOf(state, current, segments, position);
+	return current;
+}
+
+/**
+ * Returns a container this call may modify in place: `value` itself when the call created it, else a shallow copy (same prototype).
+ * @param {PatchState} state - The state of the call
+ * @param {unknown} value - The value at the first `count` segments
+ * @param {ReadonlyArray<string>} segments - The path
+ * @param {number} count - How many segments lead to `value`
+ * @returns {object} The modifiable container
+ * @throws {JsonPatchError} when `value` is not a plain object or an array
+ */
+function ownContainer(state: PatchState, value: unknown, segments: ReadonlyArray<string>, count: number): object {
+	if (!isContainer(value)) patchFailure(state, `${pointerTo(segments, count)} is not an object or an array`);
+	if (state.owned.has(value)) return value;
+	const copy = copyContainer(value);
+	// Holes become `undefined` (JSON has none): shifting items over a hole would read it through `Array.prototype`, maybe polluted.
+	if (Array.isArray(copy)) for (let index = 0; index < copy.length; index++) if (!hasOwn(copy, index)) defineOwn(copy, index, undefined);
+	state.owned.add(copy);
+	return copy;
+}
+
+/**
+ * Returns the parent of the location at a (non-empty) path, made modifiable: the containers on the way are copied (once per call), so
+ * the document itself is never modified.
+ * @param {PatchState} state - The state of the call
+ * @param {ReadonlyArray<string>} segments - The path
+ * @returns {object} The modifiable parent
+ * @throws {JsonPatchError} when the parent does not exist or is not a plain object or an array
+ */
+function writableParent(state: PatchState, segments: ReadonlyArray<string>): object {
+	let container = (state.root = ownContainer(state, state.root, segments, 0));
+	for (let position = 0; position < segments.length - 1; position++) {
+		const member = memberOf(state, container, segments, position);
+		const copy = ownContainer(state, member, segments, position + 1);
+		// The container is a copy made by this call: its key is an own, writable data property.
+		if (copy !== member) (container as Properties)[segments[position]] = copy;
+		container = copy;
+	}
+	return container;
+}
+
+/**
+ * Applies `add`: inserts into an array (shifting the next items), or sets an object member (replacing it).
+ * @param {PatchState} state - The state of the call
+ * @param {ReadonlyArray<string>} segments - The path
+ * @param {unknown} value - The value
+ * @returns {void}
+ * @throws {JsonPatchError} when the parent does not exist, or the index is out of bounds
+ */
+function addAt(state: PatchState, segments: ReadonlyArray<string>, value: unknown): void {
+	if (segments.length === 0) {
+		state.root = value;
+		return;
+	}
+	const parent = writableParent(state, segments);
+	const last = segments.length - 1;
+	if (Array.isArray(parent)) {
+		const index = arrayIndex(state, parent, segments, last, true);
+		const length = parent.length;
+		// The built-in `copyWithin` shifts the items in place, without `splice`'s call to a subclass constructor (`Symbol.species`) nor a
+		// method a subclass overrides; the array has no holes (see `ownContainer`), and the new last slot is defined first, so it never
+		// reads or writes through the prototype.
+		defineOwn(parent, length, undefined);
+		Array.prototype.copyWithin.call(parent, index + 1, index, length);
+		defineOwn(parent, index, value);
+	} else defineOwn(parent, segments[last], value);
+}
+
+/**
+ * Applies `remove`, or `replace` when `value` is given: the location must exist.
+ * @param {PatchState} state - The state of the call
+ * @param {ReadonlyArray<string>} segments - The path
+ * @param {[unknown]} [replacement] - The new value, for `replace`
+ * @returns {void}
+ * @throws {JsonPatchError} when the location does not exist (or, for `remove`, is the whole document)
+ */
+function changeAt(state: PatchState, segments: ReadonlyArray<string>, replacement?: [unknown]): void {
+	if (segments.length === 0) {
+		if (replacement === undefined) patchFailure(state, 'the whole document cannot be removed');
+		state.root = replacement[0];
+		return;
+	}
+	const parent = writableParent(state, segments);
+	const last = segments.length - 1;
+	// Checks that the location exists, whatever the container.
+	memberOf(state, parent, segments, last);
+	const key = Array.isArray(parent) ? Number(segments[last]) : segments[last];
+	if (replacement !== undefined) defineOwn(parent, key, replacement[0]);
+	else if (typeof key === 'number') {
+		Array.prototype.copyWithin.call(parent as unknown[], key, key + 1);
+		(parent as unknown[]).length--;
+	} else delete (parent as Properties)[key];
+}
+
+/**
+ * Applies a JSON Patch (RFC 6902) to a document and returns the NEW document: the input is never modified, and the parts of it that the
+ * patch does not touch are shared with the result (only the plain objects and arrays on the changed paths are copied, once per call).
+ * - All or nothing: when an operation fails, an error is thrown and no document is returned (the input is left as it was anyway).
+ * - Supports `add` (an array index inserts, `-` appends; an object member is set), `remove`, `replace`, `move` (the location must not
+ *   be inside `from`), `copy` and `test` (deep equality, {@link isEqual}). Operations apply in order, each to the result of the previous.
+ * - JSON Pointers follow RFC 6901: `''` is the whole document, `~1` is `/` and `~0` is `~` inside a key; array indices are canonical
+ *   (`0`, `12`, not `01` or `+1`) and within bounds.
+ * - Only plain objects and arrays are walked, through their OWN members: `__proto__`, `constructor` and `prototype` are ordinary member
+ *   names (defined, never assigned), and never reach a prototype.
+ * - Values are inserted as given (not copied): a later operation writing inside one copies it first, as it does the document's parts.
+ *   `copy` shares the copied value between both locations the same way. In an array an operation modifies, holes become `undefined`
+ *   (JSON has no holes, and they would otherwise be read through `Array.prototype`).
+ * @template T - The document type (the patch is assumed to keep it)
+ * @param {T} document - The document
+ * @param {ReadonlyArray<JsonPatchOperation>} operations - The patch
+ * @returns {T} The patched document
+ * @throws {TypeError} when `operations` is not an array, an operation is not an object, `path` or `from` is not a string, or `value` is
+ *   missing from an `add`, `replace` or `test`
+ * @throws {RangeError} when `op` is unknown, or a pointer is malformed
+ * @throws {JsonPatchError} when an operation cannot be applied (see {@link JsonPatchError})
+ * @example
+ * const doc = { user: { name: 'Ada' }, tags: ['a'], meta: { v: 1 } };
+ * const next = applyPatch(doc, [
+ *   { op: 'replace', path: '/user/name', value: 'Grace' },
+ *   { op: 'add', path: '/tags/-', value: 'b' }
+ * ]);
+ * next; // => { user: { name: 'Grace' }, tags: ['a', 'b'], meta: { v: 1 } }
+ * doc.user.name; // => 'Ada'
+ * next.meta === doc.meta; // => true
+ * applyPatch(doc, [{ op: 'move', from: '/tags/0', path: '/first' }]); // => { user: { name: 'Ada' }, tags: [], meta: { v: 1 }, first: 'a' }
+ * applyPatch(doc, [{ op: 'test', path: '/meta/v', value: 2 }]); // throws JsonPatchError
+ * applyPatch(doc, [{ op: 'remove', path: '/tags/01' }]); // throws JsonPatchError
+ */
+export function applyPatch<T>(document: T, operations: ReadonlyArray<JsonPatchOperation>): T {
+	if (!Array.isArray(operations)) throw new TypeError(`applyPatch: \`operations\` must be an array, got ${describe(operations)}`);
+	const length = operations.length;
+	const state: PatchState = { root: document, owned: new Set(), index: 0, operation: undefined as unknown as JsonPatchOperation, op: '', pointer: '' };
+
+	for (let index = 0; index < length; index++) {
+		const operation: unknown = operations[index];
+		if (typeof operation !== 'object' || operation === null) throw new TypeError(`applyPatch: \`operations[${index}]\` must be an object, got ${describe(operation)}`);
+		// Each field is read once (a getter could change its answer).
+		const { op, path: pointer } = operation as Record<string, unknown>;
+		if (!PATCH_OPERATIONS.has(op)) {
+			if (typeof op !== 'string') throw new TypeError(`applyPatch: \`operations[${index}].op\` must be a string, got ${describe(op)}`);
+			throw new RangeError(`applyPatch: \`operations[${index}].op\` must be 'add', 'remove', 'replace', 'move', 'copy' or 'test', got ${JSON.stringify(op)}`);
+		}
+		const path = parsePointer(index, 'path', pointer);
+		state.index = index;
+		state.operation = operation as JsonPatchOperation;
+		state.op = op as string;
+		state.pointer = pointer as string;
+
+		if (op === 'move' || op === 'copy') {
+			const from = parsePointer(index, 'from', (operation as Record<string, unknown>).from);
+			const value = valueAt(state, from);
+			if (op === 'copy') {
+				// The copied container is about to have two locations (one of them maybe inside itself): none of the containers this call
+				// created may be modified in place any more.
+				if (state.owned.has(value as object)) state.owned = new Set();
+				addAt(state, path, value);
+			} else if (!(from.length === path.length && startsWithPath(from, path))) {
+				if (startsWithPath(from, path)) patchFailure(state, `${pointerTo(from, from.length)} cannot be moved inside itself`);
+				changeAt(state, from);
+				addAt(state, path, value);
+			}
+			continue;
+		}
+
+		if (op === 'remove') {
+			changeAt(state, path);
+			continue;
+		}
+
+		if (!('value' in operation)) throw new TypeError(`applyPatch: \`operations[${index}]\` must have a \`value\` for '${op as string}'`);
+		const value = (operation as Record<string, unknown>).value;
+		if (op === 'add') addAt(state, path, value);
+		else if (op === 'replace') changeAt(state, path, [value]);
+		else if (!isEqual(valueAt(state, path), value)) patchFailure(state, 'the value is not equal to the expected one');
+	}
+
+	return state.root as T;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Key and entry helpers
 // ---------------------------------------------------------------------------------------------------------------------
 

@@ -923,3 +923,229 @@ describe('Objects helpers (round 11) - properties', function () {
 		);
 	});
 });
+
+/** Small JSON trees over few keys and values, so that two of them often share parts (and keys need escaping or are unsafe names). */
+const smallJson: fc.Arbitrary<unknown> = fc.letrec(function (tie) {
+	return {
+		value: fc.oneof(
+			{ depthSize: 'small', withCrossShrink: true },
+			fc.constantFrom<unknown>(0, 1, 'x', null, true),
+			fc.array(tie('value'), { maxLength: 4 }),
+			fc.dictionary(fc.constantFrom('a', 'b', 'c', '~', 'a/b', '__proto__', 'constructor'), tie('value'), { maxKeys: 4 })
+		)
+	};
+}).value;
+
+/** A pair of JSON values: independent, or the second derived from the first. */
+const jsonPair = fc.oneof(
+	fc.tuple(fc.jsonValue({ maxDepth: 4 }), fc.jsonValue({ maxDepth: 4 })),
+	fc.tuple(smallJson, smallJson),
+	smallJson.chain(function (value) {
+		return fc.tuple(fc.constant(value), fc.constant(helpers.deepClone(value)));
+	})
+);
+
+/**
+ * A plain object or a null-prototype object (what JSON Patch walks).
+ */
+function isWalkable(value: unknown): value is Record<string, unknown> {
+	return isPlainObject(value);
+}
+
+/**
+ * A mutable reference implementation of JSON Patch (RFC 6902), applied to a deep copy of the document: it throws on any failure.
+ */
+function referenceApply(document: unknown, operations: ReadonlyArray<helpers.JsonPatchOperation>): unknown {
+	let root = helpers.deepClone(document);
+	function parse(pointer: string): string[] {
+		return pointer === ''
+			? []
+			: pointer
+					.slice(1)
+					.split('/')
+					.map(function (segment) {
+						return segment.replace(/~1/g, '/').replace(/~0/g, '~');
+					});
+	}
+	function isIndex(segment: string): boolean {
+		return /^(?:0|[1-9][0-9]*)$/.test(segment);
+	}
+	function get(segments: string[]): unknown {
+		let node = root;
+		for (const segment of segments) {
+			if (Array.isArray(node)) {
+				if (!isIndex(segment) || Number(segment) >= node.length) throw new Error('missing');
+				node = node[Number(segment)];
+			} else if (isWalkable(node)) {
+				if (!Object.hasOwn(node, segment)) throw new Error('missing');
+				node = node[segment];
+			} else throw new Error('not a container');
+		}
+		return node;
+	}
+	function set(container: object, key: string, value: unknown): void {
+		Object.defineProperty(container, key, { value, writable: true, enumerable: true, configurable: true });
+	}
+	function add(segments: string[], value: unknown): void {
+		if (segments.length === 0) {
+			root = value;
+			return;
+		}
+		const parent = get(segments.slice(0, -1));
+		const key = segments[segments.length - 1];
+		if (Array.isArray(parent)) {
+			const index = key === '-' ? parent.length : isIndex(key) ? Number(key) : NaN;
+			if (!(index <= parent.length)) throw new Error('bad index');
+			parent.splice(index, 0, value);
+		} else if (isWalkable(parent)) set(parent, key, value);
+		else throw new Error('not a container');
+	}
+	function remove(segments: string[]): void {
+		if (segments.length === 0) throw new Error('root');
+		get(segments);
+		const parent = get(segments.slice(0, -1)) as Record<string, unknown> | unknown[];
+		const key = segments[segments.length - 1];
+		if (Array.isArray(parent)) parent.splice(Number(key), 1);
+		else delete parent[key];
+	}
+	for (const operation of operations) {
+		const path = parse(operation.path);
+		switch (operation.op) {
+			case 'add':
+				add(path, helpers.deepClone(operation.value));
+				break;
+			case 'remove':
+				remove(path);
+				break;
+			case 'replace':
+				get(path);
+				if (path.length === 0) root = helpers.deepClone(operation.value);
+				else set(get(path.slice(0, -1)) as object, path[path.length - 1], helpers.deepClone(operation.value));
+				break;
+			case 'move': {
+				const from = parse(operation.from);
+				const value = get(from);
+				const inside = from.every(function (segment, index) {
+					return segment === path[index];
+				});
+				if (from.length < path.length && inside) throw new Error('inside itself');
+				// Moving a value to where it is changes nothing (even for the whole document, which cannot be removed).
+				if (from.length === path.length && inside) break;
+				remove(from);
+				add(path, value);
+				break;
+			}
+			case 'copy':
+				add(path, helpers.deepClone(get(parse(operation.from))));
+				break;
+			case 'test':
+				if (!helpers.isEqual(get(path), operation.value)) throw new Error('test');
+				break;
+		}
+	}
+	return root;
+}
+
+/** JSON Pointers over the keys of {@link smallJson} (and array indices), escaped. */
+const pointer = fc.array(fc.constantFrom('a', 'b', '~', 'a/b', '__proto__', '0', '1', '2', '-', '01'), { maxLength: 3 }).map(function (segments) {
+	return segments
+		.map(function (segment) {
+			return '/' + segment.replace(/~/g, '~0').replace(/\//g, '~1');
+		})
+		.join('');
+});
+
+/** JSON Patch operations over {@link pointer}s. */
+const operation: fc.Arbitrary<helpers.JsonPatchOperation> = fc.oneof(
+	fc.record({ op: fc.constantFrom('add', 'replace', 'test'), path: pointer, value: smallJson }) as fc.Arbitrary<helpers.JsonPatchOperation>,
+	fc.record({ op: fc.constant('remove'), path: pointer }) as fc.Arbitrary<helpers.JsonPatchOperation>,
+	fc.record({ op: fc.constantFrom('move', 'copy'), from: pointer, path: pointer }) as fc.Arbitrary<helpers.JsonPatchOperation>
+);
+
+/**
+ * Checks the sharing invariant of replaceEqualDeep: wherever `prev` and `next` hold deeply equal values, `result` holds `prev`'s.
+ */
+function expectShared(prev: unknown, next: unknown, result: unknown): void {
+	if (helpers.isEqual(prev, next)) {
+		expect(result).toBe(prev);
+		return;
+	}
+	if (typeof next !== 'object' || next === null || typeof prev !== 'object' || prev === null) return;
+	if (Array.isArray(next) && Array.isArray(prev)) {
+		next.forEach(function (item, index) {
+			if (index < prev.length) expectShared(prev[index], item, (result as unknown[])[index]);
+		});
+	} else if (isPlainObject(next) && isPlainObject(prev) && Object.getPrototypeOf(next) === Object.getPrototypeOf(prev)) {
+		for (const key of Object.keys(next)) if (Object.hasOwn(prev, key)) expectShared(prev[key], next[key], (result as Record<string, unknown>)[key]);
+	}
+}
+
+describe('structural sharing and JSON Patch (properties)', function () {
+	it('replaceEqualDeep returns a value equal to next, sharing every part equal to prev', function () {
+		fc.assert(
+			fc.property(jsonPair, function ([prev, next]) {
+				const prevCopy = helpers.deepClone(prev);
+				const nextCopy = helpers.deepClone(next);
+				const result = helpers.replaceEqualDeep(prev, next);
+				expect(helpers.isEqual(result, next)).toBe(true);
+				expectShared(prev, next, result);
+				expect(helpers.isEqual(prev, prevCopy)).toBe(true);
+				expect(helpers.isEqual(next, nextCopy)).toBe(true);
+				// Sharing is idempotent: the result shares everything with itself.
+				expect(helpers.replaceEqualDeep(result, helpers.deepClone(result))).toBe(result);
+			})
+		);
+	});
+
+	it('applyPatch(a, createPatch(a, b)) equals b, without changing a', function () {
+		fc.assert(
+			fc.property(jsonPair, function ([a, b]) {
+				const snapshot = helpers.deepClone(a);
+				const patch = helpers.createPatch(a, b);
+				expect(helpers.isEqual(helpers.applyPatch(a, patch), b)).toBe(true);
+				expect(helpers.isEqual(a, snapshot)).toBe(true);
+				expect(patch.length === 0).toBe(helpers.isEqual(a, b));
+				// The patch survives JSON serialization (when `b` does: null-prototype objects come back with `Object.prototype`).
+				if (helpers.isEqual(JSON.parse(JSON.stringify(b)), b)) expect(helpers.isEqual(helpers.applyPatch(a, JSON.parse(JSON.stringify(patch))), b)).toBe(true);
+			})
+		);
+	});
+
+	it('createPatch gives one operation per item for a single inserted or removed run', function () {
+		fc.assert(
+			fc.property(fc.array(smallJson, { maxLength: 8 }), fc.array(smallJson, { maxLength: 4 }), fc.nat(), function (items, run, at) {
+				const position = at % (items.length + 1);
+				const longer = [...items.slice(0, position), ...run, ...items.slice(position)];
+				const inserted = helpers.createPatch(items, longer);
+				expect(inserted).toHaveLength(run.length);
+				for (const step of inserted) expect(step.op).toBe('add');
+				const removed = helpers.createPatch(longer, items);
+				expect(removed).toHaveLength(run.length);
+				for (const step of removed) expect(step.op).toBe('remove');
+			})
+		);
+	});
+
+	it('applyPatch agrees with a mutable reference implementation, and never changes its input', function () {
+		fc.assert(
+			fc.property(smallJson, fc.array(operation, { maxLength: 6 }), function (document, operations) {
+				const snapshot = helpers.deepClone(document);
+				let expected: unknown;
+				let failed = false;
+				try {
+					expected = referenceApply(document, operations);
+				} catch {
+					failed = true;
+				}
+				if (failed) {
+					expect(function () {
+						helpers.applyPatch(document, operations);
+					}).toThrow(helpers.JsonPatchError);
+				} else expect(helpers.isEqual(helpers.applyPatch(document, operations), expected)).toBe(true);
+				expect(helpers.isEqual(document, snapshot)).toBe(true);
+			}),
+			// Most random sequences fail at some step: more runs make sure that many apply in full.
+			{ numRuns: 300 }
+		);
+	});
+});

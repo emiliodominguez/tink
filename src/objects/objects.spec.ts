@@ -3523,3 +3523,729 @@ describe('Objects helpers (pass 3 regressions)', function () {
 		}
 	});
 });
+
+describe('structural sharing and JSON Patch', function () {
+	describe('replaceEqualDeep', function () {
+		it('keeps the references of the unchanged parts', function () {
+			const prev = { user: { name: 'Ada', tags: ['x'] }, list: [{ id: 1 }, { id: 2 }], count: 1 };
+			const next = helpers.replaceEqualDeep(prev, { user: { name: 'Ada', tags: ['x'] }, list: [{ id: 1 }, { id: 3 }], count: 2 });
+			expect(next).toStrictEqual({ user: { name: 'Ada', tags: ['x'] }, list: [{ id: 1 }, { id: 3 }], count: 2 });
+			expect(next).not.toBe(prev);
+			expect(next.user).toBe(prev.user);
+			expect(next.list).not.toBe(prev.list);
+			expect(next.list[0]).toBe(prev.list[0]);
+		});
+
+		it('returns prev itself when everything is equal, whatever the key order', function () {
+			const prev = { a: 1, b: [1, { c: NaN }], d: undefined };
+			expect(helpers.replaceEqualDeep(prev, { d: undefined, b: [1, { c: NaN }], a: 1 })).toBe(prev);
+			expect(helpers.replaceEqualDeep([], [])).toEqual([]);
+			const empty: unknown[] = [];
+			expect(helpers.replaceEqualDeep(empty, [])).toBe(empty);
+		});
+
+		it('compares primitives with Object.is', function () {
+			expect(helpers.replaceEqualDeep(1, 2)).toBe(2);
+			expect(helpers.replaceEqualDeep(NaN, NaN)).toBe(NaN);
+			expect(Object.is(helpers.replaceEqualDeep(0, -0), -0)).toBe(true);
+			expect(Object.is(helpers.replaceEqualDeep([0], [-0])[0], -0)).toBe(true);
+			expect(helpers.replaceEqualDeep({ a: 1 }, 'x')).toBe('x');
+			expect(helpers.replaceEqualDeep('x', { a: 1 })).toEqual({ a: 1 });
+			expect(helpers.replaceEqualDeep(null, undefined)).toBeUndefined();
+		});
+
+		it('rebuilds a container when its keys change', function () {
+			const prev = { a: 1, b: 2 };
+			const added = helpers.replaceEqualDeep(prev, { a: 1, b: 2, c: undefined });
+			expect(added).toStrictEqual({ a: 1, b: 2, c: undefined });
+			expect(added).not.toBe(prev);
+			const removed = helpers.replaceEqualDeep(prev, { a: 1 });
+			expect(removed).toStrictEqual({ a: 1 });
+			const renamed = helpers.replaceEqualDeep({ a: undefined }, { b: undefined });
+			expect(renamed).toStrictEqual({ b: undefined });
+			const shorter = [{ id: 1 }, { id: 2 }];
+			const result = helpers.replaceEqualDeep(shorter, [{ id: 1 }]);
+			expect(result).toStrictEqual([{ id: 1 }]);
+			expect(result[0]).toBe(shorter[0]);
+			const longer = helpers.replaceEqualDeep([1], [1, undefined]);
+			expect(longer).toStrictEqual([1, undefined]);
+		});
+
+		it('treats other objects as leaves, kept from prev when deeply equal', function () {
+			class Point {
+				constructor(
+					public x: number,
+					public y: number
+				) {}
+			}
+			const prev = { when: new Date(0), map: new Map([[1, { a: 1 }]]), set: new Set([1]), point: new Point(1, 2), bytes: new Uint8Array([1]) };
+			const next = { when: new Date(0), map: new Map([[1, { a: 1 }]]), set: new Set([2]), point: new Point(1, 3), bytes: new Uint8Array([1]) };
+			const result = helpers.replaceEqualDeep(prev, next);
+			expect(result.when).toBe(prev.when);
+			expect(result.map).toBe(prev.map);
+			expect(result.bytes).toBe(prev.bytes);
+			expect(result.set).toBe(next.set);
+			expect(result.point).toBe(next.point);
+			expect(helpers.replaceEqualDeep(new Date(0), new Date(0))).not.toBe(undefined);
+		});
+
+		it('walks null-prototype objects, but never mixes prototypes', function () {
+			const prev = Object.assign(Object.create(null), { a: { b: 1 }, c: 1 }) as Record<string, unknown>;
+			const next = Object.assign(Object.create(null), { a: { b: 1 }, c: 2 }) as Record<string, unknown>;
+			const result = helpers.replaceEqualDeep(prev, next);
+			expect(Object.getPrototypeOf(result)).toBeNull();
+			expect(result.a).toBe(prev.a);
+			expect(result.c).toBe(2);
+			const plain = { a: 1 };
+			const bare = Object.assign(Object.create(null), { a: 1 }) as object;
+			expect(helpers.replaceEqualDeep(plain, bare)).toBe(bare);
+			expect(helpers.replaceEqualDeep([1], { 0: 1 })).toStrictEqual({ 0: 1 });
+		});
+
+		it('treats sparse arrays, arrays with extra keys and thenables as leaves', function () {
+			// eslint-disable-next-line no-sparse-arrays
+			const sparse = [1, , 3];
+			// eslint-disable-next-line no-sparse-arrays
+			expect(helpers.replaceEqualDeep(sparse, [1, , 3])).toBe(sparse);
+			// eslint-disable-next-line no-sparse-arrays
+			const other = [1, , 4];
+			expect(helpers.replaceEqualDeep(sparse, other)).toBe(other);
+			const tagged = Object.assign([{ a: 1 }], { extra: true });
+			const taggedNext = Object.assign([{ a: 1 }], { extra: false });
+			const result = helpers.replaceEqualDeep(tagged, taggedNext);
+			expect(result).toBe(taggedNext);
+			const thenable = { then: 1, x: { a: 1 } };
+			expect(helpers.replaceEqualDeep({ then() {}, x: { a: 1 } }, thenable)).toBe(thenable);
+			const lazy = Object.assign(Object.create(null), { then() {} }) as object;
+			expect(helpers.replaceEqualDeep(Object.assign(Object.create(null), { then() {} }), lazy)).toBe(lazy);
+		});
+
+		it('compares symbol keys too', function () {
+			const key = Symbol('k');
+			const prev = { [key]: { a: 1 }, b: 1 };
+			const next = helpers.replaceEqualDeep(prev, { [key]: { a: 1 }, b: 2 });
+			expect(next[key]).toBe(prev[key]);
+			expect(helpers.replaceEqualDeep(prev, { [key]: { a: 1 }, b: 1 })).toBe(prev);
+			expect(helpers.replaceEqualDeep(prev, { [Symbol('k')]: { a: 1 }, b: 1 })).not.toBe(prev);
+		});
+
+		it('defines keys, so __proto__ stays an own key', function () {
+			const next = JSON.parse('{"__proto__": {"polluted": true}, "a": 1}') as Record<string, unknown>;
+			const result = helpers.replaceEqualDeep({ a: 2 }, next);
+			expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+			expect(Object.keys(result)).toEqual(['__proto__', 'a']);
+			expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+		});
+
+		it('never mutates its inputs and reads each value once', function () {
+			const prev = helpers.deepFreeze({ a: { b: [1, 2] }, c: 1 });
+			let reads = 0;
+			const next = {
+				get a() {
+					reads++;
+					return { b: [1, 3] };
+				},
+				c: 1
+			};
+			const result = helpers.replaceEqualDeep(prev, next);
+			expect(result).toStrictEqual({ a: { b: [1, 3] }, c: 1 });
+			expect(reads).toBe(1);
+			expect(prev).toStrictEqual({ a: { b: [1, 2] }, c: 1 });
+			expect(Object.getOwnPropertyDescriptor(result, 'a')?.value).toEqual({ b: [1, 3] });
+		});
+
+		it('handles circular values', function () {
+			const prev: Record<string, unknown> = { a: 1 };
+			prev.self = prev;
+			const next: Record<string, unknown> = { a: 1 };
+			next.self = next;
+			const result = helpers.replaceEqualDeep(prev, next) as Record<string, unknown>;
+			expect(helpers.isEqual(result, next)).toBe(true);
+			const changed: Record<string, unknown> = { a: 2 };
+			changed.self = changed;
+			const other = helpers.replaceEqualDeep(prev, changed) as Record<string, unknown>;
+			expect(helpers.isEqual(other, changed)).toBe(true);
+			expect(other.a).toBe(2);
+		});
+
+		it('processes a shared subtree once per pair (linear on DAGs)', function () {
+			function chain(depth: number, leaf: unknown): object {
+				let node: object = { leaf };
+				for (let level = 0; level < depth; level++) node = { left: node, right: node, list: [node, node] };
+				return node;
+			}
+			const start = Date.now();
+			const prev = chain(60, 1);
+			const same = chain(60, 1);
+			expect(helpers.replaceEqualDeep(prev, same)).toBe(prev);
+			const next = chain(60, 2);
+			const result = helpers.replaceEqualDeep(prev, next);
+			expect(helpers.isEqual(result, next)).toBe(true);
+			// One subtree of `next` against two distinct (equal) subtrees of `prev`.
+			const node = chain(8, 1);
+			const left = chain(8, 1);
+			const right = chain(8, 1);
+			const shared = helpers.replaceEqualDeep({ l: left, r: right }, { l: node, r: node });
+			expect(shared.l).toBe(left);
+			expect(shared.r).toBe(right);
+			expect(Date.now() - start).toBeLessThan(2000);
+		});
+
+		it('types the result as next', function () {
+			const result = helpers.replaceEqualDeep({ a: 1 } as unknown, { b: 'x' });
+			assertType<Equals<typeof result, { b: string }>>(true);
+			expect(result).toEqual({ b: 'x' });
+		});
+	});
+
+	describe('createPatch', function () {
+		it('emits nothing for equal values', function () {
+			expect(helpers.createPatch({ a: [1, { b: 2 }] }, { a: [1, { b: 2 }] })).toEqual([]);
+			const shared = { a: 1 };
+			expect(helpers.createPatch(shared, shared)).toEqual([]);
+			expect(helpers.createPatch(NaN, NaN)).toEqual([]);
+			expect(helpers.createPatch(new Date(1), new Date(1))).toEqual([]);
+		});
+
+		it('replaces the root when it is not a container on both sides', function () {
+			expect(helpers.createPatch(1, 2)).toEqual([{ op: 'replace', path: '', value: 2 }]);
+			expect(helpers.createPatch({ a: 1 }, [1])).toEqual([{ op: 'replace', path: '', value: [1] }]);
+			expect(helpers.createPatch({}, Object.create(null))).toEqual([{ op: 'replace', path: '', value: {} }]);
+		});
+
+		it('removes, diffs, then adds object members', function () {
+			expect(helpers.createPatch({ a: 1, b: { c: 1, d: 2 }, e: 3 }, { f: 4, b: { d: 2, c: 5 }, e: 3 })).toEqual([
+				{ op: 'remove', path: '/a' },
+				{ op: 'replace', path: '/b/c', value: 5 },
+				{ op: 'add', path: '/f', value: 4 }
+			]);
+		});
+
+		it('escapes ~ and / in keys', function () {
+			expect(helpers.createPatch({ 'a/b': 1, '~x': 1 }, { 'a/b': 2, '~x': 2, '~1': 0 })).toEqual([
+				{ op: 'replace', path: '/a~1b', value: 2 },
+				{ op: 'replace', path: '/~0x', value: 2 },
+				{ op: 'add', path: '/~01', value: 0 }
+			]);
+		});
+
+		it('turns a run of inserted or removed items into one operation per item', function () {
+			expect(helpers.createPatch([1, 2, 3], [1, 2, 3, 4, 5])).toEqual([
+				{ op: 'add', path: '/3', value: 4 },
+				{ op: 'add', path: '/4', value: 5 }
+			]);
+			expect(helpers.createPatch([1, 2, 3], [0, 1, 2, 3])).toEqual([{ op: 'add', path: '/0', value: 0 }]);
+			expect(helpers.createPatch([1, 2, 3, 4], [1, 4])).toEqual([
+				{ op: 'remove', path: '/2' },
+				{ op: 'remove', path: '/1' }
+			]);
+			expect(helpers.createPatch([{ id: 1 }, { id: 2 }], [{ id: 2 }])).toEqual([{ op: 'remove', path: '/0' }]);
+			expect(helpers.createPatch([1, 1], [1, 1, 1])).toEqual([{ op: 'add', path: '/2', value: 1 }]);
+		});
+
+		it('diffs the items in between by index', function () {
+			expect(helpers.createPatch([1, { a: 1 }, 3], [1, { a: 2 }, 3])).toEqual([{ op: 'replace', path: '/1/a', value: 2 }]);
+			expect(helpers.createPatch([1, 2, 3, 9], [1, 5, 6, 7, 8, 9])).toEqual([
+				{ op: 'replace', path: '/1', value: 5 },
+				{ op: 'replace', path: '/2', value: 6 },
+				{ op: 'add', path: '/3', value: 7 },
+				{ op: 'add', path: '/4', value: 8 }
+			]);
+			expect(helpers.createPatch([0, 1, 2, 3, 0], [0, 4, 0])).toEqual([
+				{ op: 'replace', path: '/1', value: 4 },
+				{ op: 'remove', path: '/3' },
+				{ op: 'remove', path: '/2' }
+			]);
+		});
+
+		it('replaces other values whole', function () {
+			expect(helpers.createPatch({ when: new Date(0), tags: new Set([1]) }, { when: new Date(1), tags: new Set([1]) })).toEqual([
+				{ op: 'replace', path: '/when', value: new Date(1) }
+			]);
+			// eslint-disable-next-line no-sparse-arrays
+			const sparse = [1, , 2];
+			expect(helpers.createPatch({ list: [1, 2, 3] }, { list: sparse })).toEqual([{ op: 'replace', path: '/list', value: sparse }]);
+			expect(helpers.createPatch({ a: { b: 1 } }, { a: Object.assign(Object.create(null), { b: 1 }) })).toHaveLength(1);
+		});
+
+		it('handles __proto__ and other Object.prototype names as plain keys', function () {
+			const a = JSON.parse('{"__proto__": {"x": 1}, "constructor": 1}');
+			const b = JSON.parse('{"__proto__": {"x": 2}, "toString": 1}');
+			const patch = helpers.createPatch(a, b);
+			expect(patch).toEqual([
+				{ op: 'replace', path: '/__proto__/x', value: 2 },
+				{ op: 'remove', path: '/constructor' },
+				{ op: 'add', path: '/toString', value: 1 }
+			]);
+			expect(helpers.isEqual(helpers.applyPatch(a, patch), b)).toBe(true);
+		});
+
+		it('shares the values of b', function () {
+			const value = { deep: true };
+			const patch = helpers.createPatch({}, { value });
+			expect((patch[0] as { value: unknown }).value).toBe(value);
+		});
+
+		it('throws on circular structures, but not on a reference to the other side', function () {
+			const a: Record<string, unknown> = { x: 1 };
+			a.self = a;
+			const b: Record<string, unknown> = { x: 1 };
+			b.self = b;
+			expect(function () {
+				helpers.createPatch(a, b);
+			}).toThrow(new TypeError('createPatch: cannot diff circular structures'));
+			const inner = { y: 1 };
+			const left = { x: { y: 2 } };
+			const right = { x: left, z: inner };
+			expect(helpers.createPatch(left, right)).toEqual([
+				{ op: 'remove', path: '/x/y' },
+				{ op: 'add', path: '/x/x', value: { y: 2 } },
+				{ op: 'add', path: '/z', value: inner }
+			]);
+			// `left` is an ancestor on `a`'s side while it is walked on `b`'s side: not a cycle.
+			expect(helpers.createPatch({ x: left }, { x: { x: left } })).toEqual([
+				{ op: 'remove', path: '/x/x/y' },
+				{ op: 'add', path: '/x/x/x', value: { y: 2 } }
+			]);
+		});
+
+		it('walks an unchanged shared subtree once per pair', function () {
+			function chain(depth: number): object {
+				let node: object = { leaf: 1 };
+				for (let level = 0; level < depth; level++) node = { left: node, right: node };
+				return node;
+			}
+			const start = Date.now();
+			expect(helpers.createPatch(chain(60), chain(60))).toEqual([]);
+			// One subtree of `a` against two distinct (equal) subtrees of `b`.
+			const node = chain(8);
+			expect(helpers.createPatch({ l: node, r: node }, { l: chain(8), r: chain(8) })).toEqual([]);
+			expect(Date.now() - start).toBeLessThan(2000);
+		});
+	});
+
+	describe('applyPatch', function () {
+		const doc = helpers.deepFreeze({ user: { name: 'Ada', tags: ['a', 'b'] }, meta: { v: 1 } });
+
+		it('adds object members and array items', function () {
+			expect(helpers.applyPatch(doc, [{ op: 'add', path: '/user/age', value: 36 }])).toEqual({ user: { name: 'Ada', tags: ['a', 'b'], age: 36 }, meta: { v: 1 } });
+			expect(helpers.applyPatch(doc, [{ op: 'add', path: '/user/name', value: 'Grace' }]).user.name).toBe('Grace');
+			expect(helpers.applyPatch(doc, [{ op: 'add', path: '/user/tags/0', value: 'z' }]).user.tags).toEqual(['z', 'a', 'b']);
+			expect(helpers.applyPatch(doc, [{ op: 'add', path: '/user/tags/1', value: 'z' }]).user.tags).toEqual(['a', 'z', 'b']);
+			expect(helpers.applyPatch(doc, [{ op: 'add', path: '/user/tags/2', value: 'z' }]).user.tags).toEqual(['a', 'b', 'z']);
+			expect(helpers.applyPatch(doc, [{ op: 'add', path: '/user/tags/-', value: 'z' }]).user.tags).toEqual(['a', 'b', 'z']);
+			expect(helpers.applyPatch(doc, [{ op: 'add', path: '', value: 1 }])).toBe(1);
+		});
+
+		it('removes object members and array items', function () {
+			expect(helpers.applyPatch(doc, [{ op: 'remove', path: '/meta' }])).toEqual({ user: { name: 'Ada', tags: ['a', 'b'] } });
+			expect(helpers.applyPatch(doc, [{ op: 'remove', path: '/user/tags/0' }]).user.tags).toEqual(['b']);
+			expect(helpers.applyPatch(doc, [{ op: 'remove', path: '/user/tags/1' }]).user.tags).toEqual(['a']);
+		});
+
+		it('replaces existing values', function () {
+			expect(helpers.applyPatch(doc, [{ op: 'replace', path: '/user/tags/1', value: 'z' }]).user.tags).toEqual(['a', 'z']);
+			expect(helpers.applyPatch(doc, [{ op: 'replace', path: '/meta/v', value: 2 }]).meta).toEqual({ v: 2 });
+			expect(helpers.applyPatch(doc, [{ op: 'replace', path: '', value: { x: 1 } }])).toEqual({ x: 1 });
+		});
+
+		it('moves values', function () {
+			expect(helpers.applyPatch(doc, [{ op: 'move', from: '/user/name', path: '/name' }])).toEqual({ user: { tags: ['a', 'b'] }, meta: { v: 1 }, name: 'Ada' });
+			expect(helpers.applyPatch({ list: [1, 2, 3, 4] }, [{ op: 'move', from: '/list/0', path: '/list/2' }])).toEqual({ list: [2, 3, 1, 4] });
+			expect(helpers.applyPatch({ list: [1, 2, 3, 4] }, [{ op: 'move', from: '/list/3', path: '/list/0' }])).toEqual({ list: [4, 1, 2, 3] });
+			expect(helpers.applyPatch({ list: [1, 2] }, [{ op: 'move', from: '/list/0', path: '/list/-' }])).toEqual({ list: [2, 1] });
+			expect(helpers.applyPatch(doc, [{ op: 'move', from: '/user', path: '/user' }])).toBe(doc);
+			expect(helpers.applyPatch({ a: { b: 1 } }, [{ op: 'move', from: '/a', path: '/ab' }])).toEqual({ ab: { b: 1 } });
+		});
+
+		it('copies values, sharing them', function () {
+			const result = helpers.applyPatch(doc, [{ op: 'copy', from: '/user/tags', path: '/tags' }]) as typeof doc & { tags: string[] };
+			expect(result.tags).toEqual(['a', 'b']);
+			expect(result.tags).toBe(doc.user.tags);
+			expect(helpers.applyPatch({ a: [1] }, [{ op: 'copy', from: '/a/0', path: '/a/-' }])).toEqual({ a: [1, 1] });
+		});
+
+		it('never lets a copied container be modified through both locations', function () {
+			const result = helpers.applyPatch({ a: { b: 1 } }, [
+				{ op: 'add', path: '/a/c', value: 2 },
+				{ op: 'copy', from: '/a', path: '/d' },
+				{ op: 'replace', path: '/d/b', value: 9 },
+				{ op: 'replace', path: '/a/c', value: 8 }
+			]);
+			expect(result).toEqual({ a: { b: 1, c: 8 }, d: { b: 9, c: 2 } });
+			const root = helpers.applyPatch({ a: { b: 1 } }, [
+				{ op: 'add', path: '/x', value: 1 },
+				{ op: 'copy', from: '', path: '/a/c' },
+				{ op: 'replace', path: '/a/c/a/b', value: 2 }
+			]);
+			expect(root).toEqual({ a: { b: 1, c: { a: { b: 2 }, x: 1 } }, x: 1 });
+		});
+
+		it('tests values with deep equality', function () {
+			expect(helpers.applyPatch(doc, [{ op: 'test', path: '/user', value: { tags: ['a', 'b'], name: 'Ada' } }])).toBe(doc);
+			expect(helpers.applyPatch(doc, [{ op: 'test', path: '', value: doc }])).toBe(doc);
+			expect(function () {
+				helpers.applyPatch(doc, [{ op: 'test', path: '/user/tags', value: ['b', 'a'] }]);
+			}).toThrow(
+				new helpers.JsonPatchError('applyPatch: `operations[0]` (test "/user/tags") cannot be applied: the value is not equal to the expected one', 0, {} as never)
+			);
+		});
+
+		it('applies operations in order, each to the result of the previous', function () {
+			const result = helpers.applyPatch({ list: [] as number[] }, [
+				{ op: 'add', path: '/list/-', value: 1 },
+				{ op: 'add', path: '/list/0', value: 0 },
+				{ op: 'test', path: '/list/1', value: 1 },
+				{ op: 'replace', path: '/list/1', value: 2 },
+				{ op: 'remove', path: '/list/0' }
+			]);
+			expect(result).toEqual({ list: [2] });
+		});
+
+		it('never modifies the document and shares its untouched parts', function () {
+			const input = { a: { b: 1 }, c: { d: [1] }, e: [{ f: 1 }, { g: 1 }] };
+			const snapshot = helpers.deepClone(input);
+			const result = helpers.applyPatch(input, [
+				{ op: 'replace', path: '/a/b', value: 2 },
+				{ op: 'add', path: '/a/x', value: 3 },
+				{ op: 'replace', path: '/e/1/g', value: 2 }
+			]);
+			expect(input).toEqual(snapshot);
+			expect(result).toEqual({ a: { b: 2, x: 3 }, c: { d: [1] }, e: [{ f: 1 }, { g: 2 }] });
+			expect(result.c).toBe(input.c);
+			expect(result.e[0]).toBe(input.e[0]);
+			expect(helpers.applyPatch(input, [])).toBe(input);
+		});
+
+		it('never modifies an inserted value', function () {
+			const value = { x: 1 };
+			const result = helpers.applyPatch({} as Record<string, unknown>, [
+				{ op: 'add', path: '/a', value },
+				{ op: 'add', path: '/b', value },
+				{ op: 'replace', path: '/a/x', value: 2 }
+			]);
+			expect(value).toEqual({ x: 1 });
+			expect(result).toEqual({ a: { x: 2 }, b: { x: 1 } });
+			expect(result.b).toBe(value);
+		});
+
+		it('is all or nothing', function () {
+			const input = { a: 1 };
+			expect(function () {
+				helpers.applyPatch(input, [
+					{ op: 'replace', path: '/a', value: 2 },
+					{ op: 'remove', path: '/missing' }
+				]);
+			}).toThrow(helpers.JsonPatchError);
+			expect(input).toEqual({ a: 1 });
+		});
+
+		it('copies a container once however many operations change it', function () {
+			const list = Array.from({ length: 20_000 }, function (_value, index) {
+				return index;
+			});
+			const operations = list.map(function (index) {
+				return { op: 'replace' as const, path: `/list/${index}`, value: -index };
+			});
+			const start = Date.now();
+			const result = helpers.applyPatch({ list }, operations);
+			expect(Date.now() - start).toBeLessThan(2000);
+			expect(result.list[19_999]).toBe(-19_999);
+			expect(list[19_999]).toBe(19_999);
+		});
+
+		it('unescapes pointers (~1 before ~0)', function () {
+			const input = { 'a/b': 1, '~1': 2, '~': 3 };
+			expect(helpers.applyPatch(input, [{ op: 'replace', path: '/a~1b', value: 9 }])).toEqual({ 'a/b': 9, '~1': 2, '~': 3 });
+			expect(helpers.applyPatch(input, [{ op: 'replace', path: '/~01', value: 9 }])).toEqual({ 'a/b': 1, '~1': 9, '~': 3 });
+			expect(helpers.applyPatch(input, [{ op: 'remove', path: '/~0' }])).toEqual({ 'a/b': 1, '~1': 2 });
+			expect(helpers.applyPatch({ '': { '': 1 } }, [{ op: 'replace', path: '//', value: 2 }])).toEqual({ '': { '': 2 } });
+		});
+
+		it('never reaches a prototype', function () {
+			const added = helpers.applyPatch({} as Record<string, unknown>, [{ op: 'add', path: '/__proto__', value: { polluted: true } }]);
+			expect(Object.getPrototypeOf(added)).toBe(Object.prototype);
+			expect(Object.keys(added)).toEqual(['__proto__']);
+			expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+			const own = JSON.parse('{"__proto__": {"x": 1}}');
+			expect(Object.getOwnPropertyDescriptor(helpers.applyPatch(own, [{ op: 'replace', path: '/__proto__/x', value: 2 }]), '__proto__')?.value).toEqual({ x: 2 });
+			for (const path of ['/__proto__/polluted', '/constructor/prototype/polluted', '/toString/x']) {
+				expect(function () {
+					helpers.applyPatch({}, [{ op: 'add', path, value: true }]);
+				}).toThrow(helpers.JsonPatchError);
+			}
+			for (const path of ['/constructor', '/toString', '/__proto__', '/hasOwnProperty']) {
+				expect(function () {
+					helpers.applyPatch({}, [{ op: 'test', path, value: {} }]);
+				}).toThrow(new RegExp(`${path.slice(1)}" does not exist`));
+			}
+			expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+			expect(helpers.applyPatch({}, [{ op: 'add', path: '/constructor', value: 1 }])).toEqual({ constructor: 1 });
+		});
+
+		it('only walks plain objects and arrays', function () {
+			const cases: unknown[] = [
+				new Date(0),
+				new Map([['a', 1]]),
+				new (class Box {
+					a = 1;
+				})(),
+				'abc',
+				1,
+				null
+			];
+			for (const value of cases) {
+				expect(function () {
+					helpers.applyPatch({ v: value }, [{ op: 'add', path: '/v/a', value: 1 }]);
+				}).toThrow(new helpers.JsonPatchError('applyPatch: `operations[0]` (add "/v/a") cannot be applied: "/v" is not an object or an array', 0, {} as never));
+				expect(function () {
+					helpers.applyPatch({ v: value }, [{ op: 'test', path: '/v/a', value: 1 }]);
+				}).toThrow(helpers.JsonPatchError);
+			}
+			expect(function () {
+				helpers.applyPatch(1, [{ op: 'add', path: '/a', value: 1 }]);
+			}).toThrow(new helpers.JsonPatchError('applyPatch: `operations[0]` (add "/a") cannot be applied: "" is not an object or an array', 0, {} as never));
+			expect(helpers.applyPatch(Object.create(null), [{ op: 'add', path: '/a', value: 1 }])).toEqual({ a: 1 });
+		});
+
+		it('validates array indices', function () {
+			const input = { list: [1, 2] };
+			const failures: Array<[string, string, string]> = [
+				['remove', '/list/01', '"/list/01" is not an array index'],
+				['remove', '/list/-1', '"/list/-1" is not an array index'],
+				['remove', '/list/1e0', '"/list/1e0" is not an array index'],
+				['remove', '/list/ 1', '"/list/ 1" is not an array index'],
+				['remove', '/list/-', '"/list/-" is not an array index'],
+				['remove', '/list/2', '"/list/2" is out of bounds (length 2)'],
+				['remove', '/list/99999999999999999999', '"/list/99999999999999999999" is out of bounds (length 2)'],
+				['add', '/list/3', '"/list/3" is out of bounds (length 2)'],
+				['add', '/list/-/x', '"/list/-" is not an array index'],
+				['test', '/list/2', '"/list/2" is out of bounds (length 2)']
+			];
+			for (const [op, path, problem] of failures) {
+				expect(function () {
+					helpers.applyPatch(input, [{ op, path, value: 0 } as helpers.JsonPatchOperation]);
+				}).toThrow(new helpers.JsonPatchError(`applyPatch: \`operations[0]\` (${op} ${JSON.stringify(path)}) cannot be applied: ${problem}`, 0, {} as never));
+			}
+			expect(helpers.applyPatch({ list: [1] }, [{ op: 'add', path: '/list/1', value: 2 }])).toEqual({ list: [1, 2] });
+		});
+
+		it('never calls methods or constructors of an array subclass', function () {
+			class Tracked extends Array<number> {
+				static override get [Symbol.species](): ArrayConstructor {
+					throw new Error('species');
+				}
+				override copyWithin(): this {
+					throw new Error('copyWithin');
+				}
+			}
+			const list = Tracked.from([1, 2, 3]) as Tracked;
+			const added = helpers.applyPatch({ list }, [{ op: 'add', path: '/list/0', value: 0 }]);
+			expect([...added.list]).toEqual([0, 1, 2, 3]);
+			expect(Object.getPrototypeOf(added.list)).toBe(Tracked.prototype);
+			expect([...helpers.applyPatch({ list }, [{ op: 'remove', path: '/list/0' }]).list]).toEqual([2, 3]);
+			expect([...list]).toEqual([1, 2, 3]);
+		});
+
+		it('reads array holes as undefined, never from a polluted prototype', function () {
+			const proto = Array.prototype as unknown as Record<number, unknown>;
+			proto[1] = 'polluted';
+			try {
+				// eslint-disable-next-line no-sparse-arrays
+				const holey = { list: [1, , 3] };
+				expect(helpers.applyPatch(holey, [{ op: 'test', path: '/list/1', value: undefined }])).toBe(holey);
+				expect(helpers.applyPatch(holey, [{ op: 'replace', path: '/list/1', value: 2 }])).toEqual({ list: [1, 2, 3] });
+				expect(function () {
+					helpers.applyPatch(holey, [{ op: 'add', path: '/list/1/x', value: 2 }]);
+				}).toThrow(helpers.JsonPatchError);
+			} finally {
+				delete proto[1];
+			}
+		});
+
+		it('reports where an operation failed', function () {
+			const operation = { op: 'remove', path: '/a/b' } as const;
+			try {
+				helpers.applyPatch({ a: {} }, [{ op: 'test', path: '/a', value: {} }, operation]);
+				throw new Error('not thrown');
+			} catch (error) {
+				expect(error).toBeInstanceOf(helpers.JsonPatchError);
+				expect(error).toBeInstanceOf(Error);
+				const failure = error as helpers.JsonPatchError;
+				expect(failure.name).toBe('JsonPatchError');
+				expect(failure.index).toBe(1);
+				expect(failure.operation).toBe(operation);
+				expect(failure.message).toBe('applyPatch: `operations[1]` (remove "/a/b") cannot be applied: "/a/b" does not exist');
+			}
+		});
+
+		it('rejects removing the root and moving a value inside itself', function () {
+			expect(function () {
+				helpers.applyPatch(doc, [{ op: 'remove', path: '' }]);
+			}).toThrow(new helpers.JsonPatchError('applyPatch: `operations[0]` (remove "") cannot be applied: the whole document cannot be removed', 0, {} as never));
+			expect(function () {
+				helpers.applyPatch(doc, [{ op: 'move', from: '/user', path: '/user/tags/0' }]);
+			}).toThrow(
+				new helpers.JsonPatchError('applyPatch: `operations[0]` (move "/user/tags/0") cannot be applied: "/user" cannot be moved inside itself', 0, {} as never)
+			);
+			expect(function () {
+				helpers.applyPatch(doc, [{ op: 'move', from: '', path: '/x' }]);
+			}).toThrow(helpers.JsonPatchError);
+			expect(function () {
+				helpers.applyPatch(doc, [{ op: 'move', from: '/nope', path: '/nope' }]);
+			}).toThrow(helpers.JsonPatchError);
+			expect(function () {
+				helpers.applyPatch(doc, [{ op: 'copy', from: '/nope', path: '/x' }]);
+			}).toThrow(helpers.JsonPatchError);
+		});
+
+		it('rejects malformed operations', function () {
+			const cases: Array<[unknown, Error]> = [
+				[null, new TypeError('applyPatch: `operations[0]` must be an object, got null')],
+				['add', new TypeError('applyPatch: `operations[0]` must be an object, got string')],
+				[{ path: '/a' }, new TypeError('applyPatch: `operations[0].op` must be a string, got undefined')],
+				[{ op: 'delete', path: '/a' }, new RangeError("applyPatch: `operations[0].op` must be 'add', 'remove', 'replace', 'move', 'copy' or 'test', got \"delete\"")],
+				[{ op: 'remove' }, new TypeError('applyPatch: `operations[0].path` must be a string, got undefined')],
+				[{ op: 'move', path: '/a', from: 1 }, new TypeError('applyPatch: `operations[0].from` must be a string, got number')],
+				[{ op: 'add', path: '/a' }, new TypeError("applyPatch: `operations[0]` must have a `value` for 'add'")],
+				[{ op: 'test', path: '/a' }, new TypeError("applyPatch: `operations[0]` must have a `value` for 'test'")],
+				[
+					{ op: 'remove', path: 'a' },
+					new RangeError("applyPatch: `operations[0].path` must be a JSON Pointer ('' or '/' followed by keys, with '~' escaped as '~0' and '/' as '~1'), got \"a\"")
+				],
+				[
+					{ op: 'remove', path: '/a~2' },
+					new RangeError(
+						"applyPatch: `operations[0].path` must be a JSON Pointer ('' or '/' followed by keys, with '~' escaped as '~0' and '/' as '~1'), got \"/a~2\""
+					)
+				],
+				[
+					{ op: 'remove', path: '/a~' },
+					new RangeError(
+						"applyPatch: `operations[0].path` must be a JSON Pointer ('' or '/' followed by keys, with '~' escaped as '~0' and '/' as '~1'), got \"/a~\""
+					)
+				]
+			];
+			for (const [operation, error] of cases) {
+				expect(function () {
+					helpers.applyPatch({ a: 1 }, [operation as helpers.JsonPatchOperation]);
+				}).toThrow(error);
+			}
+			expect(function () {
+				helpers.applyPatch({}, { length: 0 } as never);
+			}).toThrow(new TypeError('applyPatch: `operations` must be an array, got object'));
+			expect(helpers.applyPatch({ a: 1 }, [{ op: 'replace', path: '/a', value: undefined }])).toEqual({ a: undefined });
+		});
+
+		it('reads each field of an operation once', function () {
+			const reads: string[] = [];
+			const operation = new Proxy(
+				{ op: 'replace', path: '/a', value: 2 },
+				{
+					get(target, key, receiver) {
+						reads.push(String(key));
+						return Reflect.get(target, key, receiver);
+					}
+				}
+			);
+			expect(helpers.applyPatch({ a: 1 }, [operation as helpers.JsonPatchOperation])).toEqual({ a: 2 });
+			expect(reads.sort()).toEqual(['op', 'path', 'value']);
+		});
+
+		it('round-trips with createPatch', function () {
+			const a = { x: [1, { y: 2 }, 3], z: 'q', n: { m: { k: 1 } } };
+			const b = { x: [{ y: 2 }, 1, 3, 4], w: null, n: { m: { k: 2, j: [] } } };
+			expect(helpers.applyPatch(a, helpers.createPatch(a, b))).toEqual(b);
+		});
+
+		it('types the result as the document', function () {
+			const result = helpers.applyPatch({ a: 1 }, []);
+			assertType<Equals<typeof result, { a: number }>>(true);
+			expect(function () {
+				// @ts-expect-error 'delete' is not an operation
+				helpers.applyPatch({}, [{ op: 'delete', path: '/a' }]);
+			}).toThrow(RangeError);
+			expect(function () {
+				// @ts-expect-error a move needs `from`
+				helpers.applyPatch({}, [{ op: 'move', path: '/a' }]);
+			}).toThrow(TypeError);
+		});
+	});
+});
+
+describe('JSON Patch (review regressions)', function () {
+	it('diffs nested arrays in linear time', function () {
+		function nested(depth: number, leaf: number): unknown[] {
+			let node: unknown[] = [leaf];
+			const items = Array.from({ length: 1000 }, function (_value, index) {
+				return index;
+			});
+			for (let level = 0; level < depth; level++) node = [items.slice(), node];
+			return node;
+		}
+		function thread(depth: number, changed: boolean): object {
+			let node: Record<string, unknown> = { id: 0, text: changed ? 'edited' : 'x', replies: [] };
+			for (let level = 1; level < depth; level++) node = { id: level, text: 'x', replies: changed ? [node, { id: -level }] : [node] };
+			return node;
+		}
+		let start = Date.now();
+		expect(helpers.createPatch(nested(800, 1), nested(800, 2))).toHaveLength(1);
+		const arrays = Date.now() - start;
+		start = Date.now();
+		const patch = helpers.createPatch(thread(1000, false), thread(1000, true));
+		const threads = Date.now() - start;
+		expect(patch).toHaveLength(1000);
+		expect(arrays).toBeLessThan(1000);
+		expect(threads).toBeLessThan(250);
+	});
+
+	it('still trims structurally equal (not identical) items around a run', function () {
+		const before = [{ id: 1 }, { id: 2 }, { id: 3 }];
+		const after = [{ id: 0 }, { id: 1 }, { id: 2 }, { id: 3 }];
+		expect(helpers.createPatch(before, after)).toEqual([{ op: 'add', path: '/0', value: { id: 0 } }]);
+		expect(helpers.createPatch(after, before)).toEqual([{ op: 'remove', path: '/0' }]);
+		expect(helpers.createPatch([[1, [2]], { a: [3] }, 'x'], [[1, [2]], { a: [3] }])).toEqual([{ op: 'remove', path: '/2' }]);
+	});
+
+	it('confirms equal hashes with isEqual, for any kind of item', function () {
+		const symbolA = Symbol('a');
+		const symbolB = Symbol('a');
+		expect(helpers.createPatch([symbolA, 1], [symbolB, 1, 2])).toEqual([
+			{ op: 'replace', path: '/0', value: symbolB },
+			{ op: 'add', path: '/2', value: 2 }
+		]);
+		expect(helpers.createPatch([new Date(0), new Map([[1, 2]])], [new Date(0), new Map([[1, 2]]), 'x'])).toEqual([{ op: 'add', path: '/2', value: 'x' }]);
+		expect(helpers.createPatch([new Date(0)], [new Date(1), 'x'])).toEqual([
+			{ op: 'replace', path: '/0', value: new Date(1) },
+			{ op: 'add', path: '/1', value: 'x' }
+		]);
+		const left: Record<string, unknown> = { a: 1 };
+		left.self = left;
+		const right: Record<string, unknown> = { a: 1 };
+		right.self = right;
+		expect(helpers.createPatch([left], [right, 2])).toEqual([{ op: 'add', path: '/1', value: 2 }]);
+		const bare = Object.assign(Object.create(null), { a: 1 }) as object;
+		expect(helpers.createPatch([bare], [Object.assign(Object.create(null), { a: 1 }), 2])).toEqual([{ op: 'add', path: '/1', value: 2 }]);
+		expect(helpers.createPatch(['1', 0], [1, -0, 2])).toEqual([
+			{ op: 'replace', path: '/0', value: 1 },
+			{ op: 'add', path: '/2', value: 2 }
+		]);
+	});
+
+	it('never reads holes through a polluted Array.prototype', function () {
+		const proto = Array.prototype as unknown as Record<number, unknown>;
+		proto[1] = 'evil';
+		try {
+			// eslint-disable-next-line no-sparse-arrays
+			const added = helpers.applyPatch({ a: [0, , 2] }, [{ op: 'add', path: '/a/0', value: 'new' }]).a;
+			expect(Object.getOwnPropertyNames(added)).toEqual(['0', '1', '2', '3', 'length']);
+			expect([added[0], added[1], added[2], added[3]]).toEqual(['new', 0, undefined, 2]);
+			// eslint-disable-next-line no-sparse-arrays
+			const removed = helpers.applyPatch({ a: [0, 1, , 3] }, [{ op: 'remove', path: '/a/0' }]).a;
+			expect(Object.getOwnPropertyNames(removed)).toEqual(['0', '1', '2', 'length']);
+			expect([removed[0], removed[1], removed[2]]).toEqual([1, undefined, 3]);
+		} finally {
+			delete proto[1];
+		}
+	});
+});
