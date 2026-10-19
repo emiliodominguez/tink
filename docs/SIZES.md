@@ -124,7 +124,7 @@ Whole module: **9.9 kB**
 | `pollUntil`                 |      805 B |
 | `promiseAllObject`          |      348 B |
 | `promiseAllSettledObject`   |      358 B |
-| `reduceAsync`               |      799 B |
+| `reduceAsync`               |      855 B |
 | `retry`                     |     1.0 kB |
 | `sequence`                  |      227 B |
 | `sleep`                     |      593 B |
@@ -227,9 +227,9 @@ Whole module: **9.8 kB**
 | `endOfYear`             |      936 B |
 | `findGaps`              |     1.1 kB |
 | `formatDate`            |     1.1 kB |
-| `formatDuration`        |      794 B |
+| `formatDuration`        |      795 B |
 | `formatInTimeZone`      |     2.0 kB |
-| `fromUnixTime`          |      437 B |
+| `fromUnixTime`          |      483 B |
 | `fromZonedTime`         |     2.3 kB |
 | `getAge`                |     1023 B |
 | `getCalendarMonth`      |     1.3 kB |
@@ -414,12 +414,12 @@ Whole module: **5.1 kB**
 
 ## functions
 
-Whole module: **7.2 kB**
+Whole module: **7.3 kB**
 
 | Export              | min + gzip |
 | ------------------- | ---------: |
 | `_`                 |       59 B |
-| `active`            |     1.3 kB |
+| `active`            |     1.4 kB |
 | `after`             |      327 B |
 | `allPass`           |      347 B |
 | `anyOf`             |     1.5 kB |
@@ -427,20 +427,20 @@ Whole module: **7.2 kB**
 | `attempt`           |      208 B |
 | `before`            |      330 B |
 | `bind`              |      189 B |
-| `capture`           |     1.3 kB |
+| `capture`           |     1.4 kB |
 | `captureAs`         |     1.4 kB |
 | `compose`           |      297 B |
 | `composeAsync`      |      305 B |
 | `cons`              |     1.3 kB |
 | `constant`          |       72 B |
 | `curry`             |      418 B |
-| `debounce`          |      713 B |
+| `debounce`          |      712 B |
 | `defaultMemoizeKey` |     1.0 kB |
 | `flip`              |      247 B |
 | `identity`          |       66 B |
 | `match`             |      551 B |
-| `matchWith`         |     1.8 kB |
-| `matcher`           |     3.9 kB |
+| `matchWith`         |     1.9 kB |
+| `matcher`           |     4.0 kB |
 | `memoize`           |     1.4 kB |
 | `memoizeLast`       |      389 B |
 | `negate`            |      196 B |
@@ -649,7 +649,7 @@ Whole module: **7.5 kB**
 
 ## objects
 
-Whole module: **12.7 kB**
+Whole module: **12.8 kB**
 
 | Export              | min + gzip |
 | ------------------- | ---------: |
@@ -693,7 +693,7 @@ Whole module: **12.7 kB**
 | `pick`              |      558 B |
 | `pickBy`            |      547 B |
 | `replaceEqualDeep`  |     2.3 kB |
-| `safeStringify`     |     2.0 kB |
+| `safeStringify`     |     2.1 kB |
 | `setPath`           |     1.0 kB |
 | `setProperty`       |      348 B |
 | `shallowEqual`      |     1.0 kB |
@@ -768,7 +768,7 @@ Whole module: **9.0 kB**
 | `ensurePrefix`        |      365 B |
 | `ensureSuffix`        |      363 B |
 | `escapeHtml`          |      463 B |
-| `escapeRegExp`        |      590 B |
+| `escapeRegExp`        |      588 B |
 | `formatCount`         |      386 B |
 | `getWords`            |      392 B |
 | `includes`            |      351 B |
@@ -787,7 +787,7 @@ Whole module: **9.0 kB**
 | `removeDiacritics`    |      560 B |
 | `repeat`              |      544 B |
 | `replace`             |      363 B |
-| `reverse`             |      670 B |
+| `reverse`             |      669 B |
 | `similarity`          |      705 B |
 | `splitLast`           |      506 B |
 | `splitLines`          |      358 B |

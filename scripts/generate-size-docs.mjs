@@ -94,7 +94,7 @@ const LODASH = [
 	['unescape', 'strings', 'unescapeHtml', ''],
 	['upperFirst', 'strings', 'capitalize', ''],
 	['words', 'strings', 'getWords', ''],
-	['clamp', 'math', 'clamp', ''],
+	['clamp', 'math', 'clamp', 'Like lodash and CSS `clamp()`, the lower bound wins when the bounds cross.'],
 	['inRange', 'math', 'inRange', ''],
 	['max', 'math', 'max', ''],
 	['mean', 'math', 'average', ''],

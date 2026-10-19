@@ -21,22 +21,23 @@
 
 ## matchWith / matcher and the pattern helpers
 
-- 1751, 1753: `isArrayPrototypePolluted` → always `true` — elements are then read as own properties, which gives the same value; the check only keeps that slower read off the common path (as in `isTuple`).
-- 1775: the `catch` of `prototypeOf` emptied — the function returns `undefined` either way.
-- 1848: `pattern === null` → `false` — `null` then goes through `prototypeOf` (which catches `Object.getPrototypeOf(null)`) and is compared by identity: `value === null`, the same answer.
-- 1864: `depth === CYCLE_CHECK_DEPTH` → `true` / `!==`, and the `scan` scratch arrays filled — the acyclicity check runs more often (or with a junk log / ancestor), which only costs time.
-- 1868, 1876: `index < length` → `<=` — the extra step tests `undefined` against `undefined` (array) or a symbol key that is not there (`propertyIsEnumerable(undefined)` is `false`).
-- 1899: `depth + 1` → `depth - 1` for a missing key — the value is `undefined`, so the recursion stops there whatever the depth.
-- 1940: the `patterns[1] === _` shortcut → `false` — the tail is copied and tested against `_`, which matches it: same answer.
-- 1943: `new Array(value.length - 1)` → `new Array()` — preallocation only; every slot is assigned.
-- 1973, 1989: `scan` reports a helper when there is none — the pattern is then interpreted instead of compiled with `isMatching`, with the same semantics.
-- 1976: the alternatives' scratch log filled, or `<=` over the helper's patterns (`scan(undefined)` is a no-op).
-- 1991: `if (array)` → `if (false)`, `<=` — an array is then scanned through `Object.keys` (its indices), or one step past its end (`undefined`).
-- 2180: `let expected = ''` → another string — overwritten by the first alternative before it is read.
-- 2185, 2801, 2845: the ancestors / log of a `scan` seeded with a junk element — never compared with a pattern, or never read.
-- 2680: the one-shot log created non-empty — it is truncated before the first test.
-- 2683: `log.length !== 0` → `true` — truncates an empty log too; the guard only avoids the (costly) `length` write.
-- 2797: active patterns cloned by `prepare` — a clone behaves like the original (same function, no nested pattern).
-- 2799, 2801, 2895, 2896: the `'matcher'` caller of `register`, `scan`, `test` and `select` emptied — those can only throw for a circular pattern or bad captures, which `with` already rejected with the same checks.
-- 2814: the copied properties made read-only or non-configurable — the copy is private and never written.
-- 2855: `captures: log.length > 0` → `true` / `>= 0` — a case without captures gets an empty log, whose selection is `NO_SELECTION` too.
+- 1753, 1755: `isArrayPrototypePolluted` → always `true` — elements are then read as own properties, which gives the same value; the check only keeps that slower read off the common path (as in `isTuple`).
+- 1777: the `catch` of `prototypeOf` emptied — the function returns `undefined` either way.
+- 1850: `pattern === null` → `false` — `null` then goes through `prototypeOf` (which catches `Object.getPrototypeOf(null)`) and is compared by identity: `value === null`, the same answer.
+- 1866: `depth === CYCLE_CHECK_DEPTH` → `true` / `!==`, and the `scan` scratch arrays filled — the acyclicity check runs more often (or with a junk log / ancestor), which only costs time.
+- 1870, 1878: `index < length` → `<=` — the extra step tests `undefined` against `undefined` (array) or a symbol key that is not there (`propertyIsEnumerable(undefined)` is `false`).
+- 1901: `depth + 1` → `depth - 1` for a missing key — the value is `undefined`, so the recursion stops there whatever the depth.
+- 1942: the `patterns[1] === _` shortcut → `false` — the tail is copied and tested against `_`, which matches it: same answer.
+- 1945: `new Array(value.length - 1)` → `new Array()` — preallocation only; every slot is assigned.
+- 1978, 1990, 2002, 2006: `scan` reports a helper when there is none (or memoizes a part without helpers as if it had one, `found && …` → `log.slice(start)`) — the pattern is then interpreted instead of compiled with `isMatching`, with the same semantics.
+- 1995: the alternatives' scratch log filled, or `<=` over the helper's patterns (`scan(undefined)` is a no-op).
+- 2002: `if (array)` → `if (false)`, `<=` — an array is then scanned through `Object.keys` (its indices), or one step past its end (`undefined`).
+- 2196: `let expected = ''` → another string — overwritten by the first alternative before it is read.
+- 2202, 2950, 2998: the ancestors / log of a `scan` seeded with a junk element — never compared with a pattern, or never read.
+- 2804: the one-shot log created non-empty — it is truncated before the first test.
+- 2809: `log.length !== 0` → `true` — truncates an empty log too; the guard only avoids the (costly) `length` write.
+- 2813: the log not given back after the test — the next `with` creates a new one, which only costs an allocation.
+- 2949: active patterns cloned by `prepare` — a clone behaves like the original (same function, no nested pattern).
+- 2949, 2950, 3048, 3049: the `'matcher'` caller of `register`, `scan`, `test` and `select` emptied — those can only throw for a circular pattern or bad captures, which `with` already rejected with the same checks.
+- 2961–2963: the copied properties made read-only or non-configurable — the copy is private and never written.
+- 3008: `captures: log.length > 0` → `true` / `>= 0` — a case without captures gets an empty log, whose selection is `NO_SELECTION` too.

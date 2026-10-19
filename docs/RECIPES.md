@@ -248,6 +248,110 @@ diffSequences('kitten', 'sitting').filter(function (op) {
 }).length; // 5
 ```
 
+## Pattern matching, F# style
+
+`matchWith` and `matcher` use the patterns of `isMatching`: partial objects, exact-length tuples, literals and guards. The first matching case wins.
+
+```ts
+import { _, active, matcher, matchWith } from 'tinkit/functions';
+
+type Shape = { kind: 'circle'; radius: number } | { kind: 'rect'; width: number; height: number };
+
+// F#'s `function`: compiled once, reused. Add a kind to Shape and `exhaustive()` stops compiling until it is handled.
+const area = matcher<Shape>()
+	.with({ kind: 'circle' }, function (circle) {
+		return Math.round(Math.PI * circle.radius ** 2);
+	})
+	.with({ kind: 'rect' }, function (rect) {
+		return rect.width * rect.height;
+	})
+	.exhaustive();
+area({ kind: 'rect', width: 2, height: 3 }); // 6
+
+// Active pattern (F# `| Int n ->`): matches when the function returns something, and the handler receives it.
+const integer = active(function (text: string) {
+	const n = Number.parseInt(text, 10);
+	return Number.isNaN(n) ? undefined : n;
+});
+matchWith('21')
+	.with(integer, function (n) {
+		return n * 2;
+	})
+	.otherwise(function () {
+		return 0;
+	}); // 42
+
+// Tuples, wildcards and a `when` guard (a guarded case never counts toward exhaustiveness).
+function cell(row: number, column: number, alive: boolean): string {
+	return matchWith([row, column])
+		.with([0, _], function () {
+			return 'header';
+		})
+		.with([_, 0], function () {
+			return 'label';
+		})
+		.with(
+			_,
+			function () {
+				return alive;
+			},
+			function () {
+				return 'live';
+			}
+		)
+		.otherwise(function () {
+			return 'empty';
+		});
+}
+cell(0, 3, false); // 'header'
+cell(2, 2, true); // 'live'
+```
+
+## Files, money and schedules
+
+```ts
+import { toTree } from 'tinkit/arrays';
+import { findGaps } from 'tinkit/date';
+import { parseCsv, toCsv } from 'tinkit/encoding';
+import { serializeError } from 'tinkit/errors';
+import { allocate } from 'tinkit/math';
+
+// Spreadsheet export: formulaEscape defuses `=HYPERLINK(…)` and friends (OWASP CSV injection), and quotes every field.
+toCsv(
+	[
+		{ name: 'Ada', total: 12 },
+		{ name: '=HYPERLINK("http://x")', total: 3 }
+	],
+	{ formulaEscape: true }
+);
+// '"name","total"\r\n"Ada","12"\r\n"\'=HYPERLINK(""http://x"")","3"'
+
+// Import: a short row's missing fields are absent (pass `strict: true` to reject ragged rows instead).
+parseCsv('name,total\r\nAda,12\r\nGrace\r\n', { header: true }); // [{ name: 'Ada', total: '12' }, { name: 'Grace' }]
+
+// Split $10.00 three ways without losing a cent.
+allocate(1000, [1, 1, 1]); // [334, 333, 333]
+
+// Free slots of at least 30 minutes between overlapping bookings.
+const day = { start: new Date(2024, 0, 15, 9), end: new Date(2024, 0, 15, 17) };
+const busy = [
+	{ start: new Date(2024, 0, 15, 10), end: new Date(2024, 0, 15, 11, 30) },
+	{ start: new Date(2024, 0, 15, 11), end: new Date(2024, 0, 15, 13) },
+	{ start: new Date(2024, 0, 15, 16, 45), end: new Date(2024, 0, 15, 18) }
+];
+findGaps(day, busy, { minDuration: 30 * 60_000 }); // 9:00–10:00 and 13:00–16:45
+
+// id/parentId rows to a tree (O(n), cycles and duplicate ids throw).
+toTree([
+	{ id: 1, parentId: null, name: 'root' },
+	{ id: 2, parentId: 1, name: 'child' }
+]); // [{ id: 1, parentId: null, name: 'root', children: [{ id: 2, parentId: 1, name: 'child', children: [] }] }]
+
+// Errors over the wire (logs, RPC, postMessage): JSON-safe, with the cause chain.
+serializeError(new Error('failed', { cause: new TypeError('bad input') }), { stack: false });
+// { name: 'Error', message: 'failed', cause: { name: 'TypeError', message: 'bad input' } }
+```
+
 ## Decorators: memoize, debounce and bind class methods
 
 The decorators detect at runtime which decorator style they were applied with. They work with all three:

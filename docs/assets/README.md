@@ -17,4 +17,4 @@ await page.screenshot({ path: 'docs/assets/tinkit-banner.png' });
 await browser.close();
 ```
 
-Re-save the PNG losslessly optimised (palette quantisation visibly shifts the pastel gradients). The README links the image by its absolute raw GitHub URL so that it also renders on npmjs.com, which does not resolve paths relative to the repository. None of these files are published to npm: the `files` allowlist in `package.json` excludes `docs/`.
+The facts under the install command are deliberately free of counts (no number of helpers or modules), so the image does not go stale as the library grows; keep it that way. Re-save the PNG losslessly optimised (palette quantisation visibly shifts the pastel gradients). The README links the image by its absolute raw GitHub URL so that it also renders on npmjs.com, which does not resolve paths relative to the repository. None of these files are published to npm: the `files` allowlist in `package.json` excludes `docs/`.
