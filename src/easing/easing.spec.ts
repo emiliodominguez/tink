@@ -107,6 +107,12 @@ describe('Easing helpers', function () {
 	});
 
 	describe('cubicBezier', function () {
+		it('should stay finite for huge but finite y control points', function () {
+			expect(helpers.cubicBezier(0.5, 6e307, 0.5, 0)(0.5)).toBeCloseTo(2.25e307, -295);
+			expect(Number.isFinite(helpers.cubicBezier(0.5, -1e308, 0.5, 1e308)(0.25))).toBe(true);
+			expect(helpers.cubicBezier(0.5, 6e307, 0.5, 0)(1)).toBe(1);
+		});
+
 		it('should keep a flat end flat when extrapolating to ±Infinity', function () {
 			expect(helpers.cssEase(Infinity)).toBe(1);
 			expect(helpers.cssEaseOut(Infinity)).toBe(1);
@@ -437,12 +443,19 @@ describe('Easing helpers', function () {
 			}).toThrow(new TypeError('spring: `stiffness` must be a finite number > 0, got string'));
 		});
 
+		it('should settle springs whose stiffness / mass ratio is not representable, and stay at 1 for huge times', function () {
+			const stiff = helpers.spring({ stiffness: 1e300, mass: 1e-300 });
+			expect(stiff.duration).toBeGreaterThan(0);
+			expect(Math.abs(stiff.position(stiff.duration) - 1)).toBeLessThanOrEqual(0.001);
+			expect(helpers.spring({ stiffness: 1e-200, mass: 1e200 }).duration).toBeCloseTo(6.853152157597972e201, -190);
+			expect(helpers.spring().position(1e308)).toBe(1);
+			expect(helpers.spring({ damping: 20 }).position(Number.MAX_VALUE / 9)).toBe(1);
+			expect(helpers.spring({ damping: 20, velocity: 1e300 }).position(1e9)).toBe(1);
+		});
+
 		it('should throw instead of looping forever when the spring cannot settle', function () {
 			expect(function () {
 				helpers.spring({ damping: 1e-310 });
-			}).toThrow(/does not settle/);
-			expect(function () {
-				helpers.spring({ stiffness: 1e300, mass: 1e-300 });
 			}).toThrow(/does not settle/);
 			expect(function () {
 				helpers.spring({ stiffness: 1e-300, mass: 1e300, damping: 1e-300 });

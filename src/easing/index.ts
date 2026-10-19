@@ -540,6 +540,7 @@ export function cubicBezier(x1: number, y1: number, x2: number, y2: number): Eas
 	const cy = 3 * y1;
 	const by = 3 * (y2 - y1) - cy;
 	const ay = 1 - cy - by;
+	const polynomialY = Number.isFinite(ay) && Number.isFinite(by) && Number.isFinite(cy);
 	const mirroredCx = 3 - 3 * x2;
 	const mirroredBx = 3 * (x2 - x1) - mirroredCx;
 	const mirroredAx = 1 - mirroredCx - mirroredBx;
@@ -556,7 +557,10 @@ export function cubicBezier(x1: number, y1: number, x2: number, y2: number): Eas
 		}
 		// x(s) is only precise (relative to t) near s = 0, so the second half solves x̄(u) = 1 - t for u = 1 - s (1 - t is exact there).
 		const s = t <= 0.5 ? solveBezier(ax, bx, cx, t) : 1 - solveBezier(mirroredAx, mirroredBx, mirroredCx, 1 - t);
-		return ((ay * s + by) * s + cy) * s;
+		if (polynomialY) return ((ay * s + by) * s + cy) * s;
+		// Huge `y1` / `y2` overflow the polynomial coefficients: the Bernstein form, a weighted mean of the control points, cannot.
+		const u = 1 - s;
+		return 3 * u * s * (u * y1 + s * y2) + s * s * s;
 	};
 }
 
@@ -671,7 +675,8 @@ export function spring(options: SpringOptions = {}): Spring {
 	assertNumber('spring', 'velocity', velocity, Number.isFinite(velocity), 'a finite number');
 	assertNumber('spring', 'restDelta', restDelta, restDelta > 0 && restDelta < 1, 'a number between 0 and 1 (exclusive)');
 
-	const omega = Math.sqrt(stiffness / mass);
+	// Two square roots: `stiffness / mass` can overflow or underflow where the natural frequency itself does not.
+	const omega = Math.sqrt(stiffness) / Math.sqrt(mass);
 	const zeta = damping / (2 * Math.sqrt(stiffness) * Math.sqrt(mass));
 	/** `[x']`: velocity at the time of the last call of `displacement` (stored rather than returned, to avoid allocating). */
 	const speed = [0];
@@ -685,6 +690,8 @@ export function spring(options: SpringOptions = {}): Spring {
 		const b = (velocity - decay) / omegaD;
 		displacement = function (time) {
 			const envelope = Math.exp(-decay * time);
+			// Settled for good (and `sin(Infinity)` would be NaN for huge times).
+			if (envelope === 0) return (speed[0] = 0);
 			const sin = Math.sin(omegaD * time);
 			const cos = Math.cos(omegaD * time);
 			const x = envelope * (b * sin - cos);
@@ -696,14 +703,18 @@ export function spring(options: SpringOptions = {}): Spring {
 		const b = velocity - omega;
 		displacement = function (time) {
 			const envelope = Math.exp(-omega * time);
+			// Settled for good (and `b · time` may overflow to Infinity, which the zero envelope would turn into NaN).
+			if (envelope === 0) return (speed[0] = 0);
 			const x = envelope * (b * time - 1);
 			speed[0] = envelope * b - omega * x;
 			return x;
 		};
 	} else {
-		// Over-damped: x = C1·e^(r1·t) + C2·e^(r2·t); r1 = ω²/r2 avoids cancellation for large ζ, and √(ζ - 1)·√(ζ + 1) the overflow of ζ².
-		const r2 = -omega * (zeta + Math.sqrt(zeta - 1) * Math.sqrt(zeta + 1));
-		const r1 = (omega * omega) / r2;
+		// Over-damped: x = C1·e^(r1·t) + C2·e^(r2·t); r1 = ω²/r2 (= -ω/root) avoids cancellation for large ζ, and √(ζ - 1)·√(ζ + 1) the overflow of ζ².
+		const root = zeta + Math.sqrt(zeta - 1) * Math.sqrt(zeta + 1);
+		const r2 = -omega * root;
+		// `ω² / r2`, written so that ω² cannot underflow or overflow.
+		const r1 = -omega / root;
 		const c2 = (velocity + r1) / (r2 - r1);
 		const c1 = -1 - c2;
 		displacement = function (time) {
