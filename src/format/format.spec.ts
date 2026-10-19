@@ -730,3 +730,52 @@ describe('Format helpers', function () {
 		});
 	});
 });
+
+describe('Format helpers (hostile inputs)', function () {
+	it('never passes options inherited from a polluted Object.prototype to Intl, nor caches them', function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		proto.maximumFractionDigits = 0;
+		proto.timeZone = 'Asia/Tokyo';
+		try {
+			expect(helpers.formatNumber(1.25, { minimumIntegerDigits: 1 })).toBe('1.25');
+			expect(helpers.formatDateTime(0, { hour: '2-digit', hourCycle: 'h23' })).toBe('00');
+		} finally {
+			delete proto.maximumFractionDigits;
+			delete proto.timeZone;
+		}
+		expect(helpers.formatNumber(1.25, { minimumIntegerDigits: 1 })).toBe('1.25');
+	});
+
+	it('formats the time value of a Date whose getTime is overridden', function () {
+		class Lying extends Date {
+			override getTime(): number {
+				return 0;
+			}
+		}
+		expect(helpers.formatDateTime(new Lying(Date.UTC(2024, 0, 15)), { dateStyle: 'medium' })).toBe('Jan 15, 2024');
+	});
+
+	it('skips the holes of a sparse locale list, as Intl does', function () {
+		// eslint-disable-next-line no-sparse-arrays
+		expect(helpers.formatNumber(1234.5, { locale: [, 'de-DE'] as string[] })).toBe('1.234,5');
+	});
+
+	it('rejects a non-number decimals and a non-string unit with a TypeError', function () {
+		expect(function () {
+			helpers.formatPercent(0.5, { decimals: '2' as unknown as number });
+		}).toThrow(new TypeError('formatPercent: `decimals` must be a number, got string'));
+		expect(function () {
+			helpers.formatRelativeTime(1, 5 as unknown as Intl.RelativeTimeFormatUnit);
+		}).toThrow(new TypeError('formatRelativeTime: `unit` must be a string, got number'));
+	});
+
+	it('accepts formatList calls from generic wrappers', function () {
+		function joinAll<U extends Iterable<string>>(items: U): string {
+			return helpers.formatList(items);
+		}
+		function joinArray<U extends readonly string[]>(items: U): string {
+			return helpers.formatList(items);
+		}
+		expect([joinAll(new Set(['a', 'b'])), joinArray(['c'] as const)]).toEqual(['a and b', 'c']);
+	});
+});

@@ -176,9 +176,18 @@ function resolveLocales(locale: LocaleInput | undefined): string[] {
 	if (locale === undefined) return [DEFAULT_LOCALE];
 	if (typeof locale !== 'string' && !Array.isArray(locale)) throw new TypeError(`format: \`locale\` must be a string or an array of strings, got ${describe(locale)}`);
 
-	const requested: string[] = typeof locale === 'string' ? [locale] : [...locale];
+	// `filter` skips the holes of a sparse list, as `Intl` does (a spread would turn them into `undefined`).
+	const requested: string[] = typeof locale === 'string' ? [locale] : locale.filter(present);
 
 	return requested.includes(DEFAULT_LOCALE) ? requested : [...requested, DEFAULT_LOCALE];
+}
+
+/**
+ * Keeps every element (holes are not visited by `filter`).
+ * @returns {boolean} Always `true`
+ */
+function present(): boolean {
+	return true;
 }
 
 /**
@@ -217,6 +226,18 @@ function cacheKey(kind: string, locales: readonly unknown[], options: object): s
 	}
 
 	return key;
+}
+
+/**
+ * A null-prototype copy of the options passed to an `Intl` constructor, which reads them with plain property access: an option inherited
+ * from a polluted `Object.prototype` would otherwise change the formatter without being part of its cache key (and stay cached after the
+ * pollution is removed).
+ * @template O - The options type
+ * @param {O} options - The options (own keys only are meant)
+ * @returns {O} The copy
+ */
+function ownOptions<O>(options: O): O {
+	return Object.assign(Object.create(null) as object, options) as O;
 }
 
 /**
@@ -290,14 +311,14 @@ function getFormatter<T, O>(kind: string, Formatter: new (locales: string[], opt
 	const locales = resolveLocales(locale);
 	const key = cacheKey(kind, locales, options as object);
 
-	if (key === undefined) return new Formatter(locales, options);
+	if (key === undefined) return new Formatter(locales, ownOptions(options));
 
 	// Created on first use: a module-level call would be kept by bundlers even when no formatter is imported.
 	const cache = (formatterCache ??= createLRUCache<string, unknown>({ max: FORMATTER_CACHE_SIZE }));
 	let formatter = cache.get(key) as T | undefined;
 
 	if (formatter === undefined) {
-		formatter = new Formatter(locales, options);
+		formatter = new Formatter(locales, ownOptions(options));
 		cache.set(key, formatter);
 	}
 
@@ -445,7 +466,7 @@ export function formatCurrency(value: number | bigint, currency: string, options
  * @param {FormatPercentOptions} [options={}] - `locale` (default `'en-US'`), `decimals` (exact fraction digits; when omitted, `Intl`'s
  * default of 0 applies unless `minimumFractionDigits`/`maximumFractionDigits` are given) and other `Intl.NumberFormat` options
  * @returns {string} The formatted percentage
- * @throws {TypeError} when `value` is not a number
+ * @throws {TypeError} when `value` or `decimals` is not a number
  * @throws {RangeError} when `value` is `NaN`/`±Infinity`, `decimals` is not an integer from 0 to 20, or the locale or an option is invalid
  * @example
  * formatPercent(0.256); // => '26%'
@@ -459,6 +480,7 @@ export function formatPercent(value: number, options: FormatPercentOptions = {})
 	const { locale, decimals, ...rest } = options;
 
 	if (decimals !== undefined) {
+		if (typeof decimals !== 'number') throw new TypeError(`formatPercent: \`decimals\` must be a number, got ${describe(decimals)}`);
 		if (!Number.isInteger(decimals) || decimals < 0 || decimals > MAX_PERCENT_DECIMALS) {
 			throw new RangeError(`formatPercent: \`decimals\` must be an integer from 0 to ${MAX_PERCENT_DECIMALS}, got ${decimals}`);
 		}
@@ -533,7 +555,7 @@ export function formatUnit(value: number | bigint, unit: string, options: Format
  * formatList(new Set(['x'])); // => 'x'
  * formatList([]); // => ''
  */
-export function formatList<T extends Iterable<string>>(items: T extends string ? never : T, options: FormatListOptions = {}): string {
+export function formatList(items: Iterable<string> & { readonly charAt?: never }, options: FormatListOptions = {}): string {
 	if (typeof items === 'string' || !isIterable(items)) throw new TypeError(`formatList: \`items\` must be an iterable of strings, got ${describe(items)}`);
 
 	const list = Array.from(items);
@@ -569,7 +591,8 @@ export function formatList<T extends Iterable<string>>(items: T extends string ?
  * formatDateTime(new Date(NaN)); // throws RangeError
  */
 export function formatDateTime(date: DateInput, options: FormatDateTimeOptions = {}): string {
-	const time = isDate(date) ? date.getTime() : date;
+	// The intrinsic `getTime` reads the time value itself, as `Intl` does: an overridden `getTime` must not change the date.
+	const time = isDate(date) ? Date.prototype.getTime.call(date) : date;
 
 	if (typeof time !== 'number') throw new TypeError(`formatDateTime: \`date\` must be a Date or a number, got ${describe(date)}`);
 	// The range of `Date` (8.64e15 ms on each side of the epoch), checked without constructing one; `NaN` fails the comparison.
@@ -577,7 +600,8 @@ export function formatDateTime(date: DateInput, options: FormatDateTimeOptions =
 
 	const { locale, ...rest } = options;
 
-	rest.timeZone ??= 'UTC';
+	// An own `timeZone` only (an inherited one is ignored, like every other inherited option).
+	if (!Object.hasOwn(rest, 'timeZone') || rest.timeZone === undefined) rest.timeZone = 'UTC';
 
 	return getFormatter('date', Intl.DateTimeFormat, locale, rest, DATE_MEMO).format(time);
 }
@@ -591,7 +615,7 @@ export function formatDateTime(date: DateInput, options: FormatDateTimeOptions =
  * (plural forms accepted)
  * @param {FormatRelativeTimeOptions} [options={}] - `locale` (default `'en-US'`), `numeric` (default `'always'`) and `style` (default `'long'`)
  * @returns {string} The formatted relative time
- * @throws {TypeError} when `value` is not a number
+ * @throws {TypeError} when `value` is not a number or `unit` is not a string
  * @throws {RangeError} when `value` is `NaN`/`±Infinity`, `unit` is not supported, or the locale or an option is invalid
  * @example
  * formatRelativeTime(3, 'day'); // => 'in 3 days'
@@ -602,6 +626,7 @@ export function formatDateTime(date: DateInput, options: FormatDateTimeOptions =
  */
 export function formatRelativeTime(value: number, unit: Intl.RelativeTimeFormatUnit, options: FormatRelativeTimeOptions = {}): string {
 	assertFiniteNumber('formatRelativeTime', value);
+	assertString('formatRelativeTime', 'unit', unit);
 	const { locale, ...rest } = options;
 
 	return getFormatter('relative', Intl.RelativeTimeFormat, locale, rest, RELATIVE_MEMO).format(value, unit);
