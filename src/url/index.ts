@@ -6,10 +6,23 @@ import { describe } from '../utils/assert.js';
 export type QueryValue = string | number | boolean | bigint | Date;
 
 /**
+ * The value of a key of {@link QueryParams}: a single value or a list of values. `undefined` values are always skipped; `null` values
+ * depend on the `skipNull` option.
+ */
+export type QueryParamValue = QueryValue | ReadonlyArray<QueryValue | undefined | null> | undefined | null;
+
+/**
  * The parameters accepted by {@link buildQueryString} and {@link withQuery}: a single value or a list of values per key.
  * `undefined` values are always skipped; `null` values depend on the `skipNull` option.
  */
-export type QueryParams = Readonly<Record<string, QueryValue | ReadonlyArray<QueryValue | undefined | null> | undefined | null>>;
+export type QueryParams = Readonly<Record<string, QueryParamValue>>;
+
+/**
+ * The parameter objects accepted by {@link buildQueryString} and {@link withQuery}: like {@link QueryParams}, but checked key by key, so
+ * that an `interface` (which has no index signature) is accepted too.
+ * @template P - The parameters type
+ */
+export type QueryParamsOf<P> = { readonly [K in keyof P]: QueryParamValue };
 
 /**
  * How {@link buildQueryString} serializes arrays:
@@ -101,7 +114,7 @@ function serializeValue(key: string, value: unknown): string {
  * - Numbers, booleans and bigints use `String()`; dates use `toISOString()`.
  * - Arrays follow `arrayFormat`; an empty array writes nothing.
  * - Only own enumerable string keys are read, in object order unless `sort` is set.
- * @param {QueryParams} params - The parameters
+ * @param {QueryParamsOf<P>} input - The parameters
  * @param {BuildQueryStringOptions} [options={}] - `arrayFormat` (default `'repeat'`), `skipNull` (default `true`) and `sort` (default `false`)
  * @returns {string} The query string, `''` when nothing is written
  * @throws {RangeError} when `arrayFormat` is unknown or a `Date` is invalid
@@ -112,7 +125,8 @@ function serializeValue(key: string, value: unknown): string {
  * buildQueryString({ tags: ['a', 'b,c'] }, { arrayFormat: 'comma' }); // => 'tags=a,b%2Cc'
  * buildQueryString({ b: 1, a: null, c: undefined }, { skipNull: false, sort: true }); // => 'a&b=1'
  */
-export function buildQueryString(params: QueryParams, options: BuildQueryStringOptions = {}): string {
+export function buildQueryString<P extends QueryParamsOf<P>>(input: P, options: BuildQueryStringOptions = {}): string {
+	const params = input as QueryParams;
 	const { arrayFormat = 'repeat', skipNull = true, sort = false } = options;
 
 	if (!ARRAY_FORMATS.has(arrayFormat)) throw new RangeError(`buildQueryString: \`arrayFormat\` must be 'repeat', 'comma' or 'brackets', got ${String(arrayFormat)}`);
@@ -280,7 +294,7 @@ function splitUrl(url: string): { base: string; query: string; hash: string } {
  * with `options` (which apply to the appended pairs only). A `null` value therefore removes the key (with the default `skipNull: true`).
  * The fragment is preserved at the end; a dangling `?` is dropped when no pair remains.
  * @param {string} url - The URL (absolute or relative)
- * @param {QueryParams} params - The parameters to set
+ * @param {QueryParamsOf<P>} input - The parameters to set
  * @param {BuildQueryStringOptions} [options={}] - Serialization options for the new parameters
  * @returns {string} The URL with the merged query
  * @throws {RangeError} see {@link buildQueryString}
@@ -291,7 +305,8 @@ function splitUrl(url: string): { base: string; query: string; hash: string } {
  * withQuery('/list', {}); // => '/list'
  * withQuery('/list?id[]=1&id=2', { 'id[]': [3] }); // => '/list?id%5B%5D=3'
  */
-export function withQuery(url: string, params: QueryParams, options: BuildQueryStringOptions = {}): string {
+export function withQuery<P extends QueryParamsOf<P>>(url: string, input: P, options: BuildQueryStringOptions = {}): string {
+	const params = input as QueryParams;
 	const { base, query, hash } = splitUrl(url);
 	// Keys are compared without their `[]` suffix on both sides, so `a` and `a[]` replace each other.
 	const replaced = new Set<string>();
@@ -560,12 +575,11 @@ export function isSafeUrl(url: string, options: IsSafeUrlOptions = {}): boolean 
 
 /**
  * Returns the URL when {@link isSafeUrl} accepts it, else the fallback. A safe URL is returned unchanged: still set it through the DOM or
- * HTML-escape it when building markup (see {@link isSafeUrl}).
- * @template F - The type of the fallback
+ * HTML-escape it when building markup (see {@link isSafeUrl}). Any other `fallback` is returned as is (the second overload).
  * @param {string} url - The user-supplied URL
- * @param {F} [fallback='about:blank'] - What to return instead of an unsafe URL (`null` to omit the attribute: `undefined` selects the default)
+ * @param {undefined} [fallback] - Omitted or `undefined`: an unsafe URL becomes `'about:blank'` (pass `null` to omit the attribute)
  * @param {IsSafeUrlOptions} [options={}] - See {@link isSafeUrl}
- * @returns {string | F} `url` or `fallback`
+ * @returns {string} `url` or `'about:blank'`
  * @throws {TypeError} see {@link isSafeUrl}
  * @throws {RangeError} see {@link isSafeUrl}
  * @example
@@ -574,7 +588,24 @@ export function isSafeUrl(url: string, options: IsSafeUrlOptions = {}): boolean 
  * sanitizeUrl('JAVASCRIPT:alert(1)', '#'); // => '#'
  * sanitizeUrl('vbscript:x', null); // => null
  */
-export function sanitizeUrl<F = string>(url: string, fallback: F = 'about:blank' as F, options: IsSafeUrlOptions = {}): string | F {
+export function sanitizeUrl(url: string, fallback?: undefined, options?: IsSafeUrlOptions): string;
+/**
+ * Returns the URL when {@link isSafeUrl} accepts it, else `fallback` (see the first overload).
+ * @template F - The type of the fallback
+ * @param {string} url - The user-supplied URL
+ * @param {F} fallback - What to return instead of an unsafe URL
+ * @param {IsSafeUrlOptions} [options={}] - See {@link isSafeUrl}
+ * @returns {string | F} `url` or `fallback`
+ */
+export function sanitizeUrl<F>(url: string, fallback: F, options?: IsSafeUrlOptions): string | F;
+/**
+ * Implementation of {@link sanitizeUrl}.
+ * @param {string} url - The user-supplied URL
+ * @param {unknown} [fallback='about:blank'] - What to return instead of an unsafe URL
+ * @param {IsSafeUrlOptions} [options={}] - See {@link isSafeUrl}
+ * @returns {unknown} `url` or `fallback`
+ */
+export function sanitizeUrl(url: string, fallback: unknown = 'about:blank', options: IsSafeUrlOptions = {}): unknown {
 	return isSafeUrl(url, options) ? url : fallback;
 }
 

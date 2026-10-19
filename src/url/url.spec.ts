@@ -2,6 +2,21 @@ import * as helpers from '.';
 
 describe('URL helpers', function () {
 	describe('buildQueryString', function () {
+		it('accepts parameters declared with an interface', function () {
+			interface Filters {
+				q: string;
+				page?: number;
+				tags: readonly string[];
+			}
+			const filters: Filters = { q: 'a b', tags: ['x', 'y'] };
+			expect(helpers.buildQueryString(filters)).toBe('q=a%20b&tags=x&tags=y');
+			expect(helpers.withQuery('/s', filters)).toBe('/s?q=a%20b&tags=x&tags=y');
+			expect(function () {
+				// @ts-expect-error a nested object is not a query value
+				helpers.buildQueryString({ nested: { a: 1 } });
+			}).toThrow(TypeError);
+		});
+
 		it('should encode keys and values without a leading ?', function () {
 			expect(helpers.buildQueryString({ q: 'hello world', page: 2 })).toBe('q=hello%20world&page=2');
 			expect(helpers.buildQueryString({ 'a&b': 'c=d', e: '#?/+' })).toBe('a%26b=c%3Dd&e=%23%3F%2F%2B');
@@ -449,6 +464,12 @@ describe('URL helpers', function () {
 
 describe('URL helpers (round 11)', function () {
 	describe('isSafeUrl / sanitizeUrl', function () {
+		it('types an explicit undefined fallback as the default, a string', function () {
+			const url: string = helpers.sanitizeUrl('javascript:x', undefined, { protocols: ['https:'] });
+			const maybe: string | null = helpers.sanitizeUrl('javascript:x', null);
+			expect([url, maybe]).toEqual(['about:blank', null]);
+		});
+
 		it('should allow the default schemes, in any case', function () {
 			for (const url of ['https://example.com', 'http://x', 'HTTPS://X', 'mailto:a@b.c', 'tel:+123', 'Https:host']) expect(helpers.isSafeUrl(url)).toBe(true);
 		});
