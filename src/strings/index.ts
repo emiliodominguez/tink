@@ -1,4 +1,4 @@
-import { assertInteger, assertNumber, describe, draw, ownOptions, show } from '../utils/assert.js';
+import { assertInteger, assertNumber, describe, draw, readOption, show } from '../utils/assert.js';
 import type { RandomGenerator } from '../utils/index.js';
 import { isNumericString } from '../validate/index.js';
 
@@ -691,8 +691,9 @@ export function countSubString(string: string, subString: string, options: Count
 	assertString('countSubString', 'subString', subString);
 	if (subString === '') return 0;
 
-	const haystack = options.ignoreCase ? foldCase(string) : string;
-	const needle = options.ignoreCase ? foldCase(subString) : subString;
+	const ignoreCase = readOption(options, 'ignoreCase');
+	const haystack = ignoreCase ? foldCase(string) : string;
+	const needle = ignoreCase ? foldCase(subString) : subString;
 	let count = 0;
 	let index = haystack.indexOf(needle);
 
@@ -741,9 +742,9 @@ export function getWords(string: string): string[] {
  */
 export function isPalindrome(string: string, options: IsPalindromeOptions = {}): boolean {
 	assertString('isPalindrome', 'string', string);
-	let candidate = options.ignoreNonAlphanumeric ? string.replace(/[^\p{L}\p{M}\p{N}]/gu, '') : string;
+	let candidate = readOption(options, 'ignoreNonAlphanumeric') ? string.replace(/[^\p{L}\p{M}\p{N}]/gu, '') : string;
 
-	if (options.ignoreCase) candidate = foldCase(candidate);
+	if (readOption(options, 'ignoreCase')) candidate = foldCase(candidate);
 
 	return candidate === reverse(candidate);
 }
@@ -1247,7 +1248,8 @@ export interface WordWrapOptions {
 export function wordWrap(string: string, width: number, options: WordWrapOptions = {}): string {
 	assertInteger('wordWrap', 'width', width, 1, true);
 
-	const { breakLongWords = false, newline = '\n' } = ownOptions(options);
+	const breakLongWords = readOption(options, 'breakLongWords', false);
+	const newline = readOption(options, 'newline', '\n');
 	if (typeof newline !== 'string') throw new TypeError(`wordWrap: \`newline\` must be a string, got ${describe(newline)}`);
 	const output: string[] = [];
 
@@ -1318,7 +1320,9 @@ export interface MaskOptions {
  * mask('1234'); // => '****'
  */
 export function mask(string: string, options: MaskOptions = {}): string {
-	const { visibleStart = 0, visibleEnd = 4, char = '*' } = ownOptions(options);
+	const visibleStart = readOption(options, 'visibleStart', 0);
+	const visibleEnd = readOption(options, 'visibleEnd', 4);
+	const char = readOption(options, 'char', '*');
 
 	assertInteger('mask', 'visibleStart', visibleStart);
 	assertInteger('mask', 'visibleEnd', visibleEnd);
@@ -1687,7 +1691,7 @@ const WORD_CASES: ReadonlySet<string> = new Set<WordCase>(['lower', 'upper', 'ca
  * toDelimitedCase('XMLHttpRequest', ':', { case: 'preserve' }); // => 'XML:Http:Request'
  */
 export function toDelimitedCase(string: string, delimiter: string, options: DelimitedCaseOptions = {}): string {
-	const { case: wordCase = 'lower' } = ownOptions(options);
+	const wordCase = readOption(options, 'case', 'lower');
 
 	if (typeof delimiter !== 'string') throw new TypeError(`toDelimitedCase: \`delimiter\` must be a string, got ${describe(delimiter)}`);
 
@@ -1966,7 +1970,7 @@ export function compareNatural(a: string, b: string, options: CompareNaturalOpti
 
 	if (a === b) return 0;
 
-	const order = ownOptions(options).ignoreCase === true ? compareRuns(foldCase(a), foldCase(b)) : compareRuns(a, b);
+	const order = readOption(options, 'ignoreCase') === true ? compareRuns(foldCase(a), foldCase(b)) : compareRuns(a, b);
 
 	return order !== 0 ? order : a < b ? -1 : 1;
 }
@@ -2011,7 +2015,8 @@ export function truncateMiddle(string: string, length: number, options: Truncate
 	assertString('truncateMiddle', 'string', string);
 	assertInteger('truncateMiddle', 'length', length);
 
-	const { ellipsis = '…', position = 0.5 } = ownOptions(options);
+	const ellipsis = readOption(options, 'ellipsis', '…');
+	const position = readOption(options, 'position', 0.5);
 
 	assertString('truncateMiddle', 'ellipsis', ellipsis);
 	assertNumber('truncateMiddle', 'position', position, typeof position === 'number' && position >= 0 && position <= 1, 'a number between 0 and 1');

@@ -127,13 +127,22 @@ export function draw(caller: string, random: RandomGenerator): number {
 }
 
 /**
- * Copies the own enumerable properties of an options object into a null-prototype object, so that destructuring it never reads an
- * option from a polluted `Object.prototype` (and each own getter runs once).
- * @template T - The options type
- * @param {T} options - The options
- * @returns {T} The own options
+ * Reads a property of an options object (or of an input object) once, ignoring a value inherited from a polluted `Object.prototype`:
+ * own properties are read, and so are properties of the object's own prototypes (class getters, proxies), but never a key that only
+ * `Object.prototype` holds. Allocation-free, for hot paths.
+ * @template O - The options type
+ * @template K - The key
+ * @template D - The fallback type
+ * @param {O} options - The options (`null` and `undefined` throw a `TypeError`, like destructuring them)
+ * @param {K} key - The option name
+ * @param {D} [fallback] - Returned instead of `undefined`
+ * @returns {Exclude<O[K], undefined> | D} The value, or `fallback` when it is `undefined` or only inherited from `Object.prototype`
  * @internal
  */
-export function ownOptions<T extends object>(options: T): T {
-	return Object.assign(Object.create(null) as T, options);
+export function readOption<O extends object, K extends keyof O & string, D = undefined>(options: O, key: K, fallback?: D): Exclude<O[K], undefined> | D {
+	const value = hasOwn.call(options, key) || !hasOwn.call(Object.prototype, key) ? options[key] : undefined;
+	return (value === undefined ? fallback : value) as Exclude<O[K], undefined> | D;
 }
+
+/** `Object.prototype.hasOwnProperty`, captured before any user code runs. */
+const hasOwn = Object.prototype.hasOwnProperty;

@@ -1,5 +1,5 @@
 import type { Unsubscribe } from '../emitter/index.js';
-import { assertFunction, assertInteger, assertNumber, describe } from '../utils/assert.js';
+import { assertFunction, assertInteger, assertNumber, describe, readOption } from '../utils/assert.js';
 
 export type { Unsubscribe } from '../emitter/index.js';
 
@@ -979,10 +979,11 @@ export function createHistory<S>(store: HistorySource<S>, options: HistoryOption
 	assertFunction('createHistory', 'store.setState', setState);
 	assertFunction('createHistory', 'store.subscribe', subscribe);
 	if (!isObject(options)) throw new TypeError(`createHistory: \`options\` must be an object, got ${describe(options)}`);
-	// Own properties only: a polluted `Object.prototype` cannot set a limit or a coalescing window.
-	const limit = (own(options as Record<string, unknown>, 'limit') ?? Infinity) as number;
-	const coalesce = (own(options as Record<string, unknown>, 'coalesce') ?? 0) as number;
-	const now = (own(options as Record<string, unknown>, 'now') ?? Date.now) as () => number;
+	// A polluted `Object.prototype` cannot set a limit or a coalescing window.
+	const settings: HistoryOptions = options;
+	const limit = readOption(settings, 'limit', Infinity);
+	const coalesce = readOption(settings, 'coalesce', 0);
+	const now = readOption(settings, 'now', Date.now);
 	assertInteger('createHistory', 'options.limit', limit, 1, true);
 	assertNumber('createHistory', 'options.coalesce', coalesce, coalesce >= 0, 'a number >= 0');
 	assertFunction('createHistory', 'options.now', now);

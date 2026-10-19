@@ -11,7 +11,7 @@ import {
 	type StandardSchemaResult,
 	type StandardSchemaV1
 } from '../guards/index.js';
-import { describe, show } from '../utils/assert.js';
+import { describe, readOption, show } from '../utils/assert.js';
 import type { AnyFunction } from '../utils/index.js';
 import { generate } from '../utils/jit.js';
 import { hold, isTooDeep, PENDING, release, scope } from '../utils/memo.js';
@@ -3532,6 +3532,25 @@ function processEnv(): object {
 }
 
 /**
+ * Tells whether `env` is `Deno.env`, or an object like it whose variables are read through `get` and `toObject` methods: the runtime's
+ * own object, or an object with such methods (not inherited from a polluted `Object.prototype`) and no string property, so that variables
+ * named `get` or `toObject` do not make a real environment look like one.
+ * @param {object} env - The environment
+ * @returns {boolean} `true` for `Deno.env`
+ */
+function isDenoEnv(env: object): boolean {
+	const deno = (globalThis as unknown as { Deno?: { env?: unknown } }).Deno;
+	if (typeof deno === 'object' && deno !== null && env === deno.env) return true;
+
+	// `in` first: an environment without the methods has none of its properties read here.
+	if (!('get' in env && 'toObject' in env)) return false;
+	const methods = env as { get?: unknown; toObject?: unknown };
+	if (typeof readOption(methods, 'get') !== 'function' || typeof readOption(methods, 'toObject') !== 'function') return false;
+	for (const key of Object.keys(env)) if (typeof (env as Record<string, unknown>)[key] === 'string') return false;
+	return true;
+}
+
+/**
  * Throws unless `env` is an object holding the variables as properties: a `Map` or Deno's `Deno.env` (whose variables are read through
  * methods) would make every variable look unset.
  * @param {unknown} env - The environment
@@ -3542,10 +3561,7 @@ function assertEnv(env: unknown): asserts env is object {
 	if (typeof env !== 'object' || env === null) throw new TypeError(`parseEnv: \`env\` must be an object, got ${describe(env)}`);
 	if (isMap(env)) throw new TypeError('parseEnv: `env` must be an object of variables, got Map (pass `Object.fromEntries(map)`)');
 
-	const methods = env as { get?: unknown; toObject?: unknown };
-
-	// `Deno.env` has its methods on its own prototype: a plain object whose `Object.prototype` was polluted with both is no `Deno.env`.
-	if (Object.keys(env).length === 0 && Object.getPrototypeOf(env) !== Object.prototype && typeof methods.get === 'function' && typeof methods.toObject === 'function') {
+	if (isDenoEnv(env)) {
 		throw new TypeError('parseEnv: `env` must be an object of variables, got an object with `get` and `toObject` methods (pass `Deno.env.toObject()`)');
 	}
 }

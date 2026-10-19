@@ -1,4 +1,4 @@
-import { assertInteger, assertNumber, describe, draw, ownOptions, show } from '../utils/assert.js';
+import { assertInteger, assertNumber, describe, draw, readOption, show } from '../utils/assert.js';
 import type { RandomGenerator } from '../utils/index.js';
 
 /**
@@ -704,7 +704,7 @@ export function mode(numbers: ReadonlyArray<number>): number[] {
  * variance([]); // => NaN
  */
 export function variance(numbers: ReadonlyArray<number>, options: VarianceOptions = {}): number {
-	const sample = options.sample === true;
+	const sample = readOption(options, 'sample') === true;
 	const [count, squaredDistance, allFinite] = welford(numbers, 1);
 	const divisor = sample ? count - 1 : count;
 	if (divisor <= 0 || !allFinite) return NaN;
@@ -765,7 +765,7 @@ export function standardDeviation(numbers: ReadonlyArray<number>, options: Varia
 	if (result !== Infinity) return Math.sqrt(result);
 	// The variance overflows although every value is finite, but its square root (at most half the range) does not: take the root of
 	// the scaled variance, then scale back by 2 ** 600.
-	return Math.sqrt(scaledVariance(numbers, options.sample === true ? numbers.length - 1 : numbers.length)) * 2 ** 600;
+	return Math.sqrt(scaledVariance(numbers, readOption(options, 'sample') === true ? numbers.length - 1 : numbers.length)) * 2 ** 600;
 }
 
 /**
@@ -1095,7 +1095,8 @@ export function cumulativeSum(numbers: Iterable<number>): number[] {
  * approximatelyEqual(1e-12, 0, { absolute: 1e-9 }); // => true
  */
 export function approximatelyEqual(a: number, b: number, options: ApproximatelyEqualOptions = {}): boolean {
-	const { relative = 1e-9, absolute = 0 } = ownOptions(options);
+	const relative = readOption(options, 'relative', 1e-9);
+	const absolute = readOption(options, 'absolute', 0);
 	assertNumber('approximatelyEqual', 'relative', relative, relative >= 0, 'a number >= 0');
 	assertNumber('approximatelyEqual', 'absolute', absolute, absolute >= 0, 'a number >= 0');
 	if (a === b) return true;
@@ -1216,7 +1217,8 @@ function inUnit(bytes: number, base: number, exponent: number): number {
  * formatBytes(-2048, { base: 1024 }); // => '-2 KiB'
  */
 export function formatBytes(bytes: number, options: FormatBytesOptions = {}): string {
-	const { decimals = 1, base = 1000 } = ownOptions(options);
+	const decimals = readOption(options, 'decimals', 1);
+	const base = readOption(options, 'base', 1000);
 	assertNumber('formatBytes', 'bytes', bytes, Number.isFinite(bytes), 'a finite number');
 	assertInteger('formatBytes', 'decimals', decimals);
 	assertByteBase('formatBytes', base);
@@ -1282,7 +1284,7 @@ const BYTES_REGEX = /^\s*(-?(?:\d+(?:\.\d+)?|\.\d+))(?:[eE]([+-]?\d+))?(?:\s*([A
  * parseBytes('12 apples'); // throws RangeError
  */
 export function parseBytes(value: string, options: ParseBytesOptions = {}): number {
-	const { base = 1000 } = ownOptions(options);
+	const base = readOption(options, 'base', 1000);
 	assertByteBase('parseBytes', base);
 	if (typeof value !== 'string') throw new TypeError(`parseBytes: \`value\` must be a string, got ${describe(value)}`);
 	const match = BYTES_REGEX.exec(value);
@@ -1877,7 +1879,9 @@ function finiteBound(name: string, value: unknown): number {
  * histogram([1, NaN]); // throws RangeError
  */
 export function histogram(values: ReadonlyArray<number>, options: HistogramOptions = {}): HistogramBin[] {
-	const { bins, thresholds, domain } = ownOptions(options);
+	const bins = readOption(options, 'bins');
+	const thresholds = readOption(options, 'thresholds');
+	const domain = readOption(options, 'domain');
 	if (bins !== undefined && thresholds !== undefined) throw new TypeError('histogram: `bins` and `thresholds` cannot be used together');
 	if (bins !== undefined) assertNumber('histogram', 'bins', bins, Number.isInteger(bins) && bins >= 1 && bins <= MAX_BINS, `an integer between 1 and ${MAX_BINS}`);
 	// Each option element is read once: the values validated are the values used.

@@ -32,6 +32,17 @@ aboutBuilder('x');
 aboutBuilder({ id: 1 });
 // @ts-expect-error an optional parameter does not make a primitive acceptable either
 compilePath('/:lang?')(42);
+// Builders without required parameters fit a route table of optional-parameter builders, and `PathBuilder<string>`.
+const routeTable = { home: compilePath('/'), about: compilePath('/about'), docs: compilePath('/docs/:page?') } satisfies Record<
+	string,
+	(params?: Record<string, string>) => string
+>;
+const anyBuilder: PathBuilder<string> = compilePath('/about');
+const linkTo: (params?: Record<string, string>) => string = compilePath('/about');
+const unionBuilder: PathBuilder<'/a/:x?' | '/about'> = compilePath('/about');
+// @ts-expect-error a builder that requires parameters does not fit a builder type with optional ones
+const requiredLink: (params?: Record<string, string>) => string = compilePath('/users/:id');
+void [routeTable, anyBuilder, linkTo, unionBuilder, requiredLink];
 const dynamicParam: string | undefined = matchPath('/x/:y' as string, '/x/1')?.y;
 
 const sharedPatch: { a: number[] } = replaceEqualDeep({ a: [1] } as unknown, { a: [1, 2] });

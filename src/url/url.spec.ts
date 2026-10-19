@@ -1323,6 +1323,17 @@ describe('route patterns (review regressions)', function () {
 		assertType<Equals<helpers.PathParams<'/.well-known/:a/:ab/*b'>, { a: string; ab: string; b: string }>>(true);
 		assertType<Equals<helpers.PathParamsInput<'/about'>, Readonly<Record<string, never>>>>(true);
 		assertType<Equals<helpers.PathParamsInput<'/a/:x' | '/about'>, { x: string | number } | Readonly<Record<string, never>>>>(true);
+		// A builder without required parameters fits a route table of builders with optional ones.
+		const routes = { home: helpers.compilePath('/'), about: helpers.compilePath('/about'), docs: helpers.compilePath('/docs/:page?') } satisfies Record<
+			string,
+			(params?: Record<string, string>) => string
+		>;
+		const any: helpers.PathBuilder<string> = routes.about;
+		expect([routes.home(), routes.about({}), routes.docs({ page: 'x' }), any()]).toEqual(['/', '/about', '/docs/x', '/about']);
+		expect(function () {
+			// @ts-expect-error a primitive is still rejected by a direct call
+			routes.about(42);
+		}).toThrow(TypeError);
 		// Long patterns stay within the compiler's recursion limits.
 		type LongP = '/:p1/:p2/:p3/:p4/:p5/:p6/:p7/:p8/:p9/:p10/:p11/:p12/:p13/:p14/:p15/:p16/:p17/:p18/:p19/:p20/:p21/:p22/:p23/:p24/:p25/:p26/:p27/:p28/:p29/:p30';
 		type LongQ = '/:q1/:q2/:q3/:q4/:q5/:q6/:q7/:q8/:q9/:q10/:q11/:q12/:q13/:q14/:q15/:q16/:q17/:q18/:q19/:q20/:q21/:q22/:q23/:q24/:q25/:q26/:q27/:q28/:q29/:q30';
@@ -1367,6 +1378,19 @@ describe('route patterns (review regressions)', function () {
 		expect(helpers.buildQueryString({ a: [1] }, options)).toBe('a[]=1');
 		expect(reads).toBe(1);
 		expect(helpers.isSafeUrl('ftp://x', Object.assign(Object.create(null) as object, { protocols: ['ftp:'] }))).toBe(true);
+		// withQuery reports its own name.
+		expect(function () {
+			helpers.withQuery('/x', { a: 1 }, null as never);
+		}).toThrow(new TypeError('withQuery: `options` must be an object, got null'));
+		expect(function () {
+			helpers.withQuery('/x', { a: 1 }, { arrayFormat: 'x' as never });
+		}).toThrow(new RangeError("withQuery: `arrayFormat` must be 'repeat', 'comma' or 'brackets', got x"));
+		expect(function () {
+			helpers.withQuery('/x', { a: [new Date(NaN)] });
+		}).toThrow(new RangeError('withQuery: `params.a` must be a valid Date, got Invalid Date'));
+		expect(function () {
+			helpers.withQuery('/x', { a: {} as never });
+		}).toThrow(new TypeError('withQuery: `params.a` must be a string, number, boolean, bigint or Date, got object'));
 		for (const bad of [null, 'comma']) {
 			expect(function () {
 				helpers.buildQueryString({ a: 1 }, bad as never);

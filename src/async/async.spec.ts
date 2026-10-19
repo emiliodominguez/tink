@@ -3862,6 +3862,18 @@ describe('createBatcher', function () {
 			expect(reads).toBe(1);
 		});
 
+		it('rejects a loadMany with an aborted signal without calling the key function, like load', async function () {
+			const controller = new AbortController();
+			controller.abort(new AbortError('already aborted'));
+			const key = jest.fn(function (value: number) {
+				return value;
+			});
+			const batcher = createBatcher(recorder().batchLoad, { key });
+			await expect(batcher.loadMany([1, 2], { signal: controller.signal })).rejects.toThrow('already aborted');
+			await expect(batcher.load(1, { signal: controller.signal })).rejects.toThrow('already aborted');
+			expect(key).not.toHaveBeenCalled();
+		});
+
 		it('rejects a load whose key function aborts its signal, without requesting the key', async function () {
 			const controller = new AbortController();
 			const { calls, batchLoad } = recorder();

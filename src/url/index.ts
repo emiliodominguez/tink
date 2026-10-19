@@ -92,25 +92,26 @@ function decodeComponent(value: string): string {
 
 /**
  * Serializes a single value.
+ * @param {string} caller - Name of the public function, used in error messages
  * @param {string} key - The key, for error messages
  * @param {unknown} value - The value to serialize
  * @returns {string} The serialized (not yet encoded) value
  * @throws {RangeError} when `value` is an invalid `Date`
  * @throws {TypeError} when `value` is not a string, number, boolean, bigint or `Date`
  */
-function serializeValue(key: string, value: unknown): string {
+function serializeValue(caller: string, key: string, value: unknown): string {
 	if (typeof value === 'string') return value;
 
 	if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
 
 	// `isDate` also recognizes dates of other realms; the intrinsics read the time value itself (not an overridden `getTime`).
 	if (isDate(value)) {
-		if (Number.isNaN(Date.prototype.getTime.call(value))) throw new RangeError(`buildQueryString: \`params.${key}\` must be a valid Date, got Invalid Date`);
+		if (Number.isNaN(Date.prototype.getTime.call(value))) throw new RangeError(`${caller}: \`params.${key}\` must be a valid Date, got Invalid Date`);
 
 		return Date.prototype.toISOString.call(value);
 	}
 
-	throw new TypeError(`buildQueryString: \`params.${key}\` must be a string, number, boolean, bigint or Date, got ${describe(value)}`);
+	throw new TypeError(`${caller}: \`params.${key}\` must be a string, number, boolean, bigint or Date, got ${describe(value)}`);
 }
 
 /**
@@ -135,7 +136,7 @@ function serializeValue(key: string, value: unknown): string {
  * buildQueryString({ b: 1, a: null, c: undefined }, { skipNull: false, sort: true }); // => 'a&b=1'
  */
 export function buildQueryString<P extends QueryParamsOf<P>>(input: P & NotAnArray<P>, options: BuildQueryStringOptions = {}): string {
-	return buildFromEntries(entriesOf(input as QueryParams), options);
+	return buildFromEntries('buildQueryString', entriesOf(input as QueryParams), options);
 }
 
 /**
@@ -152,17 +153,18 @@ function entriesOf(params: QueryParams): Array<[string, QueryParamValue]> {
 
 /**
  * {@link buildQueryString} from already read entries.
+ * @param {string} caller - Name of the public function, used in error messages
  * @param {Array<[string, QueryParamValue]>} entries - The parameters, as `[key, value]` pairs
  * @param {BuildQueryStringOptions} options - The options
  * @returns {string} The query string
  */
-function buildFromEntries(entries: Array<[string, QueryParamValue]>, options: BuildQueryStringOptions): string {
-	if (typeof options !== 'object' || options === null) throw new TypeError(`buildQueryString: \`options\` must be an object, got ${describe(options)}`);
+function buildFromEntries(caller: string, entries: Array<[string, QueryParamValue]>, options: BuildQueryStringOptions): string {
+	if (typeof options !== 'object' || options === null) throw new TypeError(`${caller}: \`options\` must be an object, got ${describe(options)}`);
 
 	// Own options only (read once each): a polluted `Object.prototype.arrayFormat` or `sort` must not change the query string.
 	const { arrayFormat = 'repeat', skipNull = true, sort = false } = Object.assign(Object.create(null) as object, options) as BuildQueryStringOptions;
 
-	if (!ARRAY_FORMATS.has(arrayFormat)) throw new RangeError(`buildQueryString: \`arrayFormat\` must be 'repeat', 'comma' or 'brackets', got ${show(arrayFormat)}`);
+	if (!ARRAY_FORMATS.has(arrayFormat)) throw new RangeError(`${caller}: \`arrayFormat\` must be 'repeat', 'comma' or 'brackets', got ${show(arrayFormat)}`);
 
 	if (sort) {
 		entries = entries.slice().sort(function (a: [string, QueryParamValue], b: [string, QueryParamValue]): number {
@@ -192,7 +194,7 @@ function buildFromEntries(entries: Array<[string, QueryParamValue]>, options: Bu
 		}
 
 		if (!Array.isArray(value)) {
-			query += separator + name + '=' + encodeComponent(serializeValue(key, value));
+			query += separator + name + '=' + encodeComponent(serializeValue(caller, key, value));
 			separator = '&';
 			continue;
 		}
@@ -209,7 +211,7 @@ function buildFromEntries(entries: Array<[string, QueryParamValue]>, options: Bu
 			if (item == null) continue;
 
 			// The first item opens the key's pair; the next ones are appended with `,` or as pairs of their own.
-			query += (written ? itemSeparator : separator + prefix) + encodeComponent(serializeValue(key, item));
+			query += (written ? itemSeparator : separator + prefix) + encodeComponent(serializeValue(caller, key, item));
 			written = true;
 		}
 
@@ -370,7 +372,7 @@ export function withQuery<P extends QueryParamsOf<P>>(url: string, input: P & No
 
 		return !replaced.has(withoutBrackets(key));
 	});
-	const added = buildFromEntries(entries, options);
+	const added = buildFromEntries('withQuery', entries, options);
 
 	if (added !== '') pairs.push(added);
 
@@ -1096,13 +1098,25 @@ export type PathParamsInput<P extends string> = P extends unknown ? WithoutKeys<
  * `T`, or an object type accepting no keys (nor a primitive, unlike `{}`) when `T` has none.
  * @template T - An object type
  */
-type WithoutKeys<T> = [keyof T] extends [never] ? Readonly<Record<string, never>> : T;
+type WithoutKeys<T> = [keyof T] extends [never] ? NoParams : T;
+
+/** The parameters of a pattern without any: an object without keys. */
+type NoParams = Readonly<Record<string, never>>;
 
 /**
  * The function {@link compilePath} returns: it builds a pathname from parameters (which may be omitted when the pattern requires none).
+ * For a pattern without parameters, it is overloaded: called without arguments it still fits any builder type that takes optional
+ * parameters (`(params?: Record<string, string>) => string`, `PathBuilder<string>`), while a direct call with a primitive or a key is
+ * rejected.
  * @template P - The pattern
  */
-export type PathBuilder<P extends string> = Record<never, never> extends PathParamsInput<P> ? (params?: PathParamsInput<P>) => string : (params: PathParamsInput<P>) => string;
+export type PathBuilder<P extends string> = [PathParamsInput<P>] extends [never]
+	? (params: never) => string
+	: [PathParamsInput<P>] extends [NoParams]
+		? { (): string; (params: NoParams | undefined): string }
+		: Record<never, never> extends PathParamsInput<P>
+			? (params?: PathParamsInput<P>) => string
+			: (params: PathParamsInput<P>) => string;
 
 /**
  * Options accepted by {@link matchPath}.

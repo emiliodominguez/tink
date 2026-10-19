@@ -2316,7 +2316,7 @@ export function createBatcher<K, V>(batchLoad: BatchLoadFunction<K, V>, options:
 	 */
 	function request(key: unknown, signal: AbortSignalLike | null | undefined, known?: { id: unknown }): Promise<unknown> {
 		return new Promise<unknown>(function (resolve, reject) {
-			// Checked for every key: the `key` function or the cache of an earlier key of a `loadMany` may have aborted it.
+			// Checked for every key: the `key` functions of a `loadMany`, or the cache of an earlier key, may have aborted it.
 			if (signal?.aborted) throw abortReason(signal);
 
 			const id = known === undefined ? identify(key) : known.id;
@@ -2396,6 +2396,8 @@ export function createBatcher<K, V>(batchLoad: BatchLoadFunction<K, V>, options:
 				}
 				signal = signalOption('Batcher.loadMany', loadOptions);
 				list = Array.from(keys);
+				// Like `load`: an aborted signal wins over the `key` function, which is then never called.
+				if (signal?.aborted) throw abortReason(signal);
 				ids = list.map(identify);
 			} catch (error) {
 				return Promise.reject(error);

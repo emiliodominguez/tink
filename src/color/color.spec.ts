@@ -748,6 +748,43 @@ describe('Color helpers under prototype pollution', function () {
 		}
 	});
 
+	it('still reads components and options from class getters, proxies and custom prototypes', function () {
+		class Lch {
+			constructor(private readonly coords: [number, number, number]) {}
+			get l(): number {
+				return this.coords[0];
+			}
+			get c(): number {
+				return this.coords[1];
+			}
+			get h(): number {
+				return this.coords[2];
+			}
+		}
+		const red = { r: 255, g: 0, b: 0, a: 1 };
+		expect(helpers.oklchToRgb(new Lch([0.627955, 0.257683, 29.2339]))).toEqual(red);
+		const proxy = new Proxy(
+			{},
+			{
+				get(_target, key) {
+					return ({ l: 0.627955, c: 0.257683, h: 29.2339 } as Record<PropertyKey, number>)[key];
+				}
+			}
+		);
+		expect(helpers.oklchToRgb(proxy as helpers.Oklch)).toEqual(red);
+		const inherited = Object.assign(Object.create({ h: 120 }), { l: 0.7, c: 0.1 }) as helpers.Oklch;
+		expect(helpers.oklchToRgb(inherited)).toEqual(helpers.oklchToRgb({ l: 0.7, c: 0.1, h: 120 }));
+		class MixOptions {
+			get space(): 'oklch' {
+				return 'oklch';
+			}
+		}
+		expect(helpers.mix('#00f', '#ff0', 0.5, new MixOptions())).toEqual(helpers.mix('#00f', '#ff0', 0.5, { space: 'oklch' }));
+		expect(function () {
+			helpers.mix('#00f', '#ff0', 0.5, null as unknown as helpers.MixOptions);
+		}).toThrow(TypeError);
+	});
+
 	it('never reads a missing OKLab / OKLCH component from Object.prototype', function () {
 		const keys = Object.prototype as Record<string, unknown>;
 		keys.h = 250;

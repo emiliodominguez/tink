@@ -1430,6 +1430,46 @@ describe('parseEnv', function () {
 			expect(parseEnv({ get: optional(isString) }, { get: 'x', toObject: 'y' })).toEqual({ get: 'x' });
 			expect(parseEnv({ A: optional(isString) }, {})).toEqual({});
 			expect(parseEnv({ A: optional(isString) }, { get: function () {} })).toEqual({});
+			// The real `Deno.env` is an object literal of five methods (ext/os/30_os.js), and is recognized by identity too.
+			const store: Record<string, string> = { PORT: '1' };
+			const literal = {
+				get(key: string): string | undefined {
+					return store[key];
+				},
+				toObject(): Record<string, string> {
+					return { ...store };
+				},
+				set(key: string, value: string): void {
+					store[key] = value;
+				},
+				has(key: string): boolean {
+					return store[key] !== undefined;
+				},
+				delete(key: string): void {
+					delete store[key];
+				}
+			};
+			expect(function () {
+				parseEnv({ PORT: asInteger }, literal);
+			}).toThrow('pass `Deno.env.toObject()`');
+			// Variables next to such methods: an environment after all.
+			expect(parseEnv({ PORT: asInteger }, { ...literal, PORT: '1' })).toEqual({ PORT: 1 });
+			const global = globalThis as { Deno?: unknown };
+			global.Deno = { env: new Map() };
+			try {
+				expect(function () {
+					parseEnv({ PORT: asInteger }, (global.Deno as { env: object }).env);
+				}).toThrow(TypeError);
+				global.Deno = { env: Object.freeze({ toObject: 1 }) };
+				expect(function () {
+					parseEnv({ PORT: optional(isString) }, (global.Deno as { env: object }).env);
+				}).toThrow('pass `Deno.env.toObject()`');
+				expect(parseEnv({ PORT: optional(isString) }, { PORT: 'x' })).toEqual({ PORT: 'x' });
+				global.Deno = null;
+				expect(parseEnv({ PORT: optional(isString) }, {})).toEqual({});
+			} finally {
+				delete global.Deno;
+			}
 			// A polluted `Object.prototype` does not make a plain object look like `Deno.env`.
 			const polluted = Object.prototype as Record<string, unknown>;
 			polluted.get = function () {};

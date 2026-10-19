@@ -4326,8 +4326,9 @@ describe('JSON Patch (review regressions)', function () {
 		const removed = helpers.applyPatch(before, patch);
 		const elapsed = Date.now() - start;
 		expect(removed).toEqual(after);
-		// About 0.15 s (2 s with coverage instrumentation); shifting with the generic `copyWithin` took 5 s.
-		expect(elapsed).toBeLessThan(3000);
+		// About 0.15 s; shifting with the generic `copyWithin` took 5 s. Coverage instrumentation slows the shifting loops (only) about
+		// twentyfold, so the bound is only meaningful without it.
+		expect(elapsed).toBeLessThan('__coverage__' in globalThis ? 15_000 : 1500);
 	});
 
 	it('treats undefined object members as absent, as JSON does', function () {
@@ -4418,5 +4419,56 @@ describe('Object helpers read their options as own properties only', function ()
 		} finally {
 			for (const key of ['arrays', 'missing', 'separator', 'arrayLimit', 'deep', 'compare']) delete polluted[key];
 		}
+	});
+
+	it('trims items that differ only by undefined members, as the member diff ignores them', function () {
+		const before = [
+			{ id: 1, note: undefined },
+			{ id: 2, note: undefined },
+			{ id: 3, note: undefined }
+		];
+		const after = [{ id: 0 }, { id: 1 }, { id: 2 }, { id: 3 }];
+		expect(helpers.createPatch(before, after)).toEqual([{ op: 'add', path: '/0', value: { id: 0 } }]);
+		expect(helpers.createPatch(after, before)).toEqual([{ op: 'remove', path: '/0' }]);
+		expect(helpers.createPatch([{ a: { b: undefined } }, 1], [{ a: {} }])).toEqual([{ op: 'remove', path: '/1' }]);
+		// Leaves too: inside a sparse array (a leaf), only defined members count.
+		// eslint-disable-next-line no-sparse-arrays
+		expect(helpers.createPatch({ list: [{ a: 1, b: undefined }, , 2] }, { list: [{ a: 1 }, , 2] })).toEqual([]);
+		// Prototypes still count, and a defined member still differs.
+		expect(helpers.createPatch([{ id: 1 }], [Object.assign(Object.create(null) as object, { id: 1 }), 2])).toHaveLength(2);
+		expect(helpers.createPatch([{ id: 1, note: undefined }], [{ id: 1, note: 'x' }, 2])).toEqual([
+			{ op: 'add', path: '/0/note', value: 'x' },
+			{ op: 'add', path: '/1', value: 2 }
+		]);
+		// isEqual itself is unchanged.
+		expect(helpers.isEqual({ id: 1, note: undefined }, { id: 1 })).toBe(false);
+	});
+
+	it('tests plain objects without their undefined members', function () {
+		const doc = { a: { x: 1, y: undefined }, list: [{ z: undefined }] };
+		expect(helpers.applyPatch(doc, [{ op: 'test', path: '/a', value: { x: 1 } }])).toBe(doc);
+		expect(helpers.applyPatch(doc, [{ op: 'test', path: '', value: { a: { x: 1 }, list: [{}], extra: undefined } }])).toBe(doc);
+		expect(helpers.applyPatch({ a: { x: 1 } }, [{ op: 'test', path: '/a', value: { x: 1, y: undefined } }])).toEqual({ a: { x: 1 } });
+		expect(function () {
+			helpers.applyPatch(doc, [{ op: 'test', path: '/a', value: { x: 1, y: null } }]);
+		}).toThrow(helpers.JsonPatchError);
+		expect(function () {
+			helpers.applyPatch(doc, [{ op: 'test', path: '/a', value: { y: undefined } }]);
+		}).toThrow(helpers.JsonPatchError);
+		// Array items are not members: `undefined` is not a missing item.
+		expect(function () {
+			helpers.applyPatch({ list: [undefined] }, [{ op: 'test', path: '/list', value: [] }]);
+		}).toThrow(helpers.JsonPatchError);
+		// Each value is read once.
+		let reads = 0;
+		const watched = {
+			get x(): number {
+				reads++;
+				return 1;
+			}
+		};
+		expect(helpers.applyPatch({ a: watched }, [{ op: 'test', path: '/a', value: watched }]).a).toBe(watched);
+		expect(helpers.applyPatch({ a: { x: 1 } }, [{ op: 'test', path: '/a', value: watched }])).toEqual({ a: { x: 1 } });
+		expect(reads).toBe(1);
 	});
 });
