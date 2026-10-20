@@ -4393,6 +4393,317 @@ describe('Functions helpers (1.4)', function () {
 	});
 });
 
+describe('Functions helpers (pass 3 regressions)', function () {
+	afterEach(function () {
+		jest.clearAllTimers();
+		jest.useRealTimers();
+	});
+
+	describe('a get, set or attribute planted on Object.prototype', function () {
+		/**
+		 * Creates one of each helper whose result has methods, and uses them.
+		 * @returns {unknown[]} What they return
+		 */
+		function useHelpers(): unknown[] {
+			const square = helpers.memoize(function (n: number): number {
+				return n * n;
+			});
+			const throttled = helpers.throttle(helpers.identity, 10);
+			const debounced = helpers.debounce(helpers.identity, 10);
+			const last = helpers.memoizeLast(helpers.identity);
+			const first = matcher<{ a: number[] }>()
+				.with({ a: cons(capture()) }, function (head: unknown) {
+					return head;
+				})
+				.otherwise(helpers.constant(0));
+			const results = [square(3), square.cache.size, throttled(1), debounced(2), debounced.flush(), debounced.pending(), last(4), first({ a: [5, 6] })];
+			square.clear();
+			throttled.cancel();
+			debounced.cancel();
+			last.clear();
+
+			return results;
+		}
+
+		it('should still create memoized, throttled and debounced functions (regression: Object.defineProperty threw)', function () {
+			const proto = Object.prototype as Record<string, unknown>;
+			for (const key of ['get', 'set']) {
+				// A JSON deep merge plants an enumerable string; previously every helper threw `Getter must be a function: x`.
+				proto[key] = 'x';
+				try {
+					expect(useHelpers()).toEqual([9, 1, 1, undefined, 2, false, 4, 5]);
+				} finally {
+					delete proto[key];
+				}
+			}
+		});
+
+		it('should still create them when the planted get is not enumerable', function () {
+			Object.defineProperty(Object.prototype, 'get', { value: 'x', configurable: true, writable: true });
+			try {
+				expect(useHelpers()).toEqual([9, 1, 1, undefined, 2, false, 4, 5]);
+			} finally {
+				delete (Object.prototype as Record<string, unknown>).get;
+			}
+		});
+
+		it('should keep their properties read-only and hidden (regression: planted attributes were inherited)', function () {
+			const proto = Object.prototype as Record<string, unknown>;
+			proto.writable = true;
+			proto.enumerable = true;
+			proto.configurable = true;
+			try {
+				const square = helpers.memoize(helpers.identity);
+				const debounced = helpers.debounce(helpers.identity, 10);
+				for (const [target, key, enumerable] of [
+					[square, 'cache', true],
+					[square, 'clear', false],
+					[debounced, 'flush', false]
+				] as const) {
+					expect(Object.getOwnPropertyDescriptor(target, key)).toMatchObject({ writable: false, enumerable, configurable: false });
+				}
+			} finally {
+				delete proto.writable;
+				delete proto.enumerable;
+				delete proto.configurable;
+			}
+		});
+	});
+
+	describe('a hole of a pattern array with a planted Object.prototype[0]', function () {
+		it('should read as undefined in matchWith and matcher, as isMatching reads it (regression: it read the planted value)', function () {
+			const proto = Object.prototype as Record<number, unknown>;
+			proto[0] = 'planted';
+			try {
+				// oxlint-disable-next-line no-sparse-arrays
+				const pattern = [, 'b'];
+				// oxlint-disable-next-line no-sparse-arrays
+				const capturing = [, 'b', capture()];
+				expect(isMatching(pattern)([undefined, 'b'])).toBe(true);
+				expect(matchWith<unknown>([undefined, 'b']).with(pattern, helpers.constant('hit')).otherwise(helpers.constant('miss'))).toBe('hit');
+				// Previously the hole matched the planted value only.
+				expect(matchWith<unknown>(['planted', 'b']).with(pattern, helpers.constant('hit')).otherwise(helpers.constant('miss'))).toBe('miss');
+				const third = matcher<unknown>()
+					.with(capturing, function (value: unknown) {
+						return value;
+					})
+					.otherwise(helpers.constant('miss'));
+				expect(third([undefined, 'b', 3])).toBe(3);
+				expect(third(['planted', 'b', 3])).toBe('miss');
+				// A pattern deep enough to be checked for cycles reads its holes the same way.
+				let deep: unknown = pattern;
+				for (let level = 0; level < 70; level++) deep = [deep];
+				let value: unknown = [undefined, 'b'];
+				for (let level = 0; level < 70; level++) value = [value];
+				expect(matchWith<unknown>(value).with(deep, helpers.constant('hit')).otherwise(helpers.constant('miss'))).toBe('hit');
+			} finally {
+				delete proto[0];
+			}
+		});
+	});
+
+	describe('a hole of a Result tuple with a planted Object.prototype index', function () {
+		it('should read as undefined in isOk, isErr, mapResult and unwrap (regression: [, value] read as a failure)', function () {
+			const proto = Object.prototype as Record<number, unknown>;
+			proto[0] = 'planted';
+			proto[1] = 'planted value';
+			try {
+				// oxlint-disable-next-line no-sparse-arrays
+				const success = [, 5] as unknown as helpers.Result<number>;
+				// oxlint-disable-next-line no-sparse-arrays
+				const empty = [, ,] as unknown as helpers.Result<number>;
+				expect(helpers.isOk(success)).toBe(true);
+				expect(helpers.isErr(success)).toBe(false);
+				// Previously `unwrap` threw 'planted'.
+				expect(helpers.unwrap(success)).toBe(5);
+				expect(helpers.unwrap(empty)).toBeUndefined();
+				expect(helpers.mapResult(empty, helpers.identity)).toEqual([undefined, undefined]);
+				// Own values equal to the planted ones are read as they are.
+				expect(helpers.unwrap([undefined, 'planted value'])).toBe('planted value');
+				expect(helpers.isErr(['planted', undefined])).toBe(true);
+			} finally {
+				delete proto[0];
+				delete proto[1];
+			}
+		});
+	});
+
+	describe('an empty pipe or compose called without arguments', function () {
+		it('should return undefined when Object.prototype has a planted index 0 (regression: it returned the planted value)', async function () {
+			const proto = Object.prototype as Record<number, unknown>;
+			proto[0] = 'planted';
+			try {
+				// Typed to take a value: untyped (JavaScript) callers may still pass none.
+				const empties = [helpers.pipe(), helpers.compose(), helpers.pipeAsync(), helpers.composeAsync()] as unknown as Array<() => unknown>;
+				expect(
+					await Promise.all(
+						empties.map(function (empty) {
+							return empty();
+						})
+					)
+				).toEqual([undefined, undefined, undefined, undefined]);
+				expect(helpers.pipe()(0)).toBe(0);
+			} finally {
+				delete proto[0];
+			}
+		});
+	});
+
+	describe('debounce maxWait', function () {
+		it('should invoke by maxWait after a flush, also when maxWait is less than twice wait (regression: up to 2 * wait - maxWait late)', function () {
+			jest.useFakeTimers({ now: 0 });
+
+			const fn = jest.fn();
+			const debounced = helpers.debounce(fn, 100, { maxWait: 150 });
+			debounced('a');
+			jest.advanceTimersByTime(1);
+			debounced.flush();
+			// The burst goes on: the flush at 1 started a maxWait period, which ends at 151.
+			jest.advanceTimersByTime(59);
+			debounced('b');
+			jest.advanceTimersByTime(60);
+			debounced('c');
+			jest.advanceTimersByTime(30);
+			expect(fn.mock.calls).toEqual([['a']]);
+			jest.advanceTimersByTime(1);
+			// Previously at 160, when the timer armed for `wait` by the call at 60 fired.
+			expect(fn.mock.calls).toEqual([['a'], ['c']]);
+		});
+
+		it('should still wait `wait` ms after a call that follows a flush without maxWait', function () {
+			jest.useFakeTimers({ now: 0 });
+
+			const fn = jest.fn();
+			const debounced = helpers.debounce(fn, 100);
+			debounced('a');
+			debounced.flush();
+			jest.advanceTimersByTime(50);
+			debounced('b');
+			jest.advanceTimersByTime(99);
+			expect(fn.mock.calls).toEqual([['a']]);
+			jest.advanceTimersByTime(1);
+			expect(fn.mock.calls).toEqual([['a'], ['b']]);
+		});
+
+		it('should invoke at least every maxWait ms after an invocation forced by maxWait', function () {
+			jest.useFakeTimers({ now: 0 });
+
+			const times: number[] = [];
+			const debounced = helpers.debounce(
+				function (): void {
+					times.push(Date.now());
+				},
+				100,
+				{ maxWait: 150 }
+			);
+			// A continuous burst (every gap < wait): maxWait forces an invocation at 150, and the next one is due 150 ms later.
+			for (const at of [0, 80, 90, 140, 210]) {
+				jest.advanceTimersByTime(at - Date.now());
+				debounced();
+			}
+			jest.advanceTimersByTime(500);
+			// Previously [150, 310]: 160 ms apart.
+			expect(times).toEqual([150, 300]);
+		});
+	});
+
+	describe('defaultMemoizeKey with shared objects', function () {
+		/**
+		 * Builds `depth` levels of plain objects, each holding the next one twice.
+		 * @param {number} depth - The number of levels
+		 * @param {unknown} [leaf] - The innermost value
+		 * @returns {object} The outermost object
+		 */
+		function nest(depth: number, leaf: unknown = 1): object {
+			let value: unknown = leaf;
+			for (let level = 0; level < depth; level++) value = { a: value, b: value };
+			return value as object;
+		}
+
+		it('should key nested shared objects in linear time (regression: exponential, 26 levels ran out of memory)', function () {
+			const start = Date.now();
+			const key = helpers.defaultMemoizeKey(nest(60), 'x') as string;
+			// Previously 60 levels made a key of 2^60 copies of the innermost object.
+			expect(key.length).toBeLessThan(2000);
+			expect(Date.now() - start).toBeLessThan(5000);
+			// Each repeat refers to the first occurrence: the argument list is 0, the outer object 1, the object it holds twice 2, and so on.
+			expect(key.startsWith('[{"a":{"a":{"a":')).toBe(true);
+			expect(key).toContain('{"a":1,"b":1},"b":"^60"}');
+			expect(key.endsWith('"b":"^4"},"b":"^3"},"b":"^2"},"x"]')).toBe(true);
+			const square = helpers.memoize(function (value: object): number {
+				return Object.keys(value).length;
+			});
+			const shared = nest(40);
+			expect(square(shared)).toBe(2);
+			expect(square.cache.size).toBe(1);
+		});
+
+		it('should give the same key to arguments that share objects the same way, and different keys otherwise', function () {
+			// Same shape, other objects: equal keys.
+			expect(helpers.defaultMemoizeKey(nest(30))).toBe(helpers.defaultMemoizeKey(nest(30)));
+			expect(helpers.defaultMemoizeKey(nest(30, 1))).not.toBe(helpers.defaultMemoizeKey(nest(30, 2)));
+			// The same values, without sharing at the top: past the budget, a different key (a cache miss, never a wrong hit).
+			const inner = nest(29);
+			const copy = nest(29);
+			expect(helpers.defaultMemoizeKey({ a: inner, b: inner })).not.toBe(helpers.defaultMemoizeKey({ a: inner, b: copy }));
+			// A string shaped like a reference is escaped.
+			expect(helpers.defaultMemoizeKey(['^1'], 1)).toBe('[["\\\\^1"],1]');
+			expect(helpers.defaultMemoizeKey(['\\^1'], 1)).toBe('[["\\\\\\\\^1"],1]');
+		});
+
+		it('should still expand small shared objects in full, as plain trees', function () {
+			const point = { x: 1, y: 2 };
+			expect(helpers.defaultMemoizeKey([point, point], nest(10))).toBe(
+				helpers.defaultMemoizeKey(
+					[
+						{ x: 1, y: 2 },
+						{ x: 1, y: 2 }
+					],
+					JSON.parse(JSON.stringify(nest(10)))
+				)
+			);
+			// A long list of distinct objects (past the budget, but without repeats) keeps its full key.
+			const list = Array.from({ length: 70000 }, function (_value, index) {
+				return { id: index };
+			});
+			const key = helpers.defaultMemoizeKey(list) as string;
+			expect(key).toBe(JSON.stringify([list]));
+		});
+
+		it('should switch to references when a shared string makes the key too long', function () {
+			const text = 'x'.repeat(2 ** 20);
+			const page = { text };
+			const pages = Array.from({ length: 20 }, function () {
+				return page;
+			});
+			const book: Record<string, unknown> = {};
+			for (let index = 0; index < 20; index++) book[`p${index}`] = page;
+			for (const value of [pages, book]) {
+				const key = helpers.defaultMemoizeKey(value) as string;
+				expect(key.length).toBeLessThan(2 ** 20 + 1000);
+				expect(key).toContain('"^2"');
+			}
+		});
+
+		it('should still throw on circular structures, and leave a key computed by a getter meanwhile intact', function () {
+			const cyclic: Record<string, unknown> = {};
+			cyclic.self = cyclic;
+			expect(function () {
+				helpers.defaultMemoizeKey(nest(30), cyclic);
+			}).toThrow(new TypeError('defaultMemoizeKey: `args` must not contain circular structures'));
+			const inner: string[] = [];
+			const tricky = {
+				get a(): number {
+					inner.push(helpers.defaultMemoizeKey(nest(30)) as string);
+					return 1;
+				}
+			};
+			expect(helpers.defaultMemoizeKey(tricky, 2)).toBe('[{"a":1},2]');
+			expect(inner).toEqual([helpers.defaultMemoizeKey(nest(30))]);
+		});
+	});
+});
+
 /** Runs a garbage collection, once the values a test released are no longer referenced by its stack. */
 async function collectGarbage(): Promise<void> {
 	setFlagsFromString('--expose-gc');

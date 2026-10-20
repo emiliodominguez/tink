@@ -290,7 +290,7 @@ describe('Functions helpers (properties)', function () {
 		});
 
 		it('serialises argument lists like JSON.stringify with the documented markers (reference implementation)', function () {
-			const special = /^\\*(?:-?\d+n|NaN|-?Infinity|-0|undefined|#\d+|Date\((?:-?\d+|NaN)\))$/;
+			const special = /^\\*(?:-?\d+n|NaN|-?Infinity|-0|undefined|#\d+|\^\d+|Date\((?:-?\d+|NaN)\))$/;
 			function referenceKey(args: unknown[]): string {
 				return JSON.stringify(args, function (this: any, key: string): unknown {
 					const value = this[key];
@@ -325,6 +325,8 @@ describe('Functions helpers (properties)', function () {
 					Symbol.iterator,
 					add1,
 					'#1',
+					'^1',
+					'\\^0',
 					'Date(0)',
 					'\\Date(NaN)'
 				),
@@ -394,6 +396,84 @@ describe('Functions helpers (properties)', function () {
 				}),
 				{ numRuns: 1000 }
 			);
+		});
+
+		describe('with shared objects', function () {
+			/** Thirty levels of objects holding the next one twice: an argument that makes every key use references. */
+			let bomb: unknown = 0;
+			for (let level = 0; level < 30; level++) bomb = { a: bomb, b: bomb };
+
+			/** A plain value built from a list of nodes, each an array or an object of leaves and earlier nodes (so they can be shared). */
+			const graph = fc
+				.array(
+					fc.record({
+						array: fc.boolean(),
+						children: fc.array(fc.oneof(fc.nat({ max: 9 }), fc.constantFrom<unknown>('leaf', '^1', 0, null, undefined)), { maxLength: 3 })
+					}),
+					{ minLength: 1, maxLength: 6 }
+				)
+				.map(function (specs) {
+					const nodes: unknown[] = [];
+					for (const spec of specs) {
+						// A number refers to an earlier node, when there is one.
+						const children = spec.children.map(function (child) {
+							return typeof child === 'number' ? (child < nodes.length ? nodes[child] : child) : child;
+						});
+						nodes.push(
+							spec.array
+								? children
+								: Object.fromEntries(
+										children.map(function (child, index) {
+											return [`k${index}`, child];
+										})
+									)
+						);
+					}
+					return nodes[nodes.length - 1];
+				});
+
+			/**
+			 * Copies a plain value, keeping (`shared`) or not its shared objects.
+			 * @param {unknown} value - The value
+			 * @param {Map<object, unknown> | undefined} copies - The copies made so far, to keep sharing; `undefined` to make a tree
+			 * @returns {unknown} The copy
+			 */
+			function copy(value: unknown, copies: Map<object, unknown> | undefined): unknown {
+				if (typeof value !== 'object' || value === null) return value;
+				const known = copies?.get(value);
+				if (known !== undefined) return known;
+				const result: unknown = Array.isArray(value)
+					? value.map(function (item) {
+							return copy(item, copies);
+						})
+					: Object.fromEntries(
+							Object.entries(value).map(function ([key, item]) {
+								return [key, copy(item, copies)];
+							})
+						);
+				copies?.set(value, result);
+				return result;
+			}
+
+			it('expands small shared objects like trees', function () {
+				fc.assert(
+					fc.property(graph, function (value) {
+						expect(defaultMemoizeKey(value, 1)).toBe(defaultMemoizeKey(copy(value, undefined), 1));
+					})
+				);
+			});
+
+			it('gives references the same key for the same sharing, and never one key to different values', function () {
+				fc.assert(
+					fc.property(graph, graph, function (a, b) {
+						const keyA = defaultMemoizeKey(a, bomb);
+						expect(keyA).toBe(defaultMemoizeKey(copy(a, new Map()), bomb));
+						if (keyA === defaultMemoizeKey(b, bomb)) expect(b).toEqual(a);
+					}),
+					// Each key first expands the bomb up to the budget (over 100 ms under Jest).
+					{ numRuns: 20 }
+				);
+			});
 		});
 	});
 

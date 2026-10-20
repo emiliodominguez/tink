@@ -24,10 +24,38 @@ function startTimer(callback: () => void, delay: number): TimerHandle {
 
 /**
  * Strings that the default memoize key serialiser uses as markers for values JSON cannot represent (bigints, `NaN`, `±Infinity`,
- * `-0`, `undefined`, dates and the identity of other objects), optionally preceded by backslashes. Real strings of this shape get one
- * extra leading backslash.
+ * `-0`, `undefined`, dates, the identity of other objects and references to an object met before), optionally preceded by backslashes.
+ * Real strings of this shape get one extra leading backslash.
  */
-const SPECIAL_KEY_TOKEN = /^\\*(?:-?\d+n|NaN|-?Infinity|-0|undefined|#\d+|Date\((?:-?\d+|NaN)\))$/;
+const SPECIAL_KEY_TOKEN = /^\\*(?:-?\d+n|NaN|-?Infinity|-0|undefined|#\d+|\^\d+|Date\((?:-?\d+|NaN)\))$/;
+
+/**
+ * How many arrays and plain objects the default memoize key expands before it watches for repeated ones, and how long it may get, before
+ * it is computed again with references (see {@link defaultMemoizeKey}): arguments holding the same object at several places can expand
+ * exponentially (an object holding another one twice, which holds a third one twice, and so on: 30 such objects make a key of billions of
+ * characters).
+ */
+const KEY_VISIT_BUDGET = 65536;
+
+/** See {@link KEY_VISIT_BUDGET} (2^24 characters). */
+const KEY_LENGTH_BUDGET = 16777216;
+
+/** Thrown by {@link serializeKey} when a key expanded in full exceeds its budget (see {@link KEY_VISIT_BUDGET}). */
+const OVER_BUDGET: object = {};
+
+/**
+ * The state of the serialisation of one argument list by {@link serializeKey} (one per call: a getter may compute another key meanwhile).
+ */
+interface KeyState {
+	/** The arrays and plain objects being serialised around the current value, to detect cycles. */
+	readonly parents: object[];
+	/** How many more arrays and plain objects may be expanded in full before {@link KeyState.expanded} watches for repeats. */
+	budget: number;
+	/** Expanding in full, once the budget is spent: the arrays and plain objects expanded since (meeting one again restarts with references). */
+	expanded: Set<object> | undefined;
+	/** With references: the number of each array and plain object met, in order of first appearance; `undefined` to expand in full. */
+	readonly seen: Map<object, number> | undefined;
+}
 
 /**
  * The identity numbers of the functions, symbols and non-plain objects met by the default memoize key (see {@link defaultMemoizeKey}).
@@ -45,6 +73,9 @@ const SYMBOL_IDENTITIES = new Map<unknown, number>();
  * The last identity number handed out.
  */
 let lastIdentity = 0;
+
+/** `Object.prototype.hasOwnProperty`, captured before any user code runs. */
+const hasOwn = Object.prototype.hasOwnProperty;
 
 /**
  * Throws unless `value` is a finite number `>= 0` (a wait time in milliseconds; longer waits than `setTimeout` allows are split).
@@ -95,6 +126,62 @@ function append(head: ReadonlyArray<unknown>, tail: ReadonlyArray<unknown>): unk
  */
 function forward(fn: UnknownFunction, thisArg: unknown, args: unknown[]): unknown {
 	return args.length === 1 ? fn.call(thisArg, args[0]) : args.length === 2 ? fn.call(thisArg, args[0], args[1]) : fn.apply(thisArg, args);
+}
+
+/**
+ * Whether `Object.prototype` has an enumerable property (a polluted prototype, e.g. by a JSON deep merge), which a property descriptor
+ * would inherit.
+ * @returns {boolean} Whether `Object.prototype` is polluted
+ */
+function isObjectPrototypePolluted(): boolean {
+	for (const key in Object.prototype) return typeof key === 'string';
+
+	return false;
+}
+
+/**
+ * Defines a read-only, non-configurable property (a method, or `cache`) of a function this module returns. Giving only the value is
+ * the fastest (`writable`, `enumerable` and `configurable` default to `false`); with a polluted `Object.prototype`, which the descriptor
+ * would inherit them from (and a `get` or `set`, which makes `Object.defineProperty` throw), they are given on a descriptor without a
+ * prototype.
+ * @param {object} target - The function
+ * @param {string} key - The key
+ * @param {unknown} value - The value
+ * @param {boolean} [enumerable=false] - Whether the property is enumerable
+ * @returns {void}
+ */
+function defineHidden(target: object, key: string, value: unknown, enumerable = false): void {
+	if (!isObjectPrototypePolluted()) {
+		try {
+			Object.defineProperty(target, key, enumerable ? { value, enumerable } : { value });
+			return;
+		} catch {
+			// A `get` or `set` planted on `Object.prototype` as a non-enumerable property.
+		}
+	}
+	Object.defineProperty(target, key, Object.setPrototypeOf({ value, writable: false, enumerable, configurable: false }, null) as PropertyDescriptor);
+}
+
+/**
+ * Defines an own data property whatever a polluted `Object.prototype` holds: every attribute is given, so none is inherited, and a
+ * descriptor that inherits a `get` or `set` (an accessor with a value, which `Object.defineProperty` rejects with a `TypeError`) is
+ * given again without a prototype. Only the retry pays for that: a descriptor without a prototype is slower to read.
+ * @param {object} target - The object
+ * @param {PropertyKey} key - The key
+ * @param {unknown} value - The value
+ * @param {boolean} writable - Whether the property is writable
+ * @param {boolean} enumerable - Whether the property is enumerable
+ * @param {boolean} configurable - Whether the property is configurable
+ * @returns {void}
+ */
+function defineValue(target: object, key: PropertyKey, value: unknown, writable: boolean, enumerable: boolean, configurable: boolean): void {
+	const descriptor: PropertyDescriptor = { value, writable, enumerable, configurable };
+
+	try {
+		Object.defineProperty(target, key, descriptor);
+	} catch {
+		Object.defineProperty(target, key, Object.setPrototypeOf(descriptor, null) as PropertyDescriptor);
+	}
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -391,7 +478,8 @@ export function pipe(...fns: AnyFunction[]): (...args: unknown[]) => unknown {
  */
 function chain(fns: UnknownFunction[]): (...args: unknown[]) => unknown {
 	return function piped(this: unknown, ...args: unknown[]): unknown {
-		if (fns.length === 0) return args[0];
+		// Without an argument, `args[0]` would read a polluted `Array.prototype` or `Object.prototype`.
+		if (fns.length === 0) return args.length === 0 ? undefined : args[0];
 
 		let result = fns[0].apply(this, args);
 
@@ -459,6 +547,11 @@ export type Memoized<F extends AnyFunction, C extends MemoizeCache<unknown, unkn
  *   `Map`, `Set`, `RegExp`, typed arrays, ...) become `'#<identity number>'`, the same number for the same value for the program's
  *   lifetime (held weakly, except for symbols that cannot be `WeakMap` keys, such as `Symbol.for` ones). Strings shaped like a marker
  *   are escaped with a leading backslash. `toJSON` methods are ignored.
+ * - A plain object or array met several times is written out each time. Nested shared objects (an object holding another one twice,
+ *   which holds a third one twice, and so on) would double the key at each level: when an object is met again after 65,536 of them have
+ *   been written out, or the key grows past 2^24 characters, it is computed again, in linear time, with every repeat of an object written
+ *   as `'^<n>'`, a reference to the n-th array or plain object of the key (counting from 0, the argument list itself). Such keys are
+ *   equal only for arguments that hold the same objects in the same places (and getters run twice).
  *
  * Limitations: plain objects and arrays are compared structurally by their own enumerable string keys (key order matters; symbol keys
  * and non-enumerable properties are ignored; getters are invoked), holes in arrays count as `undefined`, and circular plain structures
@@ -531,12 +624,29 @@ function memoizeKey(args: unknown[]): unknown {
 
 		if (typeof value === 'string') part = JSON.stringify(escapeKeyString(value));
 		else if (Number.isFinite(value) && !Object.is(value, -0)) part = String(value);
-		else return serializeKey(args, []);
+		else return serializeArguments(args);
 
 		key += i === 0 ? part : `,${part}`;
 	}
 
 	return `${key}]`;
+}
+
+/**
+ * Serialises an argument list for {@link defaultMemoizeKey}: in full, or with references when that exceeds the budget (see
+ * {@link KEY_VISIT_BUDGET}).
+ * @param {unknown[]} args - The call arguments
+ * @returns {string} The cache key
+ * @throws {TypeError} when the arguments contain a circular structure
+ */
+function serializeArguments(args: unknown[]): string {
+	try {
+		return serializeKey(args, { parents: [], budget: KEY_VISIT_BUDGET, expanded: undefined, seen: undefined });
+	} catch (error) {
+		if (error !== OVER_BUDGET) throw error;
+	}
+
+	return serializeKey(args, { parents: [], budget: 0, expanded: undefined, seen: new Map() });
 }
 
 /**
@@ -575,11 +685,12 @@ function identityOf(value: unknown): number {
  * Serialises a value for {@link defaultMemoizeKey}: like `JSON.stringify` (without `toJSON`), but with a marker string for every value
  * JSON cannot represent or would confuse.
  * @param {unknown} value - The value
- * @param {object[]} parents - The arrays and plain objects being serialised around `value`, to detect cycles
+ * @param {KeyState} state - The state of the serialisation
  * @returns {string} The serialised value
  * @throws {TypeError} when `value` contains a circular structure of plain objects or arrays
+ * @throws {object} {@link OVER_BUDGET}, when expanding in full exceeds the budget
  */
-function serializeKey(value: unknown, parents: object[]): string {
+function serializeKey(value: unknown, state: KeyState): string {
 	switch (typeof value) {
 		case 'string':
 			return JSON.stringify(escapeKeyString(value));
@@ -597,10 +708,25 @@ function serializeKey(value: unknown, parents: object[]): string {
 			// `isDate` brand-checks (dates of other realms too, not a proxy of one), and the intrinsic `getTime` reads the time value itself.
 			if (isDate(value)) return `"Date(${Date.prototype.getTime.call(value)})"`;
 			if (!isPlainData(value)) break;
+
+			const parents = state.parents;
+			const seen = state.seen;
+
 			if (parents.includes(value)) throw new TypeError('defaultMemoizeKey: `args` must not contain circular structures');
+			if (seen === undefined) {
+				// Past the budget, a repeated object (which may double the key at every level) restarts with references.
+				if (--state.budget < 0 && (state.expanded ??= new Set()).has(value)) throw OVER_BUDGET;
+			} else {
+				const number = seen.get(value);
+
+				if (number !== undefined) return `"^${number}"`;
+				seen.set(value, seen.size);
+			}
 
 			parents.push(value);
 
+			// Checked after every element: a key expanded in full can double at each level of shared objects.
+			const limit = seen === undefined ? KEY_LENGTH_BUDGET : Infinity;
 			let key = '';
 
 			if (Array.isArray(value)) {
@@ -608,17 +734,23 @@ function serializeKey(value: unknown, parents: object[]): string {
 				// holding that value).
 				const direct = !isArrayPrototypePolluted();
 
-				for (let i = 0; i < value.length; i++) key += (i === 0 ? '' : ',') + serializeKey(elementOf(value, i, direct), parents);
+				for (let i = 0; i < value.length; i++) {
+					key += (i === 0 ? '' : ',') + serializeKey(elementOf(value, i, direct), state);
+					if (key.length > limit) throw OVER_BUDGET;
+				}
 				key = `[${key}]`;
 			} else {
 				const names = Object.keys(value);
 
-				for (let i = 0; i < names.length; i++)
-					key += `${i === 0 ? '' : ','}${JSON.stringify(names[i])}:${serializeKey((value as Record<string, unknown>)[names[i]], parents)}`;
+				for (let i = 0; i < names.length; i++) {
+					key += `${i === 0 ? '' : ','}${JSON.stringify(names[i])}:${serializeKey((value as Record<string, unknown>)[names[i]], state)}`;
+					if (key.length > limit) throw OVER_BUDGET;
+				}
 				key = `{${key}}`;
 			}
 
 			parents.pop();
+			state.expanded?.add(value);
 
 			return key;
 		}
@@ -711,11 +843,9 @@ export function memoize<F extends AnyFunction, C extends MemoizeCache<unknown, u
 	}
 
 	// One `defineProperty` per property: faster than `Object.defineProperties`, which matters for per-instance memoizing.
-	Object.defineProperty(memoized, 'cache', { value: cache, enumerable: true });
-	Object.defineProperty(memoized, 'clear', {
-		value: function clear(): void {
-			cache.clear();
-		}
+	defineHidden(memoized, 'cache', cache, true);
+	defineHidden(memoized, 'clear', function clear(): void {
+		cache.clear();
 	});
 
 	return memoized as unknown as Memoized<F, C>;
@@ -879,14 +1009,12 @@ export function throttle<F extends AnyFunction>(fn: F, wait: number, options: Th
 		return result;
 	}
 
-	Object.defineProperty(throttled, 'cancel', {
-		value: function cancel(): void {
-			clearTimeout(timer);
-			timer = undefined;
-			windowStart = NaN;
-			pendingThis = undefined;
-			pendingArgs = undefined;
-		}
+	defineHidden(throttled, 'cancel', function cancel(): void {
+		clearTimeout(timer);
+		timer = undefined;
+		windowStart = NaN;
+		pendingThis = undefined;
+		pendingArgs = undefined;
 	});
 
 	return throttled as unknown as Throttled<F>;
@@ -1070,36 +1198,33 @@ export function debounce<F extends AnyFunction>(fn: F, wait: number, options: De
 			}
 		}
 
-		if (timer === undefined) timer = startTimer(onTimer, wait);
+		// No timer while a burst goes on (after a `flush()`, or an invocation forced by `maxWait`): with `maxWait`, the timer must also fire
+		// when it is due, which may be sooner than `wait` (lodash waits `wait` here, so `fn` could be delayed up to `2 * wait - maxWait`
+		// past it).
+		if (timer === undefined) timer = startTimer(onTimer, maxing ? remainingWait(time) : wait);
 
 		return result;
 	}
 
 	// One `defineProperty` per method: about 1.6 times faster than `Object.defineProperties`, which matters for per-instance debouncing.
-	Object.defineProperty(debounced, 'cancel', {
-		value: function cancel(): void {
-			clearTimeout(timer);
-			timer = undefined;
-			lastArgs = undefined;
-			lastThis = undefined;
-			lastCallTime = undefined;
-			lastInvokeTime = 0;
-		}
+	defineHidden(debounced, 'cancel', function cancel(): void {
+		clearTimeout(timer);
+		timer = undefined;
+		lastArgs = undefined;
+		lastThis = undefined;
+		lastCallTime = undefined;
+		lastInvokeTime = 0;
 	});
-	Object.defineProperty(debounced, 'flush', {
-		value: function flush(): unknown {
-			// Without a timer nothing is pending, and `trailingEdge` just returns the latest result. The invocation time is only read with
-			// `maxWait`, so the clock is not read otherwise.
-			clearTimeout(timer);
+	defineHidden(debounced, 'flush', function flush(): unknown {
+		// Without a timer nothing is pending, and `trailingEdge` just returns the latest result. The invocation time is only read with
+		// `maxWait`, so the clock is not read otherwise.
+		clearTimeout(timer);
 
-			return trailingEdge(maxing ? Date.now() : 0);
-		}
+		return trailingEdge(maxing ? Date.now() : 0);
 	});
-	Object.defineProperty(debounced, 'pending', {
-		value: function pending(): boolean {
-			// Pending arguments always come with a running timer.
-			return trailing && lastArgs !== undefined;
-		}
+	defineHidden(debounced, 'pending', function pending(): boolean {
+		// Pending arguments always come with a running timer.
+		return trailing && lastArgs !== undefined;
 	});
 
 	return debounced as unknown as Debounced<F>;
@@ -1442,6 +1567,20 @@ function assertResult(caller: string, result: unknown): asserts result is Result
 }
 
 /**
+ * Reads the error (`0`) or the value (`1`) of a {@link Result} tuple: a hole reads `undefined`, even when a polluted `Array.prototype` or
+ * `Object.prototype` defines its index (`[, value]` would otherwise read as a failure with the planted error).
+ * @param {Result<unknown>} result - The tuple
+ * @param {0 | 1} index - The slot
+ * @returns {unknown} Its value
+ */
+function slotOf(result: Result<unknown>, index: 0 | 1): unknown {
+	const value = result[index];
+
+	// Only a value equal to the prototype's can have been read from it: an own value is then returned with one comparison.
+	return value === undefined || !Object.is(value, (Array.prototype as unknown[])[index]) || hasOwn.call(result, index) ? value : undefined;
+}
+
+/**
  * Creates a successful {@link Result}: `[undefined, value]`, the tuple {@link attempt} returns when the call returned `value`.
  * @template T - The value type
  * @param {T} value - The value
@@ -1486,7 +1625,7 @@ export function err<E>(error: E): [error: E, result: undefined] {
  */
 export function isOk<T>(result: Result<T>): result is [error: undefined, result: T] {
 	assertResult('isOk', result);
-	return result[0] === undefined;
+	return slotOf(result, 0) === undefined;
 }
 
 /**
@@ -1503,7 +1642,7 @@ export function isOk<T>(result: Result<T>): result is [error: undefined, result:
  */
 export function isErr<T>(result: Result<T>): result is [error: unknown, result: undefined] {
 	assertResult('isErr', result);
-	return result[0] !== undefined;
+	return slotOf(result, 0) !== undefined;
 }
 
 /**
@@ -1523,7 +1662,7 @@ export function isErr<T>(result: Result<T>): result is [error: unknown, result: 
 export function mapResult<T, U>(result: Result<T>, fn: (value: T) => U): Result<U> {
 	assertResult('mapResult', result);
 	assertFunction('mapResult', 'fn', fn);
-	return result[0] === undefined ? [undefined, fn(result[1] as T)] : (result as [error: unknown, result: undefined]);
+	return slotOf(result, 0) === undefined ? [undefined, fn(slotOf(result, 1) as T)] : (result as [error: unknown, result: undefined]);
 }
 
 /**
@@ -1540,8 +1679,9 @@ export function mapResult<T, U>(result: Result<T>, fn: (value: T) => U): Result<
  */
 export function unwrap<T>(result: Result<T>): T {
 	assertResult('unwrap', result);
-	if (result[0] !== undefined) throw result[0];
-	return result[1] as T;
+	const error = slotOf(result, 0);
+	if (error !== undefined) throw error;
+	return slotOf(result, 1) as T;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1879,10 +2019,8 @@ export function memoizeLast<F extends AnyFunction>(fn: F, isEqual: (next: Parame
 		return result;
 	}
 
-	Object.defineProperty(memoizedLast, 'clear', {
-		value: function clear(): void {
-			cache = undefined;
-		}
+	defineHidden(memoizedLast, 'clear', function clear(): void {
+		cache = undefined;
 	});
 
 	return memoizedLast as unknown as MemoizedLast<F>;
@@ -2060,9 +2198,6 @@ function helperOf(pattern: unknown): PatternRecord | undefined {
 /** The selection of a case whose pattern captures nothing: its handler receives the matched value only. */
 const NO_SELECTION = {};
 
-/** `Object.prototype.hasOwnProperty`, captured before any user code runs. */
-const hasOwn = Object.prototype.hasOwnProperty;
-
 /**
  * Whether `Array.prototype` (or `Object.prototype`) has an enumerable property, which the holes of an array would then read: array
  * elements are then read as own properties only, like {@link isMatching} does.
@@ -2184,9 +2319,12 @@ function test(caller: string, pattern: unknown, value: unknown, log: unknown[] |
 	if (array ? !Array.isArray(value) || value.length !== pattern.length : typeof value !== 'object' || value === null || Array.isArray(value)) return false;
 	if (depth === CYCLE_CHECK_DEPTH) scan(caller, pattern, [], [], new Map());
 	if (array) {
+		// A hole reads `undefined`, in the pattern (as `isMatching` compiles it) and in the value.
 		const direct = !isArrayPrototypePolluted();
 
-		for (let index = 0; index < pattern.length; index++) if (!test(caller, pattern[index], elementOf(value as unknown[], index, direct), log, depth + 1)) return false;
+		for (let index = 0; index < pattern.length; index++) {
+			if (!test(caller, elementOf(pattern, index, direct), elementOf(value as unknown[], index, direct), log, depth + 1)) return false;
+		}
 
 		return true;
 	}
@@ -2318,8 +2456,11 @@ function scan(caller: string, pattern: unknown, log: unknown[], ancestors: unkno
 		// A part being scanned is not in `memo` yet: meeting it again is a cycle.
 		if (ancestors.includes(pattern)) circularPattern(caller);
 		ancestors.push(pattern);
-		if (array) for (let index = 0; index < pattern.length; index++) found = scan(caller, pattern[index], log, ancestors, memo) || found;
-		else for (const key of patternKeys(pattern as object)) found = scan(caller, (pattern as Record<PropertyKey, unknown>)[key], log, ancestors, memo) || found;
+		if (array) {
+			const direct = !isArrayPrototypePolluted();
+
+			for (let index = 0; index < pattern.length; index++) found = scan(caller, elementOf(pattern, index, direct), log, ancestors, memo) || found;
+		} else for (const key of patternKeys(pattern as object)) found = scan(caller, (pattern as Record<PropertyKey, unknown>)[key], log, ancestors, memo) || found;
 		ancestors.pop();
 	}
 	memo.set(pattern, found && log.slice(start));
@@ -3270,18 +3411,15 @@ function prepare(pattern: unknown, scanned: Map<unknown, unknown[] | false>, pre
 		copy = isDate(pattern) || Array.isArray(pattern) || isPlainObject(pattern) ? isMatching(pattern) : pattern;
 	} else if (Array.isArray(pattern)) {
 		copy = [];
-		for (let index = 0; index < pattern.length; index++) (copy as unknown[]).push(prepare(pattern[index], scanned, prepared));
+		const direct = !isArrayPrototypePolluted();
+
+		for (let index = 0; index < pattern.length; index++) (copy as unknown[]).push(prepare(elementOf(pattern, index, direct), scanned, prepared));
 	} else {
-		copy = {};
+		const object = {};
 		// Defined, so that a `__proto__` key is copied as a key (a copy without prototype would make `isDate` take its slow path).
-		for (const key of patternKeys(pattern as object)) {
-			Object.defineProperty(copy, key, {
-				value: prepare((pattern as Record<PropertyKey, unknown>)[key], scanned, prepared),
-				enumerable: true,
-				writable: true,
-				configurable: true
-			});
-		}
+		for (const key of patternKeys(pattern as object))
+			defineValue(object, key, prepare((pattern as Record<PropertyKey, unknown>)[key], scanned, prepared), true, true, true);
+		copy = object;
 	}
 	prepared.set(pattern, copy);
 
@@ -3531,7 +3669,8 @@ export function composeAsync(...fns: AnyFunction[]): (...args: unknown[]) => Pro
 function chainAsync(fns: UnknownFunction[]): (...args: unknown[]) => Promise<unknown> {
 	// An async function: a step that throws synchronously rejects the returned promise instead of throwing.
 	return async function piped(this: unknown, ...args: unknown[]): Promise<unknown> {
-		if (fns.length === 0) return args[0];
+		// Without an argument, `args[0]` would read a polluted `Array.prototype` or `Object.prototype`.
+		if (fns.length === 0) return args.length === 0 ? undefined : args[0];
 
 		let result = await fns[0].apply(this, args);
 
