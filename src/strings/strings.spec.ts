@@ -2255,6 +2255,29 @@ describe('String helpers under prototype pollution', function () {
 			delete polluted[1];
 		}
 	});
+
+	it('dedent reads raw only as an own property, never a polluted Object.prototype.raw (regression)', function () {
+		const polluted = Object.prototype as Record<string, unknown>;
+		polluted.raw = ['<EVIL>', '<EVIL>'];
+		try {
+			// A plain array has no `raw`: its holes and missing literals throw instead of taking a planted one.
+			const holed = ['x', 'a'];
+			delete holed[0];
+			expect(function () {
+				helpers.dedent(holed as unknown as TemplateStringsArray);
+			}).toThrow('got an array holding undefined');
+			expect(function () {
+				helpers.dedent(['a', undefined] as unknown as TemplateStringsArray, 1);
+			}).toThrow('got an array holding undefined');
+		} finally {
+			delete polluted.raw;
+		}
+		// An own `raw` that is not an object does not throw a bare TypeError either.
+		expect(function () {
+			helpers.dedent(Object.assign([undefined], { raw: null }) as unknown as TemplateStringsArray);
+		}).toThrow('got an array holding undefined');
+		expect(helpers.dedent(Object.assign([undefined, 'b'], { raw: ['\\u', 'b'] }) as unknown as TemplateStringsArray, 1)).toBe('\\u1b');
+	});
 });
 
 describe('truncate with options', function () {

@@ -1465,7 +1465,8 @@ export function dedent(input: string | TemplateStringsArray, ...values: unknown[
 	if (!Array.isArray(input)) throw new TypeError(`dedent: \`input\` must be a string or a template strings array, got ${describe(input)}`);
 
 	const literals: string[] = [];
-	const raw: ReadonlyArray<string> = input.raw;
+	// An own property (as on a template strings array), so that a plain array does not read a `raw` planted on `Object.prototype`.
+	const raw: ArrayLike<unknown> = Object.hasOwn(input, 'raw') ? Object(input.raw) : [];
 
 	// Read by index, so that a hole (or any other non-string) throws at once: `map` visited every index of a sparse array first (minutes
 	// for a length of 2 ** 32 - 1), and the holes it left were then read through a polluted `Object.prototype`.
