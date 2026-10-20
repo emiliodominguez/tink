@@ -1460,6 +1460,38 @@ describe('Async helpers (round 2)', function () {
 			expect(input.listenerCount).toBe(0);
 		});
 
+		it('should walk an array by its own keys (regression: a sparse array of length 2 ** 32 - 1 took hours, one index at a time)', function () {
+			const first = new CountingSignal();
+			const last = new CountingSignal();
+			const signals: Array<AbortSignalLike | undefined> = [];
+			signals.length = 2 ** 32 - 1;
+			signals[0] = first;
+			signals[2 ** 32 - 2] = last;
+			// The iterator visits every index (and so do index reads): counted, and stopped long before the end.
+			let reads = 0;
+			const counted = new Proxy(signals, {
+				get(target, key, receiver) {
+					if (typeof key === 'string' && key !== 'length' && ++reads > 100) throw new Error('read index by index');
+					return Reflect.get(target, key, receiver);
+				}
+			});
+			const signal = anySignal(counted);
+			expect(reads).toBe(2);
+			expect(first.listenerCount + last.listenerCount).toBe(2);
+			last.abort('last');
+			expect(signal.reason).toBe('last');
+			expect(first.listenerCount + last.listenerCount).toBe(0);
+			// Keys that are not indexes are not entries; an invalid entry is reported at its index.
+			// oxlint-disable-next-line no-sparse-arrays
+			const named = Object.assign([undefined, , first], { name: {}, '1.5': {}, '4294967295': {}, '-1': {} });
+			expect(anySignal(named as never).aborted).toBe(false);
+			const invalid: unknown[] = [];
+			invalid[2 ** 31] = 'x';
+			expect(function () {
+				anySignal(invalid as never);
+			}).toThrow(new TypeError('anySignal: `signals[2147483648]` must be an AbortSignal, null or undefined, got string'));
+		});
+
 		it('should combine with timeoutSignal', function () {
 			jest.useFakeTimers();
 			const controller = new AbortController();
@@ -7708,5 +7740,41 @@ describe('Async helpers (one listener per shared signal, promises with their own
 		} finally {
 			delete proto[1];
 		}
+	});
+
+	it('createLimiter and createRateLimiter queue tasks over a polluted Object.prototype.next (previously called it, crashing the process)', async function () {
+		const proto = Object.prototype as unknown as Record<string, unknown>;
+		function plantedCall(): never {
+			throw new Error('planted');
+		}
+		const planted = { run: jest.fn(plantedCall), start: jest.fn(plantedCall), reject: jest.fn() };
+		proto.next = planted;
+		try {
+			const limit = createLimiter(1);
+			await expect(Promise.all([limit(jest.fn().mockReturnValue(1)), limit(jest.fn().mockReturnValue(2)), limit(jest.fn().mockReturnValue(3))])).resolves.toEqual([
+				1, 2, 3
+			]);
+			expect(limit.pendingCount).toBe(0);
+			const limiter = createRateLimiter({ limit: 1, interval: 1 });
+			await expect(Promise.all([limiter.schedule(jest.fn().mockReturnValue(1)), limiter.schedule(jest.fn().mockReturnValue(2))])).resolves.toEqual([1, 2]);
+			// Cleared queues stop at their last task too.
+			const blocked = createLimiter(1, { rejectOnClear: true });
+			blocked(function () {
+				return new Promise(function () {});
+			});
+			const waiting = blocked(jest.fn());
+			blocked.clearQueue();
+			await expect(waiting).rejects.toThrow(AbortError);
+			const slow = createRateLimiter({ limit: 1, interval: 1000 });
+			slow.schedule(jest.fn());
+			const queued = slow.schedule(jest.fn());
+			slow.clearQueue();
+			await expect(queued).rejects.toThrow(AbortError);
+		} finally {
+			delete proto.next;
+		}
+		expect(planted.run).not.toHaveBeenCalled();
+		expect(planted.start).not.toHaveBeenCalled();
+		expect(planted.reject).not.toHaveBeenCalled();
 	});
 });

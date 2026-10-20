@@ -754,7 +754,7 @@ interface LimiterTask {
 	readonly run: () => void;
 	readonly reject: (reason: unknown) => void;
 	/** The task queued after this one. */
-	next?: LimiterTask;
+	next: LimiterTask | undefined;
 }
 
 /**
@@ -839,7 +839,8 @@ export function createLimiter(concurrency: number, options: LimiterOptions = {})
 				return;
 			}
 
-			const task: LimiterTask = { run, reject };
+			// `next` set, not inherited: a polluted `Object.prototype.next` would be taken for the next task (and called).
+			const task: LimiterTask = { run, reject, next: undefined };
 			// `last` is stale once the queue has drained, so it is only followed while `first` is set.
 			if (first === undefined) first = task;
 			else (last as LimiterTask).next = task;
@@ -1249,7 +1250,7 @@ interface RateLimitedCall {
 	readonly start: () => void;
 	readonly reject: (reason: unknown) => void;
 	/** The call queued after this one. */
-	next?: RateLimitedCall;
+	next: RateLimitedCall | undefined;
 }
 
 /**
@@ -1396,7 +1397,8 @@ export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
 				return;
 			}
 
-			const call: RateLimitedCall = { start, reject };
+			// `next` set, not inherited (see `createLimiter`).
+			const call: RateLimitedCall = { start, reject, next: undefined };
 
 			// Listened to only while calls wait (idempotent), so that an idle limiter is not kept alive by a long-lived signal; when adding
 			// the listener throws, the call is not queued.
@@ -3124,9 +3126,17 @@ export function anySignal(signals: Iterable<AbortSignalLike | null | undefined>)
 	const inputs: AbortSignalLike[] = [];
 	const array = Array.isArray(signals);
 	let index = 0;
-	for (let signal of signals) {
-		// A hole of an array (`[a, , b]`) is skipped like `undefined`, not read from a polluted `Object.prototype`.
-		if (array && !Object.hasOwn(signals, index)) signal = undefined;
+	// An array is walked through its own keys, whose indexes come first and in order: its iterator visits every index, which takes hours
+	// for a sparse array of length `2 ** 32 - 1`. A hole (`[a, , b]`) is skipped like `undefined`, not read from a polluted `Object.prototype`.
+	for (const item of array ? Object.keys(signals) : signals) {
+		let signal = item as AbortSignalLike | null | undefined;
+
+		if (array) {
+			index = Number(item);
+			// The first key that is not an index (`'name'`, `'1.5'`, `'4294967295'`) ends them.
+			if (String(index >>> 0) !== item || index >= signals.length) break;
+			signal = signals[index];
+		}
 		assertOptionalSignal('anySignal', `signals[${index}]`, signal);
 		if (signal !== null && signal !== undefined) inputs.push(signal);
 		index++;
