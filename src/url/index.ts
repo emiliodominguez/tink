@@ -480,17 +480,21 @@ function joinPaths(paths: ReadonlyArray<string>, base: boolean): string {
  * Reads the first value of a query parameter from a URL string (see {@link parseQueryString} for the decoding rules).
  * Only the part between the first `?` and the `#fragment` is searched, so a string without `?` has no parameters.
  * @param {string} url - The URL (absolute or relative)
- * @param {string} key - The parameter name (`a` also matches `a[]`)
+ * @param {string} key - The parameter name (`a` and `a[]` match each other, as in {@link withQuery})
  * @returns {string | undefined} The first value, or `undefined` when the parameter is absent
  * @example
  * getQueryParam('https://x.com/?q=hello+world&q=2#top', 'q'); // => 'hello world'
  * getQueryParam('/path?flag', 'flag'); // => ''
  * getQueryParam('/path', 'q'); // => undefined
+ * getQueryParam('/list?ids[]=1&ids[]=2', 'ids[]'); // => '1'
  */
 export function getQueryParam(url: string, key: string): string | undefined {
-	// Stops at the first match instead of building the whole parsed record (whose keys have `[]` removed, see parseQueryString).
+	// Keys are compared without their `[]` suffix on both sides (as `parseQueryString` stores them and `withQuery` replaces them).
+	const name = typeof key === 'string' ? withoutBrackets(key) : key;
+
+	// Stops at the first match instead of building the whole parsed record.
 	for (const [rawKey, value] of new URLSearchParams(splitUrl(url).query)) {
-		if (withoutBrackets(rawKey) === key) return value;
+		if (withoutBrackets(rawKey) === name) return value;
 	}
 
 	return undefined;
@@ -601,8 +605,10 @@ export function isSafeUrl(url: string, options: IsSafeUrlOptions = {}): boolean 
 
 	if (!Array.isArray(protocols)) throw new TypeError(`isSafeUrl: \`options.protocols\` must be an array of strings, got ${describe(protocols)}`);
 
-	// The options are validated whatever `url` is.
-	for (const entry of protocols as ReadonlyArray<unknown>) {
+	// The options are validated whatever `url` is. A hole is read as `undefined` (rejected), not from a polluted `Object.prototype`.
+	for (let index = 0; index < protocols.length; index++) {
+		const entry: unknown = Object.hasOwn(protocols, index) ? protocols[index] : undefined;
+
 		if (typeof entry !== 'string') throw new TypeError(`isSafeUrl: \`options.protocols\` must be an array of strings, got ${describe(entry)} in it`);
 
 		if (!(SCHEME.test(entry) && entry.indexOf(':') === entry.length - 1))
@@ -702,7 +708,8 @@ function leadingSlashesEnd(path: string): number {
 export function withTrailingSlash(url: string): string {
 	const end = pathEnd(url);
 
-	return url[end - 1] === '/' ? url : url.slice(0, end) + '/' + url.slice(end);
+	// `charAt`, not an index: for an empty path, `url[-1]` would be read from a polluted `Object.prototype`.
+	return url.charAt(end - 1) === '/' ? url : url.slice(0, end) + '/' + url.slice(end);
 }
 
 /**
@@ -718,7 +725,7 @@ export function withTrailingSlash(url: string): string {
 export function withoutTrailingSlash(url: string): string {
 	const end = pathEnd(url);
 
-	if (url[end - 1] !== '/') return url;
+	if (url.charAt(end - 1) !== '/') return url;
 
 	const keep = (SLASH_PREFIX.exec(url) as RegExpExecArray)[0].length;
 	let index = end;
@@ -1249,7 +1256,8 @@ function parsePattern(caller: string, pattern: string): RoutePattern {
 		return cached;
 	}
 
-	if (pattern[0] !== '/') invalidPattern(caller, pattern, "must start with '/'");
+	// `charAt`, not an index: `''[0]` would be read from a polluted `Object.prototype`.
+	if (pattern.charAt(0) !== '/') invalidPattern(caller, pattern, "must start with '/'");
 
 	if (pattern.includes('#')) invalidPattern(caller, pattern, "must not contain '#'");
 
@@ -1484,7 +1492,7 @@ export function matchPath<P extends string>(pattern: P, pathname: string, option
 	const strict = strictOption === true;
 	let path = pathname.slice(0, pathEnd(pathname));
 
-	if (path[0] !== '/') return null;
+	if (path.charAt(0) !== '/') return null;
 
 	const trailing = path.length > 1 && path.endsWith('/');
 
@@ -1975,17 +1983,33 @@ const ESCAPE = /%[\da-f]{2}/gi;
 /** A character that RFC 3986 calls unreserved: it never needs encoding, so decoding its escape does not change the URL. */
 const UNRESERVED = /[\w.~-]/;
 
+/** A hex digit. */
+const HEX_DIGIT = /[\da-f]/i;
+
+/**
+ * The path of a `file:` URL whose first segment would start like a Windows drive letter (`/C:`, `/C|`) once its escaped letter is
+ * decoded (Node also keeps `/C:x` when resolving `..`).
+ */
+const ESCAPED_DRIVE = /^\/%(?:[46][1-9a-f]|[57][\da])[:|]/i;
+
 /**
  * Normalizes the percent-escapes of URL text (RFC 3986 §6.2.2): an escape of an unreserved character is decoded, any other gets
- * uppercase hex digits.
+ * uppercase hex digits. An escaped hex digit right after a stray `%` (or a stray `%` and a hex digit) stays escaped: decoding it would
+ * make a new escape (`%%611` would become `%a1`, the byte A1, instead of the text `%a1`).
  * @param {string} text - The URL text
+ * @param {number} [kept=-1] - The index of an escape that is only uppercased (an escaped drive letter, see `normalizeUrl`)
  * @returns {string} The text with normalized escapes
  */
-function normalizeEscapes(text: string): string {
-	return text.replace(ESCAPE, function (escape: string): string {
-		const char = String.fromCharCode(parseInt(escape.slice(1), 16));
+function normalizeEscapes(text: string, kept: number = -1): string {
+	return text.replace(ESCAPE, function (escape: string, offset: number): string {
+		if (offset === kept) return escape.toUpperCase();
 
-		return UNRESERVED.test(char) ? char : escape.toUpperCase();
+		const char = String.fromCharCode(parseInt(escape.slice(1), 16));
+		// A `%` before an escape, or before a single character and an escape, never starts an escape itself: it is a stray one.
+		// (`charAt`, not an index: `text[-1]` would be read from a polluted `Object.prototype`.)
+		const afterStray = text.charAt(offset - 1) === '%' || (text.charAt(offset - 2) === '%' && HEX_DIGIT.test(text.charAt(offset - 1)));
+
+		return UNRESERVED.test(char) && !(afterStray && HEX_DIGIT.test(char)) ? char : escape.toUpperCase();
 	});
 }
 
@@ -2025,16 +2049,21 @@ export function normalizeUrl(url: string | UrlObject, options: NormalizeUrlOptio
 	): boolean {
 		return flagOption('normalizeUrl', options, key);
 	});
-	const removed: unknown = readOption(options, 'removeQueryParams', []);
+	const list: unknown = readOption(options, 'removeQueryParams', []);
+	// The own items only: a hole is skipped, also when a polluted `Object.prototype` would fill it in.
+	const removed: Array<string | RegExp> = [];
+	let valid = Array.isArray(list);
 
-	if (
-		!Array.isArray(removed) ||
-		!removed.every(function (pattern: unknown): boolean {
-			return typeof pattern === 'string' || isRegExp(pattern);
-		})
-	) {
-		throw new TypeError(`normalizeUrl: \`removeQueryParams\` must be an array of strings and regular expressions, got ${describe(removed)}`);
+	for (let index = 0; valid && index < (list as ReadonlyArray<unknown>).length; index++) {
+		if (!Object.hasOwn(list as ReadonlyArray<unknown>, index)) continue;
+
+		const pattern: unknown = (list as ReadonlyArray<unknown>)[index];
+
+		valid = typeof pattern === 'string' || isRegExp(pattern);
+		removed.push(pattern as string | RegExp);
 	}
+
+	if (!valid) throw new TypeError(`normalizeUrl: \`removeQueryParams\` must be an array of strings and regular expressions, got ${describe(list)}`);
 
 	if (typeof url !== 'string' && !(url instanceof URL)) throw new TypeError(`normalizeUrl: \`url\` must be a string or a URL, got ${describe(url)}`);
 
@@ -2085,16 +2114,19 @@ export function normalizeUrl(url: string | UrlObject, options: NormalizeUrlOptio
 	// An opaque path (`mailto:a/`) does not start with `/`, and cannot be changed.
 	if (end < path.length && path.startsWith('/')) parsed.pathname = path.slice(0, end);
 
-	return normalizeEscapes(parsed.href);
+	// A `file:` path starting with an escaped letter and `:` or `|` keeps that escape: decoded, it would become a drive letter, which `..`
+	// segments cannot remove (and `|` would become `:` at the next normalization). The path follows `file://` and the host.
+	return normalizeEscapes(parsed.href, parsed.protocol === 'file:' && ESCAPED_DRIVE.test(parsed.pathname) ? 8 + parsed.host.length : -1);
 }
 
 /**
  * Parses a URL, returning `undefined` instead of throwing when it is invalid: the `URL.parse` of newer runtimes (Node 22, 2024
  * browsers), which it uses when available, for every runtime this library supports.
- * @param {string | UrlObject} input - The URL, absolute or relative to `base`
- * @param {string | UrlObject} [base] - The base URL for a relative `input`
+ *
  * Also `undefined` for a URL whose serialization the runtime cannot parse back: Node 26 turns `http://éxn--a/` into
  * `http://xn--xn--a-9ra/`, an invalid host, and aborts the whole process on the first setter called on it.
+ * @param {string | UrlObject} input - The URL, absolute or relative to `base`
+ * @param {string | UrlObject} [base] - The base URL for a relative `input`
  * @returns {UrlObject | undefined} A new `URL`, or `undefined` when `input` (or `base`) is not a valid URL
  * @example
  * tryParseUrl('https://example.com/a?b=1')?.searchParams.get('b'); // => '1'

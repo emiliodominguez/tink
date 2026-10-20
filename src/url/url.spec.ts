@@ -302,9 +302,17 @@ describe('URL helpers', function () {
 			expect(helpers.getQueryParam('/p?a[]=1&a=2', 'a')).toBe('1');
 			expect(helpers.getQueryParam('/p?a=2&a[]=1', 'a')).toBe('2');
 			expect(helpers.getQueryParam('/p?a%5B%5D=3', 'a')).toBe('3');
-			// `a[]` is the stored key of the raw key `a[][]` only (parseQueryString removes one pair of brackets).
-			expect(helpers.getQueryParam('/p?a[]=1', 'a[]')).toBeUndefined();
-			expect(helpers.getQueryParam('/p?a[][]=1', 'a[]')).toBe('1');
+		});
+
+		it('should compare keys without their brackets on both sides, as withQuery replaces them', function () {
+			expect(helpers.getQueryParam('/p?a[]=1', 'a[]')).toBe('1');
+			expect(helpers.getQueryParam('/p?a%5B%5D=1&a[]=2', 'a[]')).toBe('1');
+			expect(helpers.getQueryParam('/p?a=2&a[]=1', 'a[]')).toBe('2');
+			expect(helpers.getQueryParam(helpers.withQuery('/p', { 'ids[]': ['7', '8'] }), 'ids[]')).toBe('7');
+			// Only one pair of brackets is removed (parseQueryString stores `a[][]` as `a[]`).
+			expect(helpers.getQueryParam('/p?a[][]=1', 'a[]')).toBeUndefined();
+			expect(helpers.getQueryParam('/p?a[][]=1', 'a[][]')).toBe('1');
+			expect(helpers.getQueryParam('/p?a=1', 1 as unknown as string)).toBeUndefined();
 		});
 
 		it('should never match a key holding a lone surrogate (parsed keys hold U+FFFD instead)', function () {
@@ -771,6 +779,42 @@ describe('URL helpers (hostile inputs)', function () {
 			expect(helpers.buildQueryString({ ids: [1, , 3] })).toBe('ids=1&ids=3');
 		} finally {
 			delete proto[1];
+		}
+	});
+
+	it('reads no character of an empty string from a polluted prototype', function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		proto['-1'] = '/';
+		proto[0] = '/';
+		try {
+			expect(helpers.withTrailingSlash('')).toBe('/');
+			expect(helpers.withTrailingSlash('?q')).toBe('/?q');
+			expect(helpers.withoutTrailingSlash('#h')).toBe('#h');
+			expect(function () {
+				helpers.matchPath('', '/');
+			}).toThrow(new RangeError('matchPath: `pattern` must start with \'/\', got ""'));
+			expect(helpers.matchPath('/*', '?x')).toBeNull();
+			expect(helpers.normalizeUrl('http://x/%41')).toBe('http://x/A');
+		} finally {
+			delete proto['-1'];
+			delete proto[0];
+		}
+	});
+
+	it('reads no hole of an option array from a polluted prototype', function () {
+		const proto = Object.prototype as Record<number, unknown>;
+		proto[0] = 'javascript:';
+		try {
+			// eslint-disable-next-line no-sparse-arrays
+			const protocols = [, 'https:'] as unknown as string[];
+			expect(function () {
+				helpers.isSafeUrl('javascript:alert(1)', { protocols });
+			}).toThrow(new TypeError('isSafeUrl: `options.protocols` must be an array of strings, got undefined in it'));
+			proto[0] = 'q';
+			// eslint-disable-next-line no-sparse-arrays
+			expect(helpers.normalizeUrl('http://x/?q=1&r=2&z=3', { removeQueryParams: [, 'z'] as string[] })).toBe('http://x/?q=1&r=2');
+		} finally {
+			delete proto[0];
 		}
 	});
 
@@ -1683,6 +1727,44 @@ describe('normalizeUrl', function () {
 				const once = helpers.normalizeUrl(url, opts);
 				expect(helpers.normalizeUrl(once, opts)).toBe(once);
 			}
+		}
+	});
+
+	it('should not decode an escaped hex digit into a new escape after a stray %', function () {
+		// `%%611` is the text `%a1`: decoding `%61` would make the escape `%a1` (the byte A1), and the next normalization would change it.
+		const cases: Array<[string, string]> = [
+			['http://x/%%611', 'http://x/%%611'],
+			['http://x/%4%31', 'http://x/%4%31'],
+			['http://x/?q=%%61%62', 'http://x/?q=%%61b'],
+			['http://x/%%7E%%67', 'http://x/%~%g'],
+			['foo://%%61%41/%%30#%%46', 'foo://%%61a/%%30#%%46'],
+			['http://x/%a%62%61', 'http://x/%a%62a']
+		];
+		for (const [url, expected] of cases) {
+			const once = helpers.normalizeUrl(url);
+			expect(once).toBe(expected);
+			expect(helpers.normalizeUrl(once)).toBe(once);
+		}
+	});
+
+	it('should not decode an escaped letter into a drive letter of a file: path', function () {
+		// `file:///a|` is the drive `a:`, which `..` cannot remove: decoding the escape would change the URL (and the next normalization too).
+		const cases: Array<[string, string]> = [
+			['file:///%61|/x', 'file:///%61|/x'],
+			['FILE://HOST/%7a:?%61#%61', 'file://host/%7A:?a#a'],
+			['file:%5a|', 'file:///%5A|'],
+			['file:///%61b|/', 'file:///ab|/'],
+			['file:///%61|x', 'file:///%61|x'],
+			['file:///%41:%41%2e', 'file:///%41:A.'],
+			['file://h/%41:x/y', 'file://h/%41:x/y'],
+			['file:///%5b|', 'file:///%5B|'],
+			['foo:///%61|', 'foo:///a|']
+		];
+		for (const [url, expected] of cases) {
+			const once = helpers.normalizeUrl(url);
+			expect(once).toBe(expected);
+			expect(helpers.normalizeUrl(once)).toBe(once);
+			expect(new URL('../../y', once).href).toBe(new URL('../../y', url).href);
 		}
 	});
 
