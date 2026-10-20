@@ -1200,15 +1200,15 @@ describe('errors (1.4)', function () {
 			}
 		});
 
-		it('reads a hole of an errors array as undefined, not as a polluted Object.prototype[index] (regression)', function () {
+		it('skips a hole of an errors array, rather than reading a polluted Object.prototype[index] (regression)', function () {
 			const prototype = Object.prototype as Record<number, unknown>;
 			const errors: unknown[] = [];
 			errors[1] = new Error('b');
 			const holey = { name: 'AggregateError', message: 'g', errors };
 			prototype[0] = new Error('planted');
 			try {
-				expect(getErrorChain(holey, { aggregate: true })).toEqual([holey, undefined, errors[1]]);
-				expect(formatError(holey, { stack: false })).toBe('AggregateError: g\n  [1/2] undefined\n  [2/2] Error: b');
+				expect(getErrorChain(holey, { aggregate: true })).toEqual([holey, errors[1]]);
+				expect(formatError(holey, { stack: false })).toBe('AggregateError: g\n  [2/2] Error: b');
 			} finally {
 				delete prototype[0];
 			}
@@ -1586,6 +1586,31 @@ describe('errors under a polluted Object.prototype', function () {
 		});
 	});
 
+	it('skips an item of errors deleted while the items are read, rather than reading Object.prototype[index]', function () {
+		polluted({ 1: { name: 'EvilError', message: 'planted' } }, function () {
+			/**
+			 * An errors array whose first item deletes the second when it is read.
+			 * @returns {unknown[]} The array
+			 */
+			function errors(): unknown[] {
+				const items: unknown[] = [undefined, 'b'];
+				Object.defineProperty(items, 0, {
+					get(): string {
+						delete items[1];
+						return 'a';
+					},
+					enumerable: true
+				});
+				return items;
+			}
+			const group = { name: 'AggregateError', message: 'g', errors: errors() };
+			expect(getErrorChain(group, { aggregate: true })).toEqual([group, 'a']);
+			const error = deserializeError({ name: 'AggregateError', message: 'g', errors: errors() }) as AggregateError;
+			expect(error.errors).toHaveLength(2);
+			expect(Object.hasOwn(error.errors, 1)).toBe(false);
+		});
+	});
+
 	it('gives defineError classes and errors the same property attributes', function () {
 		polluted({ writable: true, enumerable: true, configurable: true }, function () {
 			const NotFound = defineError('NotFoundError', { code: 'E_NOT_FOUND' });
@@ -1595,5 +1620,122 @@ describe('errors under a polluted Object.prototype', function () {
 			const brand = Object.getOwnPropertySymbols(NotFound.prototype)[0];
 			expect(Object.getOwnPropertyDescriptor(NotFound.prototype, brand)).toEqual({ value: 'NotFoundError', writable: false, enumerable: false, configurable: false });
 		});
+	});
+});
+
+describe('errors of hostile sizes (regressions)', function () {
+	/**
+	 * A sparse array of length 2 ** 32 - 1 holding one item at its end, behind a proxy that counts the traps called and throws past 1000
+	 * of them (checking each index took minutes, and copying them ran out of memory).
+	 * @param {unknown} item - The last item
+	 * @returns {{ errors: unknown[]; traps: () => number }} The proxy, and the number of traps called so far
+	 */
+	function sparseErrors(item: unknown): { errors: unknown[]; traps: () => number } {
+		const target: unknown[] = [];
+		target[2 ** 32 - 2] = item;
+		let traps = 0;
+		/**
+		 * Counts a trap call.
+		 * @returns {void}
+		 */
+		function count(): void {
+			if (++traps > 1000) throw new Error('too many traps');
+		}
+		const errors = new Proxy(target, {
+			get(array, key) {
+				count();
+				return Reflect.get(array, key);
+			},
+			getOwnPropertyDescriptor(array, key) {
+				count();
+				return Reflect.getOwnPropertyDescriptor(array, key);
+			},
+			ownKeys(array) {
+				count();
+				return Reflect.ownKeys(array);
+			}
+		});
+		return {
+			errors,
+			traps(): number {
+				return traps;
+			}
+		};
+	}
+
+	it('getErrorChain and formatError skip the holes of a sparse errors array without checking each index', function () {
+		const last = new Error('last');
+		const { errors, traps } = sparseErrors(last);
+		const group = { name: 'AggregateError', message: 'g', errors };
+		expect(getErrorChain(group, { aggregate: true })).toEqual([group, last]);
+		expect(formatError(group, { stack: false })).toBe('AggregateError: g\n  [4294967295/4294967295] Error: last');
+		expect(traps()).toBeLessThan(20);
+	});
+
+	it('deserializeError rebuilds a sparse errors array without checking each index', function () {
+		const { errors, traps } = sparseErrors({ name: 'TypeError', message: 'last' });
+		const error = deserializeError({ name: 'AggregateError', message: 'g', errors }) as AggregateError;
+		expect(error.errors).toHaveLength(2 ** 32 - 1);
+		expect(Object.keys(error.errors)).toEqual(['4294967294']);
+		expect(error.errors[2 ** 32 - 2]).toBeInstanceOf(TypeError);
+		expect(traps()).toBeLessThan(20);
+	});
+
+	it('reads the indices of a long errors array from its keys, and only its indices', function () {
+		const first = new Error('first');
+		const last = new Error('last');
+		const long: unknown[] = new Array(2000);
+		long[0] = first;
+		long[1999] = last;
+		Object.assign(long, { '01': 'not an index', '-1': 'nor this', '1.5': 'nor this' });
+		const group = { name: 'AggregateError', message: 'g', errors: long };
+		expect(getErrorChain(group, { aggregate: true })).toEqual([group, first, last]);
+		expect(formatError(group, { stack: false })).toBe('AggregateError: g\n  [1/2000] Error: first\n  [2000/2000] Error: last');
+		const error = deserializeError({ ...group, errors: long }) as AggregateError;
+		expect(Object.keys(error.errors)).toEqual(['0', '1999']);
+	});
+
+	it('walks an errors array shared by several errors once (regression: the work was quadratic)', function () {
+		const shared: unknown[] = ['p', new Error('q')];
+		const a = { name: 'E', message: 'a', errors: shared };
+		const b = { name: 'E', message: 'b', errors: shared };
+		const root = { name: 'AggregateError', message: 'root', errors: [a, b] };
+		expect(getErrorChain(root, { aggregate: true })).toEqual([root, a, 'p', shared[1], b]);
+		expect(formatError(root, { stack: false })).toBe('AggregateError: root\n  [1/2] E: a\n    [1/2] p\n    [2/2] Error: q\n  [2/2] E: b');
+	});
+
+	it('deserializeError gives errors sharing an errors array the same rebuilt array (regression: one copy each)', function () {
+		const shared = [{ name: 'RangeError', message: 'x' }, 'y'];
+		const data = {
+			name: 'AggregateError',
+			message: 'root',
+			errors: [
+				{ name: 'AggregateError', message: 'a', errors: shared },
+				{ name: 'AggregateError', message: 'b', errors: shared }
+			]
+		};
+		const [a, b] = (deserializeError(data) as AggregateError).errors as AggregateError[];
+		expect(a.errors).toBe(b.errors);
+		expect(a.errors[0]).toBeInstanceOf(RangeError);
+		expect(a.errors[1]).toBe('y');
+	});
+
+	it('describes a value sharing objects level after level by its tag, without visiting each path (regression: exponential)', function () {
+		let reads = 0;
+		let value: unknown = {
+			get leaf(): number {
+				// Capped, so that the old exponential walk ends too.
+				if (++reads > 2_000_000) throw new Error('too many reads');
+				return 1;
+			}
+		};
+		for (let level = 0; level < 30; level++) value = { l: value, r: value };
+		expect(getErrorMessage(value)).toBe('[object Object]');
+		expect(toError(value).message).toBe('[object Object]');
+		expect(formatError(new Error('x', { cause: value }), { stack: false })).toBe('Error: x\n  Caused by: [object Object]');
+		expect(reads).toBeLessThan(2_000_000);
+		const sparse: unknown[] = [];
+		sparse[2 ** 32 - 2] = 1;
+		expect(getErrorMessage(sparse)).toBe('[object Array]');
 	});
 });

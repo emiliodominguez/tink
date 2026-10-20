@@ -136,8 +136,8 @@ export function isErrorLike(value: unknown): value is ErrorLike {
 
 /**
  * Describes a value that has no message, for {@link getErrorMessage}: a primitive as `String` writes it (a bigint with its `n`), a plain
- * object or an array as JSON, a function by its tag (not its source), any other object as `String` writes it, and by its tag or type
- * when that throws.
+ * object or an array as JSON (by its tag when that JSON holds more than a million values), a function by its tag (not its source), any
+ * other object as `String` writes it, and by its tag or type when that throws.
  * @param {unknown} value - The value
  * @returns {string} The description
  */
@@ -146,12 +146,18 @@ function describeValue(value: unknown): string {
 	try {
 		if (typeof value === 'function') return Object.prototype.toString.call(value);
 		if (typeof value === 'object' && value !== null && (Array.isArray(value) || isPlainObject(value))) {
-			const json = JSON.stringify(value) as string | undefined;
+			// Bounded: the JSON of 31 objects sharing each other level after level (`n = { l: n, r: n }`) holds 2 ** 31 values, and that of
+			// a sparse array of length 2 ** 32 - 1 as many `null`s.
+			let budget = 1e6;
+			const json = JSON.stringify(value, function (_key: string, item: unknown): unknown {
+				if (--budget < 0) throw new RangeError('Too large');
+				return item;
+			}) as string | undefined;
 			if (json !== undefined) return json;
 		}
 		return String(value);
 	} catch {
-		// A cycle, a throwing getter, `toJSON` or `toString`, a null-prototype object without `toString`, or a revoked proxy.
+		// Too large, a cycle, a throwing getter, `toJSON` or `toString`, a null-prototype object without `toString`, or a revoked proxy.
 		try {
 			return Object.prototype.toString.call(value);
 		} catch {
@@ -163,7 +169,8 @@ function describeValue(value: unknown): string {
 /**
  * Returns a human-readable message for anything caught: a non-empty string as it is, the `message` of an error or of any object with a
  * non-empty string `message`; otherwise `fallback` when given, or else a description of the value (`'42'`, `'null'`, `'10n'`,
- * `'{"code":1}'` for a plain object or an array, `String(value)` for other objects, so `'Error'` for an error with an empty message).
+ * `'{"code":1}'` for a plain object or an array, `'[object Object]'` when its JSON would hold more than a million values, `String(value)`
+ * for other objects, so `'Error'` for an error with an empty message).
  * Never throws for any `value`: throwing getters, `toString` or `toJSON` methods and revoked proxies fall back to coarser descriptions.
  * @param {unknown} value - The caught value
  * @param {string} [fallback] - Returned when the value carries no message
@@ -322,6 +329,23 @@ function holds(object: object, key: string): boolean {
 }
 
 /**
+ * Lists the own indices of an array, in ascending order (its holes are left out), from its own keys: a sparse array costs its items, not
+ * its length (checking each of 2 ** 32 - 1 indices took minutes).
+ * @param {ReadonlyArray<unknown>} array - The array
+ * @param {number} length - Its length (read once by the caller)
+ * @returns {number[]} Its own indices
+ */
+function ownIndices(array: ReadonlyArray<unknown>, length: number): number[] {
+	const indices: number[] = [];
+	// An array lists its indices first, in ascending order, then its other keys (`length`, `'01'`, `'-1'`…).
+	for (const key of Object.getOwnPropertyNames(array)) {
+		const index = Number(key);
+		if (index < length && String(index >>> 0) === key) indices.push(index);
+	}
+	return indices;
+}
+
+/**
  * An error {@link deserializeError} is rebuilding, and how far the copy of its properties went.
  */
 interface Rebuilding {
@@ -331,9 +355,13 @@ interface Rebuilding {
 	readonly depth: number;
 	/** Whether the `cause` is restored (the items of `errors` come next, then the other keys). */
 	caused: boolean;
-	/** The `errors` array of the data, once read, its items rebuilt so far (holes stay holes), and the next one. */
+	/**
+	 * The `errors` array of the data, once read, its items rebuilt so far (holes stay holes), the own indices of the items still to
+	 * rebuild (none when an error rebuilt before has the same array), and the next one.
+	 */
 	errors: unknown[] | undefined;
 	items: unknown[];
+	indices: number[];
 	index: number;
 }
 
@@ -358,7 +386,7 @@ function create(data: object, depth: number, built: Map<object, Error>, classes:
 	if (name !== undefined && name !== readName(error)) defineHidden(error, 'name', name);
 	const stack = readText(data, 'stack');
 	if (stack !== undefined) defineHidden(error, 'stack', stack);
-	return { data, error, depth, caused: false, errors: undefined, items: [], index: 0 };
+	return { data, error, depth, caused: false, errors: undefined, items: [], indices: [], index: 0 };
 }
 
 /**
@@ -366,10 +394,11 @@ function create(data: object, depth: number, built: Map<object, Error>, classes:
  * the errors are built depth-first, in the order of the data, without recursion).
  * @param {Rebuilding} entry - The error being rebuilt
  * @param {Map<object, Error>} built - The error rebuilt from each data object so far
+ * @param {Map<object, unknown[]>} arrays - The `errors` array rebuilt from each data array so far
  * @param {ReadonlyMap<unknown, object>} classes - The prototype to give the errors of each name
  * @returns {Rebuilding | undefined} The nested error to rebuild before going on, or `undefined` once every property is copied
  */
-function advance(entry: Rebuilding, built: Map<object, Error>, classes: ReadonlyMap<unknown, object>): Rebuilding | undefined {
+function advance(entry: Rebuilding, built: Map<object, Error>, arrays: Map<object, unknown[]>, classes: ReadonlyMap<unknown, object>): Rebuilding | undefined {
 	const { data, error, depth } = entry;
 	let next: Rebuilding | undefined;
 	/**
@@ -392,15 +421,25 @@ function advance(entry: Rebuilding, built: Map<object, Error>, classes: Readonly
 	}
 	if (entry.errors === undefined) {
 		const errors = hasOwn.call(data, 'errors') ? (data as { errors: unknown }).errors : undefined;
-		// The length of an array is read once, like `Array#map` does. Anything else is neither restored nor copied: `items` is then
-		// `errors` itself, empty.
-		if (Array.isArray(errors)) entry.items = new Array<unknown>(errors.length);
+		// Anything but an array is neither restored nor copied: `items` is then `errors` itself, empty. An array met again gives the same
+		// items, so that errors sharing one (hostile data) cost its length once, not once each.
+		if (Array.isArray(errors)) {
+			const shared = arrays.get(errors);
+			if (shared === undefined) {
+				// The length is read once, like `Array#map` does.
+				const length = errors.length;
+				entry.items = new Array<unknown>(length);
+				entry.indices = ownIndices(errors, length);
+				arrays.set(errors, entry.items);
+			} else entry.items = shared;
+		}
 		entry.errors = Array.isArray(errors) ? errors : entry.items;
 	}
-	const { errors, items } = entry;
-	while (entry.index < items.length) {
-		const index = entry.index++;
-		// A hole stays a hole, rather than reading a polluted `Object.prototype[index]`.
+	const { errors, items, indices } = entry;
+	while (entry.index < indices.length) {
+		const index = indices[entry.index++];
+		// Checked again (a getter of an item may have deleted another): a hole stays a hole, rather than reading a polluted
+		// `Object.prototype[index]`.
 		if (hasOwn.call(errors, index)) items[index] = restore(errors[index]);
 		if (next !== undefined) return next;
 	}
@@ -424,13 +463,14 @@ function rebuild(data: unknown, depth: number, classes: ReadonlyMap<unknown, obj
 	if (isAnyError(data)) return data;
 	if (typeof data !== 'object' || data === null) return new Error(getErrorMessage(data));
 	const built = new Map<object, Error>();
+	const arrays = new Map<object, unknown[]>();
 	const root = create(data, depth, built, classes);
 	const todo = [root];
 	while (todo.length !== 0) {
 		const entry = todo[todo.length - 1];
 		let next: Rebuilding | undefined;
 		try {
-			next = advance(entry, built, classes);
+			next = advance(entry, built, arrays, classes);
 		} catch {
 			// A throwing getter or a hostile proxy: the properties copied so far are kept.
 		}
@@ -449,7 +489,8 @@ function rebuild(data: unknown, depth: number, classes: ReadonlyMap<unknown, obj
  * - `message`, `stack` (when present; otherwise the stack is where `deserializeError` was called), `cause` and `errors` are restored as
  *   the non-enumerable properties the constructors create; an error-like `cause` or item of `errors` is rebuilt the same way (up to
  *   `maxDepth` levels, without recursion: a chain of any length is rebuilt whole), anything else is kept as data (a hole of `errors`
- *   stays a hole). Shared and circular references between them are preserved.
+ *   stays a hole). Shared and circular references between them are preserved, those to an `errors` array too (errors sharing one get
+ *   the same rebuilt array).
  * - Other own enumerable properties (`code`, `status`…) are copied, except `__proto__`, `constructor`, `prototype` and any key the error
  *   inherits (`toString`, `valueOf`, `toLocaleString`, `hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `__defineGetter__`…),
  *   so that hostile data cannot shadow a method of the error and make `String(error)` or a logger throw; their values are kept as they
@@ -781,20 +822,35 @@ function readCause(value: object): unknown {
 }
 
 /**
- * Reads the items of the own `errors` array of a value (an `AggregateError`, or its serialized form) without throwing.
+ * Reads the items of the own `errors` array of a value (an `AggregateError`, or its serialized form) without throwing. Its holes are
+ * skipped (rather than read through a polluted `Object.prototype`), and so is an array read before in the same walk: errors sharing one
+ * (hostile data) cost its length once, not once each.
  * @param {object} value - An error or error-like object
- * @returns {unknown[]} A copy of the items (those read before a read threw), empty when there is no `errors` array
+ * @param {Set<object>} arrays - The `errors` arrays read so far
+ * @returns {[items: unknown[], indices: number[], length: number]} A copy of the items (those read before a read threw), their indices,
+ * and the length of the array (all empty or 0 when there is no `errors` array, or it was read before)
  */
-function readErrors(value: object): unknown[] {
+function readErrors(value: object, arrays: Set<object>): [items: unknown[], indices: number[], length: number] {
 	const items: unknown[] = [];
+	const indices: number[] = [];
+	let length = 0;
 	try {
 		const errors = hasOwn.call(value, 'errors') ? (value as { errors: unknown }).errors : undefined;
-		// A hole reads as `undefined`, not as a polluted `Object.prototype[index]`.
-		if (Array.isArray(errors)) for (let index = 0; index < errors.length; index++) items.push(hasOwn.call(errors, index) ? errors[index] : undefined);
+		if (Array.isArray(errors) && !arrays.has(errors)) {
+			arrays.add(errors);
+			length = errors.length;
+			for (const index of ownIndices(errors, length)) {
+				// Checked again: a getter of an item may have deleted another.
+				if (hasOwn.call(errors, index)) {
+					items.push(errors[index]);
+					indices.push(index);
+				}
+			}
+		}
 	} catch {
 		// A revoked proxy, or a throwing getter or trap: the items read so far are kept.
 	}
-	return items;
+	return [items, indices, length];
 }
 
 /**
@@ -802,10 +858,11 @@ function readErrors(value: object): unknown[] {
  * error-like objects, serialized errors). The chain ends at a value that is not an object, an object without an own `cause` (or with an
  * `undefined` one), or `maxDepth` levels down; a value that is not an error, such as a string cause, is included as it is.
  * - With `aggregate: true`, the own `errors` array of an `AggregateError` (or of any object) is walked too, depth-first in pre-order:
- *   each value, then each of its `errors` with everything below it, then its `cause` with everything below it.
- * - Cycle-safe: an object met again (a circular or shared reference) is not listed again, so the result is at most as long as the number
- *   of distinct objects reached plus their primitive causes. Iterative (no recursion), O(n), and never throws on the value: getters,
- *   proxies and revoked proxies that throw end that branch.
+ *   each value, then each of its `errors` with everything below it, then its `cause` with everything below it. A hole of `errors` is
+ *   skipped.
+ * - Cycle-safe: an object met again (a circular or shared reference) is not listed again, nor are the items of an `errors` array met
+ *   again, so the result is at most as long as the number of distinct objects reached plus their primitive causes and items. Iterative
+ *   (no recursion), O(n), and never throws on the value: getters, proxies and revoked proxies that throw end that branch.
  * @param {unknown} error - The error (or anything caught)
  * @param {ErrorChainOptions} [options={}] - `aggregate` (default `false`) and `maxDepth` (default `Infinity`, clamped to 1000)
  * @returns {unknown[]} The error, then its causes (and aggregated errors), outermost first
@@ -846,6 +903,7 @@ export function getErrorChain(error: unknown, options: ErrorChainOptions = {}): 
 		return chain;
 	}
 	const seen = new Set<object>();
+	const arrays = new Set<object>();
 	// Depth-first, with an explicit stack of the values to visit and their depths (pushed in reverse order of visit).
 	const values: unknown[] = [error];
 	const depths: number[] = [0];
@@ -865,7 +923,7 @@ export function getErrorChain(error: unknown, options: ErrorChainOptions = {}): 
 			values.push(cause);
 			depths.push(depth + 1);
 		}
-		const errors = readErrors(value);
+		const [errors] = readErrors(value, arrays);
 		for (let index = errors.length - 1; index >= 0; index--) {
 			values.push(errors[index]);
 			depths.push(depth + 1);
@@ -932,8 +990,10 @@ function pushFrames(lines: string[], stack: string, header: string, indent: stri
  * - The indentation stops growing 10 levels down (20 spaces): deeper lines keep it and start with a `[depth N]` marker instead
  *   (`[depth 11] Caused by: …`), so that the report grows linearly with the chain (no `d²` spaces for a chain `d` levels deep).
  * - Never throws, and prints each object once: a circular reference prints `[Circular]`, an error met again in another branch prints
- *   its header followed by `[Seen above]` (without its frames, causes and errors), and the causes and errors deeper than `maxDepth` are
- *   replaced by one `[Truncated]` line. Iterative (no recursion), and linear in the size of what it prints.
+ *   its header followed by `[Seen above]` (without its frames, causes and errors), the items of an `errors` array met again (shared by
+ *   several errors) are printed under the first one only, and the causes and errors deeper than `maxDepth` are replaced by one
+ *   `[Truncated]` line. A hole of `errors` is skipped (the labels keep the indices: `[2/2]`). Iterative (no recursion), and linear in the
+ *   size of what it prints.
  * @param {unknown} error - The error (or anything caught)
  * @param {FormatErrorOptions} [options={}] - `stack` (default `true`) and `maxDepth` (default `Infinity`, clamped to 1000)
  * @returns {string} The report (lines separated by `\n`, no trailing newline)
@@ -963,6 +1023,7 @@ export function formatError(error: unknown, options: FormatErrorOptions = {}): s
 	const lines: string[] = [];
 	const printed = new Set<object>();
 	const onPath = new Set<object>();
+	const arrays = new Set<object>();
 	// Depth-first, with an explicit stack of entries to print (pushed in reverse order); `exit` entries take an object off the path once
 	// everything below it has been printed.
 	const todo: Array<{ value: unknown; depth: number; label: string } | { exit: object }> = [{ value: error, depth: 0, label: '' }];
@@ -995,7 +1056,7 @@ export function formatError(error: unknown, options: FormatErrorOptions = {}): s
 		const stack = withStack ? readText(value, 'stack') : undefined;
 		if (stack !== undefined) pushFrames(lines, stack, header, `${indent}    `);
 		const cause = readCause(value);
-		const errors = readErrors(value);
+		const [errors, indices, length] = readErrors(value, arrays);
 		if (cause === undefined && errors.length === 0) continue;
 		if (depth === maxDepth) {
 			lines.push(`${indentOf(depth + 1)}${markerOf(depth + 1)}[Truncated]`);
@@ -1005,7 +1066,7 @@ export function formatError(error: unknown, options: FormatErrorOptions = {}): s
 		todo.push({ exit: value });
 		if (cause !== undefined) todo.push({ value: cause, depth: depth + 1, label: 'Caused by: ' });
 		for (let index = errors.length - 1; index >= 0; index--) {
-			todo.push({ value: errors[index], depth: depth + 1, label: `[${index + 1}/${errors.length}] ` });
+			todo.push({ value: errors[index], depth: depth + 1, label: `[${indices[index] + 1}/${length}] ` });
 		}
 	}
 	return lines.join('\n');
