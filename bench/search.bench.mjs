@@ -52,6 +52,16 @@ const commands = small.map(function (title, id) {
 });
 const fuseCommands = new Fuse(commands, { keys: ['title'], includeScore: true, includeMatches: true });
 const longTarget = `${'packages/core/src/'.repeat(12)}components/editor/toggleWordWrap.ts`;
+const cyrillicWords = ['Открыть', 'файл', 'Закрыть', 'панель', 'Показать', 'терминал', 'Скрыть', 'боковую', 'Перейти', 'строку'];
+const accentedWords = ['Café', 'Crème', 'Zürich', 'Málaga', 'São', 'Paulo', 'Ångström', 'Øresund', 'Łódź', 'Straße'];
+const cyrillic = small.map(function (_, i) {
+	return `${cyrillicWords[i % 10]} ${cyrillicWords[(i * 7) % 10]} ${cyrillicWords[(i * 3) % 10]} ${i}`;
+});
+const accented = small.map(function (_, i) {
+	return `${accentedWords[i % 10]} ${accentedWords[(i * 7) % 10]} ${accentedWords[(i * 3) % 10]} ${i}`;
+});
+const fuseCyrillic = new Fuse(cyrillic, { includeScore: true, includeMatches: true });
+const fuseAccented = new Fuse(accented, { includeScore: true, includeMatches: true, ignoreDiacritics: true });
 const matchRanges = fuzzyMatch('ctww', longTarget).ranges;
 
 // A deterministic 10k-document corpus for the BM25 index: a 4,000-word vocabulary of syllable words drawn with a Zipf-like skew,
@@ -238,6 +248,13 @@ export default [
 		}
 	},
 	{
+		// The same document over and over (a live-edited one): its id and its own terms are overwritten, never deleted and re-added.
+		name: 'SearchIndex.replace (10k docs, the same document)',
+		fn: function () {
+			return searchIndex.replace(documents[7]);
+		}
+	},
+	{
 		name: 'tokenize (50-word text)',
 		fn: function () {
 			return tokenize(body);
@@ -331,6 +348,28 @@ export default [
 		competitors: {
 			'fuse.js': function () {
 				return fuseCommands.search('shterm', { limit: 10 });
+			}
+		}
+	},
+	{
+		name: 'fuzzySearch (1k Cyrillic labels, "офз")',
+		fn: function () {
+			return fuzzySearch(cyrillic, 'офз');
+		},
+		competitors: {
+			'fuse.js': function () {
+				return fuseCyrillic.search('офз');
+			}
+		}
+	},
+	{
+		name: 'fuzzySearch (1k accented labels, "zur", ignoreDiacritics)',
+		fn: function () {
+			return fuzzySearch(accented, 'zur', { ignoreDiacritics: true });
+		},
+		competitors: {
+			'fuse.js (ignoreDiacritics)': function () {
+				return fuseAccented.search('zur');
 			}
 		}
 	},

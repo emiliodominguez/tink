@@ -607,6 +607,26 @@ describe('fuzzyMatch / fuzzySearch with ignoreDiacritics', function () {
 			delete proto.ignoreDiacritics;
 		}
 	});
+
+	it('ignores every option inherited from a polluted Object.prototype (regression)', function () {
+		// `caseSensitive`, `key`, `limit` and `threshold` used to be read with plain property accesses: a polluted `key` was even called.
+		const proto = Object.prototype as Record<string, unknown>;
+		const key = jest.fn(function () {
+			return 'polluted';
+		});
+		Object.assign(proto, { caseSensitive: true, key, limit: 0, threshold: 1000 });
+		try {
+			expect(helpers.fuzzyMatch('ab', 'AB')).toEqual({ score: 45, ranges: [[0, 2]] });
+			expect(helpers.fuzzySearch(['AB'], 'ab')).toEqual([{ item: 'AB', key: 'AB', score: 45, ranges: [[0, 2]] }]);
+			expect(helpers.fuzzySearch(['AB'], 'pol')).toEqual([]);
+			expect(key).not.toHaveBeenCalled();
+			// Own options still apply.
+			expect(helpers.fuzzyMatch('ab', 'AB', { caseSensitive: true })).toBeUndefined();
+			expect(helpers.fuzzySearch(['AB', 'ab'], 'ab', { caseSensitive: true, limit: 1, threshold: 0 })).toEqual([{ item: 'ab', key: 'ab', score: 47, ranges: [[0, 2]] }]);
+		} finally {
+			for (const name of ['caseSensitive', 'key', 'limit', 'threshold']) delete proto[name];
+		}
+	});
 });
 
 describe('tokenize', function () {
@@ -712,6 +732,28 @@ describe('tokenize', function () {
 				}
 			});
 		}).toThrow(new TypeError('tokenize: `segment` must be a string, got number'));
+	});
+
+	it('normalizes runs of more than 30 combining marks 30 marks at a time, in linear time (regression)', function () {
+		// Runtimes reorder a run of marks with an insertion sort: tokenizing 100 000 alternating accents used to take about 10 seconds.
+		const started = Date.now();
+		const text = 'x' + '\u0301\u05b0'.repeat(50_000);
+		expect(helpers.tokenize(text)[0].length).toBe(100_001);
+		expect(helpers.tokenize(text, { ignoreDiacritics: true })).toEqual(['x' + '\u05b0'.repeat(50_000)]);
+		expect(helpers.tokenize(text, { segmenter: new Intl.Segmenter('en', { granularity: 'word' }) }).join('').length).toBe(100_001);
+		const index = helpers.createSearchIndex<{ id: number; text: string }>({ fields: ['text'] });
+		index.add({ id: 1, text });
+		expect(
+			index.search(text).map(function (result) {
+				return result.id;
+			})
+		).toEqual([1]);
+		expect(Date.now() - started).toBeLessThan('__stryker__' in globalThis ? Infinity : 2000);
+		// Up to 30 marks are reordered as the runtime does it, a longer run 30 marks at a time (the Stream-Safe Text Format of UAX #15).
+		expect(helpers.tokenize('א' + '\u05b1\u05b0'.repeat(15))).toEqual(['א' + '\u05b0'.repeat(15) + '\u05b1'.repeat(15)]);
+		expect(helpers.tokenize('א' + '\u05b1\u05b0'.repeat(20))).toEqual(['א' + '\u05b0'.repeat(15) + '\u05b1'.repeat(15) + '\u05b0'.repeat(5) + '\u05b1'.repeat(5)]);
+		expect(helpers.tokenize('ж'.repeat(40) + 'e\u0301')).toEqual(['ж'.repeat(40) + 'é']);
+		expect(helpers.tokenize('한국어'.repeat(20) + ' 😀😀😀 ' + 'ภาษาไทย'.repeat(10))).toEqual(['한국어'.repeat(20), 'ภาษาไทย'.repeat(10)]);
 	});
 
 	it('ignores options inherited from a polluted Object.prototype', function () {
@@ -1041,6 +1083,33 @@ describe('createSearchIndex', function () {
 				return r.terms;
 			})
 		).toEqual([['x'], ['x'], ['x']]);
+	});
+
+	it('replaces or removes and adds the same document in constant time (regression)', function () {
+		// Deleting a key of a large Map and adding it again made its V8 hash chain grow until the next rehash: replacing the same document
+		// in a 10 000-document index cost about 170 µs, growing with the index (now about 1 µs): this loop took more than 3 seconds.
+		const index = helpers.createSearchIndex<Book>({ fields: ['title'] });
+		for (let id = 0; id < 20_000; id++) index.add({ id, title: `common ${id}` });
+		const started = Date.now();
+		for (let i = 0; i < 20_000; i++) {
+			index.replace({ id: 0, title: 'common unique' });
+			index.remove(1);
+			index.add({ id: 1, title: 'common other' });
+		}
+		expect(Date.now() - started).toBeLessThan('__stryker__' in globalThis ? Infinity : 1000);
+		expect(index.size).toBe(20_000);
+		expect(idsOf(index.search('unique other', { prefix: true }))).toEqual([0, 1]);
+		// A removed document's id and the terms only it had are kept until the next vacuum, but are never found.
+		index.remove(0);
+		expect(index.has(0)).toBe(false);
+		expect(index.get(0)).toBeUndefined();
+		expect(index.remove(0)).toBe(false);
+		expect(index.search('unique')).toEqual([]);
+		expect(index.search('uni', { prefix: true })).toEqual([]);
+		expect(idsOf(index.search('unique other', { combine: 'or' }))).toEqual([1]);
+		index.add({ id: 0, title: 'common unique' });
+		expect(idsOf(index.search('unique'))).toEqual([0]);
+		expect(index.search('unique')[0].score).toBe(index.search('other')[0].score);
 	});
 
 	it('replaces documents, keeping the old one when the new one is invalid', function () {

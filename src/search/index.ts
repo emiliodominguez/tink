@@ -136,10 +136,15 @@ interface PreparedQuery {
 	codes: number[];
 	/** Original code points (for the exact-case bonus). */
 	raw: number[];
-	/** For an ASCII query, the characters (as one string) each query character matches, to reject targets with `indexOf`; `undefined` otherwise. */
-	needles: string[] | undefined;
-	/** Scratch space of {@link contains}: the next known position of each needle character in the current target (`-1`: none left). */
-	next: Map<string, number>;
+	/**
+	 * For an ASCII query, the characters each query character matches, to reject targets with `indexOf`: up to 3 indexes into `chars`,
+	 * plus one, packed in the bytes of a number (`'k'` matches `k`, `K` and the Kelvin sign). `undefined` otherwise.
+	 */
+	needles: number[] | undefined;
+	/** The distinct characters of `needles`. */
+	chars: string[];
+	/** Scratch space of {@link contains}: the next known position of each of `chars` in the current target (`-1`: none left). */
+	next: number[];
 	/** Whether diacritics are ignored (see {@link expand}). */
 	diacritics: boolean;
 }
@@ -201,6 +206,18 @@ function fold(code: number, caseSensitive: boolean): number {
 	return String.fromCodePoint(folded) === lower ? folded : code;
 }
 
+/**
+ * Lower-cases a target at once, which is much faster than folding its code points one by one (see {@link fold}) and gives the same code
+ * points, at the same offsets, unless the target holds a capital sigma (which may become a final sigma) or an `'İ'` (whose lower case is
+ * two code points, so the target gets longer).
+ * @param {string} target - The text searched
+ * @returns {string | null} The lower-cased target, or `null` when its code points must be folded one by one
+ */
+function lowerTarget(target: string): string | null {
+	const lower = target.toLowerCase();
+	return lower.length === target.length && !target.includes('\u03a3') ? lower : null;
+}
+
 /** The foldings computed by {@link expand}, by code point (at most 4096, then started afresh). */
 const expansions = new Map<number, number[]>();
 
@@ -226,6 +243,28 @@ function expand(code: number): number[] {
 	return codes;
 }
 
+/** The case-folded foldings computed by {@link expandFolded}, by code point (at most 4096, then started afresh). */
+const foldedExpansions = new Map<number, number[]>();
+
+/**
+ * Folds a code point for `ignoreDiacritics` without case sensitivity: {@link expand}, then {@link fold} on each character.
+ * @param {number} code - A code point
+ * @returns {number[]} The case-folded code points it folds to (as many as `expand` gives)
+ */
+function expandFolded(code: number): number[] {
+	let codes = foldedExpansions.get(code);
+	if (codes === undefined) {
+		codes = [];
+		for (const char of expand(code)) codes.push(fold(char, false));
+		if (foldedExpansions.size === 4096) foldedExpansions.clear();
+		foldedExpansions.set(code, codes);
+	}
+	return codes;
+}
+
+/** The classes computed by {@link classify} for non-ASCII code points (at most 4096, then started afresh). */
+const classes = new Map<number, number>();
+
 /**
  * Classifies a code point for the word-start bonus.
  * @param {number} code - A code point
@@ -233,21 +272,24 @@ function expand(code: number): number[] {
  */
 function classify(code: number): number {
 	if (code < 128) return code >= 97 && code <= 122 ? WORD_CHAR | LOWER_CASE : code >= 65 && code <= 90 ? WORD_CHAR | UPPER_CASE : code >= 48 && code <= 57 ? WORD_CHAR : 0;
-	const char = String.fromCodePoint(code);
-	return (WORD.test(char) ? WORD_CHAR : 0) | (char === char.toUpperCase() ? 0 : LOWER_CASE) | (char === char.toLowerCase() ? 0 : UPPER_CASE);
+	let type = classes.get(code);
+	if (type === undefined) {
+		const char = String.fromCodePoint(code);
+		type = (WORD.test(char) ? WORD_CHAR : 0) | (char === char.toUpperCase() ? 0 : LOWER_CASE) | (char === char.toLowerCase() ? 0 : UPPER_CASE);
+		if (classes.size === 4096) classes.clear();
+		classes.set(code, type);
+	}
+	return type;
 }
 
 /**
- * Word-start bonus of a target position: the first character, a letter or digit after any other character (a combining mark belongs
- * to the letter before it), or a camelCase hump.
- * @param {Int32Array} raw - Code points of the target
- * @param {number} j - The position
+ * Word-start bonus of a target position after the first one (which always gets `BOUNDARY`): a letter or digit after any other character
+ * (a combining mark belongs to the letter before it), or a camelCase hump.
+ * @param {number} previous - The class (see {@link classify}) of the character before the position
+ * @param {number} current - The class of the character at the position
  * @returns {number} `BOUNDARY` or `0`
  */
-function bonus(raw: Int32Array, j: number): number {
-	if (j === 0) return BOUNDARY;
-	const current = classify(raw[j]);
-	const previous = classify(raw[j - 1]);
+function bonus(previous: number, current: number): number {
 	return (current & WORD_CHAR && !(previous & WORD_CHAR)) || (previous & LOWER_CASE && current & UPPER_CASE) ? BOUNDARY : 0;
 }
 
@@ -261,7 +303,8 @@ function bonus(raw: Int32Array, j: number): number {
 function prepare(query: string, caseSensitive: boolean, diacritics: boolean): PreparedQuery {
 	const raw: number[] = [];
 	const codes: number[] = [];
-	let needles: string[] | undefined = [];
+	let needles: number[] | undefined = [];
+	const chars: string[] = [];
 	for (let k = 0; k < query.length; k++) {
 		const code = query.codePointAt(k) as number;
 		const folded = fold(code, caseSensitive);
@@ -278,35 +321,41 @@ function prepare(query: string, caseSensitive: boolean, diacritics: boolean): Pr
 		}
 		raw.push(code);
 		codes.push(folded);
-		if (code <= 127) {
+		if (needles !== undefined) {
 			// Without case sensitivity, an ASCII letter matches its two cases, and 'k' also the Kelvin sign (whose lower case is 'k').
 			const char = query[k];
-			needles?.push(caseSensitive || folded < 97 || folded > 122 ? char : folded === 107 ? 'kK\u212A' : String.fromCharCode(folded, folded - 32));
+			const alternatives = caseSensitive || folded < 97 || folded > 122 ? char : folded === 107 ? 'kK\u212A' : String.fromCharCode(folded, folded - 32);
+			let packed = 0;
+			for (let a = alternatives.length - 1; a >= 0; a--) {
+				const index = chars.indexOf(alternatives[a]);
+				packed = (packed << 8) | (index === -1 ? chars.push(alternatives[a]) : index + 1);
+			}
+			needles.push(packed);
 		}
 	}
-	return { codes, raw, needles, next: new Map(), diacritics };
+	return { codes, raw, needles, chars, next: [], diacritics };
 }
 
 /**
  * Whether `target` contains, in order, one of the characters of every needle (the subsequence test for ASCII queries, done with `indexOf`).
  * The next position found for each character is remembered, so that `indexOf` only runs again once the search has moved past it, and
  * never for a character with none left: every character scans the target at most once, keeping the test O(target length).
- * @param {string[]} needles - The characters matched by each query character
- * @param {Map<string, number>} next - Scratch space for the positions (cleared here)
+ * @param {number[]} needles - The characters matched by each query character (see `PreparedQuery`)
+ * @param {string[]} chars - The characters
+ * @param {number[]} next - Scratch space for the positions of the characters (reset here)
  * @param {string} target - The text searched
  * @returns {boolean} `false` when the query cannot match
  */
-function contains(needles: string[], next: Map<string, number>, target: string): boolean {
-	next.clear();
+function contains(needles: number[], chars: string[], next: number[], target: string): boolean {
+	// `-2`: not looked for yet.
+	for (let c = 0; c < chars.length; c++) next[c] = -2;
 	let from = 0;
 	for (const alternatives of needles) {
 		let found = -1;
-		for (const needle of alternatives) {
-			let index = next.get(needle);
-			if (index === undefined || (index >= 0 && index < from)) {
-				index = target.indexOf(needle, from);
-				next.set(needle, index);
-			}
+		for (let packed = alternatives; packed !== 0; packed >>>= 8) {
+			const needle = (packed & 255) - 1;
+			let index = next[needle];
+			if (index === -2 || (index >= 0 && index < from)) next[needle] = index = target.indexOf(chars[needle], from);
 			if (index >= 0 && (found < 0 || index < found)) found = index;
 		}
 		if (found < 0) return false;
@@ -340,20 +389,22 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean, cal
 	// `ignoreDiacritics`, one of them may fold to several characters), and an ASCII query is looked for with `indexOf` (but with
 	// `ignoreDiacritics`, an accented letter of the target matches its ASCII base).
 	const filtered = query.needles !== undefined && !diacritics;
-	if ((m > length && !diacritics) || (filtered && !contains(query.needles as string[], query.next, target))) return undefined;
-	// Greedy subsequence check (the alignment only exists if it passes), unless `contains` already did it.
-	let matched = filtered ? m : 0;
+	if ((m > length && !diacritics) || (filtered && !contains(query.needles as number[], query.chars, query.next, target))) return undefined;
 	// The number of characters of the target: its length bounds them, except with `ignoreDiacritics`, where they are counted first.
-	let capacity = length;
-	if (diacritics) {
-		capacity = 0;
-		for (let k = 0; k < length;) {
+	let capacity = diacritics ? 0 : length;
+	// The target lower-cased at once, to fold its non-ASCII code points (see `lowerTarget`), once the first one is met.
+	let lower: string | null | undefined;
+	if (!filtered) {
+		// Greedy subsequence check (the alignment only exists if it passes, and the buffers are only filled then), unless `contains` did it.
+		let matched = 0;
+		for (let k = 0; k < length && (diacritics || matched < m);) {
 			const code = target.codePointAt(k) as number;
+			if (diacritics) {
+				const chars = caseSensitive ? expand(code) : expandFolded(code);
+				for (let c = 0; c < chars.length; c++) if (chars[c] === q[matched]) matched++;
+				capacity += chars.length;
+			} else if ((code < 128 || caseSensitive || (lower ??= lowerTarget(target)) === null ? fold(code, caseSensitive) : lower.codePointAt(k)) === q[matched]) matched++;
 			k += code > 0xffff ? 2 : 1;
-			for (const char of expand(code)) {
-				if (fold(char, caseSensitive) === q[matched]) matched++;
-				capacity++;
-			}
 		}
 		if (matched < m) return undefined;
 	}
@@ -371,29 +422,32 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean, cal
 		k += code > 0xffff ? 2 : 1;
 		if (diacritics) {
 			const chars = expand(code);
+			const folded = caseSensitive ? chars : expandFolded(code);
 			if (chars.length === 0) ends.fill(k, group, n);
 			else group = n;
-			for (const char of chars) {
+			for (let c = 0; c < chars.length; c++) {
 				starts[n] = start;
 				ends[n] = k;
-				raw[n] = char;
-				codes[n++] = fold(char, caseSensitive);
+				raw[n] = chars[c];
+				codes[n++] = folded[c];
 			}
 		} else {
-			const folded = fold(code, caseSensitive);
-			if (folded === q[matched]) matched++;
 			starts[n] = start;
 			ends[n] = k;
 			raw[n] = code;
-			codes[n++] = folded;
+			codes[n++] = code < 128 || caseSensitive || (lower ??= lowerTarget(target)) === null ? fold(code, caseSensitive) : (lower.codePointAt(start) as number);
 		}
 	}
-	if (matched < m) return undefined;
 	const cells = m * n;
 	// An explicit cap: past a few GiB, V8 aborts the process instead of throwing when allocating the matrix.
 	if (cells > MAX_CELLS) throw new RangeError(`${caller}: the query and text are too long to align (${m} × ${n} code points, more than ${MAX_CELLS} cells)`);
 	const back = small && cells <= SHARED_CELLS ? workspace.back : new Int32Array(cells);
-	for (let j = 0; j < n; j++) bonuses[j] = bonus(raw, j);
+	// Each character is classified once, for its own bonus and the next one's.
+	for (let j = 0, previous = 0; j < n; j++) {
+		const current = classify(raw[j]);
+		bonuses[j] = j === 0 ? BOUNDARY : bonus(previous, current);
+		previous = current;
+	}
 
 	let [row, previousRow] = rows;
 	for (let j = 0; j < n; j++) row[j] = codes[j] === q[0] ? MATCH + bonuses[j] + (raw[j] === query.raw[0] ? EXACT_CASE : 0) - Math.min(j, MAX_LEADING_PENALTY) : -Infinity;
@@ -509,7 +563,7 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean, cal
 export function fuzzyMatch(query: string, target: string, options: FuzzyMatchOptions = {}): FuzzyMatch | undefined {
 	assertString('fuzzyMatch', 'query', query);
 	assertString('fuzzyMatch', 'target', target);
-	const caseSensitive = options.caseSensitive === true;
+	const caseSensitive = readOption(options, 'caseSensitive') === true;
 	return match(prepare(query, caseSensitive, readOption(options, 'ignoreDiacritics') === true), target, caseSensitive, 'fuzzyMatch');
 }
 
@@ -541,8 +595,11 @@ export function fuzzyMatch(query: string, target: string, options: FuzzyMatchOpt
 export function fuzzySearch<T extends string>(items: Iterable<T>, query: string, options?: FuzzySearchOptions<T>): Array<FuzzySearchResult<T>>;
 export function fuzzySearch<T>(items: Iterable<T>, query: string, options: FuzzySearchKeyedOptions<T>): Array<FuzzySearchResult<T>>;
 export function fuzzySearch<T>(items: Iterable<T>, query: string, options: FuzzySearchOptions<T> = {}): Array<FuzzySearchResult<T>> {
-	const { key, limit = Infinity, threshold = -Infinity } = options;
-	const caseSensitive = options.caseSensitive === true;
+	// Read as own (or class) properties, like every option of the module: a polluted `Object.prototype` must not supply a `key` to call.
+	const key = readOption(options, 'key');
+	const limit = readOption(options, 'limit', Infinity);
+	const threshold = readOption(options, 'threshold', -Infinity);
+	const caseSensitive = readOption(options, 'caseSensitive') === true;
 	assertString('fuzzySearch', 'query', query);
 	if (key !== undefined) assertFunction('fuzzySearch', 'key', key);
 	assertInteger('fuzzySearch', 'limit', limit, 0, true);
@@ -683,6 +740,74 @@ function unformat(char: string): string {
 	return char === '​' ? ' ' : '';
 }
 
+/** More than 30 consecutive combining marks (or halfwidth kana voiced sound marks, which decompose to combining marks). */
+const LONG_MARK_RUN = /[\p{M}\uff9e\uff9f]{31}/u;
+/** 30 marks followed by another one: where {@link normalize} cuts a long run of marks. Global: only used from `lastIndex` 0. */
+const MARK_RUN_PIECE = /[\p{M}\uff9e\uff9f]{30}(?=[\p{M}\uff9e\uff9f])/gu;
+
+/**
+ * Normalizes a string like `String.prototype.normalize`, in linear time. Runtimes put each run of combining marks in canonical order with
+ * an insertion sort, quadratic in its length (100 000 alternating accents take seconds), so a run of more than 30 marks is normalized 30
+ * marks at a time, where the Stream-Safe Text Format of UAX #15 cuts it: its marks are neither reordered nor composed across the cuts.
+ * Text without such a run (all text but absurd text) is normalized exactly as the runtime does it.
+ * @param {string} text - The string
+ * @param {'NFC' | 'NFKD'} form - The normalization form
+ * @returns {string} The normalized string
+ */
+function normalize(text: string, form: 'NFC' | 'NFKD'): string {
+	if (!hasLongMarkRun(text)) return text.normalize(form);
+	let result = '';
+	let start = 0;
+	MARK_RUN_PIECE.lastIndex = 0;
+	while (MARK_RUN_PIECE.test(text)) {
+		result += text.slice(start, MARK_RUN_PIECE.lastIndex).normalize(form);
+		start = MARK_RUN_PIECE.lastIndex;
+	}
+	return result + text.slice(start).normalize(form);
+}
+
+/**
+ * Whether a text holds more than 30 consecutive combining marks (see {@link LONG_MARK_RUN}), with a skip loop (as in Boyer–Moore) over the
+ * code units that may be marks (see {@link isUnmarked}): such a run holds the code unit 30 after its start, so only that one is read, then
+ * those before it back to the last one that is not a mark, from which the next run may start. The (slow) Unicode regular expression only
+ * runs once 31 consecutive code units may be marks, so most text is only read in part.
+ * @param {string} text - The text
+ * @returns {boolean} Whether {@link LONG_MARK_RUN} matches it
+ */
+function hasLongMarkRun(text: string): boolean {
+	// The code units from `start` to `known` may all be marks.
+	let start = 0;
+	let known = -1;
+	while (start + 30 < text.length) {
+		let index = start + 30;
+		while (index > known && !isUnmarked(text.charCodeAt(index))) index--;
+		if (index === known) return LONG_MARK_RUN.test(text);
+		known = start + 30;
+		start = index + 1;
+	}
+	return false;
+}
+
+/**
+ * Whether a code unit is certainly not (half of) a combining mark: it is below U+0300, or a Thai, Lao, Myanmar or Khmer consonant, a kana
+ * letter, a CJK ideograph or a Hangul syllable (scripts written without spaces, whose text would otherwise look like a run of marks).
+ * @param {number} code - A UTF-16 code unit
+ * @returns {boolean} `true` when the code unit is none of the marks {@link LONG_MARK_RUN} counts
+ */
+function isUnmarked(code: number): boolean {
+	return (
+		code < 0x300 ||
+		(code >= 0xe01 && code <= 0xe30) ||
+		(code >= 0xe81 && code <= 0xeb0) ||
+		(code >= 0x1000 && code <= 0x102a) ||
+		(code >= 0x1780 && code <= 0x17b3) ||
+		(code >= 0x3041 && code <= 0x3096) ||
+		(code >= 0x30a1 && code <= 0x30fa) ||
+		(code >= 0x3400 && code <= 0x9fff) ||
+		(code >= 0xac00 && code <= 0xd7a3)
+	);
+}
+
 /**
  * Counts the code points of a string.
  * @param {string} text - The string
@@ -719,17 +844,17 @@ function words(
 	if (segmenter !== undefined) {
 		const segments: string[] = [];
 		// The segmenter sees the text in NFC, the form of its dictionaries.
-		for (const { segment } of segmenter.segment(prepared.normalize('NFC'))) {
+		for (const { segment } of segmenter.segment(normalize(prepared, 'NFC'))) {
 			assertString('tokenize', 'segment', segment);
 			segments.push(segment);
 		}
 		prepared = segments.join(' ');
 	}
-	if (diacritics && nonAscii) prepared = transliterate(prepared.normalize('NFKD').replace(DIACRITICS, ''));
+	if (diacritics && nonAscii) prepared = transliterate(normalize(prepared, 'NFKD').replace(DIACRITICS, ''));
 	if (!caseSensitive) prepared = prepared.toLowerCase();
 	// Composed last, so that tokens are always in NFC: folding decomposes the text, and lower-casing can make characters composable
 	// (`'J'` + caron, which has no precomposed form, gives `'ǰ'`).
-	if (nonAscii) prepared = prepared.normalize('NFC');
+	if (nonAscii) prepared = normalize(prepared, 'NFC');
 	const tokens = (prepared.match(WORDS) ?? []) as string[];
 	if (minLength === 1 && stopWords === undefined) return tokens;
 	let kept = 0;
@@ -743,7 +868,9 @@ function words(
  * of any script followed by letters, digits and combining marks (`\p{L}`, `\p{N}`, and `\p{M}` attached to the letter before it);
  * everything else separates words: spaces, punctuation, symbols, emoji, and also apostrophes, hyphens and underscores (`"don't"` gives
  * `'don'` and `'t'`, `'e-mail'` gives `'e'` and `'mail'`). Tokens are extracted in one pass of a single regular expression (after the
- * normalization and lower-casing passes below), so the cost is linear in the text.
+ * normalization and lower-casing passes below), so the cost is linear in the text: runtimes normalize a long run of combining marks in
+ * quadratic time, so a run of more than 30 marks (which no language needs) is normalized 30 marks at a time, as the Stream-Safe Text
+ * Format of UAX #15 cuts it.
  *
  * Before splitting, format characters are ignored as in Unicode word segmentation (UAX #29): a soft hyphen, zero-width joiner or
  * non-joiner, word joiner, bidirectional mark or BOM inside a word does not split it, and a zero-width space separates words. The text
@@ -1046,9 +1173,9 @@ function assertToken(caller: string, token: unknown): asserts token is string {
  * `Infinity` but never `NaN`.
  *
  * Removal is exact: the statistics (`N`, `n`, lengths) are updated at once, so the scores after `remove` or `replace` are those of an
- * index built without the document (no tombstones that would skew the IDF). The memory of removed documents is reclaimed when they
- * outnumber the indexed ones, by renumbering the documents in O(total postings), which keeps removals amortized O(terms of the document
- * · log n).
+ * index built without the document (no tombstones that would skew the IDF). The memory of removed documents (with their ids and the terms
+ * only they had) is reclaimed when they outnumber the indexed ones, by renumbering the documents in O(total postings), which keeps removals
+ * amortized O(terms of the document · log n), also when the same document is removed and added again, or replaced, over and over.
  *
  * Cost: adding a document is O(its terms) (tokenizing aside); a search is O(postings of the matched terms + matches · log limit), plus
  * O(limit · matched terms · log n) for the `terms` of the results, plus,
@@ -1132,9 +1259,12 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 	const docs: Array<T | undefined> = [];
 	const lengths: number[] = [];
 	const termsOf: Array<Posting[] | undefined> = [];
+	// The slots of the ids, and the postings of the terms. Removing a document deletes neither its id nor the terms only it had: they
+	// stay (with an empty slot, and no live documents) until the next vacuum, so that removing and adding a document again (or replacing
+	// it) overwrites them instead of deleting and re-adding the same keys, which V8 makes cost O(size of the map) a time.
 	const slotOf = new Map<SearchId, number>();
 	const postings = new Map<string, Posting>();
-	// The terms in code-unit order (some possibly removed since), and the terms added since it was sorted.
+	// The terms in code-unit order (some possibly without indexed documents since), and the terms added since it was sorted.
 	let sorted: string[] = [];
 	let fresh: string[] = [];
 	let live = 0;
@@ -1164,6 +1294,16 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 	}
 
 	/**
+	 * The slot of an indexed document.
+	 * @param {SearchId} id - The id
+	 * @returns {number | undefined} Its slot, or `undefined` when no indexed document has this id
+	 */
+	function find(id: SearchId): number | undefined {
+		const slot = slotOf.get(id);
+		return slot !== undefined && docs[slot] !== undefined ? slot : undefined;
+	}
+
+	/**
 	 * Removes the document in a slot, updating every statistic, and vacuums when removed documents outnumber the indexed ones.
 	 * @param {number} slot - The slot of an indexed document
 	 * @returns {void}
@@ -1172,7 +1312,7 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 		for (const posting of termsOf[slot] as Posting[]) {
 			const entry = lowerBound(posting.slots, slot);
 			for (let f = 0; f < fieldCount; f++) if (posting.tfs[entry * fieldCount + f] > 0) posting.df[f]--;
-			if (--posting.live === 0) postings.delete(posting.term);
+			posting.live--;
 		}
 		for (let f = 0; f < fieldCount; f++) {
 			const length = lengths[slot * fieldCount + f];
@@ -1181,7 +1321,6 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 				totalLength[f] -= length;
 			}
 		}
-		slotOf.delete(ids[slot]);
 		docs[slot] = undefined;
 		termsOf[slot] = undefined;
 		live--;
@@ -1190,14 +1329,19 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 	}
 
 	/**
-	 * Drops the slots of removed documents: renumbers the indexed ones (keeping their order) and compacts every posting list.
+	 * Drops the slots of removed documents: renumbers the indexed ones (keeping their order), compacts every posting list, and deletes the
+	 * ids and terms that no indexed document has.
 	 * @returns {void}
 	 */
 	function vacuum(): void {
 		const renumbered = new Int32Array(docs.length).fill(-1);
 		let next = 0;
 		for (let slot = 0; slot < docs.length; slot++) {
-			if (docs[slot] === undefined) continue;
+			if (docs[slot] === undefined) {
+				// Unless the id was indexed again since.
+				if (slotOf.get(ids[slot]) === slot) slotOf.delete(ids[slot]);
+				continue;
+			}
 			renumbered[slot] = next;
 			ids[next] = ids[slot];
 			docs[next] = docs[slot];
@@ -1209,6 +1353,10 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 		ids.length = docs.length = termsOf.length = next;
 		lengths.length = next * fieldCount;
 		for (const posting of postings.values()) {
+			if (posting.live === 0) {
+				postings.delete(posting.term);
+				continue;
+			}
 			const { slots, tfs } = posting;
 			let kept = 0;
 			for (let entry = 0; entry < slots.length; entry++) {
@@ -1227,9 +1375,9 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 	}
 
 	/**
-	 * Whether a term is in the index.
+	 * Whether a term is in the index (or was, until the next vacuum).
 	 * @param {string} term - The term
-	 * @returns {boolean} Whether some indexed document contains it
+	 * @returns {boolean} Whether the term has postings
 	 */
 	function isIndexed(term: string): boolean {
 		return postings.has(term);
@@ -1276,7 +1424,7 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 			}
 		}
 
-		const existing = slotOf.get(id);
+		const existing = find(id);
 		if (existing !== undefined) {
 			if (!replace) throw new RangeError(`${method}: a document with the id ${show(id)} is already indexed`);
 			discard(existing);
@@ -1323,19 +1471,20 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 	function complete(prefix: string): Posting[] {
 		if (fresh.length > 0) {
 			fresh.sort();
-			// Merge the two sorted lists, dropping the removed terms and the duplicates (a term removed, then added again).
+			// Merge the two sorted lists, which are disjoint: a term only joins `fresh` when its postings are created, and both lists only hold
+			// terms with postings (which are only deleted by a vacuum, along with their terms in the lists).
 			const merged: string[] = [];
 			for (let i = 0, j = 0; i < sorted.length || j < fresh.length;) {
-				const term = j === fresh.length || (i < sorted.length && sorted[i] < fresh[j]) ? sorted[i++] : fresh[j++];
-				if (term !== merged[merged.length - 1] && isIndexed(term)) merged.push(term);
+				merged.push(j === fresh.length || (i < sorted.length && sorted[i] < fresh[j]) ? sorted[i++] : fresh[j++]);
 			}
 			sorted = merged;
 			fresh = [];
 		}
 		const found: Posting[] = [];
 		for (let i = lowerBound(sorted, prefix); i < sorted.length && sorted[i].startsWith(prefix); i++) {
-			const posting = postings.get(sorted[i]);
-			if (posting !== undefined) found.push(posting);
+			const posting = postings.get(sorted[i]) as Posting;
+			// The postings of a term no indexed document has any more stay until the next vacuum.
+			if (posting.live > 0) found.push(posting);
 		}
 		return found;
 	}
@@ -1371,10 +1520,12 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 			if (prefixes[q]) matches = complete(queryTerms[q]);
 			else {
 				const posting = postings.get(queryTerms[q]);
-				matches = posting === undefined ? [] : [posting];
+				matches = posting === undefined || posting.live === 0 ? [] : [posting];
 			}
 			const termStamp = ++clock;
 			const termTouched: number[] = [];
+			// A single posting (an exact term) lists each document once: its scores go straight to the totals.
+			const single = matches.length === 1;
 			for (const posting of matches) {
 				if (!matched.has(posting)) matched.set(posting, matched.size);
 				const { slots, tfs, df } = posting;
@@ -1387,25 +1538,36 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 						const tf = tfs[entry * fieldCount + f];
 						if (tf > 0) value += (weights[f] * tf) / (tf * unit + shift + scales[f] * lengths[slot * fieldCount + f]);
 					}
-					if (termMark[slot] !== termStamp) {
+					if (single) accumulate(touched, queryStamp, slot, value);
+					else if (termMark[slot] !== termStamp) {
 						termMark[slot] = termStamp;
 						best[slot] = value;
 						termTouched.push(slot);
 					} else best[slot] = Math.max(best[slot], value);
 				}
 			}
-			for (const slot of termTouched) {
-				if (docMark[slot] !== queryStamp) {
-					docMark[slot] = queryStamp;
-					total[slot] = 0;
-					hits[slot] = 0;
-					touched.push(slot);
-				}
-				total[slot] += best[slot];
-				hits[slot]++;
-			}
+			for (const slot of termTouched) accumulate(touched, queryStamp, slot, best[slot]);
 		}
 		return touched;
+	}
+
+	/**
+	 * Adds the score of a query term to a document's total (see `score`).
+	 * @param {number[]} touched - The slots of the documents matched so far (receives this one if it is new)
+	 * @param {number} queryStamp - The stamp of the current query
+	 * @param {number} slot - The document's slot
+	 * @param {number} value - The score of the query term for the document
+	 * @returns {void}
+	 */
+	function accumulate(touched: number[], queryStamp: number, slot: number, value: number): void {
+		if (docMark[slot] !== queryStamp) {
+			docMark[slot] = queryStamp;
+			total[slot] = 0;
+			hits[slot] = 0;
+			touched.push(slot);
+		}
+		total[slot] += value;
+		hits[slot]++;
 	}
 
 	return {
@@ -1425,16 +1587,16 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 			return insert(document, 'SearchIndex.replace', true);
 		},
 		remove(id: SearchId): boolean {
-			const slot = slotOf.get(id);
+			const slot = find(id);
 			if (slot === undefined) return false;
 			discard(slot);
 			return true;
 		},
 		has(id: SearchId): boolean {
-			return slotOf.has(id);
+			return find(id) !== undefined;
 		},
 		get(id: SearchId): T | undefined {
-			const slot = slotOf.get(id);
+			const slot = find(id);
 			return slot === undefined ? undefined : docs[slot];
 		},
 		search(query: string, searchOptions: SearchIndexQueryOptions<T> = {}): Array<SearchIndexResult<T>> {
