@@ -1613,6 +1613,72 @@ describe('toCsv', function () {
 		}).toThrow(new TypeError('toCsv: `rows[0][69999]` must be a string, number, bigint, boolean, null or undefined, got object'));
 	});
 
+	it('should write the holes of a long sparse row as the dense row would be written, whatever its keys and quoting (regression)', function () {
+		// A row with more holes than are read one by one, so that its own keys are listed.
+		const sparse = new Array(140_000) as unknown[];
+		for (const [index, value] of [
+			[0, 'a'],
+			[70_000, 'b'],
+			[100_000, '=c'],
+			[130_000, 'd']
+		] as const) {
+			sparse[index] = value;
+		}
+		const dense = Array.from(sparse, function (value) {
+			return value;
+		});
+		// Regression: with every field quoted, the holes past the first 65,536 columns were written as unquoted empty fields.
+		for (const options of [{ quote: 'all' }, { formulaEscape: true }] as const) {
+			const written = helpers.toCsv([sparse as never[]], options);
+			expect(written).toBe(helpers.toCsv([dense as never[]], options));
+			expect(written).toMatch(/^"a"(,""){69999},"b"(,""){29999},"'?=c"(,""){29999},"d"(,""){9999}$/);
+		}
+		// Regression: the keys of a Proxy were taken in the order it lists them, so that a cell listed after a later one was dropped, and a
+		// key past the length threw a RangeError (a negative count of holes left to write).
+		const lying = new Proxy(sparse, {
+			ownKeys() {
+				return ['130000', '100000', '1.5', '200000', '70000', '0', 'length'];
+			}
+		});
+		expect(helpers.toCsv([lying as never[]])).toBe(helpers.toCsv([dense as never[]]));
+		// A cell deleted by the getter of an earlier one is a hole, never read from a polluted `Array.prototype`.
+		const deleting = sparse.slice();
+		Object.defineProperty(deleting, 70_000, {
+			get() {
+				delete deleting[100_000];
+				return 'b';
+			},
+			enumerable: true,
+			configurable: true
+		});
+		Object.defineProperty(Array.prototype, 100_000, { value: 'planted', configurable: true, writable: true });
+		try {
+			dense[100_000] = undefined;
+			expect(helpers.toCsv([deleting as never[]])).toBe(helpers.toCsv([dense as never[]]));
+		} finally {
+			delete (Array.prototype as unknown[])[100_000];
+		}
+	});
+
+	it('should read a long row with few holes cell by cell, without listing its keys (regression)', function () {
+		// Regression: a hole past the first 65,536 columns made the whole row be walked through its keys, which takes several times as long.
+		const row = Array.from({ length: 70_000 }, function (_, i) {
+			return i;
+		});
+		delete row[66_000];
+		const listed = jest.spyOn(Object, 'getOwnPropertyNames');
+		try {
+			expect(helpers.toCsv([row])).toBe(
+				Array.from(row, function (value) {
+					return value === undefined ? '' : String(value);
+				}).join(',')
+			);
+			expect(listed).not.toHaveBeenCalled();
+		} finally {
+			listed.mockRestore();
+		}
+	});
+
 	it('should write a last row without cells as one empty field, which a final line break would lose (regression)', function () {
 		// Regression: the row was written as an empty line, so the text ended with a line break, which `parseCsv` reads as the end of the
 		// previous row: the row was lost.

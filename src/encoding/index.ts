@@ -2146,7 +2146,10 @@ function csvRecords(rows: string[][]): Partial<Record<string, string>>[] {
  */
 const FORMULA_START = /^[\t\r]|^\s*[=+\-@＝＋－＠]/;
 
-/** Columns of a row that {@link toCsv} reads index by index; past them, a row with a hole is walked through its own keys (it may be sparse). */
+/**
+ * Holes of a row that {@link toCsv} reads index by index; past them, the row (which may be sparse) is walked through its own keys. A count
+ * of holes, not of columns: listing the keys of a long dense row takes several times as long as reading its cells.
+ */
 const SPARSE_SCAN = 65536;
 
 /**
@@ -2250,6 +2253,8 @@ export function toCsv(rows: ReadonlyArray<unknown>, options?: ToCsvOptions): str
 	}
 
 	const separator = String.fromCharCode(delimiter);
+	// A hole, as `field` writes it: the fields of a run of holes are written at once in a long sparse row.
+	const hole = quoteAll ? '""' : '';
 
 	/**
 	 * Writes one cell.
@@ -2287,27 +2292,35 @@ export function toCsv(rows: ReadonlyArray<unknown>, options?: ToCsvOptions): str
 		const length = cells.length;
 		const fields = new Array<string>(Math.min(length, SPARSE_SCAN));
 		let column = 0;
+		let holes = 0;
 		for (; column < length; column++) {
 			// A hole is an empty field, never a value inherited from a polluted `Array.prototype` (which `map` would read).
 			const own = Object.hasOwn(cells, column);
-			if (!own && column >= SPARSE_SCAN) break;
+			if (!own && ++holes > SPARSE_SCAN) break;
 			fields[column] = field(own ? cells[column] : undefined, row, column);
 		}
 		if (column < length) {
-			// A hole far into a long row, which may be sparse (a length of 2 ** 32 - 1 with a few cells): its own cells are visited (indexes
+			// Many holes in a long row, which may be sparse (a length of 2 ** 32 - 1 with a few cells): its own cells are visited (indexes
 			// come first, in ascending order), each after the separators of the holes before it, so that a run of holes is written at once.
 			// One field at a time, a few hundred million holes ran the process out of memory before the text reached the engine's maximum
 			// length, which now throws a RangeError at once. `column` is the first column not written yet.
+			const indexes: number[] = [];
 			for (const key of Object.getOwnPropertyNames(cells)) {
 				const index = Number(key);
-				if (String(index) !== key) break;
-				if (index >= column) {
-					fields.push(separator.repeat(index - column) + field(cells[index], row, index));
-					column = index + 1;
-				}
+				// Only array indexes from `column` to the length read above: a Proxy may list keys past it.
+				if (index >= column && index < length && String(index >>> 0) === key) indexes.push(index);
+			}
+			// A Proxy may also list them in any order (sorting indexes already in order takes linear time).
+			indexes.sort(function (a: number, b: number): number {
+				return a - b;
+			});
+			for (const index of indexes) {
+				// Read as in the loop above, the cell could have been deleted by the getter of an earlier one.
+				fields.push((hole + separator).repeat(index - column) + field(Object.hasOwn(cells, index) ? cells[index] : undefined, row, index));
+				column = index + 1;
 			}
 		}
-		return length === 1 && fields[0] === '' ? '""' : fields.join(separator) + separator.repeat(length - column);
+		return length === 1 && fields[0] === '' ? '""' : fields.join(separator) + (separator + hole).repeat(length - column);
 	}
 
 	const lines: string[] = [];
