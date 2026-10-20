@@ -812,8 +812,17 @@ export function isOneOf<const T extends ReadonlyArray<unknown>>(values: T): (val
 	const count = values.length;
 	const allowed = new Set<unknown>();
 
-	// A hole allows `undefined`, not an element planted on a polluted `Array.prototype` or `Object.prototype` (which iterating would read).
-	for (let index = 0; index < count; index++) allowed.add(hasOwn.call(values, index) ? values[index] : undefined);
+	let indexes: number[] | undefined;
+
+	// A hole allows `undefined`, not an element planted on a polluted `Array.prototype` or `Object.prototype` (which iterating would read),
+	// and so does the rest of its run (see `holeRun`).
+	for (let index = 0; index < count; index++) {
+		if (hasOwn.call(values, index)) allowed.add(values[index]);
+		else {
+			allowed.add(undefined);
+			index = (indexes ??= ownIndexes(values))[holeRun(indexes, index)] - 1;
+		}
+	}
 
 	return explainable(
 		function isOneOfValues(value: unknown): value is T[number] {
@@ -859,7 +868,8 @@ export function isInstanceOf<T>(constructor: abstract new (...args: never[]) => 
 /**
  * Creates a guard that checks that a value is an array whose every element passes `guard`. Every index from `0` to
  * `length - 1` is checked, so the holes of a sparse array are tested as `undefined` (unlike `Array#every`, which skips
- * them). The element guard is called with the element only.
+ * them): once per run of consecutive holes, which {@link explain} reports at its first index, so that a sparse array costs its
+ * elements, not its length. The element guard is called with the element only.
  * @template T - The element type
  * @param {Guard<T>} guard - The element guard
  * @returns {(value: unknown) => boolean} A guard narrowing to `T[]`
@@ -878,9 +888,14 @@ export function isArrayOf<T>(guard: Guard<T>): (value: unknown) => value is T[] 
 			if (!Array.isArray(value)) return false;
 
 			const direct = !isArrayPrototypePolluted();
+			let indexes: number[] | undefined;
 
 			for (let index = 0; index < value.length; index++) {
-				if (!guard(direct || hasOwn.call(value, index) ? value[index] : undefined)) return false;
+				const element = direct || hasOwn.call(value, index) ? value[index] : undefined;
+
+				if (!guard(element)) return false;
+				// A hole passed: so do the others of its run (see `holeRun`).
+				if (element === undefined && !hasOwn.call(value, index)) index = (indexes ??= ownIndexes(value))[holeRun(indexes, index)] - 1;
 			}
 
 			return true;
@@ -893,10 +908,15 @@ export function isArrayOf<T>(guard: Guard<T>): (value: unknown) => value is T[] 
 			}
 
 			const direct = !isArrayPrototypePolluted();
+			let indexes: number[] | undefined;
 			let passed = true;
 
 			for (let index = 0; index < value.length; index++) {
-				passed = collectChild(guard, direct || hasOwn.call(value, index) ? value[index] : undefined, index, path, issues) && passed;
+				const element = direct || hasOwn.call(value, index) ? value[index] : undefined;
+
+				passed = collectChild(guard, element, index, path, issues) && passed;
+				// A run of holes is reported once, at its first index (see `holeRun`).
+				if (element === undefined && !hasOwn.call(value, index)) index = (indexes ??= ownIndexes(value))[holeRun(indexes, index)] - 1;
 			}
 
 			return passed;
@@ -1481,16 +1501,18 @@ export class ValidationError extends AssertionError {
 	readonly issues: ReadonlyArray<SchemaIssue>;
 
 	/**
-	 * Creates a validation error.
+	 * Creates a validation error. Its message lists the first 100 issues (then how many more there are): a report of a million issues
+	 * would otherwise make a message of tens of megabytes, enough to exhaust the memory.
 	 * @param {ReadonlyArray<SchemaIssue>} issues - The problems found (at least one)
 	 */
 	constructor(issues: ReadonlyArray<SchemaIssue>) {
 		super(
 			issues
+				.slice(0, 100)
 				.map(function (issue: SchemaIssue): string {
 					return issue.path.length === 0 ? issue.message : `${issue.path.map(String).join('.')}: ${issue.message}`;
 				})
-				.join('; ')
+				.join('; ') + (issues.length > 100 ? `; and ${issues.length - 100} more` : '')
 		);
 		this.name = 'ValidationError';
 		this.issues = issues;
@@ -1605,6 +1627,48 @@ function isArrayPrototypePolluted(): boolean {
 	for (const key in Array.prototype) return typeof key === 'string';
 
 	return false;
+}
+
+/**
+ * The own indexes of an array, in ascending order, between `-1` and `Infinity` (see {@link holeRun}).
+ * @param {ReadonlyArray<unknown>} array - The array
+ * @returns {number[]} `-1`, its own indexes, then `Infinity`
+ */
+function ownIndexes(array: ReadonlyArray<unknown>): number[] {
+	const indexes = [-1, Infinity];
+
+	for (const key of Object.getOwnPropertyNames(array)) {
+		const index = Number(key);
+
+		// Elements only, not `length` or other named properties.
+		if (String(index >>> 0) === key && index < array.length) indexes.push(index);
+	}
+
+	return indexes.sort(function (a: number, b: number): number {
+		return a - b;
+	});
+}
+
+/**
+ * Finds the run of holes holding `index` among the {@link ownIndexes} of an array: the elements around it are at `indexes[run - 1]` and
+ * `indexes[run]`. Every hole reads `undefined`, so a walk checks one hole of a run and skips the others: a sparse array (a length of
+ * `2 ** 32 - 1` for a few elements, after `array[index] = value`) costs its elements, not its length.
+ * @param {number[]} indexes - The own indexes of the array
+ * @param {number} index - A hole of the array
+ * @returns {number} The position in `indexes` of the first own index after `index`
+ */
+function holeRun(indexes: number[], index: number): number {
+	let low = 0;
+	let high = indexes.length - 1;
+
+	while (high - low > 1) {
+		const middle = (low + high) >>> 1;
+
+		if (indexes[middle] <= index) low = middle;
+		else high = middle;
+	}
+
+	return high;
 }
 
 /**
@@ -2122,7 +2186,8 @@ export function isLiteral<const T extends Primitive>(value: T): (value: unknown)
  */
 export function isNumberInRange(min: number, max: number): (value: unknown) => value is number {
 	assertNumber('isNumberInRange', 'min', min, min === min, 'a number');
-	assertNumber('isNumberInRange', 'max', max, max >= min, `a number >= min (${min})`);
+	// `typeof` first: comparing an object would convert it (an array is joined, which a sparse one makes endless).
+	assertNumber('isNumberInRange', 'max', max, typeof max === 'number' && max >= min, `a number >= min (${min})`);
 
 	return expecting(function isInRange(value: unknown): value is number {
 		return Number.isFinite(value) && (value as number) >= min && (value as number) <= max;
@@ -2147,7 +2212,8 @@ export function isNumberInRange(min: number, max: number): (value: unknown) => v
  */
 export function isIntegerInRange(min: number, max: number): (value: unknown) => value is number {
 	assertNumber('isIntegerInRange', 'min', min, min === min, 'a number');
-	assertNumber('isIntegerInRange', 'max', max, max >= min, `a number >= min (${min})`);
+	// `typeof` first: comparing an object would convert it (an array is joined, which a sparse one makes endless).
+	assertNumber('isIntegerInRange', 'max', max, typeof max === 'number' && max >= min, `a number >= min (${min})`);
 
 	return expecting(function isIntegerInBounds(value: unknown): value is number {
 		return Number.isSafeInteger(value) && (value as number) >= min && (value as number) <= max;
@@ -2793,12 +2859,15 @@ type IdentityPattern = RegExp | Map<unknown, unknown> | Set<unknown> | WeakMap<o
  * - a `Date` matches dates with the same time; any other value (primitives, maps, class instances…) is compared with SameValueZero
  *   (`NaN` matches `NaN`, `0` matches `-0`, objects by identity).
  *
- * The pattern is compiled once (later mutations do not affect the guard). {@link explain} reports `Missing required property`,
- * `Expected <literal>` and the issues of nested guards with their paths.
+ * The pattern is compiled once (later mutations do not affect the guard), each object or array of it once however many places hold it.
+ * Such a shared part checks an object once per check, as an {@link isLazy} guard does, so that a pattern sharing its parts level after
+ * level checks a value sharing objects in linear time (and {@link explain} gives the pointer issue of {@link isLazy} for an object it
+ * reports again). {@link explain} reports `Missing required property`, `Expected <literal>` and the issues of nested guards with their paths.
  * @template P - The pattern
  * @param {P} pattern - The pattern (a value, a guard, or plain objects and arrays of those)
  * @returns {(value: unknown) => boolean} A guard narrowing to {@link PatternType}
  * @throws {TypeError} when the pattern contains itself (a circular reference)
+ * @throws {RangeError} when an array of the pattern holds more than `2 ** 24` elements
  * @example
  * const isAdminEvent = isMatching({ type: 'login', user: { role: 'admin', id: isInteger } });
  * isAdminEvent({ type: 'login', at: 1, user: { role: 'admin', id: 7, name: 'Ada' } }); // => true
@@ -2807,16 +2876,70 @@ type IdentityPattern = RegExp | Map<unknown, unknown> | Set<unknown> | WeakMap<o
  * explain(isAdminEvent, { type: 'login', user: { id: 'x' } }); // => [{ message: 'Missing required property', path: ['user', 'role'] }, { message: 'Invalid value (got string)', path: ['user', 'id'] }]
  */
 export function isMatching<const P>(pattern: P): (value: unknown) => value is PatternType<P> {
-	return compilePattern(pattern, []) as (value: unknown) => value is PatternType<P>;
+	const parts = new Map<unknown, PatternPart>();
+
+	scanPattern(pattern, parts);
+
+	return compilePattern(pattern, [], parts, new Map<unknown, Guard<unknown>>()) as (value: unknown) => value is PatternType<P>;
+}
+
+/** An object or array of a pattern of {@link isMatching}: its keys (none for an array) and values, read once, and whether it is shared. */
+interface PatternPart {
+	readonly keys: PropertyKey[];
+	readonly values: unknown[];
+	shared: boolean;
+}
+
+/**
+ * Reads the objects and arrays of a pattern of {@link isMatching} (each once, however many places hold it), marking those met again.
+ * @param {unknown} pattern - The pattern
+ * @param {Map<unknown, PatternPart>} parts - The parts read so far
+ * @returns {void}
+ */
+function scanPattern(pattern: unknown, parts: Map<unknown, PatternPart>): void {
+	const array = Array.isArray(pattern);
+
+	if (typeof pattern === 'function' || isDate(pattern) || (!array && !isPlainObject(pattern))) return;
+	// Its tuple takes a guard per element as arguments, which the engine limits far below that: a sparse array of length 2^32 - 1 would
+	// exhaust the memory before.
+	if (array && (pattern as unknown[]).length > 2 ** 24) throw new RangeError('isMatching: an array pattern must hold at most 2 ** 24 elements');
+
+	const known = parts.get(pattern);
+
+	if (known !== undefined) {
+		known.shared = true;
+
+		return;
+	}
+
+	const source = pattern as Record<PropertyKey, unknown>;
+	const keys: PropertyKey[] = array
+		? []
+		: [
+				...Object.keys(source),
+				...Object.getOwnPropertySymbols(source).filter(function (key: symbol): boolean {
+					return propertyIsEnumerable.call(source, key);
+				})
+			];
+	const values: unknown[] = [];
+
+	// A hole is `undefined`, not an element planted on a polluted `Array.prototype` or `Object.prototype` (the tuple checks values that way).
+	if (array) for (let index = 0; index < (pattern as unknown[]).length; index++) values.push(hasOwn.call(source, index) ? source[index] : undefined);
+	// Read once: a getter could return a guard, then a literal.
+	for (const key of keys) values.push(source[key]);
+	parts.set(pattern, { keys, values, shared: false });
+	for (const value of values) scanPattern(value, parts);
 }
 
 /**
  * Compiles a pattern of {@link isMatching} into a guard.
  * @param {unknown} pattern - The pattern
  * @param {unknown[]} ancestors - The patterns being compiled around this one (to detect cycles)
+ * @param {Map<unknown, PatternPart>} parts - Its objects and arrays (see {@link scanPattern})
+ * @param {Map<unknown, Guard<unknown>>} compiled - The guards of the parts compiled so far
  * @returns {Guard<unknown>} The guard
  */
-function compilePattern(pattern: unknown, ancestors: unknown[]): Guard<unknown> {
+function compilePattern(pattern: unknown, ancestors: unknown[], parts: Map<unknown, PatternPart>, compiled: Map<unknown, Guard<unknown>>): Guard<unknown> {
 	if (typeof pattern === 'function') return pattern as Guard<unknown>;
 	if (isDate(pattern)) {
 		const time = dateGetTime.call(pattern);
@@ -2826,37 +2949,43 @@ function compilePattern(pattern: unknown, ancestors: unknown[]): Guard<unknown> 
 		}, `a date with time ${time}`);
 	}
 
-	const array = Array.isArray(pattern);
+	const part = parts.get(pattern);
 
-	if (!array && !isPlainObject(pattern)) return literal(pattern);
+	if (part === undefined) return literal(pattern);
 	if (ancestors.includes(pattern)) throw new TypeError('isMatching: `pattern` must be acyclic, got a circular reference');
+
+	let guard = compiled.get(pattern);
+
+	if (guard !== undefined) return guard;
 	ancestors.push(pattern);
 
-	const source = pattern as Record<PropertyKey, unknown>;
-	const keys: PropertyKey[] = array
-		? []
-		: [
-				...Object.keys(source),
-				...Object.getOwnPropertySymbols(source).filter(function (key: symbol): boolean {
-					return Object.prototype.propertyIsEnumerable.call(source, key);
-				})
-			];
 	const guards: Guard<unknown>[] = [];
-	const required: boolean[] = [];
 
-	// A hole is `undefined`, not an element planted on a polluted `Array.prototype` or `Object.prototype` (the tuple checks values that way).
-	if (array)
-		for (let index = 0; index < (pattern as unknown[]).length; index++) guards.push(compilePattern(hasOwn.call(source, index) ? source[index] : undefined, ancestors));
-	for (const key of keys) {
-		// Read once: a getter could return a guard, then a literal.
-		const value = source[key];
-
-		guards.push(compilePattern(value, ancestors));
-		required.push(typeof value !== 'function');
-	}
+	for (const value of part.values) guards.push(compilePattern(value, ancestors, parts, compiled));
 	ancestors.pop();
+	guard = Array.isArray(pattern)
+		? isTuple(...guards)
+		: shapeGuard(
+				part.keys,
+				guards,
+				part.values.map(function (value: unknown): boolean {
+					return typeof value !== 'function';
+				}),
+				undefined
+			);
 
-	return array ? isTuple(...guards) : shapeGuard(keys, guards, required, undefined);
+	// A shared part remembers what it found for each object during a check: the paths through a pattern sharing its parts level after
+	// level double at each level.
+	if (part.shared) {
+		const inner = guard;
+
+		guard = isLazy(function (): Guard<unknown> {
+			return inner;
+		});
+	}
+	compiled.set(pattern, guard);
+
+	return guard;
 }
 
 /**
@@ -3085,10 +3214,16 @@ function walkJson(root: unknown, path: PropertyKey[] | undefined, issues: Schema
 				if (Array.isArray(value)) {
 					// Holes read as `undefined` (also under a polluted `Array.prototype`), which is rejected: `JSON.stringify` writes them as `null`.
 					const polluted = isArrayPrototypePolluted();
+					let indexes: number[] | undefined;
 
 					for (let index = value.length - 1; index >= 0; index--) {
 						const child = polluted && !hasOwn.call(value, index) ? undefined : value[index];
 
+						if (child === undefined) {
+							if (issues === undefined) return false;
+							// A run of holes is reported once, at its first index (see `holeRun`).
+							if (!hasOwn.call(value, index)) index = Math.min(index, (indexes ??= ownIndexes(value))[holeRun(indexes, index) - 1] + 1);
+						}
 						if (typeof child === 'object' && child !== null) nested = true;
 						stack.push(index, child);
 					}
@@ -3148,7 +3283,7 @@ function explainJson(guard: Guard<unknown>, value: unknown, path: PropertyKey[],
  * `undefined`, functions, symbols and bigints (dropped, or throwing), sparse arrays (holes become `null`), dates, maps, class instances
  * and other non-plain objects (including those with a `toJSON` method), and circular references (which make `JSON.stringify` throw).
  * Symbol keys are ignored, as `JSON.stringify` does. The walk is iterative, so arbitrarily deep values cannot overflow the stack, and
- * {@link explain} reports the path of every offending value. A container held in several places is walked once, so the cost is linear in
+ * {@link explain} reports the path of every offending value (of a run of holes, its first index). A container held in several places is walked once, so the cost is linear in
  * the size of the value even when it shares containers (YAML aliases), where `JSON.stringify` is exponential; {@link explain} reports
  * an invalid one at its first path and gives one `Invalid value (same object as reported at another path)` issue at each other path
  * (a container of fewer than 16 primitives is cheap enough to be checked, and reported, again at each path).

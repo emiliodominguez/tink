@@ -12,6 +12,7 @@ import {
 	isError,
 	isFiniteNumber,
 	isInteger,
+	isIntegerInRange,
 	isIntersection,
 	isJsonArray,
 	isJsonObject,
@@ -1420,5 +1421,204 @@ describe('guards (pass 4 regressions)', function () {
 		} finally {
 			delete proto[0];
 		}
+	});
+});
+
+describe('guards (pass 5 regressions)', function () {
+	/**
+	 * A sparse array of length `2 ** 32 - 1` holding `1` at `indexes`, behind a proxy that throws after 100 reads of an element: a walk
+	 * visiting each hole would read billions.
+	 * @param {number[]} indexes - The indexes holding an element
+	 * @returns {unknown[]} The proxy
+	 */
+	function hugeSparse(...indexes: number[]): unknown[] {
+		const target: unknown[] = [];
+		let reads = 0;
+
+		target.length = 2 ** 32 - 1;
+		for (const index of indexes) target[index] = 1;
+
+		/**
+		 * Counts a read of an element.
+		 * @param {PropertyKey} key - The key read
+		 * @returns {void}
+		 */
+		function count(key: PropertyKey): void {
+			if (typeof key === 'string' && /^\d+$/.test(key) && ++reads > 100) throw new Error('read each hole');
+		}
+
+		return new Proxy(target, {
+			get(array, key) {
+				count(key);
+
+				return Reflect.get(array, key);
+			},
+			getOwnPropertyDescriptor(array, key) {
+				count(key);
+
+				return Reflect.getOwnPropertyDescriptor(array, key);
+			}
+		});
+	}
+
+	it('rejects a huge sparse array at once in the JSON guards, and reports each run of holes once', function () {
+		for (const indexes of [[0], [2 ** 32 - 2], [0, 2 ** 31, 2 ** 32 - 2], []]) {
+			expect(isJsonValue(hugeSparse(...indexes))).toBe(false);
+			expect(isJsonArray(hugeSparse(...indexes))).toBe(false);
+		}
+		expect(explain(isJsonValue, hugeSparse(0, 2 ** 31))).toEqual([
+			{ message: 'Expected a JSON value (got undefined)', path: [1] },
+			{ message: 'Expected a JSON value (got undefined)', path: [2 ** 31 + 1] }
+		]);
+		expect(explain(isJsonValue, { a: hugeSparse(2 ** 32 - 2) })).toEqual([{ message: 'Expected a JSON value (got undefined)', path: ['a', 0] }]);
+		// eslint-disable-next-line no-sparse-arrays
+		expect(explain(isJsonValue, [1, , , 4, , 6])).toEqual([
+			{ message: 'Expected a JSON value (got undefined)', path: [1] },
+			{ message: 'Expected a JSON value (got undefined)', path: [4] }
+		]);
+		expect(explain(isJsonValue, [1, undefined, undefined])).toEqual([
+			{ message: 'Expected a JSON value (got undefined)', path: [1] },
+			{ message: 'Expected a JSON value (got undefined)', path: [2] }
+		]);
+	});
+
+	it('checks a run of holes of a huge sparse array once in isArrayOf', function () {
+		let calls = 0;
+
+		/**
+		 * Accepts numbers and `undefined`, counting its calls.
+		 * @param {unknown} value - The value
+		 * @returns {boolean} Whether it is a number or `undefined`
+		 */
+		function isMaybeNumber(value: unknown): value is number | undefined {
+			calls++;
+
+			return value === undefined || typeof value === 'number';
+		}
+
+		expect(isArrayOf(isMaybeNumber)(hugeSparse(0, 2 ** 31, 2 ** 32 - 2))).toBe(true);
+		expect(calls).toBe(5);
+		expect(isArrayOf(isOptional(isString))(hugeSparse(2 ** 32 - 2))).toBe(false);
+		expect(explain(isArrayOf(isMaybeNumber), hugeSparse(2 ** 31))).toEqual([]);
+		expect(explain(isArrayOf(isInteger), hugeSparse(0, 2 ** 32 - 2))).toEqual([{ message: 'Invalid value (got undefined)', path: [1] }]);
+		expect(explain(isArrayOf(isOptional(isString)), hugeSparse(2 ** 31))).toEqual([{ message: 'Invalid value (got number)', path: [2 ** 31] }]);
+		// eslint-disable-next-line no-sparse-arrays
+		expect(explain(isArrayOf(isInteger), [, , 1, , 'x', , ,])).toEqual([
+			{ message: 'Invalid value (got undefined)', path: [0] },
+			{ message: 'Invalid value (got undefined)', path: [3] },
+			{ message: 'Invalid value (got string)', path: [4] },
+			{ message: 'Invalid value (got undefined)', path: [5] }
+		]);
+		// Under a polluted prototype too, where every element is read as an own property.
+		const proto = Array.prototype as unknown as Record<number, unknown>;
+		proto[1] = 'planted';
+		try {
+			expect(isArrayOf(isMaybeNumber)(hugeSparse(0, 2 ** 32 - 2))).toBe(true);
+			expect(explain(isArrayOf(isInteger), hugeSparse(2 ** 32 - 2))).toEqual([{ message: 'Invalid value (got undefined)', path: [0] }]);
+			expect(isJsonArray(hugeSparse(0))).toBe(false);
+			expect(explain(isJsonValue, hugeSparse(0))).toEqual([{ message: 'Expected a JSON value (got undefined)', path: [1] }]);
+		} finally {
+			delete proto[1];
+		}
+	});
+
+	it('builds isOneOf from a huge sparse list by its elements', function () {
+		const isListed = isOneOf(hugeSparse(2 ** 31) as never);
+
+		expect([isListed(1), isListed(undefined), isListed(2)]).toEqual([true, true, false]);
+		expect(isOneOf([1, 2] as const)(undefined)).toBe(false);
+	});
+
+	it('compiles a shared part of an isMatching pattern once, and checks an object against it once per check', function () {
+		let reads = 0;
+		let calls = 0;
+
+		/**
+		 * Accepts numbers, counting its calls.
+		 * @param {unknown} value - The value
+		 * @returns {boolean} Whether it is a number
+		 */
+		function isCounted(value: unknown): value is number {
+			if (++calls > 1000) throw new Error('called once per path');
+
+			return typeof value === 'number';
+		}
+
+		let pattern: object = { x: isCounted };
+		let value: object = { x: 1 };
+		let bad: object = { x: 'no' };
+
+		for (let level = 0; level < 30; level++) {
+			const below = pattern;
+
+			pattern = Object.defineProperty({ r: below }, 'l', {
+				enumerable: true,
+				get(): object {
+					if (++reads > 1000) throw new Error('read once per path');
+
+					return below;
+				}
+			});
+			value = { l: value, r: value };
+			bad = { l: bad, r: bad };
+		}
+
+		const isDag = isMatching(pattern);
+
+		expect(reads).toBe(30);
+		expect(isDag(value)).toBe(true);
+		expect(isDag(bad)).toBe(false);
+		// One call per object (and one with `undefined`, which the shape asks once).
+		expect(calls).toBe(3);
+		const issues = explain(isDag, bad);
+		expect(issues).toHaveLength(31);
+		expect(issues[0]).toEqual({ message: 'Invalid value (got string)', path: [...Array<string>(30).fill('r'), 'x'] });
+		expect(issues[1]).toEqual({ message: 'Invalid value (same object as reported at another path)', path: [...Array<string>(29).fill('r'), 'l'] });
+		// A tree of the same parts is reported in full; the same object at two places once.
+		const point = { x: isInteger, y: isInteger };
+		const isSegment = isMatching({ from: point, to: point });
+		const shared = { x: 1, y: 'a' };
+		expect(explain(isSegment, { from: { x: 1, y: 'a' }, to: { x: 'b', y: 2 } })).toEqual([
+			{ message: 'Invalid value (got string)', path: ['from', 'y'] },
+			{ message: 'Invalid value (got string)', path: ['to', 'x'] }
+		]);
+		expect(explain(isSegment, { from: shared, to: shared })).toEqual([
+			{ message: 'Invalid value (got string)', path: ['from', 'y'] },
+			{ message: 'Invalid value (same object as reported at another path)', path: ['to'] }
+		]);
+		expect(isMatching([point, [point]])([{ x: 1, y: 2 }, [{ x: 3, y: 4 }]])).toBe(true);
+		// An array pattern too long to compile is rejected before its elements are read.
+		expect(function () {
+			isMatching({ list: hugeSparse(0) });
+		}).toThrow(new RangeError('isMatching: an array pattern must hold at most 2 ** 24 elements'));
+	});
+
+	it('lists the first 100 issues in the message of a ValidationError', function () {
+		const issues = Array.from({ length: 1e6 }, function (_: unknown, index: number): { message: string; path: number[] } {
+			return { message: 'Invalid value (got string)', path: [index] };
+		});
+		const error = new ValidationError(issues);
+		expect(error.issues).toBe(issues);
+		expect(error.message.startsWith('0: Invalid value (got string); 1: Invalid value (got string); ')).toBe(true);
+		expect(error.message.endsWith('; 99: Invalid value (got string); and 999900 more')).toBe(true);
+		expect(new ValidationError(issues.slice(0, 100)).message.endsWith('; 99: Invalid value (got string)')).toBe(true);
+		const sparse: Array<{ message: string; path: number[] }> = [];
+		sparse[2 ** 32 - 2] = issues[0];
+		expect(new ValidationError(sparse).message.endsWith('; and 4294967195 more')).toBe(true);
+	});
+
+	it('rejects a range bound that is not a number without converting it', function () {
+		const bound = {
+			valueOf(): number {
+				throw new Error('converted');
+			}
+		};
+
+		expect(function () {
+			isNumberInRange(0, bound as never);
+		}).toThrow(new TypeError('isNumberInRange: `max` must be a number >= min (0), got object'));
+		expect(function () {
+			isIntegerInRange(0, bound as never);
+		}).toThrow(new TypeError('isIntegerInRange: `max` must be a number >= min (0), got object'));
 	});
 });
