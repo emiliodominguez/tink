@@ -1738,4 +1738,25 @@ describe('errors of hostile sizes (regressions)', function () {
 		sparse[2 ** 32 - 2] = 1;
 		expect(getErrorMessage(sparse)).toBe('[object Array]');
 	});
+
+	it('serializeError converts a leaf array shared by many paths once (regression: once per path)', function () {
+		let reads = 0;
+		const leaf = new Proxy(
+			Array.from({ length: 100 }, function (_: unknown, i: number): number {
+				return i;
+			}),
+			{
+				get(array, key) {
+					if (typeof key === 'string' && /^\d+$/.test(key)) reads++;
+					return Reflect.get(array, key);
+				}
+			}
+		);
+		const data: Record<string, unknown> = {};
+		for (let i = 0; i < 200; i++) data[`k${i}`] = leaf;
+		const serialized = serializeError(Object.assign(new Error('x'), { data })) as unknown as { data: Record<string, number[]> };
+		expect(serialized.data.k199).toEqual(Array.from(leaf));
+		// 100 for the conversion, 100 for `Array.from` above (each path converted again read 100 more).
+		expect(reads).toBeLessThan(1000);
+	});
 });
