@@ -965,9 +965,10 @@ export function toRgba(input: ColorInput): Rgba {
 	if (typeof input === 'string') return parseCssColor('toRgba', 'input', input);
 	if (typeof input !== 'object' || input === null) throw new TypeError(`toRgba: \`input\` must be a colour string or an { r, g, b } object, got ${describe(input)}`);
 	// The optional alpha is read as an own (or class-inherited) property: an `a` planted on a polluted `Object.prototype` must not make
-	// every colour translucent. (Inlined `readOption`: a constant key keeps this hot path as fast as a plain read.)
+	// every colour translucent. (Inlined `readOption`: a constant key keeps this hot path as fast as a plain read. `Object.is`, not `===`,
+	// as there: a planted `NaN` would otherwise make every colour object throw.)
 	let a = (input as Partial<Rgba>).a;
-	if (a !== undefined && a === (Object.prototype as Partial<Rgba>).a && !Object.hasOwn(input, 'a')) a = undefined;
+	if (a !== undefined && Object.is(a, (Object.prototype as Partial<Rgba>).a) && !Object.hasOwn(input, 'a')) a = undefined;
 	const alpha = readAlpha('toRgba', 'input.a', a);
 	return {
 		r: toByte(readChannel('toRgba', 'input.r', input.r)),

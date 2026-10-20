@@ -1572,9 +1572,10 @@ function weightedMean(values: ReadonlyArray<number>, weights: ReadonlyArray<numb
 	if (!Number.isFinite(high)) return Infinity;
 	// `(high + low) / (divisor + divisorLow)`: the quotient by `divisor`, corrected by the residual `numerator - quotient * divisor`, whose
 	// first part is exact (see `harmonicMean`). Scaling the numerator by a power of two scales the quotient exactly.
-	const rounded = high / divisor;
-	const shift = Math.abs(rounded) > 2 ** 900 ? 2 ** -200 : 1;
-	const quotient = rounded * shift;
+	// The numerator is scaled before dividing (exactly, for numerators that large): a quotient next to `Number.MAX_VALUE` could round up to
+	// `Infinity`, which made the result `NaN`.
+	const shift = Math.abs(high) > 2 ** 900 * divisor ? 2 ** -200 : 1;
+	const quotient = (high * shift) / divisor;
 	const residual = high * shift - quotient * divisor - productError(quotient, divisor) + low * shift - quotient * divisorLow;
 	// No mean of finite values exceeds the largest double, but the last rounding can push it there.
 	return Math.min(Math.max((quotient + residual / divisor) / shift, -Number.MAX_VALUE), Number.MAX_VALUE);
@@ -1875,7 +1876,8 @@ export function ordinal(n: number): string {
  * even roots of negative numbers are `NaN`. Uses `Math.sqrt` / `Math.cbrt` for `n = 2` / `n = 3`; other roots are within an ulp of the
  * exact root (usually correctly rounded), for any magnitude, where `Math.pow(x, 1 / n)` is off by tens of ulps for large or tiny `x` (the
  * rounding of `1 / n` is magnified by `ln(x) / n`). An exact root is returned exactly (`nthRoot(16, 4) === 2`, not `1.9999999999999998`,
- * and `nthRoot(5.0625, 4) === 1.5`), and so is an integer `k` with `k ** n === |value|` in floating point.
+ * and `nthRoot(5.0625, 4) === 1.5`), and so is an integer `k` with `k ** n === |value|` in floating point. The value is converted once with
+ * unary `+`, so the result is always a number.
  * @param {number} value - The radicand
  * @param {number} n - The degree of the root, a positive integer
  * @returns {number} The real `n`-th root of `value`, or `NaN` when it does not exist
@@ -1890,12 +1892,14 @@ export function ordinal(n: number): string {
  */
 export function nthRoot(value: number, n: number): number {
 	assertInteger('nthRoot', 'n', n, 1);
-	if (n === 2) return Math.sqrt(value);
-	if (n === 3) return Math.cbrt(value);
-	if (value < 0 && n % 2 === 0) return NaN;
-	const magnitude = Math.abs(value);
+	// Converted once with unary `+`, so that the roots returned as they are below are numbers too (`nthRoot('8', 1)` is `8`, not `'8'`).
+	const number = +value;
+	if (n === 2) return Math.sqrt(number);
+	if (n === 3) return Math.cbrt(number);
+	if (number < 0 && n % 2 === 0) return NaN;
+	const magnitude = Math.abs(number);
 	// `n = 1`, `±0`, `±Infinity` and `NaN` are their own roots (a zero keeps its sign).
-	if (n === 1 || !(magnitude > 0 && magnitude < Infinity)) return value;
+	if (n === 1 || !(magnitude > 0 && magnitude < Infinity)) return number;
 	// `Math.pow(x, inverse)` is off by a factor `x ** (1 / n - inverse)` from the root, `ln(x) * (1 / n - inverse)` relatively, which is up
 	// to tens of ulps for large or tiny `x`: correct by it, from the exact rounding error of `inverse`, `-(n * inverse - 1) / n` (the rounded
 	// product minus 1 is exact, and so is its own error; from `n = 2 ** 52` on, the correction is far below an ulp, and splitting a huge `n`
@@ -1907,7 +1911,7 @@ export function nthRoot(value: number, n: number): number {
 	// An integer whose power rounds to the value (`3 ** 40` is not exact) is the root as far as doubles can tell.
 	const nearest = Math.round(root);
 	if (Math.abs(root - nearest) <= root * 2 ** -50 && Math.pow(nearest, n) === magnitude) root = nearest;
-	return value < 0 ? -root : root;
+	return number < 0 ? -root : root;
 }
 
 /**

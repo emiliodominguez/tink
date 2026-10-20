@@ -838,6 +838,21 @@ describe('Color helpers under prototype pollution', function () {
 			delete keys.a;
 		}
 	});
+
+	it('never reads a missing alpha planted as NaN on Object.prototype (regression)', function () {
+		const keys = Object.prototype as Record<string, unknown>;
+		keys.a = NaN;
+		try {
+			expect(helpers.toRgba({ r: 255, g: 0, b: 0 })).toEqual({ r: 255, g: 0, b: 0, a: 1 });
+			expect(helpers.contrastRatio({ r: 0, g: 0, b: 0 }, { r: 255, g: 255, b: 255 })).toBe(21);
+			// An own NaN alpha is still rejected.
+			expect(function () {
+				helpers.toRgba({ r: 0, g: 0, b: 0, a: NaN });
+			}).toThrow(RangeError);
+		} finally {
+			delete keys.a;
+		}
+	});
 });
 
 /**
