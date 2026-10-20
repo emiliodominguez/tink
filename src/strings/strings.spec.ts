@@ -1378,6 +1378,20 @@ describe('String helpers (round 11)', function () {
 			expect(helpers.trimChars('-x-', [])).toBe('-x-');
 		});
 
+		it('rejects a hole in the array, never reading a polluted Object.prototype through it (regression)', function () {
+			const polluted = Object.prototype as Record<string, unknown>;
+			polluted[1] = 'x';
+			try {
+				const chars = ['-', 'hole', '_'];
+				delete chars[1];
+				expect(function () {
+					helpers.trimChars('xx-hi-xx', chars);
+				}).toThrow(new TypeError('trimChars: `chars` must be a string or an array of strings, got undefined'));
+			} finally {
+				delete polluted[1];
+			}
+		});
+
 		it('should treat regular expression syntax literally', function () {
 			expect(helpers.trimChars(']]x]]', ']')).toBe('x');
 			expect(helpers.trimChars('^^x^^', '^')).toBe('x');

@@ -1777,8 +1777,12 @@ function graphemeSet(caller: string, chars: string | ReadonlyArray<string>): Rea
 	}
 
 	const set = new Set<string>();
+	const items: ReadonlyArray<unknown> = Array.isArray(chars) ? chars : [chars];
 
-	for (const item of Array.isArray(chars) ? (chars as ReadonlyArray<unknown>) : [chars]) {
+	// Read by index, so that a hole is `undefined` (and rejected), never a string planted on a polluted `Object.prototype`.
+	for (let index = 0; index < items.length; index++) {
+		const item = Object.hasOwn(items, index) ? items[index] : undefined;
+
 		if (typeof item !== 'string') throw new TypeError(`${caller}: \`chars\` must be a string or an array of strings, got ${describe(item)}`);
 
 		for (const grapheme of splitGraphemes(item)) set.add(grapheme);
