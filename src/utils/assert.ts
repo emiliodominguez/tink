@@ -142,7 +142,8 @@ export function draw(caller: string, random: RandomGenerator): number {
  */
 export function readOption<O extends object, K extends keyof O & string, D = undefined>(options: O, key: K, fallback?: D): Exclude<O[K], undefined> | D {
 	const value = options[key];
-	if (value === undefined || (value === (Object.prototype as O)[key] && !hasOwn.call(options, key))) return fallback as D;
+	// `Object.is`, not `===`: a polluted `NaN` is recognised too.
+	if (value === undefined || (Object.is(value, (Object.prototype as O)[key]) && !hasOwn.call(options, key))) return fallback as D;
 	return value as Exclude<O[K], undefined>;
 }
 

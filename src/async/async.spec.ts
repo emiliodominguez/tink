@@ -6828,6 +6828,14 @@ describe('Async helpers (options inherited from a polluted Object.prototype)', f
 				}, {})
 			).resolves.toBe(4);
 		});
+		// `NaN` is not equal to itself: it is recognised as the polluted value all the same.
+		await polluted('priority', NaN, function () {
+			return expect(
+				createQueue({}).add(function () {
+					return 5;
+				}, {})
+			).resolves.toBe(5);
+		});
 		await polluted('limit', 5, async function () {
 			expect(function () {
 				createRateLimiter({ interval: 10 } as never);

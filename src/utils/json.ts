@@ -93,15 +93,25 @@ function read(object: object, key: string): unknown {
 
 /**
  * Writes an own data property of an object created by this file (whose prototype is `Object.prototype`): a key `Object.prototype` has
- * (`'__proto__'`, `'toString'`, anything a pollution added) is defined, so that no inherited setter intercepts it.
+ * (`'__proto__'`, `'toString'`, anything a pollution added) is defined, so that no inherited setter intercepts it. Every attribute of
+ * the descriptor is given, so none is inherited; one that inherits a `get` or `set` from a polluted `Object.prototype` (an accessor with
+ * a value, which `Object.defineProperty` rejects) is given again without a prototype.
  * @param {Record<string, unknown>} target - The object to write to
  * @param {string} key - The key
  * @param {unknown} value - The value
  * @returns {void}
  */
 function put(target: Record<string, unknown>, key: string, value: unknown): void {
-	if (key in target) Object.defineProperty(target, key, { value, writable: true, enumerable: true, configurable: true });
-	else target[key] = value;
+	if (!(key in target)) {
+		target[key] = value;
+		return;
+	}
+	const descriptor: PropertyDescriptor = { value, writable: true, enumerable: true, configurable: true };
+	try {
+		Object.defineProperty(target, key, descriptor);
+	} catch {
+		Object.defineProperty(target, key, Object.setPrototypeOf(descriptor, null) as PropertyDescriptor);
+	}
 }
 
 /**

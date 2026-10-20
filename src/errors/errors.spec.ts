@@ -208,6 +208,19 @@ describe('errors', function () {
 	});
 
 	describe('serializeError', function () {
+		it('copies keys Object.prototype has when Object.prototype also holds a get', function () {
+			const proto = Object.prototype as Record<string, unknown>;
+			proto.get = function (): string {
+				return 'polluted';
+			};
+			try {
+				const error = Object.assign(new Error('boom'), { toString: 'own', valueOf: 1 });
+				expect(serializeError(error)).toMatchObject({ name: 'Error', message: 'boom', toString: 'own', valueOf: 1 });
+			} finally {
+				delete proto.get;
+			}
+		});
+
 		it('serializes name, message, stack and cause', function () {
 			const cause = new Error('Limit: 10');
 			const error = new RangeError('Too big', { cause });

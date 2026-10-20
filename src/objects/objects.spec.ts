@@ -4491,6 +4491,20 @@ describe('safeStringify', function () {
 		return proxy;
 	}
 
+	it('writes keys Object.prototype has when Object.prototype also holds a get or set', function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		proto.get = function (): string {
+			return 'polluted';
+		};
+		proto.set = function (): void {};
+		try {
+			expect(helpers.safeStringify(JSON.parse('{"toString":1,"valueOf":[1],"__proto__":2}'))).toBe('{"toString":1,"valueOf":[1],"__proto__":2}');
+		} finally {
+			delete proto.get;
+			delete proto.set;
+		}
+	});
+
 	it('matches JSON.stringify on what JSON.stringify handles', function () {
 		const values: unknown[] = [
 			null,
