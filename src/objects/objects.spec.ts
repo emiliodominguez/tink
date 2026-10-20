@@ -4329,9 +4329,9 @@ describe('JSON Patch (review regressions)', function () {
 		const removed = helpers.applyPatch(before, patch);
 		const elapsed = Date.now() - start;
 		expect(removed).toEqual(after);
-		// About 0.15 s; shifting with the generic `copyWithin` took 5 s. Coverage instrumentation slows the shifting loops (only) about
-		// twentyfold, so the bound is only meaningful without it.
-		expect(elapsed).toBeLessThan(mutating ? Infinity : '__coverage__' in globalThis ? 15_000 : 1500);
+		// About 0.15 s; shifting with the generic `copyWithin` took 5 s. The bound leaves room for a loaded machine (a busy run took 1.6 s).
+		// Coverage instrumentation slows the shifting loops (only) about twentyfold, so the bound is only meaningful without it.
+		expect(elapsed).toBeLessThan(mutating ? Infinity : '__coverage__' in globalThis ? 15_000 : 4000);
 	});
 
 	it('treats undefined object members as absent, as JSON does', function () {

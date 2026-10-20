@@ -465,11 +465,12 @@ describe('persistStore (properties)', function () {
 	}
 
 	/**
-	 * What a JSON round trip without `__proto__` keys gives.
+	 * What a JSON round trip without the documented pollution keys gives: `__proto__`, and a `constructor` object with a `prototype` key.
 	 */
 	function sanitized(value: unknown): unknown {
 		return JSON.parse(JSON.stringify(value), function (key, item) {
-			return key === '__proto__' ? undefined : item;
+			if (key === '__proto__') return undefined;
+			return key === 'constructor' && typeof item === 'object' && item !== null && Object.hasOwn(item, 'prototype') ? undefined : item;
 		});
 	}
 
@@ -492,7 +493,8 @@ describe('persistStore (properties)', function () {
 				expect(sanitized(target.getState())).toEqual(sanitized(expected));
 				expect(Object.getPrototypeOf(target.getState())).toBe(Object.prototype);
 				expect(({} as Record<string, unknown>).polluted).toBeUndefined();
-			})
+			}),
+			{ examples: [[{ constructor: { prototype: 0 } }, {}]] }
 		);
 	});
 
