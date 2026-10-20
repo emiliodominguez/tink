@@ -43,6 +43,7 @@ import fastStableStringify from 'fast-json-stable-stringify';
 import * as lodash from 'lodash-es';
 import * as radash from 'radash';
 import * as remeda from 'remeda';
+import vm from 'node:vm';
 
 // Inputs: a small record (6 keys, a little nesting), a flat 100-key record, a nested config, and 1k (or 100k) user records.
 const small = { id: 7, name: 'Ada', active: true, tags: ['a', 'b'], meta: { created: 1, owner: { id: 1 } }, score: 9.5 };
@@ -85,11 +86,35 @@ const config = {
 	flags: [1, 2, 3, 4, 5],
 	db: { pool: { min: 1, max: 10 }, replicas: [{ host: 'a' }, { host: 'b' }] }
 };
+// Binary data, a string-keyed Map and null-prototype records (`Object.create(null)` dictionaries, as some parsers build them).
+const bytes = new Uint8Array(65_536).map(function (_, index) {
+	return index;
+});
+const lookup = new Map(Object.entries(record));
+
+/**
+ * Builds null-prototype records with a nested null-prototype object.
+ * @returns {object[]} 100 records
+ */
+function bare() {
+	return users.slice(0, 100).map(function (user) {
+		return Object.assign(Object.create(null), { id: user.id, name: user.name, geo: Object.assign(Object.create(null), user.address.geo) });
+	});
+}
+
+const bareRecords = bare();
+// Records of another realm (an iframe, a `vm` context: what `fetch(...).json()` returns under Jest).
+const realm = vm.createContext({ text: JSON.stringify(users.slice(0, 100)) });
+const foreignRecords = vm.runInContext('JSON.parse(text)', realm);
 const copies = {
 	small: JSON.parse(JSON.stringify(small)),
 	config: JSON.parse(JSON.stringify(config)),
 	users: JSON.parse(JSON.stringify(users)),
-	manyUsers: JSON.parse(JSON.stringify(manyUsers))
+	manyUsers: JSON.parse(JSON.stringify(manyUsers)),
+	bytes: bytes.slice(),
+	lookup: new Map(lookup),
+	bareRecords: bare(),
+	foreignRecords: vm.runInContext('JSON.parse(text)', realm)
 };
 const defaults = { a: { x: 1, y: { z: 2, w: [1, 2] } }, b: 'text', c: { d: { e: { f: 1 } } }, list: [1, 2, 3] };
 const overrides = { a: { y: { z: 3 }, q: 9 }, c: { d: { e: { g: 2 } } }, list: [9], extra: true };
@@ -588,6 +613,90 @@ export default [
 		}
 	),
 	compare(
+		'isEqual (64 kB typed arrays)',
+		function () {
+			return isEqual(bytes, copies.bytes);
+		},
+		{
+			'es-toolkit': function () {
+				return toolkit.isEqual(bytes, copies.bytes);
+			},
+			lodash: function () {
+				return lodash.isEqual(bytes, copies.bytes);
+			}
+		}
+	),
+	compare(
+		'isEqual (Map of 100 string keys)',
+		function () {
+			return isEqual(lookup, copies.lookup);
+		},
+		{
+			'es-toolkit': function () {
+				return toolkit.isEqual(lookup, copies.lookup);
+			},
+			lodash: function () {
+				return lodash.isEqual(lookup, copies.lookup);
+			}
+		}
+	),
+	compare(
+		'isEqual (100 null-prototype records)',
+		function () {
+			return isEqual(bareRecords, copies.bareRecords);
+		},
+		{
+			'es-toolkit': function () {
+				return toolkit.isEqual(bareRecords, copies.bareRecords);
+			},
+			lodash: function () {
+				return lodash.isEqual(bareRecords, copies.bareRecords);
+			}
+		}
+	),
+	compare(
+		'isEqual (100 records of another realm)',
+		function () {
+			return isEqual(foreignRecords, copies.foreignRecords);
+		},
+		{
+			'es-toolkit': function () {
+				return toolkit.isEqual(foreignRecords, copies.foreignRecords);
+			},
+			lodash: function () {
+				return lodash.isEqual(foreignRecords, copies.foreignRecords);
+			}
+		}
+	),
+	compare(
+		'deepClone (100 records of another realm)',
+		function () {
+			return deepClone(foreignRecords);
+		},
+		{
+			'es-toolkit': function () {
+				return toolkit.cloneDeep(foreignRecords);
+			},
+			lodash: function () {
+				return lodash.cloneDeep(foreignRecords);
+			}
+		}
+	),
+	compare(
+		'deepClone (100 null-prototype records)',
+		function () {
+			return deepClone(bareRecords);
+		},
+		{
+			'es-toolkit': function () {
+				return toolkit.cloneDeep(bareRecords);
+			},
+			lodash: function () {
+				return lodash.cloneDeep(bareRecords);
+			}
+		}
+	),
+	compare(
 		'deepMerge (2 nested objects)',
 		function () {
 			return deepMerge(defaults, overrides);
@@ -912,6 +1021,20 @@ export default [
 			},
 			lodash: function () {
 				return lodash.isEmpty(record);
+			}
+		}
+	),
+	compare(
+		'isEmpty (string)',
+		function () {
+			return isEmpty(small.name);
+		},
+		{
+			'es-toolkit/compat': function () {
+				return compat.isEmpty(small.name);
+			},
+			lodash: function () {
+				return lodash.isEmpty(small.name);
 			}
 		}
 	),

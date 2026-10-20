@@ -4842,3 +4842,132 @@ describe('safeStringify', function () {
 		}
 	});
 });
+
+describe('Objects helpers (1.6 audit regressions)', function () {
+	/**
+	 * Gives an object the prototype of a built-in and its tag, without its internal slots.
+	 * @param {object} prototype - The built-in's prototype
+	 * @param {string} tag - The tag, defined as a non-enumerable own property (so that the members still compare equal)
+	 * @returns {object} The impostor
+	 */
+	function impostor(prototype: object, tag: string): object {
+		return Object.defineProperty(Object.create(prototype) as object, Symbol.toStringTag, { value: tag });
+	}
+
+	/**
+	 * A customizer that always applies the default rules.
+	 * @returns {undefined} Nothing
+	 */
+	function defaultRules(): undefined {
+		return undefined;
+	}
+
+	it('isEqual tells a built-in from a proxy of one or an impostor, in both directions and without throwing', function () {
+		const pairs: Array<[object, object]> = [
+			[new Map([[1, 1]]), new Proxy(new Map([[1, 1]]), {})],
+			[new Set([1]), new Proxy(new Set([1]), {})],
+			[new Map(), impostor(Map.prototype, 'Map')],
+			[new Set(), impostor(Set.prototype, 'Set')],
+			[new Date(0), impostor(Date.prototype, 'Date')],
+			[/a/g, impostor(RegExp.prototype, 'RegExp')],
+			[new DataView(new ArrayBuffer(1)), impostor(DataView.prototype, 'DataView')],
+			[new ArrayBuffer(1), impostor(ArrayBuffer.prototype, 'ArrayBuffer')],
+			[new Number(1), impostor(Number.prototype, 'Number')],
+			[new WeakMap(), impostor(WeakMap.prototype, 'WeakMap')]
+		];
+		for (const [genuine, other] of pairs) {
+			expect(helpers.isEqual(genuine, other)).toBe(false);
+			expect(helpers.isEqual(other, genuine)).toBe(false);
+			expect(helpers.isEqualWith(genuine, other, defaultRules)).toBe(false);
+		}
+		expect(helpers.isMatch(new Proxy(new Map(), {}), new Map())).toBe(false);
+		expect(helpers.isMatch({ m: new Map() }, { m: new Proxy(new Map(), {}) })).toBe(false);
+	});
+
+	it('isEqual never pairs binary data of different kinds behind a forged prototype', function () {
+		const view = Object.setPrototypeOf(new Uint8Array(2), DataView.prototype) as DataView;
+		expect(helpers.isEqual(view, new DataView(new ArrayBuffer(2)))).toBe(false);
+		expect(helpers.isEqual(new DataView(new ArrayBuffer(2)), view)).toBe(false);
+		const buffer = Object.setPrototypeOf(new Uint8Array(2), ArrayBuffer.prototype) as ArrayBuffer;
+		expect(helpers.isEqual(new ArrayBuffer(2), buffer)).toBe(false);
+		expect(helpers.isEqual(buffer, new ArrayBuffer(2))).toBe(false);
+	});
+
+	it('isEqual compares large typed arrays and buffers element by element', function () {
+		const bytes = new Uint8Array(100_000).map(function (_, index) {
+			return index;
+		});
+		const copy = bytes.slice();
+		expect(helpers.isEqual(bytes, copy)).toBe(true);
+		expect(helpers.isEqual(bytes.buffer, copy.buffer)).toBe(true);
+		copy[99_999] = 0;
+		expect(helpers.isEqual(bytes, copy)).toBe(false);
+		expect(helpers.isEqual(bytes.buffer, copy.buffer)).toBe(false);
+		expect(helpers.isEqual(new BigInt64Array([1n, -1n]), new BigInt64Array([1n, -1n]))).toBe(true);
+		expect(helpers.isEqual(new BigInt64Array([1n]), new BigInt64Array([2n]))).toBe(false);
+		expect(helpers.isEqual(new Float32Array([NaN, 0]), new Float32Array([NaN, -0]))).toBe(true);
+	});
+
+	it('copies and compares null-prototype records as records, without the brand checks of built-ins', function () {
+		const record = Object.assign(Object.create(null) as Record<PropertyKey, unknown>, { a: { b: 1 }, ['__proto__']: 2 });
+		const copy = helpers.clone(record);
+		expect(Object.getPrototypeOf(copy)).toBeNull();
+		expect(Object.keys(copy)).toEqual(['a', '__proto__']);
+		expect(copy.a).toBe(record.a);
+		const deep = helpers.deepClone(record);
+		expect(Object.getPrototypeOf(deep)).toBeNull();
+		expect(deep.a).not.toBe(record.a);
+		expect(helpers.isEqual(deep, record)).toBe(true);
+		expect(helpers.isEmpty(Object.create(null))).toBe(true);
+		expect(helpers.isEmpty(record)).toBe(false);
+		// A thenable stays one (returned as is).
+		const thenable = Object.assign(Object.create(null) as object, { then: defaultRules });
+		expect(helpers.deepClone(thenable)).toBe(thenable);
+		expect(helpers.clone(thenable)).toBe(thenable);
+		// A collection whose prototype was set to `null` has lost its methods: it is a record (this threw before).
+		const orphan = Object.setPrototypeOf(new Map([[1, 2]]), null) as object;
+		expect(Object.getPrototypeOf(helpers.deepClone(orphan))).toBeNull();
+		expect(helpers.isEqual(orphan, Object.setPrototypeOf(new Map(), null))).toBe(true);
+		expect(helpers.isEmpty(orphan)).toBe(true);
+		const frozen = helpers.deepFreeze(Object.assign(Object.create(null) as object, { inner: { a: 1 }, orphan: Object.setPrototypeOf(new Set(), null) as object }));
+		expect(Object.isFrozen((frozen as { inner: object }).inner)).toBe(true);
+	});
+
+	it('copies and compares the records and arrays of another realm member by member, keeping their prototypes', function () {
+		const realm = vm.createContext({});
+		const source = '({ a: 1, list: [1, { b: 2 }], when: new Date(0), tags: new Set(["x"]), bare: Object.create(null), thenable: { then() {} } })';
+		const foreign = vm.runInContext(source, realm) as Record<string, unknown> & { list: unknown[] };
+		const copy = helpers.deepClone(foreign);
+		expect(Object.getPrototypeOf(copy)).toBe(Object.getPrototypeOf(foreign));
+		expect(Object.getPrototypeOf(copy.list)).toBe(Object.getPrototypeOf(foreign.list));
+		expect(copy.list).not.toBe(foreign.list);
+		expect(copy.thenable).toBe(foreign.thenable);
+		expect(guards.isDate(copy.when) && guards.isSet(copy.tags)).toBe(true);
+		expect(helpers.isEqual(copy, foreign)).toBe(true);
+		expect(helpers.isEqual(foreign, vm.runInContext(source, realm))).toBe(false); // the thenables differ
+		const other = vm.runInContext(source.replace('b: 2', 'b: 3'), realm) as Record<string, unknown>;
+		expect(helpers.isEqual({ ...foreign, thenable: 1 }, { ...other, thenable: 1 })).toBe(false);
+		expect(helpers.isEqual(helpers.clone(foreign.list), foreign.list)).toBe(true);
+		expect(helpers.isEqual(foreign.list, [1, { b: 2 }])).toBe(false); // different prototypes
+		const frozen = helpers.deepFreeze(vm.runInContext('({ list: [{ a: 1 }], tags: new Set([{ b: 1 }]) })', realm) as { list: object[]; tags: Set<object> });
+		expect(Object.isFrozen(frozen.list[0])).toBe(true);
+		expect(Object.isFrozen([...frozen.tags][0])).toBe(true);
+		class List extends Array<number> {}
+		expect(helpers.isEqual(List.from([1, 2]), List.from([1, 2]))).toBe(true);
+		expect(helpers.isEqual(List.from([1, 2]), List.from([1, 3]))).toBe(false);
+		expect(helpers.isEqual(List.from([1, 2]), List.from([1]))).toBe(false);
+	});
+
+	it('isEmpty answers for primitives without boxing them', function () {
+		expect(helpers.isEmpty('')).toBe(true);
+		expect(helpers.isEmpty('abc')).toBe(false);
+		expect(helpers.isEmpty(0)).toBe(true);
+		expect(helpers.isEmpty(Symbol('s'))).toBe(true);
+		expect(helpers.isEmpty(1n)).toBe(true);
+		expect(helpers.isEmpty(false)).toBe(true);
+		expect(helpers.isEmpty(null)).toBe(true);
+		expect(helpers.isEmpty(undefined)).toBe(true);
+		expect(helpers.isEmpty(Object.assign(defaultRules.bind(null), { a: 1 }))).toBe(false);
+		expect(helpers.isEmpty(defaultRules)).toBe(true);
+	});
+});

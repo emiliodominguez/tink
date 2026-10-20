@@ -475,16 +475,60 @@ function copyRegExp(value: RegExp): RegExp {
 
 /**
  * Whether `value` is a plain object or a plain array that none of the special cases of the clone functions applies to: its
- * prototype is `Object.prototype` (or `Array.prototype`, for a genuine array), it is not a thenable, and its tag is the default one.
- * With such a prototype every `instanceof`-based brand check fails, and boxed primitives, errors and binary data can only be told
- * apart by their tag (or `ArrayBuffer.isView`), so these few checks are equivalent to the full list.
+ * prototype is `Object.prototype` or `null` (or `Array.prototype`, for a genuine array), it is not a thenable, and its tag is the
+ * default one. With such a prototype every `instanceof`-based brand check fails, and boxed primitives, errors, dates, regular
+ * expressions and binary data can only be told apart by their tag (or `ArrayBuffer.isView`), so these few checks are equivalent to the
+ * full list. With a `null` prototype the guards' brand checks would run, each throwing (microseconds per object), to find at most a
+ * `Map`, `Set`, `WeakMap`, `WeakSet` or buffer whose prototype was set to `null`: one that lost every method of its kind, treated as
+ * the record it now looks like.
  * @param {object} value - The object to inspect
  * @param {unknown} prototype - Its prototype
  * @returns {boolean} Whether `value` can be copied as a plain object or array
  */
 function isOrdinary(value: object, prototype: unknown): boolean {
-	if (prototype === Object.prototype) return !isPromise(value) && getTag(value) === '[object Object]' && !ArrayBuffer.isView(value);
+	if (prototype === Object.prototype || prototype === null) return !isPromise(value) && getTag(value) === '[object Object]' && !ArrayBuffer.isView(value);
 	return prototype === Array.prototype && Array.isArray(value) && !isPromise(value) && getTag(value) === '[object Array]';
+}
+
+/**
+ * Whether an object is a record for the collection checks of {@link isEmpty} and {@link deepFreeze}: it has no prototype (a collection
+ * that lost its prototype lost its methods too), or the `Object.prototype` of another realm. Only these objects (and the other objects
+ * of other realms) fail `instanceof Object`, the cheap test that spares every other object the lookups; for them, the brand checks of
+ * `isMap` and `isSet` throw, which costs microseconds.
+ * @param {object} value - The object to inspect
+ * @returns {boolean} Whether `value` is such a record
+ */
+function isBareRecord(value: object): boolean {
+	if (value instanceof Object) return false;
+	const prototype = Object.getPrototypeOf(value);
+	return prototype === null || isForeignObjectPrototype(prototype);
+}
+
+/**
+ * Whether an object that {@link isOrdinary} rejects still has no internal state besides its members, so that the clone and equality
+ * functions can skip the brand checks of the other built-ins: an array (of another realm, of a subclass, or with holes or extra keys), or
+ * an object of another realm (an iframe, a `vm` context, such as the parsed body of a `fetch` response under Jest) whose prototype is
+ * that realm's `Object.prototype` and whose tag is the default one. Thenables excluded. For an object of another realm, each brand check
+ * of the guards fails by throwing, which costs microseconds.
+ * @param {object} value - The object to inspect
+ * @param {unknown} prototype - Its prototype
+ * @returns {boolean} Whether `value` holds nothing but its members
+ */
+function holdsOnlyMembers(value: object, prototype: unknown): boolean {
+	return (Array.isArray(value) || (isForeignObjectPrototype(prototype) && getTag(value) === '[object Object]' && !ArrayBuffer.isView(value))) && !isPromise(value);
+}
+
+/**
+ * Shallow copy of an object without a prototype: a new one with the same own enumerable (string and symbol) properties. Assignments to
+ * it define own data properties (there is no inherited setter to call, for `__proto__` neither), and are more than twice as fast as
+ * `Object.assign` onto it.
+ * @param {object} value - The object to copy
+ * @returns {Properties} The copy, without a prototype
+ */
+function copyBare(value: object): Properties {
+	const copy: Properties = Object.create(null);
+	for (const key of ownEnumerableKeys(value)) copy[key] = (value as Properties)[key];
+	return copy;
 }
 
 /**
@@ -543,10 +587,14 @@ export function merge<T extends object, S extends object[]>(target: T, ...source
  */
 export function clone<T>(value: T): T {
 	// The most common cases (plain objects and dense arrays) are handled here, without the call to the generic worker.
-	if (isObject(value) && isOrdinary(value, Object.getPrototypeOf(value))) {
-		if (!Array.isArray(value)) return { ...value };
-		// A dense array without extra keys is copied by `Array.from` (built-in fast path) with the same result as the generic copy.
-		if (isSimpleArray(value)) return Array.from(value) as T;
+	if (isObject(value)) {
+		const prototype = Object.getPrototypeOf(value);
+		if (isOrdinary(value, prototype)) {
+			if (prototype === null) return copyBare(value) as T;
+			if (!Array.isArray(value)) return { ...value };
+			// A dense array without extra keys is copied by `Array.from` (built-in fast path) with the same result as the generic copy.
+			if (isSimpleArray(value)) return Array.from(value) as T;
+		}
 	}
 	return copyWith(value) as T;
 }
@@ -674,13 +722,14 @@ export function getPropertyNames<T>(object: T): Array<keyof T> {
  * isEmpty('a'); // => false
  */
 export function isEmpty<T>(value: T): boolean {
+	// Of the primitives, only a non-empty string has (index) keys: answered without boxing it and enumerating its indices.
+	if (typeof value === 'string') return value.length === 0;
+	if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return true;
 	if (Array.isArray(value)) return value.length === 0;
-	if (isMap(value) || isSet(value)) return value.size === 0;
-	// `Object(...)` turns `null`/`undefined` into `{}` and other primitives into wrappers: only a non-empty string has (index) keys.
-	const object: object = Object(value);
+	if (!isBareRecord(value) && (isMap(value) || isSet(value))) return value.size === 0;
 	// `for...in` lists the own enumerable string keys first, so the first own key found (if any) settles it without collecting all the keys.
-	for (const key in object) if (hasOwn(object, key)) return false;
-	for (const symbol of Object.getOwnPropertySymbols(object)) if (Object.prototype.propertyIsEnumerable.call(object, symbol)) return false;
+	for (const key in value) if (hasOwn(value, key)) return false;
+	for (const symbol of Object.getOwnPropertySymbols(value)) if (Object.prototype.propertyIsEnumerable.call(value, symbol)) return false;
 	return true;
 }
 
@@ -702,7 +751,12 @@ export function pick<T extends object, K extends keyof T>(object: T, keys: Reado
 	for (const key of keys) {
 		const value = object[key];
 		// Only an `undefined` value can come from a missing key, so the `in` lookup is skipped for every other value.
-		if ((value !== undefined || key in object) && !isUnreadable(object, key)) definePlain(result, key, value);
+		if (value === undefined && !(key in object)) continue;
+		// `isUnreadable` and `definePlain` inlined, to look the key up on `Object.prototype` once for both.
+		const shared = key in Object.prototype;
+		if (key === 'prototype' || (shared && isObjectPrototypeKey(object, key))) continue;
+		if (shared) defineOwn(result, key, value);
+		else result[key] = value;
 	}
 	return result;
 }
@@ -1030,8 +1084,7 @@ export type OmitAtPath<T, P extends string> =
  */
 function copyContainer(container: object): object {
 	if (Array.isArray(container)) return clone(container);
-	// `Object.assign` defines `__proto__` as an own property on a null-prototype target (there is no inherited setter to call).
-	return Object.getPrototypeOf(container) === null ? Object.assign(Object.create(null), container) : { ...container };
+	return Object.getPrototypeOf(container) === null ? copyBare(container) : { ...container };
 }
 
 /**
@@ -1262,8 +1315,16 @@ function copyWith(value: unknown, seen?: Map<object, unknown>): unknown {
 	if (known !== undefined) return known;
 
 	// Fast paths for the usual plain objects and dense arrays (same result as the generic copy at the end).
-	if (isOrdinary(value, Object.getPrototypeOf(value))) {
+	const prototype = Object.getPrototypeOf(value);
+	if (isOrdinary(value, prototype)) {
 		if (!Array.isArray(value)) {
+			if (prototype === null) {
+				// Assignments to an object without a prototype define own data properties (no setter to run, `__proto__` included).
+				const bare: Properties = Object.create(null);
+				seen?.set(value, bare);
+				for (const key of ownEnumerableKeys(value)) bare[key] = copyChild((value as Properties)[key], seen);
+				return bare;
+			}
 			// Spread defines the same own data properties as the generic copy; a deep copy then replaces each (own, writable) one by its
 			// copy. (`clone` copies plain objects itself, with its own spread: a spread site fed with every nested shape goes megamorphic.)
 			const copy: Properties = { ...value };
@@ -1279,37 +1340,41 @@ function copyWith(value: unknown, seen?: Map<object, unknown>): unknown {
 		}
 	}
 
-	if (isUncloneable(value)) return value;
+	// Arrays and records of other realms have nothing but their members to copy: no brand check (for objects of another realm, each one
+	// fails by throwing, which costs microseconds).
+	if (!holdsOnlyMembers(value, prototype)) {
+		if (isUncloneable(value)) return value;
 
-	const [isBoxed, primitive] = unbox(value);
-	// Recorded in `seen` too, so that shared references to them stay shared in a deep copy.
-	if (isBoxed) return remember(seen, value, adoptPrototype(Object(primitive), value));
-	if (isDate(value)) return remember(seen, value, adoptPrototype(new Date(value.getTime()), value));
-	if (isRegExp(value)) return remember(seen, value, copyRegExp(value));
-	if (isBinary(value)) return remember(seen, value, seen !== undefined && ArrayBuffer.isView(value) ? copyViewOver(value, seen) : copyBinary(value));
+		const [isBoxed, primitive] = unbox(value);
+		// Recorded in `seen` too, so that shared references to them stay shared in a deep copy.
+		if (isBoxed) return remember(seen, value, adoptPrototype(Object(primitive), value));
+		if (isDate(value)) return remember(seen, value, adoptPrototype(new Date(value.getTime()), value));
+		if (isRegExp(value)) return remember(seen, value, copyRegExp(value));
+		if (isBinary(value)) return remember(seen, value, seen !== undefined && ArrayBuffer.isView(value) ? copyViewOver(value, seen) : copyBinary(value));
 
-	if (isMap(value)) {
-		if (seen === undefined) return adoptPrototype(new Map(value), value);
-		const copy = adoptPrototype(new Map<unknown, unknown>(), value);
-		seen.set(value, copy);
-		value.forEach(function (entryValue, entryKey) {
-			copy.set(copyWith(entryKey, seen), copyWith(entryValue, seen));
-		});
-		return copy;
-	}
+		if (isMap(value)) {
+			if (seen === undefined) return adoptPrototype(new Map(value), value);
+			const copy = adoptPrototype(new Map<unknown, unknown>(), value);
+			seen.set(value, copy);
+			value.forEach(function (entryValue, entryKey) {
+				copy.set(copyWith(entryKey, seen), copyWith(entryValue, seen));
+			});
+			return copy;
+		}
 
-	if (isSet(value)) {
-		if (seen === undefined) return adoptPrototype(new Set(value), value);
-		const copy = adoptPrototype(new Set<unknown>(), value);
-		seen.set(value, copy);
-		value.forEach(function (member) {
-			copy.add(copyWith(member, seen));
-		});
-		return copy;
+		if (isSet(value)) {
+			if (seen === undefined) return adoptPrototype(new Set(value), value);
+			const copy = adoptPrototype(new Set<unknown>(), value);
+			seen.set(value, copy);
+			value.forEach(function (member) {
+				copy.add(copyWith(member, seen));
+			});
+			return copy;
+		}
 	}
 
 	const error = isError(value);
-	const copy: object = error ? errorShell(value) : Array.isArray(value) ? adoptPrototype(new Array(value.length), value) : Object.create(Object.getPrototypeOf(value));
+	const copy: object = error ? errorShell(value) : Array.isArray(value) ? adoptPrototype(new Array(value.length), value) : Object.create(prototype);
 	seen?.set(value, copy);
 	// Errors keep all their own properties (`message` and `stack` are not enumerable), as they are defined (getters included).
 	for (const key of error ? Reflect.ownKeys(value) : ownEnumerableKeys(value)) {
@@ -1465,7 +1530,11 @@ interface MergeSettings {
 	arrays: ArrayMergeStrategy;
 	/** The customizer of {@link deepMergeWith}, if any. */
 	customizer: MergeCustomizer | undefined;
-	/** The plain objects created by the current merge, the only ones merged into in place (set by {@link mergeAll}). */
+	/**
+	 * With a customizer, the plain objects created by the current merge, the only ones merged into in place (set by {@link mergeAll}).
+	 * Without one, every plain object of the result is created by the merge (incoming plain objects are always merged into a new
+	 * object, never stored as they are), so none needs to be recorded.
+	 */
 	created?: WeakSet<object>;
 }
 
@@ -1550,10 +1619,10 @@ function mergeInto(result: object, source: object, ancestors: object[], settings
  * @returns {object} The object to merge `incoming` into
  */
 function mergeBase(current: unknown, incoming: object, ancestors: object[], settings: MergeSettings, path: PropertyKey[]): object {
-	const created = settings.created as WeakSet<object>;
-	if (isPlainObject(current) && created.has(current)) return current;
+	const created = settings.created;
+	if (isPlainObject(current) && (created === undefined || created.has(current))) return current;
 	const base = emptyLike(isPlainObject(current) ? current : incoming);
-	created.add(base);
+	created?.add(base);
 	return isPlainObject(current) ? mergeInto(base, current, ancestors, { ...settings, customizer: undefined }, path) : base;
 }
 
@@ -1569,7 +1638,7 @@ function mergeAll(settings: MergeSettings, target: object, sources: ReadonlyArra
 	if (!isPlainObject(target)) throw new TypeError(`${settings.caller}: \`target\` must be a plain object, got ${describe(target)}`);
 
 	const ancestors: object[] = [];
-	const run: MergeSettings = { ...settings, created: new WeakSet<object>() };
+	const run: MergeSettings = settings.customizer === undefined ? settings : { ...settings, created: new WeakSet<object>() };
 	// The target is copied (into an empty object, so the mode and the array strategy make no difference) without the customizer.
 	const copy = run.customizer === undefined ? run : { ...run, customizer: undefined };
 	const result = emptyLike(target);
@@ -1832,9 +1901,8 @@ const PROVEN_SUBTREE = 64;
  */
 function mapsEqual(a: Map<unknown, unknown>, b: Map<unknown, unknown>, stack: ComparisonStack): boolean {
 	if (a.size !== b.size) return false;
-	const objectEntriesB = Array.from(b).filter(function ([key]) {
-		return isObject(key);
-	});
+	// Collected when first needed: maps keyed by primitives (the usual ones) never need it.
+	let objectEntriesB: Array<[unknown, unknown]> | undefined;
 	const matched: boolean[] = [];
 
 	for (const [keyA, valueA] of a) {
@@ -1842,6 +1910,9 @@ function mapsEqual(a: Map<unknown, unknown>, b: Map<unknown, unknown>, stack: Co
 			if (!b.has(keyA) || !equalWith(valueA, b.get(keyA), stack, keyA)) return false;
 			continue;
 		}
+		objectEntriesB ??= Array.from(b).filter(function ([key]) {
+			return isObject(key);
+		});
 		const index = objectEntriesB.findIndex(function ([keyB, valueB], candidate) {
 			return !matched[candidate] && equalWith(keyA, keyB, stack) && equalWith(valueA, valueB, stack, keyA);
 		});
@@ -1861,7 +1932,8 @@ function mapsEqual(a: Map<unknown, unknown>, b: Map<unknown, unknown>, stack: Co
  */
 function setsEqual(a: Set<unknown>, b: Set<unknown>, stack: ComparisonStack): boolean {
 	if (a.size !== b.size) return false;
-	const objectMembersB = Array.from(b).filter(isObject);
+	// Collected when first needed: sets of primitives (the usual ones) never need it.
+	let objectMembersB: unknown[] | undefined;
 	const matched: boolean[] = [];
 
 	for (const memberA of a) {
@@ -1869,6 +1941,7 @@ function setsEqual(a: Set<unknown>, b: Set<unknown>, stack: ComparisonStack): bo
 			if (!b.has(memberA)) return false;
 			continue;
 		}
+		objectMembersB ??= Array.from(b).filter(isObject);
 		const index = objectMembersB.findIndex(function (memberB, candidate) {
 			return !matched[candidate] && equalWith(memberA, memberB, stack);
 		});
@@ -1888,19 +1961,29 @@ function binaryEqual(a: ArrayBuffer | ArrayBufferView, b: ArrayBuffer | ArrayBuf
 	let left = a as unknown as ArrayLike<unknown>;
 	let right = b as unknown as ArrayLike<unknown>;
 	if (!ArrayBuffer.isView(a)) {
+		// `b` has the tag of `a`: an `ArrayBuffer` and a `SharedArrayBuffer` never pair (a view could, with a forged prototype).
+		if (ArrayBuffer.isView(b)) return false;
 		left = new Uint8Array(a);
 		right = new Uint8Array(b as ArrayBuffer);
-	} else if (getTag(a) === '[object DataView]') {
-		const view = b as ArrayBufferView;
-		left = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
-		right = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+	} else {
+		// The built-in tag getter reads the internal name (`undefined` for a `DataView`): a forged tag or prototype cannot pair two kinds.
+		const name = typedArrayTag.call(a);
+		if (!ArrayBuffer.isView(b) || typedArrayTag.call(b) !== name) return false;
+		if (name === undefined) {
+			const view = b as ArrayBufferView;
+			left = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+			right = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+		}
 	}
-	return (
-		left.length === right.length &&
-		Array.prototype.every.call(left, function (value: unknown, index: number): boolean {
-			return sameValueZero(value, right[index]);
-		})
-	);
+	const length = left.length;
+	if (length !== right.length) return false;
+	// A plain loop (not `every` with a callback): typed arrays are often large. Inlined SameValueZero, for bigints and floats alike.
+	for (let index = 0; index < length; index++) {
+		const x = left[index];
+		const y = right[index];
+		if (x !== y && (x === x || y === y)) return false;
+	}
+	return true;
 }
 
 /**
@@ -1955,20 +2038,25 @@ function definedMembersEqual(a: object, b: object, stack: ComparisonStack): bool
  */
 function objectsEqual(a: object, b: object, stack: ComparisonStack): boolean {
 	if (stack.absentUndefined === true && isJsonObject(a) && isJsonObject(b)) return definedMembersEqual(a, b, stack);
-	if (isOrdinary(a, Object.getPrototypeOf(a))) return (!Array.isArray(a) || a.length === (b as unknown[]).length) && propertiesEqual(a, b, stack);
+	const prototype = Object.getPrototypeOf(a);
+	if (isOrdinary(a, prototype) || holdsOnlyMembers(a, prototype)) return (!Array.isArray(a) || (Array.isArray(b) && a.length === b.length)) && propertiesEqual(a, b, stack);
 	if (isUncloneable(a)) return false;
-	if (isDate(a)) return sameValueZero(a.getTime(), (b as Date).getTime());
-	if (isRegExp(a)) return a.source === (b as RegExp).source && a.flags === (b as RegExp).flags;
-	if (isMap(a)) return mapsEqual(a, b as Map<unknown, unknown>, stack);
-	if (isSet(a)) return setsEqual(a, b as Set<unknown>, stack);
-	if (isBinary(a)) return binaryEqual(a, b as ArrayBuffer | ArrayBufferView);
-	const [isBoxedA, primitiveA] = unbox(a);
-	if (isBoxedA) {
+	// `b` has the prototype and the tag of `a`, yet only one of them may be a genuine built-in (the other a proxy of one, such as a
+	// framework's reactive `Map`, or an object with a forged tag): the brands must match, in both directions.
+	if (isDate(a)) return isDate(b) && sameValueZero(a.getTime(), b.getTime());
+	if (isRegExp(a)) return isRegExp(b) && a.source === b.source && a.flags === b.flags;
+	if (isMap(a)) return isMap(b) && mapsEqual(a, b, stack);
+	if (isSet(a)) return isSet(b) && setsEqual(a, b, stack);
+	if (isBinary(a)) return isBinary(b) && binaryEqual(a, b);
+	// With the default tag (class instances), `b` is no built-in either: its prototype would provide the built-in's tag, and boxed
+	// primitives are told by their tag. (A thenable `b` has a `then` member that `a` lacks.)
+	if (getTag(a) !== '[object Object]') {
+		if (isWeakMap(b) || isWeakSet(b) || isDate(b) || isRegExp(b) || isMap(b) || isSet(b) || isBinary(b)) return false;
+		const [isBoxedA, primitiveA] = unbox(a);
 		const [isBoxedB, primitiveB] = unbox(b);
-		if (!isBoxedB || !sameValueZero(primitiveA, primitiveB)) return false;
+		if (isBoxedA !== isBoxedB || !sameValueZero(primitiveA, primitiveB)) return false;
 	}
 	if (isError(a) && (a.name !== (b as Error).name || a.message !== (b as Error).message)) return false;
-	if (Array.isArray(a) && a.length !== (b as unknown[]).length) return false;
 	return propertiesEqual(a, b, stack);
 }
 
@@ -2075,6 +2163,8 @@ function customEqual(a: unknown, b: unknown, stack: ComparisonStack, key: unknow
  *   object keys/members are matched pairwise, which is O(n²) in the worst case.
  * - Typed arrays (element-wise), `DataView`/`ArrayBuffer` (byte-wise), boxed primitives (by value), errors (`name` + `message` + own enumerable props).
  * - `WeakMap`, `WeakSet` and promises (any object with a `then` method) are only equal to themselves.
+ * - Built-ins are recognized by their internal slots, not their prototype or tag: a genuine `Map` never equals a `Proxy` of one (such
+ *   as a framework's reactive `Map`, whose entries the slots do not reveal) or an object posing as one, in either order.
  * - Circular structures are supported (pairs already under comparison are assumed equal).
  *
  * Recursion depth is bounded by the call stack (~thousands of levels): deeper input throws a `RangeError`
@@ -2321,11 +2411,13 @@ export function deepFreeze<T>(object: T): DeepReadonly<T> {
 		if (!isObject(value) || visited.has(value) || ArrayBuffer.isView(value)) continue;
 		visited.add(value);
 
-		if (isMap(value)) {
+		// Arrays and records are walked through their properties alone.
+		const record = Array.isArray(value) || isBareRecord(value);
+		if (!record && isMap(value)) {
 			value.forEach(function (entryValue, entryKey) {
 				pending.push(entryKey, entryValue);
 			});
-		} else if (isSet(value)) {
+		} else if (!record && isSet(value)) {
 			value.forEach(function (member) {
 				pending.push(member);
 			});
