@@ -40,7 +40,7 @@ import {
 	type Deferred,
 	type Release
 } from '.';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, getEventListeners } from 'node:events';
 import { runInNewContext } from 'node:vm';
 import { createEmitter } from '../emitter/index.js';
 import { createLRUCache } from '../cache/index.js';
@@ -1453,7 +1453,8 @@ describe('Async helpers (round 2)', function () {
 				yield input;
 			}
 			const signal = anySignal(signals());
-			expect(input.listenerCount).toBe(2);
+			// One listener per signal, however many times (and by however many waiters) it is listed.
+			expect(input.listenerCount).toBe(1);
 			input.abort('x');
 			expect(signal.reason).toBe('x');
 			expect(input.listenerCount).toBe(0);
@@ -2310,7 +2311,8 @@ describe('Async helpers (round 11)', function () {
 			expect(combined).not.toBe(taskSignal);
 			expect(combined).not.toBe(queueSignal);
 			expect(taskSignal.listenerCount).toBe(1);
-			expect(queueSignal.listenerCount).toBe(2);
+			// The combined signal's only: the queue listens to its own signal only while tasks wait.
+			expect(queueSignal.listenerCount).toBe(1);
 			queueSignal.abort('shutdown');
 			expect(combined.aborted).toBe(true);
 			expect(combined.reason).toBe('shutdown');
@@ -2327,7 +2329,7 @@ describe('Async helpers (round 11)', function () {
 			await queue.add(jest.fn(), { signal: taskSignal });
 			await flush();
 			expect(taskSignal.listenerCount).toBe(0);
-			expect(queueSignal.listenerCount).toBe(1); // the queue's own listener
+			expect(queueSignal.listenerCount).toBe(0); // nothing waits: the queue does not listen either
 		});
 
 		it('aborting the queue signal rejects waiting tasks and later adds, but lets running tasks finish', async function () {
@@ -3203,7 +3205,7 @@ describe('createBatcher', function () {
 				return Float64Array.from(keys, Math.sqrt);
 			});
 			await expect(typed.loadMany([4, 9])).resolves.toEqual([2, 3]);
-			// eslint-disable-next-line no-sparse-arrays
+			// oxlint-disable-next-line no-sparse-arrays
 			const holes = createBatcher(function (_keys: number[]) {
 				return new Array<string>(2);
 			});
@@ -7194,5 +7196,430 @@ describe('Async helpers (options inherited from a polluted Object.prototype)', f
 			await expect(batcher.load(4, {})).resolves.toBe(4);
 			await expect(batcher.loadMany([5], {})).resolves.toEqual([5]);
 		});
+	});
+});
+
+describe('Async helpers (one listener per shared signal, promises with their own then)', function () {
+	afterEach(function () {
+		jest.useRealTimers();
+	});
+
+	/**
+	 * A native promise fulfilled with `value` whose own `then` getter throws: `await` ignores it, a `.then()` call throws.
+	 * @param {T} value - The value
+	 * @returns {Promise<T>} The promise
+	 */
+	function ownThen<T>(value: T): Promise<T> {
+		const promise = Promise.resolve(value);
+		Object.defineProperty(promise, 'then', {
+			get: function () {
+				throw new Error('then');
+			}
+		});
+		return promise;
+	}
+
+	/**
+	 * A signal that aborts as soon as a listener is added, calling it at once.
+	 * @returns {AbortSignalLike} The signal
+	 */
+	function abortingOnAdd(): AbortSignalLike {
+		const signal = {
+			aborted: false,
+			reason: 'stop',
+			addEventListener: function (_type: string, listener: () => void) {
+				signal.aborted = true;
+				listener();
+			},
+			removeEventListener: jest.fn()
+		};
+		return signal;
+	}
+
+	it('sleep, abortable, pollUntil, the mappers, waitForEvent, fromEvent, interval and anySignal share one listener per signal (previously one each)', async function () {
+		const signal = new CountingSignal();
+		const target = new EventTarget();
+		const ticks = jest.fn();
+		const waits = [
+			sleep(10_000, { signal }),
+			sleep(10_000, { signal }),
+			abortable(new Promise(function () {}), signal),
+			pollUntil(
+				function () {
+					return false;
+				},
+				{ interval: 10_000, signal }
+			),
+			mapWithConcurrency(
+				[1, 2],
+				function () {
+					return new Promise(function () {});
+				},
+				{ concurrency: 1, signal }
+			),
+			waitForEvent(target, 'ready', { signal }),
+			fromEvent(target, 'ready', { signal }).next()
+		];
+		const stop = interval(ticks, 10_000, { signal });
+		const combined = anySignal([signal]);
+		const other = createQueue({ concurrency: 1 });
+		const gate = createDeferred<void>();
+		other.add(function () {
+			return gate.promise;
+		});
+		const pool = createSemaphore(1);
+		const held = pool.tryAcquire() as Release;
+		waits.push(other.add(jest.fn(), { signal }), pool.acquire({ signal }));
+		expect(signal.listenerCount).toBe(1);
+		signal.abort('stop');
+		for (const wait of waits) await expect(wait).rejects.toBe('stop');
+		expect(combined.reason).toBe('stop');
+		expect(signal.listenerCount).toBe(0);
+		stop();
+		expect(ticks).not.toHaveBeenCalled();
+		gate.resolve();
+		held();
+		expect(pool.available).toBe(1);
+	});
+
+	it('start and abort many sleeps and abortable waits sharing a platform signal in linear time (previously 15 s for 30,000)', async function () {
+		/**
+		 * Times 30,000 sleeps and abortable waits, with or without a shared signal, then aborts them (or lets the sleeps end).
+		 * @param {boolean} shared - Whether they share a signal
+		 * @returns {Promise<number>} The time in ms
+		 */
+		async function time(shared: boolean): Promise<number> {
+			const controller = new AbortController();
+			const signal = shared ? controller.signal : undefined;
+			const waits: Array<Promise<unknown>> = [];
+			const start = performance.now();
+			for (let i = 0; i < 15_000; i++) waits.push(sleep(shared ? 10_000 : 0, { signal }), abortable(shared ? new Promise(function () {}) : 1, signal));
+			controller.abort();
+			const elapsed = performance.now() - start;
+			await Promise.allSettled(waits);
+			return elapsed;
+		}
+		const alone = await time(false);
+		expect(await time(true)).toBeLessThan(alone * 20 + 100);
+	});
+
+	it('createQueue and createRateLimiter listen to their own signal only while something waits (previously for good)', async function () {
+		jest.useFakeTimers();
+		const signal = new CountingSignal();
+		const queue = createQueue({ concurrency: 1, signal });
+		expect(signal.listenerCount).toBe(0);
+		const gate = createDeferred<void>();
+		const running = queue.add(function () {
+			return gate.promise;
+		});
+		// The running task holds no listener of its own (it has no signal of its own to combine with).
+		expect(signal.listenerCount).toBe(0);
+		const waiting = queue.add(jest.fn().mockReturnValue('second'));
+		const third = queue.add(jest.fn().mockReturnValue('third'));
+		expect(signal.listenerCount).toBe(1);
+		gate.resolve();
+		await expect(Promise.all([running, waiting, third])).resolves.toEqual([undefined, 'second', 'third']);
+		expect(signal.listenerCount).toBe(0);
+		queue.pause();
+		const dropped = queue.add(jest.fn());
+		expect(signal.listenerCount).toBe(1);
+		queue.clear();
+		await expect(dropped).rejects.toBeInstanceOf(AbortError);
+		expect(signal.listenerCount).toBe(0);
+		const aborted = queue.add(jest.fn());
+		signal.abort('stop');
+		await expect(aborted).rejects.toBe('stop');
+		await expect(queue.add(jest.fn())).rejects.toBe('stop');
+
+		const limiterSignal = new CountingSignal();
+		const limiter = createRateLimiter({ limit: 1, interval: 100, signal: limiterSignal });
+		await expect(limiter.schedule(jest.fn().mockReturnValue(1))).resolves.toBe(1);
+		expect(limiterSignal.listenerCount).toBe(0);
+		const later = limiter.schedule(jest.fn().mockReturnValue(2));
+		const last = limiter.schedule(jest.fn().mockReturnValue(3));
+		expect(limiterSignal.listenerCount).toBe(1);
+		jest.advanceTimersByTime(100);
+		await expect(later).resolves.toBe(2);
+		expect(limiterSignal.listenerCount).toBe(1);
+		jest.advanceTimersByTime(100);
+		await expect(last).resolves.toBe(3);
+		expect(limiterSignal.listenerCount).toBe(0);
+		const cleared = limiter.schedule(jest.fn());
+		limiter.clearQueue();
+		await expect(cleared).rejects.toBeInstanceOf(AbortError);
+		expect(limiterSignal.listenerCount).toBe(0);
+		expect(jest.getTimerCount()).toBe(0);
+		const stopped = limiter.schedule(jest.fn());
+		limiterSignal.abort('stop');
+		await expect(stopped).rejects.toBe('stop');
+		expect(limiterSignal.listenerCount).toBe(0);
+	});
+
+	it('createQueue and createRateLimiter reject the call that cannot listen to their signal, and go on', async function () {
+		const signal = {
+			aborted: false,
+			addEventListener: function () {
+				throw new Error('add');
+			},
+			removeEventListener: jest.fn()
+		};
+		const queue = createQueue({ concurrency: 1, signal });
+		const gate = createDeferred<void>();
+		const running = queue.add(function () {
+			return gate.promise;
+		});
+		await expect(queue.add(jest.fn())).rejects.toThrow('add');
+		expect(queue.size).toBe(0);
+		gate.resolve();
+		await running;
+		await queue.onIdle();
+		await expect(queue.add(jest.fn().mockReturnValue(1))).resolves.toBe(1);
+		const limiter = createRateLimiter({ limit: 1, interval: 50, signal });
+		await expect(limiter.schedule(jest.fn().mockReturnValue(1))).resolves.toBe(1);
+		await expect(limiter.schedule(jest.fn())).rejects.toThrow('add');
+		expect(limiter.pendingCount).toBe(0);
+	});
+
+	it('a queued task that cannot listen to its own signal leaves the queue signal unwatched', async function () {
+		const queueSignal = new CountingSignal();
+		const queue = createQueue({ concurrency: 1, signal: queueSignal });
+		queue.pause();
+		const failing = { aborted: false, addEventListener: jest.fn().mockImplementation(boomAdd), removeEventListener: jest.fn() };
+		await expect(queue.add(jest.fn(), { signal: failing })).rejects.toThrow('add');
+		expect(queue.size).toBe(0);
+		expect(queueSignal.listenerCount).toBe(0);
+
+		/**
+		 * Throws like a signal that cannot take listeners.
+		 * @returns {never} Never returns
+		 */
+		function boomAdd(): never {
+			throw new Error('add');
+		}
+	});
+
+	it('a waiter unregistered by code an abort runs is not stopped by that abort (the queue stays consistent)', async function () {
+		const controller = new AbortController();
+		const queue = createQueue({ concurrency: 1 });
+		queue.pause();
+		// Aborting the signal aborts the combined one first, whose listener starts the waiting task (with the aborted signal).
+		anySignal([controller.signal]).addEventListener('abort', function () {
+			queue.resume();
+		});
+		const task = jest.fn().mockReturnValue('ran');
+		const waiting = queue.add(task, { signal: controller.signal });
+		controller.abort('stop');
+		await expect(waiting).resolves.toBe('ran');
+		expect(task).toHaveBeenCalledTimes(1);
+		expect(queue.size).toBe(0);
+		await expect(queue.add(jest.fn().mockReturnValue('next'))).resolves.toBe('next');
+		expect(queue.size).toBe(0);
+		expect(queue.pending).toBe(0);
+	});
+
+	it('sleep, pollUntil and interval stop at once for a signal that calls the listener while it is being added (previously a ReferenceError, a check, a tick)', async function () {
+		jest.useFakeTimers();
+		await expect(sleep(1000, { signal: abortingOnAdd() })).rejects.toBe('stop');
+		const check = jest.fn().mockReturnValue(false);
+		await expect(pollUntil(check, { interval: 10, timeout: 1000, signal: abortingOnAdd() })).rejects.toBe('stop');
+		expect(check).not.toHaveBeenCalled();
+		const tick = jest.fn();
+		interval(tick, 10, { signal: abortingOnAdd(), immediate: true });
+		expect(tick).not.toHaveBeenCalled();
+		expect(jest.getTimerCount()).toBe(0);
+	});
+
+	it('follow a promise with its own throwing then like await does (previously leaked a slot or a permit, threw, or hung)', async function () {
+		const limit = createLimiter(1);
+		await expect(
+			limit(function () {
+				return ownThen(1);
+			})
+		).resolves.toBe(1);
+		await flush();
+		expect(limit.activeCount).toBe(0);
+		await expect(limit(jest.fn().mockReturnValue(2))).resolves.toBe(2);
+
+		const queue = createQueue({ concurrency: 1 });
+		await expect(
+			queue.add(function () {
+				return ownThen(1);
+			})
+		).resolves.toBe(1);
+		await flush();
+		expect(queue.pending).toBe(0);
+		await expect(queue.add(jest.fn().mockReturnValue(2))).resolves.toBe(2);
+
+		const pool = createSemaphore(1);
+		await expect(
+			pool.run(function () {
+				return ownThen(1);
+			})
+		).resolves.toBe(1);
+		await flush();
+		expect(pool.available).toBe(1);
+
+		const fn = jest.fn().mockImplementation(function () {
+			return ownThen(1);
+		});
+		const memoized = memoizeAsync(fn);
+		await expect(memoized()).resolves.toBe(1);
+		await expect(memoized()).resolves.toBe(1);
+		expect(fn).toHaveBeenCalledTimes(1);
+
+		let checks = 0;
+		await expect(
+			pollUntil<string | false>(
+				function () {
+					return checks++ === 0 ? false : ownThen('ready');
+				},
+				{ interval: 1 }
+			)
+		).resolves.toBe('ready');
+
+		const breaker = createCircuitBreaker(function () {
+			return ownThen(1);
+		});
+		await expect(breaker()).resolves.toBe(1);
+		expect(breaker.stats.successes).toBe(1);
+
+		await expect(
+			mapSettledWithConcurrency([1], function () {
+				return ownThen(1);
+			})
+		).resolves.toEqual([{ status: 'fulfilled', value: 1 }]);
+		await expect(
+			createBatcher(function () {
+				return ownThen(['a']);
+			}).load(1)
+		).resolves.toBe('a');
+		await expect(abortable(ownThen(1), new AbortController().signal)).resolves.toBe(1);
+		await expect(minDelay(ownThen(1), 0)).resolves.toBe(1);
+		await expect(
+			reduceAsync(
+				[1],
+				function () {
+					return ownThen(5);
+				},
+				0
+			)
+		).resolves.toBe(5);
+
+		const ticks: number[] = [];
+		const stop = interval(
+			function (tick) {
+				ticks.push(tick);
+				return ownThen(tick);
+			},
+			1,
+			{ immediate: true }
+		);
+		await sleep(30);
+		stop();
+		expect(ticks.length).toBeGreaterThan(1);
+
+		jest.useFakeTimers();
+		await expect(withTimeout(ownThen(1), 1000)).resolves.toBe(1);
+		// The timer was cleared (previously left running for `ms`).
+		expect(jest.getTimerCount()).toBe(0);
+	});
+
+	it('createBatcher rejects a batch whose promise has a throwing constructor getter (previously hung, with an uncaught exception)', async function () {
+		const values = Promise.resolve(['a']);
+		Object.defineProperty(values, 'constructor', {
+			get: function () {
+				throw new Error('constructor');
+			}
+		});
+		const batcher = createBatcher(function () {
+			return values;
+		});
+		await expect(batcher.loadMany([1, 2])).rejects.toThrow('constructor');
+	});
+
+	it('memoizeAsync rejects when its cache throws (previously threw synchronously)', async function () {
+		const cache = new Map<unknown, unknown>();
+		const fn = jest.fn().mockResolvedValue(1);
+		const memoized = memoizeAsync(fn, {
+			cache: Object.assign(cache, {
+				get: function (): never {
+					throw new Error('get');
+				}
+			})
+		});
+		const call = memoized();
+		await expect(call).rejects.toThrow('get');
+		expect(fn).not.toHaveBeenCalled();
+		const hasThrows = memoizeAsync(fn, {
+			cache: Object.assign(new Map<unknown, unknown>(), {
+				has: function (): never {
+					throw new Error('has');
+				}
+			})
+		});
+		await expect(hasThrows()).rejects.toThrow('has');
+	});
+
+	it('createLimiter, debounceAsync, memoizeAsync and createCircuitBreaker work over a polluted Object.prototype (previously threw a TypeError)', async function () {
+		const proto = Object.prototype as unknown as Record<string, unknown>;
+		for (const [key, value] of [
+			['get', 1],
+			['set', 1],
+			['value', 1],
+			['writable', true],
+			['enumerable', true]
+		] as const) {
+			proto[key] = value;
+			try {
+				const limit = createLimiter(1);
+				const debounced = debounceAsync(function () {
+					return 1;
+				}, 0);
+				const memoized = memoizeAsync(async function () {
+					return 1;
+				});
+				const breaker = createCircuitBreaker(function () {
+					return 1;
+				});
+				expect(limit.activeCount).toBe(0);
+				expect(breaker.state).toBe('closed');
+				expect([Object.keys(limit), Object.keys(debounced), Object.keys(memoized), Object.keys(breaker)]).toEqual([[], [], ['cache'], []]);
+				expect(Object.getOwnPropertyDescriptor(memoized, 'clear')?.writable).toBe(false);
+				await expect(Promise.all([limit(jest.fn().mockReturnValue(1)), debounced(), memoized(), breaker()])).resolves.toEqual([1, 1, 1, 1]);
+			} finally {
+				delete proto[key];
+			}
+		}
+	});
+
+	it('removes its abort listeners over a polluted Object.prototype.capture (previously one left on the signal per sleep)', async function () {
+		const proto = Object.prototype as unknown as Record<string, unknown>;
+		const controller = new AbortController();
+		proto.capture = true;
+		try {
+			for (let i = 0; i < 3; i++) await sleep(0, { signal: controller.signal });
+			await abortable(Promise.resolve(1), controller.signal);
+		} finally {
+			delete proto.capture;
+		}
+		expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+	});
+
+	it('anySignal skips the holes of an array, also over a polluted Object.prototype (previously threw a TypeError)', function () {
+		const proto = Object.prototype as unknown as Record<number, unknown>;
+		proto[1] = { planted: true };
+		try {
+			// oxlint-disable-next-line no-sparse-arrays
+			const signal = anySignal([undefined, , null]);
+			expect(signal.aborted).toBe(false);
+			const controller = new AbortController();
+			const sparse: Array<AbortSignalLike | undefined> = [];
+			sparse[2] = controller.signal;
+			const combined = anySignal(sparse);
+			controller.abort('stop');
+			expect(combined.reason).toBe('stop');
+		} finally {
+			delete proto[1];
+		}
 	});
 });

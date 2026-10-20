@@ -107,7 +107,39 @@ function createAbortError(): AbortError {
 }
 
 /**
- * Calls `fn` with `thisArg` and `args` and returns its outcome as a promise: a synchronous throw becomes a rejection.
+ * `Object.defineProperties`, whatever a polluted `Object.prototype` holds: the descriptors lose their prototype first, so that none
+ * inherits a `get`, `set`, `value` or `writable` (with which `Object.defineProperties` throws) or an `enumerable` (which would list the
+ * methods in `Object.keys`).
+ * @param {object} target - The object
+ * @param {Record<string, PropertyDescriptor>} descriptors - The descriptors (object literals)
+ * @returns {void}
+ */
+function defineProperties(target: object, descriptors: Record<string, PropertyDescriptor>): void {
+	for (const key of Object.keys(descriptors)) Object.setPrototypeOf(descriptors[key], null);
+	Object.defineProperties(target, descriptors);
+}
+
+/**
+ * `Promise.resolve(value)`, read as `await` reads it, so that calling `then` on the result never throws: `Promise.resolve` hands a
+ * native promise back as it is, own `then` property (or prototype supplying one) included, which a `.then()` call would run, or throw
+ * from, leaving a slot or a permit taken for good, or a timer callback throwing. Such a promise is followed with the built-in `then`
+ * instead (one tick later); any other value costs nothing more.
+ * @param {unknown} value - A value, a promise or a thenable
+ * @returns {Promise<unknown>} A native promise settling like `value`, with the built-in `then`
+ * @throws {unknown} the error of a `constructor` getter that throws (as from `Promise.resolve`)
+ */
+function toPromise(value: unknown): Promise<unknown> {
+	const promise = Promise.resolve(value);
+
+	// Neither check runs user code: `promise` is a native promise, not a proxy.
+	return Object.getPrototypeOf(promise) === Promise.prototype && !Object.hasOwn(promise, 'then')
+		? promise
+		: (Promise.prototype.then.call(promise, undefined, undefined) as Promise<unknown>);
+}
+
+/**
+ * Calls `fn` with `thisArg` and `args` and returns its outcome as a promise (see {@link toPromise}): a synchronous throw becomes a
+ * rejection.
  * @param {Function} fn - The function to call
  * @param {unknown} thisArg - The `this` value
  * @param {ArrayLike<unknown>} args - The arguments
@@ -115,10 +147,86 @@ function createAbortError(): AbortError {
  */
 function invoke(fn: (...args: never[]) => unknown, thisArg: unknown, args: ArrayLike<unknown>): Promise<unknown> {
 	try {
-		return Promise.resolve((fn as (this: unknown, ...args: unknown[]) => unknown).apply(thisArg, args as unknown[]));
+		return toPromise((fn as (this: unknown, ...args: unknown[]) => unknown).apply(thisArg, args as unknown[]));
 	} catch (error) {
 		return Promise.reject(error);
 	}
+}
+
+/**
+ * The waiters sharing one abort signal, and the single listener that stops them all.
+ */
+interface SignalGroup {
+	readonly stops: Set<(reason: unknown) => void>;
+	readonly listener: () => void;
+}
+
+/**
+ * The waiters of every signal passed to this module (queued tasks, permit requests, batched keys, sleeps, abortable waits...), with ONE
+ * abort listener per signal however many wait on it: adding and removing a listener costs a scan of the signal's listener list (a
+ * platform `AbortSignal` checks for duplicates), so one listener per waiter made n waiters on one signal cost O(n²) (30,000 sleeps on
+ * one signal took 15 s to start). Shared by the whole module, so that the waiters of a signal are stopped in registration order
+ * whichever helper or structure they belong to.
+ */
+const signalGroups = new WeakMap<AbortSignalLike, SignalGroup>();
+
+/**
+ * Registers a waiter on `signal` (none: nothing to do), adding the abort listener to the signal for its first waiter. `stop` is called
+ * once, with the signal's reason (read once for all its waiters), unless {@link unwatchSignal} unregisters it first; a signal that calls
+ * the listener while it is being added stops the waiter before this returns.
+ * @param {AbortSignalLike | null | undefined} signal - The signal
+ * @param {(reason: unknown) => void} stop - Stops the waiter (it must not throw)
+ * @returns {void}
+ * @throws {unknown} the error of a throwing `addEventListener` (the waiter is not registered then)
+ */
+function watchSignal(signal: AbortSignalLike | null | undefined, stop: (reason: unknown) => void): void {
+	if (signal === null || signal === undefined) return;
+
+	const existing = signalGroups.get(signal);
+
+	if (existing !== undefined) {
+		existing.stops.add(stop);
+		return;
+	}
+
+	const stops = new Set([stop]);
+	const group: SignalGroup = {
+		stops,
+		listener: function onAbort(): void {
+			const reason = abortReason(signal);
+
+			// Iterated live, each waiter removed before it is stopped: a waiter unregistered by an earlier one (a permit granted, a task
+			// started by code that the abort ran) is skipped, and a hostile signal calling the listener again stops nobody twice.
+			for (const each of stops) {
+				stops.delete(each);
+				each(reason);
+			}
+			if (signalGroups.get(signal) === group) signalGroups.delete(signal);
+		}
+	};
+
+	// Mapped once added: when adding it throws, the waiter is not registered, and when the signal calls it while it is being added, the
+	// waiter is stopped already. `capture` is given: one inherited from a polluted `Object.prototype` would keep `removeEventListener`
+	// from finding the listener.
+	signal.addEventListener('abort', group.listener, { once: true, capture: false } as { once: boolean });
+	if (stops.size > 0) signalGroups.set(signal, group);
+}
+
+/**
+ * Unregisters a waiter that no longer waits (idempotent), removing the abort listener once no waiter is left on the signal. A waiter is
+ * never stopped once unregistered, even by a signal whose `removeEventListener` throws.
+ * @param {AbortSignalLike | null | undefined} signal - The signal
+ * @param {(reason: unknown) => void} stop - The waiter's stop function
+ * @returns {void}
+ */
+function unwatchSignal(signal: AbortSignalLike | null | undefined, stop: (reason: unknown) => void): void {
+	if (signal === null || signal === undefined) return;
+
+	const group = signalGroups.get(signal);
+
+	if (group === undefined || !group.stops.delete(stop) || group.stops.size > 0) return;
+	signalGroups.delete(signal);
+	detach(signal, group.listener);
 }
 
 /**
@@ -169,22 +277,28 @@ export function sleep(ms: number, options: SleepOptions = {}): Promise<void> {
 			return;
 		}
 
-		/**
-		 * Abort listener: clears the timer and rejects.
-		 * @returns {void}
-		 */
-		function onAbort(): void {
-			clearTimeout(timer);
-			reject(abortReason(signal as AbortSignalLike));
-		}
-
-		// The listener first: when adding it throws, no timer is left behind.
-		signal?.addEventListener('abort', onAbort, { once: true });
-
 		const timer = setTimeout(function () {
 			resolve();
-			detach(signal, onAbort);
+			unwatchSignal(signal, onAbort);
 		}, ms);
+
+		/**
+		 * Abort listener: clears the timer and rejects.
+		 * @param {unknown} reason - The abort reason
+		 * @returns {void}
+		 */
+		function onAbort(reason: unknown): void {
+			clearTimeout(timer);
+			reject(reason);
+		}
+
+		// After the timer, which a signal calling the listener while it is being added clears; when adding it throws, no timer is left behind.
+		try {
+			watchSignal(signal, onAbort);
+		} catch (error) {
+			clearTimeout(timer);
+			throw error;
+		}
 	});
 }
 
@@ -205,7 +319,7 @@ export function sleep(ms: number, options: SleepOptions = {}): Promise<void> {
  */
 export function withTimeout<T>(promise: PromiseLike<T> | T, ms: number, message?: string): Promise<T> {
 	return new Promise<T>(function (resolve, reject) {
-		const settled = Promise.resolve(promise);
+		const settled = toPromise(promise) as Promise<T>;
 		try {
 			assertDelay('withTimeout', 'ms', ms);
 		} catch (error) {
@@ -403,15 +517,16 @@ function runConcurrently(
 			if (done) return;
 			done = true;
 			settle(value as never);
-			detach(signal, onAbort);
+			unwatchSignal(signal, onAbort);
 		}
 
 		/**
 		 * Abort listener.
+		 * @param {unknown} reason - The abort reason
 		 * @returns {void}
 		 */
-		function onAbort(): void {
-			finish(reject, abortReason(signal as AbortSignalLike));
+		function onAbort(reason: unknown): void {
+			finish(reject, reason);
 		}
 
 		/**
@@ -475,7 +590,7 @@ function runConcurrently(
 			launch();
 		}
 
-		signal?.addEventListener('abort', onAbort);
+		watchSignal(signal, onAbort);
 		launch();
 	});
 }
@@ -797,7 +912,7 @@ export function createLimiter(concurrency: number, options: LimiterOptions = {})
 		});
 	}
 
-	Object.defineProperties(limit, {
+	defineProperties(limit, {
 		activeCount: {
 			get: function (): number {
 				return active;
@@ -916,87 +1031,6 @@ interface QueueTask {
 }
 
 /**
- * The waiters sharing one abort signal, and the single listener that stops them all.
- */
-interface SignalGroup {
-	readonly stops: Set<(reason: unknown) => void>;
-	readonly listener: () => void;
-}
-
-/**
- * The `watch` and `unwatch` functions returned by {@link createSignalGroups}.
- */
-interface SignalGroups {
-	/**
-	 * Registers a waiter on `signal` (none: nothing to do), adding the listener to the signal for its first waiter.
-	 * @throws {unknown} the error of a throwing `addEventListener` (the waiter is not registered then)
-	 */
-	watch(signal: AbortSignalLike | null | undefined, stop: (reason: unknown) => void): void;
-	/**
-	 * Unregisters a waiter that no longer waits (idempotent), removing the listener once no waiter is left on the signal. A waiter is
-	 * never stopped once unregistered, even by a signal whose `removeEventListener` throws.
-	 */
-	unwatch(signal: AbortSignalLike | null | undefined, stop: (reason: unknown) => void): void;
-}
-
-/**
- * Creates a registry of waiters (queued tasks, permit requests, batched keys) that share abort signals, with ONE abort listener per
- * signal however many wait on it: adding and removing a listener costs a scan of the signal's listener list (a platform `AbortSignal`
- * checks for duplicates), so one listener per waiter makes n waiters on one signal cost O(n²). The waiters of a signal are stopped
- * in registration order, with its reason read once.
- * @returns {SignalGroups} The `watch` and `unwatch` functions
- */
-function createSignalGroups(): SignalGroups {
-	const groups = new WeakMap<AbortSignalLike, SignalGroup>();
-
-	return {
-		watch(signal: AbortSignalLike | null | undefined, stop: (reason: unknown) => void): void {
-			if (signal === null || signal === undefined) return;
-
-			const existing = groups.get(signal);
-
-			if (existing !== undefined) {
-				existing.stops.add(stop);
-				return;
-			}
-
-			const stops = new Set([stop]);
-			const group: SignalGroup = {
-				stops,
-				listener: function onAbort(): void {
-					if (groups.get(signal) === group) groups.delete(signal);
-
-					const reason = abortReason(signal);
-					const stopped = Array.from(stops);
-
-					// Emptied first: a hostile signal calling the listener again stops nobody twice.
-					stops.clear();
-					for (const each of stopped) each(reason);
-				}
-			};
-
-			groups.set(signal, group);
-			try {
-				signal.addEventListener('abort', group.listener, { once: true });
-			} catch (error) {
-				if (groups.get(signal) === group) groups.delete(signal);
-				stops.clear();
-				throw error;
-			}
-		},
-		unwatch(signal: AbortSignalLike | null | undefined, stop: (reason: unknown) => void): void {
-			if (signal === null || signal === undefined) return;
-
-			const group = groups.get(signal);
-
-			if (group === undefined || !group.stops.delete(stop) || group.stops.size > 0) return;
-			groups.delete(signal);
-			detach(signal, group.listener);
-		}
-	};
-}
-
-/**
  * Orders queue tasks by decreasing priority (ties keep insertion order: the priority queue is stable).
  * @param {QueueTask} a - A task
  * @param {QueueTask} b - Another task
@@ -1059,8 +1093,6 @@ export function createQueue<S extends AbortSignalLike = never>(options: QueueOpt
 	// Aborted tasks are only marked `done` and counted in `cancelled` (removing one from the heap costs O(n), so aborting n waiting tasks
 	// at once would cost O(n²)); they are skipped when popped, and dropped once they are half of the heap.
 	const waiting = createPriorityQueue(byPriority);
-	// One abort listener per task signal, however many waiting tasks share it.
-	const signals = createSignalGroups();
 	let cancelled = 0;
 	let running = 0;
 	let paused = false;
@@ -1073,6 +1105,8 @@ export function createQueue<S extends AbortSignalLike = never>(options: QueueOpt
 	 */
 	function notify(): void {
 		if (queued() > 0) return;
+		// Listened to only while tasks wait (aborting it changes nothing else): a queue left idle is not kept alive by a long-lived signal.
+		unwatchSignal(queueSignal, drop);
 		emptyWaiters = wake(emptyWaiters);
 		if (running === 0) idleWaiters = wake(idleWaiters);
 	}
@@ -1115,18 +1149,10 @@ export function createQueue<S extends AbortSignalLike = never>(options: QueueOpt
 		for (let task = take(); task !== undefined; task = take()) {
 			task.done = true;
 			task.reject(reason);
-			signals.unwatch(task.signal, task.onAbort);
+			unwatchSignal(task.signal, task.onAbort);
 		}
 		notify();
 	}
-
-	queueSignal?.addEventListener(
-		'abort',
-		function () {
-			drop(abortReason(queueSignal));
-		},
-		{ once: true }
-	);
 
 	return {
 		add<T, O extends QueueAddOptions = QueueAddOptions<never>>(
@@ -1149,7 +1175,7 @@ export function createQueue<S extends AbortSignalLike = never>(options: QueueOpt
 				 */
 				function run(): void {
 					entry.done = true;
-					signals.unwatch(signal, onAbort);
+					unwatchSignal(signal, onAbort);
 
 					let taskSignal: AbortSignalLike | undefined;
 					let release: () => void;
@@ -1195,8 +1221,15 @@ export function createQueue<S extends AbortSignalLike = never>(options: QueueOpt
 				if (!paused && running < concurrency && queued() === 0) {
 					run();
 				} else {
-					// The listener first: when adding it throws, the task is not queued (its promise rejects).
-					signals.watch(signal, onAbort);
+					// The listeners first (the queue's, idempotent, then the task's): when adding one throws, the task is not queued (its
+					// promise rejects).
+					watchSignal(queueSignal, drop);
+					try {
+						watchSignal(signal, onAbort);
+					} catch (error) {
+						notify();
+						throw error;
+					}
 					waiting.push(entry);
 				}
 			});
@@ -1376,6 +1409,7 @@ export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
 		}
 
 		draining = false;
+		if (first === undefined) unwatchSignal(signal, drop);
 	}
 
 	/**
@@ -1386,6 +1420,7 @@ export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
 	function drop(reason: unknown): void {
 		clearTimeout(timer);
 		timer = undefined;
+		unwatchSignal(signal, drop);
 
 		let call = first;
 
@@ -1393,14 +1428,6 @@ export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
 		pending = 0;
 		for (; call !== undefined; call = call.next) call.reject(reason);
 	}
-
-	signal?.addEventListener(
-		'abort',
-		function () {
-			drop(abortReason(signal));
-		},
-		{ once: true }
-	);
 
 	/**
 	 * Queues a call (see {@link RateLimiter.schedule}).
@@ -1433,6 +1460,9 @@ export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
 
 			const call: RateLimitedCall = { start, reject };
 
+			// Listened to only while calls wait (idempotent), so that an idle limiter is not kept alive by a long-lived signal; when adding
+			// the listener throws, the call is not queued.
+			watchSignal(signal, drop);
 			// `last` is stale once the queue has drained, so it is only followed while `first` is set.
 			if (first === undefined) first = call;
 			else (last as RateLimitedCall).next = call;
@@ -1585,8 +1615,6 @@ function semaphore(name: string, permits: number, onIdle: () => void = noop): Se
 	let first: SemaphoreWaiter | undefined;
 	let last: SemaphoreWaiter | undefined;
 	let waiting = 0;
-	// One abort listener per signal, however many waiting requests share it.
-	const signals = createSignalGroups();
 
 	/**
 	 * Throws unless `weight` is an integer between 1 and `permits` (a larger request could never be granted).
@@ -1702,7 +1730,7 @@ function semaphore(name: string, permits: number, onIdle: () => void = noop): Se
 			function leave(): void {
 				unlink(waiter);
 				clearTimeout(timer);
-				signals.unwatch(signal, onAbort);
+				unwatchSignal(signal, onAbort);
 			}
 
 			/**
@@ -1730,7 +1758,7 @@ function semaphore(name: string, permits: number, onIdle: () => void = noop): Se
 			// queue before any timer exists. `leave` removes it.
 			enqueue(waiter);
 			try {
-				signals.watch(signal, onAbort);
+				watchSignal(signal, onAbort);
 			} catch (error) {
 				unlink(waiter);
 				throw error;
@@ -2012,15 +2040,16 @@ export function pollUntil<T>(check: () => T | PromiseLike<T>, options: PollOptio
 			clearTimeout(pollTimer);
 			clearTimeout(deadlineTimer);
 			settle(value as never);
-			detach(signal, onAbort);
+			unwatchSignal(signal, onAbort);
 		}
 
 		/**
 		 * Abort listener.
+		 * @param {unknown} reason - The abort reason
 		 * @returns {void}
 		 */
-		function onAbort(): void {
-			finish(reject, abortReason(signal as AbortSignalLike));
+		function onAbort(reason: unknown): void {
+			finish(reject, reason);
 		}
 
 		/**
@@ -2045,8 +2074,10 @@ export function pollUntil<T>(check: () => T | PromiseLike<T>, options: PollOptio
 			);
 		}
 
-		// `finish` removes it, so it never runs twice. Added before the deadline timer: when adding it throws, no timer is left behind.
-		signal?.addEventListener('abort', onAbort);
+		// `finish` removes it, so it never runs twice. Added before the deadline timer: when adding it throws, no timer is left behind, and
+		// when the signal calls it while it is being added, nothing starts.
+		watchSignal(signal, onAbort);
+		if (settled) return;
 		if (timeout !== Infinity) {
 			deadlineTimer = setTimeout(function () {
 				finish(reject, new TimeoutError(`pollUntil: condition not met within ${timeout} ms`));
@@ -2200,7 +2231,7 @@ export function debounceAsync<F extends (...args: never[]) => unknown>(fn: F, wa
 		return promise;
 	}
 
-	Object.defineProperties(debouncedAsync, {
+	defineProperties(debouncedAsync, {
 		cancel: {
 			value: function cancel(): void {
 				debounced.cancel();
@@ -2318,9 +2349,14 @@ export function memoizeAsync<F extends AnyFunction>(fn: F, options: MemoizeAsync
 			return Promise.reject(error);
 		}
 
-		// Read once, then `has` only for a cached `undefined` (an expiring cache could drop the entry between the two).
-		const cached = cache.get(id);
-		if (cached !== undefined || cache.has(id)) return Promise.resolve(cached);
+		// Read once, then `has` only for a cached `undefined` (an expiring cache could drop the entry between the two). A cache that
+		// throws rejects, like a throwing resolver.
+		try {
+			const cached = cache.get(id);
+			if (cached !== undefined || cache.has(id)) return Promise.resolve(cached);
+		} catch (error) {
+			return Promise.reject(error);
+		}
 
 		let shared = inflight.get(id);
 
@@ -2349,7 +2385,7 @@ export function memoizeAsync<F extends AnyFunction>(fn: F, options: MemoizeAsync
 		return shared;
 	}
 
-	Object.defineProperties(memoized, {
+	defineProperties(memoized, {
 		cache: { value: cache, enumerable: true },
 		clear: {
 			value: function clear(): void {
@@ -2696,8 +2732,6 @@ export function createBatcher<K, V>(batchLoad: BatchLoadFunction<K, V>, options:
 	// With a cache: the entry of every key requested and not settled yet, dispatched or not (single flight). Only the entry still
 	// registered here when its batch settles writes its value to the cache.
 	const inflight = new Map<unknown, BatchEntry>();
-	// One abort listener per signal, whatever the number of keys waiting on it (see `createSignalGroups`).
-	const { watch, unwatch } = createSignalGroups();
 	let pending: Batch | undefined;
 
 	/**
@@ -2734,6 +2768,7 @@ export function createBatcher<K, V>(batchLoad: BatchLoadFunction<K, V>, options:
 			);
 			// An array is read as it is: resolving it like a promise would look up a `then` method, which a polluted prototype supplies.
 			direct = Array.isArray(values) || ArrayBuffer.isView(values);
+			if (!direct) values = toPromise(values);
 		} catch (error) {
 			fail(entries, error);
 			return;
@@ -2742,7 +2777,7 @@ export function createBatcher<K, V>(batchLoad: BatchLoadFunction<K, V>, options:
 			complete(entries, values);
 			return;
 		}
-		Promise.resolve(values).then(
+		(values as Promise<unknown>).then(
 			function (resolved) {
 				complete(entries, resolved);
 			},
@@ -2951,7 +2986,7 @@ export function createBatcher<K, V>(batchLoad: BatchLoadFunction<K, V>, options:
 			}
 
 			try {
-				watch(signal, stop);
+				watchSignal(signal, stop);
 			} catch (error) {
 				// The key leaves its batch again (unless another caller waits for it).
 				stop(error);
@@ -2959,11 +2994,11 @@ export function createBatcher<K, V>(batchLoad: BatchLoadFunction<K, V>, options:
 			}
 			entry.deferred.promise.then(
 				function (value) {
-					unwatch(signal, stop);
+					unwatchSignal(signal, stop);
 					resolve(value);
 				},
 				function (error: unknown) {
-					unwatch(signal, stop);
+					unwatchSignal(signal, stop);
 					reject(error);
 				}
 			);
@@ -3121,9 +3156,10 @@ export function timeoutSignal(ms: number): PlatformAbortSignal {
  * `null` and `undefined` entries are ignored, so optional signals can be passed directly; with no signals the result never aborts.
  *
  * If an input is already aborted, the result is returned already aborted (with the reason of the first such input) and no listener
- * is attached. Otherwise one `abort` listener is added to each input, and all of them are removed as soon as the result aborts.
- * Note that if no input ever aborts, those listeners stay attached for as long as the inputs live (unlike the native implementation,
- * which holds them weakly), so avoid creating unbounded numbers of combined signals from one long-lived signal.
+ * is attached. Otherwise the result is registered with each input (which gets one `abort` listener, shared by everything of this
+ * module waiting on it), and unregistered from all of them as soon as it aborts. Note that if no input ever aborts, the registrations
+ * stay for as long as the inputs live (unlike the native implementation, which holds them weakly), so avoid creating unbounded numbers
+ * of combined signals from one long-lived signal.
  * @param {Iterable<AbortSignalLike | null | undefined>} signals - The signals to combine (consumed eagerly)
  * @returns {PlatformAbortSignal} A new signal
  * @throws {TypeError} when `signals` is not iterable, or one of its entries is not a signal, `null` or `undefined`
@@ -3146,8 +3182,11 @@ export function anySignal(signals: Iterable<AbortSignalLike | null | undefined>)
 	}
 
 	const inputs: AbortSignalLike[] = [];
+	const array = Array.isArray(signals);
 	let index = 0;
-	for (const signal of signals) {
+	for (let signal of signals) {
+		// A hole of an array (`[a, , b]`) is skipped like `undefined`, not read from a polluted `Object.prototype`.
+		if (array && !Object.hasOwn(signals, index)) signal = undefined;
 		assertOptionalSignal('anySignal', `signals[${index}]`, signal);
 		if (signal !== null && signal !== undefined) inputs.push(signal);
 		index++;
@@ -3169,10 +3208,10 @@ function combineSignals(caller: string, inputs: AbortSignalLike[]): [AbortSignal
 	const aborted = inputs.find(function (input) {
 		return input.aborted;
 	});
-	const listeners = inputs.map(function (input) {
-		return function onAbort(): void {
+	const listeners = inputs.map(function () {
+		return function onAbort(reason: unknown): void {
 			release();
-			controller.abort(abortReason(input));
+			controller.abort(reason);
 		};
 	});
 
@@ -3182,7 +3221,7 @@ function combineSignals(caller: string, inputs: AbortSignalLike[]): [AbortSignal
 	 */
 	function release(): void {
 		inputs.forEach(function (input, i) {
-			detach(input, listeners[i]);
+			unwatchSignal(input, listeners[i]);
 		});
 	}
 
@@ -3191,7 +3230,7 @@ function combineSignals(caller: string, inputs: AbortSignalLike[]): [AbortSignal
 	} else {
 		try {
 			inputs.forEach(function (input, i) {
-				input.addEventListener('abort', listeners[i]);
+				watchSignal(input, listeners[i]);
 			});
 		} catch (error) {
 			// The listeners already added would keep the combined signal (and what it is attached to) alive.
@@ -3228,7 +3267,7 @@ function combineSignals(caller: string, inputs: AbortSignalLike[]): [AbortSignal
  */
 export function abortable<T>(promise: PromiseLike<T> | T, signal: AbortSignalLike | null | undefined): Promise<T> {
 	return new Promise<T>(function (resolve, reject) {
-		const settled = Promise.resolve(promise);
+		const settled = toPromise(promise) as Promise<T>;
 		try {
 			assertOptionalSignal('abortable', 'signal', signal);
 		} catch (error) {
@@ -3239,25 +3278,26 @@ export function abortable<T>(promise: PromiseLike<T> | T, signal: AbortSignalLik
 
 		/**
 		 * Abort listener: rejects with the abort reason.
+		 * @param {unknown} reason - The abort reason
 		 * @returns {void}
 		 */
-		function onAbort(): void {
-			reject(abortReason(signal as AbortSignalLike));
+		function onAbort(reason: unknown): void {
+			reject(reason);
 		}
 
 		settled.then(
 			function (value) {
 				resolve(value);
-				detach(signal, onAbort);
+				unwatchSignal(signal, onAbort);
 			},
 			function (error: unknown) {
 				reject(error);
-				detach(signal, onAbort);
+				unwatchSignal(signal, onAbort);
 			}
 		);
 
-		if (signal?.aborted) onAbort();
-		else signal?.addEventListener('abort', onAbort, { once: true });
+		if (signal?.aborted) reject(abortReason(signal));
+		else watchSignal(signal, onAbort);
 	});
 }
 
@@ -3523,16 +3563,17 @@ export function waitForEvent(target: EventTargetLike | EventEmitterLike, type: s
 			done = true;
 			unlisten();
 			clearTimeout(timer);
-			detach(signal, onAbort);
+			unwatchSignal(signal, onAbort);
 			settle(value as never);
 		}
 
 		/**
 		 * Abort listener.
+		 * @param {unknown} reason - The abort reason
 		 * @returns {void}
 		 */
-		function onAbort(): void {
-			finish(reject, abortReason(signal as AbortSignalLike));
+		function onAbort(reason: unknown): void {
+			finish(reject, reason);
 		}
 
 		/**
@@ -3563,7 +3604,7 @@ export function waitForEvent(target: EventTargetLike | EventEmitterLike, type: s
 		}
 
 		// The abort listener first: when adding it throws, nothing else is left behind. `finish` removes it.
-		signal?.addEventListener('abort', onAbort);
+		watchSignal(signal, onAbort);
 
 		try {
 			addListeners(target, add, added, type, onEvent, rejectOn, onReject, function () {
@@ -3723,7 +3764,7 @@ export interface MinDelayOptions {
  */
 export function minDelay<T>(promise: PromiseLike<T> | T, ms: number, options: MinDelayOptions = {}): Promise<T> {
 	return new Promise<T>(function (resolve, reject) {
-		const settled = Promise.resolve(promise);
+		const settled = toPromise(promise) as Promise<T>;
 		let delayRejection: boolean;
 
 		try {
@@ -4133,7 +4174,7 @@ export function createCircuitBreaker<F extends AnyFunction>(fn: F, options: Circ
 		return invoke(fn, this, args).then(handlers.value, handlers.error);
 	}
 
-	Object.defineProperties(breaker, {
+	defineProperties(breaker, {
 		state: {
 			get: function (): CircuitState {
 				refresh();
@@ -4490,7 +4531,7 @@ export function fromEvent(target: EventTargetLike | EventEmitterLike, type: stri
 	function close(): void {
 		closed = true;
 		removeListeners(target, remove, added);
-		detach(signal, onAbort);
+		unwatchSignal(signal, onAbort);
 	}
 
 	/**
@@ -4523,11 +4564,12 @@ export function fromEvent(target: EventTargetLike | EventEmitterLike, type: stri
 
 	/**
 	 * Abort listener: ends the iteration at once.
+	 * @param {unknown} reason - The abort reason
 	 * @returns {void}
 	 */
-	function onAbort(): void {
+	function onAbort(reason: unknown): void {
 		discard();
-		fail(abortReason(signal as AbortSignalLike));
+		fail(reason);
 	}
 
 	/**
@@ -4622,14 +4664,14 @@ export function fromEvent(target: EventTargetLike | EventEmitterLike, type: stri
 		return iterator;
 	}
 	// The abort listener first: when adding it throws, nothing else is left behind.
-	signal?.addEventListener('abort', onAbort);
+	watchSignal(signal, onAbort);
 	try {
 		addListeners(target, add, added, type, onEvent, rejectOn, fail, function () {
 			return closed;
 		});
 	} catch (error) {
 		removeListeners(target, remove, added);
-		detach(signal, onAbort);
+		unwatchSignal(signal, onAbort);
 		throw error;
 	}
 	// A listener called while being added has ended the iteration (and removed the listeners added before it).
@@ -4710,7 +4752,7 @@ export function interval(callback: (tick: number) => unknown, ms: number, option
 		stopped = true;
 		clearTimeout(timer);
 		timer = undefined;
-		detach(signal, stop);
+		unwatchSignal(signal, stop);
 	}
 
 	/**
@@ -4750,8 +4792,10 @@ export function interval(callback: (tick: number) => unknown, ms: number, option
 	}
 
 	if (signal?.aborted) return stop;
-	// The listener first: when adding it throws, no timer is left behind. `stop` removes it.
-	signal?.addEventListener('abort', stop);
+	// The listener first: when adding it throws, no timer is left behind, and when the signal calls it while it is being added, nothing
+	// starts. `stop` removes it.
+	watchSignal(signal, stop);
+	if (stopped) return stop;
 	if (immediate) run(0);
 	else schedule();
 
