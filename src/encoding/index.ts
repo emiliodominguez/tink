@@ -231,8 +231,12 @@ const BASE64_URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01234567
 /** The characters that the native `Uint8Array.fromBase64` skips (ASCII white space), but {@link fromBase64} rejects. */
 const WHITE_SPACE = /[\t\n\f\r ]/;
 
-/** Lazily built decoding tables (index `0` for base64, `1` for base64url): ASCII code → 6-bit value, `64` for invalid characters. */
-const decodeTables: Uint8Array[] = [];
+/**
+ * Lazily built decoding tables (index `0` for base64, `1` for base64url): ASCII code → 6-bit value, `64` for invalid characters. The
+ * slots are own `undefined`s until built: a hole would be looked up on a (possibly polluted) `Object.prototype`, whose `0` or `1` would
+ * then be used as the table.
+ */
+const decodeTables: (Uint8Array | undefined)[] = [undefined, undefined];
 
 /**
  * Returns the decoding table of a base64 alphabet, building it on first use.
@@ -609,9 +613,12 @@ function isPair(text: string, index: number, code: number): boolean {
 	return next >= 0xdc00 && next <= 0xdfff;
 }
 
-/** The `TextDecoder` constructor the decoders were created from, and the replacing (`0`) and fatal (`1`) decoders. */
+/**
+ * The `TextDecoder` constructor the decoders were created from, and the replacing (`0`) and fatal (`1`) decoders (own `undefined`s until
+ * created, never holes looked up on a polluted `Object.prototype`).
+ */
 let decoderClass: unknown;
-let utf8Decoders: (TextDecoderLike | undefined)[] = [];
+let utf8Decoders: (TextDecoderLike | undefined)[] = [undefined, undefined];
 
 /**
  * Decodes UTF-8 bytes into a string, following the WHATWG Encoding Standard exactly (the behaviour of `TextDecoder`): each maximal
@@ -642,7 +649,7 @@ export function decodeUtf8(bytes: BytesInput, options?: DecodeUtf8Options): stri
 	const Decoder = (globalThis as { TextDecoder?: new (label: string, options: object) => TextDecoderLike }).TextDecoder;
 	if (typeof Decoder === 'function') {
 		if (Decoder !== decoderClass) {
-			utf8Decoders = [];
+			utf8Decoders = [undefined, undefined];
 			decoderClass = Decoder;
 		}
 		const kind = fatal ? 1 : 0;
@@ -1081,8 +1088,11 @@ export interface FromBase32Options {
 /** The base32 alphabets, at the indexes returned by {@link base32Kind}. */
 const BASE32 = ['ABCDEFGHIJKLMNOPQRSTUVWXYZ234567', '0123456789ABCDEFGHIJKLMNOPQRSTUV', '0123456789ABCDEFGHJKMNPQRSTVWXYZ'];
 
-/** Lazily built base32 decoding tables (indexes as in {@link BASE32}): ASCII code → 5-bit value, `32` for invalid characters. */
-const base32Tables: Uint8Array[] = [];
+/**
+ * Lazily built base32 decoding tables (indexes as in {@link BASE32}): ASCII code → 5-bit value, `32` for invalid characters. Own
+ * `undefined`s until built, as in {@link decodeTables}.
+ */
+const base32Tables: (Uint8Array | undefined)[] = [undefined, undefined, undefined];
 
 /**
  * Validates the `alphabet` option of the base32 functions.
@@ -2126,7 +2136,8 @@ const FORMULA_START = /^[\t\r]|^\s*[=+\-@＝＋－＠]/;
  * the columns.
  *
  * - A field is quoted only when it must be (it holds the delimiter, `"`, `\r` or `\n`, or starts with a byte order mark), or always
- *   with `quote: 'all'` or `formulaEscape`; a `"` inside it is doubled. A row of one empty field is written `""`, so that it is not an empty line.
+ *   with `quote: 'all'` or `formulaEscape`; a `"` inside it is doubled. A row of one empty field is written `""`, so that it is not an empty line,
+ *   and so is an empty first field before a U+FEFF delimiter, so that the text does not start with a byte order mark.
  * - Strings are written as they are, numbers, bigints and booleans with `String()`, `null`, `undefined` and holes as empty fields; any other
  *   value (an object, a `Date`…) throws, so format it first.
  * - Records: only own properties are read. The columns are `columns`, or every own enumerable key in the order first seen; a missing
@@ -2274,5 +2285,8 @@ export function toCsv(rows: ReadonlyArray<unknown>, options?: ToCsvOptions): str
 			: (row as ReadonlyArray<unknown>);
 		lines.push(line(cells, index));
 	}
+	// With the delimiter U+FEFF, a text starting with an empty field would start with the delimiter, which `parseCsv` (and spreadsheets)
+	// would drop as a byte order mark, losing the field: it is quoted instead. (A field starting with U+FEFF is already quoted.)
+	if (lines.length > 0 && lines[0].charCodeAt(0) === 0xfeff) lines[0] = `""${lines[0]}`;
 	return lines.join(newline as string);
 }

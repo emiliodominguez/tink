@@ -725,6 +725,31 @@ describe('encoding', function () {
 			});
 		});
 
+		it('should never use a decoding table or decoder planted on Object.prototype before first use (regression)', function () {
+			// A fresh copy of the module, whose lazily built tables do not exist yet.
+			let fresh: typeof helpers | undefined;
+			jest.isolateModules(function () {
+				fresh = jest.requireActual<typeof helpers>('./index');
+			});
+			const isolated = fresh as typeof helpers;
+			const zeros = new Array<number>(128).fill(0);
+			const decoder = {
+				decode(): string {
+					return 'planted';
+				}
+			};
+			polluted({ 0: zeros, 1: decoder, 2: zeros }, function () {
+				without(Uint8Array, 'fromBase64', function () {
+					expect(isolated.fromBase64('aGk=')).toEqual(bytes(104, 105));
+					expect(isolated.fromBase64('-_8', { urlSafe: true })).toEqual(bytes(0xfb, 0xff));
+				});
+				expect(isolated.fromBase32('MZXW6===')).toEqual(bytes(102, 111, 111));
+				expect(isolated.fromBase32('0000', { alphabet: 'crockford' })).toEqual(bytes(0, 0));
+				expect(isolated.decodeUtf8(bytes(104, 105), { fatal: true })).toBe('hi');
+				expect(isolated.decodeJwt('eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0.').payload).toEqual({ sub: 'x' });
+			});
+		});
+
 		it('should still read own options, including getters and options objects without a prototype', function () {
 			const options = Object.create(null) as { urlSafe: boolean };
 			options.urlSafe = true;
@@ -1539,6 +1564,37 @@ describe('toCsv', function () {
 		} finally {
 			delete (Array.prototype as unknown as Record<number, unknown>)[1];
 		}
+	});
+
+	it('should quote an empty first field before a U+FEFF delimiter, which parseCsv would drop as a byte order mark (regression)', function () {
+		const delimiter = '﻿';
+		expect(
+			helpers.toCsv(
+				[
+					['', 'a'],
+					['', 'b']
+				],
+				{ delimiter }
+			)
+		).toBe('""﻿a\r\n﻿b');
+		expect(
+			helpers.parseCsv(
+				helpers.toCsv(
+					[
+						['', 'a'],
+						['', 'b']
+					],
+					{ delimiter }
+				),
+				{ delimiter }
+			)
+		).toEqual([
+			['', 'a'],
+			['', 'b']
+		]);
+		expect(helpers.parseCsv(helpers.toCsv([{ '': 'x', y: 'z' }], { delimiter }), { delimiter, header: true })).toEqual([{ '': 'x', y: 'z' }]);
+		expect(helpers.toCsv([[null, 1]], { delimiter, quote: 'all' })).toBe('""﻿"1"');
+		expect(helpers.toCsv([['﻿', 1]], { delimiter })).toBe('"﻿"﻿1');
 	});
 
 	it('should reject rows that are not all arrays or all records', function () {
