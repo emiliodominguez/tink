@@ -2234,7 +2234,9 @@ export function toCsv(rows: ReadonlyArray<unknown>, options?: ToCsvOptions): str
 		const keys = new Set<string>();
 		for (let index = 0; index < rows.length; index++) {
 			const row = ownItem(rows, index);
-			if (typeof row === 'object' && row !== null) for (const key of Object.keys(row)) keys.add(key);
+			// Up to the first invalid row, which the loop below rejects: a huge sparse `rows` must not be walked to its end first.
+			if (typeof row !== 'object' || row === null || Array.isArray(row)) break;
+			for (const key of Object.keys(row)) keys.add(key);
 		}
 		names = [...keys];
 	}

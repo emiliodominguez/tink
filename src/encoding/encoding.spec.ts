@@ -1578,6 +1578,31 @@ describe('toCsv', function () {
 		expect(helpers.toCsv([['a'], [], ['b']])).toBe('a\r\n\r\nb');
 	});
 
+	it('should reject an invalid record row without first walking the rest of a huge sparse array (regression)', function () {
+		// Regression: the column names were collected from every index first, so `[{ a: 1 }, <4294967294 holes>]` ran for about a
+		// minute before the TypeError for `rows[1]`.
+		const rows = new Array(2 ** 32 - 1) as unknown[];
+		rows[0] = { a: 1 };
+		let reads = 0;
+		const counted = new Proxy(rows, {
+			getOwnPropertyDescriptor(target, key) {
+				reads++;
+				return Reflect.getOwnPropertyDescriptor(target, key);
+			}
+		});
+		expect(function () {
+			helpers.toCsv(counted as never);
+		}).toThrow(new TypeError('toCsv: `rows[1]` must be a record (a non-array object) like the first row, got undefined'));
+		expect(reads).toBeLessThan(10);
+		// A record row after an array row: still the error for the array row, with the columns of the rows before it.
+		expect(function () {
+			helpers.toCsv([{ a: 1 }, ['x'], { b: 2 }] as never);
+		}).toThrow(new TypeError('toCsv: `rows[1]` must be a record (a non-array object) like the first row, got array'));
+		expect(function () {
+			helpers.toCsv([{ a: 1 }, { b: {} }, 5] as never);
+		}).toThrow(new TypeError('toCsv: `rows[1]["b"]` must be a string, number, bigint, boolean, null or undefined, got object'));
+	});
+
 	it('should read only own rows and column names, never ones planted on a polluted Object.prototype (regression)', function () {
 		// oxlint-disable-next-line no-sparse-arrays
 		const sparse = [['a'], , ['b']] as string[][];
