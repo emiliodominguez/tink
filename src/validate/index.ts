@@ -2445,6 +2445,28 @@ function isStandardSchema(value: object): value is StandardSchemaLike {
 }
 
 /**
+ * Explains why `guard` rejects `value`, for a report to `issues`: in the report the caller sees, as a root `explain` call (whose issues
+ * all reach it), elsewhere nested in the lazy checks running.
+ * @param {Guard<unknown>} guard - The guard
+ * @param {unknown} value - The rejected value
+ * @param {SchemaIssue[]} issues - The report
+ * @returns {SchemaIssue[]} The issues
+ */
+function explainTo(guard: Guard<unknown>, value: unknown, issues: SchemaIssue[]): SchemaIssue[] {
+	if (issues !== rootIssues) return explain(guard, value);
+
+	const { checks, checkRoot } = scope;
+
+	scope.checks = 0;
+	try {
+		return explain(guard, value);
+	} finally {
+		scope.checks = checks;
+		scope.checkRoot = checkRoot;
+	}
+}
+
+/**
  * Compiles a guard: valid values are returned as they are, invalid ones are explained (see the guards module's `explain`).
  * @param {Guard<unknown>} guard - The guard
  * @returns {Node} The compiled guard
@@ -2457,7 +2479,7 @@ function guardNode(guard: Guard<unknown>): Node {
 		run: function runGuard(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
 			if (guard(value)) return value;
 
-			const found = explain(guard, value);
+			const found = explainTo(guard, value, issues);
 
 			// A guard that rejected the value but accepts it when explained (it is not deterministic) still fails.
 			if (found.length === 0) issues.push({ message: `Invalid value (got ${describe(value)})`, path: path.slice() });
@@ -3837,7 +3859,7 @@ export function recordOf<S extends Schema, K extends string = string>(
 			for (const name of Object.keys(value)) {
 				path.push(name);
 				if (keys !== undefined && !keys(name)) {
-					const found = explain(keys, name);
+					const found = explainTo(keys, name, issues);
 
 					if (found.length === 0) issues.push({ message: 'Invalid key', path: path.slice() });
 					for (const issue of found) issues.push({ message: `Invalid key: ${issue.message}`, path: path.slice() });
@@ -3938,6 +3960,7 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 
 		// The outermost lazy parser of a fast parse scopes the memos of the parsers it reaches to its call.
 		scope.depth++;
+		scope.checks++;
 		try {
 			const output = node.fast(value);
 
@@ -3957,6 +3980,7 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 			memo.delete(value);
 			throw error;
 		} finally {
+			if (--scope.checks === 0) scope.checkRoot = undefined;
 			if (--scope.depth === 0) release();
 		}
 	}
@@ -3984,6 +4008,7 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 
 			// A parser of another copy of tinkit may report through this one: the scope keeps `reported` until this call returns.
 			if (scope.depth++ === 0) rootIssues = issues;
+			scope.checks++;
 			try {
 				// The fast parse of this very value just failed: parsing it again first would double the cost at every level.
 				const output = node.run(value, path, issues);
@@ -4011,6 +4036,7 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 			} finally {
 				if (failed) reported.set(value, { index: before, first: issues[before] });
 				else reported.delete(value);
+				if (--scope.checks === 0) scope.checkRoot = undefined;
 				if (--scope.depth === 0) {
 					rootIssues = undefined;
 					release();

@@ -23,7 +23,10 @@ export const scope = {
 	thrown: undefined as unknown,
 	thrownAt: 0,
 	/** How many times a lazy schema met an object it was already checking (a cycle): results that did are not remembered. */
-	cycles: 0
+	cycles: 0,
+	/** How many lazy checks or parses are running outside `explain`, and the root their nested `explain` calls share (guards). */
+	checks: 0,
+	checkRoot: undefined as object | undefined
 };
 
 /** The nesting of lazy schemas from which a stack overflow is blamed on the value, not on the code (a guard or transform recursing). */

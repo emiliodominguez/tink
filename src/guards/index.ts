@@ -2530,14 +2530,12 @@ interface LazyReport {
  * call (a guard or predicate calling `explain` itself, whose issues may have been dropped, or another root call, as the validate module
  * makes several in one parse) in full; a nested call gives a pointer issue for any object already reported during the same root call, so
  * that a guard explaining at each level of a recursive value cannot make the report exponential. A call made while a lazy guard checks
- * a value outside `explain` (`lazyChecks` of them running) is nested too, in the check (`checkRoot`, shared by the calls made during the
- * outermost check): a guard or predicate there explaining each level once the levels below were checked (and explained) would otherwise
- * report them all again at each level.
+ * a value outside `explain` (`scope.checks` of them running, the lazy parsers of the validate module included) is nested too, in the
+ * check (`scope.checkRoot`, shared by the calls made during the outermost check): a guard or predicate there explaining each level once
+ * the levels below were checked (and explained) would otherwise report them all again at each level.
  */
 let explainRun: object | undefined;
 let explainRoot: object | undefined;
-let lazyChecks = 0;
-let checkRoot: object | undefined;
 
 /**
  * Returns the table of a lazy guard's results for `value` while a discriminated union checks it (`discriminated.object === value`; the
@@ -2667,7 +2665,7 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 			const cycles = scope.cycles;
 
 			scope.depth++;
-			lazyChecks++;
+			scope.checks++;
 			try {
 				const passed = guard(value);
 
@@ -2687,7 +2685,7 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 				memo.delete(value);
 				throw error;
 			} finally {
-				if (--lazyChecks === 0) checkRoot = undefined;
+				if (--scope.checks === 0) scope.checkRoot = undefined;
 				if (--scope.depth === 0) release();
 			}
 		},
@@ -2887,7 +2885,7 @@ export function explain(guard: Guard<unknown>, value: unknown): SchemaIssue[] {
 
 	// The memos of the lazy guards (see `utils/memo.ts`) live until the end, so explaining reuses what checking found.
 	explainRun = {};
-	if (previousRun === undefined) explainRoot = lazyChecks === 0 ? explainRun : (checkRoot ??= {});
+	if (previousRun === undefined) explainRoot = scope.checks === 0 ? explainRun : (scope.checkRoot ??= {});
 	scope.depth++;
 	try {
 		// Guards never consult the explainers, so valid values take the fast path and allocate nothing beyond the result.

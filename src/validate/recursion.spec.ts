@@ -843,4 +843,44 @@ describe('recursive unions told apart deep inside', function () {
 		value.b = 2;
 		expect(node.fast(value)).toEqual({ b: 2 });
 	});
+
+	it('should stay linear when a guard explains a lazy guard of the guards module at every level', function () {
+		let checked = 0;
+		/**
+		 * An integer guard that counts its calls.
+		 * @param {unknown} value - The value
+		 * @returns {boolean} Whether it is an integer
+		 */
+		function counted(value: unknown): value is number {
+			checked++;
+			return Number.isInteger(value);
+		}
+		const isNode: Guard<unknown> = isLazy(function () {
+			return isShape({ id: counted, child: isOptional(isNode) });
+		});
+		// A sibling of the child, holding the same object, explains it with the guard before the parser recurses into it.
+		const Node: Parser<unknown> = lazy(function () {
+			return {
+				pre: function (value: unknown): value is unknown {
+					return explain(isNode, value).length === 0 || true;
+				},
+				id: counted,
+				child: optional(Node)
+			};
+		});
+		/**
+		 * Counts the guard calls of an invalid parse of a chain of `depth` levels.
+		 * @param {number} depth - The depth
+		 * @returns {number} The calls
+		 */
+		function count(depth: number): number {
+			let value: unknown = { id: 'x' };
+			for (let level = 1; level < depth; level++) value = { pre: value, id: level, child: value };
+			checked = 0;
+			safeParse(Node, value);
+			return checked;
+		}
+		// Quadratic, four times the depth took about sixteen times as many calls (800 levels: 964,000).
+		expect(count(800)).toBeLessThan(count(200) * 6);
+	});
 });
