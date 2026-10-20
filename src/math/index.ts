@@ -63,18 +63,22 @@ function sortsAfter(a: number, b: number): boolean {
  * never depends on the input order. Typed-array sorting is much faster than `Array#sort` with a comparator, but allocating
  * a typed array dominates for short inputs, which are insertion-sorted into a plain array instead.
  * @param {ArrayLike<number>} numbers - The numbers to sort (not mutated)
+ * @param {boolean} [all=false] - Whether to sort every number; otherwise the first `NaN` stops the copy and `[NaN]` is returned, which every
+ * statistic of sorted numbers but the {@link mode} reads as undefined (the holes of a sparse array of length `2 ** 32 - 1` filled 32 GiB)
  * @returns {ArrayLike<number>} A new, sorted array
  * @example
- * Array.from(sortedCopy([3, NaN, 1])); // => [1, 3, NaN]
+ * Array.from(sortedCopy([3, NaN, 1], true)); // => [1, 3, NaN]
  */
-function sortedCopy(numbers: ArrayLike<number>): ArrayLike<number> {
+function sortedCopy(numbers: ArrayLike<number>, all = false): ArrayLike<number> {
 	const length = numbers.length;
 	if (length > 32) {
 		// Filled by index, not with `Float64Array.from`, which collects the elements through the iterator first: on a sparse array of length
 		// about `1.2e8` or more, that list aborted the process out of memory.
 		const values = new Float64Array(length);
-		for (let i = 0; i < length; i++) values[i] = +numbers[i];
-		return values.sort();
+		let value = 0;
+		// Tested in the loop condition (see `centredSquares`).
+		for (let i = 0; i < length && (value === value || all); i++) values[i] = value = +numbers[i];
+		return value === value || all ? values.sort() : [NaN];
 	}
 	const sorted: number[] = [];
 	for (let i = 0; i < length; i++) {
@@ -113,16 +117,19 @@ export function sum(numbers: ReadonlyArray<number>): number {
  * compensation separately: the sum itself for `divisor = 1`, and a mean as accurate as `averageBy`'s (from the arrays module) otherwise.
  * @param {ArrayLike<number>} numbers - The numbers to add up
  * @param {number} divisor - What the sum is divided by
- * @returns {number} The scaled sum (`total / divisor` alone when the total is not finite)
+ * @param {number} [factor=1] - A power of two each number is multiplied by first (exactly, as far as the result is concerned)
+ * @returns {number} The scaled sum (`total / divisor` alone when the total is not finite, `NaN` as soon as a number is `NaN`)
  */
-function scaledSum(numbers: ArrayLike<number>, divisor: number): number {
+function scaledSum(numbers: ArrayLike<number>, divisor: number, factor = 1): number {
 	let total = 0;
 	let compensation = 0;
 	// An index loop: several times faster than `for...of` here. There is deliberately no fast path for exact (e.g. integer) input:
 	// an integer pre-pass slowed mixed workloads down, and detecting exact additions inside the loop (`next - total === value`, both
 	// ways) costs as much as the compensation it would skip, so the plain loop of other libraries stays about 1.6 times faster.
 	for (let i = 0; i < numbers.length; i++) {
-		const value = +numbers[i];
+		const value = +numbers[i] * factor;
+		// A `NaN` decides the result: the rest is not read (the holes of a sparse array of length `2 ** 32 - 1` took minutes).
+		if (value !== value) return NaN;
 		const next = total + value;
 		compensation += Math.abs(total) >= Math.abs(value) ? total - next + value : value - next + total;
 		total = next;
@@ -223,12 +230,7 @@ export function average(numbers: ReadonlyArray<number>): number {
 	// scaled by a power of two at most `1 / count` (exactly, as far as the result is concerned), which cannot overflow, then scale back.
 	// Dividing each term by `count` instead rounds them all, and `average([M, M, M])` (with `M = Number.MAX_VALUE`) added up past `M`.
 	const scale = 2 ** -Math.ceil(Math.log2(count));
-	const scaled = scaledSum(
-		numbers.map(function (value) {
-			return +value * scale;
-		}),
-		count
-	);
+	const scaled = scaledSum(numbers, count, scale);
 	// No mean of finite values exceeds the largest double, but the last rounding can push it there.
 	return Number.isFinite(scaled) ? Math.min(Math.max(scaled / scale, -Number.MAX_VALUE), Number.MAX_VALUE) : scaled;
 }
@@ -480,7 +482,8 @@ export function modulo(dividend: number, divisor: number): number {
 	// was `'-13'`), and two bigints keep working (`+` throws on them).
 	const number = -(-divisor);
 	const rest = dividend % number;
-	if (rest === 0) return 0;
+	// `0`, `-0` and `0n` (`NaN` is not equal to itself) give `0`, or `0n`: `rest === 0` missed `0n`, so `modulo(6n, -3n)` was `-3n`.
+	if (rest - rest === rest) return rest - rest;
 	if (rest < 0 === number < 0) return rest;
 	const wrapped = rest + number;
 	return wrapped === number && Number.isFinite(number) ? 0 : wrapped;
@@ -749,7 +752,11 @@ export function inRange(value: number, start: number, end: number): boolean {
  */
 export function product(numbers: ReadonlyArray<number>): number {
 	let result = 1;
-	for (const value of numbers) result *= +value;
+	for (const value of numbers) {
+		result *= +value;
+		// `NaN` stays `NaN`: the rest is not read (see `scaledSum`).
+		if (result !== result) return NaN;
+	}
 	return result;
 }
 
@@ -801,7 +808,7 @@ function sortedMedian(sorted: ArrayLike<number>): number {
 export function mode(numbers: ReadonlyArray<number>): number[] {
 	// Sorted (equal values, `-0` and `0` included, are then adjacent, and `NaN`s last), then counted run by run: faster than counting in a
 	// `Map`, and the modes come out in ascending order.
-	const sorted = sortedCopy(toNumbers(numbers));
+	const sorted = sortedCopy(toNumbers(numbers), true);
 	const result: number[] = [];
 	let highest = 0;
 	for (let start = 0; start < sorted.length;) {
@@ -857,12 +864,14 @@ function centredSquares(numbers: ReadonlyArray<number>): [number, number] {
 	const count = numbers.length;
 	const values = new Float64Array(count);
 	let largest = 0;
-	for (let i = 0; i < count; i++) {
+	// A `NaN` (which makes `largest` `NaN`) makes the sum `NaN`: the rest is not read (see `scaledSum`). Tested in the loop condition: an
+	// exit inside the loop made it 25% slower.
+	for (let i = 0; i < count && largest === largest; i++) {
 		const value = +numbers[i];
 		values[i] = value;
-		// `NaN` once a value is `NaN`.
 		largest = Math.max(largest, Math.abs(value));
 	}
+	if (largest !== largest) return [NaN, 1];
 	// Between `2 ** -200` and `2 ** 480`, the squares of the values and of their deviations (a deviation is at least an ulp of the values
 	// near the mean), and their sum for any realistic count, neither overflow nor underflow: the values are used as they are, which saves a
 	// pass. Beyond, they are scaled like `scaledSample` scales them.
@@ -938,14 +947,31 @@ function toNumbers(numbers: Iterable<number> | ArrayLike<number>): number[] {
 }
 
 /**
- * Converts a sample with unary `+` and multiplies it by a power of two that brings its largest magnitude close to `1` (by `1` when that is
- * `0` or not finite), between `2 ** -1000` and `2 ** 1000` so that it is a normal double. The scaling is exact (subnormal values become
- * normal), and the scaled values, their sums and their squares neither overflow nor underflow.
- * @param {ReadonlyArray<number>} numbers - The sample
+ * {@link toNumbers} for the statistics that a `NaN` makes `NaN`: a long array or array-like is copied by index, up to its first `NaN`
+ * (included), so that the holes of a sparse array of length `2 ** 32 - 1` are not all copied (that aborted the process out of memory).
+ * Anything else (a shorter array, an iterable without a length such as a `Set`) is copied whole by {@link toNumbers}.
+ * @param {ArrayLike<number>} numbers - The numbers
+ * @returns {number[]} The converted copy, ending with the `NaN` that stopped it, if any
+ */
+function toNumbersUntilNaN(numbers: ArrayLike<number>): number[] {
+	// Up to `2 ** 24` elements (a fraction of a second even when sparse), the faster `Array.from` copy is kept.
+	if (!(numbers.length > 2 ** 24)) return toNumbers(numbers);
+	const values = new Array<number>(numbers.length);
+	for (let i = 0; i < values.length; i++) {
+		values[i] = +numbers[i];
+		if (values[i] !== values[i]) values.length = i + 1;
+	}
+	return values;
+}
+
+/**
+ * Multiplies a converted sample, in place, by a power of two that brings its largest magnitude close to `1` (by `1` when that is `0` or not
+ * finite), between `2 ** -1000` and `2 ** 1000` so that it is a normal double. The scaling is exact (subnormal values become normal), and the
+ * scaled values, their sums and their squares neither overflow nor underflow.
+ * @param {number[]} values - The sample, converted (see {@link toNumbers})
  * @returns {[number[], number]} The scaled values and the scale
  */
-function scaledSample(numbers: ReadonlyArray<number>): [number[], number] {
-	const values = toNumbers(numbers);
+function scaledSample(values: number[]): [number[], number] {
 	let largest = 0;
 	// `NaN` once a value is `NaN`.
 	for (let i = 0; i < values.length; i++) largest = Math.max(largest, Math.abs(values[i]));
@@ -969,8 +995,8 @@ function scaledSample(numbers: ReadonlyArray<number>): [number[], number] {
 function pairedMoments(caller: string, xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): PairedMoments {
 	const count = xs.length;
 	if (count !== ys.length) throw new RangeError(`${caller}: \`xs\` and \`ys\` must have the same length, got ${count} and ${ys.length}`);
-	const [x, scaleX] = scaledSample(xs);
-	const [y, scaleY] = scaledSample(ys);
+	const [x, scaleX] = scaledSample(toNumbersUntilNaN(xs));
+	const [y, scaleY] = scaledSample(toNumbersUntilNaN(ys));
 	const centreX = average(x);
 	const centreY = average(y);
 	let sumX = 0;
@@ -978,7 +1004,8 @@ function pairedMoments(caller: string, xs: ReadonlyArray<number>, ys: ReadonlyAr
 	let sxx = 0;
 	let syy = 0;
 	let sxy = 0;
-	for (let i = 0; i < count; i++) {
+	// Shorter than `count` only when a `NaN` stopped a copy, which makes every sum `NaN`.
+	for (let i = 0; i < Math.min(x.length, y.length); i++) {
 		const dx = x[i] - centreX;
 		const dy = y[i] - centreY;
 		sumX += dx;
@@ -3061,9 +3088,12 @@ export function integerSqrt(n: number | bigint): number | bigint {
 	const expected = 'a safe integer >= 0 or a bigint >= 0';
 	if (typeof n === 'bigint') {
 		if (n < 0n) throw new RangeError(`integerSqrt: \`n\` must be ${expected}, got ${n}`);
-		if (n < 2n) return n;
-		// Newton's iteration decreases monotonically to `⌊√n⌋` from any start above it, such as `2 ** ⌈bits / 2⌉`.
-		let root = 1n << BigInt((n.toString(2).length + 1) >> 1);
+		if (n <= 9007199254740991n) return BigInt(integerSqrt(Number(n)));
+		// Newton's iteration decreases monotonically to `⌊√n⌋` from any start above it. The start is the root of the top half of the bits
+		// (recursively), plus one, shifted back: it has half the bits of the root right, so two or three steps on the full number finish,
+		// where starting from `2 ** ⌈bits / 2⌉` took about `log2(bits)` (20 divisions of numbers of a million digits, over ten seconds).
+		const shift = BigInt(n.toString(2).length >> 2);
+		let root = (integerSqrt(n >> (shift * 2n)) + 1n) << shift;
 		for (let next = (root + n / root) >> 1n; next < root; next = (root + n / root) >> 1n) root = next;
 		return root;
 	}
@@ -3369,9 +3399,9 @@ function productError(a: number, b: number): number {
 export function rootMeanSquare(numbers: ReadonlyArray<number>): number {
 	const count = numbers.length;
 	if (count === 0) return NaN;
-	const [values, scale] = scaledSample(numbers);
-	// The scaled values are a copy: squared in place.
-	for (let i = 0; i < count; i++) values[i] *= values[i];
+	const [values, scale] = scaledSample(toNumbersUntilNaN(numbers));
+	// The scaled values are a copy (which ends at a `NaN`): squared in place.
+	for (let i = 0; i < values.length; i++) values[i] *= values[i];
 	return Math.sqrt(scaledSum(values, count)) / scale;
 }
 
@@ -3401,7 +3431,7 @@ interface CentralMoments {
  * @returns {CentralMoments} The count, whether the sample is constant, and the moments (`NaN` if a value is not finite)
  */
 function centralMoments(numbers: ReadonlyArray<number>): CentralMoments {
-	const [values] = scaledSample(numbers);
+	const [values] = scaledSample(toNumbersUntilNaN(numbers));
 	const count = values.length;
 	const mean = average(values);
 	let constant = true;
@@ -3597,7 +3627,7 @@ export function spearmanCorrelation(xs: ReadonlyArray<number>, ys: ReadonlyArray
  * standardize([5, 5]); // => [0, 0]
  */
 export function standardize(numbers: ReadonlyArray<number>, options: VarianceOptions = {}): number[] {
-	const [values] = scaledSample(numbers);
+	const [values] = scaledSample(toNumbers(numbers));
 	const mean = average(values);
 	const deviation = standardDeviation(values, options);
 	// The scaled values are a copy: they become the deviations, then the scores, in place.
@@ -3721,11 +3751,12 @@ export interface Summary {
  * summarize([]).count; // => 0
  */
 export function summarize(numbers: ReadonlyArray<number>): Summary {
-	const values = toNumbers(numbers);
-	const count = values.length;
+	// The copy of an array ends at the first `NaN`, which makes every field but `count` `NaN` (an iterable without a length is copied whole).
+	const values = toNumbersUntilNaN(numbers);
+	const count = values.length < numbers.length ? numbers.length : values.length;
 	const sorted = sortedCopy(values);
-	// `NaN` sorts last.
-	const nan = count > 0 && sorted[count - 1] !== sorted[count - 1];
+	// `NaN` sorts last (or alone, see `sortedCopy`).
+	const nan = count > 0 && sorted[sorted.length - 1] !== sorted[sorted.length - 1];
 	// The sum of squares is computed once for both spread fields, with the same arithmetic as `variance` and `standardDeviation`.
 	const [squares, scale] = count === 0 ? [NaN, 1] : centredSquares(values);
 	return {
@@ -4679,6 +4710,20 @@ function toFloat64(numbers: ReadonlyArray<number>): Float64Array {
 }
 
 /**
+ * {@link toFloat64} up to the first `NaN` (included), which makes a dot product `NaN`: the rest is not read (see {@link toNumbersUntilNaN}).
+ * @param {ReadonlyArray<number>} numbers - The vector
+ * @returns {Float64Array} The converted elements, ending with the `NaN` that stopped the conversion, if any
+ */
+function toFloat64UntilNaN(numbers: ReadonlyArray<number>): Float64Array {
+	const values = new Float64Array(numbers.length);
+	let value = 0;
+	let i = 0;
+	// Tested in the loop condition (see `centredSquares`).
+	for (; i < values.length && value === value; i++) values[i] = value = +numbers[i];
+	return value === value ? values : values.subarray(0, i);
+}
+
+/**
  * The power of two that brings the largest magnitude of some values close to `1`, as {@link scaledSample} picks it: between `2 ** -1000`
  * and `2 ** 1000`, so that the scaled values are normal doubles, and `1` when that magnitude is `0` or not finite.
  * @param {Float64Array} values - The values
@@ -4761,8 +4806,8 @@ function assertSameLength(caller: string, xs: ReadonlyArray<number>, ys: Readonl
  */
 export function dot(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): number {
 	assertSameLength('dot', xs, ys);
-	const x = toFloat64(xs);
-	const y = toFloat64(ys);
+	const x = toFloat64UntilNaN(xs);
+	const y = toFloat64UntilNaN(ys);
 	// Scaling each vector by its largest magnitude would flush values far smaller than it (`dot([1e300, 1e-300], [1e-300, 1e300])` is `2`),
 	// so the products are first taken as they are: an overflow makes the result infinite or `NaN` (`Infinity - Infinity`).
 	const direct = dot2(x, 1, y, 1);
@@ -4928,8 +4973,8 @@ export function distance(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): 
  */
 export function cosineSimilarity(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): number {
 	assertSameLength('cosineSimilarity', xs, ys);
-	const x = toFloat64(xs);
-	const y = toFloat64(ys);
+	const x = toFloat64UntilNaN(xs);
+	const y = toFloat64UntilNaN(ys);
 	const scaleX = vectorScale(x);
 	const scaleY = vectorScale(y);
 	// The scaled vectors have norms between 1 and `2 * √n` (or 0): the product of their squares cannot overflow or underflow. A value that

@@ -385,6 +385,15 @@ describe('Math helpers', function () {
 			}).toThrow(TypeError);
 		});
 
+		it('should give 0n for a bigint multiple of a negative divisor (regression: a zero remainder was only recognised as a number)', function () {
+			expect(helpers.modulo(6n as never, -3n as never)).toBe(0n);
+			expect(helpers.modulo(-6n as never, -3n as never)).toBe(0n);
+			expect(helpers.modulo(-6n as never, 3n as never)).toBe(0n);
+			expect(helpers.modulo(0n as never, -3n as never)).toBe(0n);
+			expect(Object.is(helpers.modulo(-6, -3), 0)).toBe(true);
+			expect(Object.is(helpers.modulo(-0, 3), 0)).toBe(true);
+		});
+
 		it('should return the modulo for positive operands', function () {
 			expect(helpers.modulo(7, 3)).toBe(1);
 			expect(helpers.modulo(10, 4)).toBe(2);
@@ -3492,6 +3501,21 @@ describe('integerSqrt', function () {
 		expect(Object.is(helpers.integerSqrt(-0), 0)).toBe(true);
 	});
 
+	it('takes a few divisions of the full number for a huge bigint (regression: about log2 of its bits, 20 for a million digits)', function () {
+		const n = 10n ** 300_000n * 7n + 3n;
+		// Newton's iteration from `2 ** ⌈bits / 2⌉`, as it was.
+		let start = performance.now();
+		let slow = 1n << BigInt((n.toString(2).length + 1) >> 1);
+		for (let next = (slow + n / slow) >> 1n; next < slow; next = (slow + n / slow) >> 1n) slow = next;
+		const reference = performance.now() - start;
+		start = performance.now();
+		const root = helpers.integerSqrt(n);
+		const elapsed = performance.now() - start;
+		expect(root).toBe(slow);
+		// About three divisions of the full number (and smaller ones), against seventeen.
+		expect(elapsed).toBeLessThan(reference / 3);
+	});
+
 	it('bounds the Bézout coefficients only when both inputs are non-zero, as documented', function () {
 		expect(helpers.extendedGcd(5, 0)).toEqual({ gcd: 5, x: 1, y: 0 });
 		expect(helpers.extendedGcd(0, -5)).toEqual({ gcd: 5, x: 0, y: -1 });
@@ -5468,5 +5492,106 @@ describe('Regressions found by the floating-point audit', function () {
 		holey[1] = 1;
 		expect(helpers.summarize(holey).mean).toBeNaN();
 		expect(helpers.rootMeanSquare(holey)).toBeNaN();
+	});
+});
+
+describe('pass 5 regressions: inputs of hostile size', function () {
+	/**
+	 * A sparse array holding `1` at index 0 and holes after it, behind a proxy that counts the reads of its elements and throws past 100:
+	 * walking every hole of such an array of length `2 ** 32 - 1` took minutes, or aborted the process out of memory when the holes were
+	 * copied. (A length of `2 ** 25` keeps the typed arrays allocated for it small, and is above the length copied whole.)
+	 * @returns {{ numbers: number[]; reads: () => number }} The array and its read count
+	 */
+	function sparseNumbers(): { numbers: number[]; reads: () => number } {
+		const target = [1];
+		target.length = 2 ** 25;
+		let reads = 0;
+		const numbers = new Proxy(target, {
+			get: function (object, key, receiver) {
+				if (typeof key === 'string' && /^\d+$/.test(key) && ++reads > 100) throw new Error('read past the first NaN');
+				return Reflect.get(object, key, receiver);
+			}
+		});
+		return {
+			numbers,
+			reads: function () {
+				return reads;
+			}
+		};
+	}
+
+	it('the statistics that a NaN makes NaN stop reading at the first one (regression: every hole was read, and sorted ones copied)', function () {
+		const single: Array<(numbers: number[]) => number> = [
+			helpers.sum,
+			helpers.average,
+			helpers.product,
+			helpers.median,
+			helpers.interquartileRange,
+			helpers.medianAbsoluteDeviation,
+			helpers.variance,
+			helpers.standardDeviation,
+			helpers.rootMeanSquare,
+			helpers.skewness,
+			helpers.kurtosis,
+			function (numbers) {
+				return helpers.quantile(numbers, 0.3);
+			},
+			function (numbers) {
+				return helpers.percentile(numbers, 30);
+			},
+			function (numbers) {
+				return helpers.trimmedMean(numbers, 0.1);
+			}
+		];
+		for (const statistic of single) {
+			const { numbers, reads } = sparseNumbers();
+			expect(statistic(numbers)).toBeNaN();
+			expect(reads()).toBeLessThanOrEqual(4);
+		}
+		const paired: Array<(xs: number[], ys: number[]) => number> = [
+			helpers.covariance,
+			helpers.correlation,
+			helpers.dot,
+			helpers.cosineSimilarity,
+			function (xs, ys) {
+				return helpers.linearRegression(xs, ys).slope;
+			}
+		];
+		for (const statistic of paired) {
+			const xs = sparseNumbers();
+			const ys = sparseNumbers();
+			expect(statistic(xs.numbers, ys.numbers)).toBeNaN();
+			expect(xs.reads() + ys.reads()).toBeLessThanOrEqual(4);
+		}
+		const { numbers, reads } = sparseNumbers();
+		expect(helpers.summarize(numbers)).toEqual({
+			count: 2 ** 25,
+			min: NaN,
+			max: NaN,
+			sum: NaN,
+			mean: NaN,
+			median: NaN,
+			q1: NaN,
+			q3: NaN,
+			variance: NaN,
+			standardDeviation: NaN
+		});
+		expect(reads()).toBeLessThanOrEqual(2);
+	});
+
+	it('still reads every value where a NaN does not decide the result', function () {
+		const holey = [1, NaN, 3, 3];
+		expect(helpers.mode(holey)).toEqual([3]);
+		expect(helpers.norm([NaN, Infinity])).toBe(Infinity);
+		expect(helpers.distance([NaN, 1], [0, -Infinity])).toBe(Infinity);
+		expect(helpers.ranks(holey)).toEqual([1, NaN, 2.5, 2.5]);
+		expect(helpers.standardize([NaN, 1])).toEqual([NaN, NaN]);
+		expect(helpers.summarize(new Set([NaN, 1]) as never).count).toBe(2);
+		expect(helpers.summarize(new Set([NaN, 1]) as never).min).toBeNaN();
+	});
+
+	it('average scales overflowing sums without mapping the array (array-likes work too)', function () {
+		expect(helpers.average({ length: 3, 0: MAX, 1: MAX, 2: MAX } as never)).toBe(MAX);
+		expect(helpers.average([MAX, MAX, -Infinity])).toBe(-Infinity);
 	});
 });
