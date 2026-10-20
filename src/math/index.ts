@@ -163,17 +163,16 @@ export function round(input: number, decimals = 0): number {
 }
 
 /**
- * Rounds a positive finite number half up (or half to even) on its shortest decimal representation (the digits `String` shows), to
- * `decimals` places. The digits are rounded as text and converted once: shifting them into a double first would lose the first dropped
- * digit for values of `2 ** 51` and more once shifted (`3.0000000000000004` to 15 places would round up).
+ * Rounds a positive finite number half up on its shortest decimal representation (the digits `String` shows), to `decimals` places.
+ * The digits are rounded as text and converted once: shifting them into a double first would lose the first dropped digit for
+ * values of `2 ** 51` and more once shifted (`3.0000000000000004` to 15 places would round up).
  * @param {number} value - A positive finite number with more than `decimals` decimal places
  * @param {number} decimals - The integer number of decimal places to keep (may be negative)
- * @param {boolean} [halfEven=false] - Whether an exact tie goes to the even neighbour instead of up
  * @returns {number} The double nearest to the rounded decimal
  * @example
  * roundDecimalString(3.0000000000000004, 15); // => 3
  */
-function roundDecimalString(value: number, decimals: number, halfEven = false): number {
+function roundDecimalString(value: number, decimals: number): number {
 	const [mantissa, exponent = '0'] = String(value).split('e');
 	const point = mantissa.indexOf('.');
 	const digits = point === -1 ? mantissa : mantissa.slice(0, point) + mantissa.slice(point + 1);
@@ -182,11 +181,7 @@ function roundDecimalString(value: number, decimals: number, halfEven = false): 
 	const keep = integerDigits + decimals;
 	// Every kept digit is beyond the ones of the value, and the first dropped one is a leading zero: it rounds to zero.
 	if (keep < 0) return 0;
-	let up = digits.charCodeAt(keep) >= 53;
-	// An exact tie (a `5` followed by nothing but zeros) goes up only from an odd last kept digit (char codes have the parity of their
-	// digits; with no kept digit, `NaN & 1` is `0`: the kept part is `0`, which is even).
-	if (halfEven && digits.charCodeAt(keep) === 53 && !/[1-9]/.test(digits.slice(keep + 1))) up = (digits.charCodeAt(keep - 1) & 1) === 1;
-	const kept = BigInt(digits.slice(0, keep) || '0') + (up ? 1n : 0n);
+	const kept = BigInt(digits.slice(0, keep) || '0') + (digits.charCodeAt(keep) >= 53 ? 1n : 0n);
 	return Number(`${kept}e${-decimals}`);
 }
 
@@ -2661,9 +2656,6 @@ export function previousPrime(n: number): number {
 	return candidate;
 }
 
-/** `2 ** 1024`: a bigint at least this large converts to `Infinity`. */
-const OVERFLOW = 2n ** 1024n;
-
 /**
  * Computes the binomial coefficient "`n` choose `k`": the number of ways to choose `k` items out of `n`, `n! / (k! (n - k)!)`, and `0`
  * when `k < 0` or `k > n` (no way to choose them). The result is exact whenever it is a safe integer, as the multiplicative formula is
@@ -2704,7 +2696,9 @@ export function binomial(n: number, k: number): number {
 	let exact = BigInt(result);
 	for (; i <= steps; i++) {
 		exact = (exact * BigInt(base + i)) / BigInt(i);
-		if (exact >= OVERFLOW) return Infinity;
+		// A bigint of at least `2 ** 1024` converts to `Infinity`. (Computed here: a module-level bigint power is kept by bundlers, which
+		// cannot tell that it has no side effects, in every import of the module.)
+		if (exact >= 1n << 1024n) return Infinity;
 	}
 	return Number(exact);
 }
@@ -3606,8 +3600,31 @@ export function roundHalfEven(input: number, decimals = 0): number {
 	if (Math.abs(scaled - Math.floor(scaled) - 0.5) > Math.abs(scaled) * 2 ** -46) return Math.round(scaled) / scale;
 	if (!Number.isFinite(number) || signedDecimalPlaces(number) <= decimals) return number;
 	const negative = 1 / number < 0;
-	const rounded = roundDecimalString(Math.abs(number), decimals, true);
+	const magnitude = Math.abs(number);
+	const rounded = evenTie(magnitude, decimals) ?? roundDecimalString(magnitude, decimals);
 	return negative ? -rounded : rounded;
+}
+
+/**
+ * Rounds an exact tie down when that is towards an even last digit (the case where {@link roundHalfEven} differs from rounding half up),
+ * on the shortest decimal representation, like {@link roundDecimalString}. Kept apart from it, so that {@link round} and the other
+ * functions sharing it do not carry this test.
+ * @param {number} value - A positive finite number with more than `decimals` decimal places
+ * @param {number} decimals - The integer number of decimal places to keep (may be negative)
+ * @returns {number | undefined} The value with the dropped digits removed, or `undefined` when it is not a tie with an even last kept digit
+ * @example
+ * evenTie(0.125, 2); // => 0.12
+ * evenTie(0.135, 2); // => undefined
+ */
+function evenTie(value: number, decimals: number): number | undefined {
+	const [mantissa, exponent = '0'] = String(value).split('e');
+	const point = mantissa.indexOf('.');
+	const digits = point === -1 ? mantissa : mantissa.slice(0, point) + mantissa.slice(point + 1);
+	const keep = (point === -1 ? mantissa.length : point) + Number(exponent) + decimals;
+	// A tie is a `5` followed by nothing but zeros (a negative `keep` drops a leading zero first: no tie). Char codes have the parity of
+	// their digits; with no kept digit, `NaN & 1` is `0`: the kept part is `0`, which is even.
+	if (digits.charCodeAt(keep) !== 53 || /[1-9]/.test(digits.slice(keep + 1)) || (digits.charCodeAt(keep - 1) & 1) === 1) return undefined;
+	return Number(`${digits.slice(0, keep) || '0'}e${-decimals}`);
 }
 
 /**
@@ -4261,8 +4278,11 @@ export function linspace(start: number, end: number, count: number, options: Lin
  */
 const MAX_TICKS = 1_048_576;
 
-/** `√50`, `√10` and `√2`: the geometric means of the neighbouring nice factors 10, 5, 2 and 1, d3's thresholds for picking one. */
-const TICK_THRESHOLDS: readonly [number, number, number] = [Math.sqrt(50), Math.sqrt(10), Math.sqrt(2)];
+/**
+ * `√50`, `√10` and `√2`: the geometric means of the neighbouring nice factors 10, 5, 2 and 1, d3's thresholds for picking one. Written as
+ * the literals `Math.sqrt` gives (a module-level call would run on import and defeat tree-shaking).
+ */
+const TICK_THRESHOLDS: readonly [number, number, number] = [7.0710678118654755, 3.1622776601683795, 1.4142135623730951];
 
 /**
  * Picks the tick step of an increasing domain, as d3-array's `tickSpec`: the power of ten of `span / count`, times 1, 2, 5 or 10, whichever
