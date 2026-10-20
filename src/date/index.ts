@@ -9,6 +9,8 @@
  *   {@link formatInTimeZone}, {@link startOfDayInTimeZone}…) work on the wall clock of that zone instead, and their results do not
  *   depend on the runtime's zone. A time zone is an IANA name known to `Intl` (`'America/New_York'`, `'UTC'`; the engine's own time
  *   zone database is used, nothing is bundled) or a fixed UTC offset (`'+05:30'`, `'-08'`).
+ * - **Cron.** {@link parseCron}, {@link nextCronDate}, {@link previousCronDate}, {@link eachCronDate} and {@link isCronMatch} read cron
+ *   expressions on the wall clock of their `timeZone` option, or of the local time zone without one, with cronie's daylight-saving rules.
  * - **Pure.** Inputs are never mutated; every function that returns a date returns a NEW `Date` instance.
  * - **Inputs.** Every date parameter accepts a {@link DateInput}: a `Date` or a millisecond timestamp. Dates created in another
  *   realm (iframe, `vm` context) are accepted; objects that merely inherit from `Date.prototype` are not.
@@ -740,6 +742,42 @@ function holidaysThrough(calendar: BusinessCalendar, day: number): number {
 function isBusinessEpochDay(calendar: BusinessCalendar, day: number): boolean {
 	// 1970-01-01 (epoch day 0) was a Thursday (weekday 4).
 	return ((calendar[0] >> mod(day + 4, DAYS_PER_WEEK)) & 1) === 0 && holidaysThrough(calendar, day) === holidaysThrough(calendar, day - 1);
+}
+
+/**
+ * Counts the business days of a calendar that the LOCAL clock skipped between two instants: calendar days that never began because
+ * the time zone moved east across the date line (Samoa skipped Friday, December 30th, 2011, going from UTC-10 to UTC+14). Such a jump
+ * of a day is the only way to skip a day, and the offsets of a zone otherwise stay within half a day of each other, so it is found
+ * (by bisection) exactly when the offset rises by more than half a day between the two instants. Two instants on either side of both a
+ * westward and an eastward crossing (Samoa 1892 and 2011, Kwajalein 1969 and 1993) see no rise, and the skipped day is then counted.
+ * (`getTimezoneOffset`, in whole minutes, is precise enough for that, and much faster than {@link localOffset}.)
+ * @param {BusinessCalendar} calendar - The business-day calendar
+ * @param {Date} earlier - A date (an invalid one counts nothing)
+ * @param {Date} later - A date at or after `earlier`
+ * @param {number} [first=-Infinity] - The first epoch day to count
+ * @returns {number} The number of business days that the clock skipped between the two
+ * @example
+ * skippedBusinessDays(WEEKEND_CALENDAR, new Date(2024, 0, 1), new Date(2024, 0, 31)); // => 0 // without a date line crossing
+ */
+function skippedBusinessDays(calendar: BusinessCalendar, earlier: Date, later: Date, first = -Infinity): number {
+	// Minutes WEST of UTC; half a day is 720 minutes.
+	const end = later.getTimezoneOffset();
+	let before = earlier.getTime();
+	let after = later.getTime();
+	let count = 0;
+
+	if (earlier.getTimezoneOffset() - end > 720) {
+		while (after - before > 1) {
+			const middle = Math.floor((before + after) / 2);
+
+			if (new Date(middle).getTimezoneOffset() - end > 720) before = middle;
+			else after = middle;
+		}
+		// The days between the one shown just before the jump and the one shown at it never began.
+		for (let day = Math.max(epochDay(new Date(before)) + 1, first); day < epochDay(new Date(after)); day++) if (isBusinessEpochDay(calendar, day)) count++;
+	}
+
+	return count;
 }
 
 /**
@@ -2153,6 +2191,9 @@ export function getAge(birthDate: DateInput, now: DateInput = new Date()): numbe
  * `amount` of `0` returns a copy of `date` unchanged, even on a weekend. Hence `diffInBusinessDays(addBusinessDays(d, n, o), d, o) === n`
  * for every business day `d`.
  *
+ * A calendar day that the local clock skipped (Samoa went from Thursday, December 29th, 2011 straight to Saturday the 31st) is not a
+ * business day: it is stepped over like a weekend day.
+ *
  * Cost: O(1) without holidays, whatever the amount (no day-by-day walk); O(h log h) with `h` holidays, which are read and sorted on
  * every call.
  * @param {DateInput} date - The date to start from
@@ -2183,26 +2224,31 @@ export function addBusinessDays(date: DateInput, amount: number, options?: Busin
 	// The first day on which the running count of business days reaches the target: counted after `day` going forward, and from the
 	// day before going backward (so that the result's own business day is the last one counted).
 	const target = amount > 0 ? businessDaysThrough(calendar, day) + amount : businessDaysThrough(calendar, day - 1) + amount + 1;
-	let offset = nthBusinessDay(calendar, target) - day;
-	let result = addDays(start, offset);
+	let skipped = 0;
 
-	// Only where a whole calendar day was skipped (Samoa's December 30th, 2011): the target day does not exist, `addDays` lands on the
-	// next one (whose weekday differs), which can be a weekend day. Keep going in the direction of travel to the next business day.
-	if (result.getDay() !== mod(day + offset + 4, DAYS_PER_WEEK)) {
-		while (!isBusinessEpochDay(calendar, epochDay(result))) {
-			offset += Math.sign(amount);
-			result = addDays(start, offset);
-		}
+	// Business days that the clock skipped on the way (Samoa's December 30th, 2011) do not count: go as many further, until no more are
+	// skipped. Going back, a skipped target day would make `addDays` land on the next day, after the jump, so the jump is then looked for
+	// from two days before the result, counting the days from the target day on.
+	for (;;) {
+		const offset = nthBusinessDay(calendar, amount > 0 ? target + skipped : target - skipped) - day;
+		const result = addDays(start, offset);
+		// (Going back, the result is on the target day unless that day was skipped.)
+		const found =
+			amount > 0
+				? skippedBusinessDays(calendar, start, result)
+				: skippedBusinessDays(calendar, epochDay(result) === day + offset ? result : new Date(result.getTime() - 2 * MS_PER_DAY), start, day + offset);
+
+		if (found === skipped) return result;
+		skipped = found;
 	}
-
-	return result;
 }
 
 /**
  * Returns the signed number of business days (local calendar days; the time of day is ignored) between two dates: for
  * `later >= earlier` it counts the business days AFTER `earlier`'s day up to and INCLUDING `later`'s day; for `later < earlier` it is
  * `-diffInBusinessDays(earlier, later)`. Business days are the days that are neither weekend days (by default Saturday and Sunday) nor
- * `holidays`. Hence, for a business day `d`, `diffInBusinessDays(addBusinessDays(d, n, o), d, o) === n`.
+ * `holidays`, and that exist: a calendar day that the local clock skipped (Samoa's Friday, December 30th, 2011) is not counted. Hence,
+ * for a business day `d`, `diffInBusinessDays(addBusinessDays(d, n, o), d, o) === n`.
  *
  * Cost: O(1) without holidays; O(h log h) with `h` holidays, which are read and sorted on every call.
  * @param {DateInput} later - The later date
@@ -2222,8 +2268,11 @@ export function addBusinessDays(date: DateInput, amount: number, options?: Busin
  */
 export function diffInBusinessDays(later: DateInput, earlier: DateInput, options?: BusinessDayOptions): number {
 	const calendar = businessCalendar('diffInBusinessDays', options);
+	const end = toValidDate(later);
+	const start = toValidDate(earlier);
+	const skipped = end.getTime() < start.getTime() ? 0 - skippedBusinessDays(calendar, end, start) : skippedBusinessDays(calendar, start, end);
 
-	return businessDaysThrough(calendar, epochDay(toValidDate(later))) - businessDaysThrough(calendar, epochDay(toValidDate(earlier)));
+	return businessDaysThrough(calendar, epochDay(end)) - businessDaysThrough(calendar, epochDay(start)) - skipped;
 }
 
 /**
@@ -3447,9 +3496,10 @@ export function isSameQuarter(a: DateInput, b: DateInput): boolean {
 type ZoneClock = readonly [Intl.DateTimeFormat, ReadonlyArray<string>];
 
 /**
- * A time zone resolved by {@link resolveTimeZone}: a fixed UTC offset in milliseconds, or the clock of an IANA zone.
+ * A time zone resolved by {@link resolveTimeZone}: a fixed UTC offset in milliseconds, or the clock of an IANA zone; a function stands for
+ * the runtime's local time zone (the cron helpers' default, {@link localZoneOffset}), so that only they bundle its code.
  */
-type ResolvedZone = number | ZoneClock;
+type ResolvedZone = number | ZoneClock | ((time: number) => number);
 
 /**
  * The clocks created by {@link zoneClock}, by time zone (constructing an `Intl.DateTimeFormat` is much more expensive than formatting
@@ -3585,6 +3635,7 @@ function resolveTimeZone(caller: string, timeZone: string): ResolvedZone {
  */
 function offsetAt(zone: ResolvedZone, time: number): number {
 	if (typeof zone === 'number') return zone;
+	if (typeof zone === 'function') return zone(time);
 
 	const [format, order] = zone;
 	const date = new Date(time);
@@ -4040,4 +4091,949 @@ export function getCalendarMonth(year: number, monthIndex: number, options: Cale
 	}
 
 	return weeks;
+}
+
+declare const parsedCron: unique symbol;
+
+/**
+ * A cron expression parsed by {@link parseCron}: an immutable handle (frozen, with a `null` prototype) on the compact form that
+ * {@link nextCronDate}, {@link previousCronDate}, {@link eachCronDate} and {@link isCronMatch} read, so that an expression used many times
+ * is parsed once. Only objects returned by `parseCron` are accepted (a copy is not): keep `expression` to store or send one, and parse it
+ * again.
+ */
+export interface Cron {
+	/** The expression, as given without its surrounding whitespace. */
+	readonly expression: string;
+	/** Brand: only {@link parseCron} creates a `Cron`. */
+	readonly [parsedCron]: true;
+}
+
+/**
+ * Options for {@link nextCronDate} and {@link previousCronDate}.
+ */
+export interface CronDateOptions {
+	/** The instant to search from (default: now). */
+	from?: DateInput;
+	/** `true` to return `from` itself when the expression fires then (default `false`: strictly after, or before, `from`). */
+	inclusive?: boolean;
+	/** The time zone whose wall clock the expression reads: an IANA time zone or a UTC offset (default: the runtime's local time zone). */
+	timeZone?: string;
+}
+
+/**
+ * Options for {@link eachCronDate}.
+ */
+export interface EachCronDateOptions extends CronDateOptions {
+	/** The last instant to yield, inclusive (default: none, up to the end of the `Date` range). */
+	to?: DateInput;
+	/** The largest number of dates to yield: an integer >= 0 or `Infinity` (the default). */
+	limit?: number;
+}
+
+/**
+ * Options for {@link isCronMatch}.
+ */
+export interface CronMatchOptions {
+	/** The time zone whose wall clock the expression reads: an IANA time zone or a UTC offset (default: the runtime's local time zone). */
+	timeZone?: string;
+}
+
+/**
+ * Where the compiled form of a cron expression (an `Int32Array`, see {@link compileCron}) keeps the sets of its fields: the seconds and
+ * the minutes take two words (values 0-29, then 30-59), the hours and the months two as well (the second one empty) so that
+ * {@link seekCron} reads them all the same way.
+ */
+const CRON_SECONDS = 0;
+const CRON_MINUTES = 2;
+const CRON_HOURS = 4;
+const CRON_MONTHS = 6;
+/** Bit `d` for the day of the month `d`; bit 0 for `L`, the last day of the month. */
+const CRON_DAYS = 8;
+/** Bits 0-6 for the days of the week, 7-13 for `wL` (the last weekday `w` of the month) and 14-20 for `w#5`. */
+const CRON_WEEKDAYS = 9;
+/** Bit `7 * (k - 1) + w` for `w#k`, the `k`th weekday `w` of the month (`k` from 1 to 4). */
+const CRON_NTH = 10;
+const CRON_FLAGS = 11;
+
+/** Flag: the day of the month and the day of the week are both restricted, so a day matches when EITHER does (Vixie cron). */
+const CRON_EITHER_DAY = 1;
+/** Flag: neither the minute nor the hour field starts with `*`, so the job is a fixed-time one for the daylight-saving rules. */
+const CRON_FIXED_TIME = 2;
+/** Flag: some day of the Gregorian calendar matches the day, month and weekday fields. */
+const CRON_SATISFIABLE = 4;
+/** Flag: the expression has a seconds field. */
+const CRON_HAS_SECONDS = 8;
+
+/** The fields of a cron expression, in order, with their smallest and largest values. */
+const CRON_FIELD_NAMES: ReadonlyArray<string> = ['second', 'minute', 'hour', 'day-of-month', 'month', 'day-of-week'];
+const CRON_MIN: ReadonlyArray<number> = [0, 0, 0, 1, 1, 0];
+const CRON_MAX: ReadonlyArray<number> = [59, 59, 23, 31, 12, 7];
+/** Where each field's set is stored (see {@link CRON_SECONDS}). */
+const CRON_SLOTS: ReadonlyArray<number> = [CRON_SECONDS, CRON_MINUTES, CRON_HOURS, CRON_DAYS, CRON_MONTHS, CRON_WEEKDAYS];
+
+/** The macros of Vixie cron, by pairs: the name, then the expression it stands for. */
+const CRON_MACROS: ReadonlyArray<string> = [
+	'@yearly',
+	'0 0 1 1 *',
+	'@annually',
+	'0 0 1 1 *',
+	'@monthly',
+	'0 0 1 * *',
+	'@weekly',
+	'0 0 * * 0',
+	'@daily',
+	'0 0 * * *',
+	'@midnight',
+	'0 0 * * *',
+	'@hourly',
+	'0 * * * *'
+];
+
+/** The names of the months (from 1) and of the days of the week (from 0, Sunday), three letters each. */
+const MONTH_NAMES = 'janfebmaraprmayjunjulaugsepoctnovdec';
+const WEEKDAY_NAMES = 'sunmontuewedthufrisat';
+
+/** An item of a cron field: `*` or a value, then an optional `-` and end value, then an optional `/` and step. */
+const CRON_ITEM_REGEX = /^(?:(\*)|([0-9a-z]+)(?:-([0-9a-z]+))?)(?:\/(\d+))?$/i;
+
+/** A `wL` or `w#k` item of the day-of-week field. */
+const CRON_NTH_REGEX = /^([0-9a-z]+)(?:(l)|#(\d+))$/i;
+
+/** How far {@link nextCronDate} and {@link previousCronDate} look: 400 years, after which the Gregorian calendar repeats. */
+const CRON_HORIZON = 146_097 * MS_PER_DAY;
+
+/** Below 5 minutes, a forward jump of the clock is caught up by every job, as cronie does after waking up late. */
+const CRON_SHORT_JUMP = 5 * MS_PER_MINUTE;
+
+/** Up to 3 hours, cronie treats a jump of the clock as a daylight-saving change; beyond, as the clock being reset. */
+const CRON_LONG_JUMP = 3 * MS_PER_HOUR;
+
+/** The compiled forms of the {@link Cron} handles. */
+const cronForms = new WeakMap<object, Int32Array>();
+
+/** The compiled forms of the expressions passed as strings, by expression. */
+const cronCache = new Map<string, Int32Array>();
+
+/**
+ * Quotes a piece of a cron expression for an error message, shortened past 50 characters.
+ * @param {string} text - The text
+ * @returns {string} The quoted text
+ * @example
+ * quoteCron('1-'); // => '"1-"'
+ */
+function quoteCron(text: string): string {
+	return JSON.stringify(text.length > 50 ? `${text.slice(0, 50)}…` : text);
+}
+
+/**
+ * Reads a value of a cron field: digits, or a three-letter name in the month and day-of-week fields (case-insensitive).
+ * @param {number} field - The field index (0 = second … 5 = day of the week)
+ * @param {string} text - The value
+ * @returns {number} The value, `NaN` for an unknown name
+ * @example
+ * cronValue(4, 'Mar'); // => 3
+ */
+function cronValue(field: number, text: string): number {
+	if (/^\d+$/.test(text)) return Number(text);
+
+	// Only the month and day-of-week fields have names.
+	const index = field > 3 && text.length === 3 ? (field === 4 ? MONTH_NAMES : WEEKDAY_NAMES).indexOf(text.toLowerCase()) : NaN;
+
+	return index % 3 === 0 ? index / 3 + CRON_MIN[field] : NaN;
+}
+
+/**
+ * Reads a value of a cron field and checks its range.
+ * @param {string} caller - Name of the public function, used in the error messages
+ * @param {number} field - The field index
+ * @param {string} text - The value
+ * @param {string} item - The list item it belongs to, for the error message
+ * @returns {number} The value
+ * @throws {RangeError} when the value is not in the field's range
+ * @example
+ * cronBound('parseCron', 2, '23', '0-23'); // => 23
+ */
+function cronBound(caller: string, field: number, text: string, item: string): number {
+	const value = cronValue(field, text);
+	const min = CRON_MIN[field];
+	const max = CRON_MAX[field];
+
+	if (!(value >= min && value <= max)) {
+		const names = field === 4 ? ' (or JAN-DEC)' : field === 5 ? ' (or SUN-SAT)' : '';
+
+		throw new RangeError(`${caller}: the ${CRON_FIELD_NAMES[field]} field values must be between ${min} and ${max}${names}, got ${quoteCron(item)}`);
+	}
+
+	return value;
+}
+
+/**
+ * Adds a field of a cron expression to its compiled form.
+ * @param {string} caller - Name of the public function, used in the error messages
+ * @param {Int32Array} bits - The compiled form
+ * @param {number} field - The field index (0 = second … 5 = day of the week)
+ * @param {string} text - The field
+ * @returns {void}
+ * @throws {RangeError} when the field is malformed or holds a value out of its range
+ * @example
+ * compileCronField('parseCron', new Int32Array(12), 1, '0/15'); // sets minutes 0, 15, 30 and 45
+ */
+function compileCronField(caller: string, bits: Int32Array, field: number, text: string): void {
+	const name = CRON_FIELD_NAMES[field];
+	const slot = CRON_SLOTS[field];
+
+	for (const item of text.split(',')) {
+		if (field === 3 && (item === 'L' || item === 'l')) {
+			bits[CRON_DAYS] |= 1;
+			continue;
+		}
+
+		const nth = field === 5 ? CRON_NTH_REGEX.exec(item) : null;
+
+		if (nth !== null) {
+			const weekday = cronBound(caller, field, nth[1], item) % 7;
+
+			if (nth[2] !== undefined) bits[CRON_WEEKDAYS] |= 1 << (7 + weekday);
+			else {
+				const k = Number(nth[3]);
+
+				if (!(k >= 1 && k <= 5)) throw new RangeError(`${caller}: the day-of-week field occurrences (#) must be between 1 and 5, got ${quoteCron(item)}`);
+				if (k === 5) bits[CRON_WEEKDAYS] |= 1 << (14 + weekday);
+				else bits[CRON_NTH] |= 1 << (7 * (k - 1) + weekday);
+			}
+			continue;
+		}
+
+		const match = CRON_ITEM_REGEX.exec(item);
+
+		if (match === null) {
+			throw new RangeError(
+				`${caller}: the ${name} field must be a list of *, values, ranges (a-b) and steps (/n)${field === 3 ? ' or L' : field === 5 ? ', nL or n#k' : ''}, got ${quoteCron(text)}`
+			);
+		}
+
+		const max = CRON_MAX[field];
+		const low = match[1] === undefined ? cronBound(caller, field, match[2], item) : CRON_MIN[field];
+		// `a/n` runs to the end of the range, like `*/n`.
+		const high = match[3] !== undefined ? cronBound(caller, field, match[3], item) : match[1] === undefined && match[4] === undefined ? low : max;
+		const step = match[4] === undefined ? 1 : Number(match[4]);
+
+		if (high < low) throw new RangeError(`${caller}: the ${name} field ranges must not be reversed, got ${quoteCron(item)}`);
+		if (!(step >= 1 && step <= max)) throw new RangeError(`${caller}: the ${name} field steps must be between 1 and ${max}, got ${quoteCron(item)}`);
+
+		for (let value = low; value <= high; value += step) {
+			// 7 is Sunday in the day-of-week field, like 0.
+			if (field === 5) bits[slot] |= 1 << (value % 7);
+			else if (value < 30 || field > 1) bits[slot] |= 1 << value;
+			else bits[slot + 1] |= 1 << (value - 30);
+		}
+	}
+}
+
+/**
+ * Parses a cron expression into its compiled form: an `Int32Array` holding the sets of values of its fields as bits and its flags (see
+ * {@link CRON_SECONDS}).
+ * @param {string} caller - Name of the public function, used in the error messages
+ * @param {string} expression - The expression
+ * @returns {Int32Array} The compiled form
+ * @throws {RangeError} when the expression is malformed
+ * @example
+ * compileCron('parseCron', '@hourly')[CRON_MINUTES]; // => 1
+ */
+function compileCron(caller: string, expression: string): Int32Array {
+	const source = expression.trim();
+	let text = source;
+
+	if (text[0] === '@') {
+		const index = CRON_MACROS.indexOf(text.toLowerCase());
+
+		// (The expansions never start with `@`, so a match is always a name.)
+		if (index < 0) {
+			const names = CRON_MACROS.filter(function (_: string, position: number): boolean {
+				return position % 2 === 0;
+			});
+
+			throw new RangeError(`${caller}: \`expression\` macros are ${names.join(', ')}, got ${quoteCron(source)}`);
+		}
+		text = CRON_MACROS[index + 1];
+	}
+
+	const fields = text.match(/[^ \t]+/g) ?? [];
+
+	if (fields.length !== 5 && fields.length !== 6) {
+		throw new RangeError(`${caller}: \`expression\` must have 5 fields, or 6 with seconds first, got ${fields.length} in ${quoteCron(source)}`);
+	}
+
+	const bits = new Int32Array(12);
+	// Five fields: the seconds field is missing, and the job fires at second 0.
+	const skip = 6 - fields.length;
+
+	if (skip === 1) bits[CRON_SECONDS] = 1;
+	for (let field = skip; field < 6; field++) compileCronField(caller, bits, field, fields[field - skip]);
+
+	const minute = fields[1 - skip];
+	const hour = fields[2 - skip];
+	const days = fields[3 - skip];
+	const weekdays = fields[5 - skip];
+
+	bits[CRON_FLAGS] =
+		(days[0] !== '*' && weekdays[0] !== '*' ? CRON_EITHER_DAY : 0) | (minute[0] !== '*' && hour[0] !== '*' ? CRON_FIXED_TIME : 0) | (skip === 0 ? CRON_HAS_SECONDS : 0);
+
+	// Every month starts on every day of the week in the 400-year Gregorian cycle (and February has 28 and 29 days): when no such month
+	// has a matching day, no day ever matches.
+	for (let month = 1; month <= 12; month++) {
+		if (((bits[CRON_MONTHS] >>> month) & 1) === 0) continue;
+
+		const longest = month === 2 ? 29 : DAYS_PER_MONTH[month - 1];
+
+		for (let length = month === 2 ? 28 : longest; length <= longest; length++) {
+			for (let day = 1; day <= length; day++) {
+				for (let weekday = 0; weekday < 7; weekday++) {
+					if (cronDayMatches(bits, day, length, weekday)) {
+						bits[CRON_FLAGS] |= CRON_SATISFIABLE;
+
+						return bits;
+					}
+				}
+			}
+		}
+	}
+
+	return bits;
+}
+
+/**
+ * Returns the compiled form of a cron argument: an expression (parsed once and cached) or a {@link Cron}.
+ * @param {string} caller - Name of the public function, used in the error messages
+ * @param {string | Cron} cron - The expression or the parsed cron
+ * @returns {Int32Array} The compiled form
+ * @throws {TypeError} when `cron` is neither a string nor a `Cron` returned by {@link parseCron}
+ * @throws {RangeError} when the expression is malformed
+ * @example
+ * cronForm('nextCronDate', '* * * * *')[CRON_SECONDS]; // => 1
+ */
+function cronForm(caller: string, cron: string | Cron): Int32Array {
+	if (typeof cron === 'string') {
+		return (
+			cronCache.get(cron) ??
+			cached(cronCache, cron, function (expression: string): Int32Array {
+				return compileCron(caller, expression);
+			})
+		);
+	}
+
+	const bits = cronForms.get(cron as object);
+
+	if (bits === undefined) throw new TypeError(`${caller}: \`cron\` must be a cron expression or a Cron returned by parseCron, got ${describe(cron)}`);
+
+	return bits;
+}
+
+/**
+ * Finds the nearest value of a field's set from `from` on (`step` 1) or back (`step` -1).
+ * @param {Int32Array} bits - The compiled form
+ * @param {number} field - Where the field's two words are ({@link CRON_SECONDS}, {@link CRON_MINUTES}, {@link CRON_HOURS} or {@link CRON_MONTHS})
+ * @param {number} from - The first value to consider, from -1 to 61
+ * @param {number} step - 1 to look up, -1 to look down
+ * @returns {number} The value, or -1 when there is none
+ * @example
+ * seekCron(compileCron('parseCron', '10,40 * * * *'), CRON_MINUTES, 11, 1); // => 40
+ */
+function seekCron(bits: Int32Array, field: number, from: number, step: number): number {
+	let value = from;
+
+	if (step > 0) {
+		if (value < 30) {
+			const low = bits[field] & (-1 << value);
+
+			if (low !== 0) return 31 - Math.clz32(low & -low);
+			value = 30;
+		}
+
+		const high = bits[field + 1] & (-1 << (value - 30));
+
+		return high === 0 ? -1 : 61 - Math.clz32(high & -high);
+	}
+	if (value >= 30) {
+		const high = bits[field + 1] & (-1 >>> (61 - value));
+
+		if (high !== 0) return 61 - Math.clz32(high);
+		value = 29;
+	}
+
+	const low = value < 0 ? 0 : bits[field] & (-1 >>> (31 - value));
+
+	// `Math.clz32(0)` is 32, so an empty set gives -1.
+	return 31 - Math.clz32(low);
+}
+
+/**
+ * Checks whether a calendar day matches the day-of-month and day-of-week fields, combined like Vixie cron: when both are restricted
+ * (neither starts with `*`), either one is enough.
+ * @param {Int32Array} bits - The compiled form
+ * @param {number} day - The day of the month
+ * @param {number} length - The number of days of the month
+ * @param {number} weekday - The day of the week (0 = Sunday)
+ * @returns {boolean} Whether the day matches
+ * @example
+ * cronDayMatches(compileCron('parseCron', '0 0 L * *'), 29, 29, 4); // => true
+ */
+function cronDayMatches(bits: Int32Array, day: number, length: number, weekday: number): boolean {
+	const days = bits[CRON_DAYS];
+	const weekdays = bits[CRON_WEEKDAYS];
+	const week = Math.floor((day - 1) / 7);
+	const byDate = ((days >>> day) & 1) === 1 || ((days & 1) === 1 && day === length);
+	// The weekdays, the `wL` weekdays in the last 7 days of the month, and the `w#k` weekdays in the k-th 7 days.
+	const candidates = weekdays | (day + 7 > length ? weekdays >>> 7 : 0) | (week < 4 ? bits[CRON_NTH] >>> (7 * week) : weekdays >>> 14);
+	const byWeekday = ((candidates >>> weekday) & 1) === 1;
+
+	return (bits[CRON_FLAGS] & CRON_EITHER_DAY) === 0 ? byDate && byWeekday : byDate || byWeekday;
+}
+
+/**
+ * Finds the nearest matching time of day from a time on (`step` 1) or back (`step` -1), within one day.
+ * @param {Int32Array} bits - The compiled form
+ * @param {number} hour - The hour to start from
+ * @param {number} minute - The minute to start from
+ * @param {number} second - The second to start from
+ * @param {number} step - 1 to look forward, -1 to look back
+ * @returns {number} The matching time as seconds since midnight, or -1 when there is none that day
+ * @example
+ * seekCronTime(compileCron('parseCron', '30 9 * * *'), 8, 0, 0, 1); // => 34_200
+ */
+function seekCronTime(bits: Int32Array, hour: number, minute: number, second: number, step: number): number {
+	const reset = step > 0 ? 0 : 59;
+
+	for (;;) {
+		const h = seekCron(bits, CRON_HOURS, hour, step);
+
+		if (h < 0) return -1;
+		if (h !== hour) {
+			hour = h;
+			minute = second = reset;
+		}
+
+		const m = seekCron(bits, CRON_MINUTES, minute, step);
+
+		if (m < 0) {
+			hour += step;
+			minute = second = reset;
+			continue;
+		}
+		if (m !== minute) {
+			minute = m;
+			second = reset;
+		}
+
+		const s = seekCron(bits, CRON_SECONDS, second, step);
+
+		if (s >= 0) return hour * 3600 + minute * 60 + s;
+		minute += step;
+		second = reset;
+	}
+}
+
+/**
+ * Finds the nearest wall-clock time that matches a cron expression, at or after `wall` (`step` 1) or at or before it (`step` -1), jumping
+ * from field to field (to the next matching month, then day, hour, minute and second) rather than scanning: a matching day always comes
+ * within 400 years when one exists at all.
+ * @param {Int32Array} bits - The compiled form
+ * @param {number} wall - The wall-clock time to start from, as the UTC timestamp of the same fields
+ * @param {number} step - 1 to look forward, -1 to look back
+ * @returns {number} The matching wall-clock time (a whole second), or `NaN` when no day ever matches
+ * @example
+ * seekCronWall(compileCron('parseCron', '0 0 1 * *'), Date.UTC(2024, 0, 15), 1); // => Date.UTC(2024, 1, 1)
+ */
+function seekCronWall(bits: Int32Array, wall: number, step: number): number {
+	if ((bits[CRON_FLAGS] & CRON_SATISFIABLE) === 0) return NaN;
+
+	const up = step > 0;
+	const start = up ? Math.ceil(wall / MS_PER_SECOND) : Math.floor(wall / MS_PER_SECOND);
+	let days = Math.floor(start / 86_400);
+	const time = start - days * 86_400;
+	let [year, month, day] = civilFromDays(days);
+	let hour = Math.floor(time / 3600);
+	let minute = Math.floor(time / 60) % 60;
+	let second = time % 60;
+
+	for (;;) {
+		const found = seekCron(bits, CRON_MONTHS, month, step);
+
+		if (found === month) {
+			const length = month === 2 && isLeapYear(year) ? 29 : DAYS_PER_MONTH[month - 1];
+
+			// 1970-01-01 (epoch day 0) was a Thursday.
+			if (cronDayMatches(bits, day, length, mod(days + 4, DAYS_PER_WEEK))) {
+				const at = seekCronTime(bits, hour, minute, second, step);
+
+				if (at >= 0) return (days * 86_400 + at) * MS_PER_SECOND;
+			}
+			days += step;
+			[year, month, day] = civilFromDays(days);
+		} else {
+			// The next (previous) matching month, in this year or the next (previous) one.
+			if (found < 0) year += step;
+			month = found < 0 ? seekCron(bits, CRON_MONTHS, up ? 1 : 12, step) : found;
+			day = up ? 1 : month === 2 && isLeapYear(year) ? 29 : DAYS_PER_MONTH[month - 1];
+			days = daysFromCivil(year, month - 1, day);
+		}
+		hour = up ? 0 : 23;
+		minute = second = up ? 0 : 59;
+	}
+}
+
+/**
+ * Returns the UTC offset of a time zone at an instant, reading it at the nearest end of the `Date` range for an instant beyond it.
+ * @param {ResolvedZone} zone - The time zone
+ * @param {number} time - A timestamp
+ * @returns {number} The offset in milliseconds
+ * @example
+ * offsetNear(0, 9e15); // => 0
+ */
+function offsetNear(zone: ResolvedZone, time: number): number {
+	return offsetAt(zone, Math.min(Math.max(time, -MAX_TIME), MAX_TIME));
+}
+
+/**
+ * Returns the UTC offset of a time zone at an instant, like {@link offsetNear}, through a span of time over which the offset is known to
+ * be constant, `[start, end, offset]`, that it widens: an instant within a day of the span with the same offset extends it (offsets are
+ * assumed to change at most once a day, as in {@link wallInstants}). Before asking `Intl` about an instant just past the span, it asks
+ * about the instant a day past it, so that a series of nearby instants (the steps of {@link eachCronDate}) costs about one `Intl` call a
+ * day. An empty span is `[NaN, NaN, NaN]`.
+ * @param {ResolvedZone} zone - The time zone
+ * @param {Float64Array} span - The span, updated in place
+ * @param {number} time - A timestamp
+ * @returns {number} The offset in milliseconds
+ * @example
+ * spanOffset(0, new Float64Array([NaN, NaN, NaN]), 5); // => 0
+ */
+function spanOffset(zone: ResolvedZone, span: Float64Array, time: number): number {
+	if (time >= span[0] && time <= span[1]) return span[2];
+
+	const side = time > span[1] ? 1 : 0;
+	// `NaN` for an empty span, which then starts at `time`.
+	const near = Math.abs(time - span[side]) <= MS_PER_DAY;
+
+	if (near) {
+		const reach = span[side] + (side * 2 - 1) * MS_PER_DAY;
+
+		if (offsetNear(zone, reach) === span[2]) {
+			span[side] = reach;
+
+			return span[2];
+		}
+	}
+
+	const offset = offsetNear(zone, time);
+
+	if (near && offset === span[2]) span[side] = time;
+	else {
+		span[0] = span[1] = time;
+		span[2] = offset;
+	}
+
+	return offset;
+}
+
+/**
+ * Finds the instant at which the UTC offset of a time zone changes, by bisection between an instant before and one after the change.
+ * @param {ResolvedZone} zone - The time zone
+ * @param {number} low - An instant before the change
+ * @param {number} high - An instant after it, where the offset differs
+ * @returns {number} The first instant with the new offset
+ * @example
+ * offsetChange(resolveTimeZone('offsetChange', 'America/New_York'), Date.UTC(2024, 2, 10), Date.UTC(2024, 2, 11)); // => Date.UTC(2024, 2, 10, 7)
+ */
+function offsetChange(zone: ResolvedZone, low: number, high: number): number {
+	const before = offsetNear(zone, low);
+
+	while (high - low > 1) {
+		const middle = Math.floor((low + high) / 2);
+
+		if (offsetNear(zone, middle) === before) low = middle;
+		else high = middle;
+	}
+
+	return high;
+}
+
+/**
+ * Whether a job fires again on the second occurrence of a repeated wall-clock time: cronie runs the wildcard jobs (those whose minute or
+ * hour field starts with `*`) on both, and the fixed-time jobs only on the first, unless the clocks went back by more than 3 hours.
+ * @param {Int32Array} bits - The compiled form
+ * @param {number} overlap - How far the clocks went back, in milliseconds
+ * @returns {boolean} Whether the job fires on the second occurrence
+ * @example
+ * cronRepeats(compileCron('parseCron', '30 1 * * *'), 3_600_000); // => false
+ */
+function cronRepeats(bits: Int32Array, overlap: number): boolean {
+	return (bits[CRON_FLAGS] & CRON_FIXED_TIME) === 0 || overlap > CRON_LONG_JUMP;
+}
+
+/**
+ * Whether a job whose wall-clock time was skipped by a forward jump of the clocks fires when the jump ends: cronie runs every job
+ * after a jump of less than 5 minutes, and the fixed-time ones after a jump of less than 3 hours.
+ * @param {Int32Array} bits - The compiled form
+ * @param {number} gap - How far the clocks went forward, in milliseconds
+ * @returns {boolean} Whether the job fires at the end of the gap
+ * @example
+ * cronCatchesUp(compileCron('parseCron', '30 2 * * *'), 3_600_000); // => true
+ */
+function cronCatchesUp(bits: Int32Array, gap: number): boolean {
+	return gap < CRON_SHORT_JUMP || ((bits[CRON_FLAGS] & CRON_FIXED_TIME) !== 0 && gap < CRON_LONG_JUMP);
+}
+
+/**
+ * Finds the first instant after `from` at which a cron job fires, by the rules of {@link nextCronDate}. It runs through the matching
+ * wall-clock times in order, taking each one's first occurrence; the second occurrences of repeated times (the clocks were set back)
+ * only matter when `from` is within the repeated span or just before it, which is checked directly. Transitions of the UTC offset are
+ * assumed to be more than a day apart, as in the time zone database (a week at least) and as {@link wallInstants} assumes.
+ * @param {Int32Array} bits - The compiled form
+ * @param {ResolvedZone} zone - The time zone
+ * @param {number} from - The instant to search after (exclusive)
+ * @param {Float64Array} span - A span of constant offset known from earlier searches (see {@link spanOffset}), updated in place
+ * @returns {number} The instant (possibly beyond the `Date` range), or `NaN` when there is none within 400 years
+ * @example
+ * cronNext(compileCron('parseCron', '0 * * * *'), 0, 1, new Float64Array([NaN, NaN, NaN])); // => 3_600_000
+ */
+function cronNext(bits: Int32Array, zone: ResolvedZone, from: number, span: Float64Array): number {
+	const offset = spanOffset(zone, span, from);
+	let wall = seekCronWall(bits, from + offset + 1, 1);
+	const candidate = wall - offset;
+
+	// The usual case: the candidate is within a day, with the same offset (so the offset does not change in between), and the clocks did
+	// not go back during the last day (so `from` is not in a repeated span).
+	if (candidate - from <= MS_PER_DAY && spanOffset(zone, span, candidate) === offset && spanOffset(zone, span, from - MS_PER_DAY) <= offset) return candidate;
+
+	const ahead = offsetNear(zone, from + MS_PER_DAY);
+	const limit = Math.min(from + offset + CRON_HORIZON, MAX_TIME + MS_PER_DAY);
+	let best = NaN;
+
+	// The clocks go back within the next `offset - ahead` milliseconds: the wall-clock times already shown since come again.
+	if (ahead < offset && cronRepeats(bits, offset - ahead) && offsetNear(zone, from + offset - ahead) === ahead) {
+		const change = offsetChange(zone, from, from + offset - ahead);
+
+		// The first time shown again. (When it comes after `from`'s, it is no earlier than the first occurrence found below.)
+		best = seekCronWall(bits, change + ahead, 1) - ahead;
+	}
+
+	while (wall <= limit) {
+		const [earlier, later, exists] = wallInstants(zone, wall);
+
+		if (exists) {
+			if (earlier > from) return best < earlier ? best : earlier;
+			// `from` is in the second occurrence of a repeated span, and this time's first occurrence has passed.
+			if (cronRepeats(bits, later - earlier)) return later;
+			wall = seekCronWall(bits, offsetChange(zone, earlier, from) + wall - earlier, 1);
+		} else {
+			// A skipped time: the job fires when the gap ends, or not at all.
+			const change = offsetChange(zone, earlier, later);
+
+			// (`best` is only set when the clocks go back within a day, so there is no gap before it.)
+			if (cronCatchesUp(bits, later - earlier)) return change;
+			wall = seekCronWall(bits, change + wall - earlier, 1);
+		}
+	}
+
+	return best;
+}
+
+/**
+ * Finds the last instant before `from` at which a cron job fires, by the rules of {@link nextCronDate}: the mirror of {@link cronNext}.
+ * @param {Int32Array} bits - The compiled form
+ * @param {ResolvedZone} zone - The time zone
+ * @param {number} from - The instant to search before (exclusive)
+ * @param {Float64Array} span - A span of constant offset known from earlier searches (see {@link spanOffset}), updated in place
+ * @returns {number} The instant (possibly beyond the `Date` range), or `NaN` when there is none within 400 years
+ * @example
+ * cronPrevious(compileCron('parseCron', '0 * * * *'), 0, 1, new Float64Array([NaN, NaN, NaN])); // => 0
+ */
+function cronPrevious(bits: Int32Array, zone: ResolvedZone, from: number, span: Float64Array): number {
+	const offset = spanOffset(zone, span, from);
+	// The last matching time before `from`'s on the wall clock.
+	const last = seekCronWall(bits, from + offset - 1, -1);
+	const candidate = last - offset;
+
+	// The usual case: the candidate is within a day, with the same offset, and the clocks did not go back during the day before it.
+	if (from - candidate <= MS_PER_DAY && spanOffset(zone, span, candidate) === offset && spanOffset(zone, span, candidate - MS_PER_DAY) <= offset) return candidate;
+
+	const behind = offsetNear(zone, from - MS_PER_DAY);
+	const limit = Math.max(from + offset - CRON_HORIZON, -MAX_TIME - MS_PER_DAY);
+	// The wall-clock times shown before `from` end before `from`'s own, unless `from` is in a repeated span.
+	let bound = from + offset;
+	let best = NaN;
+
+	// (When `behind` is not larger, `from + offset - behind` is `from` or later, and the offset there is not `behind`, or is `offset` too.)
+	if (offsetNear(zone, from + offset - behind) === behind) {
+		// The clocks went back less than `behind - offset` ago: the first occurrence of the repeated span ran until the change.
+		const change = offsetChange(zone, from + offset - behind, from);
+
+		bound = change + behind;
+		if (cronRepeats(bits, behind - offset) && last >= change + offset) best = candidate;
+	}
+
+	let wall = seekCronWall(bits, bound - 1, -1);
+
+	while (wall >= limit) {
+		const [earlier, later, exists] = wallInstants(zone, wall);
+
+		if (exists) {
+			if (later < from && cronRepeats(bits, later - earlier)) return later;
+
+			return best > earlier ? best : earlier;
+		}
+
+		const change = offsetChange(zone, earlier, later);
+
+		// (`best` is only set when the clocks went back less than a day ago, so there is no gap after it.)
+		if (change < from && cronCatchesUp(bits, later - earlier)) return change;
+		wall = seekCronWall(bits, change + wall - later - 1, -1);
+	}
+
+	return best;
+}
+
+/**
+ * Reads the time zone option of a cron helper.
+ * @param {string} caller - Name of the public function, used in the error messages
+ * @param {CronMatchOptions} options - The options
+ * @returns {ResolvedZone} The zone, {@link localZoneOffset} for the local time zone
+ * @throws {TypeError} when `timeZone` is not a string
+ * @throws {RangeError} when `timeZone` is not a valid time zone
+ * @example
+ * cronZone('nextCronDate', { timeZone: '+01:00' }); // => 3_600_000
+ */
+function cronZone(caller: string, options: CronMatchOptions): ResolvedZone {
+	const timeZone = readOption(options, 'timeZone');
+
+	return timeZone === undefined ? localZoneOffset : resolveTimeZone(caller, timeZone);
+}
+
+/**
+ * The UTC offset of the runtime's local time zone at an instant: the resolved zone of the cron helpers without a `timeZone`.
+ * @param {number} time - The instant, in milliseconds
+ * @returns {number} The offset in milliseconds east of UTC
+ * @example
+ * localZoneOffset(0) === -new Date(0).getTimezoneOffset() * 60_000; // => true
+ */
+function localZoneOffset(time: number): number {
+	return localOffset(new Date(time));
+}
+
+/**
+ * Turns the result of {@link cronNext} or {@link cronPrevious} into a date.
+ * @param {number} time - The instant, possibly `NaN` or beyond the `Date` range
+ * @returns {Date | undefined} A new date, or `undefined`
+ * @example
+ * cronDate(NaN); // => undefined
+ */
+function cronDate(time: number): Date | undefined {
+	return Math.abs(time) <= MAX_TIME ? new Date(time) : undefined;
+}
+
+/**
+ * Searches for the next or previous date of a cron expression.
+ * @param {string} caller - Name of the public function, used in the error messages
+ * @param {string | Cron} cron - The expression or the parsed cron
+ * @param {CronDateOptions} options - The options
+ * @param {number} step - 1 for the next date, -1 for the previous one
+ * @returns {Date | undefined} A new date, or `undefined` when there is none
+ * @example
+ * cronSearch('nextCronDate', '0 * * * *', { from: 0, timeZone: 'UTC' }, 1); // => new Date(3_600_000)
+ */
+function cronSearch(caller: string, cron: string | Cron, options: CronDateOptions, step: number): Date | undefined {
+	const bits = cronForm(caller, cron);
+
+	assertOptions(caller, options);
+
+	const from = timeOf(readOption(options, 'from', Date.now()));
+	const zone = cronZone(caller, options);
+	// The dates are whole seconds, so `from` itself is included by searching from a millisecond before (after) it.
+	const start = readOption(options, 'inclusive') === true ? from - step : from;
+
+	const span = new Float64Array([NaN, NaN, NaN]);
+
+	return cronDate(step > 0 ? cronNext(bits, zone, start, span) : cronPrevious(bits, zone, start, span));
+}
+
+/**
+ * Parses a cron expression, for {@link nextCronDate}, {@link previousCronDate}, {@link eachCronDate} and {@link isCronMatch} (which also
+ * take the expression itself, cached once parsed). The syntax is Vixie cron's (cronie, the crontab of Linux and macOS), read strictly:
+ *
+ * - **Fields:** `minute hour day-of-month month day-of-week`, separated by spaces or tabs; with a 6th field, the first one is the
+ *   `second` (the field count tells them apart). Without one, the jobs fire at second 0.
+ * - **Values:** seconds and minutes 0-59, hours 0-23, days of the month 1-31, months 1-12 or `JAN`-`DEC`, days of the week 0-7 (0 and 7
+ *   are Sunday) or `SUN`-`SAT`; names are case-insensitive.
+ * - **Lists, ranges and steps:** `1,15`, `9-17`, and a step after `*` (`*` then `/15`: every 15), a range (`9-17/2`) or a value
+ *   (`5/15`: from 5 to the end of the range, every 15).
+ * - **Macros:** `@yearly` (`@annually`), `@monthly`, `@weekly`, `@daily` (`@midnight`) and `@hourly`.
+ * - **Extensions** (from Quartz and croner): `L` in the day-of-month field is the last day of the month; `5L` in the day-of-week field is
+ *   the last Friday of the month, and `5#2` its second Friday (`#1` to `#5`). They mix with the other items of their field (`1,15,L`).
+ *   `W`, `L-n`, `?` and a year field are rejected.
+ * - **Days:** when both the day-of-month and day-of-week fields are restricted (neither starts with `*`), a day matches when EITHER does
+ *   (`0 0 13 * 5`: every 13th and every Friday), as in every Vixie-derived cron; otherwise both must.
+ *
+ * Anything else throws: a value out of its range, a reversed range (`5-1`, `FRI-MON`), a step of 0 or larger than the field's largest
+ * value, an empty item, a missing or extra field, an unknown name or macro (`@reboot`). The messages name the field. An expression that
+ * never matches a real date (`0 0 30 2 *`) is valid, and the other functions find no date for it. Parsing takes time linear in the
+ * length of the expression.
+ * @param {string} expression - The cron expression
+ * @returns {Cron} A frozen handle, to pass to the other cron helpers
+ * @throws {TypeError} when `expression` is not a string
+ * @throws {RangeError} when `expression` is malformed
+ * @example
+ * const weekdays = parseCron('30 9 * * MON-FRI');
+ * weekdays.expression; // => '30 9 * * MON-FRI'
+ * nextCronDate(weekdays, { from: new Date(2024, 0, 6) }); // => new Date(2024, 0, 8, 9, 30) // Saturday the 6th, so Monday
+ * parseCron('0 0 31 2 *').expression; // => '0 0 31 2 *' // valid, but never fires
+ * parseCron('60 * * * *'); // throws RangeError
+ * parseCron('0 0 * *'); // throws RangeError
+ */
+export function parseCron(expression: string): Cron {
+	if (typeof expression !== 'string') throw new TypeError(`parseCron: \`expression\` must be a string, got ${describe(expression)}`);
+
+	const bits = cronForm('parseCron', expression);
+	const cron = Object.freeze(Object.assign(Object.create(null) as Cron, { expression: expression.trim() }));
+
+	cronForms.set(cron, bits);
+
+	return cron;
+}
+
+/**
+ * Returns the next date at which a cron expression fires: the first instant strictly after `from` (or at `from`, with `inclusive`) whose
+ * wall-clock time matches, read in `timeZone` (an IANA zone or a UTC offset) or else in the runtime's local time zone. The search jumps
+ * from field to field (next matching month, day, hour, minute, second) instead of scanning minute by minute, so it takes microseconds
+ * even for a date years away, and an expression that never fires (`0 0 30 2 *`) gives `undefined` at once; so does one whose every match
+ * falls in a daylight-saving gap for 400 years (see below), and a date past the end of the `Date` range.
+ *
+ * Around a change of UTC offset, the rules are cronie's (and Vixie cron's), which classify each job by its minute and hour fields:
+ * - A **fixed-time job** (neither the minute nor the hour field starts with `*`: `30 2 * * *`, `0 9-17 * * *`) whose time is skipped
+ *   because the clocks go forward fires once, at the end of the gap (02:30 on a spring-forward night in New York: at 03:00). When the
+ *   clocks go back, it fires on the first occurrence of a repeated time only (01:30 fires once, in daylight time).
+ * - A **wildcard job** (`* 2 * * *`, `0 * * * *`, a minute field of `*` with a step) fires at the matching times that the clocks show: not at all in a gap, and on both
+ *   occurrences of a repeated time.
+ * - As in cronie, a jump of 3 hours or more (Samoa skipping December 30th, 2011) counts as the clock being reset: nothing catches up
+ *   for a forward one, and every job fires again on the repeated times of a backward one; and a forward jump of less than 5 minutes
+ *   (from local mean time to standard time) is caught up by every job.
+ *
+ * Every date is a whole second: second 0 of the minute for a 5-field expression, except a catch-up, which fires when the gap ends (not
+ * on a whole minute where a local mean time offset with seconds ended, as in Guatemala in 1918). The result does not depend on the
+ * runtime's time zone when `timeZone` is given.
+ * @param {string | Cron} cron - A cron expression (see {@link parseCron}) or a parsed one
+ * @param {CronDateOptions} [options={}] - `from` (default: now), `inclusive` (default `false`) and `timeZone` (default: local time)
+ * @returns {Date | undefined} A new date, or `undefined` when the expression never fires after `from`
+ * @throws {TypeError} when `cron` is neither a string nor a `Cron`, `options` is not an object, `from` is neither a `Date` nor a number,
+ * or `timeZone` is not a string
+ * @throws {RangeError} when the expression is malformed, `from` is invalid, or `timeZone` is not a valid time zone
+ * @example
+ * nextCronDate('0 9 * * 1-5', { from: new Date(2024, 0, 6) }); // => new Date(2024, 0, 8, 9) // Saturday the 6th, so Monday
+ * nextCronDate('0-59/15 * * * *', { from: new Date(2024, 0, 1, 10, 15), inclusive: true }); // => new Date(2024, 0, 1, 10, 15)
+ * nextCronDate('0 0 L 2 *', { from: Date.UTC(2024, 0, 1), timeZone: 'UTC' }); // => new Date(Date.UTC(2024, 1, 29))
+ * nextCronDate('30 2 * * *', { from: Date.UTC(2024, 2, 10, 5), timeZone: 'America/New_York' }); // => new Date(Date.UTC(2024, 2, 10, 7)) // 03:00 EDT: 02:30 was skipped
+ * nextCronDate('0 0 30 2 *'); // => undefined
+ */
+export function nextCronDate(cron: string | Cron, options: CronDateOptions = {}): Date | undefined {
+	return cronSearch('nextCronDate', cron, options, 1);
+}
+
+/**
+ * Returns the last date at which a cron expression fired: the last instant strictly before `from` (or at `from`, with `inclusive`) at
+ * which {@link nextCronDate} would fire, with the same rules (`previousCronDate(cron, { from: nextCronDate(cron, { from: d }) })` is
+ * the last firing at or before `d`).
+ * @param {string | Cron} cron - A cron expression (see {@link parseCron}) or a parsed one
+ * @param {CronDateOptions} [options={}] - `from` (default: now), `inclusive` (default `false`) and `timeZone` (default: local time)
+ * @returns {Date | undefined} A new date, or `undefined` when the expression never fired before `from`
+ * @throws {TypeError} when `cron` is neither a string nor a `Cron`, `options` is not an object, `from` is neither a `Date` nor a number,
+ * or `timeZone` is not a string
+ * @throws {RangeError} when the expression is malformed, `from` is invalid, or `timeZone` is not a valid time zone
+ * @example
+ * previousCronDate('0 9 * * 1-5', { from: new Date(2024, 0, 8) }); // => new Date(2024, 0, 5, 9) // Monday the 8th, so Friday
+ * previousCronDate('@monthly', { from: Date.UTC(2024, 2, 1), inclusive: true, timeZone: 'UTC' }); // => new Date(Date.UTC(2024, 2, 1))
+ */
+export function previousCronDate(cron: string | Cron, options: CronDateOptions = {}): Date | undefined {
+	return cronSearch('previousCronDate', cron, options, -1);
+}
+
+/**
+ * The generator behind {@link eachCronDate} (the arguments are already validated).
+ * @param {Int32Array} bits - The compiled form
+ * @param {ResolvedZone} zone - The time zone
+ * @param {number} from - The instant to search after (exclusive)
+ * @param {number} to - The last instant to yield
+ * @param {number} limit - The largest number of dates to yield
+ * @returns {Generator<Date, void, undefined>} A generator of new dates
+ */
+function* cronDates(bits: Int32Array, zone: ResolvedZone, from: number, to: number, limit: number): Generator<Date, void, undefined> {
+	// The offsets found by a step serve the next ones.
+	const span = new Float64Array([NaN, NaN, NaN]);
+	let time = from;
+
+	for (let count = 0; count < limit; count++) {
+		time = cronNext(bits, zone, time, span);
+		if (!(time <= to)) return;
+		yield new Date(time);
+	}
+}
+
+/**
+ * Lists the successive dates at which a cron expression fires, lazily: the dates that repeated calls to {@link nextCronDate} would give,
+ * from the first one after `from` (or at `from`, with `inclusive`) up to `to` (inclusive) and at most `limit` of them. Without `to` or
+ * `limit`, it ends only at the end of the `Date` range: take what you need (`for…of` with `break`, or `limit`). Each step jumps from
+ * field to field like `nextCronDate`; the arguments are validated at once, not on the first read.
+ * @param {string | Cron} cron - A cron expression (see {@link parseCron}) or a parsed one
+ * @param {EachCronDateOptions} [options={}] - `from` (default: now), `inclusive` (default `false`), `to` (default: none), `limit`
+ * (default `Infinity`) and `timeZone` (default: local time)
+ * @returns {IterableIterator<Date>} An iterator of new dates, in increasing order
+ * @throws {TypeError} when `cron` is neither a string nor a `Cron`, `options` is not an object, `from` or `to` is neither a `Date` nor a
+ * number, `limit` is not a number, or `timeZone` is not a string
+ * @throws {RangeError} when the expression is malformed, `from` or `to` is invalid, `limit` is not an integer >= 0 or `Infinity`, or
+ * `timeZone` is not a valid time zone
+ * @example
+ * [...eachCronDate('0 12 * * *', { from: new Date(2024, 0, 1), limit: 3 })]; // => [new Date(2024, 0, 1, 12), new Date(2024, 0, 2, 12), new Date(2024, 0, 3, 12)]
+ * [...eachCronDate('0 0 1 1/3 *', { from: Date.UTC(2024, 0, 1), to: Date.UTC(2024, 11, 31), inclusive: true, timeZone: 'UTC' })].length; // => 4
+ */
+export function eachCronDate(cron: string | Cron, options: EachCronDateOptions = {}): IterableIterator<Date> {
+	const bits = cronForm('eachCronDate', cron);
+
+	assertOptions('eachCronDate', options);
+
+	const from = timeOf(readOption(options, 'from', Date.now()));
+	const to = readOption(options, 'to');
+	const end = to === undefined ? MAX_TIME : timeOf(to);
+	const limit = readOption(options, 'limit', Infinity);
+
+	assertCount('eachCronDate', 'limit', limit, 0, true);
+
+	return cronDates(bits, cronZone('eachCronDate', options), readOption(options, 'inclusive') === true ? from - 1 : from, end, limit);
+}
+
+/**
+ * Checks whether a cron expression fires during the minute that `date` falls in (the second, for a 6-field expression), as read on the
+ * wall clock of `timeZone` or of the runtime's local time zone: whether {@link nextCronDate} gives the start of that minute, so the
+ * daylight-saving rules of `nextCronDate` apply (a fixed-time job does not match the second occurrence of a repeated time, and matches
+ * the first minute after a gap that skipped its time). Call it once a minute to drive a scheduler.
+ * @param {string | Cron} cron - A cron expression (see {@link parseCron}) or a parsed one
+ * @param {DateInput} date - The instant
+ * @param {CronMatchOptions} [options={}] - `timeZone` (default: local time)
+ * @returns {boolean} Whether the expression fires during that minute (second)
+ * @throws {TypeError} when `cron` is neither a string nor a `Cron`, `date` is neither a `Date` nor a number, `options` is not an
+ * object, or `timeZone` is not a string
+ * @throws {RangeError} when the expression is malformed, `date` is invalid, or `timeZone` is not a valid time zone
+ * @example
+ * isCronMatch('0/15 9-17 * * MON-FRI', new Date(2024, 0, 8, 9, 30, 42)); // => true
+ * isCronMatch('0/15 9-17 * * MON-FRI', new Date(2024, 0, 8, 9, 31)); // => false
+ * isCronMatch('30 * * * * *', new Date(2024, 0, 8, 9, 31, 30, 500)); // => true
+ * isCronMatch('30 1 * * *', Date.UTC(2024, 10, 3, 6, 30), { timeZone: 'America/New_York' }); // => false // the second 01:30
+ */
+export function isCronMatch(cron: string | Cron, date: DateInput, options: CronMatchOptions = {}): boolean {
+	const bits = cronForm('isCronMatch', cron);
+	const time = timeOf(date);
+
+	assertOptions('isCronMatch', options);
+
+	const zone = cronZone('isCronMatch', options);
+	const start = time - mod(time + offsetAt(zone, time), (bits[CRON_FLAGS] & CRON_HAS_SECONDS) === 0 ? MS_PER_MINUTE : MS_PER_SECOND);
+
+	return cronNext(bits, zone, start - 1, new Float64Array([NaN, NaN, NaN])) === start;
 }

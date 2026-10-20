@@ -1,4 +1,5 @@
 import fc from 'fast-check';
+import * as util from 'util';
 import * as helpers from '.';
 import { clamp } from '../math/index.js';
 
@@ -17,6 +18,19 @@ function timeOfDay(date: Date): number[] {
  */
 function ymd(date: Date): number[] {
 	return [date.getFullYear(), date.getMonth(), date.getDate()];
+}
+
+/**
+ * `addDays(date, offset)` when its local calendar day exists, else `undefined`: where a time zone skipped a whole day (Samoa,
+ * 2011-12-30), `addDays` lands on the next day, which the naive day-by-day references must not visit twice.
+ */
+function existingDay(date: Date, offset: number): Date | undefined {
+	const moved = helpers.addDays(date, offset);
+	const expected = new Date(0);
+
+	expected.setUTCFullYear(date.getFullYear(), date.getMonth(), date.getDate() + offset);
+
+	return ymd(moved).join() === [expected.getUTCFullYear(), expected.getUTCMonth(), expected.getUTCDate()].join() ? moved : undefined;
 }
 
 /**
@@ -365,7 +379,7 @@ describe('Date helpers (properties)', function () {
 
 		/**
 		 * Naive reference: walks one calendar day at a time, always measuring the offset from the original date (chaining
-		 * addDays would permanently shift the wall-clock time after passing through a DST gap).
+		 * addDays would permanently shift the wall-clock time after passing through a DST gap), over the days that exist.
 		 */
 		function naiveAddBusinessDays(date: Date, amount: number): Date {
 			const sign = amount < 0 ? -1 : 1;
@@ -374,7 +388,10 @@ describe('Date helpers (properties)', function () {
 
 			while (remaining > 0) {
 				offset += sign;
-				if (!helpers.isWeekend(helpers.addDays(date, offset))) remaining--;
+
+				const day = existingDay(date, offset);
+
+				if (day !== undefined && !helpers.isWeekend(day)) remaining--;
 			}
 
 			return helpers.addDays(date, offset);
@@ -503,7 +520,9 @@ describe('Date helpers (properties)', function () {
 					let count = 0;
 
 					for (let offset = 1; offset <= span; offset++) {
-						if (!helpers.isWeekend(helpers.addDays(earlier, offset))) count++;
+						const day = existingDay(earlier, offset);
+
+						if (day !== undefined && !helpers.isWeekend(day)) count++;
 					}
 
 					expect(helpers.diffInBusinessDays(later, earlier)).toBe(count);
@@ -1271,7 +1290,7 @@ describe('Scheduling helpers (properties)', function () {
 		const holidayOffsetsArb = fc.array(fc.integer({ min: -120, max: 120 }), { maxLength: 40 });
 
 		/**
-		 * Naive reference: walks one calendar day at a time with `isBusinessDay`.
+		 * Naive reference: walks one calendar day at a time with `isBusinessDay`, over the days that exist.
 		 */
 		function naiveAdd(date: Date, amount: number, options: helpers.BusinessDayOptions): Date {
 			const sign = amount < 0 ? -1 : 1;
@@ -1280,10 +1299,28 @@ describe('Scheduling helpers (properties)', function () {
 
 			while (remaining > 0) {
 				offset += sign;
-				if (helpers.isBusinessDay(helpers.addDays(date, offset), options)) remaining--;
+
+				const day = existingDay(date, offset);
+
+				if (day !== undefined && helpers.isBusinessDay(day, options)) remaining--;
 			}
 
 			return helpers.addDays(date, offset);
+		}
+
+		/**
+		 * Naive reference: the business days among the existing days in `(earlier, earlier + span]`.
+		 */
+		function naiveCount(earlier: Date, span: number, options: helpers.BusinessDayOptions): number {
+			let count = 0;
+
+			for (let offset = 1; offset <= span; offset++) {
+				const day = existingDay(earlier, offset);
+
+				if (day !== undefined && helpers.isBusinessDay(day, options)) count++;
+			}
+
+			return count;
 		}
 
 		/**
@@ -1313,15 +1350,47 @@ describe('Scheduling helpers (properties)', function () {
 				fc.property(businessDateArb, fc.integer({ min: 0, max: 90 }), weekendArb, holidayOffsetsArb, function (earlier, span, weekend, offsets) {
 					const options = { weekend, holidays: holidaysAround(earlier, offsets) };
 					const later = helpers.addDays(earlier, span);
-					let count = 0;
-
-					for (let offset = 1; offset <= span; offset++) {
-						if (helpers.isBusinessDay(helpers.addDays(earlier, offset), options)) count++;
-					}
+					const count = naiveCount(earlier, span, options);
 
 					expect(helpers.diffInBusinessDays(later, earlier, options)).toBe(count);
 					expect(helpers.diffInBusinessDays(earlier, later, options)).toBe(0 - count);
 				})
+			);
+		});
+
+		it('step over and do not count a skipped calendar day (Samoa, 2011-12-30), in any process time zone', function () {
+			const realProcess = new (util.inspect.constructor as FunctionConstructor)('return process')() as { env: Record<string, string | undefined> };
+			const around = fc.integer({ min: Date.UTC(2011, 9, 1), max: Date.UTC(2012, 2, 1) });
+
+			fc.assert(
+				fc.property(
+					around,
+					fc.integer({ min: -60, max: 60 }),
+					fc.integer({ min: 0, max: 90 }),
+					weekendArb,
+					holidayOffsetsArb,
+					function (time, n, span, weekend, offsets) {
+						const previous = realProcess.env.TZ;
+
+						realProcess.env.TZ = 'Pacific/Apia';
+						try {
+							const date = new Date(time);
+							const options = { weekend, holidays: holidaysAround(date, offsets) };
+							const result = helpers.addBusinessDays(date, n, options);
+
+							expect(result.getTime()).toBe(naiveAdd(date, n, options).getTime());
+							if (n !== 0) expect(helpers.isBusinessDay(result, options)).toBe(true);
+							if (helpers.isBusinessDay(date, options)) expect(helpers.diffInBusinessDays(result, date, options)).toBe(n);
+							// Where `date + span` was skipped, `addDays` lands a day later.
+							const reach = existingDay(date, span) === undefined ? span + 1 : span;
+
+							expect(helpers.diffInBusinessDays(helpers.addDays(date, span), date, options)).toBe(naiveCount(date, reach, options));
+						} finally {
+							if (previous === undefined) delete realProcess.env.TZ;
+							else realProcess.env.TZ = previous;
+						}
+					}
+				)
 			);
 		});
 	});
@@ -1422,6 +1491,680 @@ describe('fromUnixTime (properties)', function () {
 				}
 			),
 			{ numRuns: 2000 }
+		);
+	});
+});
+
+describe('Cron (properties)', function () {
+	const SECOND = 1000;
+	const MINUTE = 60_000;
+	const MONTH_NAMES = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+	const WEEKDAY_NAMES = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+
+	/**
+	 * The meaning of a generated cron expression, worked out from the generator's choices rather than by `parseCron`.
+	 */
+	interface CronSpec {
+		expression: string;
+		hasSeconds: boolean;
+		seconds: Set<number>;
+		minutes: Set<number>;
+		hours: Set<number>;
+		days: Set<number>;
+		lastDay: boolean;
+		months: Set<number>;
+		weekdays: Set<number>;
+		lastWeekdays: Set<number>;
+		/** `10 * k + w` for `w#k`. */
+		nthWeekdays: Set<number>;
+		either: boolean;
+		fixed: boolean;
+	}
+
+	/**
+	 * A generated field: its text, whether it starts with `*`, and its values.
+	 */
+	interface FieldSpec {
+		text: string;
+		star: boolean;
+		values: number[];
+		extras: string[];
+	}
+
+	/**
+	 * Writes a value of a field, as digits (sometimes zero-padded) or, when the field has names, sometimes as a name in random case.
+	 */
+	function valueText(value: number, min: number, names: string[] | undefined, style: number): string {
+		const name = names?.[value - min];
+
+		if (name !== undefined && style % 3 === 0) return style % 2 === 0 ? name : name.toLowerCase();
+
+		return style % 5 === 1 ? `0${value}` : String(value);
+	}
+
+	/**
+	 * Generates a list item: `*`, `*\/n`, `a`, `a-b`, `a-b/n` or `a/n`, with the values it stands for.
+	 */
+	function itemArb(min: number, max: number, names: string[] | undefined, valueArb: fc.Arbitrary<number>): fc.Arbitrary<FieldSpec> {
+		const top = max === 7 ? 7 : max;
+		const step = fc.integer({ min: 1, max: top });
+		const style = fc.nat(29);
+
+		/**
+		 * The values from `low` to `high`, every `by`.
+		 */
+		function run(low: number, high: number, by: number): number[] {
+			const values: number[] = [];
+
+			for (let value = low; value <= high; value += by) values.push(value);
+
+			return values;
+		}
+
+		return fc.oneof(
+			{ weight: 4, arbitrary: fc.constant<FieldSpec>({ text: '*', star: true, values: run(min, top, 1), extras: [] }) },
+			{
+				weight: 3,
+				arbitrary: step.map(function (by) {
+					return { text: `*/${by}`, star: true, values: run(min, top, by), extras: [] };
+				})
+			},
+			{
+				weight: 3,
+				arbitrary: fc.tuple(valueArb, style).map(function ([value, s]) {
+					return { text: valueText(value, min, names, s), star: false, values: [value], extras: [] };
+				})
+			},
+			{
+				weight: 2,
+				arbitrary: fc.tuple(valueArb, valueArb, style, style).map(function ([a, b, s, t]) {
+					const low = Math.min(a, b);
+					const high = Math.max(a, b);
+
+					return { text: `${valueText(low, min, names, s)}-${valueText(high, min, names, t)}`, star: false, values: run(low, high, 1), extras: [] };
+				})
+			},
+			{
+				weight: 1,
+				arbitrary: fc.tuple(valueArb, valueArb, step, style).map(function ([a, b, by, s]) {
+					const low = Math.min(a, b);
+					const high = Math.max(a, b);
+
+					return { text: `${valueText(low, min, names, s)}-${high}/${by}`, star: false, values: run(low, high, by), extras: [] };
+				})
+			},
+			{
+				weight: 1,
+				arbitrary: fc.tuple(valueArb, step).map(function ([low, by]) {
+					return { text: `${low}/${by}`, star: false, values: run(low, top, by), extras: [] };
+				})
+			}
+		);
+	}
+
+	/**
+	 * Generates a field: a list of 1 to 3 items, plus the extensions of the day fields (`L`, `wL`, `w#k`).
+	 */
+	function fieldArb(min: number, max: number, names: string[] | undefined, valueArb: fc.Arbitrary<number>, extraArb?: fc.Arbitrary<string>): fc.Arbitrary<FieldSpec> {
+		const items = fc.array(
+			extraArb === undefined
+				? itemArb(min, max, names, valueArb)
+				: fc.oneof(
+						{ weight: 5, arbitrary: itemArb(min, max, names, valueArb) },
+						{
+							weight: 1,
+							arbitrary: extraArb.map(function (text) {
+								return { text, star: false, values: [], extras: [text] };
+							})
+						}
+					),
+			{ minLength: 1, maxLength: 3 }
+		);
+
+		return items.map(function (list) {
+			return {
+				text: list
+					.map(function (item) {
+						return item.text;
+					})
+					.join(','),
+				star: list[0].text[0] === '*',
+				values: list.flatMap(function (item) {
+					return item.values;
+				}),
+				extras: list.flatMap(function (item) {
+					return item.extras;
+				})
+			};
+		});
+	}
+
+	const cronWeekdayArb = fc.integer({ min: 0, max: 7 });
+
+	/**
+	 * A day, month or weekday field: often `*`, so that the jobs often fire on the days when the clocks change.
+	 */
+	function dayFieldArb(field: fc.Arbitrary<FieldSpec>, max: number): fc.Arbitrary<FieldSpec> {
+		const values: number[] = [];
+
+		for (let value = max === 7 ? 0 : 1; value <= max; value++) values.push(value);
+
+		return fc.oneof({ weight: 3, arbitrary: fc.constant<FieldSpec>({ text: '*', star: true, values, extras: [] }) }, { weight: 2, arbitrary: field });
+	}
+
+	const cronArb: fc.Arbitrary<CronSpec> = fc
+		.record({
+			hasSeconds: fc.boolean(),
+			second: fieldArb(0, 59, undefined, fc.integer({ min: 0, max: 59 })),
+			minute: fieldArb(0, 59, undefined, fc.integer({ min: 0, max: 59 })),
+			// Hours around midnight and 2-3 am, where the clocks change, come up more often.
+			hour: fieldArb(0, 23, undefined, fc.oneof(fc.integer({ min: 0, max: 3 }), fc.integer({ min: 0, max: 23 }))),
+			day: dayFieldArb(fieldArb(1, 31, undefined, fc.integer({ min: 1, max: 31 }), fc.constantFrom('L', 'l')), 31),
+			month: dayFieldArb(fieldArb(1, 12, MONTH_NAMES, fc.integer({ min: 1, max: 12 })), 12),
+			weekday: dayFieldArb(
+				fieldArb(
+					0,
+					7,
+					WEEKDAY_NAMES,
+					cronWeekdayArb,
+					fc.oneof(
+						fc.tuple(cronWeekdayArb, fc.boolean()).map(function ([w, name]) {
+							return `${name && w < 7 ? WEEKDAY_NAMES[w] : w}L`;
+						}),
+						fc.tuple(cronWeekdayArb, fc.integer({ min: 1, max: 5 })).map(function ([w, k]) {
+							return `${w}#${k}`;
+						})
+					)
+				),
+				7
+			),
+			separator: fc.constantFrom(' ', '  ', '\t', ' \t ')
+		})
+		.map(function ({ hasSeconds, second, minute, hour, day, month, weekday, separator }) {
+			const fields = [minute, hour, day, month, weekday];
+
+			if (hasSeconds) fields.unshift(second);
+
+			const nthWeekdays = new Set<number>();
+			const lastWeekdays = new Set<number>();
+
+			for (const extra of weekday.extras) {
+				const nth = /^(\w+?)(L|#(\d))$/.exec(extra) as RegExpExecArray;
+				const w = WEEKDAY_NAMES.includes(nth[1]) ? WEEKDAY_NAMES.indexOf(nth[1]) : Number(nth[1]) % 7;
+
+				if (nth[2] === 'L') lastWeekdays.add(w);
+				else nthWeekdays.add(10 * Number(nth[3]) + w);
+			}
+
+			return {
+				expression: fields
+					.map(function (field) {
+						return field.text;
+					})
+					.join(separator),
+				hasSeconds,
+				seconds: new Set(hasSeconds ? second.values : [0]),
+				minutes: new Set(minute.values),
+				hours: new Set(hour.values),
+				days: new Set(day.values),
+				lastDay: day.extras.length > 0,
+				months: new Set(month.values),
+				weekdays: new Set(
+					weekday.values.map(function (w) {
+						return w % 7;
+					})
+				),
+				lastWeekdays,
+				nthWeekdays,
+				either: !day.star && !weekday.star,
+				fixed: !minute.star && !hour.star
+			};
+		});
+
+	/**
+	 * The number of days of a month (1-12) of a year.
+	 */
+	function monthLength(year: number, month: number): number {
+		const date = new Date(0);
+
+		date.setUTCFullYear(year, month, 0);
+
+		return date.getUTCDate();
+	}
+
+	/**
+	 * Whether a calendar day (as UTC fields of `wall`) matches the spec's day fields.
+	 */
+	function dayMatches(spec: CronSpec, wall: number): boolean {
+		const date = new Date(wall);
+		const day = date.getUTCDate();
+		const length = monthLength(date.getUTCFullYear(), date.getUTCMonth() + 1);
+		const weekday = date.getUTCDay();
+
+		if (!spec.months.has(date.getUTCMonth() + 1)) return false;
+
+		const byDate = spec.days.has(day) || (spec.lastDay && day === length);
+		const byWeekday = spec.weekdays.has(weekday) || (spec.lastWeekdays.has(weekday) && day + 7 > length) || spec.nthWeekdays.has(10 * Math.ceil(day / 7) + weekday);
+
+		return spec.either ? byDate || byWeekday : byDate && byWeekday;
+	}
+
+	/**
+	 * Whether a wall-clock time (as the UTC fields of `wall`, whole seconds) matches the spec.
+	 */
+	function specMatches(spec: CronSpec, wall: number): boolean {
+		const date = new Date(wall);
+
+		return spec.seconds.has(date.getUTCSeconds()) && spec.minutes.has(date.getUTCMinutes()) && spec.hours.has(date.getUTCHours()) && dayMatches(spec, wall);
+	}
+
+	/**
+	 * The matching times of day of the spec, in seconds since midnight, sorted.
+	 */
+	function timesOfDay(spec: CronSpec): number[] {
+		const times: number[] = [];
+
+		for (let h = 0; h < 24; h++) {
+			if (!spec.hours.has(h)) continue;
+			for (let m = 0; m < 60; m++) {
+				if (!spec.minutes.has(m)) continue;
+				for (let s = 0; s < 60; s++) if (spec.seconds.has(s)) times.push(h * 3600 + m * 60 + s);
+			}
+		}
+
+		return times;
+	}
+
+	const offsetFormats = new Map<string, Intl.DateTimeFormat>();
+
+	/**
+	 * The UTC offset of a zone at an instant, read from `Intl`'s `longOffset` time zone name (`GMT-04:56:02`), independently of the
+	 * module's own reading of the wall clock.
+	 */
+	function referenceOffset(zone: string, time: number): number {
+		let format = offsetFormats.get(zone);
+
+		if (format === undefined) {
+			format = new Intl.DateTimeFormat('en-US', { timeZone: zone, timeZoneName: 'longOffset' });
+			offsetFormats.set(zone, format);
+		}
+
+		const name = (
+			format.formatToParts(time).find(function (part) {
+				return part.type === 'timeZoneName';
+			}) as Intl.DateTimeFormatPart
+		).value;
+		const match = /^GMT(?:([+-])(\d\d):(\d\d)(?::(\d\d))?)?$/.exec(name) as RegExpExecArray;
+
+		return match[1] === undefined ? 0 : (match[1] === '-' ? -1 : 1) * ((Number(match[2]) * 60 + Number(match[3])) * 60 + Number(match[4] ?? 0)) * SECOND;
+	}
+
+	/**
+	 * The offsets of a zone over a window: `[start, offset]` pieces, found by sampling every 6 hours (offset changes are days apart) and
+	 * bisecting to the millisecond.
+	 */
+	function offsetPieces(zone: string, start: number, end: number): Array<[number, number]> {
+		const pieces: Array<[number, number]> = [[-Infinity, referenceOffset(zone, start)]];
+		let previous = pieces[0][1];
+
+		for (let time = start; time < end;) {
+			const next = Math.min(time + 6 * HOUR, end);
+			const offset = referenceOffset(zone, next);
+
+			if (offset !== previous) {
+				let low = time;
+				let high = next;
+
+				while (high - low > 1) {
+					const middle = Math.floor((low + high) / 2);
+
+					if (referenceOffset(zone, middle) === previous) low = middle;
+					else high = middle;
+				}
+				pieces.push([high, offset]);
+				previous = offset;
+			}
+			time = next;
+		}
+
+		return pieces;
+	}
+
+	const transitionCache = new Map<string, number[]>();
+
+	/**
+	 * The instants at which a zone's offset changes during a year.
+	 */
+	function transitionsIn(zone: string, year: number): number[] {
+		const key = `${zone} ${year}`;
+		let transitions = transitionCache.get(key);
+
+		if (transitions === undefined) {
+			transitions = offsetPieces(zone, Date.UTC(year, 0, 1), Date.UTC(year + 1, 0, 1))
+				.slice(1)
+				.map(function (piece) {
+					return piece[0];
+				});
+			transitionCache.set(key, transitions);
+		}
+
+		return transitions;
+	}
+
+	/**
+	 * Brute force: simulates cronie's main loop (cron.c), which wakes up every minute (here every `tick`), compares the wall clock with
+	 * its virtual time and runs the jobs: the normal step runs every job matching the wall clock; a forward jump of less than 5 minutes
+	 * runs every job for each skipped tick; one of less than 3 hours runs the wildcard jobs for the current time and the fixed-time jobs
+	 * for each skipped tick; a backward jump of up to 3 hours runs only the wildcard jobs until the wall clock catches up with the virtual
+	 * time; any larger jump resets the virtual time and runs every job for the current time. Returns the instants in `(from, end]` at
+	 * which the job runs.
+	 */
+	function simulate(spec: CronSpec, zone: string, from: number, end: number): number[] {
+		const tick = spec.hasSeconds ? SECOND : MINUTE;
+		const start = Math.floor((from - 4 * HOUR) / tick) * tick;
+		const pieces = offsetPieces(zone, start - DAY, end + DAY);
+		let piece = 0;
+
+		/**
+		 * The wall clock at `time` (called in increasing order).
+		 */
+		function wallAt(time: number): number {
+			while (piece + 1 < pieces.length && pieces[piece + 1][0] <= time) piece++;
+
+			return time + pieces[piece][1];
+		}
+
+		/**
+		 * Whether some tick of `(low, high]` matches.
+		 */
+		function anyMatch(low: number, high: number, wildcardsToo: boolean): boolean {
+			if (!wildcardsToo && !spec.fixed) return false;
+			for (let wall = low + tick; wall <= high; wall += tick) if (specMatches(spec, wall)) return true;
+
+			return false;
+		}
+
+		let virtual = wallAt(start);
+		const fires: number[] = [];
+
+		for (let time = start + tick; time <= end; time += tick) {
+			const running = wallAt(time);
+			const diff = running - virtual;
+			let fire: boolean;
+
+			if (diff === tick) {
+				fire = specMatches(spec, running);
+				virtual = running;
+			} else if (diff > tick) {
+				const gap = diff - tick;
+
+				if (gap < 5 * MINUTE) fire = anyMatch(virtual, running, true);
+				else if (gap < 3 * HOUR) fire = (!spec.fixed && specMatches(spec, running)) || anyMatch(virtual, running, false);
+				else fire = specMatches(spec, running);
+				virtual = running;
+			} else if (tick - diff <= 3 * HOUR) fire = !spec.fixed && specMatches(spec, running);
+			else {
+				fire = specMatches(spec, running);
+				virtual = running;
+			}
+			if (fire && time > from) fires.push(time);
+		}
+
+		return fires;
+	}
+
+	/**
+	 * The times of a list of dates.
+	 */
+	function timesOf(dates: Iterable<Date>): number[] {
+		return Array.from(dates, function (date) {
+			return date.getTime();
+		});
+	}
+
+	const DST_ZONES = [
+		'America/New_York',
+		'Europe/London',
+		'Australia/Lord_Howe',
+		'Pacific/Apia',
+		'America/Havana',
+		'Pacific/Chatham',
+		'Antarctica/Troll',
+		'Europe/Dublin',
+		'America/St_Johns',
+		'Australia/Adelaide',
+		'America/Santiago',
+		'Asia/Kolkata'
+	];
+
+	/**
+	 * An instant to search from: within 30 hours of a change of offset of the zone in a year, or anywhere in it.
+	 */
+	const fromArb = fc
+		.record({
+			zone: fc.constantFrom(...DST_ZONES),
+			year: fc.oneof(fc.integer({ min: 1996, max: 2030 }), fc.constant(2011)),
+			pick: fc.nat(),
+			near: fc.integer({ min: 0, max: 4 }),
+			delta: fc.integer({ min: -30 * HOUR, max: 30 * HOUR }),
+			anywhere: fc.integer({ min: 0, max: 365 * DAY })
+		})
+		.map(function ({ zone, year, pick, near, delta, anywhere }) {
+			const transitions = transitionsIn(zone, year);
+			const from = near > 0 && transitions.length > 0 ? transitions[pick % transitions.length] + delta : Date.UTC(year, 0, 1) + anywhere;
+
+			return { zone, from };
+		});
+
+	/**
+	 * The integers from 0 to `count - 1`.
+	 */
+	function upTo(count: number): number[] {
+		const values: number[] = [];
+
+		for (let value = 0; value < count; value++) values.push(value);
+
+		return values;
+	}
+
+	/**
+	 * A spec for a job firing every day at the given times (`*` day fields).
+	 */
+	function dailySpec(expression: string, seconds: number[], minutes: number[], hours: number[], fixed: boolean): CronSpec {
+		/**
+		 * The values from `min` to `max`.
+		 */
+		function all(min: number, max: number): Set<number> {
+			return new Set(upTo(max + 1).slice(min));
+		}
+
+		return {
+			expression,
+			hasSeconds: expression.split(' ').length === 6,
+			seconds: new Set(seconds),
+			minutes: new Set(minutes),
+			hours: new Set(hours),
+			days: all(1, 31),
+			lastDay: false,
+			months: all(1, 12),
+			weekdays: all(0, 6),
+			lastWeekdays: new Set(),
+			nthWeekdays: new Set(),
+			either: false,
+			fixed
+		};
+	}
+
+	/**
+	 * A job built around a change of offset, firing at wall-clock times next to it (skipped, repeated, or just outside the change) as a
+	 * fixed-time or a wildcard job, and a search that starts shortly before the change or during it.
+	 */
+	const nearArb = fc
+		.record({
+			zone: fc.constantFrom(...DST_ZONES.slice(0, -1)),
+			year: fc.oneof(fc.integer({ min: 1996, max: 2030 }), fc.constant(2011)),
+			pick: fc.nat(),
+			minutes: fc.integer({ min: -200, max: 200 }),
+			width: fc.integer({ min: 0, max: 5 }),
+			second: fc.integer({ min: 0, max: 59 }),
+			kind: fc.integer({ min: 0, max: 5 }),
+			lead: fc.integer({ min: 0, max: 26 * HOUR }),
+			shortLead: fc.integer({ min: -HOUR, max: 2 * HOUR })
+		})
+		.map(function ({ zone, year, pick, minutes, width, second, kind, lead, shortLead }) {
+			const transitions = transitionsIn(zone, year);
+			// A year without changes (Havana or Apia in some years) gives a plain day.
+			const change = transitions.length > 0 ? transitions[pick % transitions.length] : Date.UTC(year, 6, 1);
+			const wall = new Date(change + referenceOffset(zone, change - 1) + minutes * MINUTE);
+			const h = wall.getUTCHours();
+			const m = wall.getUTCMinutes();
+			const range = [m];
+
+			for (let extra = 1; extra <= width && m + extra < 60; extra++) range.push(m + extra);
+
+			const specs = [
+				dailySpec(`${m} ${h} * * *`, [0], [m], [h], true),
+				dailySpec(`${m}-${range[range.length - 1]} ${h},${(h + 1) % 24} * * *`, [0], range, [h, (h + 1) % 24], true),
+				dailySpec(`${m} * * * *`, [0], [m], upTo(24), false),
+				dailySpec(`* ${h} * * *`, [0], upTo(60), [h], false),
+				dailySpec(`${second} ${m} ${h} * * *`, [second], [m], [h], true),
+				dailySpec(
+					`${second} */${width + 1} * * * *`,
+					[second],
+					upTo(60).filter(function (i) {
+						return i % (width + 1) === 0;
+					}),
+					upTo(24),
+					false
+				)
+			];
+			const spec = specs[kind];
+
+			return { spec, zone, from: spec.hasSeconds ? change - shortLead : change - lead };
+		});
+
+	/**
+	 * Either a random job and start, or one built around a change of offset.
+	 */
+	const scenarioArb = fc.oneof(
+		fc.tuple(cronArb, fromArb).map(function ([spec, { zone, from }]) {
+			return { spec, zone, from };
+		}),
+		nearArb
+	);
+
+	it('eachCronDate, nextCronDate, previousCronDate and isCronMatch agree with a simulation of cronie around changes of UTC offset', function () {
+		fc.assert(
+			fc.property(scenarioArb, fc.nat(), function ({ spec, zone, from }, seed) {
+				const end = from + (spec.hasSeconds ? 3 * HOUR : 2 * DAY);
+				const expected = simulate(spec, zone, from, end);
+				const cron = helpers.parseCron(spec.expression);
+
+				expect(timesOf(helpers.eachCronDate(cron, { from, to: end, timeZone: zone }))).toEqual(expected);
+
+				const next = helpers.nextCronDate(spec.expression, { from, timeZone: zone });
+
+				if (expected.length > 0) expect(next?.getTime()).toBe(expected[0]);
+				else expect(next === undefined || next.getTime() > end).toBe(true);
+
+				const last = helpers.previousCronDate(cron, { from: end, inclusive: true, timeZone: zone });
+
+				if (expected.length > 0) expect(last?.getTime()).toBe(expected[expected.length - 1]);
+				else expect(last === undefined || last.getTime() <= from).toBe(true);
+
+				// The previous firing of each firing, for a sample of them.
+				for (let i = 1; i < expected.length; i += 1 + Math.floor(expected.length / 16)) {
+					expect(helpers.previousCronDate(cron, { from: expected[i], timeZone: zone })?.getTime()).toBe(expected[i - 1]);
+				}
+
+				// isCronMatch at instants within the ticks: those of the firings, and others.
+				const tick = spec.hasSeconds ? SECOND : MINUTE;
+				const fired = new Set(expected);
+
+				for (let i = 0; i < 8; i++) {
+					const at = Math.floor((from + ((seed * (i + 1)) % (end - from))) / tick) * tick + tick;
+					const probe = i % 2 === 0 && expected.length > 0 ? expected[(seed + i) % expected.length] : at;
+
+					if (probe > end) continue;
+					expect(helpers.isCronMatch(cron, probe + (seed % tick), { timeZone: zone })).toBe(fired.has(probe));
+				}
+			})
+		);
+	});
+
+	it('reads the local time zone like the same IANA zone (in any process time zone)', function () {
+		const realProcess = new (util.inspect.constructor as FunctionConstructor)('return process')() as { env: Record<string, string | undefined> };
+
+		fc.assert(
+			fc.property(scenarioArb, function ({ spec, zone, from }) {
+				const end = from + (spec.hasSeconds ? HOUR : DAY);
+				const zoned = timesOf(helpers.eachCronDate(spec.expression, { from, to: end, timeZone: zone }));
+				const before = helpers.previousCronDate(spec.expression, { from, timeZone: zone });
+				const previous = realProcess.env.TZ;
+
+				realProcess.env.TZ = zone;
+				try {
+					expect(timesOf(helpers.eachCronDate(spec.expression, { from, to: end }))).toEqual(zoned);
+					expect(helpers.previousCronDate(spec.expression, { from })).toEqual(before);
+				} finally {
+					if (previous === undefined) delete realProcess.env.TZ;
+					else realProcess.env.TZ = previous;
+				}
+			})
+		);
+	});
+
+	it('nextCronDate and previousCronDate find the nearest matching wall-clock time at a fixed offset, by a day-by-day scan', function () {
+		fc.assert(
+			fc.property(
+				cronArb,
+				fc.integer({ min: Date.UTC(1900, 0, 1), max: Date.UTC(2200, 0, 1) }),
+				fc.constantFrom('UTC', '+05:30', '-09:45'),
+				function (spec, from, timeZone) {
+					const offset = timeZone === 'UTC' ? 0 : timeZone === '+05:30' ? 5.5 * HOUR : -9.75 * HOUR;
+					const daily = timesOfDay(spec);
+					const wall = from + offset;
+					const today = Math.floor(wall / DAY) * DAY;
+					let expectedNext: number | undefined;
+					let expectedPrevious: number | undefined;
+
+					for (let day = 0; day <= 3000 && expectedNext === undefined; day++) {
+						const start = today + day * DAY;
+
+						if (!dayMatches(spec, start)) continue;
+
+						const time = daily.find(function (t) {
+							return day > 0 || t * SECOND > wall - today;
+						});
+
+						if (time !== undefined) expectedNext = start + time * SECOND - offset;
+					}
+					for (let day = 0; day <= 3000 && expectedPrevious === undefined; day++) {
+						const start = today - day * DAY;
+
+						if (!dayMatches(spec, start)) continue;
+
+						const earlier = daily.filter(function (t) {
+							return day > 0 || t * SECOND < wall - today;
+						});
+						const time = earlier.length > 0 ? earlier[earlier.length - 1] : undefined;
+
+						if (time !== undefined) expectedPrevious = start + time * SECOND - offset;
+					}
+
+					const next = helpers.nextCronDate(spec.expression, { from, timeZone });
+					const previous = helpers.previousCronDate(spec.expression, { from, timeZone });
+
+					if (expectedNext === undefined) expect(next === undefined || next.getTime() > today + 3000 * DAY - offset).toBe(true);
+					else expect(next?.getTime()).toBe(expectedNext);
+					if (expectedPrevious === undefined) expect(previous === undefined || previous.getTime() < today - 3000 * DAY - offset).toBe(true);
+					else expect(previous?.getTime()).toBe(expectedPrevious);
+					if (next !== undefined) expect(helpers.isCronMatch(spec.expression, next, { timeZone })).toBe(true);
+					expect(helpers.isCronMatch(spec.expression, from, { timeZone })).toBe(
+						specMatches(spec, Math.floor(wall / (spec.hasSeconds ? SECOND : MINUTE)) * (spec.hasSeconds ? SECOND : MINUTE))
+					);
+				}
+			)
 		);
 	});
 });

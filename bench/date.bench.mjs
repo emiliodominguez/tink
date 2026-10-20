@@ -11,6 +11,7 @@ import {
 	diffInMonths,
 	diffInWeeks,
 	diffInYears,
+	eachCronDate,
 	eachDayOfInterval,
 	eachOfInterval,
 	endOfDay,
@@ -21,17 +22,22 @@ import {
 	getDayOfYear,
 	getISOWeek,
 	getRelativeTime,
+	getZonedParts,
 	intervalsOverlap,
 	intervalToDuration,
+	isCronMatch,
 	isSameDay,
 	isSameQuarter,
 	isSameWeek,
 	isTomorrow,
 	isValidDate,
+	nextCronDate,
 	nextWeekday,
+	parseCron,
 	parseDate,
 	parseDuration,
 	parseISODate,
+	previousCronDate,
 	roundToNearestMinutes,
 	startOfDay,
 	startOfHour,
@@ -63,6 +69,39 @@ const duration = { years: 1, months: 2, weeks: 1, days: 3, hours: 4, minutes: 5,
 const mixedValues = dates.map(function (date, index) {
 	return index % 3 === 0 ? new Date(NaN) : index % 3 === 1 ? date : date.getTime();
 });
+
+// 100 search starts spread over a year (every 3 days and 17 minutes, so they fall on every weekday and time of day).
+const cronStarts = Array.from({ length: 100 }, function (_, index) {
+	return Date.UTC(2024, 0, 1) + index * (3 * 86_400_000 + 17 * 60_000) + index * 7919;
+});
+const businessHours = parseCron('*/15 9-17 * * 1-5');
+const cronExpressions = ['*/15 9-17 * * 1-5', '0 0 1 * *', '30 2 * * *', '@hourly', '0 9 * JAN-MAR MON#2,FRIL'];
+
+/**
+ * Brute force: the first whole minute after `from` whose wall clock in `timeZone` matches `*\/15 9-17 * * 1-5`, minute by minute.
+ * @param {number} from - The instant to search after
+ * @param {string} timeZone - The time zone
+ * @returns {number} The instant
+ */
+function bruteBusinessHours(from, timeZone) {
+	for (let time = Math.floor(from / 60_000) * 60_000 + 60_000; ; time += 60_000) {
+		const parts = getZonedParts(time, timeZone);
+
+		if (parts.minute % 15 === 0 && parts.hour >= 9 && parts.hour <= 17 && parts.weekday >= 1 && parts.weekday <= 5) return time;
+	}
+}
+
+/**
+ * Runs `fn(start)` on every search start and returns a checksum.
+ * @param {(start: number) => number} fn - The search
+ * @returns {() => number} The benchmark body
+ */
+function eachStart(fn) {
+	return new Function('fn', 'starts', 'return function () { let total = 0; for (let i = 0; i < starts.length; i++) total += fn(starts[i]); return total; };')(
+		fn,
+		cronStarts
+	);
+}
 
 /**
  * Returns a benchmark body that runs `fn(date, index, other)` on every sample date (`other` is the mirrored sample)
@@ -502,6 +541,71 @@ export default [
 			let total = 0;
 			for (let i = 0; i < durationStrings.length; i++) total += parseDuration(durationStrings[i]);
 			return total;
+		}
+	},
+	{
+		name: 'nextCronDate (100 starts, New York)',
+		fn: eachStart(function (from) {
+			return nextCronDate(businessHours, { from, timeZone: 'America/New_York' }).getTime();
+		}),
+		baseline: eachStart(function (from) {
+			return bruteBusinessHours(from, 'America/New_York');
+		})
+	},
+	{
+		name: 'nextCronDate (100 starts, UTC offset)',
+		fn: eachStart(function (from) {
+			return nextCronDate(businessHours, { from, timeZone: '+00:00' }).getTime();
+		}),
+		baseline: eachStart(function (from) {
+			return bruteBusinessHours(from, '+00:00');
+		})
+	},
+	{
+		name: 'nextCronDate (100 starts, local time, string)',
+		fn: eachStart(function (from) {
+			return nextCronDate('*/15 9-17 * * 1-5', { from }).getTime();
+		})
+	},
+	{
+		name: 'previousCronDate (100 starts, New York)',
+		fn: eachStart(function (from) {
+			return previousCronDate(businessHours, { from, timeZone: 'America/New_York' }).getTime();
+		})
+	},
+	{
+		name: 'nextCronDate (sparse: 0 0 29 2 *, 100 starts)',
+		fn: eachStart(function (from) {
+			return nextCronDate('0 0 29 2 *', { from, timeZone: 'UTC' }).getTime();
+		})
+	},
+	{
+		name: 'nextCronDate (never fires: 0 0 30 2 *)',
+		fn: function () {
+			return nextCronDate('0 0 30 2 *', { from: 0, timeZone: 'UTC' }) === undefined ? 1 : 0;
+		}
+	},
+	{
+		name: 'eachCronDate (*/5, one week, New York)',
+		fn: function () {
+			let count = 0;
+			for (const date of eachCronDate('*/5 * * * *', { from: cronStarts[20], to: cronStarts[20] + 7 * 86_400_000, timeZone: 'America/New_York' }))
+				count += date.getMinutes();
+			return count;
+		}
+	},
+	{
+		name: 'isCronMatch (100 instants, New York)',
+		fn: eachStart(function (from) {
+			return isCronMatch(businessHours, from, { timeZone: 'America/New_York' }) ? 1 : 0;
+		})
+	},
+	{
+		name: 'parseCron (5 expressions)',
+		fn: function () {
+			let length = 0;
+			for (let i = 0; i < cronExpressions.length; i++) length += parseCron(cronExpressions[i]).expression.length;
+			return length;
 		}
 	}
 ];

@@ -2338,6 +2338,57 @@ describe('Date helpers', function () {
 			});
 		});
 
+		it('a skipped calendar day is not a business day, for addBusinessDays and diffInBusinessDays alike', function () {
+			withTimeZone('Pacific/Apia', function () {
+				// Saturday, December 31st, 2011 at 00:00 (+14:00): the clock went from Thursday 29th 23:59:59 (-10:00) straight to it.
+				const saturday = new Date('2011-12-30T10:00:00.000Z');
+				const thursday = new Date(2011, 11, 29, 10);
+				expect(parts(saturday)).toEqual([2011, 11, 31, 0, 0, 0, 0]);
+				expect(parts(helpers.addBusinessDays(saturday, -1))).toEqual([2011, 11, 29, 0, 0, 0, 0]);
+				expect(parts(helpers.addBusinessDays(saturday, -2))).toEqual([2011, 11, 28, 0, 0, 0, 0]);
+				expect(parts(helpers.addBusinessDays(saturday, -3))).toEqual([2011, 11, 27, 0, 0, 0, 0]);
+				expect(parts(helpers.addBusinessDays(saturday, 1))).toEqual([2012, 0, 2, 0, 0, 0, 0]);
+				expect(parts(helpers.addBusinessDays(new Date(2012, 0, 2, 10), -1))).toEqual([2011, 11, 29, 10, 0, 0, 0]);
+				expect(parts(helpers.addBusinessDays(new Date(2012, 0, 2, 10), -2))).toEqual([2011, 11, 28, 10, 0, 0, 0]);
+				expect(parts(helpers.addBusinessDays(new Date(2011, 11, 28, 10), 2))).toEqual([2012, 0, 2, 10, 0, 0, 0]);
+				expect(parts(helpers.addBusinessDays(new Date(2011, 11, 20, 10), 10))).toEqual([2012, 0, 4, 10, 0, 0, 0]);
+				expect(parts(helpers.addBusinessDays(new Date(2012, 0, 4, 10), -10))).toEqual([2011, 11, 20, 10, 0, 0, 0]);
+				// Holidays and other weekends combine with the skipped day.
+				const options: helpers.BusinessDayOptions = { holidays: [new Date(2011, 11, 29)], weekend: [0] };
+				expect(parts(helpers.addBusinessDays(new Date(2011, 11, 28, 10), 1, options))).toEqual([2011, 11, 31, 10, 0, 0, 0]);
+				expect(parts(helpers.addBusinessDays(saturday, -1, options))).toEqual([2011, 11, 28, 0, 0, 0, 0]);
+				expect(helpers.diffInBusinessDays(saturday, new Date(2011, 11, 28), options)).toBe(1);
+				// A business day right after the skipped one is not skipped over going back.
+				expect(parts(helpers.addBusinessDays(new Date(2012, 0, 2, 10), -1, { weekend: [0] }))).toEqual([2011, 11, 31, 10, 0, 0, 0]);
+				expect(parts(helpers.addBusinessDays(new Date(2012, 0, 2, 10), -2, { weekend: [0] }))).toEqual([2011, 11, 29, 10, 0, 0, 0]);
+				expect(parts(helpers.addBusinessDays(new Date(2012, 0, 1, 10), -1, { weekend: [0] }))).toEqual([2011, 11, 31, 10, 0, 0, 0]);
+				// Friday the 30th is not counted.
+				expect(helpers.diffInBusinessDays(saturday, thursday)).toBe(0);
+				expect(helpers.diffInBusinessDays(thursday, saturday)).toBe(0);
+				expect(helpers.diffInBusinessDays(new Date(2012, 0, 2), thursday)).toBe(1);
+				expect(helpers.diffInBusinessDays(thursday, new Date(2012, 0, 2))).toBe(-1);
+				expect(helpers.diffInBusinessDays(new Date(2012, 0, 31), new Date(2011, 11, 1))).toBe(42);
+				expect(helpers.diffInBusinessDays(new Date(2012, 0, 31), new Date(2011, 11, 1), { weekend: [0, 5, 6] })).toBe(34);
+				// Far from the skipped day, nothing changes.
+				expect(helpers.diffInBusinessDays(new Date(2011, 11, 29), new Date(2011, 11, 1))).toBe(20);
+				expect(helpers.isBusinessDay(saturday)).toBe(false);
+				expect(helpers.isBusinessDay(thursday)).toBe(true);
+			});
+			// Looking for a skipped day costs two offset reads when there is none (no bisection).
+			const reads = jest.spyOn(Date.prototype, 'getTimezoneOffset');
+			try {
+				helpers.diffInBusinessDays(new Date(2024, 11, 31), new Date(2024, 0, 1));
+				expect(reads).toHaveBeenCalledTimes(2);
+			} finally {
+				reads.mockRestore();
+			}
+			withTimeZone('Pacific/Kiritimati', function () {
+				// Kiritimati skipped Saturday, December 31st, 1994: no business day was lost.
+				expect(parts(helpers.addBusinessDays(new Date(1994, 11, 30, 9), 1))).toEqual([1995, 0, 2, 9, 0, 0, 0]);
+				expect(helpers.diffInBusinessDays(new Date(1995, 0, 2), new Date(1994, 11, 30))).toBe(1);
+			});
+		});
+
 		it('eachDayOfInterval lists each existing local day once', function () {
 			withTimeZone('Pacific/Apia', function () {
 				const days = helpers.eachDayOfInterval(new Date(2011, 11, 29), new Date(2012, 0, 1)).map(function (date) {
@@ -3922,4 +3973,785 @@ describe('Date helpers (scheduling round)', function () {
 		}
 		expect(helpers.mergeIntervals([new Slot(), { start: 2, end: 4 }])).toEqual([{ start: new Date(1), end: new Date(4) }]);
 	});
+});
+
+describe('Cron', function () {
+	const MINUTE = 60_000;
+	const HOUR = 3_600_000;
+	const DAY = 86_400_000;
+
+	/**
+	 * The successive dates of a cron expression, formatted on the wall clock of `timeZone` with its offset.
+	 */
+	function walls(cron: string, from: number, limit: number, timeZone = 'UTC'): string[] {
+		return Array.from(helpers.eachCronDate(cron, { from, limit, timeZone }), function (date) {
+			return helpers.formatInTimeZone(date, timeZone, 'YYYY-MM-DD HH:mm:ss Z');
+		});
+	}
+
+	/**
+	 * The date before `from`, formatted like {@link walls}.
+	 */
+	function previousWall(cron: string, from: number, timeZone = 'UTC', inclusive = false): string | undefined {
+		const date = helpers.previousCronDate(cron, { from, timeZone, inclusive });
+
+		return date && helpers.formatInTimeZone(date, timeZone, 'YYYY-MM-DD HH:mm:ss Z');
+	}
+
+	/**
+	 * The time of the next date, or `undefined`.
+	 */
+	function next(cron: string | helpers.Cron, from: number, timeZone = 'UTC'): number | undefined {
+		return helpers.nextCronDate(cron, { from, timeZone })?.getTime();
+	}
+
+	describe('parseCron', function () {
+		it('returns a frozen null-prototype handle holding the trimmed expression', function () {
+			const cron = helpers.parseCron(' \t*/5 * * * *\n');
+
+			expect(cron.expression).toBe('*/5 * * * *');
+			expect(Object.isFrozen(cron)).toBe(true);
+			expect(Object.getPrototypeOf(cron)).toBeNull();
+			expect(Object.keys(cron)).toEqual(['expression']);
+			expect(helpers.parseCron('*/5 * * * *')).not.toBe(cron);
+			expect(next(cron, 0)).toBe(5 * MINUTE);
+		});
+
+		it('reads lists, ranges, steps and names', function () {
+			expect(walls('5,10-12,50/4 * * * *', Date.UTC(2024, 0, 1), 8)).toEqual([
+				'2024-01-01 00:05:00 +00:00',
+				'2024-01-01 00:10:00 +00:00',
+				'2024-01-01 00:11:00 +00:00',
+				'2024-01-01 00:12:00 +00:00',
+				'2024-01-01 00:50:00 +00:00',
+				'2024-01-01 00:54:00 +00:00',
+				'2024-01-01 00:58:00 +00:00',
+				'2024-01-01 01:05:00 +00:00'
+			]);
+			expect(walls('0 0-23/7 * * *', Date.UTC(2024, 0, 1), 5)).toEqual([
+				'2024-01-01 07:00:00 +00:00',
+				'2024-01-01 14:00:00 +00:00',
+				'2024-01-01 21:00:00 +00:00',
+				'2024-01-02 00:00:00 +00:00',
+				'2024-01-02 07:00:00 +00:00'
+			]);
+			expect(walls('0 0 1 jan,Jul *', Date.UTC(2024, 0, 2), 3)).toEqual(['2024-07-01 00:00:00 +00:00', '2025-01-01 00:00:00 +00:00', '2025-07-01 00:00:00 +00:00']);
+		});
+
+		it('rejects a reversed name range', function () {
+			expect(function () {
+				helpers.parseCron('0 0 * * SAT-SUN');
+			}).toThrow(new RangeError('parseCron: the day-of-week field ranges must not be reversed, got "SAT-SUN"'));
+			expect(walls('0 0 * * 6-7', Date.UTC(2024, 0, 1), 3)).toEqual(['2024-01-06 00:00:00 +00:00', '2024-01-07 00:00:00 +00:00', '2024-01-13 00:00:00 +00:00']);
+		});
+
+		it('reads zero-padded values, and 7 as Sunday', function () {
+			expect(walls('07 09 * * 7', Date.UTC(2024, 0, 1), 2)).toEqual(['2024-01-07 09:07:00 +00:00', '2024-01-14 09:07:00 +00:00']);
+			expect(walls('0 0 * * 5-7', Date.UTC(2024, 0, 1), 3)).toEqual(['2024-01-05 00:00:00 +00:00', '2024-01-06 00:00:00 +00:00', '2024-01-07 00:00:00 +00:00']);
+			expect(walls('0 0 * * 3/3', Date.UTC(2024, 0, 1), 3)).toEqual(['2024-01-03 00:00:00 +00:00', '2024-01-06 00:00:00 +00:00', '2024-01-10 00:00:00 +00:00']);
+			// `*` covers 0-7, which gives the same set as 0-6 for every step.
+			expect(walls('0 0 * * */7', Date.UTC(2024, 0, 1), 2)).toEqual(['2024-01-07 00:00:00 +00:00', '2024-01-14 00:00:00 +00:00']);
+			expect(walls('0 0 * * 1/7', Date.UTC(2024, 0, 1), 2)).toEqual(['2024-01-08 00:00:00 +00:00', '2024-01-15 00:00:00 +00:00']);
+		});
+
+		it('takes a leading seconds field when there are 6 fields', function () {
+			expect(walls('*/20 0 0 * * *', Date.UTC(2024, 0, 1), 4)).toEqual([
+				'2024-01-01 00:00:20 +00:00',
+				'2024-01-01 00:00:40 +00:00',
+				'2024-01-02 00:00:00 +00:00',
+				'2024-01-02 00:00:20 +00:00'
+			]);
+			expect(walls('59 59 23 31 12 *', Date.UTC(2024, 0, 1), 1)).toEqual(['2024-12-31 23:59:59 +00:00']);
+			expect(walls('30 29,30,59 * * * *', Date.UTC(2024, 0, 1), 4)).toEqual([
+				'2024-01-01 00:29:30 +00:00',
+				'2024-01-01 00:30:30 +00:00',
+				'2024-01-01 00:59:30 +00:00',
+				'2024-01-01 01:29:30 +00:00'
+			]);
+		});
+
+		it('expands the macros', function () {
+			const from = Date.UTC(2024, 4, 15, 10, 30);
+			const pairs: Array<[string, string]> = [
+				['@yearly', '0 0 1 1 *'],
+				['@annually', '0 0 1 1 *'],
+				['@monthly', '0 0 1 * *'],
+				['@weekly', '0 0 * * 0'],
+				['@daily', '0 0 * * *'],
+				['@midnight', '0 0 * * *'],
+				['@hourly', '0 * * * *'],
+				['@HOURLY', '0 * * * *']
+			];
+
+			for (const [macro, expression] of pairs) {
+				expect(walls(macro, from, 3)).toEqual(walls(expression, from, 3));
+				expect(helpers.parseCron(` ${macro} `).expression).toBe(macro);
+			}
+		});
+
+		it('combines the day of the month and the day of the week like Vixie cron', function () {
+			// Both restricted: either one matches (the 13th, or a Friday).
+			expect(walls('0 0 13 * 5', Date.UTC(2024, 8, 1), 4)).toEqual([
+				'2024-09-06 00:00:00 +00:00',
+				'2024-09-13 00:00:00 +00:00',
+				'2024-09-20 00:00:00 +00:00',
+				'2024-09-27 00:00:00 +00:00'
+			]);
+			expect(walls('0 0 1,15 * MON', Date.UTC(2024, 0, 9), 3)).toEqual(['2024-01-15 00:00:00 +00:00', '2024-01-22 00:00:00 +00:00', '2024-01-29 00:00:00 +00:00']);
+			// A field starting with `*` (even `*\/2`) is unrestricted: both must match.
+			expect(walls('0 0 */2 * 1', Date.UTC(2024, 0, 1), 3)).toEqual(['2024-01-15 00:00:00 +00:00', '2024-01-29 00:00:00 +00:00', '2024-02-05 00:00:00 +00:00']);
+			expect(walls('0 0 13 * */1', Date.UTC(2024, 0, 1), 2)).toEqual(['2024-01-13 00:00:00 +00:00', '2024-02-13 00:00:00 +00:00']);
+			// Only the first character counts, as in cronie.
+			expect(walls('0 0 13,* * 5', Date.UTC(2024, 0, 1), 2)).toEqual(['2024-01-02 00:00:00 +00:00', '2024-01-03 00:00:00 +00:00']);
+		});
+
+		it('reads L, wL and w#k', function () {
+			expect(walls('0 0 L * *', Date.UTC(2023, 0, 1), 3)).toEqual(['2023-01-31 00:00:00 +00:00', '2023-02-28 00:00:00 +00:00', '2023-03-31 00:00:00 +00:00']);
+			expect(walls('0 0 L 2 *', Date.UTC(2024, 0, 1), 2)).toEqual(['2024-02-29 00:00:00 +00:00', '2025-02-28 00:00:00 +00:00']);
+			expect(walls('0 0 1,15,l * *', Date.UTC(2024, 3, 2), 3)).toEqual(['2024-04-15 00:00:00 +00:00', '2024-04-30 00:00:00 +00:00', '2024-05-01 00:00:00 +00:00']);
+			expect(walls('0 0 * * 5L', Date.UTC(2024, 0, 1), 3)).toEqual(['2024-01-26 00:00:00 +00:00', '2024-02-23 00:00:00 +00:00', '2024-03-29 00:00:00 +00:00']);
+			expect(walls('0 0 * * FriL,0l', Date.UTC(2024, 0, 1), 3)).toEqual(['2024-01-26 00:00:00 +00:00', '2024-01-28 00:00:00 +00:00', '2024-02-23 00:00:00 +00:00']);
+			expect(walls('0 0 * * 7L', Date.UTC(2024, 0, 1), 1)).toEqual(['2024-01-28 00:00:00 +00:00']);
+			// January 24th is a Wednesday 7 days before the end, not the last one.
+			expect(walls('0 0 * * 3L', Date.UTC(2024, 0, 1), 1)).toEqual(['2024-01-31 00:00:00 +00:00']);
+			expect(walls('0 0 * * MON#1,1#3', Date.UTC(2024, 0, 2), 3)).toEqual(['2024-01-15 00:00:00 +00:00', '2024-02-05 00:00:00 +00:00', '2024-02-19 00:00:00 +00:00']);
+			expect(walls('0 0 * * 2#4,3#2', Date.UTC(2024, 0, 1), 2)).toEqual(['2024-01-10 00:00:00 +00:00', '2024-01-23 00:00:00 +00:00']);
+			// The fifth Thursday: only in months with five.
+			expect(walls('0 0 * * 4#5', Date.UTC(2024, 0, 1), 3)).toEqual(['2024-02-29 00:00:00 +00:00', '2024-05-30 00:00:00 +00:00', '2024-08-29 00:00:00 +00:00']);
+			// With a restricted day of the month: either.
+			expect(walls('0 0 10 * 5L', Date.UTC(2024, 0, 1), 3)).toEqual(['2024-01-10 00:00:00 +00:00', '2024-01-26 00:00:00 +00:00', '2024-02-10 00:00:00 +00:00']);
+		});
+
+		it('accepts expressions that never fire, which then have no dates', function () {
+			for (const expression of ['0 0 30 2 *', '0 0 31 2,4,6,9,11 *', '0 0 30,31 feb *']) {
+				const cron = helpers.parseCron(expression);
+
+				expect(helpers.nextCronDate(cron, { from: 0, timeZone: 'UTC' })).toBeUndefined();
+				expect(helpers.previousCronDate(cron, { from: 0, timeZone: 'UTC' })).toBeUndefined();
+				expect([...helpers.eachCronDate(cron, { from: 0, timeZone: 'UTC' })]).toEqual([]);
+				expect(helpers.isCronMatch(cron, 0)).toBe(false);
+			}
+			// Rare but possible: odd days AND the fifth Monday of February, so a Monday February 29th (2016, then 2044).
+			expect(walls('0 0 */2 2 1#5', Date.UTC(2017, 0, 1), 2)).toEqual(['2044-02-29 00:00:00 +00:00', '2072-02-29 00:00:00 +00:00']);
+			expect(previousWall('0 0 */2 2 1#5', Date.UTC(2044, 0, 1))).toBe('2016-02-29 00:00:00 +00:00');
+			expect(walls('0 0 29 2 *', Date.UTC(2096, 2, 1), 2)).toEqual(['2104-02-29 00:00:00 +00:00', '2108-02-29 00:00:00 +00:00']);
+			// Days 1 and 22 that are the last Monday: only February 22nd of a common year can be, so April never matches.
+			expect(walls('0 0 */21 2 1L', Date.UTC(2017, 0, 1), 2)).toEqual(['2021-02-22 00:00:00 +00:00', '2027-02-22 00:00:00 +00:00']);
+			expect(helpers.nextCronDate('0 0 */21 4 1L', { from: 0, timeZone: 'UTC' })).toBeUndefined();
+			expect(helpers.nextCronDate('0 0 */21 4 0L', { from: 0, timeZone: 'UTC' })).toBeUndefined();
+			// Days 1 and 29 that are the last Monday: February 29th.
+			expect(walls('0 0 */28 2 1L', Date.UTC(2017, 0, 1), 1)).toEqual(['2044-02-29 00:00:00 +00:00']);
+		});
+
+		it('rejects a value that is not a string', function () {
+			expect(function () {
+				helpers.parseCron(5 as any);
+			}).toThrow(new TypeError('parseCron: `expression` must be a string, got number'));
+			expect(function () {
+				helpers.parseCron(null as any);
+			}).toThrow(new TypeError('parseCron: `expression` must be a string, got null'));
+		});
+
+		it('rejects the wrong number of fields and unknown macros', function () {
+			expect(function () {
+				helpers.parseCron('');
+			}).toThrow(new RangeError('parseCron: `expression` must have 5 fields, or 6 with seconds first, got 0 in ""'));
+			expect(function () {
+				helpers.parseCron('* * * *');
+			}).toThrow(new RangeError('parseCron: `expression` must have 5 fields, or 6 with seconds first, got 4 in "* * * *"'));
+			expect(function () {
+				helpers.parseCron('0 0 0 1 1 * 2024');
+			}).toThrow(new RangeError('parseCron: `expression` must have 5 fields, or 6 with seconds first, got 7 in "0 0 0 1 1 * 2024"'));
+			const macros = '@yearly, @annually, @monthly, @weekly, @daily, @midnight, @hourly';
+
+			expect(function () {
+				helpers.parseCron('@reboot');
+			}).toThrow(new RangeError(`parseCron: \`expression\` macros are ${macros}, got "@reboot"`));
+			expect(function () {
+				helpers.parseCron('@daily *');
+			}).toThrow(new RangeError(`parseCron: \`expression\` macros are ${macros}, got "@daily *"`));
+			// The expansions are not names.
+			expect(function () {
+				helpers.parseCron('@0 0 1 1 *');
+			}).toThrow(RangeError);
+		});
+
+		it('rejects malformed items, naming the field', function () {
+			const cases: Array<[string, string]> = [
+				['1-, * * * *', 'the minute field must be a list of *, values, ranges (a-b) and steps (/n), got "1-,"'],
+				['* -1 * * *', 'the hour field must be a list of *, values, ranges (a-b) and steps (/n), got "-1"'],
+				['1,,2 * * * *', 'the minute field must be a list of *, values, ranges (a-b) and steps (/n), got "1,,2"'],
+				['5, * * * *', 'the minute field must be a list of *, values, ranges (a-b) and steps (/n), got "5,"'],
+				['*/ * * * *', 'the minute field must be a list of *, values, ranges (a-b) and steps (/n), got "*/"'],
+				['*-5 * * * *', 'the minute field must be a list of *, values, ranges (a-b) and steps (/n), got "*-5"'],
+				['+5 * * * *', 'the minute field must be a list of *, values, ranges (a-b) and steps (/n), got "+5"'],
+				['1.5 * * * *', 'the minute field must be a list of *, values, ranges (a-b) and steps (/n), got "1.5"'],
+				['* * ? * *', 'the day-of-month field must be a list of *, values, ranges (a-b) and steps (/n) or L, got "?"'],
+				['* * 15W * *', 'the day-of-month field values must be between 1 and 31, got "15W"'],
+				['* * L-3 * *', 'the day-of-month field values must be between 1 and 31, got "L-3"'],
+				['* * LW * *', 'the day-of-month field values must be between 1 and 31, got "LW"'],
+				['* * L/2 * *', 'the day-of-month field values must be between 1 and 31, got "L/2"'],
+				['* * * * ?', 'the day-of-week field must be a list of *, values, ranges (a-b) and steps (/n), nL or n#k, got "?"'],
+				['* * * * 1-5L', 'the day-of-week field values must be between 0 and 7 (or SUN-SAT), got "1-5L"'],
+				['* * * * L', 'the day-of-week field values must be between 0 and 7 (or SUN-SAT), got "L"'],
+				['* * * * #2', 'the day-of-week field must be a list of *, values, ranges (a-b) and steps (/n), nL or n#k, got "#2"'],
+				['* * * * 5L2', 'the day-of-week field values must be between 0 and 7 (or SUN-SAT), got "5L2"'],
+				['* * * * 5#1x', 'the day-of-week field must be a list of *, values, ranges (a-b) and steps (/n), nL or n#k, got "5#1x"'],
+				['* * * 1L *', 'the month field values must be between 1 and 12 (or JAN-DEC), got "1L"'],
+				['5L * * * *', 'the minute field values must be between 0 and 59, got "5L"'],
+				['* * 1#2 * *', 'the day-of-month field must be a list of *, values, ranges (a-b) and steps (/n) or L, got "1#2"']
+			];
+
+			for (const [expression, message] of cases) {
+				expect(function () {
+					helpers.parseCron(expression);
+				}).toThrow(new RangeError(`parseCron: ${message}`));
+			}
+		});
+
+		it('rejects values out of range, unknown names, reversed ranges and bad steps', function () {
+			const cases: Array<[string, string]> = [
+				['60 * * * *', 'the minute field values must be between 0 and 59, got "60"'],
+				['60 * * * * *', 'the second field values must be between 0 and 59, got "60"'],
+				['* 24 * * *', 'the hour field values must be between 0 and 23, got "24"'],
+				['* 0-24 * * *', 'the hour field values must be between 0 and 23, got "0-24"'],
+				['* * 0 * *', 'the day-of-month field values must be between 1 and 31, got "0"'],
+				['* * 32 * *', 'the day-of-month field values must be between 1 and 31, got "32"'],
+				['* * * 0 *', 'the month field values must be between 1 and 12 (or JAN-DEC), got "0"'],
+				['* * * 13 *', 'the month field values must be between 1 and 12 (or JAN-DEC), got "13"'],
+				['* * * * 8', 'the day-of-week field values must be between 0 and 7 (or SUN-SAT), got "8"'],
+				['* * * JANUARY *', 'the month field values must be between 1 and 12 (or JAN-DEC), got "JANUARY"'],
+				['* * * ANF *', 'the month field values must be between 1 and 12 (or JAN-DEC), got "ANF"'],
+				['* * * * MON-FRY', 'the day-of-week field values must be between 0 and 7 (or SUN-SAT), got "MON-FRY"'],
+				['MON * * * *', 'the minute field values must be between 0 and 59, got "MON"'],
+				['* * JAN * *', 'the day-of-month field values must be between 1 and 31, got "JAN"'],
+				['* * * MON *', 'the month field values must be between 1 and 12 (or JAN-DEC), got "MON"'],
+				['* * * * JAN', 'the day-of-week field values must be between 0 and 7 (or SUN-SAT), got "JAN"'],
+				['00000000000000000000000000060 * * * *', 'the minute field values must be between 0 and 59, got "00000000000000000000000000060"'],
+				['5-1 * * * *', 'the minute field ranges must not be reversed, got "5-1"'],
+				['* * * DEC-JAN *', 'the month field ranges must not be reversed, got "DEC-JAN"'],
+				['*/0 * * * *', 'the minute field steps must be between 1 and 59, got "*/0"'],
+				['*/60 * * * *', 'the minute field steps must be between 1 and 59, got "*/60"'],
+				['* 1-5/24 * * *', 'the hour field steps must be between 1 and 23, got "1-5/24"'],
+				['* * 1/32 * *', 'the day-of-month field steps must be between 1 and 31, got "1/32"'],
+				['* * * */13 *', 'the month field steps must be between 1 and 12, got "*/13"'],
+				['* * * * */8', 'the day-of-week field steps must be between 1 and 7, got "*/8"'],
+				['* * * * 5#0', 'the day-of-week field occurrences (#) must be between 1 and 5, got "5#0"'],
+				['* * * * 5#6', 'the day-of-week field occurrences (#) must be between 1 and 5, got "5#6"'],
+				['* * * * 8L', 'the day-of-week field values must be between 0 and 7 (or SUN-SAT), got "8L"'],
+				['* * * * 8#1', 'the day-of-week field values must be between 0 and 7 (or SUN-SAT), got "8#1"'],
+				['* * * * 5#10', 'the day-of-week field occurrences (#) must be between 1 and 5, got "5#10"'],
+				['0x1 * * * *', 'the minute field values must be between 0 and 59, got "0x1"'],
+				['1e1 * * * *', 'the minute field values must be between 0 and 59, got "1e1"'],
+				['* * * ja *', 'the month field values must be between 1 and 12 (or JAN-DEC), got "ja"'],
+				['* * MON * *', 'the day-of-month field values must be between 1 and 31, got "MON"'],
+				['* * * * mo', 'the day-of-week field values must be between 0 and 7 (or SUN-SAT), got "mo"']
+			];
+
+			for (const [expression, message] of cases) {
+				expect(function () {
+					helpers.parseCron(expression);
+				}).toThrow(new RangeError(`parseCron: ${message}`));
+			}
+			// The largest steps.
+			expect(walls('*/59 * * * *', Date.UTC(2024, 0, 1), 3)).toEqual(['2024-01-01 00:59:00 +00:00', '2024-01-01 01:00:00 +00:00', '2024-01-01 01:59:00 +00:00']);
+			expect(walls('0 0 1 */12 *', Date.UTC(2024, 0, 1), 1)).toEqual(['2025-01-01 00:00:00 +00:00']);
+			expect(walls('0 0 */31 * *', Date.UTC(2024, 0, 1), 2)).toEqual(['2024-02-01 00:00:00 +00:00', '2024-03-01 00:00:00 +00:00']);
+		});
+
+		it('shortens long items in the messages', function () {
+			expect(function () {
+				helpers.parseCron(`${'1,'.repeat(24)}1- * * * *`);
+			}).toThrow(new RangeError(`parseCron: the minute field must be a list of *, values, ranges (a-b) and steps (/n), got "${'1,'.repeat(24)}1-"`));
+			expect(function () {
+				helpers.parseCron(`${'1,'.repeat(40)}x * * * *`);
+			}).toThrow(new RangeError(`parseCron: the minute field values must be between 0 and 59, got "x"`));
+			expect(function () {
+				helpers.parseCron(`${'1,'.repeat(40)}- * * * *`);
+			}).toThrow(new RangeError(`parseCron: the minute field must be a list of *, values, ranges (a-b) and steps (/n), got "${'1,'.repeat(25)}…"`));
+		});
+
+		it('parses a long expression in linear time', function () {
+			const start = performance.now();
+
+			expect(function () {
+				helpers.parseCron(`${'a'.repeat(200_000)}! * * * *`);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.parseCron(`* * * * ${'1'.repeat(200_000)}#`);
+			}).toThrow(RangeError);
+			expect(helpers.nextCronDate(`${'0,'.repeat(50_000)}0 * * * *`, { from: 0, timeZone: 'UTC' })?.getTime()).toBe(HOUR);
+			expect(performance.now() - start).toBeLessThan(5000);
+		});
+	});
+
+	describe('nextCronDate / previousCronDate', function () {
+		it('finds the next and previous dates, strictly after and before `from` unless inclusive', function () {
+			const from = Date.UTC(2024, 0, 1, 10, 15);
+
+			expect(next('*/15 * * * *', from)).toBe(from + 15 * MINUTE);
+			expect(helpers.nextCronDate('*/15 * * * *', { from, timeZone: 'UTC', inclusive: true })?.getTime()).toBe(from);
+			expect(helpers.nextCronDate('*/15 * * * *', { from: from + 1, timeZone: 'UTC', inclusive: true })?.getTime()).toBe(from + 15 * MINUTE);
+			expect(helpers.nextCronDate('*/15 * * * *', { from: from - 1, timeZone: 'UTC' })?.getTime()).toBe(from);
+			expect(helpers.previousCronDate('*/15 * * * *', { from, timeZone: 'UTC' })?.getTime()).toBe(from - 15 * MINUTE);
+			expect(helpers.previousCronDate('*/15 * * * *', { from, timeZone: 'UTC', inclusive: true })?.getTime()).toBe(from);
+			expect(helpers.previousCronDate('*/15 * * * *', { from: from + 1, timeZone: 'UTC' })?.getTime()).toBe(from);
+			expect(helpers.previousCronDate('*/15 * * * *', { from: from - 1, timeZone: 'UTC', inclusive: true })?.getTime()).toBe(from - 15 * MINUTE);
+			expect(helpers.nextCronDate('*/15 * * * *', { from: new Date(from), timeZone: 'UTC' })).toEqual(new Date(from + 15 * MINUTE));
+		});
+
+		it('searches from now by default, in local time', function () {
+			const before = Date.now();
+			const date = helpers.nextCronDate('* * * * * *') as Date;
+
+			expect(date.getTime()).toBeGreaterThan(before);
+			expect(date.getTime()).toBeLessThanOrEqual(Date.now() + 1000);
+			expect(date.getMilliseconds()).toBe(0);
+			expect((helpers.previousCronDate('* * * * * *') as Date).getTime()).toBeLessThanOrEqual(Date.now());
+			expect(helpers.nextCronDate('0 9 * * 1-5', { from: new Date(2024, 0, 6) })).toEqual(new Date(2024, 0, 8, 9));
+		});
+
+		it('jumps over the fields, from seconds to years, forward and back', function () {
+			expect(walls('0 0 0 29 2 *', Date.UTC(2023, 5, 1), 1)).toEqual(['2024-02-29 00:00:00 +00:00']);
+			expect(previousWall('0 0 0 29 2 *', Date.UTC(2023, 5, 1))).toBe('2020-02-29 00:00:00 +00:00');
+			expect(previousWall('59 59 23 31 12 *', Date.UTC(2024, 0, 1))).toBe('2023-12-31 23:59:59 +00:00');
+			expect(previousWall('0 30 9 * * MON', Date.UTC(2024, 0, 1, 9, 30))).toBe('2023-12-25 09:30:00 +00:00');
+			expect(previousWall('15,45 */2 * * *', Date.UTC(2024, 0, 1, 1))).toBe('2024-01-01 00:45:00 +00:00');
+			expect(previousWall('15,45 */2 * * *', Date.UTC(2024, 0, 1, 0, 15))).toBe('2023-12-31 22:45:00 +00:00');
+			expect(previousWall('20-25 3 * * *', Date.UTC(2024, 0, 1, 3, 23, 30))).toBe('2024-01-01 03:23:00 +00:00');
+			expect(previousWall('10,40 0 * * * *', Date.UTC(2024, 0, 1, 5, 0, 30))).toBe('2024-01-01 05:00:10 +00:00');
+			expect(previousWall('10,40 0 * * * *', Date.UTC(2024, 0, 1, 5, 0, 5))).toBe('2024-01-01 04:00:40 +00:00');
+			expect(previousWall('40 0,30 * * * *', Date.UTC(2024, 0, 1, 5, 0, 5))).toBe('2024-01-01 04:30:40 +00:00');
+			expect(previousWall('0 0 1 * *', Date.UTC(2024, 0, 1))).toBe('2023-12-01 00:00:00 +00:00');
+			expect(previousWall('0 0 * 3 *', Date.UTC(2024, 1, 1))).toBe('2023-03-31 00:00:00 +00:00');
+			expect(previousWall('0 0 * 3 *', Date.UTC(2024, 4, 1))).toBe('2024-03-31 00:00:00 +00:00');
+			expect(previousWall('0 0 31 * *', Date.UTC(2024, 4, 1))).toBe('2024-03-31 00:00:00 +00:00');
+			expect(walls('0 0 31 * *', Date.UTC(2024, 0, 31, 1), 2)).toEqual(['2024-03-31 00:00:00 +00:00', '2024-05-31 00:00:00 +00:00']);
+			expect(walls('0 12 * * *', Date.UTC(2024, 11, 31, 13), 1)).toEqual(['2025-01-01 12:00:00 +00:00']);
+			expect(walls('5 4 * * *', Date.UTC(2024, 0, 1, 4, 5, 0, 1), 1)).toEqual(['2024-01-02 04:05:00 +00:00']);
+		});
+
+		it('reads the wall clock of a fixed-offset time zone', function () {
+			expect(walls('0 9 * * *', Date.UTC(2024, 0, 1), 2, '+05:30')).toEqual(['2024-01-01 09:00:00 +05:30', '2024-01-02 09:00:00 +05:30']);
+			expect(next('0 0 1 1 *', Date.UTC(2024, 0, 1), '-03:00')).toBe(Date.UTC(2024, 0, 1, 3));
+			expect(next('0 0 1 1 *', Date.UTC(2024, 0, 1, 3), '-03:00')).toBe(Date.UTC(2025, 0, 1, 3));
+		});
+
+		it('runs a fixed-time job skipped by the spring-forward gap once at its end, and a repeated one once (New York)', function () {
+			const zone = 'America/New_York';
+
+			expect(walls('30 2 * * *', Date.UTC(2024, 2, 9), 3, zone)).toEqual(['2024-03-09 02:30:00 -05:00', '2024-03-10 03:00:00 -04:00', '2024-03-11 02:30:00 -04:00']);
+			// Several times in the gap: still one date.
+			expect(walls('0,15,30 2 * * *', Date.UTC(2024, 2, 10, 6), 3, zone)).toEqual([
+				'2024-03-10 03:00:00 -04:00',
+				'2024-03-11 02:00:00 -04:00',
+				'2024-03-11 02:15:00 -04:00'
+			]);
+			expect(walls('0 2-3 * * *', Date.UTC(2024, 2, 10, 6), 3, zone)).toEqual([
+				'2024-03-10 03:00:00 -04:00',
+				'2024-03-11 02:00:00 -04:00',
+				'2024-03-11 03:00:00 -04:00'
+			]);
+			expect(walls('30 1 * * *', Date.UTC(2024, 10, 2), 3, zone)).toEqual(['2024-11-02 01:30:00 -04:00', '2024-11-03 01:30:00 -04:00', '2024-11-04 01:30:00 -05:00']);
+			expect(walls('0-59/20 1 * * *', Date.UTC(2024, 10, 3, 5, 30), 4, zone)).toEqual([
+				'2024-11-03 01:40:00 -04:00',
+				'2024-11-04 01:00:00 -05:00',
+				'2024-11-04 01:20:00 -05:00',
+				'2024-11-04 01:40:00 -05:00'
+			]);
+			// From the second occurrence: the first one has passed.
+			expect(walls('30 1 * * *', Date.UTC(2024, 10, 3, 6, 10), 1, zone)).toEqual(['2024-11-04 01:30:00 -05:00']);
+			expect(walls('45 1 * * *', Date.UTC(2024, 10, 3, 6, 10), 1, zone)).toEqual(['2024-11-04 01:45:00 -05:00']);
+			expect(walls('5 2 * * *', Date.UTC(2024, 10, 3, 6, 10), 1, zone)).toEqual(['2024-11-03 02:05:00 -05:00']);
+			// The same, backward.
+			expect(previousWall('30 2 * * *', Date.UTC(2024, 2, 10, 8), zone)).toBe('2024-03-10 03:00:00 -04:00');
+			expect(previousWall('30 2 * * *', Date.UTC(2024, 2, 10, 7), zone)).toBe('2024-03-09 02:30:00 -05:00');
+			expect(previousWall('30 2 * * *', Date.UTC(2024, 2, 10, 7), zone, true)).toBe('2024-03-10 03:00:00 -04:00');
+			expect(previousWall('30 1 * * *', Date.UTC(2024, 10, 3, 7), zone)).toBe('2024-11-03 01:30:00 -04:00');
+			expect(previousWall('15 1 * * *', Date.UTC(2024, 10, 3, 6, 30), zone)).toBe('2024-11-03 01:15:00 -04:00');
+			expect(previousWall('50 1 * * *', Date.UTC(2024, 10, 3, 6, 30), zone)).toBe('2024-11-03 01:50:00 -04:00');
+			expect(previousWall('50 0 * * *', Date.UTC(2024, 10, 3, 6, 30), zone)).toBe('2024-11-03 00:50:00 -04:00');
+		});
+
+		it('runs a wildcard job at the times the clocks show: none in the gap, both occurrences of a repeated time (New York)', function () {
+			const zone = 'America/New_York';
+
+			expect(walls('*/30 * * * *', Date.UTC(2024, 2, 10, 6), 3, zone)).toEqual([
+				'2024-03-10 01:30:00 -05:00',
+				'2024-03-10 03:00:00 -04:00',
+				'2024-03-10 03:30:00 -04:00'
+			]);
+			expect(walls('30 2 * * * *', Date.UTC(2024, 2, 10, 6), 2, zone)).toEqual(['2024-03-10 01:02:30 -05:00', '2024-03-10 03:02:30 -04:00']);
+			expect(walls('* 2 * * *', Date.UTC(2024, 2, 10, 6), 1, zone)).toEqual(['2024-03-11 02:00:00 -04:00']);
+			expect(walls('*/20 * * * *', Date.UTC(2024, 10, 3, 5, 30), 7, zone)).toEqual([
+				'2024-11-03 01:40:00 -04:00',
+				'2024-11-03 01:00:00 -05:00',
+				'2024-11-03 01:20:00 -05:00',
+				'2024-11-03 01:40:00 -05:00',
+				'2024-11-03 02:00:00 -05:00',
+				'2024-11-03 02:20:00 -05:00',
+				'2024-11-03 02:40:00 -05:00'
+			]);
+			expect(walls('0 * * * *', Date.UTC(2024, 10, 3, 4, 30), 4, zone)).toEqual([
+				'2024-11-03 01:00:00 -04:00',
+				'2024-11-03 01:00:00 -05:00',
+				'2024-11-03 02:00:00 -05:00',
+				'2024-11-03 03:00:00 -05:00'
+			]);
+			expect(previousWall('*/20 * * * *', Date.UTC(2024, 10, 3, 6, 10), zone)).toBe('2024-11-03 01:00:00 -05:00');
+			expect(previousWall('*/20 * * * *', Date.UTC(2024, 10, 3, 6), zone)).toBe('2024-11-03 01:40:00 -04:00');
+			expect(previousWall('*/20 * * * *', Date.UTC(2024, 10, 3, 7, 10), zone)).toBe('2024-11-03 02:00:00 -05:00');
+			// Long after the change, the last firing can still be a second occurrence.
+			expect(previousWall('* 1 * * *', Date.UTC(2024, 10, 3, 17), zone)).toBe('2024-11-03 01:59:00 -05:00');
+			expect(previousWall('* 1 3 11 *', Date.UTC(2025, 0, 1), zone)).toBe('2024-11-03 01:59:00 -05:00');
+			// A fixed-time job: the first occurrence.
+			expect(previousWall('0 1 * * 0', Date.UTC(2024, 10, 3, 6, 30), zone)).toBe('2024-11-03 01:00:00 -04:00');
+		});
+
+		it('handles the 30-minute changes of Lord Howe Island and the hour of London and Havana', function () {
+			expect(walls('0 2 * * *', Date.UTC(2024, 9, 4), 3, 'Australia/Lord_Howe')).toEqual([
+				'2024-10-05 02:00:00 +10:30',
+				'2024-10-06 02:30:00 +11:00',
+				'2024-10-07 02:00:00 +11:00'
+			]);
+			expect(walls('*/15 * * * *', Date.UTC(2024, 3, 6, 14), 8, 'Australia/Lord_Howe')).toEqual([
+				'2024-04-07 01:15:00 +11:00',
+				'2024-04-07 01:30:00 +11:00',
+				'2024-04-07 01:45:00 +11:00',
+				'2024-04-07 01:30:00 +10:30',
+				'2024-04-07 01:45:00 +10:30',
+				'2024-04-07 02:00:00 +10:30',
+				'2024-04-07 02:15:00 +10:30',
+				'2024-04-07 02:30:00 +10:30'
+			]);
+			expect(walls('30 1 * * *', Date.UTC(2024, 3, 6), 2, 'Australia/Lord_Howe')).toEqual(['2024-04-07 01:30:00 +11:00', '2024-04-08 01:30:00 +10:30']);
+			// From 01:50 in the repeated half hour: a fixed-time job's last firing is the first 01:40, a wildcard job's the second.
+			expect(previousWall('40 1 * * *', Date.UTC(2024, 3, 6, 15, 20), 'Australia/Lord_Howe')).toBe('2024-04-07 01:40:00 +11:00');
+			expect(previousWall('40 * * * *', Date.UTC(2024, 3, 6, 15, 20), 'Australia/Lord_Howe')).toBe('2024-04-07 01:40:00 +10:30');
+			expect(walls('30 1 * * *', Date.UTC(2024, 2, 30), 2, 'Europe/London')).toEqual(['2024-03-30 01:30:00 +00:00', '2024-03-31 02:00:00 +01:00']);
+			expect(walls('30 1 * * *', Date.UTC(2024, 9, 26, 12), 2, 'Europe/London')).toEqual(['2024-10-27 01:30:00 +01:00', '2024-10-28 01:30:00 +00:00']);
+			// Havana skips midnight, then repeats it.
+			expect(walls('0 0 * * *', Date.UTC(2024, 2, 9, 12), 2, 'America/Havana')).toEqual(['2024-03-10 01:00:00 -04:00', '2024-03-11 00:00:00 -04:00']);
+			expect(walls('0 0 * * *', Date.UTC(2024, 10, 2, 12), 2, 'America/Havana')).toEqual(['2024-11-03 00:00:00 -04:00', '2024-11-04 00:00:00 -05:00']);
+			expect(walls('0 * * * *', Date.UTC(2024, 10, 3, 3), 3, 'America/Havana')).toEqual([
+				'2024-11-03 00:00:00 -04:00',
+				'2024-11-03 00:00:00 -05:00',
+				'2024-11-03 01:00:00 -05:00'
+			]);
+		});
+
+		it('fires at the end of a gap that crosses midnight (Toronto, 1919)', function () {
+			expect(walls('45 23 * * *', Date.UTC(1919, 2, 30, 12), 2, 'America/Toronto')).toEqual(['1919-03-31 00:30:00 -04:00', '1919-03-31 23:45:00 -04:00']);
+			expect(previousWall('45 23 * * *', Date.UTC(1919, 2, 31, 12), 'America/Toronto')).toBe('1919-03-31 00:30:00 -04:00');
+			// St. John's, 2010: 00:01 back to 23:01 the day before.
+			expect(walls('30 23 * * *', Date.UTC(2010, 10, 6, 12), 2, 'America/St_Johns')).toEqual(['2010-11-06 23:30:00 -02:30', '2010-11-07 23:30:00 -03:30']);
+			expect(walls('*/30 * * * *', Date.UTC(2010, 10, 7, 2), 4, 'America/St_Johns')).toEqual([
+				'2010-11-07 00:00:00 -02:30',
+				'2010-11-06 23:30:00 -03:30',
+				'2010-11-07 00:00:00 -03:30',
+				'2010-11-07 00:30:00 -03:30'
+			]);
+		});
+
+		it('treats jumps of 3 hours or more as the clock being reset, like cronie', function () {
+			// Samoa skipped Friday, December 30th, 2011: nothing catches up.
+			expect(walls('0 12 * * *', Date.UTC(2011, 11, 28), 3, 'Pacific/Apia')).toEqual([
+				'2011-12-28 12:00:00 -10:00',
+				'2011-12-29 12:00:00 -10:00',
+				'2011-12-31 12:00:00 +14:00'
+			]);
+			expect(walls('0 0 30 12 *', Date.UTC(2011, 0, 1), 2, 'Pacific/Apia')).toEqual(['2012-12-30 00:00:00 +14:00', '2013-12-30 00:00:00 +14:00']);
+			expect(previousWall('0 12 * * *', Date.UTC(2011, 11, 30, 12), 'Pacific/Apia')).toBe('2011-12-29 12:00:00 -10:00');
+			// Casey, 2018: 04:00 to 07:00, 3 hours: no catch-up; 2019: 03:00 back to 00:00, 3 hours: no repeat.
+			expect(walls('30 5 * * *', Date.UTC(2018, 9, 6), 2, 'Antarctica/Casey')).toEqual(['2018-10-08 05:30:00 +11:00', '2018-10-09 05:30:00 +11:00']);
+			expect(walls('30 1 * * *', Date.UTC(2019, 2, 16), 2, 'Antarctica/Casey')).toEqual(['2019-03-17 01:30:00 +11:00', '2019-03-18 01:30:00 +08:00']);
+			// Troll: a 2-hour gap is still a daylight-saving change.
+			expect(walls('30 1 * * *', Date.UTC(2024, 2, 30), 2, 'Antarctica/Troll')).toEqual(['2024-03-30 01:30:00 +00:00', '2024-03-31 03:00:00 +02:00']);
+			expect(walls('30 1 * * *', Date.UTC(2024, 9, 26), 2, 'Antarctica/Troll')).toEqual(['2024-10-27 01:30:00 +02:00', '2024-10-28 01:30:00 +00:00']);
+			// Kwajalein, 1969: back 23 hours, so even fixed-time jobs fire again on the repeated day; 1993: August 21st skipped.
+			expect(walls('0 12 * * *', Date.UTC(1969, 8, 29, 2), 3, 'Pacific/Kwajalein')).toEqual([
+				'1969-09-30 12:00:00 +11:00',
+				'1969-09-30 12:00:00 -12:00',
+				'1969-10-01 12:00:00 -12:00'
+			]);
+			expect(previousWall('0 12 * * *', Date.UTC(1969, 9, 1, 1), 'Pacific/Kwajalein')).toBe('1969-09-30 12:00:00 -12:00');
+			expect(previousWall('0 12 * * *', Date.UTC(1969, 8, 30, 20), 'Pacific/Kwajalein')).toBe('1969-09-30 12:00:00 +11:00');
+			expect(previousWall('0 0 * * *', Date.UTC(1969, 8, 30, 13, 30), 'Pacific/Kwajalein')).toBe('1969-09-30 00:00:00 +11:00');
+			expect(walls('0 12 * * *', Date.UTC(1993, 7, 19), 3, 'Pacific/Kwajalein')).toEqual([
+				'1993-08-19 12:00:00 -12:00',
+				'1993-08-20 12:00:00 -12:00',
+				'1993-08-22 12:00:00 +12:00'
+			]);
+		});
+
+		it('catches up every job after a forward jump of less than 5 minutes (Bahia Banderas, 1922)', function () {
+			// 23:59:00 to 00:00:00: the 60 seconds of 23:59 were skipped.
+			expect(walls('30 59 * * * *', Date.UTC(1922, 0, 1, 6, 59), 2, 'America/Bahia_Banderas')).toEqual(['1922-01-01 00:00:00 -07:00', '1922-01-01 00:59:30 -07:00']);
+			expect(walls('30 59 23 * * *', Date.UTC(1922, 0, 1, 6, 59), 1, 'America/Bahia_Banderas')).toEqual(['1922-01-01 00:00:00 -07:00']);
+			expect(previousWall('30 59 * * * *', Date.UTC(1922, 0, 1, 7, 30), 'America/Bahia_Banderas')).toBe('1922-01-01 00:00:00 -07:00');
+		});
+
+		it('gives up after 400 years of matches all lost in gaps', function () {
+			// Every minute from 02:00 on the second Sunday of March: always skipped in New York since 2007.
+			const start = performance.now();
+
+			expect(helpers.nextCronDate('* 2 * 3 0#2', { from: Date.UTC(2010, 0, 1), timeZone: 'America/New_York' })).toBeUndefined();
+			expect(helpers.previousCronDate('* 2 * 3 0#2', { from: Date.UTC(2400, 0, 1), timeZone: 'America/New_York' })?.getTime()).toBe(Date.UTC(2006, 2, 12, 7, 59));
+			expect(helpers.previousCronDate('* 2 * 3 0#2', { from: Date.UTC(2410, 0, 1), timeZone: 'America/New_York' })).toBeUndefined();
+			expect(performance.now() - start).toBeLessThan(5000);
+			// A fixed-time job still fires at the end of each gap.
+			expect(next('0 2 * 3 0#2', Date.UTC(2010, 0, 1), 'America/New_York')).toBe(Date.UTC(2010, 2, 14, 7));
+		});
+
+		it('stops at the ends of the Date range', function () {
+			const max = 8.64e15;
+
+			expect(next('0 0 13 9 *', max - 1)).toBe(max);
+			expect(next('0 0 13 9 *', max)).toBeUndefined();
+			expect(next('* * * * *', max)).toBeUndefined();
+			expect(next('* * * * *', max - 1, 'America/New_York')).toBe(max);
+			expect(next('0 0 * * *', max - 5 * HOUR, '+05:00')).toBeUndefined();
+			expect(next('0 0 * * *', max - 5 * HOUR - 1, '+05:00')).toBe(max - 5 * HOUR);
+			expect(helpers.nextCronDate('0 0 20 4 *', { from: -max, inclusive: true, timeZone: 'UTC' })?.getTime()).toBe(-max);
+			expect(helpers.previousCronDate('0 0 20 4 *', { from: -max + 1, timeZone: 'UTC' })?.getTime()).toBe(-max);
+			expect(helpers.previousCronDate('* * * * *', { from: -max, timeZone: 'UTC' })).toBeUndefined();
+			// Paris was at +00:09:21: its minutes start 21 seconds past the UTC ones.
+			expect(helpers.previousCronDate('* * * * *', { from: -max + MINUTE, timeZone: 'Europe/Paris' })?.getTime()).toBe(-max + 39_000);
+			expect(helpers.previousCronDate('* * * * *', { from: -max + 39_000, timeZone: 'Europe/Paris' })).toBeUndefined();
+			expect(helpers.previousCronDate('0 0 13 9 *', { from: max, inclusive: true, timeZone: 'UTC' })?.getTime()).toBe(max);
+			expect(helpers.nextCronDate('0 0 20 4 *', { from: max, timeZone: 'UTC' })).toBeUndefined();
+			expect([...helpers.eachCronDate('0 0 * 9 *', { from: max - 3 * DAY, timeZone: 'UTC' })].length).toBe(3);
+			// The same, from further away.
+			expect(next('0 0 13 9 *', max - 30 * DAY)).toBe(max);
+			expect(next('0 0 13 9 *', max - 30 * DAY, 'America/New_York')).toBeUndefined();
+			expect(next('0 20 12 9 *', max - 30 * DAY, 'America/New_York')).toBe(max);
+			expect(helpers.previousCronDate('0 0 20 4 *', { from: -max + 30 * DAY, timeZone: 'UTC' })?.getTime()).toBe(-max);
+		});
+
+		it('validates its arguments', function () {
+			for (const fn of [helpers.nextCronDate, helpers.previousCronDate]) {
+				const name = fn.name;
+
+				expect(function () {
+					fn(5 as any);
+				}).toThrow(new TypeError(`${name}: \`cron\` must be a cron expression or a Cron returned by parseCron, got number`));
+				expect(function () {
+					fn({ expression: '* * * * *' } as any);
+				}).toThrow(new TypeError(`${name}: \`cron\` must be a cron expression or a Cron returned by parseCron, got object`));
+				expect(function () {
+					fn({ ...helpers.parseCron('* * * * *') });
+				}).toThrow(TypeError);
+				expect(function () {
+					fn('* * * *');
+				}).toThrow(new RangeError(`${name}: \`expression\` must have 5 fields, or 6 with seconds first, got 4 in "* * * *"`));
+				expect(function () {
+					fn('* * * * *', null as any);
+				}).toThrow(new TypeError(`${name}: \`options\` must be an object, got null`));
+				expect(function () {
+					fn('* * * * *', { from: '2024' as any });
+				}).toThrow(new TypeError('Expected a Date or a timestamp number'));
+				expect(function () {
+					fn('* * * * *', { from: NaN });
+				}).toThrow(new RangeError('Invalid date'));
+				expect(function () {
+					fn('* * * * *', { timeZone: 5 as any });
+				}).toThrow(new TypeError(`${name}: \`timeZone\` must be a string, got number`));
+				expect(function () {
+					fn('* * * * *', { timeZone: 'Mars/Olympus' });
+				}).toThrow(new RangeError(`${name}: \`timeZone\` must be an IANA time zone or a UTC offset (±HH:MM), got "Mars/Olympus"`));
+			}
+		});
+
+		it('caches parsed expressions without keeping their errors', function () {
+			expect(function () {
+				helpers.nextCronDate('61 * * * *');
+			}).toThrow(new RangeError('nextCronDate: the minute field values must be between 0 and 59, got "61"'));
+			expect(function () {
+				helpers.previousCronDate('61 * * * *');
+			}).toThrow(new RangeError('previousCronDate: the minute field values must be between 0 and 59, got "61"'));
+			for (let i = 0; i < 200; i++) expect(next(`${i % 60} * * * *`, 0)).toBe((i % 60 || 60) * MINUTE);
+			expect(next(`${' '.repeat(2000)}5 * * * *`, 0)).toBe(5 * MINUTE);
+		});
+	});
+
+	describe('eachCronDate', function () {
+		it('yields the successive dates lazily, up to `to` and `limit`', function () {
+			const from = Date.UTC(2024, 0, 1);
+			const all = helpers.eachCronDate('0 */6 * * *', { from, to: from + DAY, timeZone: 'UTC' });
+
+			expect(all[Symbol.iterator]()).toBe(all);
+			expect(times(all)).toEqual(
+				[6 * HOUR, 12 * HOUR, 18 * HOUR, 24 * HOUR].map(function (ms) {
+					return from + ms;
+				})
+			);
+			expect(times(helpers.eachCronDate('0 */6 * * *', { from, to: from + DAY, inclusive: true, timeZone: 'UTC' }))).toHaveLength(5);
+			expect(times(helpers.eachCronDate('0 */6 * * *', { from, to: from + DAY - 1, timeZone: 'UTC' }))).toHaveLength(3);
+			expect(times(helpers.eachCronDate('0 */6 * * *', { from, to: from - DAY, timeZone: 'UTC' }))).toEqual([]);
+			expect(times(helpers.eachCronDate('0 */6 * * *', { from, limit: 0, timeZone: 'UTC' }))).toEqual([]);
+			expect(times(helpers.eachCronDate('0 */6 * * *', { from, limit: 2, timeZone: 'UTC' }))).toEqual([from + 6 * HOUR, from + 12 * HOUR]);
+			expect(times(helpers.eachCronDate('0 */6 * * *', { from, to: new Date(from + 12 * HOUR), limit: Infinity, timeZone: 'UTC' }))).toHaveLength(2);
+
+			// Unbounded: read as much as needed.
+			const unbounded = helpers.eachCronDate(helpers.parseCron('* * * * * *'), { from, timeZone: 'UTC' });
+			let count = 0;
+
+			for (const date of unbounded) {
+				expect(date.getTime()).toBe(from + ++count * 1000);
+				if (count === 100_000) break;
+			}
+			expect(count).toBe(100_000);
+		});
+
+		it('keeps independent iterators apart', function () {
+			const a = helpers.eachCronDate('0 * * * *', { from: 0, timeZone: 'America/New_York' });
+			const b = helpers.eachCronDate('30 * * * *', { from: Date.UTC(2024, 0, 1), timeZone: 'America/New_York' });
+
+			expect(a.next().value).toEqual(new Date(HOUR));
+			expect(b.next().value).toEqual(new Date(Date.UTC(2024, 0, 1, 0, 30)));
+			expect(a.next().value).toEqual(new Date(2 * HOUR));
+			expect(b.next().value).toEqual(new Date(Date.UTC(2024, 0, 1, 1, 30)));
+		});
+
+		it('validates its arguments at once', function () {
+			expect(function () {
+				helpers.eachCronDate(5 as any);
+			}).toThrow(new TypeError('eachCronDate: `cron` must be a cron expression or a Cron returned by parseCron, got number'));
+			expect(function () {
+				helpers.eachCronDate('* * * * *', 5 as any);
+			}).toThrow(new TypeError('eachCronDate: `options` must be an object, got number'));
+			expect(function () {
+				helpers.eachCronDate('* * * * *', { to: 'x' as any });
+			}).toThrow(new TypeError('Expected a Date or a timestamp number'));
+			expect(function () {
+				helpers.eachCronDate('* * * * *', { from: new Date(NaN) });
+			}).toThrow(new RangeError('Invalid date'));
+			expect(function () {
+				helpers.eachCronDate('* * * * *', { limit: -1 });
+			}).toThrow(new RangeError('eachCronDate: `limit` must be an integer >= 0 or Infinity, got -1'));
+			expect(function () {
+				helpers.eachCronDate('* * * * *', { limit: 1.5 });
+			}).toThrow(new RangeError('eachCronDate: `limit` must be an integer >= 0 or Infinity, got 1.5'));
+			expect(function () {
+				helpers.eachCronDate('* * * * *', { limit: '3' as any });
+			}).toThrow(new TypeError('eachCronDate: `limit` must be an integer >= 0 or Infinity, got string'));
+			expect(function () {
+				helpers.eachCronDate('* * * * *', { timeZone: '' });
+			}).toThrow(new RangeError('eachCronDate: `timeZone` must be an IANA time zone or a UTC offset (±HH:MM), got ""'));
+		});
+	});
+
+	describe('isCronMatch', function () {
+		it('checks the minute (or second) that a date falls in', function () {
+			expect(helpers.isCronMatch('0/15 9-17 * * MON-FRI', new Date(2024, 0, 8, 9, 30, 42))).toBe(true);
+			expect(helpers.isCronMatch('0/15 9-17 * * MON-FRI', new Date(2024, 0, 8, 9, 31))).toBe(false);
+			expect(helpers.isCronMatch('0/15 9-17 * * MON-FRI', new Date(2024, 0, 7, 9, 30))).toBe(false);
+			expect(helpers.isCronMatch('30 * * * * *', new Date(2024, 0, 8, 9, 31, 30, 999))).toBe(true);
+			expect(helpers.isCronMatch('30 * * * * *', new Date(2024, 0, 8, 9, 31, 31))).toBe(false);
+			expect(helpers.isCronMatch('0 0 * * *', Date.UTC(2024, 0, 1, 0, 0, 59, 999), { timeZone: 'UTC' })).toBe(true);
+			expect(helpers.isCronMatch('0 0 * * *', Date.UTC(2024, 0, 1, 0, 1), { timeZone: 'UTC' })).toBe(false);
+			expect(helpers.isCronMatch('0 0 * * *', Date.UTC(2023, 11, 31, 18, 30, 5), { timeZone: '+05:30' })).toBe(true);
+			expect(helpers.isCronMatch(helpers.parseCron('@daily'), Date.UTC(2023, 11, 31, 18, 29, 59), { timeZone: '+05:30' })).toBe(false);
+		});
+
+		it('follows the daylight-saving rules of nextCronDate', function () {
+			const zone = 'America/New_York';
+
+			expect(helpers.isCronMatch('30 1 * * *', Date.UTC(2024, 10, 3, 5, 30, 10), { timeZone: zone })).toBe(true);
+			expect(helpers.isCronMatch('30 1 * * *', Date.UTC(2024, 10, 3, 6, 30, 10), { timeZone: zone })).toBe(false);
+			expect(helpers.isCronMatch('30 * * * *', Date.UTC(2024, 10, 3, 6, 30, 10), { timeZone: zone })).toBe(true);
+			expect(helpers.isCronMatch('30 2 * * *', Date.UTC(2024, 2, 10, 7, 0, 30), { timeZone: zone })).toBe(true);
+			expect(helpers.isCronMatch('30 * * * *', Date.UTC(2024, 2, 10, 7, 0, 30), { timeZone: zone })).toBe(false);
+			expect(helpers.isCronMatch('0 3 * * *', Date.UTC(2024, 2, 10, 7), { timeZone: zone })).toBe(true);
+			// Local mean time offsets have seconds: the minute starts on the wall clock.
+			expect(helpers.isCronMatch('0 0 1 1 *', Date.UTC(1900, 0, 1) - 561_000 + 59_000, { timeZone: 'Europe/Paris' })).toBe(true);
+			expect(helpers.isCronMatch('0 0 1 1 *', Date.UTC(1900, 0, 1) - 561_000 + 60_000, { timeZone: 'Europe/Paris' })).toBe(false);
+			expect(helpers.isCronMatch('0 0 1 1 *', Date.UTC(1900, 0, 1) - 561_000 - 1, { timeZone: 'Europe/Paris' })).toBe(false);
+		});
+
+		it('validates its arguments', function () {
+			expect(function () {
+				helpers.isCronMatch(undefined as any, 0);
+			}).toThrow(new TypeError('isCronMatch: `cron` must be a cron expression or a Cron returned by parseCron, got undefined'));
+			expect(function () {
+				helpers.isCronMatch('* * * * *', 'now' as any);
+			}).toThrow(new TypeError('Expected a Date or a timestamp number'));
+			expect(function () {
+				helpers.isCronMatch('* * * * *', 0, [] as any);
+			}).not.toThrow();
+			expect(function () {
+				helpers.isCronMatch('* * * * *', 0, 'UTC' as any);
+			}).toThrow(new TypeError('isCronMatch: `options` must be an object, got string'));
+			expect(function () {
+				helpers.isCronMatch('* * * * *', 0, { timeZone: '+25:00' });
+			}).toThrow(new RangeError('isCronMatch: `timeZone` must be an IANA time zone or a UTC offset (±HH:MM), got "+25:00"'));
+		});
+	});
+
+	it('asks for the UTC offset about once a day, not once a date', function () {
+		// The local offset is read from the local fields of a Date: count the `getHours` calls.
+		const spy = jest.spyOn(Date.prototype, 'getHours');
+		const from = Date.UTC(2024, 0, 1);
+		let count = 0;
+
+		for (const date of helpers.eachCronDate('* * * * *', { from, limit: 1440 })) count += Number(date.getTime() > from);
+		expect(count).toBe(1440);
+		expect(spy.mock.calls.length).toBeLessThanOrEqual(5);
+		spy.mockClear();
+		helpers.nextCronDate('*/5 * * * *', { from });
+		expect(spy.mock.calls.length).toBeLessThanOrEqual(3);
+		spy.mockClear();
+		helpers.previousCronDate('*/5 * * * *', { from });
+		expect(spy.mock.calls.length).toBeLessThanOrEqual(3);
+		spy.mockClear();
+		helpers.nextCronDate('0 0 1 1 *', { from });
+		expect(spy.mock.calls.length).toBeLessThanOrEqual(9);
+	});
+
+	it('ignores inherited options', function () {
+		const keys: Array<[string, unknown]> = [
+			['from', 0],
+			['timeZone', 'Asia/Tokyo'],
+			['inclusive', true],
+			['to', 0],
+			['limit', 0]
+		];
+		const from = Date.UTC(2024, 0, 1, 12);
+
+		for (const [key, value] of keys) {
+			(Object.prototype as Record<string, unknown>)[key] = value;
+			try {
+				expect(helpers.nextCronDate('0 * * * *', { from, timeZone: 'UTC' })?.getTime()).toBe(from + HOUR);
+				expect(times(helpers.eachCronDate('0 * * * *', { from, limit: 1, timeZone: 'UTC' }))).toEqual([from + HOUR]);
+				expect(helpers.isCronMatch('0 12 * * *', from, { timeZone: 'UTC' })).toBe(true);
+			} finally {
+				delete (Object.prototype as Record<string, unknown>)[key];
+			}
+		}
+	});
+
+	it('works in the local time zone', function () {
+		withTimeZone('America/New_York', function () {
+			expect(helpers.nextCronDate('30 2 * * *', { from: Date.UTC(2024, 2, 10, 5) })).toEqual(new Date(Date.UTC(2024, 2, 10, 7)));
+			expect(times(helpers.eachCronDate('*/30 * * * *', { from: Date.UTC(2024, 10, 3, 5), limit: 4 }))).toEqual([
+				Date.UTC(2024, 10, 3, 5, 30),
+				Date.UTC(2024, 10, 3, 6),
+				Date.UTC(2024, 10, 3, 6, 30),
+				Date.UTC(2024, 10, 3, 7)
+			]);
+			expect(helpers.isCronMatch('30 1 * * *', Date.UTC(2024, 10, 3, 6, 30))).toBe(false);
+		});
+		withTimeZone('Pacific/Apia', function () {
+			expect(helpers.previousCronDate('0 12 * * *', { from: Date.UTC(2011, 11, 30, 12) })).toEqual(new Date(Date.UTC(2011, 11, 29, 22)));
+		});
+	});
+
+	/**
+	 * The times of dates.
+	 */
+	function times(dates: Iterable<Date>): number[] {
+		return Array.from(dates, function (date) {
+			return date.getTime();
+		});
+	}
 });
