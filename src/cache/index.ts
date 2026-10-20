@@ -2,13 +2,15 @@ import { assertFunction, assertInteger, assertNumber, describe, readOption } fro
 
 /**
  * Why an entry left an {@link LRUCache}, as reported to `onEvict`:
- * - `'capacity'` — the least-recently-used live entry was dropped to make room for a new key;
+ * - `'capacity'` — the least-recently-used live entry was dropped to make room (for a new key, or under `maxSize` for a larger value);
  * - `'expired'` — the entry's TTL had elapsed when it was found (by a lookup, `set`, `delete`, `prune`, `clear` or a capacity eviction);
  * - `'deleted'` — removed with `delete(key)`;
  * - `'cleared'` — removed by `clear()`;
- * - `'replaced'` — `set(key, value)` overwrote a live entry with a different value (`Object.is`).
+ * - `'replaced'` — `set(key, value)` overwrote a live entry with a different value (`Object.is`);
+ * - `'oversized'` — `set(key, value)` was given a value whose `sizeOf` exceeds `maxSize`: that value was not stored, and the live entry
+ *   it would have overwritten was removed.
  */
-export type LRUEvictionReason = 'capacity' | 'expired' | 'deleted' | 'cleared' | 'replaced';
+export type LRUEvictionReason = 'capacity' | 'expired' | 'deleted' | 'cleared' | 'replaced' | 'oversized';
 
 /**
  * Options accepted by {@link createLRUCache}.
@@ -16,8 +18,20 @@ export type LRUEvictionReason = 'capacity' | 'expired' | 'deleted' | 'cleared' |
  * @template V - The value type
  */
 export interface LRUCacheOptions<K, V> {
-	/** Maximum number of entries (an integer `>= 1`, or `Infinity` for an unbounded, TTL-only cache). */
+	/** Maximum number of entries (an integer `>= 1`, or `Infinity` for an unbounded, TTL-only or `maxSize`-only cache). */
 	max: number;
+	/**
+	 * Maximum total size of the entries, as measured by `sizeOf` (a number `> 0`, or `Infinity`, the default): the least-recently-used
+	 * entries are evicted until the total fits, so a cache can be bounded in bytes, tokens or any other weight rather than in entries.
+	 * A value larger than `maxSize` is never stored (see `'oversized'` in {@link LRUEvictionReason}).
+	 * @default Infinity
+	 */
+	maxSize?: number;
+	/**
+	 * Measures an entry for `maxSize` and `totalSize`: a finite number `>= 0` (otherwise `set` throws, changing nothing). It is called
+	 * once per `set` (and per `getOrSet` miss), before the cache changes, and must not use the cache. Defaults to `1` per entry.
+	 */
+	sizeOf?: (value: V, key: K) => number;
 	/** Default time-to-live of an entry in milliseconds (`> 0`; `Infinity`, the default, means entries never expire). */
 	ttl?: number;
 	/**
@@ -52,6 +66,8 @@ export interface LRUCache<K, V> extends Iterable<[K, V]> {
 	 * operation has touched yet; call `prune()` first for an exact live count. Never exceeds `max`.
 	 */
 	readonly size: number;
+	/** Total size of the stored entries, as measured by `sizeOf` (the number of entries without it). Never exceeds `maxSize`. */
+	readonly totalSize: number;
 	/** Returns the value of a live entry and marks it most-recently used (restarting its TTL with `updateAgeOnGet`); `undefined` otherwise. */
 	get(key: K): V | undefined;
 	/**
@@ -66,7 +82,15 @@ export interface LRUCache<K, V> extends Iterable<[K, V]> {
 	peek(key: K): V | undefined;
 	/** Whether `key` holds a live (unexpired) entry. Does not change recency. */
 	has(key: K): boolean;
-	/** Stores `value` as the most-recently-used entry (evicting the least-recently-used one when full) and returns the cache. */
+	/**
+	 * The milliseconds left before the entry of `key` expires (`Infinity` when it never does), or `undefined` when there is no live
+	 * entry. Changes neither recency nor TTL (e.g. to send a `Cache-Control: max-age`, or to refresh an entry ahead of its expiry).
+	 */
+	getRemainingTTL(key: K): number | undefined;
+	/**
+	 * Stores `value` as the most-recently-used entry (evicting least-recently-used ones until the cache fits `max` and `maxSize`) and
+	 * returns the cache.
+	 */
 	set(key: K, value: V, options?: LRUCacheSetOptions): LRUCache<K, V>;
 	/** Removes `key`; returns `true` when a live entry was removed. */
 	delete(key: K): boolean;
@@ -85,14 +109,15 @@ export interface LRUCache<K, V> extends Iterable<[K, V]> {
 }
 
 /**
- * A stored entry: its key and value, its own TTL (for `updateAgeOnGet`), the instant it expires (`Infinity` for never), and its
- * neighbours in the recency list.
+ * A stored entry: its key and value, its size (from `sizeOf`), its own TTL (for `updateAgeOnGet`), the instant it expires (`Infinity`
+ * for never), and its neighbours in the recency list.
  * @template K - The key type
  * @template V - The value type
  */
 interface Entry<K, V> {
 	readonly key: K;
 	value: V;
+	size: number;
 	ttl: number;
 	expiresAt: number;
 	/** The next more recently used entry (`undefined` for the most recently used one). */
@@ -102,17 +127,84 @@ interface Entry<K, V> {
 }
 
 /**
- * Key of each cache's (non-enumerable) function returning its size, called by the shared `size` getter.
+ * Key of each structure's function returning its size, called by the shared `size` getter.
  */
 const SIZE = Symbol();
 
 /**
- * The `size` getter of every cache. Sharing one getter keeps the caches' shape shared: with a getter per cache, V8 turns every cache
- * but the first into a (much slower) dictionary-mode object.
- * @returns {number} The number of entries of the cache it is read on
+ * The `size` getter of every structure.
+ * @returns {number} The number of values or entries of the structure it is read on
  */
 function getSize(this: { [SIZE](): number }): number {
 	return this[SIZE]();
+}
+
+/**
+ * Creates a prototype holding shared getters (not enumerable, like `Map.prototype.size`).
+ * @param {Record<string, () => unknown>} getters - The getters, by property name
+ * @returns {object} The prototype
+ */
+function withGetters(getters: Record<string, () => unknown>): object {
+	const prototype = {};
+	for (const name of Object.keys(getters)) Object.defineProperty(prototype, name, { get: getters[name], configurable: true });
+	return prototype;
+}
+
+/** The prototype of the structures whose only getter is `size`, created on first use. */
+let sized: object | undefined;
+
+/**
+ * Returns the prototype of the structures whose only getter is `size`, creating it on first use (a call at the top level of the module would run on import, and keep
+ * bundlers from dropping the module when nothing of it is used).
+ * @returns {object} The prototype
+ */
+function sizedPrototype(): object {
+	return (sized ??= withGetters({ size: getSize }));
+}
+
+/**
+ * Key of each LRU cache's function returning its total size, called by the shared `totalSize` getter.
+ */
+const TOTAL_SIZE = Symbol();
+
+/**
+ * The `totalSize` getter of every LRU cache.
+ * @returns {number} The total size of the cache it is read on
+ */
+function getTotalSize(this: { [TOTAL_SIZE](): number }): number {
+	return this[TOTAL_SIZE]();
+}
+
+/** The prototype of LRU caches, created on first use. */
+let lru: object | undefined;
+
+/**
+ * Returns the prototype of LRU caches, creating it on first use (a call at the top level of the module would run on import, and keep
+ * bundlers from dropping the module when nothing of it is used).
+ * @returns {object} The prototype
+ */
+function lruPrototype(): object {
+	return (lru ??= withGetters({ size: getSize, totalSize: getTotalSize }));
+}
+
+/**
+ * Builds a structure: an object inheriting the shared getters of `prototype`, holding `methods` (closures over the structure's state,
+ * so they work unbound) and the functions the getters call. Built this way, a structure costs about 40 ns to create: an object literal
+ * with a computed key such as `[Symbol.iterator]`, or `Object.defineProperties` on each instance, costs 150 to 400 ns, more than a
+ * short-lived queue or cache spends doing its job. With the getters on a shared prototype, every instance also keeps one shape (a getter
+ * per instance turns every instance but the first into a much slower dictionary-mode object).
+ * @template T - The structure type
+ * @param {object} prototype - The prototype with the structure's getters
+ * @param {object} methods - The methods (an object literal without computed keys)
+ * @param {() => number} size - Returns the size
+ * @param {() => Iterator<unknown>} iterate - The `[Symbol.iterator]` method
+ * @returns {T} The structure
+ */
+function build<T>(prototype: object, methods: object, size: () => number, iterate: () => Iterator<unknown>): T {
+	const structure = Object.assign(Object.create(prototype) as Record<symbol, unknown>, methods);
+	structure[SIZE] = size;
+	structure[Symbol.iterator] = iterate;
+	return structure as T;
 }
 
 /**
@@ -142,17 +234,20 @@ function assertTTL(caller: string, ttl: number): void {
  *   is never disposed while still stored. A `-0` key is stored and reported as `0`, as by `Map`.
  *   It is called after the cache has been updated; an exception it throws propagates to the caller, but the cache stays consistent, and
  *   `clear`/`prune` still report every removed entry before rethrowing (an `AggregateError` when several calls threw).
+ * - Size budget: with `maxSize` and `sizeOf`, the cache also evicts least-recently-used entries until the total size fits (see the
+ *   fourth example); a value too large to ever fit is not stored. Without `sizeOf`, each entry counts as `1`.
  * - For a TTL-only cache use `max: Infinity` (see the second example).
  * Type arguments: pass them explicitly for standalone use (`createLRUCache<string, User>(...)`), or let them be inferred from a contextual
  * type or `onEvict`. When nothing determines them they default to `unknown`, so a bare `createLRUCache({ max })` works standalone and
  * slots straight into `memoize(fn, { cache: ... })`.
  * @template K - The key type (defaults to `unknown`)
  * @template V - The value type (defaults to `unknown`)
- * @param {LRUCacheOptions<K, V>} options - `max` (required), and optional `ttl`, `now`, `onEvict`, `updateAgeOnGet`
+ * @param {LRUCacheOptions<K, V>} options - `max` (required), and optional `maxSize`, `sizeOf`, `ttl`, `now`, `onEvict`, `updateAgeOnGet`
  * @returns {LRUCache<K, V>} A new, empty cache
- * @throws {TypeError} when `options` is not an object, `now`/`onEvict` is provided but not a function, `max`/`ttl` is not a number, or
- * (from `getOrSet`) `factory` is not a function
- * @throws {RangeError} when `max` is not an integer `>= 1` (or `Infinity`), or `ttl` (here, in `set` or in `getOrSet`) is not a number `> 0`
+ * @throws {TypeError} when `options` is not an object, `now`/`onEvict`/`sizeOf` is provided but not a function, `max`/`maxSize`/`ttl`
+ * is not a number, (from `getOrSet`) `factory` is not a function, or (from `set`/`getOrSet`) `sizeOf` does not return a number
+ * @throws {RangeError} when `max` is not an integer `>= 1` (or `Infinity`), `maxSize` is not a number `> 0`, `ttl` (here, in `set` or in
+ * `getOrSet`) is not a number `> 0`, or (from `set`/`getOrSet`) `sizeOf` returns a negative, infinite or `NaN` size
  * @throws {AggregateError} from `clear`/`prune` when several `onEvict` calls threw
  * @example
  * const cache = createLRUCache<string, number>({ max: 2 });
@@ -170,6 +265,7 @@ function assertTTL(caller: string, ttl: number): void {
  * clock = 5_000;
  * sessions.get('otp'); // => undefined
  * sessions.get('user'); // => 'ada'
+ * sessions.getRemainingTTL('user'); // => 55_000
  * sessions.prune(); // optional (e.g. on an interval): reclaims the memory of expired entries nobody looked up
  * @example
  * // Compute on a miss: `getOrSet` returns the cached value, or stores and returns what the factory returns
@@ -181,6 +277,15 @@ function assertTTL(caller: string, ttl: number): void {
  * calls; // => 1
  * lengths.getOrSet('x', 'nope' as never); // throws TypeError
  * @example
+ * // Bounded by size: at most 10 characters of text, whatever the number of entries
+ * const texts = createLRUCache<string, string>({ max: Infinity, maxSize: 10, sizeOf: function (text) { return text.length; } });
+ * texts.set('a', 'hello').set('b', 'world');
+ * texts.totalSize; // => 10
+ * texts.set('c', 'hi'); // evicts 'a', the least recently used, to make room
+ * [...texts.keys()]; // => ['c', 'b']
+ * texts.set('d', 'far too long'); // larger than maxSize: not stored
+ * texts.has('d'); // => false
+ * @example
  * // Bounded memoization
  * import { memoize } from 'tinkit/functions';
  * const square = memoize(function (n: number): number { return n * n; }, { cache: createLRUCache({ max: 100 }) });
@@ -189,9 +294,18 @@ function assertTTL(caller: string, ttl: number): void {
 export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOptions<K, V>): LRUCache<K, V> {
 	if (typeof options !== 'object' || options === null) throw new TypeError(`createLRUCache: \`options\` must be an object, got ${describe(options)}`);
 
-	const { max, ttl: defaultTTL = Infinity, now = Date.now, onEvict, updateAgeOnGet = false } = options;
+	// Read as own properties: a polluted `Object.prototype` must not set a TTL, a clock or an eviction callback.
+	const max = readOption(options, 'max') as number;
+	const maxSize = readOption(options, 'maxSize', Infinity);
+	const sizeOf = readOption(options, 'sizeOf');
+	const defaultTTL = readOption(options, 'ttl', Infinity);
+	const now = readOption(options, 'now', Date.now);
+	const onEvict = readOption(options, 'onEvict');
+	const updateAgeOnGet = readOption(options, 'updateAgeOnGet', false);
 
 	assertInteger('createLRUCache', 'max', max, 1, true);
+	assertNumber('createLRUCache', 'maxSize', maxSize, maxSize > 0, 'a number > 0 or Infinity');
+	if (sizeOf !== undefined) assertFunction('createLRUCache', 'sizeOf', sizeOf);
 	assertTTL('createLRUCache', defaultTTL);
 	assertFunction('createLRUCache', 'now', now);
 	if (onEvict !== undefined) assertFunction('createLRUCache', 'onEvict', onEvict);
@@ -200,9 +314,11 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	// Both ends of the recency list.
 	let newest: Entry<K, V> | undefined;
 	let oldest: Entry<K, V> | undefined;
-	// Whether any entry may ever expire. Until then every `expiresAt` is `Infinity`, so the clock (`Date.now` costs more than a `Map`
-	// lookup) is not read at all.
-	let timed = defaultTTL !== Infinity;
+	// The sum of the entries' sizes.
+	let total = 0;
+	// Whether any entry may ever expire (set by the first `set` with a finite TTL). Until then every `expiresAt` is `Infinity`, so the
+	// clock (`Date.now` costs more than a `Map` lookup) is not read at all.
+	let timed = false;
 
 	/**
 	 * Reads the clock, or returns `0` while no entry can expire (any finite time is then equivalent).
@@ -239,16 +355,16 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	/**
 	 * Reports several removals, calling `onEvict` for every one of them even if some calls throw; the errors are rethrown afterwards (the
 	 * error itself, or an `AggregateError` holding every error in call order when several calls threw).
-	 * @param {Array<[Entry<K, V>, LRUEvictionReason]>} removed - The removed entries and why
+	 * @param {Array<[K, V, LRUEvictionReason]>} removed - The removed keys and values, and why
 	 * @returns {void}
 	 * @throws {AggregateError} when several `onEvict` calls threw (a single error is rethrown as is)
 	 */
-	function notifyAll(removed: Array<[Entry<K, V>, LRUEvictionReason]>): void {
+	function notifyAll(removed: Array<[K, V, LRUEvictionReason]>): void {
 		const errors: unknown[] = [];
 
-		for (const [entry, reason] of removed) {
+		for (const [key, value, reason] of removed) {
 			try {
-				notify(entry.key, entry.value, reason);
+				notify(key, value, reason);
 			} catch (error) {
 				errors.push(error);
 			}
@@ -291,6 +407,50 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	function remove(entry: Entry<K, V>): void {
 		store.delete(entry.key);
 		unlink(entry);
+		total -= entry.size;
+	}
+
+	/**
+	 * Whether the cache holds more entries than `max`, or more than `maxSize` in total.
+	 * @returns {boolean} `true` when least-recently-used entries must go
+	 */
+	function overflows(): boolean {
+		return store.size > max || total > maxSize;
+	}
+
+	/**
+	 * Evicts least-recently-used entries until the cache fits `max` and `maxSize` (never the most recently used one, which fits on its
+	 * own), then reports them after `removed` (a single eviction, the usual case, is reported without allocating).
+	 * @param {number} time - The current time, to tell expired entries apart
+	 * @param {Array<[K, V, LRUEvictionReason]> | undefined} removed - Removals to report first, if any
+	 * @returns {void}
+	 */
+	function fit(time: number, removed: Array<[K, V, LRUEvictionReason]> | undefined): void {
+		while (overflows()) {
+			const evicted = oldest as Entry<K, V>;
+			const reason = time >= evicted.expiresAt ? 'expired' : 'capacity';
+
+			remove(evicted);
+			if (removed === undefined && !overflows()) return notify(evicted.key, evicted.value, reason);
+			(removed ??= []).push([evicted.key, evicted.value, reason]);
+		}
+		if (removed !== undefined) notifyAll(removed);
+	}
+
+	/**
+	 * Measures a value with `sizeOf` (`1` without it).
+	 * @param {string} caller - Name of the method, used in the error message
+	 * @param {K} key - The key
+	 * @param {V} value - The value
+	 * @returns {number} Its size
+	 * @throws {TypeError} when `sizeOf` does not return a number
+	 * @throws {RangeError} when it returns a negative, infinite or `NaN` size
+	 */
+	function measure(caller: string, key: K, value: V): number {
+		if (sizeOf === undefined) return 1;
+		const size: unknown = sizeOf(value, key);
+		if (!(typeof size === 'number' && size >= 0 && size < Infinity)) assertNumber(caller, 'sizeOf()', size, false, 'a finite number >= 0');
+		return size;
 	}
 
 	/**
@@ -372,133 +532,162 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	 * @throws {RangeError} when the TTL is not a number `> 0`
 	 */
 	function readTTL(caller: string, setOptions: LRUCacheSetOptions | undefined): number {
-		const ttl = setOptions?.ttl ?? defaultTTL;
+		const ttl = (setOptions == null ? undefined : readOption(setOptions, 'ttl')) ?? defaultTTL;
 		if (ttl !== defaultTTL) assertTTL(caller, ttl);
 		return ttl;
 	}
 
-	// `size` is defined below, with the getter shared by every cache (see `getSize`).
-	const cache = {
-		get(key: K): V | undefined {
-			return touch(key)?.value;
-		},
-		getOrSet(key: K, factory: (key: K) => V, setOptions?: LRUCacheSetOptions): V {
-			assertFunction('LRUCache.getOrSet', 'factory', factory);
-			// Validated before `factory` runs, so that its result is never computed for nothing.
-			readTTL('LRUCache.getOrSet', setOptions);
+	const cache: LRUCache<K, V> = build(
+		lruPrototype(),
+		{
+			get(key: K): V | undefined {
+				return touch(key)?.value;
+			},
+			getOrSet(key: K, factory: (key: K) => V, setOptions?: LRUCacheSetOptions): V {
+				assertFunction('LRUCache.getOrSet', 'factory', factory);
+				// Validated before `factory` runs, so that its result is never computed for nothing.
+				readTTL('LRUCache.getOrSet', setOptions);
 
-			const entry = touch(key);
-			if (entry !== undefined) return entry.value;
+				const entry = touch(key);
+				if (entry !== undefined) return entry.value;
 
-			const value = factory(key);
-			cache.set(key, value, setOptions);
+				const value = factory(key);
+				cache.set(key, value, setOptions);
 
-			return value;
-		},
-		peek(key: K): V | undefined {
-			return lookup(key)?.value;
-		},
-		has(key: K): boolean {
-			return lookup(key) !== undefined;
-		},
-		set(key: K, value: V, setOptions?: LRUCacheSetOptions): LRUCache<K, V> {
-			const ttl = readTTL('LRUCache.set', setOptions);
+				return value;
+			},
+			peek(key: K): V | undefined {
+				return lookup(key)?.value;
+			},
+			has(key: K): boolean {
+				return lookup(key) !== undefined;
+			},
+			getRemainingTTL(key: K): number | undefined {
+				const entry = store.get(key);
+				if (entry === undefined) return undefined;
+				if (entry.expiresAt === Infinity) return Infinity;
+				// The clock is read once, so that a live entry never reports a remaining time <= 0.
+				const remaining = entry.expiresAt - readNow();
+				return remaining > 0 ? remaining : expire(entry);
+			},
+			set(key: K, value: V, setOptions?: LRUCacheSetOptions): LRUCache<K, V> {
+				const ttl = readTTL('LRUCache.set', setOptions);
+				// Measured before anything changes: when `sizeOf` throws, the cache is left as it was.
+				const size = measure('LRUCache.set', key, value);
 
-			if (ttl !== Infinity) timed = true;
+				if (ttl !== Infinity) timed = true;
 
-			const time = clock();
-			const entry = store.get(key);
+				const time = clock();
+				const entry = store.get(key);
 
-			if (entry !== undefined) {
-				const previousValue = entry.value;
-				const expired = time >= entry.expiresAt;
+				if (size > maxSize) {
+					// It would evict every other entry and still not fit: it is not stored, and neither is the value it replaces.
+					if (entry !== undefined) {
+						remove(entry);
+						notify(entry.key, entry.value, time >= entry.expiresAt ? 'expired' : 'oversized');
+					}
+					return cache;
+				}
 
-				entry.value = value;
-				entry.ttl = ttl;
-				entry.expiresAt = time + ttl;
-				unlink(entry);
-				pushNewest(entry);
+				if (entry !== undefined) {
+					const previousValue = entry.value;
+					const expired = time >= entry.expiresAt;
 
-				// Storing the very same value again removes nothing, even over an expired entry: it must not be disposed while stored.
-				if (!Object.is(previousValue, value)) notify(entry.key, previousValue, expired ? 'expired' : 'replaced');
+					entry.value = value;
+					total += size - entry.size;
+					entry.size = size;
+					entry.ttl = ttl;
+					entry.expiresAt = time + ttl;
+					unlink(entry);
+					pushNewest(entry);
+
+					// Storing the very same value again removes nothing, even over an expired entry: it must not be disposed while stored.
+					if (Object.is(previousValue, value)) fit(time, undefined);
+					else if (overflows()) fit(time, [[entry.key, previousValue, expired ? 'expired' : 'replaced']]);
+					else notify(entry.key, previousValue, expired ? 'expired' : 'replaced');
+
+					return cache;
+				}
+
+				// `Map` normalises -0 to +0; keep the key it actually stores, so iteration and eviction report the same key as before.
+				const added: Entry<K, V> = {
+					key: Object.is(key, -0) ? (0 as K) : key,
+					value,
+					size,
+					ttl,
+					expiresAt: time + ttl,
+					newer: undefined,
+					older: undefined
+				};
+
+				store.set(key, added);
+				pushNewest(added);
+				total += size;
+				fit(time, undefined);
 
 				return cache;
+			},
+			delete(key: K): boolean {
+				const entry = lookup(key);
+				if (entry === undefined) return false;
+
+				remove(entry);
+				notify(entry.key, entry.value, 'deleted');
+
+				return true;
+			},
+			clear(): void {
+				const time = clock();
+				const removed: Array<[K, V, LRUEvictionReason]> = [];
+
+				for (let entry = oldest; entry !== undefined; entry = entry.newer) removed.push([entry.key, entry.value, time >= entry.expiresAt ? 'expired' : 'cleared']);
+				store.clear();
+				newest = undefined;
+				oldest = undefined;
+				total = 0;
+
+				notifyAll(removed);
+			},
+			prune(): number {
+				const time = clock();
+				const expired: Array<Entry<K, V>> = [];
+
+				for (let entry = oldest; entry !== undefined; entry = entry.newer) {
+					if (time >= entry.expiresAt) expired.push(entry);
+				}
+				for (const entry of expired) remove(entry);
+				notifyAll(
+					expired.map(function (entry): [K, V, LRUEvictionReason] {
+						return [entry.key, entry.value, 'expired'];
+					})
+				);
+
+				return expired.length;
+			},
+			keys(): IterableIterator<K> {
+				return live(function (entry): K {
+					return entry.key;
+				});
+			},
+			values(): IterableIterator<V> {
+				return live(function (entry): V {
+					return entry.value;
+				});
+			},
+			entries(): IterableIterator<[K, V]> {
+				return live(pair);
 			}
-
-			// `Map` normalises -0 to +0; keep the key it actually stores, so iteration and eviction report the same key as before.
-			const added: Entry<K, V> = { key: Object.is(key, -0) ? (0 as K) : key, value, ttl, expiresAt: time + ttl, newer: undefined, older: undefined };
-
-			store.set(key, added);
-			pushNewest(added);
-
-			if (store.size > max) {
-				// The least-recently-used entry is never the one just added (size > max >= 1).
-				const evicted = oldest as Entry<K, V>;
-
-				remove(evicted);
-				notify(evicted.key, evicted.value, time >= evicted.expiresAt ? 'expired' : 'capacity');
-			}
-
-			return cache;
 		},
-		delete(key: K): boolean {
-			const entry = lookup(key);
-			if (entry === undefined) return false;
-
-			remove(entry);
-			notify(entry.key, entry.value, 'deleted');
-
-			return true;
+		function (): number {
+			return store.size;
 		},
-		clear(): void {
-			const time = clock();
-			const removed: Array<[Entry<K, V>, LRUEvictionReason]> = [];
-
-			for (let entry = oldest; entry !== undefined; entry = entry.newer) removed.push([entry, time >= entry.expiresAt ? 'expired' : 'cleared']);
-			store.clear();
-			newest = undefined;
-			oldest = undefined;
-
-			notifyAll(removed);
-		},
-		prune(): number {
-			const time = clock();
-			const expired: Array<[Entry<K, V>, LRUEvictionReason]> = [];
-
-			for (let entry = oldest; entry !== undefined; entry = entry.newer) {
-				if (time >= entry.expiresAt) expired.push([entry, 'expired']);
-			}
-			for (const [entry] of expired) remove(entry);
-			notifyAll(expired);
-
-			return expired.length;
-		},
-		keys(): IterableIterator<K> {
-			return live(function (entry): K {
-				return entry.key;
-			});
-		},
-		values(): IterableIterator<V> {
-			return live(function (entry): V {
-				return entry.value;
-			});
-		},
-		entries(): IterableIterator<[K, V]> {
-			return live(pair);
-		},
-		[Symbol.iterator](): IterableIterator<[K, V]> {
+		function (): IterableIterator<[K, V]> {
 			return live(pair);
 		}
-	} as LRUCache<K, V>;
-
-	Object.defineProperties(cache, {
-		[SIZE]: {
-			value: function (): number {
-				return store.size;
-			}
-		},
-		size: { get: getSize, enumerable: true, configurable: true }
-	});
+	);
+	(cache as unknown as Record<symbol, unknown>)[TOTAL_SIZE] = function (): number {
+		return total;
+	};
 
 	return cache;
 }
@@ -664,33 +853,40 @@ export function createPriorityQueue<T>(compare: (a: T, b: T) => number): Priorit
 		return removed;
 	}
 
-	const queue = {
-		push(value: T): number {
-			siftUp(values.length, value, inserted++);
+	const queue: PriorityQueue<T> = build(
+		sizedPrototype(),
+		{
+			push(value: T): number {
+				siftUp(values.length, value, inserted++);
 
+				return values.length;
+			},
+			pop(): T | undefined {
+				return values.length === 0 ? undefined : removeAt(0);
+			},
+			peek(): T | undefined {
+				// Checked: reading index 0 of an empty array would reach a polluted `Array.prototype`.
+				return values.length === 0 ? undefined : values[0];
+			},
+			delete(value: T): boolean {
+				let found = -1;
+
+				// The oldest occurrence: the one with the smallest insertion number.
+				for (let i = 0; i < values.length; i++) if (values[i] === value && (found < 0 || order[i] < order[found])) found = i;
+				if (found < 0) return false;
+				removeAt(found);
+
+				return true;
+			},
+			clear(): void {
+				values = [];
+				order = [];
+			}
+		},
+		function (): number {
 			return values.length;
 		},
-		pop(): T | undefined {
-			return values.length === 0 ? undefined : removeAt(0);
-		},
-		peek(): T | undefined {
-			return values[0];
-		},
-		delete(value: T): boolean {
-			let found = -1;
-
-			// The oldest occurrence: the one with the smallest insertion number.
-			for (let i = 0; i < values.length; i++) if (values[i] === value && (found < 0 || order[i] < order[found])) found = i;
-			if (found < 0) return false;
-			removeAt(found);
-
-			return true;
-		},
-		clear(): void {
-			values = [];
-			order = [];
-		},
-		[Symbol.iterator](): IterableIterator<T> {
+		function (): IterableIterator<T> {
 			const indexes = values.map(function (_, i) {
 				return i;
 			});
@@ -705,16 +901,7 @@ export function createPriorityQueue<T>(compare: (a: T, b: T) => number): Priorit
 				})
 				.values();
 		}
-	} as PriorityQueue<T>;
-
-	Object.defineProperties(queue, {
-		[SIZE]: {
-			value: function (): number {
-				return values.length;
-			}
-		},
-		size: { get: getSize, enumerable: true, configurable: true }
-	});
+	);
 
 	return queue;
 }
@@ -848,68 +1035,66 @@ export function createDeque<T>(values?: Iterable<T> | null, options: DequeOption
 		} else if (length === ring.length) resize(ring.length * 2);
 	}
 
-	const deque = {
-		capacity,
-		pushBack(value: T): number {
-			reserve(true);
-			ring[(head + length) & (ring.length - 1)] = value;
-			return ++length;
+	const deque: Deque<T> = build(
+		sizedPrototype(),
+		{
+			capacity,
+			pushBack(value: T): number {
+				reserve(true);
+				ring[(head + length) & (ring.length - 1)] = value;
+				return ++length;
+			},
+			pushFront(value: T): number {
+				reserve(false);
+				head = (head - 1) & (ring.length - 1);
+				ring[head] = value;
+				return ++length;
+			},
+			popBack(): T | undefined {
+				if (length === 0) return undefined;
+				const slot = (head + length - 1) & (ring.length - 1);
+				const value = ring[slot];
+				ring[slot] = undefined;
+				length--;
+				shrink();
+				return value;
+			},
+			popFront(): T | undefined {
+				if (length === 0) return undefined;
+				const value = ring[head];
+				ring[head] = undefined;
+				head = (head + 1) & (ring.length - 1);
+				length--;
+				shrink();
+				return value;
+			},
+			// An empty deque's slots are all cleared, and every masked index is inside the filled ring: no check needed.
+			peekFront(): T | undefined {
+				return ring[head];
+			},
+			peekBack(): T | undefined {
+				return ring[(head + length - 1) & (ring.length - 1)];
+			},
+			at(index: number): T | undefined {
+				if (!Number.isInteger(index)) assertNumber('Deque.at', 'index', index, false, 'an integer');
+				const offset = index < 0 ? index + length : index;
+				return offset >= 0 && offset < length ? ring[(head + offset) & (ring.length - 1)] : undefined;
+			},
+			clear(): void {
+				ring = new Array<T | undefined>(MIN_RING).fill(undefined);
+				head = 0;
+				length = 0;
+			}
 		},
-		pushFront(value: T): number {
-			reserve(false);
-			head = (head - 1) & (ring.length - 1);
-			ring[head] = value;
-			return ++length;
+		function (): number {
+			return length;
 		},
-		popBack(): T | undefined {
-			if (length === 0) return undefined;
-			const slot = (head + length - 1) & (ring.length - 1);
-			const value = ring[slot];
-			ring[slot] = undefined;
-			length--;
-			shrink();
-			return value;
-		},
-		popFront(): T | undefined {
-			if (length === 0) return undefined;
-			const value = ring[head];
-			ring[head] = undefined;
-			head = (head + 1) & (ring.length - 1);
-			length--;
-			shrink();
-			return value;
-		},
-		peekFront(): T | undefined {
-			return length === 0 ? undefined : ring[head];
-		},
-		peekBack(): T | undefined {
-			return length === 0 ? undefined : ring[(head + length - 1) & (ring.length - 1)];
-		},
-		at(index: number): T | undefined {
-			if (!Number.isInteger(index)) assertNumber('Deque.at', 'index', index, false, 'an integer');
-			const offset = index < 0 ? index + length : index;
-			return offset >= 0 && offset < length ? ring[(head + offset) & (ring.length - 1)] : undefined;
-		},
-		clear(): void {
-			ring = new Array<T | undefined>(MIN_RING).fill(undefined);
-			head = 0;
-			length = 0;
-		},
-		[Symbol.iterator](): IterableIterator<T> {
+		function (): IterableIterator<T> {
 			const snapshot: T[] = [];
 			for (let i = 0; i < length; i++) snapshot.push(ring[(head + i) & (ring.length - 1)] as T);
 			return snapshot.values();
 		}
-	} as Deque<T>;
-
-	Object.defineProperties(deque, {
-		[SIZE]: {
-			value: function (): number {
-				return length;
-			}
-		},
-		size: { get: getSize, enumerable: true, configurable: true }
-	});
+	);
 
 	if (values != null) for (const value of values) deque.pushBack(value);
 
@@ -965,11 +1150,29 @@ export interface RingBuffer<T> extends Iterable<T> {
 const MAX_LENGTH = 2 ** 32 - 1;
 
 /**
- * The `full` getter of every ring buffer (shared, like {@link getSize}, so that the buffers share one shape).
+ * Key of each ring buffer's function telling whether it is full, called by the shared `full` getter (which therefore never depends on
+ * the writable `capacity` property).
+ */
+const FULL = Symbol();
+
+/**
+ * The `full` getter of every ring buffer (shared, like {@link getSize}).
  * @returns {boolean} Whether the buffer it is read on is full
  */
-function getFull(this: { [SIZE](): number; capacity: number }): boolean {
-	return this[SIZE]() === this.capacity;
+function getFull(this: { [FULL](): boolean }): boolean {
+	return this[FULL]();
+}
+
+/** The prototype of ring buffers, created on first use. */
+let ringBuffer: object | undefined;
+
+/**
+ * Returns the prototype of ring buffers, creating it on first use (a call at the top level of the module would run on import, and keep
+ * bundlers from dropping the module when nothing of it is used).
+ * @returns {object} The prototype
+ */
+function ringBufferPrototype(): object {
+	return (ringBuffer ??= withGetters({ size: getSize, full: getFull }));
 }
 
 /**
@@ -1033,65 +1236,64 @@ export function createRingBuffer<T>(capacity: number, options: RingBufferOptions
 		return index >= capacity ? index - capacity : index;
 	}
 
-	const buffer = {
-		capacity,
-		push(value: T): number {
-			if (length === capacity) {
-				// Full: the oldest value's slot becomes the newest one's.
-				const evicted = ring[head] as T;
-				ring[head] = value;
+	const buffer: RingBuffer<T> = build(
+		ringBufferPrototype(),
+		{
+			capacity,
+			push(value: T): number {
+				if (length === capacity) {
+					// Full: the oldest value's slot becomes the newest one's.
+					const evicted = ring[head] as T;
+					ring[head] = value;
+					head = slot(1);
+					if (onEvict) onEvict(evicted);
+					return length;
+				}
+				const tail = slot(length);
+				if (tail === ring.length) ring.push(value);
+				else ring[tail] = value;
+				return ++length;
+			},
+			shift(): T | undefined {
+				if (length === 0) return undefined;
+				const value = ring[head];
+				ring[head] = undefined;
 				head = slot(1);
-				if (onEvict) onEvict(evicted);
-				return length;
+				length--;
+				return value;
+			},
+			peekFirst(): T | undefined {
+				return length === 0 ? undefined : ring[head];
+			},
+			peekLast(): T | undefined {
+				return length === 0 ? undefined : ring[slot(length - 1)];
+			},
+			at(index: number): T | undefined {
+				if (!Number.isInteger(index)) assertNumber('RingBuffer.at', 'index', index, false, 'an integer');
+				const offset = index < 0 ? index + length : index;
+				return offset >= 0 && offset < length ? ring[slot(offset)] : undefined;
+			},
+			toArray(): T[] {
+				const values: T[] = [];
+				for (let i = 0; i < length; i++) values.push(ring[slot(i)] as T);
+				return values;
+			},
+			clear(): void {
+				ring = [];
+				head = 0;
+				length = 0;
 			}
-			const tail = slot(length);
-			if (tail === ring.length) ring.push(value);
-			else ring[tail] = value;
-			return ++length;
 		},
-		shift(): T | undefined {
-			if (length === 0) return undefined;
-			const value = ring[head];
-			ring[head] = undefined;
-			head = slot(1);
-			length--;
-			return value;
+		function (): number {
+			return length;
 		},
-		peekFirst(): T | undefined {
-			return length === 0 ? undefined : ring[head];
-		},
-		peekLast(): T | undefined {
-			return length === 0 ? undefined : ring[slot(length - 1)];
-		},
-		at(index: number): T | undefined {
-			if (!Number.isInteger(index)) assertNumber('RingBuffer.at', 'index', index, false, 'an integer');
-			const offset = index < 0 ? index + length : index;
-			return offset >= 0 && offset < length ? ring[slot(offset)] : undefined;
-		},
-		toArray(): T[] {
-			const values: T[] = [];
-			for (let i = 0; i < length; i++) values.push(ring[slot(i)] as T);
-			return values;
-		},
-		clear(): void {
-			ring = [];
-			head = 0;
-			length = 0;
-		},
-		[Symbol.iterator](): IterableIterator<T> {
+		function (): IterableIterator<T> {
 			return buffer.toArray().values();
 		}
-	} as RingBuffer<T>;
-
-	Object.defineProperties(buffer, {
-		[SIZE]: {
-			value: function (): number {
-				return length;
-			}
-		},
-		size: { get: getSize, enumerable: true, configurable: true },
-		full: { get: getFull, enumerable: true, configurable: true }
-	});
+	);
+	(buffer as unknown as Record<symbol, unknown>)[FULL] = function (): boolean {
+		return length === capacity;
+	};
 
 	return buffer;
 }
@@ -1174,53 +1376,50 @@ export function createDefaultMap<K, V>(factory: (key: K) => V, entries?: Iterabl
 	assertFunction('createDefaultMap', 'factory', factory);
 	const map = new Map<K, V>(readEntries('createDefaultMap', entries));
 
-	const defaults = {
-		get(key: K): V {
-			const stored = map.get(key);
-			if (stored !== undefined || map.has(key)) return stored as V;
-			// The key as the map stores it (`-0` as `0`), as `getOrInsertComputed` passes it.
-			const value = factory(key === 0 ? (0 as K) : key);
-			map.set(key, value);
-			return value;
-		},
-		peek(key: K): V | undefined {
-			return map.get(key);
-		},
-		has(key: K): boolean {
-			return map.has(key);
-		},
-		set(key: K, value: V): DefaultMap<K, V> {
-			map.set(key, value);
-			return defaults;
-		},
-		delete(key: K): boolean {
-			return map.delete(key);
-		},
-		clear(): void {
-			map.clear();
-		},
-		keys(): IterableIterator<K> {
-			return map.keys();
-		},
-		values(): IterableIterator<V> {
-			return map.values();
-		},
-		entries(): IterableIterator<[K, V]> {
-			return map.entries();
-		},
-		[Symbol.iterator](): IterableIterator<[K, V]> {
-			return map.entries();
-		}
-	} as DefaultMap<K, V>;
-
-	Object.defineProperties(defaults, {
-		[SIZE]: {
-			value: function (): number {
-				return map.size;
+	const defaults: DefaultMap<K, V> = build(
+		sizedPrototype(),
+		{
+			get(key: K): V {
+				const stored = map.get(key);
+				if (stored !== undefined || map.has(key)) return stored as V;
+				// The key as the map stores it (`-0` as `0`), as `getOrInsertComputed` passes it.
+				const value = factory(key === 0 ? (0 as K) : key);
+				map.set(key, value);
+				return value;
+			},
+			peek(key: K): V | undefined {
+				return map.get(key);
+			},
+			has(key: K): boolean {
+				return map.has(key);
+			},
+			set(key: K, value: V): DefaultMap<K, V> {
+				map.set(key, value);
+				return defaults;
+			},
+			delete(key: K): boolean {
+				return map.delete(key);
+			},
+			clear(): void {
+				map.clear();
+			},
+			keys(): IterableIterator<K> {
+				return map.keys();
+			},
+			values(): IterableIterator<V> {
+				return map.values();
+			},
+			entries(): IterableIterator<[K, V]> {
+				return map.entries();
 			}
 		},
-		size: { get: getSize, enumerable: true, configurable: true }
-	});
+		function (): number {
+			return map.size;
+		},
+		function (): IterableIterator<[K, V]> {
+			return map.entries();
+		}
+	);
 
 	return defaults;
 }
@@ -1266,77 +1465,103 @@ export interface BiMap<K, V> extends Iterable<[K, V]> {
 }
 
 /**
+ * Key of each bimap view's other side, returned by the shared `inverse` getter (a getter rather than an own property, so that spreading
+ * or serializing a map does not walk into the cycle).
+ */
+const INVERSE = Symbol();
+
+/**
+ * The `inverse` getter of every bimap view.
+ * @returns {BiMap<unknown, unknown>} The other side of the view it is read on
+ */
+function getInverse(this: { [INVERSE]: BiMap<unknown, unknown> }): BiMap<unknown, unknown> {
+	return this[INVERSE];
+}
+
+/** The prototype of bimap views, created on first use. */
+let biMap: object | undefined;
+
+/**
+ * Returns the prototype of bimap views, creating it on first use (a call at the top level of the module would run on import, and keep
+ * bundlers from dropping the module when nothing of it is used).
+ * @returns {object} The prototype
+ */
+function biMapPrototype(): object {
+	return (biMap ??= withGetters({ size: getSize, inverse: getInverse }));
+}
+
+/**
  * Creates one side of a bidirectional map over two `Map`s kept as exact mirrors.
  * @template K - The key type of this side
  * @template V - The value type of this side
  * @param {Map<K, V>} forward - Keys to values
  * @param {Map<V, K>} backward - Values to keys
- * @returns {BiMap<K, V>} The view (its `size` and `inverse` are defined by the caller)
+ * @returns {BiMap<K, V>} The view (its inverse view is set by the caller)
  */
 function biMapView<K, V>(forward: Map<K, V>, backward: Map<V, K>): BiMap<K, V> {
-	const view = {
-		get(key: K): V | undefined {
-			return forward.get(key);
-		},
-		getKey(value: V): K | undefined {
-			return backward.get(value);
-		},
-		has(key: K): boolean {
-			return forward.has(key);
-		},
-		hasValue(value: V): boolean {
-			return backward.has(value);
-		},
-		set(key: K, value: V): BiMap<K, V> {
-			// Both sides are keys of one of the maps, so both are stored as those maps store keys (`-0` as `0`): each side then reads the
-			// same in both directions.
-			const left = Object.is(key, -0) ? (0 as K) : key;
-			const right = Object.is(value, -0) ? (0 as V) : value;
+	const view: BiMap<K, V> = build(
+		biMapPrototype(),
+		{
+			get(key: K): V | undefined {
+				return forward.get(key);
+			},
+			getKey(value: V): K | undefined {
+				return backward.get(value);
+			},
+			has(key: K): boolean {
+				return forward.has(key);
+			},
+			hasValue(value: V): boolean {
+				return backward.has(value);
+			},
+			set(key: K, value: V): BiMap<K, V> {
+				// Both sides are keys of one of the maps, so both are stored as those maps store keys (`-0` as `0`): each side then reads the
+				// same in both directions.
+				const left = Object.is(key, -0) ? (0 as K) : key;
+				const right = Object.is(value, -0) ? (0 as V) : value;
 
-			if (forward.has(left)) {
-				const previous = forward.get(left) as V;
-				// The pair is already there (SameValueZero, like the maps).
-				if (previous === right || (previous !== previous && right !== right)) return view;
-				backward.delete(previous);
+				if (forward.has(left)) {
+					const previous = forward.get(left) as V;
+					// The pair is already there (SameValueZero, like the maps).
+					if (previous === right || (previous !== previous && right !== right)) return view;
+					backward.delete(previous);
+				}
+				if (backward.has(right)) forward.delete(backward.get(right) as K);
+				forward.set(left, right);
+				backward.set(right, left);
+				return view;
+			},
+			delete(key: K): boolean {
+				if (!forward.has(key)) return false;
+				backward.delete(forward.get(key) as V);
+				return forward.delete(key);
+			},
+			deleteValue(value: V): boolean {
+				if (!backward.has(value)) return false;
+				forward.delete(backward.get(value) as K);
+				return backward.delete(value);
+			},
+			clear(): void {
+				forward.clear();
+				backward.clear();
+			},
+			keys(): IterableIterator<K> {
+				return forward.keys();
+			},
+			values(): IterableIterator<V> {
+				return forward.values();
+			},
+			entries(): IterableIterator<[K, V]> {
+				return forward.entries();
 			}
-			if (backward.has(right)) forward.delete(backward.get(right) as K);
-			forward.set(left, right);
-			backward.set(right, left);
-			return view;
 		},
-		delete(key: K): boolean {
-			if (!forward.has(key)) return false;
-			backward.delete(forward.get(key) as V);
-			return forward.delete(key);
-		},
-		deleteValue(value: V): boolean {
-			if (!backward.has(value)) return false;
-			forward.delete(backward.get(value) as K);
-			return backward.delete(value);
-		},
-		clear(): void {
-			forward.clear();
-			backward.clear();
-		},
-		keys(): IterableIterator<K> {
-			return forward.keys();
-		},
-		values(): IterableIterator<V> {
-			return forward.values();
-		},
-		entries(): IterableIterator<[K, V]> {
-			return forward.entries();
-		},
-		[Symbol.iterator](): IterableIterator<[K, V]> {
-			return forward.entries();
-		}
-	} as BiMap<K, V>;
-
-	Object.defineProperty(view, SIZE, {
-		value: function (): number {
+		function (): number {
 			return forward.size;
+		},
+		function (): IterableIterator<[K, V]> {
+			return forward.entries();
 		}
-	});
+	);
 
 	return view;
 }
@@ -1374,9 +1599,8 @@ export function createBiMap<K, V>(entries?: Iterable<readonly [K, V]> | null): B
 	const map = biMapView(forward, backward);
 	const inverse = biMapView(backward, forward);
 
-	// `inverse` is not enumerable, so that spreading or serializing a map does not walk into the cycle.
-	Object.defineProperties(map, { size: { get: getSize, enumerable: true, configurable: true }, inverse: { value: inverse } });
-	Object.defineProperties(inverse, { size: { get: getSize, enumerable: true, configurable: true }, inverse: { value: map } });
+	(map as unknown as Record<symbol, unknown>)[INVERSE] = inverse;
+	(inverse as unknown as Record<symbol, unknown>)[INVERSE] = map;
 	if (pairs !== undefined) for (const [key, value] of pairs) map.set(key, value);
 
 	return map;
@@ -1445,6 +1669,18 @@ const KEY_COUNT = Symbol();
  */
 function getKeyCount(this: { [KEY_COUNT](): number }): number {
 	return this[KEY_COUNT]();
+}
+
+/** The prototype of multimaps, created on first use. */
+let multiMap: object | undefined;
+
+/**
+ * Returns the prototype of multimaps, creating it on first use (a call at the top level of the module would run on import, and keep
+ * bundlers from dropping the module when nothing of it is used).
+ * @returns {object} The prototype
+ */
+function multiMapPrototype(): object {
+	return (multiMap ??= withGetters({ size: getSize, keyCount: getKeyCount }));
 }
 
 /**
@@ -1533,82 +1769,76 @@ export function createMultiMap<K, V>(entries?: Iterable<readonly [K, V]> | null,
 		return unique ? (group as Set<V>).size : (group as V[]).length;
 	}
 
-	const multimap = {
-		add(key: K, value: V): boolean {
-			const group = groups.get(key);
-			if (group === undefined) groups.set(key, unique ? new Set([value]) : [value]);
-			else if (!unique) (group as V[]).push(value);
-			else if ((group as Set<V>).has(value)) return false;
-			else (group as Set<V>).add(value);
-			total++;
-			return true;
-		},
-		get(key: K): V[] {
-			const group = groups.get(key);
-			return group === undefined ? [] : Array.from(group);
-		},
-		count(key: K): number {
-			const group = groups.get(key);
-			return group === undefined ? 0 : countOf(group);
-		},
-		has(key: K, ...value: [] | [V]): boolean {
-			const group = groups.get(key);
-			if (group === undefined) return false;
-			if (value.length === 0) return true;
-			return unique ? (group as Set<V>).has(value[0]) : indexOfValue(group as V[], value[0]) >= 0;
-		},
-		delete(key: K, ...value: [] | [V]): boolean {
-			const group = groups.get(key);
-			if (group === undefined) return false;
-			if (value.length === 0) {
-				total -= countOf(group);
-				return groups.delete(key);
+	const multimap: MultiMap<K, V> = build(
+		multiMapPrototype(),
+		{
+			add(key: K, value: V): boolean {
+				const group = groups.get(key);
+				if (group === undefined) groups.set(key, unique ? new Set([value]) : [value]);
+				else if (!unique) (group as V[]).push(value);
+				else if ((group as Set<V>).has(value)) return false;
+				else (group as Set<V>).add(value);
+				total++;
+				return true;
+			},
+			get(key: K): V[] {
+				const group = groups.get(key);
+				return group === undefined ? [] : Array.from(group);
+			},
+			count(key: K): number {
+				const group = groups.get(key);
+				return group === undefined ? 0 : countOf(group);
+			},
+			has(key: K, ...value: [] | [V]): boolean {
+				const group = groups.get(key);
+				if (group === undefined) return false;
+				if (value.length === 0) return true;
+				return unique ? (group as Set<V>).has(value[0]) : indexOfValue(group as V[], value[0]) >= 0;
+			},
+			delete(key: K, ...value: [] | [V]): boolean {
+				const group = groups.get(key);
+				if (group === undefined) return false;
+				if (value.length === 0) {
+					total -= countOf(group);
+					return groups.delete(key);
+				}
+				if (unique) {
+					if (!(group as Set<V>).delete(value[0])) return false;
+				} else {
+					const index = indexOfValue(group as V[], value[0]);
+					if (index < 0) return false;
+					(group as V[]).splice(index, 1);
+				}
+				total--;
+				if (countOf(group) === 0) groups.delete(key);
+				return true;
+			},
+			clear(): void {
+				groups.clear();
+				total = 0;
+			},
+			keys(): IterableIterator<K> {
+				return Array.from(groups.keys()).values();
+			},
+			values(): IterableIterator<V> {
+				return collect(function (_, value): V {
+					return value;
+				});
+			},
+			entries(): IterableIterator<[K, V]> {
+				return collect<[K, V]>(pairOf);
 			}
-			if (unique) {
-				if (!(group as Set<V>).delete(value[0])) return false;
-			} else {
-				const index = indexOfValue(group as V[], value[0]);
-				if (index < 0) return false;
-				(group as V[]).splice(index, 1);
-			}
-			total--;
-			if (countOf(group) === 0) groups.delete(key);
-			return true;
 		},
-		clear(): void {
-			groups.clear();
-			total = 0;
+		function (): number {
+			return total;
 		},
-		keys(): IterableIterator<K> {
-			return Array.from(groups.keys()).values();
-		},
-		values(): IterableIterator<V> {
-			return collect(function (_, value): V {
-				return value;
-			});
-		},
-		entries(): IterableIterator<[K, V]> {
-			return collect<[K, V]>(pairOf);
-		},
-		[Symbol.iterator](): IterableIterator<[K, V]> {
+		function (): IterableIterator<[K, V]> {
 			return collect<[K, V]>(pairOf);
 		}
-	} as MultiMap<K, V>;
-
-	Object.defineProperties(multimap, {
-		[SIZE]: {
-			value: function (): number {
-				return total;
-			}
-		},
-		[KEY_COUNT]: {
-			value: function (): number {
-				return groups.size;
-			}
-		},
-		size: { get: getSize, enumerable: true, configurable: true },
-		keyCount: { get: getKeyCount, enumerable: true, configurable: true }
-	});
+	);
+	(multimap as unknown as Record<symbol, unknown>)[KEY_COUNT] = function (): number {
+		return groups.size;
+	};
 
 	if (pairs !== undefined) for (const [key, value] of pairs) multimap.add(key, value);
 
@@ -1883,139 +2113,136 @@ export function createTrie<V>(entries?: Iterable<readonly [string, V]> | null): 
 		return key;
 	}
 
-	const trie = {
-		get(key: string): V | undefined {
-			assertString('Trie.get', 'key', key);
-			const value = find(key)?.value;
-			return value === NO_VALUE ? undefined : (value as V | undefined);
-		},
-		has(key: string): boolean {
-			assertString('Trie.has', 'key', key);
-			const node = find(key);
-			return node !== undefined && node.value !== NO_VALUE;
-		},
-		set(key: string, value: V): Trie<V> {
-			assertString('Trie.set', 'key', key);
-			let node = root;
-			for (let i = 0; i < key.length;) {
-				const code = key.charCodeAt(i);
-				let child = node.children?.get(code);
-				if (child === undefined) {
-					// A new leaf holds the rest of the key.
-					child = { label: detach(key.slice(i)), value: NO_VALUE, children: undefined, sorted: undefined };
-					(node.children ??= new Map()).set(code, child);
-					node.sorted = undefined;
+	const trie: Trie<V> = build(
+		sizedPrototype(),
+		{
+			get(key: string): V | undefined {
+				assertString('Trie.get', 'key', key);
+				const value = find(key)?.value;
+				return value === NO_VALUE ? undefined : (value as V | undefined);
+			},
+			has(key: string): boolean {
+				assertString('Trie.has', 'key', key);
+				const node = find(key);
+				return node !== undefined && node.value !== NO_VALUE;
+			},
+			set(key: string, value: V): Trie<V> {
+				assertString('Trie.set', 'key', key);
+				let node = root;
+				for (let i = 0; i < key.length;) {
+					const code = key.charCodeAt(i);
+					let child = node.children?.get(code);
+					if (child === undefined) {
+						// A new leaf holds the rest of the key.
+						child = { label: detach(key.slice(i)), value: NO_VALUE, children: undefined, sorted: undefined };
+						(node.children ??= new Map()).set(code, child);
+						node.sorted = undefined;
+						node = child;
+						break;
+					}
+					const label = child.label;
+					const common = commonLength(label, key, i);
+					if (common < label.length) {
+						// The key leaves (or ends inside) the edge: split it at the divergence.
+						const middle: TrieNode = { label: detach(label.slice(0, common)), value: NO_VALUE, children: new Map(), sorted: undefined };
+						child.label = detach(label.slice(common));
+						(middle.children as Map<number, TrieNode>).set(child.label.charCodeAt(0), child);
+						(node.children as Map<number, TrieNode>).set(code, middle);
+						node.sorted = undefined;
+						child = middle;
+					}
+					i += common;
 					node = child;
-					break;
 				}
-				const label = child.label;
-				const common = commonLength(label, key, i);
-				if (common < label.length) {
-					// The key leaves (or ends inside) the edge: split it at the divergence.
-					const middle: TrieNode = { label: detach(label.slice(0, common)), value: NO_VALUE, children: new Map(), sorted: undefined };
-					child.label = detach(label.slice(common));
-					(middle.children as Map<number, TrieNode>).set(child.label.charCodeAt(0), child);
-					(node.children as Map<number, TrieNode>).set(code, middle);
-					node.sorted = undefined;
-					child = middle;
+				if (node.value === NO_VALUE) count++;
+				node.value = value;
+				return trie;
+			},
+			delete(key: string): boolean {
+				assertString('Trie.delete', 'key', key);
+				let grandparent: TrieNode | undefined;
+				let parent: TrieNode | undefined;
+				let node = root;
+				for (let i = 0; i < key.length;) {
+					const child = node.children?.get(key.charCodeAt(i));
+					if (child === undefined || !key.startsWith(child.label, i)) return false;
+					i += child.label.length;
+					grandparent = parent;
+					parent = node;
+					node = child;
 				}
-				i += common;
-				node = child;
+				if (node.value === NO_VALUE) return false;
+				node.value = NO_VALUE;
+				count--;
+				// Every node but the root holds a value or has two children or more; restore that.
+				if (parent !== undefined) {
+					const children = node.children;
+					if (children === undefined) {
+						const siblings = parent.children as Map<number, TrieNode>;
+						siblings.delete(node.label.charCodeAt(0));
+						parent.sorted = undefined;
+						// A parent left without children holds a value (or is the root): it becomes a leaf.
+						if (siblings.size === 0) parent.children = undefined;
+						else if (grandparent !== undefined && parent.value === NO_VALUE && siblings.size === 1) merge(grandparent, parent);
+					} else if (children.size === 1) merge(parent, node);
+				}
+				return true;
+			},
+			clear(): void {
+				root.value = NO_VALUE;
+				root.children = undefined;
+				root.sorted = undefined;
+				count = 0;
+			},
+			hasPrefix(prefix: string): boolean {
+				assertString('Trie.hasPrefix', 'prefix', prefix);
+				// Every node below the root leads to a key; only the root can be empty.
+				return count > 0 && locate(prefix) !== undefined;
+			},
+			keysWithPrefix(prefix: string, options: TrieQueryOptions = {}): string[] {
+				assertString('Trie.keysWithPrefix', 'prefix', prefix);
+				const limit = readLimit('Trie.keysWithPrefix', options);
+				const start = locate(prefix);
+				return collect(start, locatedKey, limit, keyOf);
+			},
+			entriesWithPrefix(prefix: string, options: TrieQueryOptions = {}): Array<[string, V]> {
+				assertString('Trie.entriesWithPrefix', 'prefix', prefix);
+				const limit = readLimit('Trie.entriesWithPrefix', options);
+				const start = locate(prefix);
+				return collect<[string, V]>(start, locatedKey, limit, pairOf);
+			},
+			longestPrefixOf(text: string): string | undefined {
+				assertString('Trie.longestPrefixOf', 'text', text);
+				let node = root;
+				let longest = root.value === NO_VALUE ? -1 : 0;
+				for (let i = 0; i < text.length;) {
+					const child = node.children?.get(text.charCodeAt(i));
+					if (child === undefined || !text.startsWith(child.label, i)) break;
+					i += child.label.length;
+					node = child;
+					if (node.value !== NO_VALUE) longest = i;
+				}
+				return longest < 0 ? undefined : text.slice(0, longest);
+			},
+			keys(): IterableIterator<string> {
+				return collect(root, '', Infinity, keyOf).values();
+			},
+			values(): IterableIterator<V> {
+				return collect(root, '', Infinity, function (_, value: V): V {
+					return value;
+				}).values();
+			},
+			entries(): IterableIterator<[string, V]> {
+				return collect<[string, V]>(root, '', Infinity, pairOf).values();
 			}
-			if (node.value === NO_VALUE) count++;
-			node.value = value;
-			return trie;
 		},
-		delete(key: string): boolean {
-			assertString('Trie.delete', 'key', key);
-			let grandparent: TrieNode | undefined;
-			let parent: TrieNode | undefined;
-			let node = root;
-			for (let i = 0; i < key.length;) {
-				const child = node.children?.get(key.charCodeAt(i));
-				if (child === undefined || !key.startsWith(child.label, i)) return false;
-				i += child.label.length;
-				grandparent = parent;
-				parent = node;
-				node = child;
-			}
-			if (node.value === NO_VALUE) return false;
-			node.value = NO_VALUE;
-			count--;
-			// Every node but the root holds a value or has two children or more; restore that.
-			if (parent !== undefined) {
-				const children = node.children;
-				if (children === undefined) {
-					const siblings = parent.children as Map<number, TrieNode>;
-					siblings.delete(node.label.charCodeAt(0));
-					parent.sorted = undefined;
-					// A parent left without children holds a value (or is the root): it becomes a leaf.
-					if (siblings.size === 0) parent.children = undefined;
-					else if (grandparent !== undefined && parent.value === NO_VALUE && siblings.size === 1) merge(grandparent, parent);
-				} else if (children.size === 1) merge(parent, node);
-			}
-			return true;
+		function (): number {
+			return count;
 		},
-		clear(): void {
-			root.value = NO_VALUE;
-			root.children = undefined;
-			root.sorted = undefined;
-			count = 0;
-		},
-		hasPrefix(prefix: string): boolean {
-			assertString('Trie.hasPrefix', 'prefix', prefix);
-			// Every node below the root leads to a key; only the root can be empty.
-			return count > 0 && locate(prefix) !== undefined;
-		},
-		keysWithPrefix(prefix: string, options: TrieQueryOptions = {}): string[] {
-			assertString('Trie.keysWithPrefix', 'prefix', prefix);
-			const limit = readLimit('Trie.keysWithPrefix', options);
-			const start = locate(prefix);
-			return collect(start, locatedKey, limit, keyOf);
-		},
-		entriesWithPrefix(prefix: string, options: TrieQueryOptions = {}): Array<[string, V]> {
-			assertString('Trie.entriesWithPrefix', 'prefix', prefix);
-			const limit = readLimit('Trie.entriesWithPrefix', options);
-			const start = locate(prefix);
-			return collect<[string, V]>(start, locatedKey, limit, pairOf);
-		},
-		longestPrefixOf(text: string): string | undefined {
-			assertString('Trie.longestPrefixOf', 'text', text);
-			let node = root;
-			let longest = root.value === NO_VALUE ? -1 : 0;
-			for (let i = 0; i < text.length;) {
-				const child = node.children?.get(text.charCodeAt(i));
-				if (child === undefined || !text.startsWith(child.label, i)) break;
-				i += child.label.length;
-				node = child;
-				if (node.value !== NO_VALUE) longest = i;
-			}
-			return longest < 0 ? undefined : text.slice(0, longest);
-		},
-		keys(): IterableIterator<string> {
-			return collect(root, '', Infinity, keyOf).values();
-		},
-		values(): IterableIterator<V> {
-			return collect(root, '', Infinity, function (_, value: V): V {
-				return value;
-			}).values();
-		},
-		entries(): IterableIterator<[string, V]> {
-			return collect<[string, V]>(root, '', Infinity, pairOf).values();
-		},
-		[Symbol.iterator](): IterableIterator<[string, V]> {
+		function (): IterableIterator<[string, V]> {
 			return collect<[string, V]>(root, '', Infinity, pairOf).values();
 		}
-	} as Trie<V>;
-
-	Object.defineProperties(trie, {
-		[SIZE]: {
-			value: function (): number {
-				return count;
-			}
-		},
-		size: { get: getSize, enumerable: true, configurable: true }
-	});
+	);
 
 	if (pairs !== undefined) for (const [key, value] of pairs) trie.set(key, value);
 

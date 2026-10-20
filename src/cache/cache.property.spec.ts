@@ -25,6 +25,10 @@ type Event = [Key, Value, LRUEvictionReason];
 
 interface Config {
 	max: number;
+	/** `Infinity`, or a bound on the total size. */
+	maxSize: number;
+	/** Whether `sizeOf` is given (each entry then weighs its value, 0 to 3), or each entry weighs 1. */
+	sized: boolean;
 	ttl: number | undefined;
 	updateAgeOnGet: boolean;
 }
@@ -32,6 +36,7 @@ interface Config {
 interface ModelEntry {
 	key: Key;
 	value: Value;
+	size: number;
 	ttl: number;
 	expiresAt: number;
 }
@@ -78,17 +83,28 @@ function modelGet(model: Model, key: Key): Value | undefined {
 	return entry.value;
 }
 
+function modelTotal(model: Model): number {
+	return model.entries.reduce(function (sum, e) {
+		return sum + e.size;
+	}, 0);
+}
+
 function modelSet(model: Model, key: Key, value: Value, ttlOverride: number | undefined): void {
 	const ttl = ttlOverride ?? model.config.ttl ?? Infinity;
+	const size = model.config.sized ? value : 1;
 	const index = model.entries.findIndex(function (e) {
 		return e.key === key;
 	});
 	const previous = index === -1 ? undefined : model.entries.splice(index, 1)[0];
-	model.entries.push({ key, value, ttl, expiresAt: model.time + ttl });
-	if (previous !== undefined) {
-		// The very same value stays stored, so nothing is reported, expired or not.
-		if (previous.value !== value) model.events.push([key, previous.value, isExpired(model, previous) ? 'expired' : 'replaced']);
-	} else if (model.entries.length > model.config.max) {
+	if (size > model.config.maxSize) {
+		// Never stored, and the entry it would have replaced is gone.
+		if (previous !== undefined) model.events.push([key, previous.value, isExpired(model, previous) ? 'expired' : 'oversized']);
+		return;
+	}
+	model.entries.push({ key, value, size, ttl, expiresAt: model.time + ttl });
+	// The very same value stays stored, so nothing is reported, expired or not.
+	if (previous !== undefined && previous.value !== value) model.events.push([key, previous.value, isExpired(model, previous) ? 'expired' : 'replaced']);
+	while (model.entries.length > model.config.max || modelTotal(model) > model.config.maxSize) {
 		const oldest = model.entries.shift() as ModelEntry;
 		model.events.push([oldest.key, oldest.value, isExpired(model, oldest) ? 'expired' : 'capacity']);
 	}
@@ -109,6 +125,8 @@ function liveModelEntries(model: Model): Array<[Key, Value]> {
 function checkInvariants(model: Model, real: Real): void {
 	expect(real.cache.size).toBeLessThanOrEqual(model.config.max);
 	expect(real.cache.size).toBe(model.entries.length);
+	expect(real.cache.totalSize).toBe(modelTotal(model));
+	expect(real.cache.totalSize).toBeLessThanOrEqual(model.config.maxSize);
 	expect([...real.cache.entries()]).toEqual(liveModelEntries(model));
 	expect(real.events).toEqual(model.events);
 }
@@ -175,6 +193,12 @@ const commandArbs = [
 		});
 	}),
 	keyArb.map(function (key) {
+		return command(`getRemainingTTL(${key})`, function (model, real) {
+			const entry = modelLookup(model, key);
+			expect(real.cache.getRemainingTTL(key)).toBe(entry === undefined ? undefined : entry.expiresAt - model.time);
+		});
+	}),
+	keyArb.map(function (key) {
 		return command(`delete(${key})`, function (model, real) {
 			const entry = modelLookup(model, key);
 			if (entry !== undefined) {
@@ -213,12 +237,14 @@ const commandArbs = [
 
 const configArb: fc.Arbitrary<Config> = fc.record({
 	max: fc.oneof(fc.integer({ min: 1, max: 5 }), fc.constant(Infinity)),
+	maxSize: fc.oneof(fc.constant(Infinity), fc.integer({ min: 1, max: 6 })),
+	sized: fc.boolean(),
 	ttl: ttlArb,
 	updateAgeOnGet: fc.boolean()
 });
 
 describe('createLRUCache (properties)', function () {
-	it('behaves like a naive recency-ordered array model (size, LRU order, expiry, onEvict)', function () {
+	it('behaves like a naive recency-ordered array model (size, size budget, LRU order, expiry, onEvict)', function () {
 		fc.assert(
 			fc.property(configArb, fc.commands(commandArbs, { size: '+1' }), function (config, commands) {
 				fc.modelRun(function () {
@@ -226,6 +252,13 @@ describe('createLRUCache (properties)', function () {
 					const events: Event[] = [];
 					const cache = createLRUCache<Key, Value>({
 						max: config.max,
+						maxSize: config.maxSize,
+						sizeOf: config.sized
+							? function (value: Value, key: Key): number {
+									expect(typeof key).toBe('number');
+									return value;
+								}
+							: undefined,
 						ttl: config.ttl,
 						updateAgeOnGet: config.updateAgeOnGet,
 						now: function (): number {

@@ -1,4 +1,4 @@
-import { createStore } from 'tinkit/store';
+import { batch, createStore } from 'tinkit/store';
 
 /**
  * A minimal hand-written store (no re-entrancy queue, no error isolation, no selectors): the theoretical best for setState + notify.
@@ -68,6 +68,8 @@ for (let i = 0; i < 10; i++) {
 		calls += i;
 	});
 }
+const third = createStore(0);
+third.subscribe(listener);
 const selected = setup(20);
 const handlers = Array.from({ length: 20 }, function (_, index) {
 	return function () {
@@ -140,6 +142,36 @@ export default [
 			let total = 0;
 			for (let i = 0; i < 100; i++) total += counter.getState();
 			return total;
+		}
+	},
+	{
+		name: 'batch: 3 stores x 10 changes (1 notification each)',
+		fn: function () {
+			batch(function () {
+				for (let i = 0; i < 10; i++) {
+					plain.setState(i);
+					plainTen.setState(i);
+					third.setState(i);
+				}
+			});
+			return calls;
+		},
+		baseline: function () {
+			for (let i = 0; i < 10; i++) {
+				plain.setState(i);
+				plainTen.setState(i);
+				third.setState(i);
+			}
+			return calls;
+		}
+	},
+	{
+		name: 'createStore + select',
+		fn: function () {
+			const store = createStore({ a: 1 });
+			return store.select(function (state) {
+				return state.a;
+			});
 		}
 	},
 	{

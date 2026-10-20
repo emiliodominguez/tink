@@ -1,5 +1,5 @@
 import fc from 'fast-check';
-import { computed, createHistory, createMachine, createStore, persistStore } from '.';
+import { batch, computed, createHistory, createMachine, createStore, persistStore } from '.';
 
 type Op = { kind: 'set'; value: number } | { kind: 'add'; value: number } | { kind: 'reset' };
 
@@ -526,6 +526,57 @@ describe('persistStore (properties)', function () {
 				if (errors.length > 0) expect(store.getState()).toBe(before);
 				expect(errors.length).toBeLessThanOrEqual(1);
 			})
+		);
+	});
+});
+
+describe('batch (properties)', function () {
+	it('notifies every store that changed exactly once, after every change, and a computed store over them at most once', function () {
+		fc.assert(
+			fc.property(
+				fc.integer({ min: 1, max: 4 }),
+				fc.array(fc.tuple(fc.nat(3), fc.integer({ min: 0, max: 3 }), fc.boolean()), { maxLength: 20 }),
+				function (count, changes) {
+					const stores = Array.from({ length: count }, function () {
+						return createStore(0);
+					});
+					const sum = computed(stores, function (...states: number[]) {
+						return states.reduce(function (a, b) {
+							return a + b;
+						}, 0);
+					});
+					const seen: number[][] = stores.map(function () {
+						return [];
+					});
+					const sums: number[] = [];
+					stores.forEach(function (store, i) {
+						store.subscribe(function () {
+							seen[i].push(store.getState());
+						});
+					});
+					sum.subscribe(function () {
+						sums.push(sum.getState());
+					});
+					const changed = new Set<number>();
+					const before = sum.getState();
+					batch(function () {
+						for (const [index, value, nested] of changes) {
+							const store = stores[index % count];
+							if (!Object.is(store.getState(), value)) changed.add(index % count);
+							if (nested)
+								batch(function () {
+									store.setState(value);
+								});
+							else store.setState(value);
+						}
+						expect(seen.flat()).toEqual([]);
+					});
+					stores.forEach(function (store, i) {
+						expect(seen[i]).toEqual(changed.has(i) ? [store.getState()] : []);
+					});
+					expect(sums).toEqual(sum.getState() === before ? [] : [sum.getState()]);
+				}
+			)
 		);
 	});
 });

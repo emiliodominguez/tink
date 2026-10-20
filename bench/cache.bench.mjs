@@ -62,6 +62,13 @@ for (let i = 0; i < SIZE; i++) {
 	minimalNumeric.set(numberKeys[i], i);
 }
 const small = createLRUCache({ max: SIZE / 2 });
+const weighted = createLRUCache({
+	max: Infinity,
+	maxSize: SIZE * 4,
+	sizeOf: function (value) {
+		return (value % 15) + 1;
+	}
+});
 const minimalSmall = minimalLRU(SIZE / 2);
 const map = new Map(
 	keys.map(function (key, index) {
@@ -682,6 +689,28 @@ export default [
 			'minimal Map LRU': function () {
 				for (let i = 0; i < SIZE; i++) minimalSmall.set(keys[i], i);
 				return minimalSmall;
+			}
+		}
+	},
+	{
+		name: 'set with maxSize eviction (1k keys, weights 1-15)',
+		fn: function () {
+			for (let i = 0; i < SIZE; i++) weighted.set(keys[i], i);
+			return weighted.totalSize;
+		}
+	},
+	{
+		name: 'create 1k caches',
+		fn: function () {
+			let last;
+			for (let i = 0; i < SIZE; i++) last = createLRUCache({ max: 10 });
+			return last;
+		},
+		competitors: {
+			'minimal Map LRU': function () {
+				let last;
+				for (let i = 0; i < SIZE; i++) last = minimalLRU(10);
+				return last;
 			}
 		}
 	},

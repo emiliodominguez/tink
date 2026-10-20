@@ -11,6 +11,11 @@ export type { Unsubscribe } from '../emitter/index.js';
  */
 const MAX_ROUNDS = 100;
 
+/** How many {@link batch} calls are running (nested ones included). */
+let batchDepth = 0;
+/** The notifications held back by the running batch, in the order of the first change of each store (called with `true`). */
+let heldBack: Array<(released: boolean) => void> = [];
+
 /**
  * Decides whether two states are equal (no notification is sent for equal states).
  * @template T - The compared type
@@ -66,8 +71,8 @@ interface Notifier {
  * One subscription of a listener.
  */
 interface Subscription {
-	readonly listener: () => void;
-	active: boolean;
+	/** The listener, `undefined` once unsubscribed (so that the list does not keep it alive). */
+	listener: (() => void) | undefined;
 }
 
 /**
@@ -79,47 +84,43 @@ interface Subscription {
  * @throws {RangeError} from `notify` when listeners keep changing the state for 100 consecutive rounds
  */
 function createNotifier(): Notifier {
-	// Mutated in place, except during a round, which iterates the array it started with: then it is copied on write.
-	let subscriptions: Subscription[] = [];
+	// The subscriptions in subscription order, unsubscribed ones included until `compact` drops them: unsubscribing only clears the
+	// listener, so it is O(1) amortized (a `splice` per unsubscription made unmounting n subscribers O(n²)), and a round can iterate the
+	// list by index, up to the length it started with, while listeners subscribe and unsubscribe.
+	const subscriptions: Subscription[] = [];
+	// How many of them are unsubscribed.
+	let removed = 0;
 	let notifying = false;
-	// Whether the current round already works on a copy (so that a round copies the list once, not once per change).
-	let copied = false;
-	// Set by every `notify` call before it is read.
+	// Set by every `run` call before it is read.
 	let pending: boolean;
 	// Callbacks to run once the current notification has finished (see `defer`).
 	let deferred: Array<() => void> = [];
+	// Whether a notification is held back by a batch.
+	let held = false;
 
 	/**
-	 * Calls every active listener of the current list once.
-	 * @returns {unknown[] | undefined} The errors thrown by listeners, if any
+	 * Drops the unsubscribed entries once they are half of the list (never during a notification, whose rounds iterate it by index),
+	 * so that the list stays within twice the number of subscribers and each unsubscription costs O(1) amortized.
+	 * @returns {void}
 	 */
-	function round(): unknown[] | undefined {
-		const snapshot = subscriptions;
-		let errors: unknown[] | undefined;
-
-		copied = false;
-
-		for (const subscription of snapshot) {
-			if (!subscription.active) continue;
-
-			try {
-				const listener = subscription.listener;
-				listener();
-			} catch (error) {
-				errors = errors ?? [];
-				errors.push(error);
-			}
-		}
-
-		return errors;
+	function compact(): void {
+		if (notifying || removed * 2 < subscriptions.length) return;
+		let kept = 0;
+		for (const subscription of subscriptions) if (subscription.listener !== undefined) subscriptions[kept++] = subscription;
+		subscriptions.length = kept;
+		removed = 0;
 	}
 
 	/**
-	 * Runs the deferred callbacks, once the notification has finished.
+	 * Ends a notification: compacts the list, then runs the deferred callbacks.
 	 * @param {unknown[] | undefined} errors - The errors collected so far
 	 * @returns {unknown[] | undefined} `errors`, plus those of the callbacks
 	 */
 	function settle(errors: unknown[] | undefined): unknown[] | undefined {
+		notifying = false;
+		compact();
+		// Most notifications defer nothing: no array is allocated for them.
+		if (deferred.length === 0) return errors;
 		const callbacks = deferred;
 		deferred = [];
 		for (const callback of callbacks) {
@@ -134,72 +135,95 @@ function createNotifier(): Notifier {
 	}
 
 	/**
-	 * Before a change during a round, replaces the list the round iterates with a copy (once per round).
+	 * Notifies the listeners: rounds until no listener changes the state anymore, then the deferred callbacks. Each round calls every
+	 * listener subscribed when it starts, and still subscribed when its turn comes, once. (One closure rather than several: a derived
+	 * store creates a notifier, and every closure adds to the cost of `select`.)
+	 * @param {boolean} released - Whether a batch releases the notification it held back
 	 * @returns {void}
+	 * @throws {RangeError} when listeners keep changing the state for 100 consecutive rounds
 	 */
-	function copyOnWrite(): void {
-		if (!notifying || copied) return;
-		subscriptions = subscriptions.slice();
-		copied = true;
+	function run(released: boolean): void {
+		// Already notified: a listener of a store released earlier changed this one again, which notified at once.
+		if (released && !held) return;
+		held = false;
+		pending = true;
+		if (notifying) return;
+
+		let errors: unknown[] | undefined;
+		let rounds = 0;
+
+		notifying = true;
+
+		while (pending) {
+			pending = false;
+
+			if (++rounds > MAX_ROUNDS) {
+				errors = settle(errors);
+				const message = `store: listeners changed the state during ${MAX_ROUNDS} consecutive notification rounds`;
+				// The errors of the rounds run so far are kept as the cause, rather than lost.
+				if (errors === undefined) throw new RangeError(message);
+				throw new RangeError(message, {
+					cause: errors.length === 1 ? errors[0] : new AggregateError(errors, `store: ${errors.length} notification rounds threw`)
+				});
+			}
+
+			const length = subscriptions.length;
+			let roundErrors: unknown[] | undefined;
+
+			for (let i = 0; i < length; i++) {
+				const listener = subscriptions[i].listener;
+				if (listener === undefined) continue;
+
+				try {
+					listener();
+				} catch (error) {
+					roundErrors = roundErrors ?? [];
+					roundErrors.push(error);
+				}
+			}
+
+			if (roundErrors !== undefined) {
+				errors = errors ?? [];
+				errors.push(roundErrors.length === 1 ? roundErrors[0] : new AggregateError(roundErrors, `store: ${roundErrors.length} listeners threw`));
+			}
+		}
+
+		errors = settle(errors);
+
+		if (errors === undefined) return;
+		if (errors.length === 1) throw errors[0];
+		throw new AggregateError(errors, `store: ${errors.length} notification rounds threw`);
 	}
 
 	return {
 		subscribe(listener: () => void): Unsubscribe {
-			const subscription: Subscription = { listener, active: true };
+			const subscription: Subscription = { listener };
 
-			copyOnWrite();
 			subscriptions.push(subscription);
 
 			return function (): void {
-				if (!subscription.active) return;
+				if (subscription.listener === undefined) return;
 
-				subscription.active = false;
-				copyOnWrite();
-				subscriptions.splice(subscriptions.indexOf(subscription), 1);
+				subscription.listener = undefined;
+				removed++;
+				compact();
 			};
 		},
 
 		notify(): void {
-			pending = true;
-			if (notifying) return;
-
-			let errors: unknown[] | undefined;
-			let rounds = 0;
-
-			notifying = true;
-
-			while (pending) {
-				pending = false;
-
-				if (++rounds > MAX_ROUNDS) {
-					notifying = false;
-					errors = settle(errors);
-					const message = `store: listeners changed the state during ${MAX_ROUNDS} consecutive notification rounds`;
-					// The errors of the rounds run so far are kept as the cause, rather than lost.
-					if (errors === undefined) throw new RangeError(message);
-					throw new RangeError(message, {
-						cause: errors.length === 1 ? errors[0] : new AggregateError(errors, `store: ${errors.length} notification rounds threw`)
-					});
+			if (batchDepth > 0) {
+				// Held back until the outermost batch ends, once however many changes the batch makes.
+				if (!held) {
+					held = true;
+					heldBack.push(run);
 				}
-
-				const roundErrors = round();
-
-				if (roundErrors !== undefined) {
-					errors = errors ?? [];
-					errors.push(roundErrors.length === 1 ? roundErrors[0] : new AggregateError(roundErrors, `store: ${roundErrors.length} listeners threw`));
-				}
+				return;
 			}
-
-			notifying = false;
-			errors = settle(errors);
-
-			if (errors === undefined) return;
-			if (errors.length === 1) throw errors[0];
-			throw new AggregateError(errors, `store: ${errors.length} notification rounds threw`);
+			run(false);
 		},
 
 		size(): number {
-			return subscriptions.length;
+			return subscriptions.length - removed;
 		},
 
 		defer(callback: () => void): boolean {
@@ -211,10 +235,47 @@ function createNotifier(): Notifier {
 }
 
 /**
- * The notifier of each store made by {@link createStore}, so that {@link createHistory} can tell when a notification (all the rounds
- * caused by one change) has ended.
+ * A base class whose constructor returns the object it is given, so that a subclass can add private fields to an existing object.
  */
-const NOTIFIERS = /* @__PURE__ */ new WeakMap<object, Notifier>();
+class Stamp {
+	/**
+	 * Returns `target` as the instance under construction.
+	 * @param {object} target - The object to stamp
+	 */
+	constructor(target: object) {
+		return target;
+	}
+}
+
+/**
+ * Attaches the notifier of each store made by {@link createStore}, so that {@link createHistory} can tell when a notification (all the
+ * rounds caused by one change) has ended. A private field rather than a `WeakMap`: registering a store in a `WeakMap` cost more than
+ * creating the rest of it, and a private field is just as invisible and impossible to forge (no reflection reaches it, and only the
+ * constructor below can add it). The store keeps its `Object.prototype` prototype.
+ */
+class NotifierBrand extends Stamp {
+	/** The store's notifier. */
+	readonly #notifier: Notifier;
+
+	/**
+	 * Adds the private field to `store`.
+	 * @param {object} store - The store
+	 * @param {Notifier} notifier - Its notifier
+	 */
+	constructor(store: object, notifier: Notifier) {
+		super(store);
+		this.#notifier = notifier;
+	}
+
+	/**
+	 * Returns the notifier of a store made by {@link createStore}.
+	 * @param {object} store - Any store
+	 * @returns {Notifier | undefined} Its notifier, or `undefined` for other stores
+	 */
+	static of(store: object): Notifier | undefined {
+		return #notifier in store ? (store as NotifierBrand).#notifier : undefined;
+	}
+}
 
 /**
  * Creates a read-only store derived from `source`. While it has no subscribers it is not subscribed to `source` (so unused derived stores
@@ -521,7 +582,8 @@ export function computed<T>(
  * // React: const value = useSyncExternalStore(count.subscribe, count.getState);
  */
 export function createStore<S>(initialState: S, options: StoreOptions<S> = {}): Store<S> {
-	const { equals = Object.is } = options;
+	// Not destructured: a polluted `Object.prototype.equals` must not decide which states are equal.
+	const equals = readOption(options, 'equals', Object.is as EqualityFn<S>);
 
 	assertFunction('createStore', 'options.equals', equals);
 
@@ -564,8 +626,71 @@ export function createStore<S>(initialState: S, options: StoreOptions<S> = {}): 
 		}
 	};
 
-	NOTIFIERS.set(store, notifier);
+	new NotifierBrand(store, notifier);
 	return store;
+}
+
+/**
+ * Runs `fn`, holding back the notifications of every store it changes until it returns: each store then notifies its listeners once,
+ * however many times `fn` changed it. Updating several stores (or one store several times) thus costs one notification per store, and
+ * no subscriber ever sees a combination of states that `fn` only passed through (Preact signals' and MobX's `batch`, nanostores'
+ * `batched`).
+ *
+ * - States change at once: `getState` returns the new state inside `fn`; only the listeners wait. When the outermost batch ends
+ *   (batches nest), the stores notify in the order of their first change, even when `fn` threw.
+ * - Covers every store of this module: {@link createStore} stores, and through them `select`, {@link computed}, {@link createMachine}
+ *   (whose listeners then only see the last snapshot of the batch) and {@link createHistory} (the changes of a batch make one undo step,
+ *   like `history.batch`). A derived store over several changed stores still recomputes and notifies once.
+ * - Errors: those of `fn` and of the listeners are rethrown once every store has notified (the error itself, or an `AggregateError`,
+ *   `fn`'s error first). `fn` must be synchronous: what an `async` function changes after its first `await` escapes the batch, so a
+ *   returned thenable throws a `TypeError` (after the changes made so far have been notified).
+ * @template R - The result type
+ * @param {() => R} fn - The function making the changes
+ * @returns {R} What `fn` returns
+ * @throws {TypeError} when `fn` is not a function, or returns a thenable
+ * @throws {AggregateError} when `fn` and listeners, or several listeners, threw
+ * @example
+ * const first = createStore('Ada');
+ * const last = createStore('Lovelace');
+ * const full = computed([first, last], function (f, l) { return `${f} ${l}`; });
+ * const seen: string[] = [];
+ * full.subscribe(function () { seen.push(full.getState()); });
+ * batch(function () {
+ * 	first.setState('Grace');
+ * 	last.setState('Hopper');
+ * });
+ * seen; // => ['Grace Hopper'] // never 'Grace Lovelace'
+ * batch(function () { return first.getState(); }); // => 'Grace'
+ */
+export function batch<R>(fn: () => R): R {
+	assertFunction('batch', 'fn', fn);
+	let result: R | undefined;
+	let errors: unknown[] | undefined;
+
+	batchDepth++;
+	try {
+		result = fn();
+	} catch (error) {
+		errors = [error];
+	} finally {
+		batchDepth--;
+	}
+	if (batchDepth === 0) {
+		// Taken as a whole: a batch run by a listener holds back (and releases) its own notifications.
+		const released = heldBack;
+		heldBack = [];
+		for (const release of released) {
+			try {
+				release(true);
+			} catch (error) {
+				errors = errors ?? [];
+				errors.push(error);
+			}
+		}
+	}
+	if (errors !== undefined) throw errors.length === 1 ? errors[0] : new AggregateError(errors, `batch: ${errors.length} errors`);
+	if (isThenable(result)) throw new TypeError('batch: `fn` must be synchronous, got a function returning a thenable');
+	return result as R;
 }
 
 /**
@@ -1161,7 +1286,7 @@ export function createHistory<S>(store: HistorySource<S>, options: HistoryOption
 	assertNumber('createHistory', 'options.coalesce', coalesce, coalesce >= 0, 'a number >= 0');
 	assertFunction('createHistory', 'options.now', now);
 	// Set for `createStore` stores only: tells when a notification has ended.
-	const notifier = NOTIFIERS.get(store);
+	const notifier = NotifierBrand.of(store);
 
 	// The state the history last saw, the undo steps (oldest first, from index `start`: dropping the oldest one just advances `start`,
 	// and the array is compacted once half of it is dropped) and the redo steps (most recent last).
@@ -1169,11 +1294,11 @@ export function createHistory<S>(store: HistorySource<S>, options: HistoryOption
 	let past: S[] = [];
 	let start = 0;
 	let future: S[] = [];
-	// When the last change was recorded (for `coalesce`), batch nesting depth, whether the current batch has recorded its step, and
-	// whether `undo`/`redo` is restoring a state (until the end of its notification).
+	// When the last change was recorded (for `coalesce`), batch nesting depth, whether the current batch has recorded its step (only
+	// read during a batch, which sets it first), and whether `undo`/`redo` is restoring a state (until the end of its notification).
 	let lastChange = -Infinity;
 	let depth = 0;
-	let batched = false;
+	let batched: boolean;
 	let restoring = false;
 	let disposed = false;
 
@@ -1262,7 +1387,7 @@ export function createHistory<S>(store: HistorySource<S>, options: HistoryOption
 		present = next;
 		future = [];
 		lastChange = undone ? -Infinity : time;
-		batched = depth > 0 && !undone;
+		batched = !undone;
 		publish();
 	}
 
@@ -1273,7 +1398,6 @@ export function createHistory<S>(store: HistorySource<S>, options: HistoryOption
 	function settle(): void {
 		record();
 		restoring = false;
-		trim();
 		publish();
 	}
 
@@ -1339,7 +1463,7 @@ export function createHistory<S>(store: HistorySource<S>, options: HistoryOption
 			record();
 			if (future.length === 0) return false;
 			const target = future.pop() as S;
-			// Trimmed once restored, so that a rollback has nothing to bring back.
+			// No trimming: `undo` took this step off `past`, so `past` is back to at most `limit` steps.
 			past.push(present);
 			return restore(target, function (): void {
 				past.pop();
@@ -1467,6 +1591,15 @@ export interface PersistOptions<S, P = S> {
 	 */
 	debounce?: number;
 	/**
+	 * When `true`, follows the changes other tabs (or windows) make to the key: on each `storage` event for it, the new text is
+	 * hydrated into the store as at startup (deserialized, migrated and merged into the current state), without being written back.
+	 * Only native storages (`localStorage`, `sessionStorage`) fire these events, and only in browsers; elsewhere the option does nothing.
+	 * Removing the key in another tab leaves the state as it is. The store must notify synchronously (as this module's stores do), so
+	 * that hydrating does not echo the state back to the other tabs.
+	 * @default false
+	 */
+	sync?: boolean;
+	/**
 	 * Receives the errors of reading, parsing, migrating, merging, serializing and writing, which never propagate (a storage may throw
 	 * when it is full or disabled, and stored data may be corrupt). By default they are ignored.
 	 */
@@ -1550,13 +1683,13 @@ function identity<T>(value: T): T {
  * - Safe with untrusted stored data: the default `deserialize` drops `__proto__` keys and `constructor.prototype` objects at every
  *   depth, and the default `merge` copies
  *   own keys with plain assignments. A custom `deserialize` or `merge` must take the same care.
- * - Changes made in other tabs (`storage` events) are not followed; call `persistStore` again to re-hydrate.
+ * - Changes made in other tabs (`storage` events) are followed with `sync: true`, and ignored otherwise.
  * @template S - The store's state type
  * @template P - The persisted state type
  * @param {Pick<Store<S>, 'getState' | 'setState' | 'subscribe'>} store - The store (any object with `getState`, `setState` and `subscribe`)
  * @param {PersistOptions<S, P>} options - `key` (required), and `storage`, `serialize`, `deserialize`, `version`, `migrate`,
- * `partialize`, `merge`, `debounce` and `onError`
- * @returns {Unsubscribe} Stops persisting: writes a pending change, then unsubscribes from the store (idempotent)
+ * `partialize`, `merge`, `debounce`, `sync` and `onError`
+ * @returns {Unsubscribe} Stops persisting: writes a pending change, then unsubscribes from the store and from `storage` events (idempotent)
  * @throws {TypeError} when `store` lacks one of the methods, `options` is not an object, `key` is not a string, `storage` is not a
  * storage, a function option is not a function, or `version` or `debounce` is not a number
  * @throws {RangeError} when `version` is not an integer `>= 0`, or `debounce` is not a usable delay
@@ -1613,6 +1746,7 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 	const partialize = readOption(settings, 'partialize', identity as (state: S) => P);
 	const merge = readOption(settings, 'merge', mergeShallow as (persisted: P, current: S) => S);
 	const onError = readOption(settings, 'onError');
+	const sync = readOption(settings, 'sync', false);
 	assertInteger('persistStore', 'options.version', version);
 	assertDelay('persistStore', 'options.debounce', debounce);
 	assertFunction('persistStore', 'options.serialize', serialize);
@@ -1633,6 +1767,9 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 	let stored: string | null = null;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let active = true;
+	// Whether a `storage` event is being hydrated (the store's notification then writes nothing), and the state it set.
+	let syncing = false;
+	let synced: S;
 
 	/**
 	 * Reports an error to `onError`, if any.
@@ -1644,13 +1781,14 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 	}
 
 	/**
-	 * Reads, migrates and merges the stored state into the store. Never throws: errors go to `onError`.
-	 * @returns {void}
+	 * Reads, migrates and merges a stored state into the store. Never throws: errors go to `onError`.
+	 * @param {() => unknown} read - Returns the stored text (`null` or `undefined` for none)
+	 * @returns {boolean} Whether a state was set on the store
 	 */
-	function hydrate(): void {
+	function hydrate(read: () => unknown): boolean {
 		try {
-			const text: unknown = (storage as PersistStorage).getItem(key as string);
-			if (text === null || text === undefined) return;
+			const text = read();
+			if (text === null || text === undefined) return false;
 			if (typeof text !== 'string') throw new TypeError(`persistStore: \`storage.getItem\` must return a string or null, got ${describe(text)}`);
 			stored = text;
 			const persisted = deserialize(text);
@@ -1667,13 +1805,48 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 			// The storage still holds the old version: replace it with the migrated state now (not with whatever the store holds after
 			// `setState`, which a store may defer or ignore), or every load would migrate it again, and fail once `migrate` is gone.
 			if (from !== version) writeState(next);
+			synced = next;
 			// Wrapped: `setState` would call a function-valued state as an updater.
 			setState.call(store, function (): S {
 				return next;
 			});
+			return true;
 		} catch (error) {
 			report(error);
+			return false;
 		}
+	}
+
+	/**
+	 * Reads the stored text.
+	 * @returns {unknown} What `storage.getItem` returned
+	 */
+	function readStorage(): unknown {
+		return (storage as PersistStorage).getItem(key as string);
+	}
+
+	/**
+	 * The `storage` event listener (with `sync`): hydrates what another tab wrote under the key.
+	 * @param {unknown} event - The event
+	 * @returns {void}
+	 */
+	function onStorage(event: unknown): void {
+		const { key: changed, newValue, storageArea } = event as { key?: unknown; newValue?: unknown; storageArea?: unknown };
+		// `key` is `null` when another tab cleared the whole storage.
+		if (storageArea !== storage || (changed !== key && changed !== null)) return;
+		// The storage no longer holds what this tab wrote (`hydrate` records what it holds now, when it is a string).
+		stored = null;
+		syncing = true;
+		let set: boolean;
+		try {
+			set = hydrate(function (): unknown {
+				return newValue;
+			});
+		} finally {
+			syncing = false;
+		}
+		// What this tab's listeners changed in reaction is a change of its own, written as usual.
+		if (set && !Object.is(getState.call(store), synced)) onChange();
 	}
 
 	/**
@@ -1714,18 +1887,23 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 	 * @returns {void}
 	 */
 	function onChange(): void {
+		if (syncing) return;
 		if (debounce === 0) write();
 		else if (timer === undefined) timer = setTimeout(write, debounce);
 	}
 
-	hydrate();
+	hydrate(readStorage);
 	const unsubscribe: unknown = subscribe.call(store, onChange);
 	assertFunction('persistStore', 'store.subscribe()', unsubscribe);
+	const events = sync ? (globalThis as { addEventListener?: unknown; removeEventListener?: unknown }) : undefined;
+	const listening = events !== undefined && typeof events.addEventListener === 'function' && typeof events.removeEventListener === 'function';
+	if (listening) (events.addEventListener as (type: string, listener: (event: unknown) => void) => void)('storage', onStorage);
 
 	return function (): void {
 		if (!active) return;
 		active = false;
 		unsubscribe();
+		if (listening) (events.removeEventListener as (type: string, listener: (event: unknown) => void) => void)('storage', onStorage);
 		if (timer === undefined) return;
 		clearTimeout(timer);
 		write();

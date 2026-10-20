@@ -22,6 +22,22 @@ import {
 	type Trie
 } from '.';
 
+/**
+ * Returns the getter `name` of a structure, checking that it is inherited (like `Map.prototype.size`): not an own property, and not
+ * enumerable, so that every instance keeps one shape and creating one defines no accessor.
+ * @param {object} structure - A structure
+ * @param {string} name - The getter name
+ * @returns {(() => unknown) | undefined} The getter
+ */
+function inheritedGetter(structure: object, name: string): (() => unknown) | undefined {
+	expect(Object.hasOwn(structure, name)).toBe(false);
+	expect(name in structure).toBe(true);
+	const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(structure), name);
+	expect(descriptor).toMatchObject({ enumerable: false, configurable: true, set: undefined });
+	expect(typeof descriptor?.get).toBe('function');
+	return descriptor?.get;
+}
+
 function fakeClock(start = 0) {
 	const clock = {
 		time: start,
@@ -102,6 +118,40 @@ describe('createLRUCache', function () {
 			expect(function () {
 				createLRUCache({ max: 1, onEvict: 'x' as any });
 			}).toThrow(new TypeError('createLRUCache: `onEvict` must be a function, got string'));
+		});
+
+		it('ignores options inherited from a polluted Object.prototype', function () {
+			const proto = Object.prototype as Record<string, unknown>;
+			const evicted: unknown[] = [];
+			proto.max = 1;
+			proto.ttl = 1;
+			proto.now = function (): number {
+				throw new Error('polluted clock');
+			};
+			proto.onEvict = function (key: unknown): void {
+				evicted.push(key);
+			};
+			proto.updateAgeOnGet = true;
+			try {
+				expect(function () {
+					createLRUCache({} as never);
+				}).toThrow(new TypeError('createLRUCache: `max` must be an integer >= 1 or Infinity, got undefined'));
+				const cache = createLRUCache<string, number>({ max: 2 });
+				cache.set('a', 1).set('b', 2, {}).set('c', 3);
+				// No TTL (so the polluted clock is never read), no eviction callback, and the real `max`.
+				expect([...cache]).toEqual([
+					['c', 3],
+					['b', 2]
+				]);
+				expect(cache.get('b')).toBe(2);
+				expect(evicted).toEqual([]);
+			} finally {
+				delete proto.max;
+				delete proto.ttl;
+				delete proto.now;
+				delete proto.onEvict;
+				delete proto.updateAgeOnGet;
+			}
 		});
 	});
 
@@ -196,7 +246,7 @@ describe('createLRUCache', function () {
 	});
 
 	describe('size', function () {
-		it('is an own enumerable getter that reports the size of the cache it is read on', function () {
+		it('is an inherited getter that reports the size of the cache it is read on', function () {
 			const first = createLRUCache<string, number>({ max: 5 });
 			const second = createLRUCache<string, number>({ max: 5 });
 			first.set('a', 1).set('b', 2);
@@ -204,11 +254,11 @@ describe('createLRUCache', function () {
 
 			expect(first.size).toBe(2);
 			expect(second.size).toBe(1);
-			expect(Object.keys(first)).toContain('size');
-			const descriptor = Object.getOwnPropertyDescriptor(first, 'size');
-			expect(descriptor).toMatchObject({ enumerable: true, configurable: true, set: undefined });
-			expect(typeof descriptor?.get).toBe('function');
-			expect({ ...second }.size).toBe(1);
+			expect(inheritedGetter(first, 'size')).toBe(inheritedGetter(second, 'size'));
+			expect(Object.getPrototypeOf(first)).toBe(Object.getPrototypeOf(second));
+			// Like a `Map`, the size is not an own property: a spread copy or a serialization does not include it.
+			expect(Object.keys(first)).not.toContain('size');
+			expect(JSON.stringify(first)).toBe('{}');
 		});
 
 		it('works through a proxy and for objects inheriting from a cache', function () {
@@ -622,12 +672,202 @@ describe('createLRUCache', function () {
 			expect(events).toEqual([['short', 2, 'expired']]);
 		});
 
-		it('keeps `size` as an enumerable accessor reflecting the current entry count', function () {
+		it('keeps `size` as an inherited accessor reflecting the current entry count', function () {
 			const cache = createLRUCache<string, number>({ max: 3 });
-			expect(Object.getOwnPropertyDescriptor(cache, 'size')).toMatchObject({ enumerable: true, configurable: true });
+			inheritedGetter(cache, 'size');
 			cache.set('a', 1);
 			expect(cache.size).toBe(1);
 		});
+	});
+});
+
+describe('LRUCache size budget and remaining TTL', function () {
+	function textCache(maxSize: number, onEvict?: (key: string, value: string, reason: LRUEvictionReason) => void): LRUCache<string, string> {
+		return createLRUCache<string, string>({
+			max: Infinity,
+			maxSize,
+			sizeOf: function (text) {
+				return text.length;
+			},
+			onEvict
+		});
+	}
+
+	it('evicts least-recently-used entries until the total size fits, several at once if needed', function () {
+		const { events, onEvict } = recorder<string, string>();
+		const cache = textCache(6, onEvict);
+		cache.set('a', 'aa').set('b', 'bb').set('c', 'cc');
+		cache.get('a');
+		expect(cache.totalSize).toBe(6);
+		cache.set('d', 'dddd');
+		expect([...cache.keys()]).toEqual(['d', 'a']);
+		expect(events).toEqual([
+			['b', 'bb', 'capacity'],
+			['c', 'cc', 'capacity']
+		]);
+		// Growing an entry evicts others too, after reporting the replaced value.
+		cache.set('a', 'aaaa');
+		expect([...cache]).toEqual([['a', 'aaaa']]);
+		expect(cache.totalSize).toBe(4);
+		expect(events.slice(2)).toEqual([
+			['a', 'aa', 'replaced'],
+			['d', 'dddd', 'capacity']
+		]);
+		cache.delete('a');
+		expect(cache.totalSize).toBe(0);
+	});
+
+	it('never stores a value larger than maxSize, removing the entry it would replace', function () {
+		const { events, onEvict } = recorder<string, string>();
+		const cache = textCache(4, onEvict);
+		cache.set('a', 'aa').set('b', 'bb');
+		cache.set('a', 'too long');
+		expect([...cache]).toEqual([['b', 'bb']]);
+		expect(events).toEqual([['a', 'aa', 'oversized']]);
+		cache.set('c', 'longer still');
+		expect(cache.has('c')).toBe(false);
+		expect(
+			cache.getOrSet('d', function () {
+				return 'way too long';
+			})
+		).toBe('way too long');
+		expect([cache.has('d'), cache.size, cache.totalSize]).toEqual([false, 1, 2]);
+		expect(events).toEqual([['a', 'aa', 'oversized']]);
+	});
+
+	it('counts each entry as 1 without sizeOf, and accepts zero-sized entries', function () {
+		const counted = createLRUCache<string, number>({ max: Infinity, maxSize: 2 });
+		counted.set('a', 1).set('b', 2).set('c', 3);
+		expect([[...counted.keys()], counted.totalSize]).toEqual([['c', 'b'], 2]);
+		const free = textCache(1);
+		free.set('a', '').set('b', '').set('c', 'c');
+		expect([free.size, free.totalSize]).toEqual([3, 1]);
+	});
+
+	it('reports every eviction even when onEvict throws', function () {
+		const seen: string[] = [];
+		const cache = textCache(4, function (key) {
+			seen.push(key);
+			throw new Error(key);
+		});
+		cache.set('a', 'a').set('b', 'b').set('c', 'cc');
+		let caught: unknown;
+		try {
+			cache.set('d', 'dddd');
+		} catch (error) {
+			caught = error;
+		}
+		expect(seen).toEqual(['a', 'b', 'c']);
+		expect(caught).toBeInstanceOf(AggregateError);
+		expect((caught as AggregateError).errors).toEqual([new Error('a'), new Error('b'), new Error('c')]);
+		expect([...cache]).toEqual([['d', 'dddd']]);
+	});
+
+	it('validates maxSize, sizeOf and its results, leaving the cache unchanged', function () {
+		for (const maxSize of [0, -1, NaN]) {
+			expect(function () {
+				createLRUCache({ max: 1, maxSize });
+			}).toThrow(new RangeError(`createLRUCache: \`maxSize\` must be a number > 0 or Infinity, got ${maxSize}`));
+		}
+		expect(function () {
+			createLRUCache({ max: 1, maxSize: '5' as never });
+		}).toThrow(new TypeError('createLRUCache: `maxSize` must be a number > 0 or Infinity, got string'));
+		expect(function () {
+			createLRUCache({ max: 1, sizeOf: 5 as never });
+		}).toThrow(new TypeError('createLRUCache: `sizeOf` must be a function, got number'));
+
+		let size: unknown = 1;
+		const { events, onEvict } = recorder<string, number>();
+		const cache = createLRUCache<string, number>({
+			max: 5,
+			maxSize: 10,
+			sizeOf: function () {
+				if (size instanceof Error) throw size;
+				return size as number;
+			},
+			onEvict
+		});
+		cache.set('a', 1);
+		for (const [bad, error] of [
+			['1', new TypeError('LRUCache.set: `sizeOf()` must be a finite number >= 0, got string')],
+			[-1, new RangeError('LRUCache.set: `sizeOf()` must be a finite number >= 0, got -1')],
+			[NaN, new RangeError('LRUCache.set: `sizeOf()` must be a finite number >= 0, got NaN')],
+			[Infinity, new RangeError('LRUCache.set: `sizeOf()` must be a finite number >= 0, got Infinity')],
+			[new Error('measure'), new Error('measure')]
+		] as const) {
+			size = bad;
+			expect(function () {
+				cache.set('a', 2);
+			}).toThrow(error);
+			expect(function () {
+				cache.getOrSet('b', function () {
+					return 2;
+				});
+			}).toThrow(error);
+		}
+		expect([[...cache], cache.totalSize, events]).toEqual([[['a', 1]], 1, []]);
+	});
+
+	it('reports an oversized or grown value over an expired entry as expired, and evicts for a grown value', function () {
+		const clock = fakeClock();
+		const { events, onEvict } = recorder<string, string[]>();
+		const cache = createLRUCache<string, string[]>({
+			max: Infinity,
+			maxSize: 4,
+			sizeOf: function (list) {
+				return list.length;
+			},
+			ttl: 10,
+			now: clock.now,
+			onEvict
+		});
+		cache.set('a', ['x']);
+		clock.advance(10);
+		cache.set('a', ['x', 'x', 'x', 'x', 'x']);
+		expect(events).toEqual([['a', ['x'], 'expired']]);
+		// The very same value, grown: it stays, the others go to make room.
+		const list = ['y'];
+		cache.set('b', ['z', 'z']).set('c', list);
+		list.push('y', 'y');
+		cache.set('c', list);
+		expect([...cache.keys()]).toEqual(['c']);
+		expect(events.slice(1)).toEqual([['b', ['z', 'z'], 'capacity']]);
+		// A larger value over an expired entry: reported as expired, then the evictions.
+		cache.set('d', ['d']);
+		clock.advance(10);
+		cache.set('d', ['d', 'd']);
+		expect(events.slice(2)).toEqual([
+			['d', ['d'], 'expired'],
+			['c', list, 'expired']
+		]);
+	});
+
+	it('never reads the clock for the remaining TTL of a cache without TTLs', function () {
+		const cache = createLRUCache<string, number>({
+			max: 2,
+			now(): number {
+				throw new Error('clock');
+			}
+		});
+		cache.set('a', 1);
+		expect(cache.getRemainingTTL('a')).toBe(Infinity);
+	});
+
+	it('tells the remaining TTL without touching the entry, and expires it once it is due', function () {
+		const clock = fakeClock(1000);
+		const { events, onEvict } = recorder<string, number>();
+		const cache = createLRUCache<string, number>({ max: 5, ttl: 100, now: clock.now, onEvict });
+		cache.set('a', 1).set('forever', 2, { ttl: Infinity });
+		clock.advance(30);
+		expect(cache.getRemainingTTL('a')).toBe(70);
+		expect(cache.getRemainingTTL('forever')).toBe(Infinity);
+		expect(cache.getRemainingTTL('missing')).toBeUndefined();
+		// No recency change: 'forever' is still the most recently used.
+		expect([...cache.keys()]).toEqual(['forever', 'a']);
+		clock.advance(70);
+		expect(cache.getRemainingTTL('a')).toBeUndefined();
+		expect(events).toEqual([['a', 1, 'expired']]);
+		expect(cache.size).toBe(1);
 	});
 });
 
@@ -658,7 +898,7 @@ describe('createPriorityQueue', function () {
 		expect(queue.push(1)).toBe(2);
 		expect(queue.peek()).toBe(1);
 		expect(queue.size).toBe(2);
-		expect(Object.getOwnPropertyDescriptor(queue, 'size')).toMatchObject({ enumerable: true, configurable: true });
+		inheritedGetter(queue, 'size');
 	});
 
 	it('is stable: equal values leave in insertion order (FIFO)', function () {
@@ -748,27 +988,106 @@ describe('createPriorityQueue', function () {
 		).toEqual(['a', 'c', 'd', 'e', 'f']);
 	});
 
+	it('moves the last value up when a delete leaves a hole below a value it precedes', function () {
+		const queue = createPriorityQueue(ascending);
+		// The heap is laid out as [1, 10, 2, 11, 12, 3, 4]: deleting 11 (below 10) leaves 4, the last value, to move up above 10.
+		for (const n of [1, 10, 2, 11, 12, 3, 4]) queue.push(n);
+		expect(queue.delete(11)).toBe(true);
+		const drained: number[] = [];
+		for (let value = queue.pop(); value !== undefined; value = queue.pop()) drained.push(value);
+		expect(drained).toEqual([1, 2, 3, 4, 10, 12]);
+		// Here a heap that only moved the value down would pop 3 before 2.
+		const other = createPriorityQueue(ascending);
+		for (const n of [3, 1, 6, 5, 4, 0, 2]) other.push(n);
+		other.delete(5);
+		const order: number[] = [];
+		for (let value = other.pop(); value !== undefined; value = other.pop()) order.push(value);
+		expect(order).toEqual([0, 1, 2, 3, 4, 6]);
+	});
+
+	it('deletes the oldest of several occurrences of a value, and never finds an absent undefined', function () {
+		const queue = createPriorityQueue(function (a: { p: number; id: string }, b: { p: number; id: string }) {
+			return a.p - b.p;
+		});
+		const shared = { p: 0, id: 'shared' };
+		const items = [shared, { p: 0, id: 'a' }, shared, { p: 0, id: 'b' }];
+		for (const item of items) queue.push(item);
+		expect(queue.delete(shared)).toBe(true);
+		function ids(): string[] {
+			return [...queue].map(function (item) {
+				return item.id;
+			});
+		}
+		// The first `shared` (the oldest, at the root) went: the second keeps its place between 'a' and 'b'.
+		expect(ids()).toEqual(['a', 'shared', 'b']);
+		const later = createPriorityQueue(function (a: { p: number; id: string }, b: { p: number; id: string }) {
+			return a.p - b.p;
+		});
+		for (const item of [{ p: 0, id: 'x' }, shared, { p: 0, id: 'y' }, shared]) later.push(item);
+		later.delete(shared);
+		expect(
+			[...later].map(function (item) {
+				return item.id;
+			})
+		).toEqual(['x', 'y', 'shared']);
+		expect(queue.delete(undefined as never)).toBe(false);
+		expect(queue.size).toBe(3);
+
+		// Here the newer occurrence sits closer to the root than the older one: age decides, not the heap layout.
+		const byAge = createPriorityQueue(function (a: { p: number; id: string }, b: { p: number; id: string }) {
+			return a.p - b.p;
+		});
+		const s = { p: 1, id: 'S' };
+		for (const item of [{ p: 1, id: 'x0' }, { p: 2, id: 'x1' }, s, { p: 1, id: 'x3' }, { p: 0, id: 'x4' }, s, { p: 0, id: 'x6' }]) byAge.push(item);
+		byAge.delete(s);
+		const drained: string[] = [];
+		for (let item = byAge.pop(); item !== undefined; item = byAge.pop()) drained.push(item.id);
+		expect(drained).toEqual(['x4', 'x6', 'x0', 'x3', 'S', 'x1']);
+	});
+
 	it('leaves the queue exactly as it was when compare throws during push, pop or delete', function () {
-		const operations: ReadonlyArray<(queue: PriorityQueue<number>) => unknown> = [
-			function (queue) {
-				return queue.push(0);
-			},
-			function (queue) {
-				return queue.pop();
-			},
-			function (queue) {
-				return queue.delete(2);
-			}
+		interface Item {
+			p: number;
+			id: number;
+		}
+		// Priorities laid out so that deleting some items moves the last one up, and others down; ties make insertion numbers matter.
+		const items: Item[] = [1, 10, 2, 11, 12, 3, 4, 10, 2, 4].map(function (p, id) {
+			return { p, id };
+		});
+		const sorted = items.slice().sort(function (a, b) {
+			return a.p - b.p;
+		});
+		const operations: Array<[string, (queue: PriorityQueue<Item>) => unknown]> = [
+			[
+				'push',
+				function (queue) {
+					return queue.push({ p: 0, id: -1 });
+				}
+			],
+			[
+				'pop',
+				function (queue) {
+					return queue.pop();
+				}
+			],
+			...items.map(function (item): [string, (queue: PriorityQueue<Item>) => unknown] {
+				return [
+					`delete #${item.id}`,
+					function (queue) {
+						return queue.delete(item);
+					}
+				];
+			})
 		];
-		for (const operation of operations) {
-			for (let throwAt = 1; throwAt <= 4; throwAt++) {
+		for (const [name, operation] of operations) {
+			for (let throwAt = 1; throwAt <= 8; throwAt++) {
 				let calls = 0;
 				let armed = false;
-				const queue = createPriorityQueue(function (a: number, b: number): number {
+				const queue = createPriorityQueue(function (a: Item, b: Item): number {
 					if (armed && ++calls === throwAt) throw new Error('boom');
-					return a - b;
+					return a.p - b.p;
 				});
-				for (const n of [1, 2, 3, 4, 5, 6, 7]) queue.push(n);
+				for (const item of items) queue.push(item);
 				armed = true;
 				let threw = false;
 				try {
@@ -777,12 +1096,13 @@ describe('createPriorityQueue', function () {
 					threw = true;
 				}
 				armed = false;
+				// It throws exactly when `compare` was called `throwAt` times.
+				expect([name, throwAt, threw]).toEqual([name, throwAt, calls >= throwAt]);
 				if (!threw) continue;
-				expect(queue.size).toBe(7);
-				expect(queue.peek()).toBe(1);
-				const drained: number[] = [];
-				for (let value = queue.pop(); value !== undefined; value = queue.pop()) drained.push(value);
-				expect(drained).toEqual([1, 2, 3, 4, 5, 6, 7]);
+				expect(queue.size).toBe(items.length);
+				const drained: Item[] = [];
+				for (let item = queue.pop(); item !== undefined; item = queue.pop()) drained.push(item);
+				expect([name, throwAt, drained]).toEqual([name, throwAt, sorted]);
 			}
 		}
 	});
@@ -1066,6 +1386,15 @@ describe('createDeque', function () {
 		try {
 			const deque = createDeque<number>();
 			expect([deque.peekFront(), deque.peekBack(), deque.popFront(), deque.popBack(), deque.at(0)]).toEqual([undefined, undefined, undefined, undefined, undefined]);
+			deque.pushBack(1);
+			deque.clear();
+			expect([deque.peekFront(), deque.peekBack(), deque.at(0)]).toEqual([undefined, undefined, undefined]);
+			deque.pushBack(2);
+			expect([deque.popFront(), deque.peekFront(), deque.popBack()]).toEqual([2, undefined, undefined]);
+			const queue = createPriorityQueue(function (a: number, b: number) {
+				return a - b;
+			});
+			expect([queue.pop(), queue.peek(), queue.size]).toEqual([undefined, undefined, 0]);
 		} finally {
 			delete proto[0];
 			delete proto[5];
@@ -1107,12 +1436,17 @@ describe('createDeque', function () {
 		}
 	});
 
-	it('shares the size getter shape with the other structures', function () {
+	it('shares the size getter with the other structures', function () {
 		const deque = createDeque([1, 2]);
-		expect(Object.keys(deque)).toContain('size');
-		expect(Object.getOwnPropertyDescriptor(deque, 'size')).toEqual(Object.getOwnPropertyDescriptor(createLRUCache({ max: 1 }), 'size'));
-		expect(Object.getOwnPropertyDescriptor(deque, 'size')?.configurable).toBe(true);
-		expect({ ...deque }.size).toBe(2);
+		expect(inheritedGetter(deque, 'size')).toBe(inheritedGetter(createLRUCache({ max: 1 }), 'size'));
+		expect(Object.getPrototypeOf(deque)).toBe(
+			Object.getPrototypeOf(
+				createPriorityQueue(function (a: number, b: number) {
+					return a - b;
+				})
+			)
+		);
+		expect(deque.size).toBe(2);
 	});
 });
 
@@ -1257,6 +1591,7 @@ describe('createRingBuffer', function () {
 
 	it('never reads a polluted Array.prototype', function () {
 		const proto = Array.prototype as unknown as Record<number, unknown>;
+		proto[-1] = 'polluted';
 		proto[0] = 'polluted';
 		proto[1] = 'polluted';
 		proto[2] = 'polluted';
@@ -1270,6 +1605,7 @@ describe('createRingBuffer', function () {
 			// The oldest slot is now past the end of the (still growing) storage.
 			expect([buffer.peekFirst(), buffer.peekLast(), buffer.shift(), buffer.at(0), buffer.at(-1)]).toEqual([undefined, undefined, undefined, undefined, undefined]);
 		} finally {
+			delete proto[-1];
 			delete proto[0];
 			delete proto[1];
 			delete proto[2];
@@ -1314,13 +1650,13 @@ describe('createRingBuffer', function () {
 	it('shares the size and full getters between buffers', function () {
 		const a = createRingBuffer<number>(1);
 		const b = createRingBuffer<number>(2);
-		expect(Object.getOwnPropertyDescriptor(a, 'size')).toEqual(Object.getOwnPropertyDescriptor(createDeque(), 'size'));
-		expect(Object.getOwnPropertyDescriptor(a, 'full')).toEqual(Object.getOwnPropertyDescriptor(b, 'full'));
-		expect(Object.getOwnPropertyDescriptor(a, 'full')?.configurable).toBe(true);
-		expect(Object.getOwnPropertyDescriptor(a, 'full')?.enumerable).toBe(true);
+		expect(inheritedGetter(a, 'size')).toBe(inheritedGetter(createDeque(), 'size'));
+		expect(inheritedGetter(a, 'full')).toBe(inheritedGetter(b, 'full'));
 		a.push(1);
-		expect({ ...a }.full).toBe(true);
-		expect({ ...b }.size).toBe(0);
+		expect([a.full, b.full, b.size]).toEqual([true, false, 0]);
+		// `full` never depends on the (writable) `capacity` property.
+		(a as { capacity: number }).capacity = 10;
+		expect(a.full).toBe(true);
 	});
 });
 
@@ -1486,14 +1822,30 @@ describe('createBiMap', function () {
 		expect(map.has('x')).toBe(false);
 		map.clear();
 		expect([map.size, inverse.size]).toEqual([0, 0]);
-		expect(Object.getOwnPropertyDescriptor(map, 'size')).toEqual(Object.getOwnPropertyDescriptor(inverse, 'size'));
-		expect(Object.getOwnPropertyDescriptor(map, 'inverse')?.writable).toBe(false);
-		// Not enumerable: spreading and serializing do not walk into the cycle.
+		expect(inheritedGetter(map, 'size')).toBe(inheritedGetter(inverse, 'size'));
+		expect(inheritedGetter(map, 'inverse')).toBe(inheritedGetter(inverse, 'inverse'));
+		// Inherited: spreading and serializing do not walk into the cycle.
 		map.set('z', 26);
-		expect(Object.keys(map)).toEqual(expect.not.arrayContaining(['inverse']));
-		expect(JSON.stringify(map)).toBe('{"size":1}');
-		expect(JSON.stringify(inverse)).toBe('{"size":1}');
-		expect({ ...inverse }.size).toBe(1);
+		expect(JSON.stringify(map)).toBe('{}');
+		expect(JSON.stringify(inverse)).toBe('{}');
+		expect({ ...inverse }.inverse).toBeUndefined();
+	});
+
+	it('keeps pairs with an undefined key or value intact when other keys and values change', function () {
+		const map = createBiMap<string | undefined, number | undefined>([
+			[undefined, 1],
+			['u', undefined]
+		]);
+		map.set('a', 2);
+		map.set('b', 3);
+		expect([map.delete('missing'), map.deleteValue(42)]).toEqual([false, false]);
+		expect([...map]).toEqual([
+			[undefined, 1],
+			['u', undefined],
+			['a', 2],
+			['b', 3]
+		]);
+		expect([map.getKey(undefined), map.get(undefined), map.inverse.size]).toEqual(['u', 1, 4]);
 	});
 
 	it('compares with SameValueZero and stores -0 as 0 on both sides', function () {
@@ -1608,10 +1960,9 @@ describe('createMultiMap', function () {
 			delete proto.unique;
 		}
 		const map = createMultiMap();
-		expect(Object.getOwnPropertyDescriptor(map, 'size')).toEqual(Object.getOwnPropertyDescriptor(createDeque(), 'size'));
-		expect(Object.getOwnPropertyDescriptor(map, 'keyCount')).toEqual(Object.getOwnPropertyDescriptor(createMultiMap(), 'keyCount'));
-		expect(Object.getOwnPropertyDescriptor(map, 'keyCount')?.configurable).toBe(true);
-		expect({ ...map }.keyCount).toBe(0);
+		expect(inheritedGetter(map, 'size')).toBe(inheritedGetter(createDeque(), 'size'));
+		expect(inheritedGetter(map, 'keyCount')).toBe(inheritedGetter(createMultiMap(), 'keyCount'));
+		expect([map.size, map.keyCount]).toEqual([0, 0]);
 	});
 });
 

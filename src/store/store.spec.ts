@@ -2,6 +2,7 @@ import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import { isEqual } from '../objects/index.js';
 import {
+	batch,
 	computed,
 	createHistory,
 	createMachine,
@@ -353,6 +354,17 @@ describe('createStore', function () {
 			expect(function () {
 				createStore(0, { equals: 'x' as any });
 			}).toThrow(new TypeError('createStore: `options.equals` must be a function, got string'));
+			const proto = Object.prototype as Record<string, unknown>;
+			proto.equals = function (): boolean {
+				return true;
+			};
+			try {
+				const polluted = createStore(0);
+				polluted.setState(1);
+				expect(polluted.getState()).toBe(1);
+			} finally {
+				delete proto.equals;
+			}
 			expect(function () {
 				store.select('x' as any);
 			}).toThrow(new TypeError('select: `selector` must be a function, got string'));
@@ -750,7 +762,7 @@ describe('createStore (re-entrancy)', function () {
 			twice.setState(1);
 		}).toThrow(
 			expect.objectContaining({
-				cause: expect.objectContaining({ errors: [new Error('round 10'), new Error('round 20')] })
+				cause: expect.objectContaining({ message: 'store: 2 notification rounds threw', errors: [new Error('round 10'), new Error('round 20')] })
 			})
 		);
 	});
@@ -1277,7 +1289,7 @@ describe('createMachine', function () {
 				}).toThrow(new TypeError(`send: \`event\` must be an event type or an object with a string \`type\`, got ${event === null ? 'null' : typeof event}`));
 				expect(function () {
 					machine.can(event as unknown as 'FETCH');
-				}).toThrow(TypeError);
+				}).toThrow(new TypeError(`can: \`event\` must be an event type or an object with a string \`type\`, got ${event === null ? 'null' : typeof event}`));
 			}
 			expect(function () {
 				machine.subscribe(1 as unknown as () => void);
@@ -1476,6 +1488,7 @@ describe('createMachine', function () {
 			expect(machine.getState().value).toBe('red');
 			expect(caught).toBeInstanceOf(AggregateError);
 			expect((caught as AggregateError).errors).toEqual([new Error('yellow'), new Error('red')]);
+			expect((caught as AggregateError).message).toBe('send: 2 events threw');
 
 			expect(function () {
 				machine.send('NEXT');
@@ -1530,10 +1543,60 @@ describe('createMachine', function () {
 			});
 			expect(function () {
 				noisy.send('NEXT');
-			}).toThrow(expect.objectContaining({ cause: expect.objectContaining({ errors: [new Error('40'), new Error('80')] }) }));
+			}).toThrow(expect.objectContaining({ cause: expect.objectContaining({ message: 'send: 2 events threw', errors: [new Error('40'), new Error('80')] }) }));
 		});
 	});
 });
+
+/**
+ * A store of another library that notifies its listeners only when `flush()` is called (so the history sees each change late), may
+ * transform the states it is given (as a store that clamps or normalizes would), and counts its live subscriptions.
+ * @param {number} initialState - The initial state
+ * @param {(next: number) => number} [transform] - Applied to every state set
+ * @returns {HistorySource<number> & { flush(): void; subscriptions(): number; unsubscribes(): number }} The store
+ */
+function lateStore(
+	initialState: number,
+	transform: (next: number) => number = function (next) {
+		return next;
+	}
+): HistorySource<number> & { flush(): void; subscriptions(): number; unsubscribes(): number } {
+	let state = initialState;
+	let dirty = false;
+	let unsubscribes = 0;
+	const listeners = new Set<() => void>();
+	return {
+		getState(): number {
+			return state;
+		},
+		setState(next: number | ((prev: number) => number)): void {
+			state = transform(typeof next === 'function' ? next(state) : next);
+			dirty = true;
+		},
+		subscribe(listener: () => void): () => void {
+			// A subscription of its own, so that subscribing the same listener twice makes two subscriptions.
+			function subscription(): void {
+				listener();
+			}
+			listeners.add(subscription);
+			return function (): void {
+				unsubscribes++;
+				listeners.delete(subscription);
+			};
+		},
+		flush(): void {
+			if (!dirty) return;
+			dirty = false;
+			for (const listener of [...listeners]) listener();
+		},
+		subscriptions(): number {
+			return listeners.size;
+		},
+		unsubscribes(): number {
+			return unsubscribes;
+		}
+	};
+}
 
 describe('createHistory', function () {
 	describe('undo / redo', function () {
@@ -1888,6 +1951,36 @@ describe('createHistory', function () {
 			expect(calls).toEqual([1, 2, 1, 2]);
 		});
 
+		it('records a pending change before redo or clear when called by a listener notified earlier', function () {
+			const store = createStore(0);
+			const commands: Array<() => unknown> = [];
+			store.subscribe(function () {
+				commands.shift()?.();
+			});
+			const history = createHistory(store);
+
+			store.setState(1);
+			store.setState(2);
+			history.undo();
+			// The listener redoes while the change to 3 is still being notified: that change clears the redo steps first.
+			commands.push(function () {
+				return history.redo();
+			});
+			store.setState(3);
+			expect(store.getState()).toBe(3);
+			expect(history.getState()).toEqual({ canUndo: true, canRedo: false, undoCount: 2, redoCount: 0 });
+
+			// Clearing while the change to 4 is being notified forgets that change's step too.
+			commands.push(function () {
+				history.clear();
+			});
+			store.setState(4);
+			expect(history.getState()).toEqual({ canUndo: false, canRedo: false, undoCount: 0, redoCount: 0 });
+			store.setState(5);
+			history.undo();
+			expect(store.getState()).toBe(4);
+		});
+
 		it('keeps its state consistent when a store listener throws during undo', function () {
 			const store = createStore(0);
 			const history = createHistory(store);
@@ -1936,6 +2029,64 @@ describe('createHistory', function () {
 		});
 	});
 
+	describe('stores that notify later', function () {
+		it('records a change seen late as one step, before a batch and after it', function () {
+			const store = lateStore(0);
+			const history = createHistory(store);
+
+			store.setState(1);
+			// Not notified yet: the batch records it first, as its own step.
+			history.batch(function () {
+				store.setState(2);
+				store.setState(3);
+			});
+			expect(history.getState().undoCount).toBe(2);
+			store.flush();
+			expect(history.getState().undoCount).toBe(2);
+			history.undo();
+			expect(store.getState()).toBe(1);
+			history.undo();
+			expect(store.getState()).toBe(0);
+		});
+
+		it('attaches what the store changes while restoring to the restored step', function () {
+			let max = 100;
+			const store = lateStore(0, function (next) {
+				return Math.min(next, max);
+			});
+			const history = createHistory(store);
+
+			store.setState(50);
+			store.flush();
+			store.setState(80);
+			store.flush();
+			// The store now clamps what it is given: restoring 50, then 80, sets 10 instead.
+			max = 10;
+			history.undo();
+			store.flush();
+			expect(store.getState()).toBe(10);
+			expect(history.getState()).toEqual({ canUndo: true, canRedo: true, undoCount: 1, redoCount: 1 });
+			history.redo();
+			store.flush();
+			expect(store.getState()).toBe(10);
+			expect(history.getState()).toEqual({ canUndo: true, canRedo: false, undoCount: 2, redoCount: 0 });
+			history.undo();
+			history.undo();
+			expect(store.getState()).toBe(0);
+		});
+
+		it('unsubscribes once when disposed', function () {
+			const store = lateStore(0);
+			const history = createHistory(store);
+			expect(store.subscriptions()).toBe(1);
+
+			history.dispose();
+			history.dispose();
+			expect(store.subscriptions()).toBe(0);
+			expect(store.unsubscribes()).toBe(1);
+		});
+	});
+
 	describe('limit', function () {
 		it('forgets the oldest steps beyond the limit', function () {
 			const store = createStore(0);
@@ -1952,6 +2103,21 @@ describe('createHistory', function () {
 			expect(history.redo()).toBe(true);
 			expect(history.redo()).toBe(true);
 			expect(store.getState()).toBe(100);
+		});
+
+		it('keeps `limit` steps after an undo, while dropped steps are waiting to be compacted', function () {
+			const store = createStore(0);
+			const history = createHistory(store, { limit: 3 });
+
+			for (let i = 1; i <= 4; i++) store.setState(i);
+			history.undo();
+			store.setState(5);
+			expect(history.getState().undoCount).toBe(3);
+			for (const expected of [3, 2, 1]) {
+				history.undo();
+				expect(store.getState()).toBe(expected);
+			}
+			expect(history.undo()).toBe(false);
 		});
 
 		it('keeps the limit across redo', function () {
@@ -2135,6 +2301,49 @@ describe('createHistory', function () {
 			expect(store.getState()).toBe(0);
 		});
 
+		it('starts a new step after clear() within a batch', function () {
+			const store = createStore(0);
+			const history = createHistory(store);
+
+			history.batch(function () {
+				store.setState(1);
+				history.clear();
+				store.setState(2);
+				store.setState(3);
+			});
+			expect(history.getState().undoCount).toBe(1);
+			history.undo();
+			expect(store.getState()).toBe(1);
+		});
+
+		it('merges changes made at the same instant, and never merges a change into the step of the batch before it', function () {
+			let time = 100;
+			const now = jest.fn(function (): number {
+				return time;
+			});
+			const store = createStore(0);
+			const history = createHistory(store, { coalesce: 500, now });
+
+			store.setState(1);
+			store.setState(2);
+			expect(history.getState().undoCount).toBe(1);
+			now.mockClear();
+			history.batch(function () {
+				store.setState(3);
+				store.setState(4);
+			});
+			// Changes of a batch are merged without reading the clock.
+			expect(now).not.toHaveBeenCalled();
+			expect(history.getState().undoCount).toBe(2);
+			time += 1;
+			store.setState(5);
+			expect(history.getState().undoCount).toBe(3);
+			history.undo();
+			expect(store.getState()).toBe(4);
+			history.undo();
+			expect(store.getState()).toBe(2);
+		});
+
 		it('rejects asynchronous batch functions', function () {
 			const store = createStore(0);
 			const history = createHistory(store);
@@ -2152,6 +2361,13 @@ describe('createHistory', function () {
 					return { then: 1 };
 				})
 			).toEqual({ then: 1 });
+			for (const value of [null, undefined, 0, '', false]) {
+				expect(
+					history.batch(function () {
+						return value;
+					})
+				).toBe(value);
+			}
 			expect(function () {
 				history.batch(function () {
 					return Object.assign(function () {}, {
@@ -2383,6 +2599,198 @@ function spied<S>(store: ReadonlyStore<S>): ReadonlyStore<S> & { live(): number 
 		}
 	};
 }
+
+describe('batch', function () {
+	it('notifies each changed store once, after fn, in the order of their first change, with the states already set', function () {
+		const a = createStore(0);
+		const b = createStore(0);
+		const c = createStore(0);
+		const seen: string[] = [];
+		for (const [name, store] of [
+			['a', a],
+			['b', b],
+			['c', c]
+		] as const) {
+			store.subscribe(function () {
+				seen.push(`${name}:${a.getState()}${b.getState()}${c.getState()}`);
+			});
+		}
+
+		const result = batch(function () {
+			b.setState(1);
+			a.setState(1);
+			b.setState(2);
+			expect([a.getState(), b.getState()]).toEqual([1, 2]);
+			expect(seen).toEqual([]);
+			return 'done';
+		});
+		expect(result).toBe('done');
+		expect(seen).toEqual(['b:120', 'a:120']);
+		// Outside a batch, notifications are immediate again.
+		c.setState(1);
+		expect(seen).toEqual(['b:120', 'a:120', 'c:121']);
+	});
+
+	it('nests: only the outermost batch releases the notifications', function () {
+		const store = createStore(0);
+		const listener = jest.fn();
+		store.subscribe(listener);
+		batch(function () {
+			batch(function () {
+				store.setState(1);
+			});
+			expect(listener).not.toHaveBeenCalled();
+			store.setState(2);
+		});
+		expect(listener).toHaveBeenCalledTimes(1);
+	});
+
+	it('makes derived stores, machines and histories see one change', function () {
+		const price = createStore(10);
+		const quantity = createStore(1);
+		const total = computed([price, quantity], function (p, q) {
+			return p * q;
+		});
+		const totals: number[] = [];
+		total.subscribe(function () {
+			totals.push(total.getState());
+		});
+		const history = createHistory(price);
+		batch(function () {
+			price.setState(20);
+			quantity.setState(3);
+			price.setState(30);
+		});
+		expect(totals).toEqual([90]);
+		expect(history.getState().undoCount).toBe(1);
+		history.undo();
+		expect(price.getState()).toBe(10);
+
+		const toggle = createMachine({ initial: 'off', states: { off: { on: { FLIP: 'on' } }, on: { on: { FLIP: 'off' } } } });
+		const values: string[] = [];
+		toggle.subscribe(function () {
+			values.push(toggle.getState().value);
+		});
+		batch(function () {
+			toggle.send('FLIP');
+			toggle.send('FLIP');
+			toggle.send('FLIP');
+		});
+		expect(values).toEqual(['on']);
+	});
+
+	it('notifies a store changed by the listener of another held-back store once', function () {
+		const a = createStore(0);
+		const b = createStore(0);
+		a.subscribe(function () {
+			b.setState(a.getState() * 10);
+		});
+		const seen: number[] = [];
+		b.subscribe(function () {
+			seen.push(b.getState());
+		});
+		batch(function () {
+			a.setState(1);
+			b.setState(5);
+		});
+		expect(seen).toEqual([10]);
+	});
+
+	it('works from a listener: the changes join the running notification', function () {
+		const store = createStore(0);
+		const other = createStore(0);
+		const seen: number[] = [];
+		store.subscribe(function () {
+			if (store.getState() === 1)
+				batch(function () {
+					store.setState(2);
+					other.setState(2);
+				});
+		});
+		store.subscribe(function () {
+			seen.push(store.getState());
+		});
+		const otherListener = jest.fn();
+		other.subscribe(otherListener);
+		store.setState(1);
+		expect(seen).toEqual([2, 2]);
+		expect(otherListener).toHaveBeenCalledTimes(1);
+	});
+
+	it('still notifies when fn throws, then rethrows every error, fn first', function () {
+		const store = createStore(0);
+		const other = createStore(0);
+		store.subscribe(function () {
+			throw new Error('listener');
+		});
+		const listener = jest.fn();
+		other.subscribe(listener);
+		expect(function () {
+			batch(function () {
+				other.setState(1);
+				throw new Error('fn');
+			});
+		}).toThrow(new Error('fn'));
+		expect(listener).toHaveBeenCalledTimes(1);
+
+		let caught: unknown;
+		try {
+			batch(function () {
+				store.setState(1);
+				other.setState(2);
+				throw new Error('fn');
+			});
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toEqual(new AggregateError([new Error('fn'), new Error('listener')], 'batch: 2 errors'));
+		expect((caught as AggregateError).errors).toEqual([new Error('fn'), new Error('listener')]);
+		expect(listener).toHaveBeenCalledTimes(2);
+		// The batch is over: notifications are immediate again.
+		other.setState(3);
+		expect(listener).toHaveBeenCalledTimes(3);
+	});
+
+	it('rethrows a listener error after notifying every store, when fn itself succeeds', function () {
+		const store = createStore(0);
+		const other = createStore(0);
+		store.subscribe(function () {
+			throw new Error('listener');
+		});
+		const listener = jest.fn();
+		other.subscribe(listener);
+		expect(function () {
+			batch(function () {
+				store.setState(1);
+				other.setState(1);
+			});
+		}).toThrow(new Error('listener'));
+		expect(listener).toHaveBeenCalledTimes(1);
+	});
+
+	it('rejects non-functions and asynchronous functions, after notifying', function () {
+		expect(function () {
+			batch(5 as never);
+		}).toThrow(new TypeError('batch: `fn` must be a function, got number'));
+		const store = createStore(0);
+		const listener = jest.fn();
+		store.subscribe(listener);
+		expect(function () {
+			batch(function () {
+				store.setState(1);
+				return Promise.resolve();
+			});
+		}).toThrow(new TypeError('batch: `fn` must be synchronous, got a function returning a thenable'));
+		expect(listener).toHaveBeenCalledTimes(1);
+		for (const value of [null, undefined, 0, '']) {
+			expect(
+				batch(function () {
+					return value;
+				})
+			).toBe(value);
+		}
+	});
+});
 
 describe('computed', function () {
 	it('combines several stores, in order, and recomputes only when a source state changes', function () {
@@ -3053,6 +3461,177 @@ describe('persistStore', function () {
 		stop();
 		store.setState(1);
 		expect(storage.calls).toEqual(['get k']);
+	});
+
+	describe('sync', function () {
+		/**
+		 * Installs a fake `addEventListener`/`removeEventListener` pair on `globalThis` for the duration of `run`.
+		 * @param {(dispatch: (event: object) => void, count: () => number) => void} run - The test, given a way to dispatch events
+		 * @returns {void}
+		 */
+		function withEvents(run: (dispatch: (event: object) => void, count: () => number) => void): void {
+			const listeners = new Set<(event: object) => void>();
+			const scope = globalThis as { addEventListener?: unknown; removeEventListener?: unknown };
+			const previous = [scope.addEventListener, scope.removeEventListener];
+			scope.addEventListener = function (type: string, listener: (event: object) => void): void {
+				if (type === 'storage') listeners.add(listener);
+			};
+			scope.removeEventListener = function (type: string, listener: (event: object) => void): void {
+				if (type === 'storage') listeners.delete(listener);
+			};
+			try {
+				run(
+					function (event) {
+						for (const listener of [...listeners]) listener(event);
+					},
+					function () {
+						return listeners.size;
+					}
+				);
+			} finally {
+				[scope.addEventListener, scope.removeEventListener] = previous;
+			}
+		}
+
+		it('hydrates what another tab writes under the key, without writing it back', function () {
+			withEvents(function (dispatch) {
+				const storage = memoryStorage({ prefs: '{"state":{"theme":"light","size":1},"version":0}' });
+				const store = createStore({ theme: 'light', size: 1 });
+				const seen: string[] = [];
+				store.subscribe(function () {
+					seen.push(store.getState().theme);
+				});
+				persistStore(store, { key: 'prefs', storage, sync: true });
+				storage.calls.length = 0;
+
+				const text = '{"state":{"theme":"dark"},"version":0}';
+				storage.data.set('prefs', text);
+				dispatch({ key: 'prefs', newValue: text, storageArea: storage });
+				expect(store.getState()).toEqual({ theme: 'dark', size: 1 });
+				// The startup hydration notified once (a merged copy), the event once more.
+				expect(seen).toEqual(['light', 'dark']);
+				expect(storage.calls).toEqual([]);
+				// Other keys and other storages are ignored.
+				dispatch({ key: 'other', newValue: '{"state":{"theme":"x"},"version":0}', storageArea: storage });
+				dispatch({ key: 'prefs', newValue: '{"state":{"theme":"y"},"version":0}', storageArea: memoryStorage() });
+				expect(store.getState().theme).toBe('dark');
+				// A change of this tab is written as usual.
+				store.setState({ theme: 'dark', size: 2 });
+				expect(storage.data.get('prefs')).toBe('{"state":{"theme":"dark","size":2},"version":0}');
+			});
+		});
+
+		it('keeps the state when another tab removes the key or clears the storage, and writes the next change', function () {
+			withEvents(function (dispatch) {
+				const storage = memoryStorage();
+				const store = createStore(1);
+				persistStore(store, { key: 'n', storage, sync: true });
+				store.setState(2);
+				for (const event of [
+					{ key: 'n', newValue: null, storageArea: storage },
+					{ key: null, newValue: null, storageArea: storage }
+				]) {
+					storage.data.clear();
+					dispatch(event);
+					expect(store.getState()).toBe(2);
+					// Nothing is written back in reaction.
+					expect(storage.data.has('n')).toBe(false);
+					store.setState(3);
+					store.setState(2);
+					expect(storage.data.get('n')).toBe('{"state":2,"version":0}');
+				}
+
+				// A change whose persisted slice is what this tab last wrote is still written once the storage was cleared.
+				const slice = createStore({ theme: 'dark', open: false });
+				persistStore(slice, {
+					key: 'slice',
+					storage,
+					sync: true,
+					partialize(state) {
+						return { theme: state.theme };
+					}
+				});
+				slice.setState({ theme: 'light', open: false });
+				storage.data.clear();
+				dispatch({ key: null, newValue: null, storageArea: storage });
+				slice.setState({ theme: 'light', open: true });
+				expect(storage.data.get('slice')).toBe('{"state":{"theme":"light"},"version":0}');
+			});
+		});
+
+		it('writes back a migrated state, and what listeners change in reaction', function () {
+			withEvents(function (dispatch) {
+				const storage = memoryStorage();
+				const store = createStore(0);
+				store.subscribe(function () {
+					if (store.getState() > 100) store.setState(100);
+				});
+				persistStore(store, {
+					key: 'n',
+					storage,
+					version: 1,
+					migrate(persisted) {
+						return (persisted as number) * 10;
+					},
+					sync: true
+				});
+				dispatch({ key: 'n', newValue: '{"state":5,"version":0}', storageArea: storage });
+				expect(store.getState()).toBe(50);
+				expect(storage.data.get('n')).toBe('{"state":50,"version":1}');
+				dispatch({ key: 'n', newValue: '{"state":500,"version":1}', storageArea: storage });
+				expect(store.getState()).toBe(100);
+				expect(storage.data.get('n')).toBe('{"state":100,"version":1}');
+			});
+		});
+
+		it('reports bad data, and stops listening once disposed', function () {
+			withEvents(function (dispatch, count) {
+				const storage = memoryStorage();
+				const store = createStore(0);
+				const onError = jest.fn();
+				const stop = persistStore(store, { key: 'n', storage, sync: true, onError });
+				expect(count()).toBe(1);
+				storage.data.set('n', 'not json');
+				dispatch({ key: 'n', newValue: 'not json', storageArea: storage });
+				expect(onError).toHaveBeenCalledWith(expect.any(SyntaxError));
+				expect(store.getState()).toBe(0);
+				// The bad data is not overwritten in reaction.
+				expect(storage.calls).toEqual(['get n']);
+				stop();
+				stop();
+				expect(count()).toBe(0);
+				dispatch({ key: 'n', newValue: '{"state":1,"version":0}', storageArea: storage });
+				expect(store.getState()).toBe(0);
+				// Without `sync`, no listener at all.
+				persistStore(createStore(0), { key: 'n', storage });
+				expect(count()).toBe(0);
+			});
+		});
+
+		it('does nothing where there are no storage events', function () {
+			const scope = globalThis as { addEventListener?: unknown; removeEventListener?: unknown };
+			expect(scope.addEventListener).toBeUndefined();
+			const store = createStore(0);
+			expect(function () {
+				persistStore(store, { key: 'n', storage: memoryStorage(), sync: true })();
+			}).not.toThrow();
+			// Half an event API is no event API.
+			for (const [add, remove] of [
+				[jest.fn(), undefined],
+				[undefined, jest.fn()],
+				['x', jest.fn()]
+			]) {
+				scope.addEventListener = add;
+				scope.removeEventListener = remove;
+				try {
+					persistStore(store, { key: 'n', storage: memoryStorage(), sync: true })();
+					for (const fn of [add, remove]) if (typeof fn === 'function') expect(fn).not.toHaveBeenCalled();
+				} finally {
+					delete scope.addEventListener;
+					delete scope.removeEventListener;
+				}
+			}
+		});
 	});
 
 	it('defaults to globalThis.localStorage when it is usable, and does nothing otherwise', function () {
