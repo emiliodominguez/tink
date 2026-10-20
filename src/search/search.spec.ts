@@ -367,6 +367,18 @@ describe('Search helpers', function () {
 	});
 
 	describe('highlight', function () {
+		it('reads ranges from any iterable, and each range from any iterable', function () {
+			expect(helpers.highlight('secret', new Set<[number, number]>([[0, 1]]))).toEqual([
+				{ text: 's', match: true },
+				{ text: 'ecret', match: false }
+			]);
+			expect(helpers.highlight('secret', [new Set([1, 3]) as unknown as [number, number]])).toEqual([
+				{ text: 's', match: false },
+				{ text: 'ec', match: true },
+				{ text: 'ret', match: false }
+			]);
+		});
+
 		it('should split text into matched and unmatched segments', function () {
 			expect(
 				helpers.highlight('fooBar', [
@@ -1326,6 +1338,51 @@ describe('createSearchIndex', function () {
 				});
 			}).toThrow(new TypeError('fuzzySearch: `key(item)` must be a string, got undefined'));
 		} finally {
+			delete proto[1];
+		}
+	});
+
+	it('reads the holes of addAll documents as undefined, never through a polluted Object.prototype (regression)', function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		proto[1] = { id: 'planted', title: 'planted' };
+		try {
+			const index = helpers.createSearchIndex<Book>({ fields: ['title'] });
+			const documents = [{ id: 1, title: 'kept' }, undefined, { id: 2, title: 'after' }] as Book[];
+			delete documents[1];
+			expect(function () {
+				index.addAll(documents);
+			}).toThrow(new TypeError('SearchIndex.addAll: `document` must be an object, got undefined'));
+			expect(index.has('planted')).toBe(false);
+			expect(index.search('planted')).toEqual([]);
+			// Any other iterable is iterated.
+			index.addAll(new Set([{ id: 3, title: 'from a set' }]));
+			expect(index.has(3)).toBe(true);
+		} finally {
+			delete proto[1];
+		}
+	});
+
+	it('reads the holes of highlight ranges as undefined, never through a polluted Object.prototype (regression)', function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		proto[0] = 0;
+		try {
+			const ranges: Array<[number, number]> = [
+				[0, 1],
+				[2, 3],
+				[4, 5]
+			];
+			delete ranges[1];
+			proto[1] = [0, 6];
+			expect(function () {
+				helpers.highlight('secret', ranges);
+			}).toThrow(TypeError);
+			const range = [0, 6];
+			delete range[0];
+			expect(function () {
+				helpers.highlight('secret', [range as [number, number]]);
+			}).toThrow(new TypeError('highlight: `start` must be an integer between 0 and 6, got undefined'));
+		} finally {
+			delete proto[0];
 			delete proto[1];
 		}
 		// Dense arrays and other iterables are read as before.

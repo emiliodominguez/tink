@@ -682,7 +682,11 @@ export function highlight(text: string, ranges: Iterable<readonly [number, numbe
 	assertString('highlight', 'text', text);
 	const length = text.length;
 	const sorted: Array<[number, number]> = [];
-	for (const [start, end] of ranges) {
+	// Arrays are read by index, so that a hole is `undefined` (see `elementAt`).
+	const list: ArrayLike<readonly [number, number]> = Array.isArray(ranges) ? ranges : Array.from(ranges);
+	for (let i = 0; i < list.length; i++) {
+		const range = elementAt(list, i) as readonly [number, number];
+		const [start, end] = Array.isArray(range) ? [elementAt(range, 0) as number, elementAt(range, 1) as number] : range;
 		// The messages are only built for invalid bounds.
 		if (!(Number.isInteger(start) && start >= 0 && start <= length)) assertNumber('highlight', 'start', start, false, `an integer between 0 and ${length}`);
 		if (!(Number.isInteger(end) && end >= start && end <= length)) assertNumber('highlight', 'end', end, false, `an integer between ${start} and ${length}`);
@@ -1634,7 +1638,9 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 			if (typeof (documents as Partial<Iterable<T>> | null)?.[Symbol.iterator] !== 'function') {
 				throw new TypeError(`SearchIndex.addAll: \`documents\` must be an iterable, got ${typeName(documents)}`);
 			}
-			for (const document of documents) insert(document, 'SearchIndex.addAll', false);
+			// An array is read by index, so that a hole is `undefined` (see `elementAt`), not a document planted on `Object.prototype`.
+			if (Array.isArray(documents)) for (let i = 0; i < documents.length; i++) insert(elementAt(documents as T[], i) as T, 'SearchIndex.addAll', false);
+			else for (const document of documents) insert(document, 'SearchIndex.addAll', false);
 		},
 		replace(document: T): boolean {
 			return insert(document, 'SearchIndex.replace', true);
