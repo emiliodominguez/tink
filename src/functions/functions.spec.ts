@@ -304,6 +304,37 @@ describe('Functions helpers', function () {
 	});
 
 	describe('memoize', function () {
+		it('should read holes of array arguments as undefined when Object.prototype has a planted index (regression)', function () {
+			const proto = Object.prototype as Record<number, unknown>;
+			proto[0] = 'planted';
+			try {
+				// The own indexes of the list.
+				const describeArgs = helpers.memoize(function (list: unknown[]): string {
+					return Object.keys(list).join(',');
+				});
+				// oxlint-disable-next-line no-sparse-arrays
+				const holey = [, 1];
+				expect(describeArgs(['planted', 1])).toBe('0,1');
+				// Previously the hole read the planted value, so the key merged with the call above: '0,1'.
+				expect(describeArgs(holey)).toBe('1');
+				expect(helpers.defaultMemoizeKey(holey)).toBe(helpers.defaultMemoizeKey([undefined, 1]));
+			} finally {
+				delete proto[0];
+			}
+		});
+
+		it('should treat a null resolver or cache as the default, like undefined (regression: a null resolver threw)', function () {
+			const double = helpers.memoize(
+				function (n: number): number {
+					return n * 2;
+				},
+				{ resolver: null, cache: null } as unknown as helpers.MemoizeOptions<(n: number) => number>
+			);
+			expect([double(1), double(2), double(1)]).toEqual([2, 4, 2]);
+			expect(double.cache).toBeInstanceOf(Map);
+			expect([...double.cache.keys()]).toEqual([1, 2]);
+		});
+
 		it('should ignore options inherited from a polluted Object.prototype', function () {
 			const proto = Object.prototype as Record<string, unknown>;
 			const shared = new Map<unknown, unknown>();
@@ -749,6 +780,27 @@ describe('Functions helpers', function () {
 			expect(calls).toEqual([1, 3]);
 			jest.runAllTimers();
 			expect(calls).toEqual([1, 3]);
+		});
+
+		it('should treat null options as the defaults, like undefined (regression: null read as false)', function () {
+			jest.useFakeTimers();
+
+			const fn = jest.fn();
+			// Previously `leading: null` was read as `false`, leaving no edge at all: a RangeError.
+			const throttled = helpers.throttle(fn, 100, { leading: null, trailing: null } as unknown as helpers.ThrottleOptions);
+			throttled(1);
+			throttled(2);
+			jest.advanceTimersByTime(100);
+			// The defaults: leading edge only.
+			expect(fn.mock.calls).toEqual([[1]]);
+			const both = jest.fn();
+			const throttledBoth = helpers.throttle(both, 100, { leading: null, trailing: true } as unknown as helpers.ThrottleOptions);
+			throttledBoth(3);
+			// Previously a trailing-only throttle: nothing yet.
+			expect(both.mock.calls).toEqual([[3]]);
+			throttledBoth(4);
+			jest.advanceTimersByTime(100);
+			expect(both.mock.calls).toEqual([[3], [4]]);
 		});
 
 		it('should ignore options inherited from a polluted Object.prototype', function () {
@@ -1231,6 +1283,20 @@ describe('Functions helpers', function () {
 			}).toThrow(new TypeError('debounce: `fn` must be a function, got string'));
 		});
 
+		it('should treat null options as the defaults, like undefined (regression: null read as false)', function () {
+			jest.useFakeTimers();
+
+			const fn = jest.fn();
+			// Previously `trailing: null` was read as `false`, leaving no edge at all: a RangeError.
+			const debounced = helpers.debounce(fn, 100, { leading: null, trailing: null } as unknown as helpers.DebounceOptions);
+			debounced(1);
+			debounced(2);
+			expect(fn).not.toHaveBeenCalled();
+			jest.advanceTimersByTime(100);
+			// The defaults: trailing edge only.
+			expect(fn.mock.calls).toEqual([[2]]);
+		});
+
 		it('should ignore options inherited from a polluted Object.prototype', function () {
 			jest.useFakeTimers();
 
@@ -1488,7 +1554,7 @@ describe('Functions helpers (round 2)', function () {
 
 		it('should mark nested undefined values too (holes count as undefined)', function () {
 			expect(helpers.defaultMemoizeKey({ a: undefined, b: 1 }, [undefined])).toBe('[{"a":"undefined","b":1},["undefined"]]');
-			// eslint-disable-next-line no-sparse-arrays -- a hole on purpose
+			// oxlint-disable-next-line no-sparse-arrays on purpose
 			expect(helpers.defaultMemoizeKey([1, , 2])).toBe('[[1,"undefined",2]]');
 			expect(helpers.defaultMemoizeKey({ a: -0, b: NaN })).toBe('[{"a":"-0","b":"NaN"}]');
 		});

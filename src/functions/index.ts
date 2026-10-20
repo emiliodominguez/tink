@@ -604,7 +604,11 @@ function serializeKey(value: unknown, parents: object[]): string {
 			let key = '';
 
 			if (Array.isArray(value)) {
-				for (let i = 0; i < value.length; i++) key += (i === 0 ? '' : ',') + serializeKey(value[i], parents);
+				// A hole reads `undefined`, even when a polluted prototype defines its index (the key would otherwise merge with the array
+				// holding that value).
+				const direct = !isArrayPrototypePolluted();
+
+				for (let i = 0; i < value.length; i++) key += (i === 0 ? '' : ',') + serializeKey(elementOf(value, i, direct), parents);
 				key = `[${key}]`;
 			} else {
 				const names = Object.keys(value);
@@ -646,8 +650,9 @@ export function memoize<F extends AnyFunction, C extends MemoizeCache<unknown, u
 ): Memoized<F, C> {
 	assertFunction('memoize', 'fn', fn);
 
-	// Own (or deliberately inherited) options only: a polluted `Object.prototype` must not supply a resolver or a cache.
-	const resolver = readOption(options, 'resolver', defaultMemoizeKey) as UnknownFunction;
+	// Own (or deliberately inherited) options only: a polluted `Object.prototype` must not supply a resolver or a cache. `null` means the
+	// default, as `undefined` does.
+	const resolver = (readOption(options, 'resolver') ?? defaultMemoizeKey) as UnknownFunction;
 	assertFunction('memoize', 'options.resolver', resolver);
 	// The default resolver ignores `this`, so it can be applied to the argument list directly.
 	const defaultKey = resolver === defaultMemoizeKey;
@@ -770,8 +775,9 @@ export function throttle<F extends AnyFunction>(fn: F, wait: number, options: Th
 	assertFunction('throttle', 'fn', fn);
 	assertWait('throttle', 'wait', wait);
 
-	const leading = readOption(options, 'leading', true);
-	const trailing = readOption(options, 'trailing', false);
+	// `null` means the default, as `undefined` does.
+	const leading = readOption(options, 'leading') ?? true;
+	const trailing = readOption(options, 'trailing') ?? false;
 
 	if (!leading && !trailing) throw new RangeError('throttle: at least one of `leading` or `trailing` must be true');
 
@@ -942,8 +948,9 @@ export function debounce<F extends AnyFunction>(fn: F, wait: number, options: De
 	assertFunction('debounce', 'fn', fn);
 	assertWait('debounce', 'wait', wait);
 
-	const leading = readOption(options, 'leading', false);
-	const trailing = readOption(options, 'trailing', true);
+	// `null` means the default, as `undefined` does.
+	const leading = readOption(options, 'leading') ?? false;
+	const trailing = readOption(options, 'trailing') ?? true;
 	// Read once: a getter returning another value later must not replace the validated one.
 	const requestedMaxWait = readOption(options, 'maxWait');
 	const maxing = requestedMaxWait !== undefined;
