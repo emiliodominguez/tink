@@ -954,9 +954,11 @@ function toNumbers(numbers: Iterable<number> | ArrayLike<number>): number[] {
  * @returns {number[]} The converted copy, ending with the `NaN` that stopped it, if any
  */
 function toNumbersUntilNaN(numbers: ArrayLike<number>): number[] {
-	// Up to `2 ** 24` elements (a fraction of a second even when sparse), the faster `Array.from` copy is kept.
-	if (!(numbers.length > 2 ** 24)) return toNumbers(numbers);
-	const values = new Array<number>(numbers.length);
+	const length = numbers.length;
+	// Up to `2 ** 24` elements (a fraction of a second even when sparse), the faster `Array.from` copy is kept. Beyond, the length is truncated
+	// like `Array.from` truncates it (`new Array(2 ** 24 + 0.5)` throws).
+	if (!(length > 2 ** 24)) return toNumbers(numbers);
+	const values = new Array<number>(Math.trunc(length));
 	for (let i = 0; i < values.length; i++) {
 		values[i] = +numbers[i];
 		if (values[i] !== values[i]) values.length = i + 1;
@@ -1004,8 +1006,9 @@ function pairedMoments(caller: string, xs: ReadonlyArray<number>, ys: ReadonlyAr
 	let sxx = 0;
 	let syy = 0;
 	let sxy = 0;
-	// Shorter than `count` only when a `NaN` stopped a copy, which makes every sum `NaN`.
-	for (let i = 0; i < Math.min(x.length, y.length); i++) {
+	// Shorter than `count` only when a `NaN` stopped a copy, which makes the sums of that sample, and `sxy`, `NaN`.
+	const pairs = Math.min(x.length, y.length);
+	for (let i = 0; i < pairs; i++) {
 		const dx = x[i] - centreX;
 		const dy = y[i] - centreY;
 		sumX += dx;
@@ -1013,6 +1016,13 @@ function pairedMoments(caller: string, xs: ReadonlyArray<number>, ys: ReadonlyAr
 		sxx += dx * dx;
 		syy += dy * dy;
 		sxy += dx * dy;
+	}
+	// A `NaN` stopped the copy of `ys` only: `sxx` still covers every `x`, since `linearRegression` tells constant `xs` by it (summed over
+	// the first pairs only, it could be `0` for `xs` that are not constant).
+	for (let i = pairs; i < x.length; i++) {
+		const dx = x[i] - centreX;
+		sumX += dx;
+		sxx += dx * dx;
 	}
 	// The corrected two-pass algorithm (Chan, Golub and LeVeque): the deviations from the rounded means add up to `n` times the rounding
 	// error `e` of the mean instead of `0`, which adds `n·e²` to the sum of squares; subtracting `(Σd)² / n` takes it out again.
@@ -2268,7 +2278,10 @@ function nativeSumPrecise(): SumPrecise | null {
 				});
 			if (works) checkedSumPrecise = candidate as SumPrecise;
 		} catch {
-			// A replacement that throws is not used.
+			// A replacement that throws is not used, but checked again on the next call: a stack overflow in a check (a first call made
+			// deep in the stack) disabled a correct one for good.
+			checkedSumPrecise = undefined;
+			return null;
 		}
 	}
 	return checkedSumPrecise;
@@ -3751,9 +3764,10 @@ export interface Summary {
  * summarize([]).count; // => 0
  */
 export function summarize(numbers: ReadonlyArray<number>): Summary {
-	// The copy of an array ends at the first `NaN`, which makes every field but `count` `NaN` (an iterable without a length is copied whole).
+	// The copy of a long array ends at the first `NaN`, which makes every field but `count` `NaN`, so the count is its (truncated) length; a
+	// shorter array, or an iterable without a length, is copied whole, and counted by what its iterator gives (see `toNumbersUntilNaN`).
 	const values = toNumbersUntilNaN(numbers);
-	const count = values.length < numbers.length ? numbers.length : values.length;
+	const count = numbers.length > 2 ** 24 ? Math.trunc(numbers.length) : values.length;
 	const sorted = sortedCopy(values);
 	// `NaN` sorts last (or alone, see `sortedCopy`).
 	const nan = count > 0 && sorted[sorted.length - 1] !== sorted[sorted.length - 1];
@@ -3762,7 +3776,7 @@ export function summarize(numbers: ReadonlyArray<number>): Summary {
 	return {
 		count,
 		min: nan ? NaN : count === 0 ? Infinity : sorted[0],
-		max: nan ? NaN : count === 0 ? -Infinity : sorted[count - 1],
+		max: nan ? NaN : count === 0 ? -Infinity : sorted[sorted.length - 1],
 		sum: sum(values),
 		mean: average(values),
 		median: sortedMedian(sorted),

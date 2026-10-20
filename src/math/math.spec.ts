@@ -3503,15 +3503,20 @@ describe('integerSqrt', function () {
 
 	it('takes a few divisions of the full number for a huge bigint (regression: about log2 of its bits, 20 for a million digits)', function () {
 		const n = 10n ** 300_000n * 7n + 3n;
-		// Newton's iteration from `2 ** ⌈bits / 2⌉`, as it was.
-		let start = performance.now();
-		let slow = 1n << BigInt((n.toString(2).length + 1) >> 1);
-		for (let next = (slow + n / slow) >> 1n; next < slow; next = (slow + n / slow) >> 1n) slow = next;
-		const reference = performance.now() - start;
-		start = performance.now();
-		const root = helpers.integerSqrt(n);
-		const elapsed = performance.now() - start;
-		expect(root).toBe(slow);
+		// The fastest of three interleaved runs of each, so that a loaded machine does not decide.
+		let reference = Infinity;
+		let elapsed = Infinity;
+		for (let run = 0; run < 3; run++) {
+			// Newton's iteration from `2 ** ⌈bits / 2⌉`, as it was.
+			let start = performance.now();
+			let slow = 1n << BigInt((n.toString(2).length + 1) >> 1);
+			for (let next = (slow + n / slow) >> 1n; next < slow; next = (slow + n / slow) >> 1n) slow = next;
+			reference = Math.min(reference, performance.now() - start);
+			start = performance.now();
+			const root = helpers.integerSqrt(n);
+			elapsed = Math.min(elapsed, performance.now() - start);
+			expect(root).toBe(slow);
+		}
 		// About three divisions of the full number (and smaller ones), against seventeen.
 		expect(elapsed).toBeLessThan(reference / 3);
 	});
@@ -5593,5 +5598,65 @@ describe('pass 5 regressions: inputs of hostile size', function () {
 	it('average scales overflowing sums without mapping the array (array-likes work too)', function () {
 		expect(helpers.average({ length: 3, 0: MAX, 1: MAX, 2: MAX } as never)).toBe(MAX);
 		expect(helpers.average([MAX, MAX, -Infinity])).toBe(-Infinity);
+	});
+});
+
+describe('pass 6 regressions: the copies that stop at the first NaN', function () {
+	it('linearRegression only rejects constant xs when a NaN in ys stops its copy (regression: the xs before the NaN decided)', function () {
+		// Longer than the arrays copied whole; `xs[0]` is their mean, and the `NaN` of `ys` stopped the sums of `xs` right after it.
+		const xs = new Float64Array(2 ** 24 + 2);
+		xs[1] = -1;
+		xs[2] = 1;
+		const ys = new Float64Array(xs.length).fill(1);
+		ys[0] = NaN;
+		const line = helpers.linearRegression(xs as never, ys as never);
+		expect([line.slope, line.intercept, line.r2]).toEqual([NaN, NaN, NaN]);
+		xs.fill(5);
+		expect(function () {
+			helpers.linearRegression(xs as never, ys as never);
+		}).toThrow('`xs` must not all be equal');
+	});
+
+	it('long array-likes with a fractional length are truncated like Array.from does (regression: RangeError)', function () {
+		const numbers = { length: 2 ** 24 + 0.5 } as never;
+		expect(helpers.rootMeanSquare(numbers)).toBeNaN();
+		expect(helpers.skewness(numbers)).toBeNaN();
+		expect(helpers.covariance(numbers, numbers)).toBeNaN();
+		expect(helpers.summarize(numbers).count).toBe(2 ** 24);
+		expect(helpers.summarize({ length: '20000000', 0: 1 } as never).count).toBe(2e7);
+	});
+
+	it('summarize counts what the iterator of a short array gives (regression: its length, and max read past the copy)', function () {
+		const numbers = [1, 2, 3, 4, 5, 6];
+		numbers[Symbol.iterator] = function* (): Generator<number> {
+			yield 1;
+			yield 2;
+			yield 3;
+		} as never;
+		const summary = helpers.summarize(numbers);
+		expect([summary.count, summary.min, summary.max, summary.mean]).toEqual([3, 1, 3, 2]);
+		expect(summary.variance).toBeCloseTo(2 / 3, 15);
+	});
+
+	it('sumPrecise checks a native Math.sumPrecise again after a check that threw (regression: it was never used again)', function () {
+		const math = Math as { sumPrecise?: unknown };
+		const original = Object.getOwnPropertyDescriptor(Math, 'sumPrecise');
+		let calls = 0;
+		try {
+			// Throws in its first check, as a stack overflow would, then is exact (this module's own sum), and recognizable on `[1, 2]`.
+			math.sumPrecise = function (items: number[]): number {
+				if (++calls === 1) throw new RangeError('Maximum call stack size exceeded');
+				return items.length === 2 && items[0] === 1 && items[1] === 2 ? 42 : helpers.sumPrecise(items);
+			};
+			let isolated: typeof helpers | undefined;
+			jest.isolateModules(function () {
+				isolated = jest.requireActual<typeof helpers>('./index');
+			});
+			expect(isolated!.sumPrecise([1, 2])).toBe(3);
+			expect(isolated!.sumPrecise([1, 2])).toBe(42);
+		} finally {
+			if (original === undefined) delete math.sumPrecise;
+			else Object.defineProperty(Math, 'sumPrecise', original);
+		}
 	});
 });
