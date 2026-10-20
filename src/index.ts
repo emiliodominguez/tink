@@ -21,6 +21,7 @@ export * as guards from './guards/index.js';
 export * as iterables from './iterables/index.js';
 export * as math from './math/index.js';
 export * as objects from './objects/index.js';
+export * as path from './path/index.js';
 export * as random from './random/index.js';
 export * as search from './search/index.js';
 export * as store from './store/index.js';
