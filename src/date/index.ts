@@ -278,15 +278,11 @@ const DURATION_UNIT_EXPONENTS: Readonly<Record<DurationUnit, number>> = { d: 5, 
 const DURATION_UNITS: ReadonlyArray<DurationUnit> = ['d', 'h', 'm', 's', 'ms'];
 
 /**
- * A whole duration string: optional leading minus sign, then one or more `<number><unit>` tokens. Every token must
- * contain digits and end in a unit, so the repetition cannot backtrack exponentially.
+ * A `<number><unit>` token of a duration string and the whitespace after it (`ms` is listed before `m` so it wins), matched only where
+ * the previous token ends (`y`): {@link parseDuration} validates and reads the string in one pass over its tokens, in linear time and
+ * constant stack (a regex repeating the token over the whole string overflows the backtracking stack past about a million tokens).
  */
-const DURATION_REGEX = /^\s*-?(?:(?:\d+(?:\.\d+)?|\.\d+)\s*(?:ms|d|h|m|s)\s*)+$/;
-
-/**
- * A single `<number><unit>` token of a duration string (`ms` is listed before `m` so it wins).
- */
-const DURATION_TOKEN_REGEX = /(\d+(?:\.\d+)?|\.\d+)\s*(ms|d|h|m|s)/g;
+const DURATION_TOKEN_REGEX = /(\d+(?:\.\d+)?|\.\d+)\s*(ms|d|h|m|s)\s*/y;
 
 /**
  * The fields of a {@link Duration}, largest first (the order in which {@link addDuration} applies them).
@@ -811,6 +807,17 @@ function elementAt<T>(array: ArrayLike<T>, index: number): T | undefined {
 }
 
 /**
+ * Whether a user iterable is an array that iterates the default way, which is then read by index with {@link elementAt} (so that a hole
+ * is `undefined`). An array whose `Symbol.iterator` is overridden (own or by a subclass) is iterated, like any other iterable.
+ * @template T - The type of the elements
+ * @param {Iterable<T>} iterable - The iterable
+ * @returns {boolean} `true` for an array read by index
+ */
+function isIndexed<T>(iterable: Iterable<T>): iterable is T[] {
+	return Array.isArray(iterable) && iterable[Symbol.iterator] === Array.prototype[Symbol.iterator];
+}
+
+/**
  * Validates {@link BusinessDayOptions} and builds their calendar. O(h log h) for `h` holidays; without them, O(1) and allocation-free.
  * @param {string} caller - Name of the public function, used in the error messages
  * @param {BusinessDayOptions | undefined} options - The options
@@ -864,8 +871,8 @@ function businessCalendar(caller: string, options: BusinessDayOptions | undefine
 			if (((weekend >> mod(day + 4, DAYS_PER_WEEK)) & 1) === 0) days.add(day);
 		}
 
-		// An array is read by index, so that a hole is `undefined` (see `elementAt`).
-		if (Array.isArray(holidayDates)) for (let i = 0; i < holidayDates.length; i++) add(elementAt(holidayDates as DateInput[], i) as DateInput);
+		// An array is read by index, so that a hole is `undefined` (see `isIndexed`).
+		if (isIndexed(holidayDates)) for (let i = 0; i < holidayDates.length; i++) add(elementAt(holidayDates, i) as DateInput);
 		else for (const holiday of holidayDates) add(holiday);
 		holidays = Float64Array.from(days).sort();
 	}
@@ -1673,8 +1680,8 @@ export function compareDesc(a: DateInput, b: DateInput): -1 | 0 | 1 {
 export function minDate(dates: Iterable<DateInput>): Date | undefined {
 	let result = Infinity;
 
-	// An array is read by index, so that a hole is `undefined` (see `elementAt`).
-	if (Array.isArray(dates)) for (let i = 0; i < dates.length; i++) result = Math.min(result, timeOf(elementAt(dates, i) as DateInput));
+	// An array is read by index, so that a hole is `undefined` (see `isIndexed`).
+	if (isIndexed(dates)) for (let i = 0; i < dates.length; i++) result = Math.min(result, timeOf(elementAt(dates, i) as DateInput));
 	else for (const date of dates) result = Math.min(result, timeOf(date));
 
 	// Valid timestamps are finite, so `Infinity` means that `dates` was empty.
@@ -1694,8 +1701,8 @@ export function minDate(dates: Iterable<DateInput>): Date | undefined {
 export function maxDate(dates: Iterable<DateInput>): Date | undefined {
 	let result = -Infinity;
 
-	// An array is read by index, so that a hole is `undefined` (see `elementAt`).
-	if (Array.isArray(dates)) for (let i = 0; i < dates.length; i++) result = Math.max(result, timeOf(elementAt(dates, i) as DateInput));
+	// An array is read by index, so that a hole is `undefined` (see `isIndexed`).
+	if (isIndexed(dates)) for (let i = 0; i < dates.length; i++) result = Math.max(result, timeOf(elementAt(dates, i) as DateInput));
 	else for (const date of dates) result = Math.max(result, timeOf(date));
 
 	// Valid timestamps are finite, so `-Infinity` means that `dates` was empty.
@@ -1733,8 +1740,8 @@ export function closestTo(target: DateInput, dates: Iterable<DateInput>): Date |
 		}
 	}
 
-	// An array is read by index, so that a hole is `undefined` (see `elementAt`).
-	if (Array.isArray(dates)) for (let i = 0; i < dates.length; i++) visit(elementAt(dates, i) as DateInput);
+	// An array is read by index, so that a hole is `undefined` (see `isIndexed`).
+	if (isIndexed(dates)) for (let i = 0; i < dates.length; i++) visit(elementAt(dates, i) as DateInput);
 	else for (const date of dates) visit(date);
 
 	return distance === Infinity ? undefined : new Date(closest);
@@ -2545,15 +2552,21 @@ export function formatDuration(ms: number, options: FormatDurationOptions = {}):
  */
 export function parseDuration(value: string): number {
 	if (typeof value !== 'string') throw new TypeError(`parseDuration: \`value\` must be a string, got ${describe(value)}`);
-	if (!DURATION_REGEX.test(value))
-		throw new TypeError(`parseDuration: \`value\` must be a valid duration, got ${JSON.stringify(value.length > 50 ? `${value.slice(0, 50)}…` : value)}`);
 
+	// `trimStart` removes exactly the characters that `\s` matches.
+	const text = value.trimStart();
+	const negative = text.startsWith('-');
+	const start = negative ? 1 : 0;
+	let end = start;
 	let total = 0;
 	let match: RegExpExecArray | null;
 
-	// An `exec` loop rather than `matchAll`, which allocates an iterator and copies the regex.
-	DURATION_TOKEN_REGEX.lastIndex = 0;
-	while ((match = DURATION_TOKEN_REGEX.exec(value)) !== null) {
+	// An `exec` loop rather than `matchAll`, which allocates an iterator and copies the regex. Each token starts where the previous one
+	// ends, so the string is valid when there is at least one and they reach its end.
+	DURATION_TOKEN_REGEX.lastIndex = start;
+	while ((match = DURATION_TOKEN_REGEX.exec(text)) !== null) {
+		end = DURATION_TOKEN_REGEX.lastIndex;
+
 		const amount = match[1];
 		const size = DURATION_UNIT_MS[match[2] as DurationUnit];
 		const exponent = DURATION_UNIT_EXPONENTS[match[2] as DurationUnit];
@@ -2573,9 +2586,11 @@ export function parseDuration(value: string): number {
 		}
 	}
 
+	if (end === start || end < text.length)
+		throw new TypeError(`parseDuration: \`value\` must be a valid duration, got ${JSON.stringify(value.length > 50 ? `${value.slice(0, 50)}…` : value)}`);
 	if (!Number.isFinite(total)) throw new RangeError('parseDuration: the duration is too large to be represented');
 
-	return value.trimStart().startsWith('-') ? 0 - total : total;
+	return negative ? 0 - total : total;
 }
 
 /**
@@ -3294,8 +3309,8 @@ function sortedBounds(caller: string, name: string, intervals: Iterable<Interval
 		if (keepEmpty || pair[0] < pair[1]) bounds.push(pair);
 	}
 
-	// An array is read by index, so that a hole is `undefined` (see `elementAt`).
-	if (Array.isArray(intervals)) for (let i = 0; i < intervals.length; i++) add(elementAt(intervals as Interval[], i) as Interval);
+	// An array is read by index, so that a hole is `undefined` (see `isIndexed`).
+	if (isIndexed(intervals)) for (let i = 0; i < intervals.length; i++) add(elementAt(intervals, i) as Interval);
 	else for (const interval of intervals) add(interval);
 
 	return bounds.sort(function (a: [number, number], b: [number, number]): number {

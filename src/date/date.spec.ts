@@ -1466,6 +1466,24 @@ describe('Date helpers', function () {
 			expect(Object.is(helpers.parseDuration('-0s'), 0)).toBe(true);
 		});
 
+		it('reads millions of tokens without overflowing the regex backtracking stack', function () {
+			const tokens = '1d'.repeat(3_000_000);
+
+			expect(helpers.parseDuration(tokens)).toBe(3_000_000 * 86_400_000);
+			expect(function () {
+				helpers.parseDuration(`${tokens}!`);
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.parseDuration(`-${tokens} -`);
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.parseDuration('- 1d');
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.parseDuration(' -');
+			}).toThrow(TypeError);
+		});
+
 		it('accepts multi-digit decimals, with or without a leading digit', function () {
 			expect(helpers.parseDuration('1.25h')).toBe(4_500_000);
 			expect(helpers.parseDuration('.25s')).toBe(250);
@@ -3565,6 +3583,55 @@ describe('Date helpers under prototype pollution', function () {
 		// Other iterables are read as they iterate.
 		expect(helpers.minDate(new Set([5, 3]))?.getTime()).toBe(3);
 		expect(helpers.mergeIntervals(new Set([{ start: 1, end: 2 }]))).toEqual([{ start: new Date(1), end: new Date(2) }]);
+	});
+
+	it('iterates an array whose Symbol.iterator is overridden, own or by a subclass, instead of reading its indices', function () {
+		/**
+		 * An array of `stored` that iterates `yielded` instead.
+		 */
+		function overridden<T>(stored: T[], yielded: T[]): T[] {
+			return Object.assign(stored.slice(), {
+				[Symbol.iterator]: function (): Iterator<T> {
+					return yielded[Symbol.iterator]();
+				}
+			});
+		}
+
+		/**
+		 * An array that iterates its elements doubled.
+		 */
+		class Doubled extends Array<number> {
+			/**
+			 * Yields each element times two.
+			 */
+			override [Symbol.iterator](): ArrayIterator<number> {
+				const values: number[] = [];
+
+				for (let i = 0; i < this.length; i++) values.push(this[i] * 2);
+
+				return values.values();
+			}
+		}
+
+		const doubled = Doubled.from([5, 7]);
+
+		expect(helpers.minDate(overridden([1, 2], [30, 40]))?.getTime()).toBe(30);
+		expect(helpers.maxDate(overridden([1, 2], [30, 40]))?.getTime()).toBe(40);
+		expect(helpers.closestTo(0, overridden([1, 2], [30, 40]))?.getTime()).toBe(30);
+		expect(helpers.minDate(doubled)?.getTime()).toBe(10);
+		expect(helpers.maxDate(doubled)?.getTime()).toBe(14);
+		expect(helpers.mergeIntervals(overridden([{ start: 1, end: 2 }], []))).toEqual([]);
+		expect(helpers.findGaps({ start: 0, end: 10 }, overridden([], [{ start: 2, end: 4 }]))).toEqual([
+			{ start: new Date(0), end: new Date(2) },
+			{ start: new Date(4), end: new Date(10) }
+		]);
+
+		const wednesday = new Date(2024, 0, 3);
+
+		expect(helpers.isBusinessDay(wednesday, { holidays: overridden([wednesday], []) })).toBe(true);
+		expect(helpers.isBusinessDay(wednesday, { holidays: overridden([], [wednesday]) })).toBe(false);
+		// An array proxy iterates by default, so it is read by index.
+		expect(helpers.minDate(new Proxy([8, 6], {}))?.getTime()).toBe(6);
 	});
 
 	it('time zone clocks and relative time formatters ignore inherited Intl options, and are not cached corrupted', function () {
