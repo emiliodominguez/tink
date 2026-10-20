@@ -468,6 +468,16 @@ describe('Arrays helpers', function () {
 			expect(helpers.range(1.7e15, 1.7e15 + 10, 3)).toHaveLength(4);
 		});
 
+		it('should never round the count of safe integers, which have no rounding errors', function () {
+			// The ratio is a few ulps above an integer: the tolerance for decimal steps used to drop the last item.
+			expect(helpers.range(0, 2e15 + 1, 1e15)).toEqual([0, 1e15, 2e15]);
+			expect(helpers.range(-3e15, 3e15 + 1, 3e15)).toEqual([-3e15, 0, 3e15]);
+			expect(helpers.range(3e15 + 1, -3e15, -3e15)).toEqual([3e15 + 1, 1, -3e15 + 1]);
+			// Microsecond timestamps (2042), hourly.
+			expect(helpers.range(2.3e15, 2.3e15 + 10 * 3.6e9 + 1, 3.6e9)).toHaveLength(11);
+			expect(helpers.range(2.3e15, 2.3e15 + 10 * 3.6e9, 3.6e9)).toHaveLength(10);
+		});
+
 		it('should handle spans and values beyond Number.MAX_VALUE', function () {
 			expect(helpers.range(1e308, -1e308, -1e308)).toEqual([1e308, 0]);
 			expect(helpers.range(-1.5e308, 1.5e308, 1e308)).toEqual([-1.5e308, -5e307, 5e307]);

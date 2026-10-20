@@ -353,7 +353,8 @@ export function compact<T>(array: ReadonlyArray<T>): Array<Exclude<T, Falsy>> {
  * The result is empty when `step` points away from `end`. Each value is computed as `start + i * step`,
  * so fractional steps do not accumulate rounding errors (but are still subject to floating-point precision).
  * When `(end - start) / step` is an integer up to floating-point rounding (e.g. `range(0, 2.1, 0.3)`), the range has exactly
- * that many items, and no item ever reaches `end` (it is always exclusive, even when rounding errors would land on it).
+ * that many items, and no item ever reaches `end` (it is always exclusive, even when rounding errors would land on it). Safe integers
+ * have no rounding errors: `range(0, 2e15 + 1, 1e15)` has 3 items.
  * Only lengths above `2 ** 32 - 1` (the array limit) are rejected, far more than a heap can hold: callers must bound untrusted sizes
  * (e.g. `range(Number(query.pages))`), since a result that does not fit in memory aborts the whole process with a fatal
  * "heap out of memory" error rather than throwing.
@@ -404,10 +405,13 @@ function rangeLength(from: number, to: number, step: number): number {
 	// `ratio` carries rounding errors (`2.1 / 0.3` is `7.000000000000001`); when it is an integer up to those errors,
 	// the range is meant to stop exactly one step before `end`, so the count must not be rounded up.
 	// (An exact integer ratio, the usual case, needs no tolerance.) The tolerance bounds those errors: half an ulp for each of
-	// `from` and `to` (relative to `step`) and a few for `step`, the subtraction and the division.
+	// `from` and `to` (relative to `step`) and a few for `step`, the subtraction and the division. Safe integers carry no such errors,
+	// and their ratio is rounded to an integer only when it is one: they never get the tolerance (`range(0, 2e15 + 1, 1e15)` has 3 items).
 	let length = Math.max(
 		0,
-		ratio === nearest || Math.abs(ratio - nearest) <= Number.EPSILON * ((Math.abs(from) + Math.abs(to)) / Math.abs(step) + 2 * Math.abs(ratio))
+		ratio === nearest ||
+			(Math.abs(ratio - nearest) <= Number.EPSILON * ((Math.abs(from) + Math.abs(to)) / Math.abs(step) + 2 * Math.abs(ratio)) &&
+				!(Number.isSafeInteger(from) && Number.isSafeInteger(to) && Number.isSafeInteger(step) && Number.isSafeInteger(to - from)))
 			? nearest
 			: Math.ceil(ratio)
 	);
@@ -2761,7 +2765,9 @@ export function reverseComparator<T>(compare: Comparator<T>): Comparator<T> {
 // ---------------------------------------------------------------------------------------------------------------------
 
 /**
- * A node built by {@link toTree}: a shallow copy of an item (without any previous `C` property) with its children under `C`.
+ * A node built by {@link toTree}: a shallow copy of an item (without any previous `C` property) with its children under `C`. The copy
+ * is a plain object holding the item's own enumerable properties (as `{ ...item }` does): the methods and accessors of a class instance
+ * are not copied, although this type (which cannot tell own properties from inherited ones) still lists them.
  * @template T - The item type
  * @template C - The name of the children property
  */
@@ -2833,7 +2839,8 @@ function keyReader<T extends object>(name: string, key: unknown): (item: T) => u
 /**
  * Build a forest from a flat list of items that reference their parent by id (an adjacency list, as rows of a database table or
  * a CMS export): each item becomes a node, a SHALLOW COPY of the item with the array of its children added under `childrenKey`
- * (the items themselves are never mutated). Roots are the items whose parent id is `null` or `undefined`; children and roots keep
+ * (the items themselves are never mutated). A node is a plain object with the item's own enumerable properties, like `{ ...item }`:
+ * class instances lose their methods and accessors (see {@link TreeNode}). Roots are the items whose parent id is `null` or `undefined`; children and roots keep
  * the order of the input. An item whose parent id matches no item is an orphan: by default it becomes a root (see
  * {@link ToTreeOptions.orphans}). O(n) time and memory, whatever the order of the items and the depth of the tree.
  *
