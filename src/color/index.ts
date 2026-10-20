@@ -902,7 +902,7 @@ export interface ColorNameOptions {
  * @param {ColorInput} color - The colour (see {@link toRgba}; colour names are not accepted as input, use `parseNamedColor` first)
  * @param {ColorNameOptions} [options={}] - `nearest` (default `false`)
  * @returns {string | undefined} The lowercase name, or `undefined` when there is no exact match
- * @throws {TypeError} when `color` is invalid (see {@link toRgba})
+ * @throws {TypeError} when `color` is invalid (see {@link toRgba}), or `options.nearest` is not a boolean
  * @throws {RangeError} when a channel is `NaN`
  * @example
  * toColorName('#663399'); // => 'rebeccapurple'
@@ -917,7 +917,7 @@ export function toColorName(color: ColorInput, options: ColorNameOptions = {}): 
 	const rgba = toRgba(color);
 	const table = namedColors();
 	const value = (rgba.r << 16) | (rgba.g << 8) | rgba.b;
-	if (!readOption(options, 'nearest', false)) {
+	if (!readFlag('toColorName', options, 'nearest')) {
 		if (rgba.a < 1) return rgba.a === 0 && value === 0 ? 'transparent' : undefined;
 		if (NAMES_BY_VALUE === undefined) {
 			// Built aside and published whole; the first name of a duplicated colour (`aqua`, not `cyan`) is kept.
@@ -995,12 +995,41 @@ function readAlpha(name: string, channel: string, value: unknown): number {
 }
 
 /**
+ * Reads a boolean option (see `readOption`), rejecting other values: a truthy string such as `'false'` must not count as `true`.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {object} options - The options object
+ * @param {string} key - The option
+ * @returns {boolean | undefined} The option, `undefined` when it is missing, `undefined` or `null` (its default)
+ * @throws {TypeError} when the option is set to anything else than a boolean
+ * @example
+ * readFlag('meetsContrast', { largeText: true }, 'largeText'); // => true
+ */
+function readFlag<O extends object>(caller: string, options: O, key: keyof O & string): boolean | undefined {
+	const value: unknown = readOption(options, key);
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== 'boolean') throw new TypeError(`${caller}: \`options.${key}\` must be a boolean, got ${describe(value)}`);
+	return value;
+}
+
+/**
+ * Reads an element of an array as an own property.
+ * @param {readonly unknown[]} array - The array
+ * @param {number} index - The index
+ * @returns {unknown} The element, `undefined` for a hole (never a value inherited from a polluted `Object.prototype`)
+ * @example
+ * ownItem([1, , 3], 1); // => undefined
+ */
+function ownItem(array: readonly unknown[], index: number): unknown {
+	return Object.hasOwn(array, index) ? array[index] : undefined;
+}
+
+/**
  * Formats a colour as a lowercase CSS hex string. Channels are clamped and rounded (see {@link toRgba}).
  * @param {ColorInput} color - The colour
  * @param {ToHexOptions} [options={}] - `alpha`: `true` to always emit `#rrggbbaa`, `false` to always emit `#rrggbb`;
  * by default the alpha byte is emitted only when the colour is translucent
  * @returns {string} `'#rrggbb'` or `'#rrggbbaa'`
- * @throws {TypeError} when `color` is not a valid colour (see {@link toRgba})
+ * @throws {TypeError} when `color` is not a valid colour (see {@link toRgba}), or `options.alpha` is not a boolean
  * @throws {RangeError} when a channel is `NaN`
  * @example
  * toHex({ r: 255, g: 128, b: 0 }); // => '#ff8000'
@@ -1011,7 +1040,7 @@ function readAlpha(name: string, channel: string, value: unknown): number {
 export function toHex(color: ColorInput, options: ToHexOptions = {}): string {
 	const { r, g, b, a } = toRgba(color);
 	const alphaByte =
-		(readOption(options, 'alpha') ?? a < 1)
+		(readFlag('toHex', options, 'alpha') ?? a < 1)
 			? Math.round(a * 255)
 					.toString(16)
 					.padStart(2, '0')
@@ -1390,10 +1419,10 @@ function scaleOf(caller: string, stops: readonly ColorInput[], options: ColorSca
 	if (stops.length === 0) throw new RangeError(`${caller}: \`stops\` must hold at least one colour, got an empty array`);
 	const [space, hue] = readMixOptions(caller, options);
 	const domain = readOption(options, 'domain');
-	// `Array.from`, not `map`: a hole is an invalid (`undefined`) stop, not a skipped one.
-	const colors = Array.from(stops, function (stop) {
-		return toRgba(stop);
-	});
+	// Every index, as an own element: a hole is an invalid (`undefined`) stop, neither skipped (as by `map`) nor read from a polluted
+	// `Object.prototype` (as by `Array.from`).
+	const colors: Rgba[] = [];
+	for (let i = 0; i < stops.length; i++) colors.push(toRgba(ownItem(stops, i) as ColorInput));
 	const last = colors.length - 1;
 	let positions: readonly number[] = [0, 1];
 	if (domain !== undefined) {
@@ -1401,12 +1430,15 @@ function scaleOf(caller: string, stops: readonly ColorInput[], options: ColorSca
 		if (domain.length !== 2 && domain.length !== colors.length) {
 			throw new RangeError(`${caller}: \`options.domain\` must hold 2 or ${colors.length} positions (one per stop), got ${domain.length}`);
 		}
+		// The validated own elements are copied (`slice` would copy a hole as the value of a polluted `Object.prototype`).
+		const own: number[] = [];
 		for (let i = 0; i < domain.length; i++) {
-			const position: unknown = domain[i];
-			const valid = Number.isFinite(position) && (i === 0 || (position as number) > domain[i - 1]);
+			const position = ownItem(domain, i);
+			const valid = Number.isFinite(position) && (i === 0 || (position as number) > own[i - 1]);
 			assertNumber(caller, `options.domain[${i}]`, position, valid, i === 0 ? 'a finite number' : `a finite number > options.domain[${i - 1}]`);
+			own.push(position);
 		}
-		positions = domain.slice();
+		positions = own;
 	}
 	const start = positions[0];
 	// A single stop makes a constant scale: every `t` clamps to it.
@@ -1918,17 +1950,18 @@ export function getReadableTextColor(background: ColorInput, options: ReadableTe
  * @param {ColorInput} background - The background colour
  * @param {MeetsContrastOptions} [options={}] - `level` (`'AA'` (default) or `'AAA'`) and `largeText` (default `false`)
  * @returns {boolean} `true` if the contrast ratio is at least the required threshold
- * @throws {TypeError} when a colour is invalid (see {@link toRgba})
+ * @throws {TypeError} when a colour is invalid (see {@link toRgba}), or `largeText` is not a boolean
  * @throws {RangeError} when `level` is not `'AA'` or `'AAA'`, or a channel is `NaN`
  * @example
  * meetsContrast('#767676', '#ffffff'); // => true // 4.54:1
  * meetsContrast('#777777', '#ffffff'); // => false // 4.48:1
  * meetsContrast('#777777', '#ffffff', { largeText: true }); // => true
  * meetsContrast('#767676', '#ffffff', { level: 'AAA' }); // => false
+ * meetsContrast('#777777', '#ffffff', { largeText: 'false' as never }); // throws TypeError
  */
 export function meetsContrast(foreground: ColorInput, background: ColorInput, options: MeetsContrastOptions = {}): boolean {
 	const level = readOption(options, 'level', 'AA');
-	const largeText = readOption(options, 'largeText', false);
+	const largeText = readFlag('meetsContrast', options, 'largeText');
 	if (level !== 'AA' && level !== 'AAA') throw new RangeError(`meetsContrast: \`level\` must be 'AA' or 'AAA', got ${show(level)}`);
 	const threshold = level === 'AA' ? (largeText ? 3 : 4.5) : largeText ? 4.5 : 7;
 	return contrastRatio(foreground, background) >= threshold;
@@ -2307,7 +2340,7 @@ function hashText(text: string): number {
  * showPair([1, 2, 3]); // => 'an array of length 3'
  */
 function showPair(value: readonly unknown[]): string {
-	return value.length === 2 ? `[${show(value[0])}, ${show(value[1])}]` : `an array of length ${value.length}`;
+	return value.length === 2 ? `[${show(ownItem(value, 0))}, ${show(ownItem(value, 1))}]` : `an array of length ${value.length}`;
 }
 
 /**
@@ -2331,8 +2364,8 @@ function pickInRange(name: string, value: unknown, fallback: number, high: numbe
 		return value;
 	}
 	if (!Array.isArray(value)) throw new TypeError(`colorFromString: \`options.${name}\` must be ${expected}, got ${describe(value)}`);
-	const min: unknown = value[0];
-	const max: unknown = value[1];
+	const min = ownItem(value, 0);
+	const max = ownItem(value, 1);
 	if (!(value.length === 2 && typeof min === 'number' && typeof max === 'number' && min >= 0 && min <= max && max <= high)) {
 		throw new RangeError(`colorFromString: \`options.${name}\` must be ${expected} with min <= max, got ${showPair(value)}`);
 	}
@@ -2394,8 +2427,8 @@ export function colorFromString(text: string, options: ColorFromStringOptions = 
 	let end = 360;
 	if (hueRange !== undefined) {
 		if (!Array.isArray(hueRange)) throw new TypeError(`colorFromString: \`options.hueRange\` must be a [start, end] pair of degrees, got ${describe(hueRange)}`);
-		start = hueRange[0];
-		end = hueRange[1];
+		start = ownItem(hueRange, 0) as number;
+		end = ownItem(hueRange, 1) as number;
 		if (!(hueRange.length === 2 && Number.isFinite(start) && Number.isFinite(end) && start <= end && end - start <= 360)) {
 			throw new RangeError(
 				`colorFromString: \`options.hueRange\` must be a [start, end] pair of finite degrees with start <= end <= start + 360, got ${showPair(hueRange)}`

@@ -344,6 +344,33 @@ describe('Color helpers', function () {
 				helpers.meetsContrast('#000', '#fff', { level: 'A' as any });
 			}).toThrow(RangeError);
 		});
+
+		it('should reject a largeText that is not a boolean, which counted as its truthiness (regression)', function () {
+			// Regression: `largeText: 'false'` (from a query string, a data attribute) applied the large-text threshold: 4.48:1 passed AA.
+			for (const [value, got] of [
+				['false', 'string'],
+				[0, 'number'],
+				[{}, 'object']
+			] as const) {
+				expect(function () {
+					helpers.meetsContrast('#777777', '#ffffff', { largeText: value as never });
+				}).toThrow(new TypeError(`meetsContrast: \`options.largeText\` must be a boolean, got ${got}`));
+			}
+			// `undefined` and `null` mean the default (`false`), as before.
+			expect(helpers.meetsContrast('#777777', '#ffffff', { largeText: undefined })).toBe(false);
+			expect(helpers.meetsContrast('#777777', '#ffffff', { largeText: null as never })).toBe(false);
+		});
+
+		it('should reject the other boolean options when they are not booleans (regression)', function () {
+			expect(function () {
+				helpers.toColorName('#ff0001', { nearest: 'false' as never });
+			}).toThrow(new TypeError('toColorName: `options.nearest` must be a boolean, got string'));
+			expect(function () {
+				helpers.toHex('#ff0000', { alpha: 'false' as never });
+			}).toThrow(new TypeError('toHex: `options.alpha` must be a boolean, got string'));
+			expect(helpers.toColorName('#ff0001', { nearest: null as never })).toBeUndefined();
+			expect(helpers.toHex('#ff000080', { alpha: null as never })).toBe('#ff000080');
+		});
 	});
 
 	describe('parseColor', function () {
@@ -836,6 +863,45 @@ describe('Color helpers under prototype pollution', function () {
 			expect(helpers.toRgba(new Translucent()).a).toBe(0.25);
 		} finally {
 			delete keys.a;
+		}
+	});
+
+	it('reads colour stops, domain positions and colorFromString pairs as own elements only (regression)', function () {
+		// oxlint-disable-next-line no-sparse-arrays
+		const stops = ['#000', , '#fff'] as string[];
+		// oxlint-disable-next-line no-sparse-arrays
+		const domain = [0, , 1] as number[];
+		// oxlint-disable-next-line no-sparse-arrays
+		const pair = [, 40] as unknown as [number, number];
+		const indexes = Object.prototype as Record<number, unknown>;
+		indexes[0] = 0;
+		indexes[1] = '#f00';
+		try {
+			// Regression: a hole was read from the polluted prototype, so a planted colour or position was used instead of an error.
+			expect(function () {
+				helpers.colorScale(stops);
+			}).toThrow(new TypeError('toRgba: `input` must be a colour string or an { r, g, b } object, got undefined'));
+			expect(function () {
+				helpers.colorSteps(stops, 3);
+			}).toThrow(TypeError);
+			indexes[1] = 0.9;
+			expect(function () {
+				helpers.colorScale(['#000', '#888', '#fff'], { domain });
+			}).toThrow(new TypeError('colorScale: `options.domain[1]` must be a finite number > options.domain[0], got undefined'));
+			indexes[1] = 40;
+			expect(function () {
+				helpers.colorFromString('x', { hueRange: pair });
+			}).toThrow(
+				new RangeError('colorFromString: `options.hueRange` must be a [start, end] pair of finite degrees with start <= end <= start + 360, got [undefined, 40]')
+			);
+			indexes[1] = 0.5;
+			expect(function () {
+				// oxlint-disable-next-line no-sparse-arrays
+				helpers.colorFromString('x', { lightness: [, 0.5] as unknown as [number, number] });
+			}).toThrow(new RangeError('colorFromString: `options.lightness` must be a number in [0, 1] or a [min, max] pair of them with min <= max, got [undefined, 0.5]'));
+		} finally {
+			delete indexes[0];
+			delete indexes[1];
 		}
 	});
 
