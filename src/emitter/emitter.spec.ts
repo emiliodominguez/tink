@@ -643,6 +643,126 @@ describe('createEmitter', function () {
 			expect(b).toHaveBeenCalledTimes(1);
 			expect(a).not.toHaveBeenCalled();
 		});
+
+		it('removes n listeners in O(n) (regression: each call scanned the list, 30,000 took 13 s)', function () {
+			const events = createEmitter<{ x: void }>();
+			const handlers = Array.from({ length: 2000 }, function () {
+				return function (): void {};
+			});
+			for (const handler of handlers) events.on('x', handler);
+			// Every scan of a listener list steps an array iterator: counted.
+			const iteratorPrototype = Object.getPrototypeOf([][Symbol.iterator]()) as { next: () => unknown };
+			const next = iteratorPrototype.next;
+			let steps = 0;
+			iteratorPrototype.next = function (this: unknown) {
+				steps++;
+				return next.call(this);
+			};
+			try {
+				for (const handler of handlers) events.off('x', handler);
+			} finally {
+				iteratorPrototype.next = next;
+			}
+			expect(events.listenerCount()).toBe(0);
+			// About 2 per call, plus the compactions; the scans took about 2,000,000.
+			expect(steps).toBeLessThan(20 * handlers.length);
+		});
+
+		it('keeps removing exactly the registrations of a handler through every kind of removal', function () {
+			const events = createEmitter<{ x: number; y: number }>();
+			const calls: string[] = [];
+			function listener(name: string): (n: number) => void {
+				return function (n) {
+					calls.push(`${name}${n}`);
+				};
+			}
+			const a = listener('a');
+			const b = listener('b');
+			const c = listener('c');
+			const stopA = events.on('x', a);
+			events.on('x', b);
+			events.once('x', c);
+			// The first `off` indexes the listeners of the event.
+			expect(events.off('x', function () {})).toBe(false);
+			expect(events.off('y', a)).toBe(false);
+			// Removed through its unsubscribe function, then registered again: indexed again.
+			stopA();
+			expect(events.off('x', a)).toBe(false);
+			events.on('x', a);
+			// A `once` listener leaves the index as it runs.
+			events.emit('x', 1);
+			expect(events.off('x', c)).toBe(false);
+			expect(calls).toEqual(['b1', 'c1', 'a1']);
+			// Registered twice: both go, through a scan, and the others stay.
+			const stopB = events.on('x', b);
+			expect(events.listenerCount('x')).toBe(3);
+			expect(events.off('x', b)).toBe(true);
+			stopB();
+			expect(events.listenerCount('x')).toBe(1);
+			events.emit('x', 2);
+			expect(calls).toEqual(['b1', 'c1', 'a1', 'a2']);
+			// A duplicate removed through its unsubscribe function is not indexed either.
+			const stopA2 = events.on('x', a);
+			stopA2();
+			expect(events.off('x', a)).toBe(true);
+			expect(events.off('x', a)).toBe(false);
+			// `clear` drops the index; registrations made after it are found.
+			events.on('x', a);
+			events.on('x', b);
+			events.off('x', b);
+			events.clear('x');
+			expect(events.off('x', a)).toBe(false);
+			events.on('x', a);
+			events.on('x', a);
+			events.clear();
+			events.on('x', b);
+			expect(events.off('x', a)).toBe(false);
+			expect(events.off('x', b)).toBe(true);
+			// Indexed from a list still holding a removed registration (not compacted yet).
+			const stopY = events.on('y', a);
+			events.on('y', b);
+			events.on('y', c);
+			stopY();
+			expect(events.off('y', a)).toBe(false);
+			expect(events.off('y', b)).toBe(true);
+			expect(events.off('y', c)).toBe(true);
+			expect(events.listenerCount()).toBe(0);
+		});
+
+		it('does not take an index planted on a polluted Object.prototype for its own', function () {
+			const proto = Object.prototype as Record<string, unknown>;
+			const events = createEmitter<{ x: number }>();
+			const handler = jest.fn();
+
+			// What a JSON merge of `{ "__proto__": { "index": {} } }` plants (previously, adding a second listener threw a TypeError).
+			proto.index = {};
+			try {
+				events.on('x', jest.fn());
+				events.on('x', handler);
+				expect(events.off('x', handler)).toBe(true);
+				events.emit('x', 1);
+			} finally {
+				delete proto.index;
+			}
+			expect(handler).not.toHaveBeenCalled();
+			expect(events.listenerCount('x')).toBe(1);
+		});
+
+		it('removes a handler during an emit, which then skips it', function () {
+			const events = createEmitter<{ x: void }>();
+			const calls: string[] = [];
+			function late(): void {
+				calls.push('late');
+			}
+			events.on('x', function () {
+				calls.push('first');
+				events.off('x', late);
+			});
+			events.on('x', late);
+			events.emit('x');
+			events.emit('x');
+			expect(calls).toEqual(['first', 'first']);
+		});
 	});
 
 	describe('clear / listenerCount', function () {
