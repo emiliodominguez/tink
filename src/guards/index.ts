@@ -2483,6 +2483,66 @@ function samePath(a: ReadonlyArray<PropertyKey>, b: ReadonlyArray<PropertyKey>):
 }
 
 /**
+ * Where {@link isLazy} explained an object that failed: the path it reported it at, and the {@link explain} call that did (`run`).
+ */
+interface LazyReport {
+	readonly path: PropertyKey[];
+	readonly run: object;
+}
+
+/**
+ * The {@link explain} call running right now (a fresh object per call, `undefined` outside one). An object that {@link isLazy} reported
+ * during another call (a guard or predicate calling `explain` itself, or the validate module explaining several guards in one parse) is
+ * reported again in full: that call's issues may have been dropped.
+ */
+let explainRun: object | undefined;
+
+/**
+ * Returns the table of a lazy guard's results for `value` while a discriminated union checks it (`discriminated.object === value`; the
+ * lazy guard uses its plain table otherwise): one table per set of discriminant keys, created on first use, since an exact shape accepts
+ * those keys on `value` there and nowhere else. Only the innermost run of entries for `value` counts: deeper ones belong to an ancestor
+ * check, which only a cycle (always rejected) meets again.
+ * @param {object} value - The object checked
+ * @param {Map<string, Map<object, unknown>>} contextual - The tables by discriminant keys
+ * @returns {Map<object, unknown>} The table
+ */
+function tableOf(value: object, contextual: Map<string, Map<object, unknown>>): Map<object, unknown> {
+	const keys: string[] = [];
+
+	for (let entry = discriminated; entry !== undefined && entry.object === value; entry = entry.previous) if (!keys.includes(entry.key)) keys.push(entry.key);
+
+	// Sorted and length-prefixed: the same set of keys always gives the same context.
+	const context = keys
+		.sort()
+		.map(function (key: string): string {
+			return `${key.length}:${key}`;
+		})
+		.join('');
+	let table = contextual.get(context);
+
+	if (table === undefined) {
+		table = new Map<object, unknown>();
+		contextual.set(context, table);
+	}
+
+	return table;
+}
+
+/**
+ * Whether a lazy guard is explaining `value` in any of its tables: meeting it again, in whatever discriminant context, means a cycle.
+ * @param {object} value - The object met
+ * @param {Map<object, unknown>} plain - The table outside discriminated unions
+ * @param {Map<string, Map<object, unknown>>} contextual - The tables by discriminant keys
+ * @returns {boolean} `true` when `value` is `PENDING` in one of them
+ */
+function isPending(value: object, plain: Map<object, unknown>, contextual: Map<string, Map<object, unknown>>): boolean {
+	if (plain.get(value) === PENDING) return true;
+	for (const table of contextual.values()) if (table.get(value) === PENDING) return true;
+
+	return false;
+}
+
+/**
  * Creates a guard that defers to the guard returned by `getter`, called once on first use: the way to write recursive schemas
  * (`z.lazy()`), whose guard must refer to itself before it exists. Annotate the result (`const isTree: Guard<Tree> = ...`), since
  * TypeScript cannot infer a recursive type.
@@ -2493,7 +2553,9 @@ function samePath(a: ReadonlyArray<PropertyKey>, b: ReadonlyArray<PropertyKey>):
  * by each lazy guard, which keeps a recursive {@link isUnion} linear in the size of the value however its members differ, and a value
  * nested so deeply that checking it would overflow the stack is rejected (explained as `Value is nested too deeply`). {@link explain}
  * reports an invalid object the value holds in several places at the first place only, the others getting one `Invalid value (same
- * object as reported at another path)` issue, so that a value sharing objects cannot make the report (or its cost) grow exponentially.
+ * object as reported at another path)` issue, so that a value sharing objects cannot make the report (or its cost) grow exponentially
+ * (each `explain` call reports it in full: a guard may call `explain` itself). Inside an {@link isDiscriminatedUnion}, where an exact shape
+ * accepts the discriminant, an object is checked apart from its uses elsewhere.
  * @template T - The guarded type
  * @param {() => Guard<T>} getter - Returns the guard (called once, on the first check)
  * @returns {(value: unknown) => boolean} A guard narrowing to `T`
@@ -2513,10 +2575,12 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 
 	let resolved: Guard<T> | undefined;
 	// The result for each object checked by this guard during the current check (see `utils/memo.ts`), and for each object explained during
-	// the current `explain`: `PENDING` while it is being explained (meeting it again means a cycle), then `true` when it passed, or the
-	// path it was reported at.
-	const memo = new Map<object, unknown>();
-	const reported = new Map<object, unknown>();
+	// the current `explain`: `PENDING` while it is being explained (meeting it again means a cycle), then `true` when it passed, or where
+	// it was reported (a `LazyReport`). Inside a discriminated union's check of the object, other tables, by discriminant keys (see `tableOf`).
+	const plainMemo = new Map<object, unknown>();
+	const plainReported = new Map<object, unknown>();
+	const discriminatedMemos = new Map<string, Map<object, unknown>>();
+	const discriminatedReports = new Map<string, Map<object, unknown>>();
 	// The values being scored: a union that reaches this guard again on the same value (`isLazy(() => isUnion(a, isNullable(self)))`)
 	// would score it forever.
 	const scoring = new Set<unknown>();
@@ -2542,6 +2606,9 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 
 			if (typeof value !== 'object' || value === null) return guard(value);
 
+			// Inline test of the usual case: not inside a discriminated union's check of this object (see `tableOf`). A cycle met in another
+			// discriminant context than the one it started in is caught one turn later, in the same context: the result is `false` either way.
+			const memo = discriminated === undefined || discriminated.object !== value ? plainMemo : tableOf(value, discriminatedMemos);
 			const known = memo.get(value);
 
 			if (known === PENDING) {
@@ -2582,17 +2649,20 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 
 			if (typeof value !== 'object' || value === null) return collect(guard, value, path, issues);
 
+			const reported = discriminated === undefined || discriminated.object !== value ? plainReported : tableOf(value, discriminatedReports);
 			const state = reported.get(value);
 
 			if (state === true) return true;
-			if (state === PENDING) {
+			// A cycle is reported where it closes, whatever the discriminant context it started in.
+			if (state === PENDING || (state === undefined && discriminatedReports.size !== 0 && isPending(value, plainReported, discriminatedReports))) {
 				issues.push({ message: 'Circular reference', path: path.slice() });
 
 				return false;
 			}
-			if (state !== undefined) {
-				// Met again at the path it was reported at (the members of an intersection): its issues are there already.
-				if (!samePath(state as PropertyKey[], path)) issues.push({ message: 'Invalid value (same object as reported at another path)', path: path.slice() });
+			// Reported by this `explain` call (whose issues all reach its result): one pointer issue, or none when met again at the same
+			// path (the members of an intersection), where its issues are already. Reported by another call, it is explained again.
+			if (state !== undefined && (state as LazyReport).run === explainRun) {
+				if (!samePath((state as LazyReport).path, path)) issues.push({ message: 'Invalid value (same object as reported at another path)', path: path.slice() });
 
 				return false;
 			}
@@ -2619,7 +2689,7 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 				// The verdict is kept for the other paths to the same object: a value sharing objects (each held twice by the next) is then
 				// explained in linear time, with one issue per extra path, instead of once per path (exponential in the depth). A
 				// failure that reported nothing (a guard that is not deterministic), or threw, is explained again when met again.
-				if (issues.length > before) reported.set(value, path.slice());
+				if (issues.length > before) reported.set(value, { path: path.slice(), run: explainRun } as LazyReport);
 				else if (passed) reported.set(value, true);
 				else reported.delete(value);
 				scope.depth--;
@@ -2725,7 +2795,9 @@ function compilePattern(pattern: unknown, ancestors: unknown[]): Guard<unknown> 
 	const guards: Guard<unknown>[] = [];
 	const required: boolean[] = [];
 
-	if (array) for (let index = 0; index < (pattern as unknown[]).length; index++) guards.push(compilePattern(source[index], ancestors));
+	// A hole is `undefined`, not an element planted on a polluted `Array.prototype` or `Object.prototype` (the tuple checks values that way).
+	if (array)
+		for (let index = 0; index < (pattern as unknown[]).length; index++) guards.push(compilePattern(hasOwn.call(source, index) ? source[index] : undefined, ancestors));
 	for (const key of keys) {
 		guards.push(compilePattern(source[key], ancestors));
 		required.push(typeof source[key] !== 'function');
@@ -2756,8 +2828,10 @@ export function explain(guard: Guard<unknown>, value: unknown): SchemaIssue[] {
 	assertFunction('explain', 'guard', guard);
 
 	const issues: SchemaIssue[] = [];
+	const previousRun = explainRun;
 
 	// The memos of the lazy guards (see `utils/memo.ts`) live until the end, so explaining reuses what checking found.
+	explainRun = {};
 	scope.depth++;
 	try {
 		// Guards never consult the explainers, so valid values take the fast path and allocate nothing beyond the result.
@@ -2772,6 +2846,7 @@ export function explain(guard: Guard<unknown>, value: unknown): SchemaIssue[] {
 		issues.length = 0;
 		issues.push({ message: 'Value is nested too deeply', path: [] });
 	} finally {
+		explainRun = previousRun;
 		if (--scope.depth === 0) release();
 	}
 

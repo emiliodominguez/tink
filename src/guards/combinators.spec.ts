@@ -494,6 +494,95 @@ describe('isLazy', function () {
 		]);
 	});
 
+	it('should report in full an object that another explain call reported (nested explains, or several in one check)', function () {
+		const isItem = isLazy(function () {
+			return isShape({ id: isInteger });
+		});
+		const shared = { id: 'x' };
+		const real = { message: 'Invalid value (got string)', path: ['second', 'id'] };
+
+		// A guard calling `explain` itself, whose issues are dropped.
+		function isFirst(value: unknown): value is unknown {
+			return explain(isItem, value).length === 0;
+		}
+		expect(explain(isShape({ first: isFirst, second: isItem }), { first: shared, second: shared })).toEqual([
+			{ message: 'Invalid value (got object)', path: ['first'] },
+			real
+		]);
+		// The same at the root path, which the pointer issue would have skipped: no issue at all.
+		const isProbed = isIntersection(
+			refine(isPlainObject, function (value) {
+				return explain(isItem, value).length >= 0;
+			}),
+			isItem
+		);
+		expect(explain(isProbed, shared)).toEqual([{ message: 'Invalid value (got string)', path: ['id'] }]);
+
+		// Two `explain` calls within one outer check (as the validate module makes): the second reports what the first did.
+		const reports: unknown[] = [];
+		const isProbe = isLazy(function () {
+			return function (value: unknown): value is object {
+				reports.push(explain(isItem, value), explain(isItem, value));
+
+				return true;
+			};
+		});
+		expect(isProbe(shared)).toBe(true);
+		expect(reports).toEqual([[{ message: 'Invalid value (got string)', path: ['id'] }], [{ message: 'Invalid value (got string)', path: ['id'] }]]);
+	});
+
+	it('should not reuse a verdict across the discriminated and plain uses of an object by a lazy exact shape', function () {
+		// Inside the union's check of `shared`, the exact shape accepts the discriminant `type`; elsewhere it is an unknown key.
+		const isExact = isLazy(function () {
+			return isShape({ a: isFiniteNumber }, { exact: true });
+		});
+		const isTagged = isDiscriminatedUnion('type', { x: isExact });
+		const isPair = isLazy(function () {
+			return isShape({ p: isTagged, q: isExact });
+		});
+		const shared = { type: 'x', a: 1 };
+
+		expect(isTagged(shared)).toBe(true);
+		expect(isExact(shared)).toBe(false);
+		expect(isPair({ p: shared, q: shared })).toBe(false);
+		expect(explain(isShape({ p: isTagged, q: isExact }), { p: shared, q: shared })).toEqual([{ message: 'Unknown property', path: ['q', 'type'] }]);
+		expect(function () {
+			ensure(isShape({ p: isTagged, q: isExact }), { p: shared, q: shared });
+		}).toThrow(ValidationError);
+
+		// The other order: the plain verdict must not reject the discriminated use.
+		const isReversed = isLazy(function () {
+			return isShape({ q: isOptional(isExact), p: isTagged });
+		});
+		expect(isReversed({ q: { a: 1 }, p: shared })).toBe(true);
+		expect(isReversed({ q: shared, p: shared })).toBe(false);
+		expect(explain(isReversed, { q: shared, p: shared })).toEqual([{ message: 'Unknown property', path: ['q', 'type'] }]);
+	});
+
+	it('should report a cycle where it closes, also through a discriminated union', function () {
+		type Node = { t: 'x'; c?: Node };
+		const isNode: Guard<Node> = isLazy(function () {
+			return isDiscriminatedUnion('t', { x: isShape({ c: isOptional(isNode) }) });
+		});
+		const loop: Record<string, unknown> = { t: 'x' };
+		loop.c = loop;
+
+		expect(isNode(loop)).toBe(false);
+		expect(explain(isNode, loop)).toEqual([{ message: 'Circular reference', path: ['c'] }]);
+
+		// A cycle that starts inside the union's check of an object and closes outside it (inside the union's check of another object).
+		type Linked = { t?: 'x'; c?: Linked; d?: Linked };
+		const isLinked: Guard<Linked> = isLazy(function () {
+			return isShape({ c: isOptional(isVariant), d: isOptional(isLinked) });
+		});
+		const isVariant = isDiscriminatedUnion('t', { x: isLinked });
+		const first: Record<string, unknown> = { t: 'x' };
+		first.c = { t: 'x', d: first };
+
+		expect(isVariant(first)).toBe(false);
+		expect(explain(isVariant, first)).toEqual([{ message: 'Circular reference', path: ['c', 'd'] }]);
+	});
+
 	it('should support mutual recursion', function () {
 		type Expr = { op: 'neg'; arg: Expr } | { op: 'lit'; value: number };
 		const isExpr: Guard<Expr> = isUnion(
@@ -563,6 +652,20 @@ describe('isLazy', function () {
 
 describe('isMatching', function () {
 	const isAdminEvent = isMatching({ type: 'login', user: { role: 'admin', id: isInteger } });
+
+	it('should read a hole of an array pattern as undefined, not as an element planted on a polluted prototype', function () {
+		const proto = Object.prototype as unknown as Record<number, unknown>;
+		proto[1] = 'x';
+		try {
+			// eslint-disable-next-line no-sparse-arrays
+			const isGap = isMatching([1, , 3]);
+
+			expect(isGap([1, undefined, 3])).toBe(true);
+			expect(isGap([1, 'x', 3])).toBe(false);
+		} finally {
+			delete proto[1];
+		}
+	});
 
 	it('should match deep partial structures', function () {
 		expect(isAdminEvent({ type: 'login', at: 1, user: { role: 'admin', id: 7, name: 'Ada' } })).toBe(true);
