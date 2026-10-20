@@ -1,4 +1,19 @@
-import { colorFromString, contrastRatio, deltaE, hslToRgb, lighten, mix, parseColor, parseHex, rgbToHsl, simulateColorVisionDeficiency, toCssRgb, toHex } from 'tinkit/color';
+import {
+	colorFromString,
+	contrastRatio,
+	deltaE,
+	hslToRgb,
+	lighten,
+	mix,
+	parseColor,
+	parseHex,
+	rgbToHsl,
+	simulateColorVisionDeficiency,
+	toColorName,
+	toCssRgb,
+	toHex,
+	toOklch
+} from 'tinkit/color';
 
 // No colour library is installed as a competitor: the `hand-written` implementations below are the straightforward
 // code one would write inline (no validation, no CSS Color 4 syntax, no alpha), i.e. a lower bound for the work.
@@ -518,6 +533,30 @@ export default [
 				for (let i = 0; i < hexes.length; i++) total += naiveDeuteranopia(hexes[i]).r;
 				return total;
 			}
+		}
+	},
+	{
+		name: 'contrastRatio (1000 object pairs)',
+		fn: function () {
+			let total = 0;
+			for (let i = 0; i < rgbs.length; i++) total += contrastRatio(rgbs[i], rgbs[(i + 1) % rgbs.length]);
+			return total;
+		}
+	},
+	{
+		name: 'toOklch (1000 objects)',
+		fn: function () {
+			let total = 0;
+			for (let i = 0; i < rgbs.length; i++) total += toOklch(rgbs[i]).l;
+			return total;
+		}
+	},
+	{
+		name: 'toColorName exact (1000 objects)',
+		fn: function () {
+			let total = 0;
+			for (let i = 0; i < rgbs.length; i++) total += (toColorName(rgbs[i]) ?? '').length;
+			return total;
 		}
 	}
 ];

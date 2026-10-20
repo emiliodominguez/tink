@@ -277,10 +277,10 @@ function toByte(value: number): number {
 }
 
 /**
- * Cache of {@link linearChannel} results, by channel value (filled on first use, at most 256 entries). A `Map`, not an array: a missing
- * array index would be looked up on a (possibly polluted) `Array.prototype`.
+ * {@link toLinear} of every 8-bit channel, by channel value: built on first use. A typed array, not an array or a `Map`: indexing it is
+ * several times faster than `Map#get`, and it never reads a (possibly polluted) `Array.prototype`.
  */
-const LINEAR_CHANNELS = new Map<number, number>();
+let LINEAR_CHANNELS: Float64Array | undefined;
 
 /**
  * Converts one 8-bit sRGB channel to linear light, as defined by WCAG 2.x.
@@ -290,12 +290,13 @@ const LINEAR_CHANNELS = new Map<number, number>();
  * linearChannel(255); // => 1
  */
 function linearChannel(value: number): number {
-	let linear = LINEAR_CHANNELS.get(value);
-	if (linear === undefined) {
-		linear = toLinear(value / 255);
-		LINEAR_CHANNELS.set(value, linear);
+	if (LINEAR_CHANNELS === undefined) {
+		// Built aside and published whole, so the cache is never seen half filled.
+		const table = new Float64Array(256);
+		for (let i = 0; i < 256; i++) table[i] = toLinear(i / 255);
+		LINEAR_CHANNELS = table;
 	}
-	return linear;
+	return LINEAR_CHANNELS[value];
 }
 
 /**
@@ -832,6 +833,11 @@ let NAMED_COLORS: Map<string, number> | undefined;
 let NAMED_LABS: Array<[name: string, lab: ReturnType<typeof oklabOf>]> | undefined;
 
 /**
+ * `0xrrggbb` to the first (alphabetical) name of that colour: built on the first exact lookup of {@link toColorName}.
+ */
+let NAMES_BY_VALUE: Map<number, string> | undefined;
+
+/**
  * Returns the table of the 148 CSS named colours (CSS Color 4 `<named-color>`, `transparent` excluded), decoding it on first use.
  * @returns {Map<string, number>} Lowercase name to `0xrrggbb`, in alphabetical order
  * @example
@@ -919,8 +925,13 @@ export function toColorName(color: ColorInput, options: ColorNameOptions = {}): 
 	const value = (rgba.r << 16) | (rgba.g << 8) | rgba.b;
 	if (!readOption(options, 'nearest', false)) {
 		if (rgba.a < 1) return rgba.a === 0 && value === 0 ? 'transparent' : undefined;
-		for (const [name, packed] of table) if (packed === value) return name;
-		return undefined;
+		if (NAMES_BY_VALUE === undefined) {
+			// Built aside and published whole; the first name of a duplicated colour (`aqua`, not `cyan`) is kept.
+			const names = new Map<number, string>();
+			for (const [name, packed] of table) if (!names.has(packed)) names.set(packed, name);
+			NAMES_BY_VALUE = names;
+		}
+		return NAMES_BY_VALUE.get(value);
 	}
 	if (NAMED_LABS === undefined) {
 		// Built aside and published whole, so the cache is never seen half filled.
@@ -959,7 +970,11 @@ export function toColorName(color: ColorInput, options: ColorNameOptions = {}): 
 export function toRgba(input: ColorInput): Rgba {
 	if (typeof input === 'string') return parseCssColor('toRgba', 'input', input);
 	if (typeof input !== 'object' || input === null) throw new TypeError(`toRgba: \`input\` must be a colour string or an { r, g, b } object, got ${describe(input)}`);
-	const alpha = readAlpha('toRgba', 'input.a', (input as Partial<Rgba>).a);
+	// The optional alpha is read as an own (or class-inherited) property: an `a` planted on a polluted `Object.prototype` must not make
+	// every colour translucent. (Inlined `readOption`: a constant key keeps this hot path as fast as a plain read.)
+	let a = (input as Partial<Rgba>).a;
+	if (a !== undefined && a === (Object.prototype as Partial<Rgba>).a && !Object.hasOwn(input, 'a')) a = undefined;
+	const alpha = readAlpha('toRgba', 'input.a', a);
 	return {
 		r: toByte(readChannel('toRgba', 'input.r', input.r)),
 		g: toByte(readChannel('toRgba', 'input.g', input.g)),

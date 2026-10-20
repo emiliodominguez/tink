@@ -814,6 +814,30 @@ describe('Color helpers under prototype pollution', function () {
 			delete keys.l;
 		}
 	});
+
+	it('never reads a missing alpha of an { r, g, b } colour from Object.prototype', function () {
+		class Translucent {
+			r = 255;
+			g = 0;
+			b = 0;
+			get a(): number {
+				return 0.25;
+			}
+		}
+		const keys = Object.prototype as Record<string, unknown>;
+		keys.a = 0;
+		try {
+			expect(helpers.toRgba({ r: 255, g: 0, b: 0 })).toEqual({ r: 255, g: 0, b: 0, a: 1 });
+			expect(helpers.toHex({ r: 255, g: 0, b: 0 })).toBe('#ff0000');
+			expect(helpers.toCssRgb({ r: 1, g: 2, b: 3 })).toBe('rgb(1 2 3)');
+			expect(helpers.mix({ r: 0, g: 0, b: 0 }, { r: 255, g: 255, b: 255 }).a).toBe(1);
+			// Own and class-inherited alphas are still read, even when they hold the polluted value.
+			expect(helpers.toRgba({ r: 255, g: 0, b: 0, a: 0 }).a).toBe(0);
+			expect(helpers.toRgba(new Translucent()).a).toBe(0.25);
+		} finally {
+			delete keys.a;
+		}
+	});
 });
 
 /**
