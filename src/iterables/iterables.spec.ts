@@ -4743,6 +4743,37 @@ describe('async combinators: hostile promises, large read-aheads and a polluted 
 		expect(outcome).toEqual({ done: true, value: undefined });
 		expect(reads).toBe(1);
 	});
+	it('the stream readers read the then of a read result once with a signal too, as await does (regression: they hung)', async function () {
+		let reads = 0;
+		/** An async iterable of one `'a\n'` chunk, whose read results gain a `then` that never calls back from its second read on. */
+		const source: AsyncIterable<string> = {
+			[Symbol.asyncIterator]() {
+				let index = 0;
+				return {
+					next: async function () {
+						let own = 0;
+						return Object.defineProperty({ done: index++ > 0, value: 'a\n' }, 'then', {
+							get(): unknown {
+								reads++;
+								own++;
+								return own === 1 ? undefined : function (): void {};
+							}
+						});
+					}
+				} as unknown as AsyncIterator<string>;
+			}
+		};
+		const signal = new AbortController().signal;
+		const outcome = await Promise.race([
+			Promise.all([helpers.toArrayAsync(helpers.readLines(source, { signal })), helpers.streamToArray(source, { signal })]),
+			new Promise(function (resolve) {
+				setTimeout(resolve, 1000, 'hung');
+			})
+		]);
+		expect(outcome).toEqual([['a'], ['a\n']]);
+		// One read per result: two results for each reader.
+		expect(reads).toBe(4);
+	});
 
 	it('accepts a function as an iterator result, reading its value only when not done, as for await does (regression: a TypeError)', async function () {
 		/** An async iterable of `'f'` whose results are functions; the `value` of the last one throws. */

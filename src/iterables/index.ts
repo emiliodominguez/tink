@@ -2301,12 +2301,19 @@ function chunkReader(caller: string, source: unknown, whole: boolean, signal: Ab
 	/**
 	 * Waits for a read, unless the signal is aborted first (used only with a signal).
 	 * @param {PromiseLike<unknown> | unknown} pull - The pending read
-	 * @returns {Promise<unknown>} Its result
+	 * @returns {Promise<[unknown]>} Its result, boxed: resolving the promise with the result itself would read its `then` a second time
+	 * (a getter could then make it a thenable that never settles), where `await` reads it once
 	 */
-	function interruptible(pull: unknown): Promise<unknown> {
+	function interruptible(pull: unknown): Promise<[unknown]> {
 		return new Promise(function (resolve, reject) {
 			interrupt = reject;
-			whenSettled(pull, resolve, reject);
+			whenSettled(
+				pull,
+				function (step: unknown) {
+					resolve([step]);
+				},
+				reject
+			);
 		});
 	}
 
@@ -2327,7 +2334,7 @@ function chunkReader(caller: string, source: unknown, whole: boolean, signal: Ab
 			try {
 				const pull = reader !== undefined ? reader.read() : (iterator as AsyncIterator<unknown>).next();
 				// Without a signal nothing can interrupt the read: awaiting it directly saves a promise and two ticks per chunk.
-				const step = signal === undefined ? await pull : await interruptible(pull);
+				const step = signal === undefined ? await pull : (await interruptible(pull))[0];
 				// Aborted while the chunk was arriving: it is dropped (the source is already cancelled).
 				check();
 				// Read like `for await` reads it: an object (functions too), whose `value` is read only when it is not `done`.
