@@ -646,17 +646,25 @@ export function fuzzySearch<T>(items: Iterable<T>, query: string, options: Fuzzy
 			const result = match(prepared, texts, caseSensitive, 'fuzzySearch');
 			if (result !== undefined) best = { item, key: texts, score: result.score, ranges: result.ranges };
 		}
-		if (best !== undefined && best.score >= threshold) results.push(best);
+		// Pruned as they come, so that a small `limit` keeps few results (not one per matching item) whatever the number of items.
+		if (best !== undefined && best.score >= threshold && results.push(best) > 2 * limit + 64) prune();
+	}
+	/**
+	 * Sorts the results, best first (ties keep their order: the sort is stable, and the kept ones come before the newer ones), and keeps the first `limit`.
+	 * @returns {void}
+	 */
+	function prune(): void {
+		results.sort(function (a, b) {
+			return b.score - a.score;
+		});
+		if (results.length > limit) results.length = limit;
 	}
 	// An array is read by index, so that a hole is `undefined` (see `elementAt`).
 	if (Array.isArray(items)) for (let i = 0; i < items.length; i++) visit(elementAt(items as T[], i) as T);
 	else for (const item of items) visit(item);
 
-	return results
-		.sort(function (a, b) {
-			return b.score - a.score;
-		})
-		.slice(0, limit);
+	prune();
+	return results;
 }
 
 /**
@@ -682,16 +690,22 @@ export function highlight(text: string, ranges: Iterable<readonly [number, numbe
 	assertString('highlight', 'text', text);
 	const length = text.length;
 	const sorted: Array<[number, number]> = [];
-	// Arrays are read by index, so that a hole is `undefined` (see `elementAt`).
-	const list: ArrayLike<readonly [number, number]> = Array.isArray(ranges) ? ranges : Array.from(ranges);
-	for (let i = 0; i < list.length; i++) {
-		const range = elementAt(list, i) as readonly [number, number];
+	/**
+	 * Validates a range and keeps it unless it is empty.
+	 * @param {readonly [number, number]} range - The range
+	 * @returns {void}
+	 */
+	function visit(range: readonly [number, number]): void {
 		const [start, end] = Array.isArray(range) ? [elementAt(range, 0) as number, elementAt(range, 1) as number] : range;
 		// The messages are only built for invalid bounds.
 		if (!(Number.isInteger(start) && start >= 0 && start <= length)) assertNumber('highlight', 'start', start, false, `an integer between 0 and ${length}`);
 		if (!(Number.isInteger(end) && end >= start && end <= length)) assertNumber('highlight', 'end', end, false, `an integer between ${start} and ${length}`);
 		if (end > start) sorted.push([start, end]);
 	}
+	// Arrays are read by index, so that a hole is `undefined` (see `elementAt`); other iterables one range at a time, so that an invalid
+	// range throws before the rest is read (an array-like with a huge length is not copied first).
+	if (Array.isArray(ranges)) for (let i = 0; i < ranges.length; i++) visit(elementAt(ranges, i) as readonly [number, number]);
+	else for (const range of ranges) visit(range);
 	sorted.sort(function (a, b) {
 		return a[0] - b[0];
 	});

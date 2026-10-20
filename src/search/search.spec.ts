@@ -364,6 +364,26 @@ describe('Search helpers', function () {
 				});
 			}).toThrow(new TypeError('fuzzySearch: `key(item)` must be a string, got undefined'));
 		});
+
+		it('keeps about `limit` results while searching, with the same ranking as a full sort (regression)', function () {
+			const items = Array.from({ length: 5000 }, function (_, i) {
+				return ['ab', 'a-b', 'xaxb', 'a b'][i % 4] + i;
+			});
+			const full = helpers.fuzzySearch(items, 'ab');
+			const original = Array.prototype.sort;
+			let largest = 0;
+			const sort = jest.spyOn(Array.prototype, 'sort').mockImplementation(function (this: unknown[], compare) {
+				largest = Math.max(largest, this.length);
+				return original.call(this, compare) as never;
+			});
+			try {
+				for (const limit of [0, 1, 3, 100]) expect(helpers.fuzzySearch(items, 'ab', { limit })).toEqual(full.slice(0, limit));
+			} finally {
+				sort.mockRestore();
+			}
+			// Every result was kept until the end (5 000 here, one per item: memory O(items) for `limit: 1`).
+			expect(largest).toBeLessThanOrEqual(2 * 100 + 65);
+		});
 	});
 
 	describe('highlight', function () {
@@ -442,6 +462,22 @@ describe('Search helpers', function () {
 			expect(function () {
 				helpers.highlight(5 as any, []);
 			}).toThrow(new TypeError('highlight: `text` must be a string, got number'));
+		});
+
+		it('reads an iterable one range at a time, so an invalid range throws before the rest is read (regression)', function () {
+			let reads = 0;
+			const ranges = {
+				*[Symbol.iterator]() {
+					for (let i = 0; i < 1_000_000; i++) {
+						reads++;
+						yield [i === 0 ? -1 : 0, 1] as [number, number];
+					}
+				}
+			};
+			expect(function () {
+				helpers.highlight('ab', ranges);
+			}).toThrow(RangeError);
+			expect(reads).toBe(1);
 		});
 
 		it('should round-trip fuzzyMatch ranges', function () {
