@@ -1872,8 +1872,8 @@ export function orderBy<T>(
 	for (let k = 0; k < count; k++) {
 		// The parameter names are only formatted on failure.
 		if (typeof selectors[k] !== 'function') assertFunction('orderBy', `selectors[${k}]`, selectors[k]);
-		// Missing trailing directions are not read: past the end, an index would be looked up on a polluted `Object.prototype`.
-		directions.push(single ? shared : toDirection('orderBy', 'orders', k < orders.length ? (orders[k] ?? 'asc') : 'asc', k));
+		// Missing directions (holes, or past the end) are not read: they would be looked up on a polluted `Object.prototype`.
+		directions.push(single ? shared : toDirection('orderBy', 'orders', Object.hasOwn(orders, k) ? (orders[k] ?? 'asc') : 'asc', k));
 	}
 	if (count === 1) return sortBy(array, selectors[0], directions[0] === 1 ? 'asc' : 'desc');
 	const length = array.length;

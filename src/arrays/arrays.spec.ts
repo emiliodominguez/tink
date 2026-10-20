@@ -1982,7 +1982,14 @@ describe('Arrays helpers (ordering, slicing, set algebra, combinatorics)', funct
 				).toStrictEqual([users[3], users[2], users[0], users[1]]);
 				// An explicit `undefined` direction is `'asc'` too.
 				expect(helpers.orderBy(users, [name, name], ['desc', undefined as never])).toStrictEqual([users[0], users[2], users[1], users[3]]);
+				// So is a hole (regression: it was read from the polluted prototype).
+				// oxlint-disable-next-line no-sparse-arrays
+				expect(helpers.orderBy(users, [name, name], ['desc', ,] as never)).toStrictEqual([users[0], users[2], users[1], users[3]]);
+				proto[0] = 'desc';
+				// oxlint-disable-next-line no-sparse-arrays
+				expect(helpers.orderBy(users, [name, name], [, 'asc'] as never)).toStrictEqual(helpers.orderBy(users, [name, name], ['asc', 'asc']));
 			} finally {
+				delete proto[0];
 				delete proto[1];
 			}
 		});
