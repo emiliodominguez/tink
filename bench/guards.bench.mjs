@@ -9,6 +9,7 @@ import {
 	isPlainObject,
 	isPrimitive,
 	isPromise,
+	isRecordOf,
 	isRegExp,
 	isSet,
 	isString,
@@ -60,6 +61,11 @@ const promises = Array.from({ length: 100 }, function () {
 	return Promise.resolve(1);
 });
 const isStrings = isArrayOf(isString);
+const isScores = isRecordOf(isFiniteNumber);
+const zodScores = z.record(z.string(), z.number());
+const scoreRecords = Array.from({ length: 100 }, function (_, index) {
+	return { a: index, b: index + 1, c: index * 2, d: 3, e: 5, f: 8, g: 13, h: 21 };
+});
 const strings = Array.from({ length: 100 }, function (_, index) {
 	return `s${index}`;
 });
@@ -407,6 +413,21 @@ export default [
 		name: 'isArrayOf(isString) (100 strings)',
 		fn: function () {
 			return isStrings(strings);
+		}
+	},
+	{
+		name: 'isRecordOf(isFiniteNumber) (100 records, 8 keys)',
+		fn: function () {
+			let count = 0;
+			for (let i = 0; i < scoreRecords.length; i++) if (isScores(scoreRecords[i])) count++;
+			return count;
+		},
+		competitors: {
+			zod: function () {
+				let count = 0;
+				for (let i = 0; i < scoreRecords.length; i++) if (zodScores.safeParse(scoreRecords[i]).success) count++;
+				return count;
+			}
 		}
 	},
 	{

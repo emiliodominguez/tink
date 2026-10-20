@@ -213,11 +213,11 @@ export function isRegExp(value: unknown): value is RegExp {
 
 /**
  * Checks whether a value is an `Error` (including subclasses such as `TypeError`).
- * Uses `instanceof`, falling back to `Object.prototype.toString` (`'[object Error]'`) for objects of other realms and objects with a
- * `null` prototype, so errors from other realms are recognised. Other objects of this realm are rejected by the cheap `instanceof`
- * test, like the built-in guards do (so a same-realm object faking `Symbol.toStringTag = 'Error'` is rejected, and so is a genuine
- * error whose prototype was swapped for an unrelated one). There is no brand-check method for errors, so a cross-realm or
- * null-prototype object faking `Symbol.toStringTag = 'Error'` passes the fallback.
+ * Uses `instanceof`, falling back to a brand check for objects of other realms and objects with a `null` prototype, so errors from other
+ * realms are recognised: `Error.isError` where the runtime has it (ES2026), else `Object.prototype.toString` (`'[object Error]'`). Other
+ * objects of this realm are rejected by the cheap `instanceof` test, like the built-in guards do (so a same-realm object faking
+ * `Symbol.toStringTag = 'Error'` is rejected, and so is a genuine error whose prototype was swapped for an unrelated one). Without
+ * `Error.isError`, a cross-realm or null-prototype object faking `Symbol.toStringTag = 'Error'` passes the fallback.
  * @param {unknown} value - The value to check
  * @returns {boolean} Whether the value is an error
  * @example
@@ -227,11 +227,23 @@ export function isRegExp(value: unknown): value is RegExp {
  */
 export function isError(value: unknown): value is Error {
 	try {
-		return value instanceof Error || (isForeign(value) && getTag(value) === '[object Error]');
+		return value instanceof Error || (isForeign(value) && isErrorBranded(value as object));
 	} catch {
 		// A revoked proxy throws on `instanceof`.
 		return false;
 	}
+}
+
+/**
+ * The brand check of errors for {@link isError}: `Error.isError` (which checks the internal `[[ErrorData]]` slot, so a fake
+ * `Symbol.toStringTag` cannot pass it), or the `'[object Error]'` tag in runtimes without it.
+ * @param {object} value - An object of another realm or with a `null` prototype
+ * @returns {boolean} Whether it is an error
+ */
+function isErrorBranded(value: object): boolean {
+	const brand = (Error as { isError?: unknown }).isError;
+
+	return typeof brand === 'function' ? (brand as (value: unknown) => boolean)(value) === true : getTag(value) === '[object Error]';
 }
 
 /**
@@ -895,11 +907,14 @@ export function isRecordOf<T>(guard: Guard<T>): (value: unknown) => value is Rec
 		function isRecordOfGuarded(value: unknown): value is Record<PropertyKey, T> {
 			if (!isPlainObject(value)) return false;
 
-			const keys: PropertyKey[] = [...Object.keys(value), ...Object.getOwnPropertySymbols(value)];
+			// Both lists are taken before any getter or guard runs. `Object.keys` only lists enumerable keys; symbols need the check.
+			const keys = Object.keys(value);
+			const symbols = Object.getOwnPropertySymbols(value);
 
-			return keys.every(function (key: PropertyKey): boolean {
-				return !Object.prototype.propertyIsEnumerable.call(value, key) || guard(value[key]);
-			});
+			for (let index = 0; index < keys.length; index++) if (!guard(value[keys[index]])) return false;
+			for (let index = 0; index < symbols.length; index++) if (propertyIsEnumerable.call(value, symbols[index]) && !guard(value[symbols[index]])) return false;
+
+			return true;
 		},
 		function explainRecordOf(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
 			if (!isPlainObject(value)) {
@@ -909,10 +924,10 @@ export function isRecordOf<T>(guard: Guard<T>): (value: unknown) => value is Rec
 			}
 
 			let passed = true;
+			const symbols = Object.getOwnPropertySymbols(value);
 
-			for (const key of [...Object.keys(value), ...Object.getOwnPropertySymbols(value)]) {
-				if (Object.prototype.propertyIsEnumerable.call(value, key)) passed = collectChild(guard, value[key], key, path, issues) && passed;
-			}
+			for (const key of Object.keys(value)) passed = collectChild(guard, value[key], key, path, issues) && passed;
+			for (const key of symbols) if (propertyIsEnumerable.call(value, key)) passed = collectChild(guard, value[key], key, path, issues) && passed;
 
 			return passed;
 		}
@@ -1133,8 +1148,9 @@ export type TypeName =
  * It is not fooled by `Symbol.toStringTag`: arrays, dates, regexps, maps, sets, weak collections, buffers and typed arrays are told
  * apart by brand checks (as the guards of this module do, so values of other realms are recognised), functions by the tag their
  * prototype owns (see {@link isAsyncFunction}). Errors
- * and promises have no brand check: they are recognised by `instanceof`, and values of other realms (or with a `null` prototype) by
- * their tag, so only such a value faking the tag can be misnamed. A thenable that is not a native promise is an `'object'`; a proxy is
+ * and promises are recognised by `instanceof`, and values of other realms (or with a `null` prototype) by `Error.isError` (see
+ * {@link isError}) or their tag, so only such a value faking the tag of a promise (or of an error, without `Error.isError`) can be
+ * misnamed. A thenable that is not a native promise is an `'object'`; a proxy is
  * named after its target when that is an array or a function, and `'object'` otherwise.
  * @param {unknown} value - The value to inspect
  * @returns {TypeName} Its type name
@@ -1559,6 +1575,7 @@ export interface IsShapeOptions {
 }
 
 const hasOwn = Object.prototype.hasOwnProperty;
+const propertyIsEnumerable = Object.prototype.propertyIsEnumerable;
 
 /**
  * Whether `Array.prototype` (or `Object.prototype`, which it inherits from) has an enumerable property: what prototype pollution adds,
@@ -2453,6 +2470,19 @@ export function refine<T>(guard: Guard<T>, predicate: (value: T) => boolean, mes
 }
 
 /**
+ * Whether two issue paths are the same.
+ * @param {ReadonlyArray<PropertyKey>} a - A path
+ * @param {ReadonlyArray<PropertyKey>} b - Another path
+ * @returns {boolean} `true` when they have the same segments
+ */
+function samePath(a: ReadonlyArray<PropertyKey>, b: ReadonlyArray<PropertyKey>): boolean {
+	if (a.length !== b.length) return false;
+	for (let index = 0; index < a.length; index++) if (!Object.is(a[index], b[index])) return false;
+
+	return true;
+}
+
+/**
  * Creates a guard that defers to the guard returned by `getter`, called once on first use: the way to write recursive schemas
  * (`z.lazy()`), whose guard must refer to itself before it exists. Annotate the result (`const isTree: Guard<Tree> = ...`), since
  * TypeScript cannot infer a recursive type.
@@ -2461,7 +2491,9 @@ export function refine<T>(guard: Guard<T>, predicate: (value: T) => boolean, mes
  * reports `Circular reference` where the lazy guard meets the value again, instead of overflowing the stack. Shared (non-circular) sub-values are fine.
  * Rejecting cycles also guarantees that recursive code consuming the narrowed value terminates. Each object is checked once per check
  * by each lazy guard, which keeps a recursive {@link isUnion} linear in the size of the value however its members differ, and a value
- * nested so deeply that checking it would overflow the stack is rejected (explained as `Value is nested too deeply`).
+ * nested so deeply that checking it would overflow the stack is rejected (explained as `Value is nested too deeply`). {@link explain}
+ * reports an invalid object the value holds in several places at the first place only, the others getting one `Invalid value (same
+ * object as reported at another path)` issue, so that a value sharing objects cannot make the report (or its cost) grow exponentially.
  * @template T - The guarded type
  * @param {() => Guard<T>} getter - Returns the guard (called once, on the first check)
  * @returns {(value: unknown) => boolean} A guard narrowing to `T`
@@ -2480,10 +2512,11 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 	assertFunction('isLazy', 'getter', getter);
 
 	let resolved: Guard<T> | undefined;
-	// The result for each object checked by this guard during the current check (see `utils/memo.ts`), and the objects being explained
-	// right now: meeting one again means a cycle.
+	// The result for each object checked by this guard during the current check (see `utils/memo.ts`), and for each object explained during
+	// the current `explain`: `PENDING` while it is being explained (meeting it again means a cycle), then `true` when it passed, or the
+	// path it was reported at.
 	const memo = new Map<object, unknown>();
-	const explaining = new Set<object>();
+	const reported = new Map<object, unknown>();
 	// The values being scored: a union that reaches this guard again on the same value (`isLazy(() => isUnion(a, isNullable(self)))`)
 	// would score it forever.
 	const scoring = new Set<unknown>();
@@ -2548,17 +2581,33 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 			const guard = resolve();
 
 			if (typeof value !== 'object' || value === null) return collect(guard, value, path, issues);
-			if (explaining.has(value)) {
+
+			const state = reported.get(value);
+
+			if (state === true) return true;
+			if (state === PENDING) {
 				issues.push({ message: 'Circular reference', path: path.slice() });
 
 				return false;
 			}
-			// Explainers only run inside `explain` (or a parse of the validate module), whose scope keeps `explaining` until it ends: the
+			if (state !== undefined) {
+				// Met again at the path it was reported at (the members of an intersection): its issues are there already.
+				if (!samePath(state as PropertyKey[], path)) issues.push({ message: 'Invalid value (same object as reported at another path)', path: path.slice() });
+
+				return false;
+			}
+			// Explainers only run inside `explain` (or a parse of the validate module), whose scope keeps `reported` until it ends: the
 			// depth counts the nesting (see `isTooDeep`), and never drops to 0 here.
-			hold(explaining).add(value);
+			hold(reported).set(value, PENDING);
 			scope.depth++;
+
+			const before = issues.length;
+			let passed = false;
+
 			try {
-				return collect(guard, value, path, issues);
+				passed = collect(guard, value, path, issues);
+
+				return passed;
 			} catch (error) {
 				// Recorded inline, without a call, since a call can overflow again: the first lazy schema to see the error is the deepest.
 				if (scope.thrown !== error) {
@@ -2567,7 +2616,12 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 				}
 				throw error;
 			} finally {
-				explaining.delete(value);
+				// The verdict is kept for the other paths to the same object: a value sharing objects (each held twice by the next) is then
+				// explained in linear time, with one issue per extra path, instead of once per path (exponential in the depth). A
+				// failure that reported nothing (a guard that is not deterministic), or threw, is explained again when met again.
+				if (issues.length > before) reported.set(value, path.slice());
+				else if (passed) reported.set(value, true);
+				else reported.delete(value);
 				scope.depth--;
 			}
 		}

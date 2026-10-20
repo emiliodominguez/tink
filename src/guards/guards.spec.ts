@@ -229,14 +229,31 @@ describe('guards', function () {
 			expect(guards.isError(undefined)).toBe(false);
 		});
 
-		it('only falls back to the toString tag for cross-realm and null-prototype objects', function () {
+		it('only falls back to the brand check for cross-realm and null-prototype objects', function () {
 			// Same-realm objects are decided by `instanceof`, like the built-in guards: fake tags and re-parented errors are rejected...
 			expect(guards.isError({ [Symbol.toStringTag]: 'Error' })).toBe(false);
 			expect(guards.isError(Object.setPrototypeOf(new Error('x'), Object.prototype))).toBe(false);
-			// ...while null-prototype and cross-realm objects get the tag check.
+			// ...while null-prototype and cross-realm objects get the brand check, `Error.isError`, which a fake tag cannot pass.
+			expect(typeof (Error as { isError?: unknown }).isError).toBe('function');
 			expect(guards.isError(Object.setPrototypeOf(new Error('x'), null))).toBe(true);
 			expect(guards.isError(Object.setPrototypeOf({}, null))).toBe(false);
-			expect(guards.isError(vm.runInNewContext('({ [Symbol.toStringTag]: "Error" })'))).toBe(true);
+			expect(guards.isError(vm.runInNewContext('({ [Symbol.toStringTag]: "Error" })'))).toBe(false);
+			expect(guards.isError(Object.setPrototypeOf({ [Symbol.toStringTag]: 'Error' }, null))).toBe(false);
+			expect(guards.getType(vm.runInNewContext('({ [Symbol.toStringTag]: "Error" })'))).toBe('object');
+		});
+
+		it('falls back to the toString tag in runtimes without Error.isError', function () {
+			const descriptor = Object.getOwnPropertyDescriptor(Error, 'isError') as PropertyDescriptor;
+			delete (Error as { isError?: unknown }).isError;
+			try {
+				expect(guards.isError(Object.setPrototypeOf(new Error('x'), null))).toBe(true);
+				expect(guards.isError(Object.setPrototypeOf({}, null))).toBe(false);
+				expect(guards.isError(foreign.error)).toBe(true);
+				// The tag is all there is to go by then.
+				expect(guards.isError(vm.runInNewContext('({ [Symbol.toStringTag]: "Error" })'))).toBe(true);
+			} finally {
+				Object.defineProperty(Error, 'isError', descriptor);
+			}
 		});
 	});
 
@@ -760,6 +777,30 @@ describe('guards', function () {
 			Object.defineProperty(withHidden, 'hidden', { value: 'x', enumerable: false });
 			expect(isScores(withSymbol)).toBe(false);
 			expect(isScores(withHidden)).toBe(true);
+			// Enumerable symbols are checked, hidden ones are not.
+			const symbols = Object.defineProperty({ a: 1, [Symbol('shown')]: 2 }, Symbol('hidden'), { value: 'x', enumerable: false });
+			expect(isScores(symbols)).toBe(true);
+			expect(guards.explain(isScores, symbols)).toEqual([]);
+			expect(guards.explain(isScores, { ...symbols, [Symbol.iterator]: 'x' })).toEqual([{ message: 'Invalid value (got string)', path: [Symbol.iterator] }]);
+		});
+
+		it('checks the keys the object had when the check started, once each', function () {
+			const seen: unknown[] = [];
+			const record = {
+				get a(): number {
+					// Keys added by a getter are not visited.
+					(record as Record<string, unknown>).c = 3;
+					(record as Record<PropertyKey, unknown>)[Symbol.for('d')] = 4;
+					return 1;
+				},
+				b: 2
+			};
+			const isLogged = guards.isRecordOf(function (value: unknown): value is number {
+				seen.push(value);
+				return typeof value === 'number';
+			});
+			expect(isLogged(record)).toBe(true);
+			expect(seen).toEqual([1, 2]);
 		});
 
 		it('rejects non-plain objects', function () {

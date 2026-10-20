@@ -447,6 +447,53 @@ describe('isLazy', function () {
 		expect(explain(isTree, shared)).toEqual([]);
 	});
 
+	it('should explain values sharing objects in linear time, reporting a shared invalid object once', function () {
+		/**
+		 * Builds `depth` nodes, each holding the previous one twice: 2^depth paths to the last one.
+		 * @param {number} depth - The number of nodes above the leaf
+		 * @param {unknown} leafValue - The value of the leaf
+		 * @returns {Tree} The root
+		 */
+		function chain(depth: number, leafValue: unknown): Tree {
+			let node = { value: leafValue, children: [] } as unknown as Tree;
+			for (let index = 0; index < depth; index++) node = { value: index, children: [node, node] };
+			return node;
+		}
+
+		// An invalid shared object is reported at its first path; every other path to it gets one pointer issue.
+		const small = chain(2, 'x');
+		expect(explain(isTree, small)).toEqual([
+			{ message: 'Invalid value (got string)', path: ['children', 0, 'children', 0, 'value'] },
+			{ message: 'Invalid value (same object as reported at another path)', path: ['children', 0, 'children', 1] },
+			{ message: 'Invalid value (same object as reported at another path)', path: ['children', 1] }
+		]);
+		// 2^40 paths: one issue per node instead of one per path (which ran out of memory).
+		const issues = explain(isTree, chain(40, 'x'));
+		expect(issues).toHaveLength(41);
+		expect(issues[0].message).toBe('Invalid value (got string)');
+		// A valid shared value under an invalid root is not walked once per path either.
+		expect(explain(isTree, { value: 'root', children: [chain(40, 0)] })).toEqual([{ message: 'Invalid value (got string)', path: ['value'] }]);
+		// The verdicts only last for one report.
+		expect(explain(isTree, small)).toHaveLength(3);
+	});
+
+	it('should not point to another path when the members of an intersection meet an invalid object at the same path', function () {
+		const isLeaf = isLazy(function () {
+			return isShape({ n: isFiniteNumber });
+		});
+		const isBoth = isIntersection(isShape({ a: isLeaf }), isShape({ a: isLeaf, b: isOptional(isString) }));
+
+		expect(explain(isBoth, { a: { n: 'x' } })).toEqual([{ message: 'Invalid value (got string)', path: ['a', 'n'] }]);
+		expect(explain(isBoth, { a: { n: 1 } })).toEqual([]);
+
+		// At a path of another length, the pointer issue is there.
+		const leaf = { n: 'x' };
+		expect(explain(isShape({ a: isShape({ b: isLeaf }), c: isLeaf }), { a: { b: leaf }, c: leaf })).toEqual([
+			{ message: 'Invalid value (got string)', path: ['a', 'b', 'n'] },
+			{ message: 'Invalid value (same object as reported at another path)', path: ['c'] }
+		]);
+	});
+
 	it('should support mutual recursion', function () {
 		type Expr = { op: 'neg'; arg: Expr } | { op: 'lit'; value: number };
 		const isExpr: Guard<Expr> = isUnion(
