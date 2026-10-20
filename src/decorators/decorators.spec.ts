@@ -1877,9 +1877,10 @@ describe('Decorators (pass 3 regressions)', function () {
 	}
 
 	it('should create and use instances when Object.prototype has a planted get or set (regression: Object.defineProperty threw)', function () {
+		// Installed first: the fake timers themselves do not support a polluted prototype.
+		jest.useFakeTimers();
 		for (const key of ['get', 'set']) {
 			withPlanted([key], function () {
-				jest.useFakeTimers();
 				// Previously `new Widget()` threw `Getter must be a function: planted` (the @readonly setter), and so did every first call.
 				const widget = new Widget();
 				widget.late = 'set';
@@ -1895,7 +1896,6 @@ describe('Decorators (pass 3 regressions)', function () {
 				const replacement = constant(1) as unknown as () => Widget;
 				widget.self = replacement;
 				expect(widget.self).toBe(replacement);
-				jest.useRealTimers();
 			});
 		}
 	});
@@ -1936,10 +1936,37 @@ describe('Decorators (pass 3 regressions)', function () {
 		expect(Object.getOwnPropertyDescriptor(later, 'flag')).toEqual({ value: 'assigned', writable: false, enumerable: true, configurable: false });
 	});
 
+	it('should return a promise whose then cannot be chained untouched from @log and @measure (regression: they threw)', function () {
+		const hostile = Promise.resolve(1);
+		Object.defineProperty(hostile, 'constructor', {
+			get: function (): never {
+				throw new Error('no species');
+			}
+		});
+		const logSpy = jest.spyOn(console, 'log').mockImplementation(noop);
+		const measurements: decorators.Measurement[] = [];
+		const logged = decorators.log({}, 'load', { value: constant(hostile), writable: true, configurable: true });
+		const measured = decorators.measure({
+			onMeasure: function (measurement: decorators.Measurement): void {
+				measurements.push(measurement);
+			}
+		})({}, 'load', { value: constant(hostile), writable: true, configurable: true });
+		// Previously both threw 'no species', although the method had returned.
+		expect((logged.value as () => unknown).call({})).toBe(hostile);
+		expect((measured.value as () => unknown).call({})).toBe(hostile);
+		expect(logSpy).toHaveBeenLastCalledWith('load method returned:', hostile);
+		expect(measurements).toHaveLength(1);
+		expect(measurements[0].failed).toBe(false);
+	});
+
 	it('should bind standard methods and statics when Object.prototype has a planted get (regression: the initializers threw)', function () {
-		const method = function (this: unknown): unknown {
+		/**
+		 * Returns its `this`.
+		 * @returns {unknown} `this`
+		 */
+		function method(this: unknown): unknown {
 			return this;
-		};
+		}
 		const instanceContext = fakeContext('method', 'who');
 		const staticContext = fakeContext('method', 'who', { static: true });
 		decorators.bound(method, instanceContext.context);

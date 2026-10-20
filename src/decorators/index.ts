@@ -141,6 +141,23 @@ function perInstance(wrap: () => UnknownMethod, detached?: UnknownMethod): Unkno
 }
 
 /**
+ * `Object.defineProperty`, whatever a polluted `Object.prototype` holds: a descriptor that inherits a `get` or `set` (or, for an accessor,
+ * a `value` or `writable`), which `Object.defineProperty` rejects with a `TypeError`, is given again without a prototype. Callers give
+ * every attribute that matters, so that none is inherited. Only the retry pays for that: a descriptor without a prototype is slower to read.
+ * @param {object} target - The object
+ * @param {PropertyKey} key - The key
+ * @param {PropertyDescriptor} descriptor - The descriptor
+ * @returns {void}
+ */
+function defineOwn(target: object, key: PropertyKey, descriptor: PropertyDescriptor): void {
+	try {
+		Object.defineProperty(target, key, descriptor);
+	} catch {
+		Object.defineProperty(target, key, Object.setPrototypeOf(descriptor, null) as PropertyDescriptor);
+	}
+}
+
+/**
  * Finds the property descriptor that a lookup of `key` on `obj` resolves to (walking the prototype chain).
  * @param {object} obj - The object to start from
  * @param {string | symbol} key - The property key
@@ -257,12 +274,16 @@ export function readonly(targetOrValue: unknown, keyOrContext: unknown, descript
 			const field = Object.getOwnPropertyDescriptor(owner, name);
 
 			if (field === undefined) return;
-			if (owner[name] !== undefined) {
-				Object.defineProperty(owner, name, { writable: false, configurable: false });
+
+			const current = owner[name];
+
+			if (current !== undefined) {
+				// Every attribute, so that none comes from a polluted `Object.prototype` (a planted `value` would replace the field's).
+				defineOwn(owner, name, { value: current, writable: false, enumerable: field.enumerable, configurable: false });
 				return;
 			}
 			// No value yet (a field without initializer, assigned in the constructor): the first assignment defines the read-only property.
-			Object.defineProperty(owner, name, {
+			defineOwn(owner, name, {
 				configurable: true,
 				enumerable: field.enumerable,
 				get: function (): undefined {
@@ -271,7 +292,7 @@ export function readonly(targetOrValue: unknown, keyOrContext: unknown, descript
 				// On the object assigned to (like the legacy setter), not `owner`: an assignment through a subclass or an object inheriting
 				// from `owner` must not lock `owner`.
 				set: function (this: object, value: unknown): void {
-					Object.defineProperty(this, name, { value, writable: false, configurable: false, enumerable: field.enumerable });
+					defineOwn(this, name, { value, writable: false, configurable: false, enumerable: field.enumerable });
 				}
 			});
 		});
@@ -293,18 +314,18 @@ export function readonly(targetOrValue: unknown, keyOrContext: unknown, descript
 	const target = targetOrValue as object;
 	const existing = Object.getOwnPropertyDescriptor(target, key);
 
-	if (existing !== undefined && 'value' in existing) {
+	if (existing !== undefined && Object.prototype.hasOwnProperty.call(existing, 'value')) {
 		// A static field already initialised by assignment before the decorator ran.
-		Object.defineProperty(target, key, { writable: false });
+		defineOwn(target, key, { value: existing.value, writable: false, enumerable: existing.enumerable, configurable: existing.configurable });
 		return;
 	}
 
-	Object.defineProperty(target, key, {
+	defineOwn(target, key, {
 		configurable: true,
 		enumerable: false,
 		get: noop,
 		set: function (this: unknown, value: unknown): void {
-			Object.defineProperty(this as object, key, { value, writable: false, enumerable: true, configurable: false });
+			defineOwn(this as object, key, { value, writable: false, enumerable: true, configurable: false });
 		}
 	});
 }
@@ -379,16 +400,20 @@ function wrapLog(method: UnknownMethod, name: string): UnknownMethod {
 		// A promise is logged through a promise chained on it, which is returned: handlers attached to the original instead would mark
 		// a rejection nobody handles as handled. Other thenables are left alone, since calling `then` can start their work (query builders).
 		if (isNativePromise(result)) {
-			return result.then(
-				function (value: unknown): unknown {
-					safeLog(`${name} method resolved:`, value);
-					return value;
-				},
-				function (error: unknown): never {
-					safeLog(`${name} method rejected:`, error);
-					throw error;
-				}
-			);
+			try {
+				return result.then(
+					function (value: unknown): unknown {
+						safeLog(`${name} method resolved:`, value);
+						return value;
+					},
+					function (error: unknown): never {
+						safeLog(`${name} method rejected:`, error);
+						throw error;
+					}
+				);
+			} catch {
+				// A promise whose `then` (or `constructor`, read by `then`) throws: returned untouched, like other thenables.
+			}
 		}
 
 		safeLog(`${name} method returned:`, result);
@@ -603,11 +628,9 @@ export function bound(targetOrValue: unknown, keyOrContext: unknown, descriptor?
 			const owner = this as Record<string | symbol, unknown>;
 
 			// A static method is bound lazily, like legacy ones: binding it to the class now would give subclasses the base class.
-			if (context.static) Object.defineProperty(owner, context.name, bindingAccessor(method, context.name, false));
+			if (context.static) defineOwn(owner, context.name, bindingAccessor(method, context.name, false));
 			// Skip when a subclass overrides the method: binding ours would shadow the override.
-			else if (owner[context.name] === method) {
-				Object.defineProperty(owner, context.name, { value: method.bind(owner), configurable: true, writable: true, enumerable: false });
-			}
+			else if (owner[context.name] === method) defineOwn(owner, context.name, { value: method.bind(owner), configurable: true, writable: true, enumerable: false });
 		});
 
 		return;
@@ -655,7 +678,7 @@ function bindingAccessor(method: UnknownMethod, key: string | symbol, enumerable
 
 		// Cache only on extensible instances that still resolve to this getter (frozen/sealed instances get a fresh bound method).
 		if (Object.isExtensible(this) && resolveDescriptor(this, key)?.get === get) {
-			Object.defineProperty(this, key, { value: boundMethod, configurable: true, writable: true, enumerable: false });
+			defineOwn(this, key, { value: boundMethod, configurable: true, writable: true, enumerable: false });
 		}
 
 		return boundMethod;
@@ -666,7 +689,7 @@ function bindingAccessor(method: UnknownMethod, key: string | symbol, enumerable
 		enumerable,
 		get,
 		set: function (this: unknown, value: unknown): void {
-			Object.defineProperty(this as object, key, { value, configurable: true, writable: true, enumerable: true });
+			defineOwn(this as object, key, { value, configurable: true, writable: true, enumerable: true });
 		}
 	};
 }
@@ -1162,16 +1185,20 @@ function measureWrapper(label: string | undefined, onMeasure: (measurement: Meas
 			// As for `@log`: a promise is timed until it settles, through a promise chained on it (which is returned), so a rejection nobody
 			// handles still surfaces; other thenables are returned untouched (calling `then` can start their work) and timed as returned.
 			if (isNativePromise(result)) {
-				return result.then(
-					function (value: unknown): unknown {
-						report(self, start, args, false, undefined);
-						return value;
-					},
-					function (error: unknown): never {
-						report(self, start, args, true, error);
-						throw error;
-					}
-				);
+				try {
+					return result.then(
+						function (value: unknown): unknown {
+							report(self, start, args, false, undefined);
+							return value;
+						},
+						function (error: unknown): never {
+							report(self, start, args, true, error);
+							throw error;
+						}
+					);
+				} catch {
+					// A promise whose `then` (or `constructor`, read by `then`) throws: returned untouched, like other thenables.
+				}
 			}
 
 			report(self, start, args, false, undefined);
