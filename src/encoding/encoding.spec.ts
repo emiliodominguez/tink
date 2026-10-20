@@ -1091,6 +1091,16 @@ describe('decodeJwt', function () {
 				helpers.decodeJwt(input);
 			}).toThrow(new SyntaxError(`decodeJwt: \`token\` must have 3 parts separated by dots, got ${parts}`));
 		}
+		// The parts are counted, never split into an array (regression: a token of a hundred million dots ran the process out of memory).
+		const split = jest.spyOn(String.prototype, 'split');
+		try {
+			expect(function () {
+				helpers.decodeJwt('.'.repeat(100_000));
+			}).toThrow(new SyntaxError('decodeJwt: `token` must have 3 parts separated by dots, got 100001'));
+			expect(split).not.toHaveBeenCalled();
+		} finally {
+			split.mockRestore();
+		}
 		const valid = JWT_IO.split('.');
 		for (const [index, name] of [
 			[0, 'header'],
@@ -1564,6 +1574,43 @@ describe('toCsv', function () {
 		} finally {
 			delete (Array.prototype as unknown as Record<number, unknown>)[1];
 		}
+	});
+
+	it('should write the holes of a huge sparse row by runs, failing fast when the text cannot exist (regression)', function () {
+		// Regression: every index was written as a field, so a row of length 2 ** 32 - 1 with one cell ran the process out of memory.
+		const huge = new Array(2 ** 32 - 1) as unknown[];
+		huge[0] = 'a';
+		huge[2 ** 31] = 'b';
+		let reads = 0;
+		const counted = new Proxy(huge, {
+			getOwnPropertyDescriptor(target, key) {
+				reads++;
+				return Reflect.getOwnPropertyDescriptor(target, key);
+			}
+		});
+		expect(function () {
+			helpers.toCsv([counted] as never);
+		}).toThrow(RangeError);
+		expect(reads).toBeLessThan(70_000);
+		// The same text as the dense row, with the cells of the sparse part checked in order.
+		const sparse = new Array(70_000) as unknown[];
+		for (const [index, value] of [
+			[0, 'a'],
+			[65_535, 1],
+			[65_537, 'x,y'],
+			[69_998, null]
+		] as const) {
+			sparse[index] = value;
+		}
+		const dense = Array.from(sparse, function (value) {
+			return value;
+		});
+		expect(helpers.toCsv([sparse as never[], ['z']], { delimiter: ';' })).toBe(helpers.toCsv([dense as never[], ['z']], { delimiter: ';' }));
+		expect(helpers.toCsv([sparse as never[]])).toMatch(/^a,{65535}1,,"x,y",{4462}$/);
+		sparse[69_999] = {};
+		expect(function () {
+			helpers.toCsv([sparse as never[]]);
+		}).toThrow(new TypeError('toCsv: `rows[0][69999]` must be a string, number, bigint, boolean, null or undefined, got object'));
 	});
 
 	it('should write a last row without cells as one empty field, which a final line break would lose (regression)', function () {
@@ -2246,6 +2293,23 @@ describe('signJwt / verifyJwt', function () {
 			}
 			// Unchecked when not asked.
 			expect(verify('{"iss":1,"sub":2,"aud":3}', {})).toEqual({ iss: 1, sub: 2, aud: 3 });
+		});
+
+		it('should match the audience in time linear in the lengths of the claim and the option (regression)', function () {
+			// Regression: each value of the `aud` claim was looked up with `includes`, so the work was the product of both lengths.
+			const aud = Array.from({ length: 200 }, function (_, i) {
+				return `aud-${i}`;
+			});
+			let reads = 0;
+			const audience = new Proxy(['web', ...aud.slice(150)].reverse(), {
+				get(target, key) {
+					reads++;
+					return Reflect.get(target, key);
+				}
+			});
+			expect(helpers.verifyJwt(token(HS256, JSON.stringify({ aud })), SECRET, { audience }).payload).toEqual({ aud });
+			expect(reads).toBeLessThan(500);
+			rejects(token(HS256, JSON.stringify({ aud: aud.slice(0, 150) })), 'invalid_audience', 'the `aud` claim of `token` must hold an accepted `audience`', { audience });
 		});
 
 		it('should read only own claims and options, ignoring a polluted Object.prototype', function () {

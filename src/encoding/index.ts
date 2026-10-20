@@ -1365,7 +1365,10 @@ function jwtDots(caller: string, token: string): number[] {
 	// Without a first dot, `second` is -1 too.
 	const second = token.indexOf('.', first + 1);
 	if (second === -1 || token.includes('.', second + 1)) {
-		throw new SyntaxError(`${caller}: \`token\` must have 3 parts separated by dots, got ${token.split('.').length}`);
+		// The parts are counted, not split: splitting a token of a hundred million dots ran the process out of memory.
+		let parts = 1;
+		for (let i = first; i !== -1; i = token.indexOf('.', i + 1)) parts++;
+		throw new SyntaxError(`${caller}: \`token\` must have 3 parts separated by dots, got ${parts}`);
 	}
 	return [first, second];
 }
@@ -1881,9 +1884,11 @@ export function verifyJwt<P extends object = JwtPayload, H extends object = JwtH
 	if (audiences !== undefined) {
 		const aud = ownValue(payload, 'aud');
 		const values: unknown[] = Array.isArray(aud) ? aud : [aud];
+		// A set: `includes` for each value took time in the product of the two lengths.
+		const accepted = new Set<unknown>(audiences);
 		if (
 			!values.some(function (value: unknown): boolean {
-				return audiences.includes(value as string);
+				return accepted.has(value);
 			})
 		) {
 			reject('invalid_audience', 'the `aud` claim of `token` must hold an accepted `audience`');
@@ -2141,6 +2146,9 @@ function csvRecords(rows: string[][]): Partial<Record<string, string>>[] {
  */
 const FORMULA_START = /^[\t\r]|^\s*[=+\-@＝＋－＠]/;
 
+/** Columns of a row that {@link toCsv} reads index by index; past them, a row with a hole is walked through its own keys (it may be sparse). */
+const SPARSE_SCAN = 65536;
+
 /**
  * Writes rows as CSV text (RFC 4180) that {@link parseCsv} reads back exactly: rows of cells, or records (objects) whose keys become
  * the columns.
@@ -2277,10 +2285,29 @@ export function toCsv(rows: ReadonlyArray<unknown>, options?: ToCsvOptions): str
 	 */
 	function line(cells: ReadonlyArray<unknown>, row: number): string {
 		const length = cells.length;
-		const fields = new Array<string>(length);
-		// A hole is an empty field, never a value inherited from a polluted `Array.prototype` (which `map` would read).
-		for (let column = 0; column < length; column++) fields[column] = field(Object.hasOwn(cells, column) ? cells[column] : undefined, row, column);
-		return length === 1 && fields[0] === '' ? '""' : fields.join(separator);
+		const fields = new Array<string>(Math.min(length, SPARSE_SCAN));
+		let column = 0;
+		for (; column < length; column++) {
+			// A hole is an empty field, never a value inherited from a polluted `Array.prototype` (which `map` would read).
+			const own = Object.hasOwn(cells, column);
+			if (!own && column >= SPARSE_SCAN) break;
+			fields[column] = field(own ? cells[column] : undefined, row, column);
+		}
+		if (column < length) {
+			// A hole far into a long row, which may be sparse (a length of 2 ** 32 - 1 with a few cells): its own cells are visited (indexes
+			// come first, in ascending order), each after the separators of the holes before it, so that a run of holes is written at once.
+			// One field at a time, a few hundred million holes ran the process out of memory before the text reached the engine's maximum
+			// length, which now throws a RangeError at once. `column` is the first column not written yet.
+			for (const key of Object.getOwnPropertyNames(cells)) {
+				const index = Number(key);
+				if (String(index) !== key) break;
+				if (index >= column) {
+					fields.push(separator.repeat(index - column) + field(cells[index], row, index));
+					column = index + 1;
+				}
+			}
+		}
+		return length === 1 && fields[0] === '' ? '""' : fields.join(separator) + separator.repeat(length - column);
 	}
 
 	const lines: string[] = [];
