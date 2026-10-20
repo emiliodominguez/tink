@@ -408,6 +408,44 @@ describe('Standard Schema interop', function () {
 		expect(issuesOf({ a: failing([]) }, { a: 1 })).toEqual([{ message: 'Invalid value (got number)', path: ['a'] }]);
 	});
 
+	it('should treat any falsy `issues` as a success, as the Standard Schema spec says', function () {
+		/**
+		 * Builds a Standard Schema validator that succeeds with `issues` set to a falsy value.
+		 * @param {unknown} issues - The falsy value
+		 * @returns {object} The validator
+		 */
+		function succeeding(issues: unknown): StandardSchemaLike {
+			return {
+				'~standard': {
+					version: 1,
+					vendor: 'test',
+					validate: function (value: unknown) {
+						return { value: String(value), issues };
+					}
+				}
+			};
+		}
+
+		for (const issues of [null, false, 0, '']) {
+			expect(safeParse(succeeding(issues), 1)).toEqual([undefined, '1']);
+			expect(safeParse({ a: succeeding(issues), b: isInteger }, { a: 1, b: 'x' })[0]?.issues).toEqual([{ message: 'Invalid value (got string)', path: ['b'] }]);
+		}
+
+		let calls = 0;
+		// Fails its first call (the fast parse), then succeeds with `issues: null` (the reporting parse).
+		const late: StandardSchemaLike = {
+			'~standard': {
+				version: 1,
+				vendor: 'test',
+				validate: function (value: unknown) {
+					return calls++ === 0 ? { issues: [{ message: 'first call' }] } : { value, issues: null };
+				}
+			}
+		};
+
+		expect(safeParse(late, 2)).toEqual([undefined, 2]);
+	});
+
 	it('should accept the guards module’s Standard Schema validators', function () {
 		expect(parse({ id: toStandardSchema(isInteger) }, { id: 1 })).toEqual({ id: 1 });
 		expect(issuesOf({ id: toStandardSchema(isInteger) }, { id: 'x' })).toEqual([{ message: 'Invalid value (got string)', path: ['id'] }]);

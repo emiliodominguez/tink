@@ -105,6 +105,19 @@ describe('parseJson', function () {
 			assertNotPolluted();
 		});
 
+		it('should ignore a proto option inherited from a polluted Object.prototype', function () {
+			const polluted = Object.prototype as Record<string, unknown>;
+			polluted.proto = 'ignore';
+			try {
+				expect(parseJson(HOSTILE, {})[0]).toBeInstanceOf(SyntaxError);
+				expect(parseJson(HOSTILE, isShape({}), {})[0]).toBeInstanceOf(SyntaxError);
+				expect(parseJson(HOSTILE, { proto: 'remove' })).toEqual([undefined, {}]);
+			} finally {
+				delete polluted.proto;
+			}
+			assertNotPolluted();
+		});
+
 		it('should check deep values without overflowing the stack', function () {
 			const depth = 50_000;
 			const text = `${'{"a":'.repeat(depth)}{"__proto__":1}${'}'.repeat(depth)}`;

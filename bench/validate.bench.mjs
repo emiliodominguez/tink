@@ -24,6 +24,8 @@ import {
 	asNumber,
 	chain,
 	discriminatedUnion,
+	lazy,
+	nullable,
 	safeParse,
 	withDefault
 } from 'tinkit/validate';
@@ -226,6 +228,14 @@ const zodEvents = z.array(
 	])
 );
 
+// A recursive schema and an invalid value whose 16 objects are each held twice by the next one (as YAML aliases can build): 65,536
+// paths lead to the invalid leaf, and each shared object is reported once rather than once per path.
+const pairSchema = lazy(function () {
+	return { left: nullable(pairSchema), right: nullable(pairSchema) };
+});
+let sharedPairs = 'invalid';
+for (let level = 0; level < 16; level++) sharedPairs = { left: sharedPairs, right: sharedPairs };
+
 /**
  * The usual "safe" JSON.parse snippet: try/catch plus a reviver dropping `__proto__` keys.
  * @param {string} text - The JSON text
@@ -361,6 +371,12 @@ export default [
 			zod: function () {
 				return zodEvents.safeParse(events);
 			}
+		}
+	},
+	{
+		name: 'safeParse: lazy schema, invalid value sharing objects (16 levels, issue reporting)',
+		fn: function () {
+			return safeParse(pairSchema, sharedPairs);
 		}
 	},
 	predicateCase('isEmail', isEmail, emails, { 'typical regex': matches(TYPICAL_EMAIL), 'WHATWG regex': matches(WHATWG_EMAIL) }),

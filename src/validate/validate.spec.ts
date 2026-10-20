@@ -137,6 +137,26 @@ describe('isEmail', function () {
 });
 
 describe('isUrl', function () {
+	it('ignores options inherited from a polluted Object.prototype', function () {
+		const polluted = Object.prototype as Record<string, unknown>;
+		polluted.protocols = ['javascript', 'data'];
+		polluted.requireTld = true;
+		try {
+			expect(helpers.isUrl('javascript:alert(1)')).toBe(false);
+			expect(helpers.isUrl('javascript:alert(1)', {})).toBe(false);
+			expect(helpers.isUrl('data:text/html,<script>alert(1)</script>', {})).toBe(false);
+			expect(helpers.isUrl('http://localhost:3000')).toBe(true);
+			expect(helpers.isUrl('http://localhost:3000', {})).toBe(true);
+			// Own options still apply.
+			expect(helpers.isUrl('javascript:alert(1)', { protocols: ['javascript'] })).toBe(true);
+			expect(helpers.isUrl('http://localhost:3000', { requireTld: true })).toBe(false);
+			expect(helpers.isUrl('http://localhost:3000', { requireTld: false })).toBe(true);
+		} finally {
+			delete polluted.protocols;
+			delete polluted.requireTld;
+		}
+	});
+
 	it.each([
 		'http://example.com',
 		'https://example.com/path/to?query=1&x=y#frag',
@@ -590,6 +610,20 @@ describe('isHexColor', function () {
 		expect(helpers.isHexColor('#ff8000', { alpha: false })).toBe(true);
 		expect(helpers.isHexColor('#ffff', { alpha: false })).toBe(false);
 		expect(helpers.isHexColor('#ff800080', { alpha: false })).toBe(false);
+	});
+
+	it('ignores an alpha option inherited from a polluted Object.prototype', function () {
+		const polluted = Object.prototype as Record<string, unknown>;
+		polluted.alpha = false;
+		try {
+			expect(helpers.isHexColor('#ff800080', {})).toBe(true);
+			expect(helpers.isHexColor('#ff800080', { alpha: true })).toBe(true);
+			expect(helpers.isHexColor('#ff800080', { alpha: false })).toBe(false);
+		} finally {
+			delete polluted.alpha;
+		}
+		// An option inherited from another prototype counts.
+		expect(helpers.isHexColor('#ff800080', Object.create({ alpha: false }) as helpers.IsHexColorOptions)).toBe(false);
 	});
 });
 

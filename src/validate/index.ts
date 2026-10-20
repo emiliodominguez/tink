@@ -18,7 +18,7 @@ import { hold, isTooDeep, PENDING, release, scope } from '../utils/memo.js';
 import { guardScore } from '../utils/score.js';
 
 /**
- * Options accepted by {@link isUrl}.
+ * Options accepted by {@link isUrl}. A polluted `Object.prototype` cannot set one.
  */
 export interface IsUrlOptions {
 	/** Allowed schemes, compared case-insensitively, with or without the trailing `:` (e.g. `'https'` or `'https:'`). Defaults to `['http', 'https']`. */
@@ -33,7 +33,7 @@ export interface IsUrlOptions {
 export type UuidVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 'nil' | 'max';
 
 /**
- * Options accepted by {@link isHexColor}.
+ * Options accepted by {@link isHexColor}. A polluted `Object.prototype` cannot set one.
  */
 export interface IsHexColorOptions {
 	/** Accept the 4 and 8 digit forms with an alpha channel (`#rgba`, `#rrggbbaa`). Defaults to `true`. */
@@ -385,7 +385,7 @@ function isPlainWebUrl(value: string, requireTld: boolean): boolean {
  * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
  * non-matching string, test `typeof value === 'string'` there.
  * @param {unknown} value - The value to check
- * @param {IsUrlOptions} [options={}] - `protocols` (default `['http', 'https']`): allowed schemes;
+ * @param {IsUrlOptions} [options] - `protocols` (default `['http', 'https']`): allowed schemes;
  * `requireTld` (default `false`): require a host ending in a top-level domain, which rejects `localhost`, IP addresses and host-less URLs
  * @returns {boolean} `true` when `value` is a string holding a URL that satisfies the options
  * @throws {TypeError} when `options.protocols` is not an array
@@ -401,15 +401,17 @@ function isPlainWebUrl(value: string, requireTld: boolean): boolean {
  * isUrl('https://ｅvil.com'); // => false
  * isUrl('https://例え.jp'); // => true
  */
-export function isUrl(value: unknown, options: IsUrlOptions = {}): value is string {
-	const { protocols, requireTld = false } = options;
+export function isUrl(value: unknown, options?: IsUrlOptions): value is string {
+	// Not read from a polluted `Object.prototype`, where a planted `protocols` would allow `javascript:` URLs.
+	const protocols = options === undefined ? undefined : readOption(options, 'protocols');
+	const requireTld = options !== undefined && Boolean(readOption(options, 'requireTld'));
 	if (protocols !== undefined && !Array.isArray(protocols)) throw new TypeError(`isUrl: \`protocols\` must be an array of strings, got ${typeof protocols}`);
 	if (typeof value !== 'string') return false;
 
 	const UrlParser = getUrlConstructor();
 
 	// The common case, decided without the (much more expensive) parser; anything less plain takes the full check below.
-	if (protocols === undefined && UrlParser === NATIVE_URL && isPlainWebUrl(value, Boolean(requireTld))) return true;
+	if (protocols === undefined && UrlParser === NATIVE_URL && isPlainWebUrl(value, requireTld)) return true;
 	if (URL_FORBIDDEN_CHARACTER.test(value)) return false;
 	// A successful parse reads the scheme up to the first `:` and lower-cases it, so the scheme checks can run before the (much more
 	// expensive) parse. Without any `:` the parse fails, whatever these checks conclude.
@@ -609,8 +611,11 @@ export function isIP(value: unknown): value is string {
  * isHexColor('#ff800'); // => false
  */
 export function isHexColor(value: unknown, options?: IsHexColorOptions): value is string {
-	// No `= {}` default: allocating an options object would cost about as much as the test itself.
-	return typeof value === 'string' && (options?.alpha === false ? OPAQUE_HEX_COLOR_PATTERN : HEX_COLOR_PATTERN).test(value);
+	// No `= {}` default: allocating an options object would cost about as much as the test itself. An `alpha: false` inherited from a
+	// polluted `Object.prototype` is ignored (`readOption`, inlined: it would double the cost of the call).
+	const opaque = options !== undefined && options.alpha === false && ((Object.prototype as IsHexColorOptions).alpha !== false || hasOwn.call(options, 'alpha'));
+
+	return typeof value === 'string' && (opaque ? OPAQUE_HEX_COLOR_PATTERN : HEX_COLOR_PATTERN).test(value);
 }
 
 /**
@@ -1976,7 +1981,7 @@ export function isNumericString(value: unknown): value is string {
 export type ProtoAction = 'error' | 'remove' | 'ignore';
 
 /**
- * Options accepted by {@link parseJson}.
+ * Options accepted by {@link parseJson}. A polluted `Object.prototype` cannot set one.
  */
 export interface ParseJsonOptions {
 	/** What to do with `__proto__` and `constructor.prototype` keys. Defaults to `'error'`. */
@@ -2103,7 +2108,8 @@ export function parseJson(text: string, guardOrOptions?: Guard<unknown> | ParseJ
 		throw new TypeError(`parseJson: \`options\` must be an object, got ${describe(options)}`);
 	}
 
-	const proto = options?.proto ?? 'error';
+	// Not read from a polluted `Object.prototype`, where a planted `proto: 'ignore'` would turn the check off.
+	const proto = (options === undefined ? undefined : readOption(options, 'proto')) ?? 'error';
 
 	if (proto !== 'error' && proto !== 'remove' && proto !== 'ignore') {
 		throw new RangeError(`parseJson: \`proto\` must be 'error', 'remove' or 'ignore', got ${show(proto)}`);
@@ -2471,13 +2477,14 @@ function standardNode(schema: StandardSchemaLike): Node {
 		fast: function fastStandard(value: unknown): unknown {
 			const result = callValidator(value);
 
-			return result.issues === undefined ? result.value : FAIL;
+			// As the Standard Schema spec says, any falsy `issues` (not only `undefined`) means success.
+			return result.issues ? FAIL : result.value;
 		},
 		run: function runStandard(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
 			const result = callValidator(value);
 			const found = result.issues;
 
-			if (found === undefined) return result.value;
+			if (!found) return result.value;
 			if (found.length === 0) issues.push({ message: `Invalid value (got ${describe(value)})`, path: path.slice() });
 			for (const issue of found as ReadonlyArray<{ readonly message: string; readonly path?: ReadonlyArray<PropertyKey | { readonly key: PropertyKey }> }>) {
 				const segments = (issue.path ?? []).map(function (segment: PropertyKey | { readonly key: PropertyKey }): PropertyKey {
@@ -3800,7 +3807,9 @@ export function recordOf<S extends Schema, K extends string = string>(
  * recursive type. Cycle-safe: a value that reaches itself through the same lazy parser (`node.children = [node]`) is rejected with
  * `Circular reference`, instead of overflowing the stack, and a value nested too deeply to parse fails with `Value is nested too
  * deeply`. Inside a lazy parser, each object is parsed once by each lazy parser it reaches, which keeps a recursive {@link union}
- * linear in the size of the value however its members differ: an object the value holds in two places parses to the same output.
+ * linear in the size of the value however its members differ: an object the value holds in two places parses to the same output, and
+ * when it is invalid its issues are reported at the first place only, the others getting one `Invalid value (same object as reported
+ * at another path)` issue (so a value sharing objects, such as YAML aliases, cannot make the report grow exponentially).
  * @template T - The output type
  * @param {() => Schema} getter - Returns the schema (called once, on the first parse)
  * @returns {Parser<T>} The parser
@@ -3818,10 +3827,11 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 
 	let resolved: Node | undefined;
 	let resolving = false;
-	// The output for each object parsed by this parser during the current parse (see `utils/memo.ts`), and the objects being reported
-	// right now: meeting one again means a cycle.
+	// The output for each object parsed by this parser during the current parse (see `utils/memo.ts`), and the objects reported during
+	// it: `PENDING` while being reported (meeting one again means a cycle), then `FAIL` when it had issues, so that an object reached
+	// again by another path is not reported again (once per path would be exponential in the depth of the objects a value shares).
 	const memo = new Map<object, unknown>();
-	const reporting = new Set<object>();
+	const reported = new Map<object, unknown>();
 	// The values being scored: a union that reaches this parser again on the same value (`lazy(() => union(a, nullable(self)))`) would
 	// score it forever.
 	const scoring = new Set<unknown>();
@@ -3902,20 +3912,31 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 			const node = resolve();
 
 			if (typeof value !== 'object' || value === null) return node.run(value, path, issues);
-			if (reporting.has(value)) {
-				issues.push({ message: 'Circular reference', path: path.slice() });
+
+			const state = reported.get(value);
+
+			if (state !== undefined) {
+				issues.push({ message: state === PENDING ? 'Circular reference' : 'Invalid value (same object as reported at another path)', path: path.slice() });
 
 				return undefined;
 			}
-			hold(reporting).add(value);
+			hold(reported).set(value, PENDING);
 
 			const length = path.length;
+			const before = issues.length;
+			let failed = false;
 
-			// A parser of another copy of tinkit may report through this one: the scope keeps `reporting` until this call returns.
+			// A parser of another copy of tinkit may report through this one: the scope keeps `reported` until this call returns.
 			scope.depth++;
 			try {
 				// The fast parse of this very value just failed: parsing it again first would double the cost at every level.
-				return node.run(value, path, issues);
+				const output = node.run(value, path, issues);
+
+				// Only a value that had issues is remembered: one whose report found nothing (a schema that is not deterministic) or threw is
+				// reported again when met again.
+				failed = issues.length > before;
+
+				return output;
 			} catch (error) {
 				// Recorded inline, without a call, since a call can overflow again: the first lazy schema to see the error is the deepest.
 				if (scope.thrown !== error) {
@@ -3932,7 +3953,8 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 				}
 				throw error;
 			} finally {
-				reporting.delete(value);
+				if (failed) reported.set(value, FAIL);
+				else reported.delete(value);
 				if (--scope.depth === 0) release();
 			}
 		},

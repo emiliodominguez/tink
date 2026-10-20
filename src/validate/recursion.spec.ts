@@ -558,6 +558,59 @@ describe('recursive unions told apart deep inside', function () {
 		expect(runs).toBe(1);
 	});
 
+	it('should report an invalid object held in several places once, in linear time', function () {
+		type Pair = { l: Pair | null; r: Pair | null };
+		const pair: Parser<Pair> = lazy(function () {
+			return { l: nullable(pair), r: nullable(pair) };
+		});
+		// 40 objects, each held twice by the next: 2^40 paths lead to the invalid leaf (YAML aliases build such values).
+		let value: unknown = 'x';
+
+		for (let level = 0; level < 40; level++) value = { l: value, r: value };
+
+		const issues = issuesOf(pair, value);
+		const left = new Array<string>(40).fill('l');
+
+		expect(issues).toHaveLength(41);
+		expect(issues[0]).toEqual({ message: 'Expected an object (got string)', path: left });
+		expect(issues[1]).toEqual({ message: 'Expected an object (got string)', path: [...left.slice(1), 'r'] });
+		expect(issues[2]).toEqual({ message: 'Invalid value (same object as reported at another path)', path: [...left.slice(2), 'r'] });
+		expect(issues[40]).toEqual({ message: 'Invalid value (same object as reported at another path)', path: ['r'] });
+
+		const shared = { id: 'x' };
+
+		const item = lazy(function () {
+			return { id: asInteger };
+		});
+
+		expect(issuesOf(arrayOf(item), [shared, { id: 1 }, shared])).toEqual([
+			{ message: 'Expected an integer or an integer string (got string)', path: [0, 'id'] },
+			{ message: 'Invalid value (same object as reported at another path)', path: [2] }
+		]);
+	});
+
+	it('should report again an object held twice whose first report found nothing', function () {
+		let lateCalls = 0;
+		/**
+		 * Rejects its first two lateCalls (the fast parses of the value and of the first element), then accepts objects.
+		 * @param {unknown} value - The value
+		 * @returns {boolean} Whether to accept it
+		 */
+		function late(value: unknown): value is object {
+			return typeof value === 'object' && lateCalls++ >= 2;
+		}
+		const item: Parser<object> = lazy(function () {
+			return late;
+		});
+		const shared = {};
+		const [error, output] = safeParse(arrayOf(item), [shared, shared]);
+
+		expect(error).toBeUndefined();
+		expect(output).toEqual([shared, shared]);
+		// The first element's report found nothing, so the second one is reported again (not remembered as failing).
+		expect(lateCalls).toBe(4);
+	});
+
 	it('should remember outputs that are undefined', function () {
 		const nothing: Parser<undefined> = lazy(function () {
 			return transform(isObject, function (): undefined {
