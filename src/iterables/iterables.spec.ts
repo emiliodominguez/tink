@@ -53,6 +53,24 @@ function isEven(n: number): boolean {
 	return n % 2 === 0;
 }
 
+/**
+ * An iterable whose iterator returns `result` from every `next()` (closing it throws: it must not be closed).
+ */
+function resultOf(result: unknown): Iterable<unknown> {
+	return {
+		[Symbol.iterator]() {
+			return {
+				next() {
+					return result;
+				},
+				return() {
+					throw new Error('must not be closed');
+				}
+			} as unknown as Iterator<unknown>;
+		}
+	};
+}
+
 describe('iterables', function () {
 	describe('count', function () {
 		it('counts from 0 by 1 by default', function () {
@@ -743,6 +761,34 @@ describe('iterables', function () {
 			expect(function () {
 				helpers.toArray(helpers.zip(throwingClose, failingNext));
 			}).toThrow('next failed');
+		});
+
+		it('throws a TypeError for an iterator result that is not an object, like for...of, closing the other iterators', function () {
+			for (const result of [5, 'x', true, undefined, null, Symbol('s')]) {
+				const a = spy([1, 2, 3]);
+				expect(function () {
+					helpers.toArray(helpers.zip(a.iterable, resultOf(result)));
+				}).toThrow(TypeError);
+				expect(a.stats.closed).toBe(1);
+			}
+			expect(function () {
+				helpers.toArray(helpers.zip([1], resultOf(5)));
+			}).toThrow(new TypeError('zip: iterator result number is not an object'));
+			// A function is an object: its `done` and `value` are read, as for...of does.
+			const result = Object.assign(function () {}, { done: false, value: 'f' });
+			const functions: Iterable<unknown> = {
+				[Symbol.iterator]() {
+					return {
+						next() {
+							return result;
+						}
+					} as unknown as Iterator<unknown>;
+				}
+			};
+			expect(helpers.toArray(helpers.zip([1, 2], functions))).toEqual([
+				[1, 'f'],
+				[2, 'f']
+			]);
 		});
 
 		it('tolerates iterators without a return method', function () {
@@ -2277,8 +2323,8 @@ describe('mapConcurrent', function () {
 	});
 
 	it('accepts sync iterables of values and promises, closing them on early exit', async function () {
-		const { iterable, stats } = spy([1, Promise.resolve(2), 3, 4]);
-		const iterator = helpers.mapConcurrent(iterable, double, Infinity);
+		const { iterable, stats } = spy([1, Promise.resolve(2), 3, 4, 5, 6]);
+		const iterator = helpers.mapConcurrent(iterable, double, 2);
 		await expect(iterator.next()).resolves.toEqual({ done: false, value: 2 });
 		await expect(iterator.next()).resolves.toEqual({ done: false, value: 4 });
 		await iterator.return!();
@@ -2365,6 +2411,32 @@ describe('mapConcurrent', function () {
 			helpers.mapConcurrent([1], double, { concurrency: 1, signal: 'x' as any });
 		}).toThrow(new TypeError('mapConcurrent: `signal` must be an AbortSignal, null or undefined, got string'));
 		expect(helpers.mapConcurrent([1], double, { concurrency: 1, signal: null })).toBeDefined();
+	});
+
+	it('ignores options inherited from a polluted Object.prototype', async function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		const signal = new FakeSignal();
+		signal.abort(new Error('polluted'));
+		/** Resolves later for the first item, so that an unordered mapping would yield it last. */
+		async function slowFirst(n: number): Promise<number> {
+			await ticks(n === 1 ? 20 : 1);
+			return n;
+		}
+		proto.signal = signal;
+		proto.ordered = false;
+		proto.concurrency = 2;
+		try {
+			// A number as the options, and an object without these keys: neither takes the signal or the order of the prototype.
+			expect(await helpers.toArrayAsync(helpers.mapConcurrent([1, 2], slowFirst, 2))).toEqual([1, 2]);
+			expect(await helpers.toArrayAsync(helpers.mapConcurrent([1, 2], slowFirst, { concurrency: 2 }))).toEqual([1, 2]);
+			expect(function () {
+				helpers.mapConcurrent([1], double, {} as any);
+			}).toThrow(new TypeError('mapConcurrent: `concurrency` must be an integer >= 1 or Infinity, got undefined'));
+		} finally {
+			delete proto.signal;
+			delete proto.ordered;
+			delete proto.concurrency;
+		}
 	});
 });
 
@@ -3963,6 +4035,19 @@ describe('interleave', function () {
 			iterator.throw!(error);
 		}).toThrow(error);
 		expect([b.stats.closed, c.stats.closed]).toEqual([1, 1]);
+	});
+
+	it('throws a TypeError for an iterator result that is not an object, like for...of, closing the other iterators', function () {
+		for (const result of [5, 'x', false, undefined, null]) {
+			const a = spy([1, 2, 3]);
+			expect(function () {
+				helpers.toArray(helpers.interleave(a.iterable, resultOf(result)));
+			}).toThrow(TypeError);
+			expect(a.stats.closed).toBe(1);
+		}
+		expect(function () {
+			helpers.toArray(helpers.interleave([1], resultOf('x')));
+		}).toThrow(new TypeError('interleave: iterator result string is not an object'));
 	});
 
 	it('rejects iterators that are not objects, and non-iterables', function () {

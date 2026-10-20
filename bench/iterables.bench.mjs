@@ -14,6 +14,7 @@ import {
 	flatMap,
 	interleave,
 	map,
+	mapAsync,
 	mapConcurrent,
 	mergeAsync,
 	pairwise,
@@ -27,6 +28,7 @@ import {
 	streamToText,
 	take,
 	toArray,
+	toArrayAsync,
 	unique,
 	windowed,
 	zip
@@ -698,6 +700,24 @@ export default [
 			for (const value of numbers) yield value;
 		}
 		/**
+		 * A sync source of promises over `numbers`, which the async helpers await one by one.
+		 * @yields {Promise<number>} The numbers, as promises
+		 * @returns {Generator<Promise<number>>} The source
+		 */
+		function* promises() {
+			for (const value of numbers) yield Promise.resolve(value);
+		}
+		/**
+		 * The hand-written async map over a sync source of promises.
+		 * @param {Iterable<Promise<number>>} iterable - The source
+		 * @param {(value: number) => number} fn - The mapping
+		 * @yields {number} The mapped values
+		 * @returns {AsyncGenerator<number>} The mapped values
+		 */
+		async function* mapAwaited(iterable, fn) {
+			for (const value of iterable) yield fn(await value);
+		}
+		/**
 		 * @param {number} value - A number
 		 * @returns {Promise<number>} Twice the number
 		 */
@@ -715,6 +735,28 @@ export default [
 			return sum;
 		}
 		return [
+			{
+				name: `toArrayAsync (sync generator of ${label(n)} promises)`,
+				fn: function () {
+					return toArrayAsync(promises());
+				},
+				competitors: {
+					'Array.fromAsync': function () {
+						return Array.fromAsync(promises());
+					}
+				}
+			},
+			{
+				name: `mapAsync (sync generator of ${label(n)} promises)`,
+				fn: function () {
+					return drain(mapAsync(promises(), double));
+				},
+				competitors: {
+					'async generator': function () {
+						return drain(mapAwaited(promises(), double));
+					}
+				}
+			},
 			{
 				name: `mapConcurrent (${label(n)}, concurrency 8)`,
 				fn: function () {

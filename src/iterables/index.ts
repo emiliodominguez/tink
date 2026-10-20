@@ -41,18 +41,15 @@ function assertAwaitableIterable(caller: string, value: unknown): void {
 }
 
 /**
- * The built-in iterator of arrays (`Array.prototype[Symbol.iterator]`).
- */
-const ARRAY_ITERATOR = Array.prototype[Symbol.iterator];
-
-/**
  * Awaits each item of a sync iterable inside a `for...of` loop (see {@link awaitItems}).
  * @template T
  * @param {Iterable<T | PromiseLike<T>>} iterable - A sync iterable of values and/or promises
  * @returns {AsyncGenerator<T, void, undefined>} An async generator of the awaited items
  */
 async function* awaitedItems<T>(iterable: Iterable<T | PromiseLike<T>>): AsyncGenerator<T, void, undefined> {
-	for (const value of iterable) yield await value;
+	// `yield` awaits the item in an async generator (an explicit `await` would cost a second tick): a rejection is thrown here, inside the
+	// loop, which closes the source.
+	for (const value of iterable) yield value;
 }
 
 /**
@@ -65,8 +62,8 @@ async function* awaitedItems<T>(iterable: Iterable<T | PromiseLike<T>>): AsyncGe
  */
 function awaitItems<T>(iterable: AwaitableIterable<T>): AwaitableIterable<T> {
 	// An array (or array-like) using the built-in array iterator needs no wrapper: that iterator has nothing to close, so the
-	// async-from-sync wrapper of `for await` is enough.
-	if (isAsyncIterable(iterable) || iterable[Symbol.iterator] === ARRAY_ITERATOR) return iterable;
+	// async-from-sync wrapper of `for await` is enough. (Read here rather than at the top level, which bundlers would keep in every helper.)
+	if (isAsyncIterable(iterable) || iterable[Symbol.iterator] === Array.prototype[Symbol.iterator]) return iterable;
 	return awaitedItems(iterable);
 }
 
@@ -556,6 +553,18 @@ function closeIterators(iterators: ReadonlyArray<Iterator<unknown>>, skip: numbe
 }
 
 /**
+ * Checks the result of an iterator's `next()` as `for...of` does: it must be an object (functions included).
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {unknown} result - The result
+ * @returns {IteratorResult<unknown>} The result
+ * @throws {TypeError} when the result is not an object
+ */
+function stepOf(caller: string, result: unknown): IteratorResult<unknown> {
+	if (typeof result !== 'object' ? typeof result !== 'function' : result === null) throw new TypeError(`${caller}: iterator result ${describe(result)} is not an object`);
+	return result as IteratorResult<unknown>;
+}
+
+/**
  * The generator behind {@link zip} (the arguments are already validated).
  * @template T
  * @param {T} iterables - The iterables to zip
@@ -577,7 +586,7 @@ function* zipped<T extends Array<Iterable<unknown>>>(iterables: T): Generator<Zi
 		for (;;) {
 			const tuple = new Array<unknown>(iterators.length);
 			for (current = 0; current < iterators.length; current++) {
-				const result = iterators[current].next();
+				const result = stepOf('zip', iterators[current].next());
 				if (result.done) return;
 				tuple[current] = result.value;
 			}
@@ -992,7 +1001,8 @@ export function countItems<T>(iterable: Iterable<T>, predicate?: (value: T, inde
  */
 async function* mappedAsync<T, U>(iterable: AwaitableIterable<T>, fn: (value: T, index: number) => U | PromiseLike<U>): AsyncGenerator<U, void, undefined> {
 	let index = 0;
-	for await (const value of awaitItems(iterable)) yield await fn(value, index++);
+	// `yield` awaits the mapped value (a rejection is thrown inside the loop, closing the source).
+	for await (const value of awaitItems(iterable)) yield fn(value, index++);
 }
 
 /**
@@ -1412,14 +1422,16 @@ export function mapConcurrent<T, U>(
 	fn: (value: T, index: number, signal: AbortSignalLike | undefined) => U | PromiseLike<U>,
 	options: number | MapConcurrentOptions
 ): AsyncIterableIterator<U> {
-	const { concurrency, ordered = true, signal } = typeof options === 'object' && options !== null ? options : { concurrency: options };
+	// Read as own properties: a polluted `Object.prototype` must not inject a signal, an order or a concurrency.
+	const settings = typeof options === 'object' && options !== null ? options : undefined;
+	const concurrency = (settings === undefined ? options : readOption(settings, 'concurrency')) as number;
+	const ordered = settings === undefined || readOption(settings, 'ordered', true);
+	const signal = settings === undefined ? undefined : readOption(settings, 'signal');
 
 	assertAwaitableIterable('mapConcurrent', iterable);
 	assertFunction('mapConcurrent', 'fn', fn);
 	assertInteger('mapConcurrent', 'concurrency', concurrency, 1, true);
-	if (signal != null && (typeof signal !== 'object' || typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function')) {
-		throw new TypeError(`mapConcurrent: \`signal\` must be an AbortSignal, null or undefined, got ${describe(signal)}`);
-	}
+	assertOptionalSignal('mapConcurrent', 'signal', signal);
 
 	return mappedConcurrently(
 		iterable,
@@ -1502,7 +1514,7 @@ function* interleaved<T extends Array<Iterable<unknown>>>(iterables: T): Generat
 		while (iterators.length > 0) {
 			if (index >= iterators.length) index = 0;
 			current = index;
-			const result = iterators[index].next();
+			const result = stepOf('interleave', iterators[index].next());
 			if (result.done) {
 				iterators.splice(index, 1);
 			} else {
