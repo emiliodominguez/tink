@@ -797,6 +797,21 @@ function assertType<T extends true>(_value: T): void {}
 
 describe('route patterns', function () {
 	describe('matchPath', function () {
+		it('does not read its memo from a polluted Object.prototype', function () {
+			const proto = Object.prototype as Record<string, unknown>;
+			for (const planted of [true, false]) {
+				for (let slot = 0; slot < 16; slot++) proto[slot] = planted;
+				try {
+					expect(helpers.matchPath('/admin', '/public')).toBeNull();
+					expect(helpers.matchPath('/users/:id', '/x/y')).toBeNull();
+					expect(helpers.matchPath('/a/:b?/c', '/a/c')).toEqual({});
+					expect(helpers.compilePath('/:a?/:b?')({ a: 'x', b: 'y' })).toBe('/x/y');
+				} finally {
+					for (let slot = 0; slot < 16; slot++) delete proto[slot];
+				}
+			}
+		});
+
 		it('captures named parameters in a null-prototype object', function () {
 			const params = helpers.matchPath('/users/:id/posts/:postId', '/users/42/posts/7');
 			expect(params).toEqual({ id: '42', postId: '7' });
@@ -1667,6 +1682,31 @@ describe('normalizeUrl', function () {
 			for (const opts of [{}, options]) {
 				const once = helpers.normalizeUrl(url, opts);
 				expect(helpers.normalizeUrl(once, opts)).toBe(once);
+			}
+		}
+	});
+
+	it('tryParseUrl returns undefined for a URL the runtime cannot parse back, and keeps every other punycode host', function () {
+		const url = helpers.tryParseUrl('http://éxn--a/');
+		// Runtimes that read the serialization back are not affected.
+		if (url !== undefined) expect(URL.canParse(url.href)).toBe(true);
+		expect(helpers.tryParseUrl('http://münchen.de/')?.hostname).toBe('xn--mnchen-3ya.de');
+		expect(helpers.tryParseUrl('http://xn--mnchen-3ya.de/')?.href).toBe('http://xn--mnchen-3ya.de/');
+	});
+
+	it('should not abort the process on a URL that the runtime cannot parse back', function () {
+		// Node 26 parses these to `http://xn--xn--a-9ra/`, which it then rejects, and aborts on the first setter called on them: they are
+		// rejected as invalid there. Runtimes that read the serialization back normalize it.
+		for (const url of ['http://éxn--a/', 'https://www.éxn--a.com/?b=1#h']) {
+			for (const options of [{}, { stripWww: true, forceHttps: true, sortQuery: true }]) {
+				const reparsed = helpers.tryParseUrl(helpers.tryParseUrl(url)?.href ?? '');
+				if (reparsed === undefined) {
+					expect(function () {
+						helpers.normalizeUrl(url, options);
+					}).toThrow(new TypeError(`normalizeUrl: \`url\` must be an absolute URL, got ${JSON.stringify(url)}`));
+				} else {
+					expect(helpers.normalizeUrl(url, options)).toMatch(/^https?:\/\/xn--xn--a-9ra(?:\.com)?\//);
+				}
 			}
 		}
 	});

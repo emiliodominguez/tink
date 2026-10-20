@@ -1374,8 +1374,9 @@ function matchSegments(parsed: RoutePattern, segments: ReadonlyArray<string>, ca
 	const { tokens, splat } = parsed;
 	const count = tokens.length;
 	const length = segments.length;
-	// `fits(index, position)`, for `position <= index` (each pattern segment consumes at most one pathname segment).
-	const memo: Array<boolean | undefined> = [];
+	// `fits(index, position)`, for `position <= index` (each pattern segment consumes at most one pathname segment): 0 when not known
+	// yet, 1 when false, 2 when true. A typed array: a missing slot of a plain one would be read from a polluted `Object.prototype[0]`.
+	const memo = new Uint8Array((count + 1) * (count + 1));
 
 	/**
 	 * Whether the pattern segments from `index` on match the pathname segments from `position` on.
@@ -1388,16 +1389,17 @@ function matchSegments(parsed: RoutePattern, segments: ReadonlyArray<string>, ca
 		if (index === count) return splat === undefined ? position === length : position === length ? splat.optional : startsSplat(segments[position]);
 
 		const slot = index * (count + 1) + position;
-		let result = memo[slot];
 
-		if (result === undefined) {
+		if (memo[slot] === 0) {
 			const token = tokens[index];
 
-			result = memo[slot] =
-				(position < length && fitsSegment(token, segments[position], caseSensitive) && fits(index + 1, position + 1)) || (token.optional && fits(index + 1, position));
+			memo[slot] =
+				(position < length && fitsSegment(token, segments[position], caseSensitive) && fits(index + 1, position + 1)) || (token.optional && fits(index + 1, position))
+					? 2
+					: 1;
 		}
 
-		return result;
+		return memo[slot] === 2;
 	}
 
 	if (!fits(0, 0)) return null;
@@ -2001,7 +2003,8 @@ function normalizeEscapes(text: string): string {
  * @param {NormalizeUrlOptions} [options={}] - `stripHash`, `stripWww`, `sortQuery`, `removeTrailingSlash`, `removeQueryParams` and
  * `forceHttps`, all off by default
  * @returns {string} The normalized URL
- * @throws {TypeError} when `url` is not an absolute URL (or a `URL`), `options` is not an object, or an option has the wrong type
+ * @throws {TypeError} when `url` is not an absolute URL (or a `URL`), or one whose serialization the runtime cannot parse back (some
+ *   internationalized hosts in Node 26), `options` is not an object, or an option has the wrong type
  * @example
  * normalizeUrl('HTTP://Example.COM:80/a/./b/../c?q=%7e%2f'); // => 'http://example.com/a/c?q=~%2F'
  * normalizeUrl('http://www.example.com/docs/?utm_source=x&b=2&a=1#top', {
@@ -2035,6 +2038,7 @@ export function normalizeUrl(url: string | UrlObject, options: NormalizeUrlOptio
 
 	if (typeof url !== 'string' && !(url instanceof URL)) throw new TypeError(`normalizeUrl: \`url\` must be a string or a URL, got ${describe(url)}`);
 
+	// A URL the runtime cannot read back (see `tryParseUrl`), on which a setter would abort the process, is rejected like an invalid one.
 	const parsed = tryParseUrl(url);
 
 	if (parsed === undefined) throw new TypeError(`normalizeUrl: \`url\` must be an absolute URL, got ${JSON.stringify(url)}`);
@@ -2089,6 +2093,8 @@ export function normalizeUrl(url: string | UrlObject, options: NormalizeUrlOptio
  * browsers), which it uses when available, for every runtime this library supports.
  * @param {string | UrlObject} input - The URL, absolute or relative to `base`
  * @param {string | UrlObject} [base] - The base URL for a relative `input`
+ * Also `undefined` for a URL whose serialization the runtime cannot parse back: Node 26 turns `http://éxn--a/` into
+ * `http://xn--xn--a-9ra/`, an invalid host, and aborts the whole process on the first setter called on it.
  * @returns {UrlObject | undefined} A new `URL`, or `undefined` when `input` (or `base`) is not a valid URL
  * @example
  * tryParseUrl('https://example.com/a?b=1')?.searchParams.get('b'); // => '1'
@@ -2097,6 +2103,19 @@ export function normalizeUrl(url: string | UrlObject, options: NormalizeUrlOptio
  * tryParseUrl('https://exa mple.com'); // => undefined
  */
 export function tryParseUrl(input: string | UrlObject, base?: string | UrlObject): UrlObject | undefined {
+	const url = parseUrl(input, base);
+
+	// Only a host the parser wrote in punycode can fail to read back: other URLs are not parsed twice.
+	return url === undefined || !url.hostname.includes('xn--') || parseUrl(url.href) !== undefined ? url : undefined;
+}
+
+/**
+ * Parses a URL with `URL.parse` when the runtime has it, else with the constructor.
+ * @param {string | UrlObject} input - The URL, absolute or relative to `base`
+ * @param {string | UrlObject} [base] - The base URL for a relative `input`
+ * @returns {UrlObject | undefined} A new `URL`, or `undefined` when `input` (or `base`) is not a valid URL
+ */
+function parseUrl(input: string | UrlObject, base?: string | UrlObject): UrlObject | undefined {
 	const Native = URL as { parse?: (input: string | URL, base?: string | URL) => URL | null };
 
 	if (typeof Native.parse === 'function') return Native.parse(input, base) ?? undefined;
