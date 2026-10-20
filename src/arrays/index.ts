@@ -1438,7 +1438,8 @@ function myersDiff<T>(caller: string, a: Iterable<T>, b: Iterable<T>, equals: (x
 	const left = toList(caller, 'a', a);
 	const right = toList(caller, 'b', b);
 	assertFunction(caller, 'equals', equals);
-	const { maxEdits = Infinity } = options;
+	// Not destructured: a polluted `Object.prototype.maxEdits` must not cap (or fail) every diff.
+	const maxEdits = readOption(options, 'maxEdits', Infinity);
 	assertInteger(caller, 'maxEdits', maxEdits, 0, true);
 	// The searches for the middle snake of a sub-problem with D edits stop after ceil(D / 2) rounds, and every sub-problem has at most
 	// as many edits as the whole problem: a search that needs more rounds proves that more than `maxEdits` edits are needed.
@@ -2392,10 +2393,21 @@ export function toArray<T>(value: T | ReadonlyArray<T> | null | undefined): T[] 
 export function zipObject<const K extends PropertyKey, V>(keys: ReadonlyArray<K>, values: ReadonlyArray<V>): Record<K, V> {
 	if (keys.length !== values.length) throw new RangeError(`zipObject: \`values\` must have as many items as \`keys\` (${keys.length}), got ${values.length}`);
 	// Assigning to a null-prototype object is defining (nothing is inherited, not even the `__proto__` accessor), and is several
-	// times faster than `Object.defineProperty`; the usual prototype is attached afterwards.
-	const result = nullObject() as Record<K, V>;
-	for (let i = 0; i < keys.length; i++) result[keys[i]] = values[i];
-	return Object.setPrototypeOf(result, Object.prototype) as Record<K, V>;
+	// times faster than `Object.defineProperty`; the usual prototype is attached afterwards. For few keys (the usual case, e.g. a CSV
+	// header), attaching it costs more than the keys themselves: they are assigned to a plain object as long as `Object.prototype`
+	// holds none of them (`__proto__`, `toString`, a polluted setter or read-only property) and none is an object (whose conversion to a
+	// property key could run code twice). The first such key moves the keys assigned so far to a null-prototype object.
+	let plain = keys.length <= 16;
+	let result = (plain ? {} : nullObject()) as Record<K, V>;
+	for (let i = 0; i < keys.length; i++) {
+		const key = keys[i];
+		if (plain && (typeof key === 'object' || typeof key === 'function' || key in Object.prototype)) {
+			plain = false;
+			result = Object.assign(nullObject(), result) as Record<K, V>;
+		}
+		result[key] = values[i];
+	}
+	return plain ? result : (Object.setPrototypeOf(result, Object.prototype) as Record<K, V>);
 }
 
 /**

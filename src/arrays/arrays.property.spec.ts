@@ -1015,7 +1015,10 @@ describe('Arrays properties (ordering, slicing, set algebra, combinatorics)', fu
 	});
 
 	it('zipObject should define every key, with the last value of a repeated key', function () {
-		const keys = fc.array(fc.constantFrom('a', 'b', '__proto__', 'constructor', 'toString', 'prototype', '0'), { maxLength: 10 });
+		// Up to 40 keys: both the short (assigned) and the long (null-prototype) constructions.
+		const keys = fc.array(fc.oneof(fc.constantFrom('a', 'b', '__proto__', 'constructor', 'toString', 'prototype', '0'), fc.string({ maxLength: 3 }), fc.nat(20)), {
+			maxLength: 40
+		});
 		fc.assert(
 			fc.property(keys, function (list) {
 				const values = list.map(function (_, index) {
@@ -1023,8 +1026,16 @@ describe('Arrays properties (ordering, slicing, set algebra, combinatorics)', fu
 				});
 				const result = helpers.zipObject(list, values) as Record<string, number>;
 				expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
-				expect(Object.keys(result).sort()).toStrictEqual([...new Set(list)].sort());
-				for (const key of new Set(list)) expect(Object.getOwnPropertyDescriptor(result, key)?.value).toBe(list.lastIndexOf(key));
+				// `Object.fromEntries` defines its keys (CreateDataProperty): the reference for the keys, their order and their values.
+				const reference = Object.fromEntries(
+					list.map(function (key, index) {
+						return [key, index];
+					})
+				);
+				expect(Reflect.ownKeys(result)).toStrictEqual(Reflect.ownKeys(reference));
+				for (const key of Reflect.ownKeys(reference)) {
+					expect(Object.getOwnPropertyDescriptor(result, key)).toStrictEqual(Object.getOwnPropertyDescriptor(reference, key));
+				}
 			})
 		);
 	});

@@ -1877,6 +1877,18 @@ describe('Arrays helpers', function () {
 			expect(helpers.diffSequences([1], [2], undefined, {})).toHaveLength(2);
 		});
 
+		it('ignores a `maxEdits` inherited from a polluted Object.prototype', function () {
+			const polluted = Object.prototype as Record<string, unknown>;
+			polluted.maxEdits = 0;
+			try {
+				expect(helpers.diffSequences([1, 2], [2, 3])).toHaveLength(3);
+				expect(helpers.longestCommonSubsequence([1, 2], [2, 3])).toStrictEqual([2]);
+				expect(helpers.diffSequences([1, 2], [2, 3], undefined, { maxEdits: 2 })).toHaveLength(3);
+			} finally {
+				delete polluted.maxEdits;
+			}
+		});
+
 		it('windowed rejects results with more than 2 ** 32 - 1 items in all before allocating them', function () {
 			const items = new Array(200_000).fill(0);
 			expect(function () {
@@ -2347,6 +2359,66 @@ describe('Arrays helpers (ordering, slicing, set algebra, combinatorics)', funct
 			expect((Object.prototype as any).x).toBeUndefined();
 			const named = helpers.zipObject(['toString', 'hasOwnProperty'], [1, 2]);
 			expect(Object.keys(named)).toStrictEqual(['toString', 'hasOwnProperty']);
+		});
+
+		it('neither runs a setter nor meets a read-only property planted on Object.prototype, for few or many keys', function () {
+			const set = jest.fn();
+			Object.defineProperty(Object.prototype, 'planted', { set, configurable: true });
+			Object.defineProperty(Object.prototype, 'frozen', { value: 0, writable: false, configurable: true });
+			try {
+				for (const count of [2, 40]) {
+					const keys = ['planted', 'frozen'].concat(
+						Array.from({ length: count - 2 }, function (_, index) {
+							return `k${index}`;
+						})
+					);
+					const result = helpers.zipObject(
+						keys,
+						keys.map(function (_, index) {
+							return index;
+						})
+					) as Record<string, number>;
+					expect(Object.getOwnPropertyDescriptor(result, 'planted')).toStrictEqual({ value: 0, writable: true, enumerable: true, configurable: true });
+					expect(Object.getOwnPropertyDescriptor(result, 'frozen')).toStrictEqual({ value: 1, writable: true, enumerable: true, configurable: true });
+					expect(Object.keys(result)).toStrictEqual(keys);
+				}
+				expect(set).not.toHaveBeenCalled();
+			} finally {
+				delete (Object.prototype as Record<string, unknown>).planted;
+				delete (Object.prototype as Record<string, unknown>).frozen;
+			}
+		});
+
+		it('converts an object key to a property key once', function () {
+			const toString = jest.fn(function () {
+				return 'k';
+			});
+			expect(helpers.zipObject([{ toString } as unknown as string], [1])).toStrictEqual({ k: 1 });
+			expect(toString).toHaveBeenCalledTimes(1);
+		});
+
+		it('reads every key and value once, also when a key moves the result to a null-prototype object', function () {
+			const keys = ['a', 'b', '__proto__', 'c'];
+			const values = [1, 2, 3, 4];
+			let reads = 0;
+			for (const list of [keys, values]) {
+				const value = list[1];
+				Object.defineProperty(list, 1, {
+					get: function () {
+						reads++;
+						return value;
+					}
+				});
+			}
+			const result = helpers.zipObject(keys, values);
+			expect(reads).toBe(2);
+			expect(Object.entries(result)).toStrictEqual([
+				['a', 1],
+				['b', 2],
+				['__proto__', 3],
+				['c', 4]
+			]);
+			expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
 		});
 
 		it('rejects arrays of different lengths instead of dropping keys or values', function () {

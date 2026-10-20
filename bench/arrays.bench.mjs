@@ -803,7 +803,8 @@ export default [
 			}
 		};
 	}),
-	...sized('zipObject', [10, 1_000], function (n) {
+	// 16 keys is the largest input of the short path (a plain object); 1k takes the null-prototype one.
+	...sized('zipObject', [10, 16, 1_000], function (n) {
 		const keys = people(n).map(byName);
 		const values = integers(n, n);
 		return {
