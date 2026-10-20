@@ -3133,8 +3133,9 @@ export function anySignal(signals: Iterable<AbortSignalLike | null | undefined>)
 
 		if (array) {
 			index = Number(item);
-			// The first key that is not an index (`'name'`, `'1.5'`, `'4294967295'`) ends them.
-			if (String(index >>> 0) !== item || index >= signals.length) break;
+			// A key that is not an index (`'name'`, `'1.5'`, `'4294967295'`) is skipped, not taken for the end of them: a Proxy may list
+			// it first.
+			if (String(index >>> 0) !== item || index >= signals.length) continue;
 			signal = signals[index];
 		}
 		assertOptionalSignal('anySignal', `signals[${index}]`, signal);

@@ -117,8 +117,15 @@ export function watchSignal(signal: AbortSignalLike | null | undefined, stop: (r
 	// Mapped once added: when adding it throws, the waiter is not registered, and when the signal calls it while it is being added, the
 	// waiter is stopped already. The options have no prototype: a `capture` inherited from a polluted `Object.prototype` would keep
 	// `removeEventListener` from finding the listener, and an inherited `signal` makes a platform signal throw.
-	signal.addEventListener('abort', group.listener, { __proto__: null, once: true } as { once: boolean });
-	if (stops.size > 0) signalGroups.set(signal, group);
+	try {
+		signal.addEventListener('abort', group.listener, { __proto__: null, once: true } as { once: boolean });
+		if (stops.size > 0) signalGroups.set(signal, group);
+	} catch (error) {
+		// The waiter is not registered: a listener the signal kept anyway (added, then a throw, or a stack overflow at the mapping) must
+		// stop nobody (a keyed mutex would forget a key held since, a queue miscount its cancelled tasks).
+		stops.clear();
+		throw error;
+	}
 }
 
 /**

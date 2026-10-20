@@ -1492,6 +1492,20 @@ describe('Async helpers (round 2)', function () {
 			}).toThrow(new TypeError('anySignal: `signals[2147483648]` must be an AbortSignal, null or undefined, got string'));
 		});
 
+		it('should take every index of a Proxy listing a key that is not an index first (regression: the signals after it were dropped)', function () {
+			const input = new CountingSignal();
+			const target = Object.assign([input], { name: 'signals' });
+			const listed = new Proxy(target, {
+				ownKeys() {
+					return ['name', '0', 'length'];
+				}
+			});
+			const signal = anySignal(listed);
+			expect(input.listenerCount).toBe(1);
+			input.abort('x');
+			expect(signal.reason).toBe('x');
+		});
+
 		it('should combine with timeoutSignal', function () {
 			jest.useFakeTimers();
 			const controller = new AbortController();
@@ -7776,5 +7790,64 @@ describe('Async helpers (one listener per shared signal, promises with their own
 		expect(planted.run).not.toHaveBeenCalled();
 		expect(planted.start).not.toHaveBeenCalled();
 		expect(planted.reject).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * A signal-like whose `addEventListener` keeps the listener, then throws.
+ * @returns {{ signal: { aborted: boolean; reason: unknown; addEventListener: (type: string, listener: () => void) => void; removeEventListener: (type: string, listener: () => void) => void }; abort: () => void }} The signal and its abort
+ */
+function keepingThenThrowing() {
+	const listeners = new Set<() => void>();
+	const signal = {
+		aborted: false,
+		reason: undefined as unknown,
+		addEventListener(_type: string, listener: () => void): void {
+			listeners.add(listener);
+			throw new Error('add failed');
+		},
+		removeEventListener(_type: string, listener: () => void): void {
+			listeners.delete(listener);
+		}
+	};
+	return {
+		signal,
+		abort(): void {
+			signal.aborted = true;
+			for (const listener of listeners) listener();
+		}
+	};
+}
+
+describe('abort listener kept by a signal whose addEventListener throws', function () {
+	it('does not stop the unregistered queue task later (regression: the queue counted it cancelled and left the next task waiting)', async function () {
+		const queue = createQueue({ concurrency: 1 });
+		const release: Array<() => void> = [];
+		void queue.add(function () {
+			return new Promise<void>(function (resolve) {
+				release.push(resolve);
+			});
+		});
+		const hostile = keepingThenThrowing();
+		await expect(queue.add(function () {}, { signal: hostile.signal })).rejects.toThrow('add failed');
+		const next = queue.add(function () {
+			return 'next';
+		});
+		hostile.abort();
+		expect(queue.size).toBe(1);
+		release[0]();
+		await expect(next).resolves.toBe('next');
+	});
+
+	it('does not let a late abort make a keyed mutex forget a held key (regression: two holders)', async function () {
+		const mutex = createKeyedMutex<string>();
+		const releaseA = await mutex.acquire('k');
+		const hostile = keepingThenThrowing();
+		await expect(mutex.acquire('k', { signal: hostile.signal })).rejects.toThrow('add failed');
+		releaseA();
+		const releaseC = await mutex.acquire('k');
+		hostile.abort();
+		expect(mutex.isLocked('k')).toBe(true);
+		releaseC();
 	});
 });
