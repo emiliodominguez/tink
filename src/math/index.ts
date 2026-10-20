@@ -105,11 +105,11 @@ export function sum(numbers: ReadonlyArray<number>): number {
 /**
  * The compensated (Neumaier) sum of `numbers` divided by `divisor`, the division being applied to the running total and to the
  * compensation separately: the sum itself for `divisor = 1`, and a mean as accurate as `averageBy`'s (from the arrays module) otherwise.
- * @param {ReadonlyArray<number>} numbers - The numbers to add up
+ * @param {ArrayLike<number>} numbers - The numbers to add up
  * @param {number} divisor - What the sum is divided by
  * @returns {number} The scaled sum (`total / divisor` alone when the total is not finite)
  */
-function scaledSum(numbers: ReadonlyArray<number>, divisor: number): number {
+function scaledSum(numbers: ArrayLike<number>, divisor: number): number {
 	let total = 0;
 	let compensation = 0;
 	// An index loop: several times faster than `for...of` here. There is deliberately no fast path for exact (e.g. integer) input:
@@ -808,9 +808,24 @@ export function variance(numbers: ReadonlyArray<number>, options: VarianceOption
  * @returns {[number, number]} The sum of squares of the scaled values (`NaN` if a value is not finite) and the scale
  */
 function centredSquares(numbers: ReadonlyArray<number>): [number, number] {
-	const [values, scale] = scaledSample(numbers);
-	const count = values.length;
-	const mean = average(values);
+	const count = numbers.length;
+	const values = new Float64Array(count);
+	let largest = 0;
+	for (let i = 0; i < count; i++) {
+		const value = +numbers[i];
+		values[i] = value;
+		// `NaN` once a value is `NaN`.
+		largest = Math.max(largest, Math.abs(value));
+	}
+	// Between `2 ** -200` and `2 ** 480`, the squares of the values and of their deviations (a deviation is at least an ulp of the values
+	// near the mean), and their sum for any realistic count, neither overflow nor underflow: the values are used as they are, which saves a
+	// pass. Beyond, they are scaled like `scaledSample` scales them.
+	let scale = 1;
+	if (largest > 0 && largest < Infinity && !(largest > 2 ** -200 && largest < 2 ** 480)) {
+		scale = 2 ** Math.min(1000, Math.max(-1000, -Math.floor(Math.log2(largest))));
+		for (let i = 0; i < count; i++) values[i] *= scale;
+	}
+	const mean = scaledSum(values, count);
 	let total = 0;
 	let squares = 0;
 	for (let i = 0; i < count; i++) {
