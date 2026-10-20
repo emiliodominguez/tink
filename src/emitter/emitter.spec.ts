@@ -1,3 +1,5 @@
+import { setFlagsFromString } from 'node:v8';
+import * as vm from 'vm';
 import { AbortError, TimeoutError } from '../async/index.js';
 import type { AbortSignalLike } from '../utils/index.js';
 import { createEmitter, type EmitArgs, type Emitter, type EventHandler, type Unsubscribe, type WildcardHandler } from '.';
@@ -662,6 +664,62 @@ describe('createEmitter', function () {
 			other();
 			expect(events.listenerCount('count')).toBe(0);
 		});
+
+		it('lets the removed handlers be collected while an old unsubscribe function is kept (previously kept them all alive)', async function () {
+			/**
+			 * Registers handlers reading new objects (in a scope of their own: closures of one scope share what they hold), removes
+			 * them, and keeps only the first unsubscribe function.
+			 * @param {(events: Emitter<TestEvents>, stops: Unsubscribe[]) => void} remove - Removes the registrations
+			 * @returns {{ refs: Array<WeakRef<{ id: number }>>; kept: Unsubscribe; events: Emitter<TestEvents> }} What survives
+			 */
+			function register(remove: (events: Emitter<TestEvents>, stops: Unsubscribe[]) => void): {
+				refs: Array<WeakRef<{ id: number }>>;
+				kept: Unsubscribe;
+				events: Emitter<TestEvents>;
+			} {
+				const events = createEmitter<TestEvents>();
+				const refs: Array<WeakRef<{ id: number }>> = [];
+				const stops = [1, 2, 3, 4].map(function (id) {
+					const value = { id };
+					refs.push(new WeakRef(value));
+					return events.on('count', function () {
+						expect(value.id).toBeGreaterThan(0);
+					});
+				});
+				remove(events, stops);
+				return { refs, kept: stops[0], events };
+			}
+
+			const scenarios = [
+				register(function (events) {
+					events.clear();
+				}),
+				register(function (events) {
+					events.clear('count');
+				}),
+				register(function (events) {
+					events.on('count', function () {
+						events.clear();
+					});
+					events.emit('count', 1);
+				}),
+				register(function (_events, stops) {
+					for (const stop of [...stops].reverse()) stop();
+				})
+			];
+
+			await collectGarbage();
+			for (const { refs, kept, events } of scenarios) {
+				// The first handler stays reachable through its own unsubscribe function, as in 1.5.
+				expect(
+					refs.map(function (ref) {
+						return ref.deref() === undefined;
+					})
+				).toEqual([false, true, true, true]);
+				kept();
+				expect(events.listenerCount()).toBe(0);
+			}
+		});
 	});
 
 	describe('waitFor', function () {
@@ -912,3 +970,17 @@ describe('createEmitter', function () {
 		});
 	});
 });
+
+/**
+ * Runs a full garbage collection once pending callbacks have run.
+ * @returns {Promise<void>} Resolves after the collection
+ */
+async function collectGarbage(): Promise<void> {
+	setFlagsFromString('--expose-gc');
+	const gc = vm.runInNewContext('gc') as () => void;
+	// `setImmediate`, not `setTimeout`: a spy restored after a test with fake timers can leave the fake `setTimeout` behind.
+	await new Promise(function (resolve) {
+		setImmediate(resolve);
+	});
+	gc();
+}

@@ -202,7 +202,7 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 
 	/**
 	 * Accounts for registrations of `event` just marked inactive: forgets the event once it has no active registration left, and
-	 * compacts its list otherwise.
+	 * compacts its list.
 	 * @param {PropertyKey} event - The event name
 	 * @param {Listeners} listeners - Its registrations (those of the registry: an inactive registration is never released again)
 	 * @param {number} count - Number of registrations just marked inactive
@@ -210,9 +210,10 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 	 */
 	function release(event: PropertyKey, listeners: Listeners, count: number): void {
 		listeners.removed += count;
-		// An emit iterating the list keeps it: only the registry forgets it.
+		// An emit iterating the list keeps it (and empties it when it ends): only the registry forgets it.
 		if (listeners.removed === listeners.list.length) registry.delete(event);
-		else compact(listeners);
+		// Also once forgotten: the unsubscribe functions still hold the list, which must not keep the removed handlers alive.
+		compact(listeners);
 	}
 
 	/**
@@ -343,8 +344,13 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 
 		clear(event?: PropertyKey): void {
 			for (const listeners of event === undefined ? registry.values() : [registry.get(event)]) {
+				if (listeners === undefined) continue;
 				// Inactive, they are skipped by an emit iterating the list, and their unsubscribe functions do nothing.
-				if (listeners !== undefined) for (const registration of listeners.list) registration.active = false;
+				for (const registration of listeners.list) registration.active = false;
+				// Emptied (now, or when the emits iterating it end): the unsubscribe functions still hold the list, which must not keep the
+				// removed handlers alive.
+				listeners.removed = listeners.list.length;
+				compact(listeners);
 			}
 			if (event === undefined) registry.clear();
 			else registry.delete(event);
