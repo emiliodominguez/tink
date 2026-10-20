@@ -11,7 +11,7 @@ Each helper with an equivalent in a popular library is benchmarked against it at
 | mitt          |     7 |              1.65× |              71% |
 | nanoid        |     3 |              0.84× |               0% |
 
-Newer helpers were measured per module: `createQueue` runs 4–9× faster than p-queue, `takeFirstBy` 6–13× faster than remeda, `parseDate` about 9× faster than date-fns' `parse`.
+Newer helpers were measured per module: `createQueue` runs 4–9× faster than p-queue, `takeFirstBy` 6–13× faster than remeda, `parseDate` about 9× faster than date-fns' `parse`. In 1.4.0: `satisfiesSemver` is about 2× faster than node-semver (20× on ranges its cache hasn't seen) and `maxSatisfyingSemver` 7×; `normalizePath` and `relativePath` are 2–3× faster than `node:path` (and linear where it is quadratic); `readLines` is 1.3× faster than `node:readline`; `hmacSha256` is 5× faster than `node:crypto`'s `createHmac` on short messages.
 
 ## Where tink is slower, and why
 

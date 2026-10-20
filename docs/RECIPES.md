@@ -352,6 +352,53 @@ serializeError(new Error('failed', { cause: new TypeError('bad input') }), { sta
 // { name: 'Error', message: 'failed', cause: { name: 'TypeError', message: 'bad input' } }
 ```
 
+## Streams, cron, versions and resilience
+
+```ts
+import { parseSSE, readLines } from 'tinkit/iterables';
+
+const response = await fetch('/v1/chat', { method: 'POST', body, signal });
+for await (const { data } of parseSSE(response.body, { signal })) {
+	if (data === '[DONE]') break; // leaving the loop cancels the stream and releases its lock
+	render(JSON.parse(data).delta); // 'Hel', then 'lo': events split across chunks arrive whole
+}
+for await (const line of readLines(createReadStream('app.log'))) {
+} // Node streams too; LF, CRLF or CR, in linear time
+```
+
+```ts
+import { eachCronDate, nextCronDate } from 'tinkit/date';
+
+// 02:30 never happens on March 10th in New York: like cronie, the job runs once, when the clock jumps to 03:00 EDT.
+nextCronDate('30 2 * * *', { from: new Date('2024-03-10T05:00:00Z'), timeZone: 'America/New_York' }); // 2024-03-10T07:00:00.000Z
+[...eachCronDate('0 9 * * 1-5', { from: new Date('2024-03-08T15:00:00Z'), timeZone: 'Europe/London', limit: 2 })]; // Mon 11th and Tue 12th, 09:00
+```
+
+```ts
+import { incrementSemver, maxSatisfyingSemver, satisfiesSemver } from 'tinkit/validate';
+
+satisfiesSemver('1.4.0-beta.2', '^1.3.0'); // false: like node-semver, pre-releases only match ranges that mention one of the same version
+maxSatisfyingSemver(['1.2.0', '1.9.3', '2.0.0'], '~1.9 || <1.3'); // '1.9.3'
+incrementSemver('1.4.0-beta.2', 'prerelease'); // '1.4.0-beta.3'
+```
+
+```ts
+import { backoff, createCircuitBreaker, sleep } from 'tinkit/async';
+import { relativePath } from 'tinkit/path';
+import { createSearchIndex } from 'tinkit/search';
+
+const charge = createCircuitBreaker(callPaymentApi, { failureThreshold: 5, resetTimeout: 30_000 }); // fails fast with CircuitOpenError while open
+[...backoff({ retries: 4 })]; // [100, 200, 400, 800]; jitter: 'full' | 'equal' | 'decorrelated' (AWS)
+relativePath('/srv/app/src', '/srv/app/dist/index.js'); // '../dist/index.js', as node:path computes it, in any runtime
+
+const index = createSearchIndex({ fields: { title: 2, body: 1 } }); // BM25, title matches count twice
+index.addAll([
+	{ id: 1, title: 'Dark mode', body: 'Switch themes' },
+	{ id: 2, title: 'Settings', body: 'Enable dark mode in settings' }
+]);
+index.search('dark mo', { prefix: 'last' }); // ids 1, then 2: 'mo' completes to 'mode' as the user types
+```
+
 ## Decorators: memoize, debounce and bind class methods
 
 The decorators detect at runtime which decorator style they were applied with. They work with all three:

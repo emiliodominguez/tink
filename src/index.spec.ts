@@ -38,6 +38,7 @@ describe('root entry', function () {
 			'iterables',
 			'math',
 			'objects',
+			'path',
 			'random',
 			'search',
 			'store',
@@ -454,5 +455,50 @@ describe('README examples', function () {
 			message: 'failed',
 			cause: { name: 'TypeError', message: 'bad input' }
 		});
+	});
+
+	it('should match the "Streams, cron, versions and resilience" recipe', async function () {
+		const { async, date, iterables, path, search, validate } = root;
+		const deltas: string[] = [];
+		for await (const { data } of iterables.parseSSE(['data: {"delta":"Hel"}\n\ndata: {"del', 'ta":"lo"}\n\n', 'data: [DONE]\n\n'])) {
+			if (data === '[DONE]') break;
+			deltas.push((JSON.parse(data) as { delta: string }).delta);
+		}
+		expect(deltas).toEqual(['Hel', 'lo']);
+		const lines: string[] = [];
+		for await (const line of iterables.readLines(['a\r', '\nb\rc\n'])) lines.push(line);
+		expect(lines).toEqual(['a', 'b', 'c']);
+
+		expect(date.nextCronDate('30 2 * * *', { from: new Date('2024-03-10T05:00:00Z'), timeZone: 'America/New_York' })).toEqual(new Date('2024-03-10T07:00:00.000Z'));
+		expect([...date.eachCronDate('0 9 * * 1-5', { from: new Date('2024-03-08T15:00:00Z'), timeZone: 'Europe/London', limit: 2 })]).toEqual([
+			new Date('2024-03-11T09:00:00.000Z'),
+			new Date('2024-03-12T09:00:00.000Z')
+		]);
+
+		expect(validate.satisfiesSemver('1.4.0-beta.2', '^1.3.0')).toBe(false);
+		expect(validate.maxSatisfyingSemver(['1.2.0', '1.9.3', '2.0.0'], '~1.9 || <1.3')).toBe('1.9.3');
+		expect(validate.incrementSemver('1.4.0-beta.2', 'prerelease')).toBe('1.4.0-beta.3');
+
+		const charge = async.createCircuitBreaker(
+			async function (): Promise<never> {
+				throw new Error('declined');
+			},
+			{ failureThreshold: 1, resetTimeout: 30_000 }
+		);
+		await expect(charge()).rejects.toThrow('declined');
+		await expect(charge()).rejects.toBeInstanceOf(async.CircuitOpenError);
+		expect([...async.backoff({ retries: 4 })]).toEqual([100, 200, 400, 800]);
+		expect(path.relativePath('/srv/app/src', '/srv/app/dist/index.js')).toBe('../dist/index.js');
+
+		const index = search.createSearchIndex({ fields: { title: 2, body: 1 } });
+		index.addAll([
+			{ id: 1, title: 'Dark mode', body: 'Switch themes' },
+			{ id: 2, title: 'Settings', body: 'Enable dark mode in settings' }
+		]);
+		expect(
+			index.search('dark mo', { prefix: 'last' }).map(function (result) {
+				return result.id;
+			})
+		).toEqual([1, 2]);
 	});
 });

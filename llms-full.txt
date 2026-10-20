@@ -350,6 +350,23 @@ Import: `import { … } from 'tinkit/url';`
 - `normalizeUrl(url: string | UrlObject, options: NormalizeUrlOptions = {}): string` — Normalizes an absolute URL so that equivalent spellings compare equal (for cache keys, deduplication or canonical links), like `normalize-url` and ufo's `normalizeURL`.
 - `tryParseUrl(input: string | UrlObject, base?: string | UrlObject): UrlObject | undefined` — Parses a URL, returning `undefined` instead of throwing when it is invalid: the `URL.parse` of newer runtimes (Node 22, 2024 browsers), which it uses when available, for every runtime this library supports.
 
+## path
+
+POSIX path helpers (normalize, join, resolve, relative, parse/format, basename/dirname/extname) for every runtime, byte for byte like node:path, in linear time.
+Import: `import { … } from 'tinkit/path';`
+
+- `basename(path: string, suffix?: string): string` — Returns the last segment of a path, ignoring trailing slashes, like `path.posix.basename`.
+- `dirname(path: string): string` — Returns the directory part of a path, like `path.posix.dirname`: everything before the last segment, trailing slashes ignored.
+- `extname(path: string): string` — Returns the extension of the last segment of a path, from its last `.`, like `path.posix.extname`.
+- `isAbsolutePath(path: string): boolean` — Tells whether a path is absolute, i.e. starts with `/`, like `path.posix.isAbsolute`.
+- `normalizePath(path: string): string` — Normalizes a path like `path.posix.normalize`: runs of slashes become one, `.` segments are removed and `..` segments remove the segment before them.
+- `joinPath(...segments: string[]): string` — Joins path segments with `/` and normalizes the result, like `path.posix.join`.
+- `resolvePath(...segments: string[]): string` — Resolves a sequence of paths into an absolute path, like `path.posix.resolve`: segments are applied from right to left until an absolute one is found, and the result is normalized, without a trailing slash.
+- `relativePath(from: string, to: string): string` — Returns the relative path from `from` to `to`, like `path.posix.relative`: both are resolved with `resolvePath` (relative paths against the virtual root `/`, where Node uses `process.cwd()`), then the path climbs out of `from` with `..` and descends into `to`.
+- `parsePath(path: string): ParsedPath` — Splits a path into its root, directory, base name, extension and name, like `path.posix.parse` (quirks included: Node reads the extension of `'/..'` as `'.'`, unlike `extname`).
+- `formatPath(pathObject: PathObject): string` — Builds a path from its parts, like `path.posix.format`: the inverse of `parsePath`.
+- `toPosixPath(path: string): string` — Converts Windows separators to POSIX ones: every `\` becomes `/`.
+
 ## math
 
 Precise arithmetic and rounding (exact sums, half-even rounding, lossless allocation, fractions), statistics, regression, histograms, number theory (factorization, modular arithmetic), interpolation, axis ticks, vectors, root finding and random numbers.
@@ -462,7 +479,7 @@ Import: `import { … } from 'tinkit/math';`
 
 ## functions
 
-Function composition, currying, memoization and rate limiting.
+Function composition, currying, memoization, rate limiting, pattern matching, Result tuples (ok/err/unwrap) and when/unless/cond.
 Import: `import { … } from 'tinkit/functions';`
 
 - `bind<T, A extends unknown[], R>(fn: (this: T, ...args: A) => R, thisArg: T): (...args: A) => R` — Creates a function that always invokes `fn` with `thisArg` as `this`, regardless of how it is called.
@@ -484,6 +501,15 @@ Import: `import { … } from 'tinkit/functions';`
 - `identity<T>(value: T): T` — Returns its argument unchanged.
 - `noop(..._args: unknown[]): void` — Does nothing and returns `undefined`, whatever the arguments.
 - `attempt<A extends unknown[], R>(fn: (...args: A) => R, ...args: A): Result<R>` — Calls `fn(...args)` and captures its outcome as a `Result` tuple instead of throwing.
+- `ok<T>(value: T): [error: undefined, result: T]` — Creates a successful `Result`: `[undefined, value]`, the tuple `attempt` returns when the call returned `value`.
+- `err<E>(error: E): [error: E, result: undefined]` — Creates a failed `Result`: `[error, undefined]`, the tuple `attempt` returns when the call threw `error`.
+- `isOk<T>(result: Result<T>): result is [error: undefined, result: T]` — Checks whether a `Result` is a success, narrowing it to `[undefined, T]`.
+- `isErr<T>(result: Result<T>): result is [error: unknown, result: undefined]` — Checks whether a `Result` is a failure, narrowing it to `[error, undefined]`: the negation of `isOk` (its error is not `undefined`).
+- `mapResult<T, U>(result: Result<T>, fn: (value: T) => U): Result<U>` — Transforms the value of a successful `Result` with `fn`; a failed result is returned as it is (the same tuple), without calling `fn`.
+- `unwrap<T>(result: Result<T>): T` — Returns the value of a successful `Result`, or throws its error, as it is (the very value the function given to `attempt` threw, not wrapped), so `unwrap(attempt(fn, ...args))` behaves like `fn(...args)`.
+- `when<T, S extends T, R>(predicate: (value: T) => value is S, fn: (value: S) => R): <V extends T>(value: V) => R | Exclude<V, S>` — Creates a function that applies `fn` to its argument when `predicate` returns a truthy value for it, and returns the argument unchanged otherwise: `value => predicate(value) ? fn(value) : value` (Ramda's `when`).
+- `unless<T, S extends T, R>(predicate: (value: T) => value is S, fn: (value: Exclude<T, S>) => R): <V extends T>(value: V) => (V & S) | R` — Creates a function that applies `fn` to its argument when `predicate` returns a falsy value for it, and returns the argument unchanged otherwise: `value => predicate(value) ? value : fn(value)` (Ramda's `unless`).
+- `cond<A extends unknown[], R1>(pairs: readonly [CondPair<A, R1>]): (...args: A) => R1 | undefined` — Creates a function that tries each `[predicate, transform]` pair in order and returns `transform(...args)` for the first predicate that returns a truthy value for the same arguments, or `undefined` when none does (Ramda's `cond`, lodash's `cond`).
 - `times<R>(n: number, fn: (index: number) => R): R[]` — Calls `fn` `n` times with the indexes `0` to `n - 1` and collects the results in a new array.
 - `flip<A extends unknown[], R>(fn: (...args: A) => R): (...args: Reverse<A>) => R` — Creates a function that invokes `fn` with the arguments it receives in reverse order.
 - `unary<T, R>(fn: (arg: T) => R): (arg: T) => R` — Creates a function that invokes `fn` with only its first argument, ignoring the others.
@@ -504,7 +530,7 @@ Import: `import { … } from 'tinkit/functions';`
 
 ## async
 
-Promise utilities: retries, timeouts, polling, limiters, semaphores and mutexes, request batching, event waiting, keyed Promise.all and async debounce.
+Promise utilities: retries and backoff, timeouts, polling, limiters, semaphores and mutexes, circuit breakers, request batching, event waiting and async event iteration, drift-free intervals, stopwatches, keyed Promise.all and async debounce.
 Import: `import { … } from 'tinkit/async';`
 
 - `AbortErrornew (message = 'The operation was aborted.')` — Error used to reject operations cancelled through an abort signal that carries no `reason`.
@@ -537,10 +563,18 @@ Import: `import { … } from 'tinkit/async';`
 - `waitForEvent<E = PlatformEvent>(target: EventTargetLike, type: string, options?: WaitForEventOptions<E>): Promise<E>` — Waits for the next `type` event of a DOM `EventTarget` (resolving with the `Event`) or of a Node-style emitter (resolving with the first argument the listeners receive), like `events.once` or `p-event`, with the cleanup done right.
 - `reduceAsync<T, A>(items: Iterable<T> | AsyncIterable<T>, reducer: (accumulator: A, item: Awaited<T>, index: number) => PromiseLike<A> | A, initial: PromiseLike<A> | A, options: ReduceAsyncOptions = {}): Promise<A>` — Reduces a sync or async iterable with an async `reducer`, one item at a time, in order: each item is read only after the previous step has settled, so lazy and infinite sources (async generators, paginated APIs, streams) are consumed on demand.
 - `minDelay<T>(promise: PromiseLike<T> | T, ms: number, options: MinDelayOptions = {}): Promise<T>` — Settles like `promise`, but no earlier than `ms` milliseconds after the call (like `p-min-delay`): a loading indicator shown while waiting then stays up long enough to be read, instead of flickering when the response is fast.
+- `isAbortError(value: unknown): value is Error & { readonly name: 'AbortError' }` — Checks whether a value is an abort error: an error-like object (with a string `message`) whose `name` is `'AbortError'`.
+- `isTimeoutError(value: unknown): value is Error & { readonly name: 'TimeoutError' }` — Checks whether a value is a timeout error: an error-like object (with a string `message`) whose `name` is `'TimeoutError'`.
+- `CircuitOpenErrornew (message = 'The circuit is open.', retryAfter = 0)` — Error with which a `createCircuitBreaker` breaker rejects the calls it does not let through.
+- `createCircuitBreaker<F extends AnyFunction>(fn: F, options: CircuitBreakerOptions = {}): CircuitBreaker<F>` — Wraps an async (or sync) operation in a circuit breaker, which stops calling a dependency that keeps failing, so that callers fail fast instead of piling up on timeouts, and the dependency gets time to recover.
+- `backoff(options: BackoffOptions = {}): Iterable<number>` — Creates the sequence of delays (in ms) of an exponential backoff, for retry loops written by hand (or for a `retry` policy of your own): `delay`, `delay × factor`, `delay × factor²`… capped at `maxDelay`, optionally randomized (see `BackoffJitter`), and `retries` long (endless by default).
+- `fromEvent<E = PlatformEvent>(target: EventTargetLike, type: string, options?: FromEventOptions<E>): AsyncIterableIterator<E>` — Turns the `type` events of a DOM `EventTarget` (yielding the `Event`s) or of a Node-style emitter (yielding the first argument the listeners receive) into an async iterator, for `for await` loops, like Node's `events.on` but for any target, with.
+- `interval(callback: (tick: number) => unknown, ms: number, options: IntervalOptions = {}): () => void` — Calls `callback` every `ms` milliseconds, without drift: tick `n` is scheduled at `start + n × ms` (on a monotonic clock), not `ms` after the previous one, so late timers do not add up as they do with `setInterval` or a chain of `setTimeout`s.
+- `createStopwatch(options: StopwatchOptions = {}): Stopwatch` — Creates a stopwatch measuring elapsed time in milliseconds on a monotonic clock (`performance.now()` by default, so changes of the system time do not affect it), with pause and resume (`stop()` / `start()`), laps and an injectable clock for tests.
 
 ## color
 
-Hex/RGB/HSL/HSV and OKLab/OKLCH conversion with CSS gamut mapping, perceptual mixing and scales, opt-in named colours and WCAG contrast checks.
+Hex/RGB/HSL/HSV, OKLab/OKLCH and CIELAB conversion with CSS gamut mapping, perceptual mixing and scales, colour difference (deltaE, CIEDE2000), stable colours from strings, colour-blindness simulation, opt-in named colours and WCAG contrast checks.
 Import: `import { … } from 'tinkit/color';`
 
 - `parseHex(hex: string): Rgba` — Parses a CSS hex colour.
@@ -577,15 +611,22 @@ Import: `import { … } from 'tinkit/color';`
 - `contrastRatio(a: ColorInput, b: ColorInput): number` — Computes the WCAG 2.x contrast ratio `(L1 + 0.05) / (L2 + 0.05)` between two colours, where `L1` is the larger relative luminance.
 - `getReadableTextColor<L extends ColorInput, D extends ColorInput>(background: ColorInput, options: Required<ReadableTextColorOptions<L, D>>): L | D` — Picks whichever of two text colours has the higher WCAG contrast against a background (the dark one on ties).
 - `meetsContrast(foreground: ColorInput, background: ColorInput, options: MeetsContrastOptions = {}): boolean` — Checks whether a foreground/background pair meets a WCAG 2.x contrast requirement: AA needs `4.5:1` (`3:1` for large text), AAA needs `7:1` (`4.5:1` for large text).
+- `toLab(color: ColorInput): Required<Lab>` — Converts a colour to CIELAB relative to D50 (see `Lab`), as CSS Color 4 `lab()` and colorjs.io do: sRGB is linearized, converted to XYZ D65, adapted to D50 with the Bradford transform, then to L\*a\*b\*.
+- `ciede2000(first: Lab, second: Lab): number` — Computes the CIEDE2000 colour difference ΔE00 (CIE 142-2001) between two CIELAB colours, following Sharma, Wu & Dalal, "The CIEDE2000 color-difference formula: implementation notes, supplementary test data, and mathematical observations" (2005): it matches all 34 of their test pairs to 4 decimals, including the hue-angle discontinuities.
+- `deltaE(a: ColorInput, b: ColorInput, options: DeltaEOptions = {}): number` — Measures how different two colours look (ΔE), with the conventions of CSS Color 4 and colorjs.io.
+- `colorFromString(text: string, options?: ColorFromStringOptions & { format?: 'hex' }): string` — Derives a stable colour from a string, for avatars, tags, labels or chart series: the same text always gives the same colour, in every runtime, and different texts are spread evenly over the hues (similar strings such as `'user1'` and `'user2'` land far apart).
+- `simulateColorVisionDeficiency(color: ColorInput, type: ColorVisionDeficiency, severity = 1): Rgba` — Simulates how a colour looks to someone with a colour vision deficiency, to check that a palette, chart or UI state stays distinguishable.
 
 ## search
 
-Fuzzy matching and ranking with highlight ranges and optional accent folding, for command palettes and filter-as-you-type UIs.
+Fuzzy matching and ranking with highlight ranges and optional accent folding, for command palettes and filter-as-you-type UIs, plus a BM25 full-text index and a Unicode tokenizer.
 Import: `import { … } from 'tinkit/search';`
 
 - `fuzzyMatch(query: string, target: string, options: FuzzyMatchOptions = {}): FuzzyMatch | undefined` — Fuzzy-matches `query` against `target` (as in command palettes and filter-as-you-type lists): the query matches when all of its characters appear in the target in order, not necessarily contiguously.
 - `fuzzySearch<T extends string>(items: Iterable<T>, query: string, options?: FuzzySearchOptions<T>): Array<FuzzySearchResult<T>>` — Fuzzy-filters and ranks `items` by how well they match `query` (see `fuzzyMatch` for the matching and scoring rules).
 - `highlight(text: string, ranges: Iterable<readonly [number, number]>): HighlightSegment[]` — Splits `text` into alternating matched / unmatched segments, e.g. to render the `ranges` of `fuzzyMatch` with `<mark>` elements in React (no `dangerouslySetInnerHTML` needed).
+- `tokenize(text: string, options: TokenizeOptions = {}): string[]` — Splits `text` into lower-cased words, for indexing and full-text search (see `createSearchIndex`).
+- `createSearchIndex<T extends object>(options: SearchIndexOptions<T>): SearchIndex<T>` — Creates an in-memory full-text index whose results are ranked with Okapi BM25, over one or more fields of the documents with per-field boosts.
 
 ## easing
 
@@ -636,7 +677,7 @@ Import: `import { … } from 'tinkit/easing';`
 
 ## encoding
 
-Buffer-free base64/base64url, base32, hex and UTF-8 conversions with strict decoding, RFC 4180 CSV, JWT decoding, constant-time comparison and a synchronous SHA-256.
+Buffer-free base64/base64url, base32, hex and UTF-8 conversions with strict decoding, RFC 4180 CSV, JWT decoding and HS256 signing/verification, constant-time comparison, a synchronous SHA-256 and HMAC-SHA256, and CRC-32.
 Import: `import { … } from 'tinkit/encoding';`
 
 - `toBase64(data: string | BytesInput, options?: ToBase64Options): string` — Encodes binary data (or the UTF-8 encoding of a string) as base64 (RFC 4648 §4) or base64url (§5).
@@ -647,18 +688,24 @@ Import: `import { … } from 'tinkit/encoding';`
 - `decodeUtf8(bytes: BytesInput, options?: DecodeUtf8Options): string` — Decodes UTF-8 bytes into a string, following the WHATWG Encoding Standard exactly (the behaviour of `TextDecoder`): each maximal invalid subsequence (a stray continuation byte, a truncated sequence, an overlong form, a surrogate code point, a value above U+10FFFF) becomes one U+FFFD, or throws with `fatal`.
 - `sha256(data: string | BytesInput): Uint8Array<ArrayBuffer>` — Computes the SHA-256 digest (FIPS 180-4) of binary data or of the UTF-8 encoding of a string, synchronously and in plain JavaScript.
 - `sha256Hex(data: string | BytesInput): string` — Computes the SHA-256 digest of binary data or of the UTF-8 encoding of a string, as 64 lowercase hex digits (see `sha256`).
+- `hmacSha256(key: string | BytesInput, message: string | BytesInput): Uint8Array<ArrayBuffer>` — Computes the HMAC-SHA256 (RFC 2104, FIPS 198-1) of a message under a key, synchronously and in plain JavaScript: the keyed digest behind HS256 JWTs, webhook signatures (Stripe, GitHub, Slack…), signed cookies and AWS Signature V4.
+- `hmacSha256Hex(key: string | BytesInput, message: string | BytesInput): string` — Computes the HMAC-SHA256 of a message under a key as 64 lowercase hex digits (see `hmacSha256`).
 - `timingSafeEqual(a: string | BytesInput, b: string | BytesInput): boolean` — Compares two byte sequences (or the UTF-8 encodings of two strings) in a time that depends only on their length, not on where they first differ: use it to check a secret (an HMAC, an API key, a CSRF or reset token) against the expected value, where an early-exit `===` lets an attacker recover it byte by byte by timing the responses.
+- `crc32(data: string | BytesInput, initial = 0): number` — Computes the CRC-32 checksum of binary data or of the UTF-8 encoding of a string: the IEEE 802.3 polynomial with the usual reflection and final inversion (often called "CRC-32" or "CRC-32/ISO-HDLC"), as in zlib, gzip, ZIP, PNG and Ethernet, and as Node's `zlib.crc32` computes it.
 - `toBase32(data: string | BytesInput, options?: ToBase32Options): string` — Encodes binary data (or the UTF-8 encoding of a string) as base32: RFC 4648 §6 (the default), base32hex (§7) or Crockford's base32, with uppercase letters.
 - `fromBase32(text: string, options?: FromBase32Options): Uint8Array<ArrayBuffer>` — Decodes base32 text (see `toBase32`) strictly, like `fromBase64`: it rejects characters outside the alphabet (white space and Crockford's optional `-` separators included), misplaced or incomplete padding, a final group of 1, 3 or 6 characters (which no bytes encode to), and non-canonical text whose last character has non-zero unused bits.
 - `decodeJwt<P extends object = JwtPayload, H extends object = JwtHeader>(token: string): DecodedJwt<P, H>` — Decodes a JSON Web Token in compact serialization (`header.payload.signature`, each part base64url-encoded) WITHOUT VERIFYING IT.
 - `getJwtExpiration(token: string): Date | undefined` — Returns the expiration time of a JWT (its `exp` claim), WITHOUT VERIFYING the token (see `decodeJwt`): use it to schedule a token refresh on the client, never to decide whether a token is valid.
 - `isJwtExpired(token: string, options?: IsJwtExpiredOptions): boolean` — Tells whether a JWT has expired, WITHOUT VERIFYING it (see `decodeJwt`): use it to refresh a token before sending it, never to decide whether a token is valid.
+- `signJwt(payload: object, secret: string | BytesInput, options?: SignJwtOptions): string` — Signs a JWT with HMAC-SHA256 (`alg: 'HS256'`, RFC 7519 and RFC 7515), synchronously: the JSON header (`{"alg":"HS256","typ":"JWT"}` plus `options.header`), the JSON claims, each base64url-encoded without padding, then the HMAC of both under `secret`.
+- `JwtVerificationErrornew (message: string, code: JwtVerificationErrorCode)` — Error thrown by `verifyJwt` when a token is malformed, forged, or not acceptable; `code` tells why.
+- `verifyJwt<P extends object = JwtPayload, H extends object = JwtHeader>(token: string, secret: string | BytesInput, options?: VerifyJwtOptions): VerifiedJwt<P, H>` — Verifies a JWT signed with HMAC-SHA256 (`alg: 'HS256'`), synchronously, and returns its header and claims; anything else throws a `JwtVerificationError` whose `code` tells why.
 - `parseCsv(text: string, options?: ParseCsvOptions & { readonly header?: false }): string[][]` — Parses CSV text (RFC 4180) into rows of fields, or with `header`, into records keyed by the first row.
 - `toCsv(rows: ReadonlyArray<ReadonlyArray<CsvValue>>, options?: ToCsvOptions): string` — Writes rows as CSV text (RFC 4180) that `parseCsv` reads back exactly: rows of cells, or records (objects) whose keys become the columns.
 
 ## errors
 
-Never-throwing error normalization (toError, getErrorMessage) and cycle-safe error serialization that round-trips through JSON.
+Never-throwing error normalization (toError, getErrorMessage), cycle-safe error serialization that round-trips through JSON, typed error classes (defineError), cause chains and readable reports.
 Import: `import { … } from 'tinkit/errors';`
 
 - `isErrorLike(value: unknown): value is ErrorLike` — Checks whether a value is error-like: a non-null object with a string `name` and a string `message`, own or inherited (values inherited from `Object.prototype` do not count, so a polluted prototype cannot make every object error-like).
@@ -666,6 +713,9 @@ Import: `import { … } from 'tinkit/errors';`
 - `toError(value: unknown): Error` — Normalizes anything caught into an `Error`: an error (of any realm, including subclasses and `DOMException`s) is returned as it is; anything else becomes a new `Error` whose message is `getErrorMessage`'s, whose `name` is the value's own when it is an error-like object (`{ name: 'AbortError', message }`), and whose `cause` is the original value.
 - `serializeError(value: unknown, options: SerializeErrorOptions = {}): SerializedError` — Converts an error into a plain, JSON-safe object (`JSON.stringify` never throws on it, and `JSON.parse` gives back an equal object).
 - `deserializeError(data: unknown, options: DeserializeErrorOptions = {}): Error` — Rebuilds an `Error` from the output of `serializeError` (after any number of `JSON.stringify`/`JSON.parse` round trips).
+- `defineError<const N extends string, const M extends DefineErrorOptions = Record<never, never>>(name: N, options?: M): DefinedErrorClass<N, M>` — Creates a typed error class: `const NotFound = defineError('NotFoundError', { code: 'E_NOT_FOUND', status: 404 })`, then `throw new NotFound('No user 42', { cause, status: 410 })`.
+- `getErrorChain(error: unknown, options: ErrorChainOptions = {}): unknown[]` — Lists an error and its causes: `[error, error.cause, error.cause.cause, …]`, following own `cause` properties of objects (errors, error-like objects, serialized errors).
+- `formatError(error: unknown, options: FormatErrorOptions = {}): string` — Formats an error as a human-readable, multi-line report: `Name: message`, its stack frames, then its aggregated `errors` (labelled `[1/2]`, `[2/2]`…) and its `cause` (`Caused by: …`), each nested two spaces deeper, recursively.
 
 ## format
 
@@ -686,7 +736,7 @@ Import: `import { … } from 'tinkit/format';`
 
 ## validate
 
-Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates, zod-like parsing with coercion, defaults and transforms, and typed environment variables.
+Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates, zod-like parsing with coercion, defaults and transforms, typed environment variables, and node-semver-exact ranges.
 Import: `import { … } from 'tinkit/validate';`
 
 - `isEmail(value: unknown): value is string` — Checks whether a value is an email address, using the WHATWG HTML "valid email address" grammar (the one browsers apply to `<input type="email">`) plus the usual length limits: at most 64 characters before the `@`, 254 characters in total and 63 characters per domain label.
@@ -699,6 +749,12 @@ Import: `import { … } from 'tinkit/validate';`
 - `isSemver(value: unknown): value is string` — Checks whether a value is a semantic version, using the official regular expression from semver.org (SemVer 2.0.0): `MAJOR.MINOR.PATCH`, optional `-pre.release` identifiers and optional `+build.metadata`.
 - `parseSemver(value: unknown): SemVer | undefined` — Parses a semantic version into its parts.
 - `compareSemver(a: string, b: string): -1 | 0 | 1` — Compares two semantic versions by SemVer 2.0.0 precedence (semver.org §11): major, minor and patch numerically (exactly, at any size), then a version with a pre-release is lower than the same version without one, and pre-releases are compared identifier by identifier (numeric identifiers numerically and lower than alphanumeric ones, which compare in ASCII order; a shorter list of equal identifiers is lower).
+- `satisfiesSemver(version: string, range: string, options?: SemverRangeOptions): boolean` — Checks whether a version satisfies a semver range, with the semantics of npm and node-semver 7.8.5 (`semver.satisfies` without `loose`), which it matches on every input of its range grammar.
+- `compileSemverRange(range: string, options?: SemverRangeOptions): (version: string) => boolean` — Compiles a semver range into a predicate, for testing many versions against the same range: the range is parsed once, and each test only reads the version (no regular expression; a release allocates only the small object holding its numbers).
+- `isSemverRange(value: unknown, options?: SemverRangeOptions): value is string` — Checks whether a value is a semver range that `satisfiesSemver` and node-semver accept (node-semver's `validRange` not returning `null`).
+- `maxSatisfyingSemver(versions: Iterable<string>, range: string, options?: SemverRangeOptions): string | undefined` — Finds the highest version of a list that satisfies a range (node-semver's `maxSatisfying`): versions are tested as by `satisfiesSemver` (invalid ones are skipped) and compared by precedence, the first of equal versions winning (`1.0.0+a` and `1.0.0+b` are equal).
+- `minSatisfyingSemver(versions: Iterable<string>, range: string, options?: SemverRangeOptions): string | undefined` — Finds the lowest version of a list that satisfies a range (node-semver's `minSatisfying`), like `maxSatisfyingSemver`.
+- `incrementSemver(version: string, releaseType: SemverRelease, options?: IncrementSemverOptions): string` — Increments a version, with the semantics of node-semver 7.8.5's `inc` (`semver.inc(version, release, identifier, identifierBase)`).
 - `isIsoDateString(value: unknown): value is string` — Checks whether a value is an ISO 8601 / RFC 3339 calendar date in the `YYYY-MM-DD` form that is an actual date (`2023-02-29` and `2024-04-31` are rejected; leap years are handled).
 - `isIsoDateTimeString(value: unknown): value is string` — Checks whether a value is an RFC 3339 date-time: `YYYY-MM-DD`, `T`, `hh:mm:ss`, an optional fraction of a second, then `Z` or a `±hh:mm` offset (`T` and `Z` may be lowercase, as RFC 3339 allows).
 - `luhnCheck(digits: string): boolean` — Validates a string of digits with the Luhn (mod 10) checksum used by payment card numbers, IMEIs and similar identifiers.
@@ -735,7 +791,7 @@ Import: `import { … } from 'tinkit/validate';`
 
 ## date
 
-DST-safe, non-mutating date arithmetic, formatting and parsing, IANA time zones, calendar grids, interval sets and business days with holidays.
+DST-safe, non-mutating date arithmetic, formatting and parsing, IANA time zones, calendar grids, interval sets, business days with holidays and cron schedules.
 Import: `import { … } from 'tinkit/date';`
 
 - `isValidDate(value: unknown): value is ValidDate` — Checks whether a value is a `Date` instance holding a valid time (i.e. not `new Date(NaN)`).
@@ -833,10 +889,15 @@ Import: `import { … } from 'tinkit/date';`
 - `startOfDayInTimeZone(date: DateInput, timeZone: string): Date` — Returns the first instant of the calendar day that the wall clock of a time zone shows at `date`: normally its 00:00:00.000 there, but the end of the gap where midnight was skipped (in Havana, 2024-03-10 starts at 01:00; in Toronto, 1919-03-31 started at 00:30, the clocks having gone from 23:30 to 00:30, where date-fns-tz and Temporal's `'compatible'` midnight give 01:00) and the first midnight where it was repeated.
 - `endOfDayInTimeZone(date: DateInput, timeZone: string): Date` — Returns the last millisecond of the calendar day that the wall clock of a time zone shows at `date`: the instant before the next day starts there (normally 23:59:59.999).
 - `getCalendarMonth(year: number, monthIndex: number, options: CalendarMonthOptions = {}): Date[][]` — Returns the grid of a month as every date picker shows it: an array of weeks, each an array of 7 dates at the start of their LOCAL day (normally 00:00; where midnight was skipped, the end of the gap, like `startOfDay`: 01:00 in Havana or Beirut on the night the clocks go forward), from the week containing the 1st to the week containing the last day.
+- `parseCron(expression: string): Cron` — Parses a cron expression, for `nextCronDate`, `previousCronDate`, `eachCronDate` and `isCronMatch` (which also take the expression itself, cached once parsed).
+- `nextCronDate(cron: string | Cron, options: CronDateOptions = {}): Date | undefined` — Returns the next date at which a cron expression fires: the first instant strictly after `from` (or at `from`, with `inclusive`) whose wall-clock time matches, read in `timeZone` (an IANA zone or a UTC offset) or else in the runtime's local time zone.
+- `previousCronDate(cron: string | Cron, options: CronDateOptions = {}): Date | undefined` — Returns the last date at which a cron expression fired: the last instant strictly before `from` (or at `from`, with `inclusive`) at which `nextCronDate` would fire, with the same rules (`previousCronDate(cron, { from: nextCronDate(cron, { from: d }) })` is the last firing at or before `d`).
+- `eachCronDate(cron: string | Cron, options: EachCronDateOptions = {}): IterableIterator<Date>` — Lists the successive dates at which a cron expression fires, lazily: the dates that repeated calls to `nextCronDate` would give, from the first one after `from` (or at `from`, with `inclusive`) up to `to` (inclusive) and at most `limit` of them.
+- `isCronMatch(cron: string | Cron, date: DateInput, options: CronMatchOptions = {}): boolean` — Checks whether a cron expression fires during the minute that `date` falls in (the second, for a 6-field expression), as read on the wall clock of `timeZone` or of the runtime's local time zone: whether `nextCronDate` gives the start of that minute, so the daylight-saving rules of `nextCronDate` apply (a fixed-time job does not match the second occurrence of a repeated time, and matches the first minute after a gap that skipped its time).
 
 ## iterables
 
-Lazy, generator-based pipelines over any (async) iterable, with exact pull counts and early-exit cleanup.
+Lazy, generator-based pipelines over any (async) iterable, with exact pull counts and early-exit cleanup, plus stream readers (lines, Server-Sent Events, NDJSON) and async merging and batching.
 Import: `import { … } from 'tinkit/iterables';`
 
 - `count(start = 0, step = 1): IterableIterator<number>` — Lazily count from `start` by `step`, forever: `start, start + step, start + 2 * step, ...`.
@@ -872,15 +933,32 @@ Import: `import { … } from 'tinkit/iterables';`
 - `chunkAsync<T>(iterable: AwaitableIterable<T>, size: number): AsyncIterableIterator<T[]>` — Lazily split an async (or sync) iterable into consecutive chunks of `size` items; only the last chunk may be shorter.
 - `mapConcurrent<T, U>(iterable: AwaitableIterable<T>, fn: (value: T, index: number, signal: AbortSignalLike | undefined) => U | PromiseLike<U>, options: number | MapConcurrentOptions): AsyncIterableIterator<U>` — Lazily maps an async (or sync) iterable with a possibly async `fn`, running up to `concurrency` mappings at the same time: the streaming counterpart of `mapWithConcurrency` (from the async module), for sources too large or too slow to collect first.
 - `toArrayAsync<T>(iterable: AwaitableIterable<T>): Promise<T[]>` — Collect the items of an async (or sync) iterable into a new array, awaiting each item in turn (like `Array.fromAsync`).
+- `interleave<T extends Array<Iterable<unknown>>>(...iterables: T): IterableIterator<ZippedValues<T>[number]>` — Lazily take one item from each iterable in turn (round-robin): `a1, b1, c1, a2, b2, c2, ...`.
+- `pairwise<T>(iterable: Iterable<T>): IterableIterator<[T, T]>` — Lazily yield each item with the next one: `[a, b], [b, c], [c, d], ...` (one pair fewer than items; none for fewer than two items).
+- `partition<T, S extends T>(iterable: Iterable<T>, predicate: (value: T, index: number) => value is S): [S[], Exclude<T, S>[]]` — Split the items of an iterable in two with a type guard: the items it accepts (narrowed) and the others.
+- `mergeAsync<T extends Array<AwaitableIterable<unknown>>>(...sources: T): AsyncIterableIterator<MergedValue<T>>` — Merges several async (or sync) iterables into one, yielding their values as they arrive (the first to settle comes first).
+- `bufferTime<T>(iterable: AwaitableIterable<T>, ms: number, options?: BufferTimeOptions): AsyncIterableIterator<T[]>` — Lazily groups the items of an async (or sync) iterable into batches by time: a batch opens with its first item and is flushed `ms` milliseconds later, or as soon as it holds `maxSize` items, whichever comes first (the timer then restarts with the next item, so an idle source produces no batches: a batch is never empty).
+- `readLines(source: TextStreamSource, options?: ReadLinesOptions): AsyncIterableIterator<string>` — Lazily reads the lines of a text stream: a `fetch` body, a Node stream, a `Blob#stream()`, an async generator...
+- `parseSSE(source: TextStreamSource, options?: ParseSSEOptions): AsyncIterableIterator<ServerSentEvent>` — Lazily parses a stream of Server-Sent Events (`text/event-stream`) exactly as an `EventSource` does, following the WHATWG HTML "event stream interpretation" algorithm; usable directly on `fetch(...).body`, for example to read the streaming responses of LLM APIs (where `EventSource` cannot send a POST body or headers).
+- `parseNdjson<T = unknown>(source: TextStreamSource, options?: ParseNdjsonOptions): AsyncIterableIterator<T>` — Lazily parses a stream of newline-delimited JSON (NDJSON, JSON Lines): one JSON value per line.
+- `streamToText(source: TextStreamSource, options?: StreamToTextOptions): Promise<string>` — Reads a whole text stream into a string (like `Response#text()`, for any stream of strings and/or UTF-8 bytes): decoding, the byte order mark, cleanup and `signal` work as in `readLines`.
+- `streamToBytes(source: StreamSource<Uint8Array>, options?: StreamToBytesOptions): Promise<Uint8Array<ArrayBuffer>>` — Reads a whole byte stream into one new `Uint8Array` (like `Response#bytes()`): the chunks are kept as they come and copied once, into a buffer of the exact total size (so a source must not reuse a chunk's memory after handing it out, as with any stream).
+- `streamToArray<T>(source: StreamSource<T>, options?: StreamToArrayOptions): Promise<T[]>` — Collects the chunks (or values, for an object stream) of a stream into a new array: `toArrayAsync` for `ReadableStream`s too, with a limit and a signal.
 
 ## cache
 
-O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock (plugs into memoize), a ring-buffer deque and a priority queue.
+O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock (plugs into memoize), a ring-buffer deque, a ring buffer, a priority queue, a radix trie, a Bloom filter, and bidirectional, multi-value and default maps.
 Import: `import { … } from 'tinkit/cache';`
 
 - `createLRUCache<K = unknown, V = unknown>(options: LRUCacheOptions<K, V>): LRUCache<K, V>` — Creates a least-recently-used cache backed by a `Map` for lookups and a doubly linked list for recency, so `get`, `set`, `peek`, `has` and `delete` are O(1) (a hit only relinks two list nodes; it never re-inserts the key into the `Map`).
 - `createPriorityQueue<T>(compare: (a: T, b: T) => number): PriorityQueue<T>` — Creates a priority queue backed by a binary heap: `push` and `pop` are O(log n) and `peek` is O(1).
 - `createDeque<T>(values?: Iterable<T> | null, options: DequeOptions = {}): Deque<T>` — Creates a double-ended queue backed by a growable ring buffer: adding or removing a value at either end, and reading any index, are O(1) (amortized: the ring doubles when full and halves when three quarters empty, so memory follows the size).
+- `createRingBuffer<T>(capacity: number, options: RingBufferOptions<T> = {}): RingBuffer<T>` — Creates a ring buffer: a circular buffer of at most `capacity` values where pushing to a full buffer overwrites the oldest value, so it always holds the most recent values (the last N log lines, samples, frames or events).
+- `createDefaultMap<K, V>(factory: (key: K) => V, entries?: Iterable<readonly [K, V]> | null): DefaultMap<K, V>` — Creates a `Map` whose `get` never misses: a missing key gets the value `factory(key)`, which is stored and returned (Python's `defaultdict`, or `Map.prototype.getOrInsertComputed` on every `get`).
+- `createBiMap<K, V>(entries?: Iterable<readonly [K, V]> | null): BiMap<K, V>` — Creates a bidirectional map: a one-to-one map that looks up values by key (`get`) and keys by value (`getKey`) in O(1), backed by two `Map`s kept as exact mirrors.
+- `createMultiMap<K, V>(entries?: Iterable<readonly [K, V]> | null, options: MultiMapOptions = {}): MultiMap<K, V>` — Creates a multimap: a map from each key to several values, a list per key (or a set, with `unique: true`).
+- `createTrie<V>(entries?: Iterable<readonly [string, V]> | null): Trie<V>` — Creates a trie (prefix tree): a map from strings to values that also answers prefix queries: autocomplete (`keysWithPrefix`, which stops at `limit` results), `hasPrefix`, and `longestPrefixOf(text)` for routing tables, tokenizers and dictionaries.
+- `createBloomFilter(options: BloomFilterOptions): BloomFilter` — Creates a Bloom filter: a set of strings in a fixed, small amount of memory (about 9.6 bits per item at 1% false positives, whatever the length of the strings) that answers "definitely not added" or "probably added".
 
 ## emitter
 
@@ -922,7 +1000,7 @@ Import: `import { … } from 'tinkit/random';`
 
 ## decorators
 
-Class decorators for TypeScript (legacy and TC39 standard) and Babel.
+Class decorators for TypeScript (legacy and TC39 standard) and Babel, including lazy getters and method timing.
 Import: `import { … } from 'tinkit/decorators';`
 
 - `readonly(targetOrValue: object, keyOrContext: string | symbol, descriptor?: undefined): void` — Makes a class field write-once: the value assigned by the field initializer (or the first assignment) is kept, and the instance gets an enumerable, non-writable, non-configurable own property.
@@ -935,6 +1013,8 @@ Import: `import { … } from 'tinkit/decorators';`
 - `once<T extends AnyFunction>(targetOrValue: object, keyOrContext: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>` — Makes the decorated method run at most once per instance (per class for static methods), like `once` from the functions module: later calls on the same instance return the first result (or rethrow the first error) without running the method again, and a re-entrant call made by the method itself returns `undefined`.
 - `retryable(options: RetryOptions = {}, random: RandomGenerator = Math.random): AsyncMethodDecorator` — Creates a decorator for async methods that retries failed calls with `retry` (exponential backoff, optional jitter, `shouldRetry`, `onRetry`, `signal`).
 - `timeout(ms: number, message?: string): AsyncMethodDecorator` — Creates a decorator for async methods that rejects with a `TimeoutError` when the returned promise does not settle within `ms` milliseconds (using `withTimeout`; the timer is always cleared, but the underlying operation is not cancelled).
+- `lazy<T>(targetOrValue: object, keyOrContext: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>` — Makes the decorated getter compute its value once per instance (per class for static getters), on first read, and return that value on every later read.
+- `measure<T extends AnyFunction>(targetOrValue: object, keyOrContext: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>` — Times every call of the decorated method and reports a `Measurement` (`{ name, duration, args, failed, error }`) to `onMeasure` (by default, `"<name> method took 1.234 ms"` is logged with `console.debug`).
 
 ## types
 
