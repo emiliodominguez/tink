@@ -746,6 +746,21 @@ describe('Format helpers (hostile inputs)', function () {
 		expect(helpers.formatNumber(1.25, { minimumIntegerDigits: 1 })).toBe('1.25');
 	});
 
+	it('does not reuse the formatter of the previous call for an option that only a polluted Object.prototype holds', function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		proto.minimumFractionDigits = 2;
+		try {
+			// The previous call's own option must not be matched by the planted one, nor the other way round.
+			expect(helpers.formatNumber(1, { minimumFractionDigits: 2 })).toBe('1.00');
+			expect(helpers.formatNumber(1, {})).toBe('1');
+			expect(helpers.formatNumber(1, { minimumFractionDigits: 2 })).toBe('1.00');
+			expect(helpers.formatPercent(0.5, { minimumFractionDigits: 2 })).toBe('50.00%');
+			expect(helpers.formatPercent(0.5)).toBe('50%');
+		} finally {
+			delete proto.minimumFractionDigits;
+		}
+	});
+
 	it('ignores the locale, display, decimals, list type and style, and suffixes inherited from a polluted Object.prototype', function () {
 		const proto = Object.prototype as Record<string, unknown>;
 		const planted = { locale: 'de-DE', display: 'long', decimals: 5, type: 'disjunction', style: 'narrow', suffixes: { other: '<b>' }, one: '<i>' };

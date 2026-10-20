@@ -326,6 +326,16 @@ function sameOptions(a: object, b: object, size: number): boolean {
 }
 
 /**
+ * Whether `Object.prototype` has an enumerable property: what prototype pollution adds, and what `for…in` lists on every plain object.
+ * @returns {boolean} `true` when it has one
+ */
+function isObjectPrototypePolluted(): boolean {
+	for (const key in Object.prototype) return typeof key === 'string';
+
+	return false;
+}
+
+/**
  * Returns a cached `Intl` formatter for `(kind, locale, options)`, constructing and caching it on a miss.
  *
  * Building the cache key costs about as much as formatting, so each call site first compares its inputs with those of its previous call
@@ -341,7 +351,11 @@ function sameOptions(a: object, b: object, size: number): boolean {
  * @throws {RangeError} when `Intl` rejects the locale or the options
  */
 function getFormatter<T, O>(kind: string, Formatter: new (locales: string[], options: O) => T, locale: LocaleInput | undefined, options: O, memo: FormatterMemo): T {
-	if (memo.formatter !== undefined && locale === memo.locale && sameOptions(options as object, memo.options, memo.size)) return memo.formatter as T;
+	// `sameOptions` lists keys with `for…in`, which also lists those planted on a polluted `Object.prototype`: they would then match
+	// whether they are own options or not, so the memo is only consulted while `Object.prototype` has no enumerable key.
+	if (memo.formatter !== undefined && locale === memo.locale && !isObjectPrototypePolluted() && sameOptions(options as object, memo.options, memo.size)) {
+		return memo.formatter as T;
+	}
 
 	const locales = resolveLocales(locale);
 	const key = cacheKey(kind, locales, options as object);
