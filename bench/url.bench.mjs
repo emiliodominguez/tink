@@ -5,6 +5,7 @@ import {
 	isAbsoluteUrl,
 	isSafeUrl,
 	joinUrl,
+	matchPath,
 	parseQueryString,
 	safeDecodeURIComponent,
 	withBase,
@@ -146,6 +147,13 @@ const dirty = ['https://example.com//a///b?u=http://x//y', '/a//b//c', '//cdn.ex
 const mounted = ['/users?page=2', '/app/users', 'users', '/application', '/', '/items/42#details'];
 const encoded = ['caf%C3%A9%20au%20lait', 'plain-text', '100%25%20off', '%E6%97%A5%E6%9C%AC%E8%AA%9E', 'Jos%E9%20Garc%C3%ADa', '%E0%A4%A'];
 const fragmented = ['/docs?v=2#old', '/docs', 'https://x.com/a?b#c', '/page#section?x'];
+const routes = ['/users/:id', '/users/:id/posts/:postId?', '/files/*path', '/about'];
+const routePatterns =
+	typeof URLPattern === 'function'
+		? ['/users/:id', '/users/:id/posts{/:postId}?', '/files/:path+', '/about'].map(function (pathname) {
+				return new URLPattern({ pathname });
+			})
+		: [];
 
 /**
  * Maps a function over a list.
@@ -317,6 +325,25 @@ export default [
 				return new URL(`https://example.com/?${bigQuery}`).searchParams.get('key50');
 			}
 		}
+	},
+	{
+		name: 'matchPath (4 routes)',
+		fn: function () {
+			return each(function (route) {
+				return matchPath(route, '/users/42/posts/7');
+			}, routes);
+		},
+		competitors:
+			routePatterns.length === 0
+				? {}
+				: {
+						// Loose: URLPattern compiles each pattern to a regular expression once, and neither decodes nor checks dot segments.
+						'URLPattern.exec (compiled)': function () {
+							return routePatterns.map(function (pattern) {
+								return pattern.exec({ pathname: '/users/42/posts/7' });
+							});
+						}
+					}
 	},
 	{
 		name: 'joinUrl (4 parts)',

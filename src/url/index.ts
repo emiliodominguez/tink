@@ -848,17 +848,13 @@ export function withoutBase(url: string, base: string): string {
 	return root !== '' && isInside(url, root) ? withLeadingSlash(url.slice(root.length)) : url;
 }
 
-/** A percent-escaped UTF-8 continuation byte (`80`–`BF`). */
-const CONTINUATION = '%[89ab][\\da-f]';
-
 /**
  * A well-formed UTF-8 sequence of percent-escapes (Unicode Table 3-7: no overlong form, surrogate or code point past U+10FFFF), which
- * `decodeURIComponent` always accepts.
+ * `decodeURIComponent` always accepts. Each `%[89ab][\da-f]` is a continuation byte (`80`–`BF`). A literal, not `new RegExp(...)`:
+ * bundlers keep a module-level constructor call (it could throw), even in bundles that never decode.
  */
-const UTF8_ESCAPES = new RegExp(
-	`%(?:[0-7][\\da-f]|(?:c[2-9a-f]|d[\\da-f])${CONTINUATION}|(?:e0%[ab][\\da-f]|e[1-9a-cef]${CONTINUATION}|ed%[89][\\da-f])${CONTINUATION}|(?:f0%[9ab][\\da-f]|f[1-3]${CONTINUATION}|f4%8[\\da-f])${CONTINUATION}${CONTINUATION})`,
-	'gi'
-);
+const UTF8_ESCAPES =
+	/%(?:[0-7][\da-f]|(?:c[2-9a-f]|d[\da-f])%[89ab][\da-f]|(?:e0%[ab][\da-f]|e[1-9a-cef]%[89ab][\da-f]|ed%[89][\da-f])%[89ab][\da-f]|(?:f0%[9ab][\da-f]|f[1-3]%[89ab][\da-f]|f4%8[\da-f])%[89ab][\da-f]%[89ab][\da-f])/gi;
 
 /**
  * Decodes a percent-encoded URL component like `decodeURIComponent`, but never throws: every well-formed escape (a valid UTF-8 sequence)
