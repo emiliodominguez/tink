@@ -1408,3 +1408,48 @@ describe('errors (1.4)', function () {
 function getMessage(value: unknown): string {
 	return getErrorMessage(value);
 }
+
+describe('errors under a polluted Object.prototype', function () {
+	const prototype = Object.prototype as Record<string, unknown>;
+
+	/**
+	 * Runs `test` while `Object.prototype` holds `values`.
+	 * @param {Record<string, unknown>} values - The polluted keys and their values
+	 * @param {() => void} test - The test
+	 */
+	function polluted(values: Record<string, unknown>, test: () => void): void {
+		Object.assign(prototype, values);
+		try {
+			test();
+		} finally {
+			for (const key of Object.keys(values)) delete prototype[key];
+		}
+	}
+
+	it('still defines properties when an inherited `get` or `set` would make every descriptor invalid', function () {
+		for (const values of [{ get: 'polluted' }, { set: 'polluted' }, { get: Math.random, set: Math.random }]) {
+			polluted(values, function () {
+				const error = deserializeError({ name: 'AbortError', message: 'x', stack: 'at x', cause: { name: 'TypeError', message: 'y' }, code: 'E' });
+				expect([error.name, error.stack, (error as Error & { code?: string }).code]).toEqual(['AbortError', 'at x', 'E']);
+				expect(error.cause).toBeInstanceOf(TypeError);
+				expect(Object.getOwnPropertyDescriptor(error, 'name')).toEqual({ value: 'AbortError', writable: true, enumerable: false, configurable: true });
+				expect(toError({ name: 'AbortError', message: 'x' }).name).toBe('AbortError');
+				const NotFound = defineError('NotFoundError', { code: 'E_NOT_FOUND', status: 404 });
+				const instance = new NotFound('No user', { status: 410 });
+				expect([instance.name, instance.code, instance.status, NotFound.code]).toEqual(['NotFoundError', 'E_NOT_FOUND', 410, 'E_NOT_FOUND']);
+				expect(NotFound.is(instance)).toBe(true);
+			});
+		}
+	});
+
+	it('gives defineError classes and errors the same property attributes', function () {
+		polluted({ writable: true, enumerable: true, configurable: true }, function () {
+			const NotFound = defineError('NotFoundError', { code: 'E_NOT_FOUND' });
+			expect(Object.getOwnPropertyDescriptor(NotFound, 'code')).toEqual({ value: 'E_NOT_FOUND', writable: false, enumerable: true, configurable: false });
+			expect(Object.getOwnPropertyDescriptor(NotFound, 'name')).toEqual({ value: 'NotFoundError', writable: false, enumerable: false, configurable: true });
+			expect(Object.getOwnPropertyDescriptor(NotFound.prototype, 'name')).toEqual({ value: 'NotFoundError', writable: true, enumerable: false, configurable: true });
+			const brand = Object.getOwnPropertySymbols(NotFound.prototype)[0];
+			expect(Object.getOwnPropertyDescriptor(NotFound.prototype, brand)).toEqual({ value: 'NotFoundError', writable: false, enumerable: false, configurable: false });
+		});
+	});
+});

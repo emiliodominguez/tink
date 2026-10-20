@@ -261,6 +261,27 @@ export function serializeError(value: unknown, options: SerializeErrorOptions = 
 }
 
 /**
+ * Defines an own data property whatever a polluted `Object.prototype` holds: every attribute is given, so none is inherited, and a
+ * descriptor that inherits a `get` or `set` (an accessor with a value, which `Object.defineProperty` rejects with a `TypeError`) is
+ * given again without a prototype. Only the retry pays for that: a descriptor without a prototype is slower to read.
+ * @param {object} target - The object
+ * @param {PropertyKey} key - The key
+ * @param {unknown} value - The value
+ * @param {boolean} writable - Whether the property is writable
+ * @param {boolean} enumerable - Whether it is enumerable
+ * @param {boolean} [configurable=true] - Whether it is configurable
+ * @returns {void}
+ */
+function defineValue(target: object, key: PropertyKey, value: unknown, writable: boolean, enumerable: boolean, configurable = true): void {
+	const descriptor: PropertyDescriptor = { value, writable, enumerable, configurable };
+	try {
+		Object.defineProperty(target, key, descriptor);
+	} catch {
+		Object.defineProperty(target, key, Object.setPrototypeOf(descriptor, null) as PropertyDescriptor);
+	}
+}
+
+/**
  * Defines a non-enumerable own property, as the `Error` constructors define `message`, `cause` and `errors`.
  * @param {Error} error - The error
  * @param {string} key - The key
@@ -268,7 +289,7 @@ export function serializeError(value: unknown, options: SerializeErrorOptions = 
  * @returns {void}
  */
 function defineHidden(error: Error, key: string, value: unknown): void {
-	Object.defineProperty(error, key, { value, writable: true, enumerable: false, configurable: true });
+	defineValue(error, key, value, true, false);
 }
 
 /**
@@ -323,8 +344,7 @@ function rebuild(data: unknown, depth: number, built: Map<object, Error>, classe
 		if (Array.isArray(errors)) defineHidden(error, 'errors', errors.map(nestedValue));
 		for (const key of Object.keys(data)) {
 			// A key the error inherits (`toString`, `valueOf`, `hasOwnProperty`…) would shadow its method: `String(error)` would throw.
-			if (!RESERVED_KEYS.has(key) && !(key in error))
-				Object.defineProperty(error, key, { value: (data as Record<string, unknown>)[key], writable: true, enumerable: true, configurable: true });
+			if (!RESERVED_KEYS.has(key) && !(key in error)) defineValue(error, key, (data as Record<string, unknown>)[key], true, true);
 		}
 	} catch {
 		// A throwing getter, a hostile proxy, or a chain of causes longer than the call stack allows: the properties copied so far are kept.
@@ -592,7 +612,7 @@ export function defineError(name: string, options: DefineErrorOptions = {}): Def
 			super(message, given !== undefined && hasOwn.call(given, 'cause') ? { cause: given.cause } : undefined);
 			for (let index = 0; index < keys.length; index++) {
 				const value = index === code || given === undefined || !hasOwn.call(given, keys[index]) ? undefined : given[keys[index]];
-				Object.defineProperty(this, keys[index], { value: value === undefined ? defaults[index] : value, writable: true, enumerable: true, configurable: true });
+				defineValue(this, keys[index], value === undefined ? defaults[index] : value, true, true);
 			}
 			if (capture) (Error as unknown as { captureStackTrace(target: object, constructor: unknown): void }).captureStackTrace(this, new.target);
 		}
@@ -615,11 +635,11 @@ export function defineError(name: string, options: DefineErrorOptions = {}): Def
 			return false;
 		}
 	}
-	Object.defineProperty(DefinedError, 'name', { value: name, configurable: true });
-	Object.defineProperty(DefinedError, 'is', { value: is, writable: true, configurable: true });
-	for (let index = 0; index < keys.length; index++) Object.defineProperty(DefinedError, keys[index], { value: defaults[index], enumerable: true });
-	Object.defineProperty(DefinedError.prototype, 'name', { value: name, writable: true, configurable: true });
-	Object.defineProperty(DefinedError.prototype, brand, { value: name });
+	defineValue(DefinedError, 'name', name, false, false);
+	defineValue(DefinedError, 'is', is, true, false);
+	for (let index = 0; index < keys.length; index++) defineValue(DefinedError, keys[index], defaults[index], false, true, false);
+	defineValue(DefinedError.prototype, 'name', name, true, false);
+	defineValue(DefinedError.prototype, brand, name, false, false, false);
 	return DefinedError as unknown as DefinedErrorClass<string>;
 }
 
