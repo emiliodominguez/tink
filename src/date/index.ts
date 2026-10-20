@@ -2444,20 +2444,25 @@ export function formatDuration(ms: number, options: FormatDurationOptions = {}):
 	const largest = readOption(options, 'largest', Infinity);
 
 	if (!Array.isArray(units)) throw new TypeError(`formatDuration: \`units\` must be an array of duration units, got ${describe(units)}`);
-	if (units.length === 0) throw new RangeError('formatDuration: `units` must not be empty');
 
-	// An index loop, unlike `forEach`, also visits the holes of a sparse array.
+	// The units seen, as bits of their indices in `DURATION_UNITS`: each element is read once, so the units that are validated are the
+	// units that are used, even behind a getter. An index loop, unlike `forEach`, also visits the holes of a sparse array.
+	let seen = 0;
+
 	for (let i = 0; i < units.length; i++) {
 		const unit: unknown = units[i];
+		const index = DURATION_UNITS.indexOf(unit as DurationUnit);
 
-		if (!DURATION_UNITS.includes(unit as DurationUnit))
+		if (index < 0)
 			throw new RangeError(`formatDuration: \`units\` must only contain ${DURATION_UNITS.join(', ')}, got ${typeof unit === 'string' ? unit : describe(unit)}`);
+		seen |= 1 << index;
 	}
 
+	if (seen === 0) throw new RangeError('formatDuration: `units` must not be empty');
 	assertCount('formatDuration', 'largest', largest, 1, true);
 
-	const selected = DURATION_UNITS.filter(function (unit: DurationUnit): boolean {
-		return units.includes(unit);
+	const selected = DURATION_UNITS.filter(function (_: DurationUnit, index: number): boolean {
+		return ((seen >> index) & 1) === 1;
 	});
 	const parts: string[] = [];
 	let rest = Math.abs(ms);
@@ -2476,7 +2481,7 @@ export function formatDuration(ms: number, options: FormatDurationOptions = {}):
 		if (value > 0) parts.push(`${value}${unit}`);
 	}
 
-	if (parts.length === 0) return units.includes('s') ? '0s' : `0${selected[selected.length - 1]}`;
+	if (parts.length === 0) return selected.includes('s') ? '0s' : `0${selected[selected.length - 1]}`;
 
 	return (ms < 0 ? '-' : '') + parts.join(' ');
 }
@@ -2846,14 +2851,28 @@ function msIntoHour(date: Date): number {
 }
 
 /**
+ * Returns how far the wall clock at `date` is ahead of the wall clock at `from`, for two dates less than 3 days apart (whose days of the
+ * week then tell the days apart, without the calendar arithmetic of {@link localOffset}).
+ * @param {Date} date - A date (an invalid one gives `NaN`)
+ * @param {Date} from - A valid date
+ * @returns {number} The wall-clock difference in milliseconds (negative when `date` shows an earlier time)
+ * @example
+ * wallClockDistance(new Date(2024, 0, 1, 0, 30), new Date(2023, 11, 31, 23, 0)); // => 5_400_000
+ */
+function wallClockDistance(date: Date, from: Date): number {
+	return (mod(date.getDay() - from.getDay() + 3, DAYS_PER_WEEK) - 3) * MS_PER_DAY + (date.getHours() - from.getHours()) * MS_PER_HOUR + msIntoHour(date) - msIntoHour(from);
+}
+
+/**
  * Returns the boundary of a wall-clock grid of `stepMs` (a divisor of an hour) at or around `date`: `'floor'` gives the last
  * boundary at or before `date`, `'ceil'` the first at or after it, `'round'` the nearest one (ties go up) and `'next'` the
  * first one strictly after it.
  *
  * The boundary is normally `date`'s distance to it on the wall clock away on the timeline too. When the UTC offset changes in
- * between, the instant that far away on the timeline is taken when the wall clock reads a grid time there (so the repeated hour after
- * clocks are set back keeps its own boundaries), else the wall-clock boundary (after a change by a fraction of the step, e.g. Lord
- * Howe Island's 30 minutes), where a time inside a DST gap is moved forward by the gap and a repeated one takes its first occurrence.
+ * between, a boundary that the clocks skipped is replaced by the end of the gap (where the grid restarts); otherwise the instant that
+ * far away on the timeline is taken when the wall clock reads a grid time there (so the repeated hour after clocks are set back keeps
+ * its own boundaries), else the wall-clock boundary (after a change by a fraction of the step, e.g. Lord Howe Island's 30 minutes),
+ * whose first occurrence a repeated one takes.
  * @param {Date} date - A valid date, which may be mutated (callers pass a fresh copy)
  * @param {number} stepMs - The grid step in milliseconds, a divisor of an hour
  * @param {string} mode - `'floor'`, `'ceil'`, `'round'` or `'next'`
@@ -2870,11 +2889,36 @@ function gridBoundary(date: Date, stepMs: number, mode: string): Date {
 	const next = back === 1 || (mode === 'ceil' ? intoStep > 0 : mode === 'round' && intoStep * 2 >= stepMs) ? 1 : 0;
 	// How long before `date` the boundary is (negative when it is after) on the wall clock.
 	const distance = intoStep - next * stepMs;
+	// (Only read for a boundary after `date`, see below.)
+	const minutesWest = distance < 0 ? date.getTimezoneOffset() : 0;
 
 	date.setMinutes(0, 0, intoHour - distance);
 
-	// The usual case: no change of UTC offset in between, so the wall-clock boundary is as far away on the timeline.
-	if (time - date.getTime() === distance) return date;
+	// The usual case: no change of UTC offset in between, so the wall-clock boundary is as far away on the timeline. A boundary after
+	// `date` can be that far away and yet skipped, the clocks being set forward in between (the conversion moves a skipped time by the
+	// length of the gap, with the offset before it): the wall clock then shows another time there. (Before `date`, it cannot.)
+	if (time - date.getTime() === distance && (distance >= 0 || (date.getTimezoneOffset() === minutesWest && msIntoHour(date) === mod(intoHour - distance, MS_PER_HOUR))))
+		return date;
+
+	const from = new Date(time);
+
+	// A boundary that the clocks skipped (02:20 on a 20-minute grid on Lord Howe Island, where they go from 02:00 to 02:30; Toronto's
+	// midnight on 1919-03-31, from 23:30 to 00:30), which the conversion moves possibly past `date` or back to another hour: the grid
+	// restarts where the gap ends, at the first instant whose wall clock shows a later time (found by bisection, before `date` when the
+	// boundary is, after it otherwise, a gap being shorter than a day).
+	if (!Number.isNaN(date.getTime()) && wallClockDistance(date, from) !== -distance) {
+		let low = distance >= 0 ? time - distance - MS_PER_DAY : time;
+		let high = distance >= 0 ? time : time - distance;
+
+		while (high - low > 1) {
+			const middle = Math.floor((low + high) / 2);
+
+			if (wallClockDistance(new Date(middle), from) >= -distance) high = middle;
+			else low = middle;
+		}
+
+		return ensureInRange(new Date(high));
+	}
 
 	// Otherwise take the instant that far away on the timeline (the repeated hour after clocks are set back keeps its own boundaries)
 	// when the wall clock reads a grid time there (for `'next'`: 1 ms before it), else the wall-clock boundary (a change by a fraction
@@ -2966,7 +3010,9 @@ export function endOfMinute(date: DateInput): Date {
  * Rounds a date to a grid of `step` minutes of the local wall clock (`step` must divide 60, so the grid restarts at every hour:
  * `:00`, `:15`, `:30`, `:45` for 15), e.g. to snap a time picker to 5- or 15-minute slots. Seconds and milliseconds count: with
  * `'round'`, `09:07:30` is nearer to `09:10` than to `09:05` on a 5-minute grid, and a tie goes to the later slot. Across DST changes
- * the grid follows the wall clock, like {@link startOfHour}. `step` 60 rounds to the hour.
+ * the grid follows the wall clock, like {@link startOfHour}: a slot that the clocks skipped is replaced by the end of the gap, where
+ * the grid restarts (with `'floor'` on Lord Howe Island's 20-minute grid, 02:35 on the night the clocks go from 02:00 to 02:30 gives
+ * 02:30, as 02:20 never happened). `step` 60 rounds to the hour.
  * @param {DateInput} date - The date to round
  * @param {number} [step=1] - The grid step in minutes: 1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30 or 60
  * @param {RoundingMode} [mode='round'] - `'round'` (nearest, ties up), `'floor'` (down) or `'ceil'` (up)
@@ -3212,7 +3258,8 @@ function coalesce(bounds: Array<[number, number]>, inclusive: boolean): Array<[n
 	const merged: Array<[number, number]> = [];
 
 	for (const pair of bounds) {
-		const last = merged[merged.length - 1];
+		// (Not `merged[-1]` when empty: a polluted `Object.prototype` would answer.)
+		const last = merged.length > 0 ? merged[merged.length - 1] : undefined;
 
 		if (last !== undefined && (inclusive ? pair[0] <= last[1] : pair[0] < last[1])) last[1] = Math.max(last[1], pair[1]);
 		else merged.push(pair);
@@ -3419,8 +3466,9 @@ function tokenOf(formatter: Formatter): string {
  *
  * Fields missing from the pattern take the values of 2000-01-01 00:00:00.000 (2000 is a leap year, so `'02-29'` parses with
  * `'MM-DD'`). `YY` means 2000-2099. `hh`/`h` without `A`/`a` means AM. Numbers are read greedily: `YYYY` takes 4 digits when a
- * numeric token follows directly (`'YYYYMMDD'`) and every digit otherwise (years after 9999, and a `-` for years before 0), the
- * unpadded tokens (`M`, `D`, `H`, `h`, `m`, `s`) take up to 2 digits, so two of them in a row (`'DM'`) cannot always be told apart.
+ * numeric token or a digit follows directly (`'YYYYMMDD'`, `'YYYY[0]MM'`) and every digit otherwise (years after 9999, and a `-` for
+ * years before 0), the unpadded tokens (`M`, `D`, `H`, `h`, `m`, `s`) take up to 2 digits, so two of them in a row (`'DM'`), or one
+ * followed by a digit (`'D[0]'`), cannot always be told apart.
  * So `parseDate(formatDate(d, pattern), pattern)` equals `d` whenever `pattern` has every field down to the milliseconds (with
  * 4-digit years when they are written next to another number), outside the repeated hour.
  *
@@ -3469,7 +3517,8 @@ export function parseDate(value: string, pattern: string): Date | undefined {
 		// (Own elements only: past the end, a polluted `Object.prototype` would answer.)
 		while (after < parts.length && parts[after] === '') after++;
 		const next = after < parts.length ? parts[after] : undefined;
-		const followedByNumber = typeof next === 'function' && next !== FORMATTERS.A && next !== FORMATTERS.a;
+		// A numeric token, or a literal text starting with a digit (`'YYYY[0]MM'`), which a greedy year would swallow too.
+		const followedByNumber = typeof next === 'function' ? next !== FORMATTERS.A && next !== FORMATTERS.a : next !== undefined && /^\d/.test(next);
 		const maxDigits = token.length === 1 ? 2 : token === 'YYYY' && !followedByNumber ? Infinity : token.length;
 		const start = position;
 

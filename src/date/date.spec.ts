@@ -1346,6 +1346,25 @@ describe('Date helpers', function () {
 	});
 
 	describe('formatDuration', function () {
+		it('reads each unit once (a getter cannot pass validation with one unit and supply another)', function () {
+			function shifty(): helpers.DurationUnit[] {
+				let reads = 0;
+				const units = [] as helpers.DurationUnit[];
+
+				Object.defineProperty(units, 0, {
+					get: function () {
+						return reads++ === 0 ? 'm' : 'x';
+					},
+					enumerable: true
+				});
+
+				return units;
+			}
+
+			expect(helpers.formatDuration(0, { units: shifty() })).toBe('0m');
+			expect(helpers.formatDuration(150_000, { units: shifty() })).toBe('2m');
+		});
+
 		it('rejects a sparse units array instead of formatting its holes', function () {
 			expect(function () {
 				helpers.formatDuration(1000, { units: new Array(1) });
@@ -1904,6 +1923,21 @@ describe('Date helpers', function () {
 			});
 		});
 
+		it('starts an hour whose beginning the clocks skipped at the end of the gap (Chatham Islands, Toronto 1919)', function () {
+			withTimeZone('Pacific/Chatham', function () {
+				// 2025-09-28 02:45 (+12:45) → 03:45 (+13:45): the hour 03 starts at 03:45, and the hour 02 ends at the jump.
+				expect(helpers.startOfHour(new Date('2025-09-27T14:05:00Z')).toISOString()).toBe('2025-09-27T14:00:00.000Z'); // 03:50, not 02:00
+				expect(helpers.endOfHour(new Date('2025-09-27T13:45:00Z')).toISOString()).toBe('2025-09-27T13:59:59.999Z'); // 02:30, not 03:59:59
+			});
+			withTimeZone('America/Toronto', function () {
+				// 1919-03-30 23:30 (-05:00) → 00:30 (-04:00): midnight was skipped.
+				expect(helpers.startOfHour(new Date('1919-03-31T04:45:00Z')).toISOString()).toBe('1919-03-31T04:30:00.000Z'); // 00:45, not 23:00
+				expect(helpers.endOfHour(new Date('1919-03-31T04:15:00Z')).toISOString()).toBe('1919-03-31T04:29:59.999Z'); // 23:15
+				// 1895-01-01 00:00 (-05:17:32) → 00:17:32 (-05:00): the minute 00:17 starts at 00:17:32, not 17 minutes later.
+				expect(helpers.startOfMinute(new Date('1895-01-01T05:17:32Z')).toISOString()).toBe('1895-01-01T05:17:32.000Z');
+			});
+		});
+
 		it('throws when the boundary is out of range', function () {
 			withTimeZone('UTC', function () {
 				expect(helpers.startOfHour(-8.64e15).getTime()).toBe(-8.64e15);
@@ -1943,6 +1977,21 @@ describe('Date helpers', function () {
 				// 01:45 (+11:00) rounded up to the hour: 02:00 comes after the repeated half hour, at +10:30.
 				expect(helpers.roundToNearestMinutes(new Date('2024-04-06T14:45:00Z'), 60, 'ceil').toISOString()).toBe('2024-04-06T15:30:00.000Z');
 				expect(helpers.roundToNearestMinutes(new Date('2024-04-06T14:45:00Z'), 30, 'ceil').toISOString()).toBe('2024-04-06T15:00:00.000Z');
+			});
+		});
+
+		it('replaces a slot that the clocks skipped with the end of the gap, never past the date with floor', function () {
+			withTimeZone('Australia/Lord_Howe', function () {
+				// 2024-10-06 02:00 (+10:30) → 02:30 (+11:00): 02:20 (20-minute grid) and 02:24 (12-minute grid) never happened.
+				expect(helpers.roundToNearestMinutes(new Date('2024-10-05T15:35:00Z'), 20, 'floor').toISOString()).toBe('2024-10-05T15:30:00.000Z'); // not 02:50
+				expect(helpers.roundToNearestMinutes(new Date('2024-10-05T15:31:00Z'), 12, 'floor').toISOString()).toBe('2024-10-05T15:30:00.000Z'); // not 02:54
+				expect(helpers.roundToNearestMinutes(new Date('2024-10-05T15:25:00Z'), 12, 'ceil').toISOString()).toBe('2024-10-05T15:30:00.000Z');
+			});
+			withTimeZone('Pacific/Chatham', function () {
+				// 2025-09-28 02:45 (+12:45) → 03:45 (+13:45): 03:00 and 03:30 never happened.
+				expect(helpers.roundToNearestMinutes(new Date('2025-09-27T14:05:00Z'), 30, 'floor').toISOString()).toBe('2025-09-27T14:00:00.000Z'); // not 02:30
+				expect(helpers.roundToNearestMinutes(new Date('2025-09-27T13:45:00Z'), 60, 'ceil').toISOString()).toBe('2025-09-27T14:00:00.000Z'); // not 04:00
+				expect(helpers.roundToNearestMinutes(new Date('2025-09-27T13:45:00Z'), 60).toISOString()).toBe('2025-09-27T14:00:00.000Z');
 			});
 		});
 
@@ -2166,6 +2215,10 @@ describe('Date helpers', function () {
 			expect(helpers.parseDate('23:59:59', 'H:m:s')).toEqual(new Date(2000, 0, 1, 23, 59, 59));
 			expect(helpers.parseDate('20240229', 'YYYYMMDD')).toEqual(new Date(2024, 1, 29));
 			expect(helpers.parseDate('20240229235959999', 'YYYYMMDDHHmmssSSS')).toEqual(new Date(2024, 1, 29, 23, 59, 59, 999));
+			// A literal digit after the year is not part of it, as in what formatDate writes.
+			expect(helpers.parseDate('2024001', 'YYYY[0]MM')).toEqual(new Date(2024, 0, 1));
+			expect(helpers.parseDate(helpers.formatDate(new Date(2024, 4, 5), 'YYYY[1]MMDD'), 'YYYY[1]MMDD')).toEqual(new Date(2024, 4, 5));
+			expect(helpers.parseDate('2024 1', 'YYYY[ 1]')).toEqual(new Date(2024, 0, 1));
 			expect(helpers.parseDate("on 05 [x] o'clock", "[on] DD [[x]] [o'clock]")).toEqual(new Date(2000, 0, 5));
 			expect(helpers.parseDate('PM', 'A')).toEqual(new Date(2000, 0, 1, 12));
 			expect(helpers.parseDate('', '')).toEqual(new Date(2000, 0, 1));
@@ -3366,6 +3419,21 @@ describe('Date helpers under prototype pollution', function () {
 		polluted('days', 5, function () {
 			expect(helpers.addDuration(0, {}).getTime()).toBe(0);
 		});
+	});
+
+	it('mergeIntervals, subtractIntervals and findGaps do not read a last merged interval from an inherited "-1"', function () {
+		const everything = [0, 8.64e15];
+
+		function at(hour: number): Date {
+			return new Date(Date.UTC(2024, 0, 1, hour));
+		}
+
+		polluted('-1', everything, function () {
+			expect(helpers.mergeIntervals([{ start: at(9), end: at(11) }])).toHaveLength(1);
+			expect(helpers.findGaps({ start: at(9), end: at(17) }, [{ start: at(10), end: at(11) }])).toHaveLength(2);
+			expect(helpers.subtractIntervals({ start: at(9), end: at(17) }, [{ start: at(10), end: at(11) }])).toHaveLength(2);
+		});
+		expect(everything).toEqual([0, 8.64e15]);
 	});
 
 	it('eachDayOfInterval, formatDuration and toISOStringLocal ignore inherited options', function () {
