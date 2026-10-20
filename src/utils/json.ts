@@ -37,7 +37,22 @@ export interface JsonWalk {
 	readonly ancestors: object[];
 	/** The same containers, for O(1) cycle detection (a scan of `ancestors` would make deep values quadratic). */
 	readonly onPath: Set<object>;
+	/**
+	 * The JSON of the containers converted so far that hold other containers, by depth: a container shared by several paths (YAML
+	 * aliases build such values) is converted once per depth instead of once per path, which is exponential in the depth of the sharing.
+	 */
+	converted?: Map<object, [depth: number, json: JsonValue] | Map<number, JsonValue>>;
+	/** Whether the conversion under way depends on its path (it wrote `'[Circular]'`, a truncation or a thrown error): not remembered. */
+	dependent?: boolean;
+	/** The number of containers converted so far. */
+	count?: number;
 }
+
+/**
+ * Items of an array so long that its JSON (at least 2 characters an item) cannot fit in a string: refused at once, as `JSON.stringify`
+ * would refuse the text, instead of building a tree that size (a sparse array of length 2 ** 32 - 1 ran the process out of memory).
+ */
+const MAX_JSON_ITEMS = 2 ** 28;
 
 /** `Object.prototype.hasOwnProperty`. */
 const hasOwn = Object.prototype.hasOwnProperty;
@@ -192,6 +207,7 @@ export function toJsonValue(holder: object, key: string | number, walk: JsonWalk
 		// Unwinds the containers a throw (a stack overflow included) left on the path.
 		const { ancestors, onPath } = walk;
 		while (ancestors.length > depth) onPath.delete(ancestors.pop() as object);
+		walk.dependent = true;
 		return thrown(error);
 	}
 }
@@ -224,7 +240,10 @@ function primitive(value: unknown): JsonValue | undefined {
  */
 function toJsonObject(value: object, walk: JsonWalk): JsonValue {
 	const { ancestors, onPath } = walk;
-	if (onPath.has(value)) return '[Circular]';
+	if (onPath.has(value)) {
+		walk.dependent = true;
+		return '[Circular]';
+	}
 	const isArray = Array.isArray(value);
 	// Plain objects and arrays (the bulk of most values) skip the checks below: none of them can hold.
 	const prototype: unknown = isArray ? undefined : Object.getPrototypeOf(value);
@@ -238,7 +257,18 @@ function toJsonObject(value: object, walk: JsonWalk): JsonValue {
 			// A fake `Symbol.toStringTag`: an ordinary object.
 		}
 	}
-	if (ancestors.length > walk.maxDepth) return isArray ? '[Array]' : '[Object]';
+	const depth = ancestors.length;
+	if (depth > walk.maxDepth) {
+		walk.dependent = true;
+		return isArray ? '[Array]' : '[Object]';
+	}
+	// The JSON of a container already converted at this depth: a replacer sees the holder and key of each path, so it disables this.
+	const entry = walk.replacer === undefined ? walk.converted?.get(value) : undefined;
+	const known = entry === undefined ? undefined : Array.isArray(entry) ? (entry[0] === depth ? entry[1] : undefined) : entry.get(depth);
+	if (known !== undefined) return known;
+	const outer = walk.dependent;
+	const before = (walk.count = (walk.count ?? 0) + 1);
+	walk.dependent = false;
 	ancestors.push(value);
 	onPath.add(value);
 	const json = isArray
@@ -248,6 +278,14 @@ function toJsonObject(value: object, walk: JsonWalk): JsonValue {
 			: toJsonMembers(!isPlain && isAnyError(value) ? errorView(value, walk.stack) : value, walk);
 	ancestors.pop();
 	onPath.delete(value);
+	// Remembered when it holds other containers (leaves cost no more to convert again) and does not depend on its path.
+	if (!walk.dependent && walk.count > before && walk.replacer === undefined) {
+		const converted = (walk.converted ??= new Map());
+		if (entry === undefined) converted.set(value, [depth, json]);
+		else if (Array.isArray(entry)) converted.set(value, new Map([entry, [depth, json]]));
+		else entry.set(depth, json);
+	}
+	walk.dependent = outer || walk.dependent;
 	return json;
 }
 
@@ -258,6 +296,7 @@ function toJsonObject(value: object, walk: JsonWalk): JsonValue {
  * @returns {JsonValue[]} The JSON array
  */
 function toJsonItems(items: ReadonlyArray<unknown>, walk: JsonWalk): JsonValue[] {
+	if (items.length >= MAX_JSON_ITEMS) throw new RangeError('Invalid string length');
 	const json: JsonValue[] = [];
 	for (let index = 0; index < items.length; index++) json.push(toJsonValue(items, index, walk) ?? null);
 	return json;

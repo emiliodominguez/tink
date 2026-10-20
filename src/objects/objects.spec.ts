@@ -4491,6 +4491,41 @@ describe('safeStringify', function () {
 		return proxy;
 	}
 
+	it('converts a container shared by several paths once per depth', function () {
+		let reads = 0;
+		const leaf = {
+			get v(): number {
+				reads++;
+				return 1;
+			}
+		};
+		let shared: object = leaf;
+		for (let level = 0; level < 16; level++) shared = { l: shared, r: shared };
+		// 65,536 paths to the leaf: it is read by its parent's single conversion, twice.
+		expect(helpers.safeStringify(shared)).toBe(JSON.stringify(shared));
+		expect(reads).toBe(2 + 2 ** 16);
+		// Shared at several depths: converted once at each.
+		const node = { a: [1, 2] };
+		const mixed = { x: node, y: { z: node, w: { v: node } }, again: [node, { deep: node }] };
+		expect(helpers.safeStringify(mixed)).toBe(JSON.stringify(mixed));
+		// A cycle or a truncation under a shared container depends on the path: never reused elsewhere.
+		const looped: Record<string, unknown> = { inner: { list: [1] } };
+		(looped.inner as Record<string, unknown>).back = looped;
+		const both = { first: looped, second: { nested: looped.inner } };
+		expect(JSON.parse(helpers.safeStringify(both) as string)).toEqual({
+			first: { inner: { list: [1], back: '[Circular]' } },
+			second: { nested: { list: [1], back: { inner: '[Circular]' } } }
+		});
+		expect(helpers.safeStringify({ a: node, b: { c: node } }, { maxDepth: 1 })).toBe('{"a":{"a":"[Array]"},"b":{"c":"[Object]"}}');
+	});
+
+	it('refuses an array too long for its text at once, instead of running out of memory', function () {
+		const sparse: unknown[] = [];
+		sparse.length = 2 ** 32 - 1;
+		sparse[0] = 1;
+		expect(helpers.safeStringify({ a: sparse, b: 2 })).toBe('{"a":"[Throws: Invalid string length]","b":2}');
+	});
+
 	it('writes keys Object.prototype has when Object.prototype also holds a get or set', function () {
 		const proto = Object.prototype as Record<string, unknown>;
 		proto.get = function (): string {
