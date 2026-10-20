@@ -698,6 +698,37 @@ describe('createStore', function () {
 			expect(view.getState()).toEqual({ n: 2 });
 		});
 
+		it('notifies on the next source change after the equality function threw while notifying', function () {
+			const store = createStore(1);
+			let calls = 0;
+			let failAt = 0;
+			const view = store.select(
+				function (n) {
+					return Math.min(n, 2) * 10;
+				},
+				function (a, b) {
+					if (++calls === failAt) throw new Error('equals');
+					return a === b;
+				}
+			);
+			const seen: number[] = [];
+			view.subscribe(function () {
+				seen.push(view.getState());
+			});
+
+			// The recomputation compares once (10 vs 20), the notification once more (the last notified 10 vs 20): that one throws.
+			failAt = calls + 2;
+			expect(function () {
+				store.setState(2);
+			}).toThrow('equals');
+			expect(seen).toEqual([]);
+			// The selected value does not change again, but the subscribers have not seen 20 yet.
+			store.setState(3);
+			expect(seen).toEqual([20]);
+			store.setState(4);
+			expect(seen).toEqual([20]);
+		});
+
 		it('does not attach to the source when the selector throws on subscribe', function () {
 			const store = createStore(-1);
 			const view = store.select(function (n) {
@@ -2679,6 +2710,60 @@ describe('batch', function () {
 		expect(values).toEqual(['on']);
 	});
 
+	it('keeps the reactions to an undo or redo made in a batch in the restored step', function () {
+		const store = createStore({ value: 0, dirty: false });
+		// A reaction to every change, restorations included.
+		store.subscribe(function () {
+			const state = store.getState();
+			if (!state.dirty) store.setState({ ...state, dirty: true });
+		});
+		const history = createHistory(store);
+		store.setState({ value: 1, dirty: false });
+		expect(history.getState()).toEqual({ canUndo: true, canRedo: false, undoCount: 1, redoCount: 0 });
+
+		expect(
+			batch(function () {
+				return history.undo();
+			})
+		).toBe(true);
+		expect(store.getState()).toEqual({ value: 0, dirty: true });
+		// The reaction ran after the batch, yet neither added a step nor cleared the redo step.
+		expect(history.getState()).toEqual({ canUndo: false, canRedo: true, undoCount: 0, redoCount: 1 });
+		batch(function () {
+			history.redo();
+		});
+		expect(store.getState()).toEqual({ value: 1, dirty: true });
+		expect(history.getState()).toEqual({ canUndo: true, canRedo: false, undoCount: 1, redoCount: 0 });
+		// Undo and redo in one batch.
+		batch(function () {
+			history.undo();
+			history.redo();
+			history.undo();
+		});
+		expect(store.getState()).toEqual({ value: 0, dirty: true });
+		expect(history.getState()).toEqual({ canUndo: false, canRedo: true, undoCount: 0, redoCount: 1 });
+		// After the batch, changes are recorded again.
+		store.setState({ value: 2, dirty: true });
+		expect(history.getState()).toEqual({ canUndo: true, canRedo: false, undoCount: 1, redoCount: 0 });
+	});
+
+	it('makes one history step of a change and a history batch that follows it in a batch', function () {
+		const store = createStore(0);
+		const history = createHistory(store);
+		batch(function () {
+			store.setState(1);
+			expect(
+				history.batch(function () {
+					store.setState(2);
+					return 'result';
+				})
+			).toBe('result');
+		});
+		expect(history.getState().undoCount).toBe(1);
+		history.undo();
+		expect(store.getState()).toBe(0);
+	});
+
 	it('notifies a store changed by the listener of another held-back store once', function () {
 		const a = createStore(0);
 		const b = createStore(0);
@@ -3231,6 +3316,31 @@ describe('persistStore', function () {
 		expect(onError).toHaveBeenCalledWith(new RangeError('persistStore: the stored state has version 1, not 2, and no `migrate` was given'));
 	});
 
+	it('reads the version of the stored value once', function () {
+		const store = createStore({ count: 0 });
+		const migrate = jest.fn(function (persisted: unknown): { count: number } {
+			return persisted as { count: number };
+		});
+		let reads = 0;
+		persistStore(store, {
+			key: 'c',
+			storage: memoryStorage({ c: '{}' }),
+			version: 1,
+			migrate,
+			// A getter returning the current version, then another one: the version validated is the one compared.
+			deserialize(): unknown {
+				return {
+					state: { count: 3 },
+					get version(): number {
+						return ++reads === 1 ? 1 : 0;
+					}
+				};
+			}
+		});
+		expect([store.getState(), reads]).toEqual([{ count: 3 }, 1]);
+		expect(migrate).not.toHaveBeenCalled();
+	});
+
 	it('never throws on bad storage: reports to onError and keeps the state', function () {
 		const cases: Array<[PersistStorage, unknown]> = [
 			[memoryStorage({ k: '{not json' }), SyntaxError],
@@ -3559,7 +3669,7 @@ describe('persistStore', function () {
 			});
 		});
 
-		it('writes back a migrated state, and what listeners change in reaction', function () {
+		it('writes back what listeners change in reaction, but not a migrated state', function () {
 			withEvents(function (dispatch) {
 				const storage = memoryStorage();
 				const store = createStore(0);
@@ -3575,13 +3685,51 @@ describe('persistStore', function () {
 					},
 					sync: true
 				});
+				// Written by a tab still running version 0: migrated here, but not written back, or that tab would migrate it back (or
+				// fail to) and write it again, and so on.
+				storage.data.set('n', '{"state":5,"version":0}');
 				dispatch({ key: 'n', newValue: '{"state":5,"version":0}', storageArea: storage });
 				expect(store.getState()).toBe(50);
-				expect(storage.data.get('n')).toBe('{"state":50,"version":1}');
+				expect(storage.calls).toEqual(['get n']);
+				expect(storage.data.get('n')).toBe('{"state":5,"version":0}');
 				dispatch({ key: 'n', newValue: '{"state":500,"version":1}', storageArea: storage });
 				expect(store.getState()).toBe(100);
 				expect(storage.data.get('n')).toBe('{"state":100,"version":1}');
+				// A change of this tab is written in the current version.
+				store.setState(7);
+				expect(storage.data.get('n')).toBe('{"state":7,"version":1}');
 			});
+		});
+
+		it('does not echo a synced state that the store deems equal to its own', function () {
+			withEvents(function (dispatch) {
+				const storage = memoryStorage();
+				// Two tabs whose states only differ in key order: writing this tab's state back would make the other one write its own.
+				const store = createStore(
+					{ b: 2, a: 1 },
+					{
+						equals(x, y) {
+							return x.a === y.a && x.b === y.b;
+						}
+					}
+				);
+				const before = store.getState();
+				persistStore(store, { key: 'k', storage, sync: true });
+				const text = '{"state":{"a":1,"b":2},"version":0}';
+				storage.data.set('k', text);
+				dispatch({ key: 'k', newValue: text, storageArea: storage });
+				expect(store.getState()).toBe(before);
+				expect(storage.calls).toEqual(['get k']);
+				expect(storage.data.get('k')).toBe(text);
+			});
+		});
+
+		it('rejects a non-boolean `sync`', function () {
+			for (const sync of ['false', 1, null]) {
+				expect(function () {
+					persistStore(createStore(0), { key: 'n', storage: memoryStorage(), sync: sync as never });
+				}).toThrow(new TypeError(`persistStore: \`options.sync\` must be a boolean, got ${sync === null ? 'null' : typeof sync}`));
+			}
 		});
 
 		it('reports bad data, and stops listening once disposed', function () {

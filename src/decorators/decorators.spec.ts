@@ -1816,3 +1816,143 @@ describe('Decorators (1.4)', function () {
 		});
 	});
 });
+
+describe('Decorators (pass 3 regressions)', function () {
+	afterEach(function () {
+		jest.clearAllTimers();
+		jest.useRealTimers();
+	});
+
+	/**
+	 * Runs `fn` with each of `keys` planted on `Object.prototype` (an enumerable string, as a JSON deep merge plants it).
+	 * @param {string[]} keys - The planted keys
+	 * @param {() => void} fn - The test
+	 * @returns {void}
+	 */
+	function withPlanted(keys: string[], fn: () => void): void {
+		const prototype = Object.prototype as Record<string, unknown>;
+		for (const key of keys) prototype[key] = 'planted';
+		try {
+			fn();
+		} finally {
+			for (const key of keys) delete prototype[key];
+		}
+	}
+
+	class Widget {
+		@decorators.readonly
+		label: string = 'widget';
+
+		@decorators.readonly
+		late: string | undefined;
+
+		count = 0;
+
+		@decorators.bound
+		self(): Widget {
+			return this;
+		}
+
+		@decorators.memoize
+		square(n: number): number {
+			this.count++;
+			return n * n;
+		}
+
+		@decorators.debounced(10)
+		later(): void {
+			this.count++;
+		}
+
+		@decorators.throttled(10)
+		often(): void {
+			this.count++;
+		}
+
+		@decorators.lazy
+		get total(): number {
+			this.count++;
+			return 42;
+		}
+	}
+
+	it('should create and use instances when Object.prototype has a planted get or set (regression: Object.defineProperty threw)', function () {
+		for (const key of ['get', 'set']) {
+			withPlanted([key], function () {
+				jest.useFakeTimers();
+				// Previously `new Widget()` threw `Getter must be a function: planted` (the @readonly setter), and so did every first call.
+				const widget = new Widget();
+				widget.late = 'set';
+				const { self } = widget;
+				expect([widget.label, widget.late, self(), widget.square(3), widget.square(3), widget.total, widget.total]).toEqual(['widget', 'set', widget, 9, 9, 42, 42]);
+				widget.later();
+				widget.often();
+				jest.advanceTimersByTime(10);
+				// square once, total once, later once, often once.
+				expect(widget.count).toBe(4);
+				// The bound method is cached as before, and assigning it still works.
+				expect(Object.getOwnPropertyDescriptor(widget, 'self')).toMatchObject({ writable: true, enumerable: false, configurable: true });
+				const replacement = constant(1) as unknown as () => Widget;
+				widget.self = replacement;
+				expect(widget.self).toBe(replacement);
+				jest.useRealTimers();
+			});
+		}
+	});
+
+	it('should lock a standard field with its own value when Object.prototype has a planted value (regression: the planted value replaced it)', function () {
+		const { context, runInitializers } = fakeContext('field', 'x');
+		decorators.readonly(undefined, context);
+		withPlanted(['value', 'enumerable'], function () {
+			const instance: { x: number } = { x: 1 };
+			runInitializers(instance);
+			// Previously `{ writable: false, configurable: false }` inherited the planted `value` and `enumerable`.
+			expect(Object.getOwnPropertyDescriptor(instance, 'x')).toEqual({ value: 1, writable: false, enumerable: true, configurable: false });
+			// A field without a value yet becomes an accessor: previously it threw (an accessor with a planted value).
+			const empty: { x: number | undefined } = { x: undefined };
+			runInitializers(empty);
+			empty.x = 2;
+			expect(Object.getOwnPropertyDescriptor(empty, 'x')).toEqual({ value: 2, writable: false, enumerable: true, configurable: false });
+		});
+		withPlanted(['get'], function () {
+			const instance: { x: number } = { x: 1 };
+			runInitializers(instance);
+			expect(Object.getOwnPropertyDescriptor(instance, 'x')).toEqual({ value: 1, writable: false, enumerable: true, configurable: false });
+		});
+	});
+
+	it('should make a legacy static field read-only without taking a planted value (regression)', function () {
+		const target: Record<string, unknown> = { flag: 'own' };
+		withPlanted(['value'], function () {
+			decorators.readonly(target, 'flag');
+		});
+		expect(Object.getOwnPropertyDescriptor(target, 'flag')).toEqual({ value: 'own', writable: false, enumerable: true, configurable: true });
+		// Without a value yet: the accessor, whose first assignment defines the read-only value.
+		const later: Record<string, unknown> = {};
+		withPlanted(['value', 'writable'], function () {
+			decorators.readonly(later, 'flag');
+			later.flag = 'assigned';
+		});
+		expect(Object.getOwnPropertyDescriptor(later, 'flag')).toEqual({ value: 'assigned', writable: false, enumerable: true, configurable: false });
+	});
+
+	it('should bind standard methods and statics when Object.prototype has a planted get (regression: the initializers threw)', function () {
+		const method = function (this: unknown): unknown {
+			return this;
+		};
+		const instanceContext = fakeContext('method', 'who');
+		const staticContext = fakeContext('method', 'who', { static: true });
+		decorators.bound(method, instanceContext.context);
+		decorators.bound(method, staticContext.context);
+		withPlanted(['get'], function () {
+			const instance: Record<string, unknown> = { who: method };
+			instanceContext.runInitializers(instance);
+			const { who } = instance as { who: () => unknown };
+			expect(who()).toBe(instance);
+			class Host {}
+			staticContext.runInitializers(Host);
+			const { who: staticWho } = Host as unknown as { who: () => unknown };
+			expect(staticWho()).toBe(Host);
+		});
+	});
+});

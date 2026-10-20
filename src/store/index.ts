@@ -63,7 +63,10 @@ interface Notifier {
 	subscribe(listener: () => void): Unsubscribe;
 	notify(): void;
 	size(): number;
-	/** While a notification is running, schedules `callback` (once, however often it is deferred) for when its last round ends. */
+	/**
+	 * While a notification is running, or held back by a batch, schedules `callback` (once, however often it is deferred) for when its
+	 * last round ends.
+	 */
 	defer(callback: () => void): boolean;
 }
 
@@ -227,7 +230,8 @@ function createNotifier(): Notifier {
 		},
 
 		defer(callback: () => void): boolean {
-			if (!notifying) return false;
+			// A held notification runs when the batch ends, and its last round then runs the callbacks.
+			if (!notifying && !held) return false;
 			if (!deferred.includes(callback)) deferred.push(callback);
 			return true;
 		}
@@ -335,9 +339,11 @@ function derive<S, T>(source: Pick<ReadonlyStore<S>, 'getState' | 'subscribe'>, 
 	function onSourceChange(): void {
 		const current = getState();
 		if (version === notifiedVersion) return;
+		// The value may have changed and changed back within the round (A, then B read by another listener, then A again). Compared
+		// before the version is marked as notified: when `equals` throws, the next notification of the source compares again.
+		const unchanged = equals(notifiedValue, current);
 		notifiedVersion = version;
-		// The value may have changed and changed back within the round (A, then B read by another listener, then A again).
-		if (equals(notifiedValue, current)) return;
+		if (unchanged) return;
 		notifiedValue = current;
 		notifier.notify();
 	}
@@ -1229,7 +1235,9 @@ function isThenable(value: unknown): boolean {
  * - One notification, one step: for a {@link createStore} store, a change and everything its listeners change in reaction (in any
  *   order, e.g. a listener keeping a derived field up to date) make one step, recorded once the notification has ended. Likewise, what
  *   listeners change in reaction to `undo()` or `redo()` belongs to the restored step: it neither adds a step nor clears the redo
- *   steps. States the store's `equals` deems equal make no step.
+ *   steps. States the store's `equals` deems equal make no step. Inside a {@link batch}, whose listeners run when it ends, everything
+ *   the batch changes after `undo()` or `redo()` belongs to the restored step too, and a `history.batch` called after a change makes
+ *   one step with it.
  * - Other stores do not tell when a notification ends: changes are recorded as the history's listener sees them, so a listener
  *   subscribed after the history that changes the state in reaction makes a step of its own (subscribe it before the history, or
  *   make the change in a `batch`); reactions to `undo()`/`redo()` are only attached to the restored step if the store notifies
@@ -1592,7 +1600,8 @@ export interface PersistOptions<S, P = S> {
 	debounce?: number;
 	/**
 	 * When `true`, follows the changes other tabs (or windows) make to the key: on each `storage` event for it, the new text is
-	 * hydrated into the store as at startup (deserialized, migrated and merged into the current state), without being written back.
+	 * hydrated into the store as at startup (deserialized, migrated and merged into the current state), without being written back (not
+	 * even once migrated: the other tab may run another version).
 	 * Only native storages (`localStorage`, `sessionStorage`) fire these events, and only in browsers; elsewhere the option does nothing.
 	 * Removing the key in another tab leaves the state as it is. The store must notify synchronously (as this module's stores do), so
 	 * that hydrating does not echo the state back to the other tabs.
@@ -1691,7 +1700,7 @@ function identity<T>(value: T): T {
  * `partialize`, `merge`, `debounce`, `sync` and `onError`
  * @returns {Unsubscribe} Stops persisting: writes a pending change, then unsubscribes from the store and from `storage` events (idempotent)
  * @throws {TypeError} when `store` lacks one of the methods, `options` is not an object, `key` is not a string, `storage` is not a
- * storage, a function option is not a function, or `version` or `debounce` is not a number
+ * storage, a function option is not a function, `version` or `debounce` is not a number, or `sync` is not a boolean
  * @throws {RangeError} when `version` is not an integer `>= 0`, or `debounce` is not a usable delay
  * @example
  * // An in-memory storage (in a browser, omit `storage` to use localStorage)
@@ -1747,6 +1756,7 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 	const merge = readOption(settings, 'merge', mergeShallow as (persisted: P, current: S) => S);
 	const onError = readOption(settings, 'onError');
 	const sync = readOption(settings, 'sync', false);
+	if (typeof sync !== 'boolean') throw new TypeError(`persistStore: \`options.sync\` must be a boolean, got ${describe(sync)}`);
 	assertInteger('persistStore', 'options.version', version);
 	assertDelay('persistStore', 'options.debounce', debounce);
 	assertFunction('persistStore', 'options.serialize', serialize);
@@ -1792,10 +1802,11 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 			if (typeof text !== 'string') throw new TypeError(`persistStore: \`storage.getItem\` must return a string or null, got ${describe(text)}`);
 			stored = text;
 			const persisted = deserialize(text);
-			if (!isObject(persisted) || !Object.hasOwn(persisted, 'state') || typeof own(persisted, 'version') !== 'number') {
+			// Each field is read once (a custom `deserialize` may return getters).
+			const from = isObject(persisted) ? own(persisted, 'version') : undefined;
+			if (!isObject(persisted) || !Object.hasOwn(persisted, 'state') || typeof from !== 'number') {
 				throw new TypeError(`persistStore: the stored value must be a { state, version } object, got ${describe(persisted)}`);
 			}
-			const from = persisted.version as number;
 			let state = persisted.state;
 			if (from !== version) {
 				if (migrate === undefined) throw new RangeError(`persistStore: the stored state has version ${from}, not ${version}, and no \`migrate\` was given`);
@@ -1803,8 +1814,9 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 			}
 			const next = merge(state as P, getState.call(store));
 			// The storage still holds the old version: replace it with the migrated state now (not with whatever the store holds after
-			// `setState`, which a store may defer or ignore), or every load would migrate it again, and fail once `migrate` is gone.
-			if (from !== version) writeState(next);
+			// `setState`, which a store may defer or ignore), or every load would migrate it again, and fail once `migrate` is gone. Not
+			// for a state another tab wrote: that tab runs another version, and would migrate it back and write it again, endlessly.
+			if (from !== version && !syncing) writeState(next);
 			synced = next;
 			// Wrapped: `setState` would call a function-valued state as an updater.
 			setState.call(store, function (): S {
@@ -1836,6 +1848,7 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 		if (storageArea !== storage || (changed !== key && changed !== null)) return;
 		// The storage no longer holds what this tab wrote (`hydrate` records what it holds now, when it is a string).
 		stored = null;
+		const before = getState.call(store);
 		syncing = true;
 		let set: boolean;
 		try {
@@ -1845,8 +1858,10 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 		} finally {
 			syncing = false;
 		}
-		// What this tab's listeners changed in reaction is a change of its own, written as usual.
-		if (set && !Object.is(getState.call(store), synced)) onChange();
+		// What this tab's listeners changed in reaction is a change of its own, written as usual; a state the store did not take (its
+		// `equals` deemed it equal to the current one) is not, or two tabs whose states only differ in key order would echo each other.
+		const after = getState.call(store);
+		if (set && !Object.is(after, synced) && !Object.is(after, before)) onChange();
 	}
 
 	/**
