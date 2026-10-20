@@ -118,6 +118,27 @@ export default [
 		}
 	},
 	{
+		// Removing a once listener as it runs, or through its unsubscribe function, is O(1) amortized (it was O(n), and copied the list
+		// during an emit): n of them cost O(n), not O(n²).
+		name: 'once + emit (1,000 listeners)',
+		fn: function () {
+			const emitter = createEmitter();
+			for (let i = 0; i < 1000; i++) emitter.once('tick', handlers[i % 20]);
+			emitter.emit('tick', 1);
+			return emitter.listenerCount();
+		}
+	},
+	{
+		name: 'on + unsubscribe (1,000 listeners)',
+		fn: function () {
+			const emitter = createEmitter();
+			const stops = [];
+			for (let i = 0; i < 1000; i++) stops.push(emitter.on('tick', handlers[i % 20]));
+			for (let i = 0; i < 1000; i++) stops[i]();
+			return emitter.listenerCount();
+		}
+	},
+	{
 		name: 'on + off (20 listeners, LIFO)',
 		fn: function () {
 			for (let i = 0; i < 20; i++) churn.on('tick', handlers[i]);

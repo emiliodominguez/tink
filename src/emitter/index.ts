@@ -1,5 +1,5 @@
 import { AbortError, TimeoutError } from '../async/index.js';
-import { assertDelay, assertFunction } from '../utils/assert.js';
+import { assertDelay, assertFunction, readOption } from '../utils/assert.js';
 import { assertOptionalSignal, detach, reasonOf } from '../utils/signal.js';
 import type { AbortSignalLike, AnyFunction } from '../utils/index.js';
 
@@ -105,12 +105,38 @@ interface Registration {
 }
 
 /**
- * The registrations of one event, in registration order.
+ * The registrations of one event.
  */
 interface Listeners {
-	list: Registration[];
-	/** Number of `emit` calls currently iterating `list`: while it is non-zero, `list` is copied on write instead of mutated. */
+	/**
+	 * The registrations in registration order, removed ones included until {@link compact} drops them. An `emit` iterates it by index up
+	 * to the length it had when the emit started, so a registration added meanwhile (pushed at the end) is not called, and removing one
+	 * only marks it inactive: neither copies the list, and each removal costs O(1) amortized.
+	 */
+	readonly list: Registration[];
+	/** Number of inactive registrations in `list`. */
+	removed: number;
+	/** Number of `emit` calls iterating `list`: it is only compacted while none is. */
 	emitting: number;
+}
+
+/**
+ * Drops the inactive registrations once they are half of the list, unless an `emit` iterates it, so that the list stays within twice
+ * the number of registrations.
+ * @param {Listeners} listeners - The registrations of an event
+ * @returns {void}
+ */
+function compact(listeners: Listeners): void {
+	const list = listeners.list;
+
+	if (listeners.emitting > 0 || listeners.removed * 2 < list.length) return;
+
+	let kept = 0;
+
+	for (const registration of list) if (registration.active) list[kept++] = registration;
+	// Faster than assigning `length` (a generic store).
+	while (list.length > kept) list.pop();
+	listeners.removed = 0;
 }
 
 /**
@@ -128,6 +154,8 @@ interface Listeners {
  * - A throwing listener does not stop the others: every listener is called, then the error is rethrown (or an `AggregateError` holding
  *   every error, in call order, when several listeners threw).
  * - `'*'` is reserved for wildcard listeners and cannot be emitted.
+ * - Adding a listener, removing one through its unsubscribe function and removing a `once` listener as it runs cost O(1) amortized,
+ *   also during an emit (which neither copies the listener list nor is affected by the changes).
  * @template Events - Maps each event name to its payload type (`void` payloads can be emitted without argument)
  * @returns {Emitter<Events>} A new emitter
  * @throws {TypeError} from `on`/`once`/`off` when the handler is not a function, and (as a rejection) from `waitFor` when `filter` is not
@@ -150,8 +178,7 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 	const registry = new Map<PropertyKey, Listeners>();
 
 	/**
-	 * Adds a registration. The list is mutated in place, unless an `emit` is iterating it: then it is copied, so that the emit keeps its
-	 * snapshot.
+	 * Adds a registration at the end of the list of `event` (an `emit` iterating the list does not reach it).
 	 * @param {PropertyKey} event - The event name (`'*'` for wildcard listeners)
 	 * @param {AnyFunction} handler - The listener
 	 * @param {boolean} once - Whether to remove the registration before its first call
@@ -159,54 +186,42 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 	 */
 	function add(event: PropertyKey, handler: AnyFunction, once: boolean): Unsubscribe {
 		const registration: Registration = { handler: handler as (...args: unknown[]) => unknown, once, active: true };
-		const listeners = registry.get(event);
+		let listeners = registry.get(event);
 
-		if (listeners === undefined) registry.set(event, { list: [registration], emitting: 0 });
-		else if (listeners.emitting > 0) listeners.list = [...listeners.list, registration];
+		if (listeners === undefined) registry.set(event, (listeners = { list: [registration], removed: 0, emitting: 0 }));
 		else listeners.list.push(registration);
 
+		const owner = listeners;
+
 		return function (): void {
-			remove(event, registration);
+			if (!registration.active) return;
+			registration.active = false;
+			release(event, owner, 1);
 		};
 	}
 
 	/**
-	 * Deactivates and removes the registrations of `event` matching `target` (in place, or into a copy while an `emit` iterates the list).
+	 * Accounts for registrations of `event` just marked inactive: forgets the event once it has no active registration left, and
+	 * compacts its list otherwise.
 	 * @param {PropertyKey} event - The event name
-	 * @param {Registration | AnyFunction} [target] - A registration, or a handler (all its registrations), or nothing (every registration)
-	 * @returns {boolean} Whether anything was removed
+	 * @param {Listeners} listeners - Its registrations (those of the registry: an inactive registration is never released again)
+	 * @param {number} count - Number of registrations just marked inactive
+	 * @returns {void}
 	 */
-	function remove(event: PropertyKey, target?: Registration | AnyFunction): boolean {
-		const listeners = registry.get(event);
-
-		if (listeners === undefined) return false;
-
-		const list = listeners.list;
-		const length = list.length;
-		const kept = listeners.emitting > 0 ? [] : list;
-		let count = 0;
-
-		for (let i = 0; i < length; i++) {
-			const registration = list[i];
-
-			if (target === undefined || registration === target || registration.handler === target) registration.active = false;
-			else kept[count++] = registration;
-		}
-
-		if (count === 0) registry.delete(event);
-		// Faster than assigning `length` (a generic store).
-		while (kept.length > count) kept.pop();
-		listeners.list = kept;
-
-		return count !== length;
+	function release(event: PropertyKey, listeners: Listeners, count: number): void {
+		listeners.removed += count;
+		// An emit iterating the list keeps it: only the registry forgets it.
+		if (listeners.removed === listeners.list.length) registry.delete(event);
+		else compact(listeners);
 	}
 
 	/**
-	 * Calls the active registrations of a snapshot, collecting thrown errors. Listeners are called with no argument, `(payload)` or, for
-	 * wildcard listeners, `(event, payload)`.
+	 * Calls the active registrations among the first `length` of a list, collecting thrown errors. Listeners are called with no argument,
+	 * `(payload)` or, for wildcard listeners, `(event, payload)`.
 	 * @param {PropertyKey} event - The emitted event
-	 * @param {ReadonlyArray<Registration>} snapshot - The registrations at the start of the emit
-	 * @param {boolean} wildcard - Whether the snapshot holds the wildcard listeners
+	 * @param {Listeners} listeners - The registrations of the event, or the wildcard ones
+	 * @param {number} length - The length of their list when the emit started
+	 * @param {boolean} wildcard - Whether these are the wildcard listeners
 	 * @param {boolean} withPayload - Whether a payload argument was given to `emit`
 	 * @param {unknown} payload - The payload
 	 * @param {unknown[] | undefined} errors - The errors collected so far, if any
@@ -214,24 +229,32 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 	 */
 	function run(
 		event: PropertyKey,
-		snapshot: ReadonlyArray<Registration>,
+		listeners: Listeners,
+		length: number,
 		wildcard: boolean,
 		withPayload: boolean,
 		payload: unknown,
 		errors: unknown[] | undefined
 	): unknown[] | undefined {
-		for (let i = 0; i < snapshot.length; i++) {
-			const registration = snapshot[i];
+		// Not compacted while the emit runs: the indexes are stable.
+		const list = listeners.list;
+
+		for (let i = 0; i < length; i++) {
+			const registration = list[i];
 
 			if (!registration.active) continue;
 			if (registration.once) {
-				remove(wildcard ? WILDCARD : event, registration);
+				registration.active = false;
+				release(wildcard ? WILDCARD : event, listeners, 1);
 			}
 
+			// Called as a plain function: `this` is `undefined`, not the registration (which a listener could otherwise reactivate).
+			const handler = registration.handler;
+
 			try {
-				if (wildcard) registration.handler(event, payload);
-				else if (withPayload) registration.handler(payload);
-				else registration.handler();
+				if (wildcard) handler(event, payload);
+				else if (withPayload) handler(payload);
+				else handler();
 			} catch (error) {
 				errors = errors ?? [];
 				errors.push(error);
@@ -268,31 +291,49 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 		off(event: PropertyKey, handler: AnyFunction): boolean {
 			assertFunction('off', 'handler', handler);
 
-			return remove(event, handler);
+			const listeners = registry.get(event);
+
+			if (listeners === undefined) return false;
+
+			let count = 0;
+
+			for (const registration of listeners.list) {
+				if (registration.active && registration.handler === handler) {
+					registration.active = false;
+					count++;
+				}
+			}
+			if (count === 0) return false;
+			release(event, listeners, count);
+
+			return true;
 		},
 
 		emit(event: PropertyKey, ...args: unknown[]): void {
 			assertNotWildcard('emit', event);
 
-			// Both snapshots are taken (and protected from in-place mutation) before any listener runs.
 			const listeners = registry.get(event);
 			const wildcards = registry.get(WILDCARD);
+
+			if (listeners === undefined && wildcards === undefined) return;
+
 			const withPayload = args.length > 0;
 			const payload = args[0];
-			const list = listeners?.list;
-			const wildcardList = wildcards?.list;
+			// Both snapshots (the list lengths) are taken before any listener runs.
+			const length = listeners === undefined ? 0 : listeners.list.length;
+			const wildcardLength = wildcards === undefined ? 0 : wildcards.list.length;
 			let errors: unknown[] | undefined;
 
 			if (listeners !== undefined) listeners.emitting++;
 			if (wildcards !== undefined) wildcards.emitting++;
-			// The counters always come back down, even when a stack overflow escapes from `run`: a raised counter would make every later
-			// `on` copy the listener list.
+			// The counters always come back down, even when a stack overflow escapes from `run`: a raised counter would keep the list from
+			// ever being compacted.
 			try {
-				if (list !== undefined) errors = run(event, list, false, withPayload, payload, errors);
-				if (wildcardList !== undefined) errors = run(event, wildcardList, true, withPayload, payload, errors);
+				if (listeners !== undefined) errors = run(event, listeners, length, false, withPayload, payload, errors);
+				if (wildcards !== undefined) errors = run(event, wildcards, wildcardLength, true, withPayload, payload, errors);
 			} finally {
-				if (listeners !== undefined) listeners.emitting--;
-				if (wildcards !== undefined) wildcards.emitting--;
+				if (listeners !== undefined && --listeners.emitting === 0) compact(listeners);
+				if (wildcards !== undefined && --wildcards.emitting === 0) compact(wildcards);
 			}
 
 			if (errors === undefined) return;
@@ -301,26 +342,30 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 		},
 
 		clear(event?: PropertyKey): void {
-			const events = event === undefined ? [...registry.keys()] : [event];
-
-			for (const name of events) {
-				remove(name);
+			for (const listeners of event === undefined ? registry.values() : [registry.get(event)]) {
+				// Inactive, they are skipped by an emit iterating the list, and their unsubscribe functions do nothing.
+				if (listeners !== undefined) for (const registration of listeners.list) registration.active = false;
 			}
+			if (event === undefined) registry.clear();
+			else registry.delete(event);
 		},
 
 		listenerCount(event?: PropertyKey): number {
-			if (event !== undefined) return registry.get(event)?.list.length ?? 0;
-
 			let total = 0;
 
-			for (const listeners of registry.values()) total += listeners.list.length;
+			for (const listeners of event === undefined ? registry.values() : [registry.get(event)]) {
+				if (listeners !== undefined) total += listeners.list.length - listeners.removed;
+			}
 
 			return total;
 		},
 
 		waitFor(event: PropertyKey, options: WaitForOptions<unknown> = {}): Promise<never> {
 			return new Promise<never>(function (resolve, reject) {
-				const { signal, timeout = Infinity, filter } = options;
+				// Read as own properties: a value inherited from a polluted `Object.prototype` is ignored.
+				const signal = readOption(options, 'signal');
+				const timeout = readOption(options, 'timeout', Infinity);
+				const filter = readOption(options, 'filter');
 
 				assertNotWildcard('waitFor', event);
 				assertDelay('waitFor', 'timeout', timeout, true);

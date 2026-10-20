@@ -160,6 +160,185 @@ describe('createEmitter (properties)', function () {
 		);
 	});
 
+	it('behaves like a copy-on-emit reference when listeners add, remove, clear and emit during an emit', function () {
+		/** What a listener does each time it is called, in turn (nothing once its actions are used up). */
+		type Action =
+			| { kind: 'on'; event: Target; handler: number; once: boolean }
+			| { kind: 'off'; event: Target; handler: number }
+			| { kind: 'unsubscribe'; index: number }
+			| { kind: 'clear'; event: Target | undefined }
+			| { kind: 'emit'; event: Name }
+			| { kind: 'throw' };
+
+		const actionArb: fc.Arbitrary<Action> = fc.oneof(
+			{ arbitrary: fc.record({ kind: fc.constant('on' as const), event: targetArb, handler: handlerArb, once: fc.boolean() }), weight: 3 },
+			{ arbitrary: fc.record({ kind: fc.constant('off' as const), event: targetArb, handler: handlerArb }), weight: 1 },
+			{ arbitrary: fc.record({ kind: fc.constant('unsubscribe' as const), index: fc.nat() }), weight: 2 },
+			{ arbitrary: fc.record({ kind: fc.constant('clear' as const), event: fc.option(targetArb, { nil: undefined }) }), weight: 1 },
+			{ arbitrary: fc.record({ kind: fc.constant('emit' as const), event: nameArb }), weight: 2 },
+			{ arbitrary: fc.constant({ kind: 'throw' as const }), weight: 1 }
+		);
+
+		interface Api {
+			on(event: Target, handler: (...args: unknown[]) => void, once: boolean): () => void;
+			off(event: Target, handler: (...args: unknown[]) => void): boolean;
+			emit(event: Name, payload: number): void;
+			clear(event?: Target): void;
+			listenerCount(event?: Target): number;
+		}
+
+		/** The documented semantics, written naively: every emit copies the lists, removal filters them. */
+		function reference(): Api {
+			interface Entry {
+				handler: (...args: unknown[]) => void;
+				once: boolean;
+				active: boolean;
+			}
+			const lists = new Map<Target, Entry[]>();
+
+			function drop(event: Target, entry: Entry): void {
+				entry.active = false;
+				lists.set(
+					event,
+					(lists.get(event) ?? []).filter(function (other) {
+						return other !== entry;
+					})
+				);
+			}
+
+			function call(event: Name, target: Target, snapshot: Entry[], payload: number, errors: unknown[]): void {
+				for (const entry of snapshot) {
+					if (!entry.active) continue;
+					if (entry.once) drop(target, entry);
+					try {
+						if (target === '*') entry.handler(event, payload);
+						else entry.handler(payload);
+					} catch (error) {
+						errors.push(error);
+					}
+				}
+			}
+
+			return {
+				on(event, handler, once) {
+					const entry: Entry = { handler, once, active: true };
+					lists.set(event, [...(lists.get(event) ?? []), entry]);
+					return function () {
+						if (entry.active) drop(event, entry);
+					};
+				},
+				off(event, handler) {
+					const matching = (lists.get(event) ?? []).filter(function (entry) {
+						return entry.handler === handler;
+					});
+					for (const entry of matching) drop(event, entry);
+					return matching.length > 0;
+				},
+				emit(event, payload) {
+					const snapshot = [...(lists.get(event) ?? [])];
+					const wildcards = [...(lists.get('*') ?? [])];
+					const errors: unknown[] = [];
+					call(event, event, snapshot, payload, errors);
+					call(event, '*', wildcards, payload, errors);
+					if (errors.length === 1) throw errors[0];
+					if (errors.length > 1) throw new AggregateError(errors);
+				},
+				clear(event) {
+					for (const [target, entries] of lists) {
+						if (event !== undefined && target !== event) continue;
+						for (const entry of entries) entry.active = false;
+						lists.delete(target);
+					}
+				},
+				listenerCount(event) {
+					if (event !== undefined) return (lists.get(event) ?? []).length;
+					let total = 0;
+					for (const entries of lists.values()) total += entries.length;
+					return total;
+				}
+			};
+		}
+
+		function actual(): Api {
+			const emitter = createEmitter<Events>();
+			return {
+				on(event, handler, once) {
+					return once ? emitter.once(event as Name, handler) : emitter.on(event as Name, handler);
+				},
+				off(event, handler) {
+					return emitter.off(event as Name, handler);
+				},
+				emit(event, payload) {
+					emitter.emit(event, payload);
+				},
+				clear(event) {
+					emitter.clear(event);
+				},
+				listenerCount(event) {
+					return emitter.listenerCount(event);
+				}
+			};
+		}
+
+		/** Runs the scenario on an implementation and records everything observable. */
+		function play(api: Api, scripts: Action[][], ops: Op[]): unknown[] {
+			const log: unknown[] = [];
+			const cursors = scripts.map(function () {
+				return 0;
+			});
+			const subscriptions: Array<() => void> = [];
+			let depth = 0;
+			const handlers = scripts.map(function (_, index) {
+				return function (...args: unknown[]): void {
+					log.push(['call', index, ...args]);
+					const action = scripts[index][cursors[index]++];
+					if (action === undefined) return;
+					perform(action);
+				};
+			});
+
+			function perform(action: Action | Op): void {
+				switch (action.kind) {
+					case 'on':
+						subscriptions.push(api.on(action.event, handlers[action.handler], action.once));
+						break;
+					case 'off':
+						log.push(['off', api.off(action.event, handlers[action.handler])]);
+						break;
+					case 'unsubscribe':
+						if (subscriptions.length > 0) subscriptions[action.index % subscriptions.length]();
+						break;
+					case 'clear':
+						api.clear(action.event);
+						break;
+					case 'emit':
+						if (depth > 4) break;
+						depth++;
+						try {
+							api.emit(action.event, 'payload' in action ? action.payload : depth);
+						} catch (error) {
+							log.push(['threw', error instanceof AggregateError ? error.errors.length : 1]);
+						} finally {
+							depth--;
+						}
+						break;
+					case 'throw':
+						throw new Error('listener');
+				}
+				log.push(['count', ...(['a', 'b', 'c', '*'] as const).map(api.listenerCount), api.listenerCount()]);
+			}
+
+			for (const op of ops) perform(op);
+			return log;
+		}
+
+		fc.assert(
+			fc.property(fc.array(fc.array(actionArb, { maxLength: 4 }), { minLength: 4, maxLength: 4 }), fc.array(opArb, { maxLength: 40 }), function (scripts, ops) {
+				expect(play(actual(), scripts, ops)).toEqual(play(reference(), scripts, ops));
+			})
+		);
+	});
+
 	it('waitFor resolves with the first payload accepted by the filter and always removes its listener', async function () {
 		await fc.assert(
 			fc.asyncProperty(fc.array(fc.integer({ min: -50, max: 50 }), { maxLength: 20 }), fc.integer({ min: -50, max: 50 }), async function (payloads, threshold) {

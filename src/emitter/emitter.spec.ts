@@ -464,6 +464,46 @@ describe('createEmitter', function () {
 			expect(listenerCount()).toBe(1);
 		});
 
+		it('calls listeners without a receiver (not with an internal record they could change)', function () {
+			const events = createEmitter<TestEvents>();
+			const receivers: unknown[] = [];
+
+			events.on('count', function (this: unknown) {
+				receivers.push(this);
+			});
+			events.on('*', function (this: unknown) {
+				receivers.push(this);
+			});
+			events.emit('count', 1);
+			expect(receivers).toEqual([undefined, undefined]);
+		});
+
+		it('handles thousands of once listeners and unsubscriptions, also during an emit', function () {
+			const events = createEmitter<TestEvents>();
+			const calls: number[] = [];
+			const stops: Array<() => void> = [];
+
+			for (let i = 0; i < 5000; i++) {
+				events.once('count', function () {
+					calls.push(i);
+				});
+			}
+			// Unsubscribes every other listener of 'maybe' while 'count' is being emitted.
+			for (let i = 0; i < 5000; i++) stops.push(events.on('maybe', jest.fn()));
+			events.on('*', function () {
+				for (let i = 0; i < stops.length; i += 2) stops[i]();
+			});
+			events.emit('count', 1);
+			events.emit('count', 2);
+
+			expect(calls).toHaveLength(5000);
+			expect(calls[4999]).toBe(4999);
+			expect(events.listenerCount('count')).toBe(0);
+			expect(events.listenerCount('maybe')).toBe(2500);
+			for (const stop of stops) stop();
+			expect(events.listenerCount()).toBe(1);
+		});
+
 		it('rejects non-function handlers and emitting the wildcard', function () {
 			const events = createEmitter<TestEvents>();
 
@@ -835,6 +875,26 @@ describe('createEmitter', function () {
 			controller.abort();
 			await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
 			expect(events.listenerCount()).toBe(0);
+		});
+
+		it('ignores options inherited from a polluted Object.prototype', async function () {
+			const events = createEmitter<TestEvents>();
+			const proto = Object.prototype as Record<string, unknown>;
+
+			proto.filter = function () {
+				return false;
+			};
+			proto.timeout = 0;
+			proto.signal = { aborted: true, reason: 'polluted', addEventListener: jest.fn(), removeEventListener: jest.fn() };
+			try {
+				const promise = events.waitFor('count', {});
+				events.emit('count', 1);
+				await expect(promise).resolves.toBe(1);
+			} finally {
+				delete proto.filter;
+				delete proto.timeout;
+				delete proto.signal;
+			}
 		});
 
 		it('rejects invalid arguments', async function () {
