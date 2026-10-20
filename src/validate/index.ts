@@ -57,6 +57,32 @@ export interface SemVer {
 }
 
 /**
+ * Options accepted by {@link satisfiesSemver}, {@link compileSemverRange}, {@link isSemverRange}, {@link maxSatisfyingSemver} and
+ * {@link minSatisfyingSemver}.
+ */
+export interface SemverRangeOptions {
+	/**
+	 * Let a pre-release version satisfy a range like any other version. By default (as in npm and node-semver) a pre-release only
+	 * satisfies a comparator set that names a pre-release of the same `major.minor.patch`: `1.3.0-beta` does not satisfy `^1.2.0`, while
+	 * `1.2.0-rc.2` satisfies `^1.2.0-rc.1`. Defaults to `false`.
+	 */
+	readonly includePrerelease?: boolean;
+}
+
+/** The kinds of increment applied by {@link incrementSemver} (node-semver's `ReleaseType`). */
+export type SemverRelease = 'major' | 'minor' | 'patch' | 'premajor' | 'preminor' | 'prepatch' | 'prerelease' | 'release';
+
+/**
+ * Options accepted by {@link incrementSemver}.
+ */
+export interface IncrementSemverOptions {
+	/** The pre-release identifier(s) to use, such as `'beta'` or `'rc.dev'` (dot-separated pre-release identifiers). An empty string counts as none. */
+	readonly identifier?: string;
+	/** The number a new pre-release counter starts at: `'0'` (the default) or `'1'`; `false` appends no counter to `identifier`. */
+	readonly identifierBase?: '0' | '1' | false;
+}
+
+/**
  * How {@link isBase64} treats `=` padding: allowed but not needed, mandatory, or not allowed.
  */
 export type Base64Padding = 'optional' | 'required' | 'forbidden';
@@ -691,12 +717,18 @@ function compareIdentifiers(a: string, b: string): -1 | 0 | 1 {
  */
 function semverOrThrow(value: unknown): RegExpExecArray {
 	const match = matchSemver(value);
-	if (match === null) {
-		// At most 50 characters of the value are quoted, so that an attacker-sized input does not end up whole in logs.
-		const quoted = typeof value === 'string' ? JSON.stringify(value.length > 50 ? `${value.slice(0, 50)}…` : value) : typeof value;
-		throw new TypeError(`compareSemver: ${quoted} is not a valid semantic version`);
-	}
+	if (match === null) throw new TypeError(`compareSemver: ${quoteValue(value)} is not a valid semantic version`);
 	return match;
+}
+
+/**
+ * Shows a rejected value in an error message: a string as JSON, cut to 50 characters so that an attacker-sized input does not end up
+ * whole in logs, anything else by its type.
+ * @param {unknown} value - The value
+ * @returns {string} Its text for the message
+ */
+function quoteValue(value: unknown): string {
+	return typeof value === 'string' ? JSON.stringify(value.length > 50 ? `${value.slice(0, 50)}…` : value) : describe(value);
 }
 
 /**
@@ -738,6 +770,979 @@ export function compareSemver(a: string, b: string): -1 | 0 | 1 {
 	}
 
 	return Math.sign(leftIds.length - rightIds.length) as -1 | 0 | 1;
+}
+
+/*
+ * Semver ranges, written to give exactly the answers of node-semver 7.8.5 without `loose`. node-semver desugars a range with a chain of
+ * regular expressions, and its quirks are part of what npm accepts (`>= 1.2.3` and `^ 1.2.3` are valid, `>  1.2.3` with two spaces is
+ * not, `1.2.3 - 2` is a hyphen range, build metadata anywhere is dropped). The parser below follows the same steps on the same
+ * grammar, with hand-written scanners instead of the regular expressions, so that it runs in linear time.
+ */
+
+/** Bits of a comparator's operator: a version satisfies the comparator when its order against the bound is one of the set bits. */
+const LESS = 1;
+/** See {@link LESS}. */
+const GREATER = 2;
+/** See {@link LESS}. */
+const EQUAL = 4;
+
+/** The lowest pre-release, so that an upper bound `<1.3.0-0` excludes the pre-releases of `1.3.0` and a lower bound `>=1.2.0-0` includes those of `1.2.0`. */
+const LOWEST_PRERELEASE = '0';
+
+/** The longest version node-semver parses (its `MAX_LENGTH`); longer versions satisfy nothing. */
+const SEMVER_MAX_LENGTH = 256;
+
+/** The longest number node-semver's range grammar reads (`[1-9]\d{0,256}`), and the cap on an identifier's leading digits. */
+const MAX_NUMBER_DIGITS = 257;
+
+/** The most characters node-semver's grammar reads after the first letter or hyphen of an alphanumeric identifier. */
+const MAX_IDENTIFIER_TAIL = 250;
+
+/** Build metadata, which node-semver deletes from a range wherever it appears. */
+const RANGE_BUILD_PATTERN = /\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*/g;
+
+/** A space after an operator, a tilde, a caret or another space: only then can a space be dropped before splitting a range. */
+const OPERATOR_SPACE_PATTERN = /[<>=~^ ] /;
+
+/** A version read by {@link readVersion}: identifiers below `Number.MAX_SAFE_INTEGER` are numbers, and `prerelease` is `undefined` on a release. */
+interface ParsedVersion {
+	readonly major: number;
+	readonly minor: number;
+	readonly patch: number;
+	readonly prerelease: (string | number)[] | undefined;
+}
+
+/** A comparator of a compiled range: a version satisfies it when its order against the bound (see {@link orderVersions}) is in `operator`. */
+interface SemverComparator extends ParsedVersion {
+	readonly operator: number;
+}
+
+/** A compiled range: a version satisfies it when it satisfies every comparator of one of the sets (an empty set allows any version). */
+type CompiledRange = ReadonlyArray<ReadonlyArray<SemverComparator>>;
+
+/** The value of the number read by the last {@link readNumber} call (`-1` for a wildcard). Module state, so that scanning allocates nothing. */
+let scannedNumber = 0;
+/** The major part read by the last {@link readPartial} call (`-1` for a wildcard or a missing part, like the other parts). */
+let partialMajor = 0;
+/** The minor part read by the last {@link readPartial} call. */
+let partialMinor = 0;
+/** The patch part read by the last {@link readPartial} call. */
+let partialPatch = 0;
+/** The pre-release read by the last {@link readPartial} call, as written, or `undefined`. */
+let partialPrerelease: string | undefined;
+
+/**
+ * Tells whether a character code is an ASCII digit.
+ * @param {number} code - The character code
+ * @returns {boolean} `true` for `0`–`9`
+ */
+function isDigitCode(code: number): boolean {
+	return code >= 48 && code <= 57;
+}
+
+/**
+ * Tells whether a character code is an ASCII letter or a hyphen.
+ * @param {number} code - The character code
+ * @returns {boolean} `true` for `A`–`Z`, `a`–`z` and `-`
+ */
+function isLetterCode(code: number): boolean {
+	return (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 45;
+}
+
+/**
+ * Tells whether a character code can start a version or partial version: a digit, `x`, `X` or `*`.
+ * @param {number} code - The character code
+ * @returns {boolean} `true` when a (partial) version can start with it
+ */
+function isPartialStart(code: number): boolean {
+	return isDigitCode(code) || code === 120 || code === 88 || code === 42;
+}
+
+/**
+ * Reads a number (`0`, or up to 257 digits without a leading zero) or a wildcard (`x`, `X`, `*`) at `index` into {@link scannedNumber}.
+ * Numbers above `Number.MAX_SAFE_INTEGER` are read approximately: they are rejected wherever they are used.
+ * @param {string} text - The text
+ * @param {number} index - Where the number starts
+ * @returns {number} The index after it, or `-1` when there is none
+ */
+function readNumber(text: string, index: number): number {
+	const code = text.charCodeAt(index);
+	if (code === 120 || code === 88 || code === 42) {
+		scannedNumber = -1;
+		return index + 1;
+	}
+	if (!isDigitCode(code)) return -1;
+
+	let value = code - 48;
+	let end = index + 1;
+	if (value !== 0) {
+		const limit = Math.min(text.length, index + MAX_NUMBER_DIGITS);
+		while (end < limit && isDigitCode(text.charCodeAt(end))) value = value * 10 + (text.charCodeAt(end++) - 48);
+	}
+	scannedNumber = value;
+	return end;
+}
+
+/**
+ * Reads a pre-release identifier at `index` as node-semver's grammar does: an alphanumeric identifier (at most 256 digits, a letter or
+ * hyphen, then at most 250 letters, digits and hyphens), else a number without a leading zero.
+ * @param {string} text - The text
+ * @param {number} index - Where the identifier starts
+ * @returns {number} The index after the longest identifier there, or `-1` when there is none
+ */
+function readIdentifier(text: string, index: number): number {
+	let end = index;
+	while (isDigitCode(text.charCodeAt(end))) end++;
+	if (end - index < MAX_NUMBER_DIGITS && isLetterCode(text.charCodeAt(end))) {
+		const limit = Math.min(text.length, end + 1 + MAX_IDENTIFIER_TAIL);
+		end++;
+		while (end < limit && (isLetterCode(text.charCodeAt(end)) || isDigitCode(text.charCodeAt(end)))) end++;
+		return end;
+	}
+	if (end === index) return -1;
+	return text.charCodeAt(index) === 48 ? index + 1 : Math.min(end, index + MAX_NUMBER_DIGITS);
+}
+
+/**
+ * Reads dot-separated pre-release identifiers at `index`.
+ * @param {string} text - The text
+ * @param {number} index - Where the first identifier starts
+ * @returns {number} The index after the longest list of identifiers there, or `-1` when there is none
+ */
+function readPrerelease(text: string, index: number): number {
+	let end = readIdentifier(text, index);
+	while (text.charCodeAt(end) === 46) {
+		const next = readIdentifier(text, end + 1);
+		if (next < 0) break;
+		end = next;
+	}
+	return end;
+}
+
+/**
+ * Reads the longest (partial) version at `index`, `1`, `1.x`, `1.2.*` or `1.2.3-beta`, into {@link partialMajor}, {@link partialMinor},
+ * {@link partialPatch} and {@link partialPrerelease} (node-semver's `XRANGEPLAIN`, without its prefix and build metadata).
+ * @param {string} text - The text
+ * @param {number} index - Where the version starts
+ * @returns {number} The index after it, or `-1` when no version starts there (the parts are then meaningless)
+ */
+function readPartial(text: string, index: number): number {
+	let end = readNumber(text, index);
+	partialMajor = scannedNumber;
+	partialMinor = -1;
+	partialPatch = -1;
+	partialPrerelease = undefined;
+
+	if (text.charCodeAt(end) !== 46) return end;
+	let next = readNumber(text, end + 1);
+	if (next < 0) return end;
+	partialMinor = scannedNumber;
+	end = next;
+
+	if (text.charCodeAt(end) !== 46) return end;
+	next = readNumber(text, end + 1);
+	if (next < 0) return end;
+	partialPatch = scannedNumber;
+	end = next;
+
+	if (text.charCodeAt(end) === 45) {
+		next = readPrerelease(text, end + 1);
+		if (next > end + 1) {
+			partialPrerelease = text.slice(end + 1, next);
+			end = next;
+		}
+	}
+	return end;
+}
+
+/**
+ * Splits valid pre-release identifiers, turning numeric ones below `Number.MAX_SAFE_INTEGER` into numbers (larger ones stay exact
+ * strings, as in node-semver).
+ * @param {string} text - The text holding the identifiers
+ * @param {number} [start=0] - Where the first identifier starts
+ * @param {number} [end=text.length] - Where the last one ends
+ * @returns {(string | number)[]} The identifiers
+ */
+function splitPrerelease(text: string, start = 0, end = text.length): (string | number)[] {
+	const identifiers: (string | number)[] = [];
+	for (let index = start; ; index++) {
+		const from = index;
+		let value = 0;
+		for (let code = text.charCodeAt(index); index < end && code !== 46; code = text.charCodeAt(++index)) {
+			// A non-digit makes the value NaN, so that the identifier stays a string.
+			value = isDigitCode(code) ? value * 10 + (code - 48) : NaN;
+		}
+		identifiers.push(value < Number.MAX_SAFE_INTEGER ? value : text.slice(from, index));
+		if (index >= end) return identifiers;
+	}
+}
+
+/**
+ * Reads a version the way node-semver does without `loose`: a semantic version (see {@link isSemver}), optionally with one leading `v`
+ * and surrounding white space, at most 256 characters long, with major, minor and patch numbers up to `Number.MAX_SAFE_INTEGER`.
+ * @param {unknown} value - The value
+ * @returns {ParsedVersion | undefined} The version, or `undefined` when `value` is not one
+ */
+function readVersion(value: unknown): ParsedVersion | undefined {
+	if (typeof value !== 'string' || value.length > SEMVER_MAX_LENGTH) return undefined;
+	const text = value.trim();
+
+	// When a number is missing (`end` is -1), `scannedNumber` is stale but the character checks at index -1 fail.
+	let end = readNumber(text, text.charCodeAt(0) === 118 ? 1 : 0);
+	const major = scannedNumber;
+	if (major < 0 || major > Number.MAX_SAFE_INTEGER || text.charCodeAt(end) !== 46) return undefined;
+	end = readNumber(text, end + 1);
+	const minor = scannedNumber;
+	if (minor < 0 || minor > Number.MAX_SAFE_INTEGER || text.charCodeAt(end) !== 46) return undefined;
+	end = readNumber(text, end + 1);
+	const patch = scannedNumber;
+	if (patch < 0 || patch > Number.MAX_SAFE_INTEGER) return undefined;
+
+	let prerelease: (string | number)[] | undefined;
+	if (text.charCodeAt(end) === 45) {
+		const next = readPrerelease(text, end + 1);
+		if (next < 0) return undefined;
+		prerelease = splitPrerelease(text, end + 1, next);
+		end = next;
+	}
+	return endsWithBuild(text, end) ? { major, minor, patch, prerelease } : undefined;
+}
+
+/**
+ * Orders a version against another by SemVer precedence, build metadata aside. Pre-release identifiers are compared as
+ * {@link compareSemver} compares them (numeric strings, beyond `Number.MAX_SAFE_INTEGER`, compare exactly).
+ * @param {ParsedVersion} version - The version
+ * @param {ParsedVersion} bound - The version it is compared with
+ * @returns {number} {@link LESS}, {@link GREATER} or {@link EQUAL}
+ */
+function orderVersions(version: ParsedVersion, bound: ParsedVersion): number {
+	if (version.major < bound.major) return LESS;
+	if (version.major > bound.major) return GREATER;
+	if (version.minor < bound.minor) return LESS;
+	if (version.minor > bound.minor) return GREATER;
+	if (version.patch < bound.patch) return LESS;
+	if (version.patch > bound.patch) return GREATER;
+
+	const left = version.prerelease;
+	const right = bound.prerelease;
+	if (left === undefined || right === undefined) return left === right ? EQUAL : left === undefined ? GREATER : LESS;
+	const shared = Math.min(left.length, right.length);
+	for (let i = 0; i < shared; i++) {
+		const a = left[i];
+		const b = right[i];
+		if (a === b) continue;
+		// Two numbers (the common case, about 20% faster this way) compare directly; anything else exactly, as compareSemver does.
+		return (typeof a === 'number' && typeof b === 'number' ? a < b : compareIdentifiers(String(a), String(b)) === -1) ? LESS : GREATER;
+	}
+	return left.length < right.length ? LESS : left.length > right.length ? GREATER : EQUAL;
+}
+
+/**
+ * Tests a version against a compiled range, with node-semver's pre-release rule: unless `includePrerelease` is set, a pre-release
+ * only satisfies a set that has a comparator on a pre-release of the same `major.minor.patch`.
+ * @param {CompiledRange} range - The range
+ * @param {ParsedVersion} version - The version
+ * @param {boolean} includePrerelease - Whether pre-releases are tested like releases
+ * @returns {boolean} `true` when the version satisfies the range
+ */
+function testRange(range: CompiledRange, version: ParsedVersion, includePrerelease: boolean): boolean {
+	sets: for (let s = 0; s < range.length; s++) {
+		const set = range[s];
+		for (let c = 0; c < set.length; c++) {
+			if ((orderVersions(version, set[c]) & set[c].operator) === 0) continue sets;
+		}
+		if (version.prerelease === undefined || includePrerelease) return true;
+		for (let c = 0; c < set.length; c++) {
+			const bound = set[c];
+			if (bound.prerelease !== undefined && bound.major === version.major && bound.minor === version.minor && bound.patch === version.patch) return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Adds a comparator to a set, with node-semver's checks: every number at most `Number.MAX_SAFE_INTEGER`, the version at most 256
+ * characters, and `>=0.0.0` dropped when written exactly so, as it allows any release. (node-semver also drops `>=0.0.0-0` with
+ * `includePrerelease`, which allows every version: dropping it or not cannot change an answer.)
+ * @param {SemverComparator[]} set - The set
+ * @param {number} operator - The operator bits
+ * @param {number} major - The major number
+ * @param {number} minor - The minor number
+ * @param {number} patch - The patch number
+ * @param {string | undefined} prerelease - The pre-release as written
+ * @param {boolean} includePrerelease - Whether pre-releases are tested like releases
+ * @param {number} [written=0] - The length of the version as written in the range (with its `v` and build metadata), or `0` when it
+ * is written in the canonical form `major.minor.patch-prerelease`
+ * @returns {boolean} `false` when node-semver rejects the comparator
+ */
+function addComparator(
+	set: SemverComparator[],
+	operator: number,
+	major: number,
+	minor: number,
+	patch: number,
+	prerelease: string | undefined,
+	includePrerelease: boolean,
+	written = 0
+): boolean {
+	if (major > Number.MAX_SAFE_INTEGER || minor > Number.MAX_SAFE_INTEGER || patch > Number.MAX_SAFE_INTEGER || written > SEMVER_MAX_LENGTH) return false;
+	// Three safe integers and the separators take at most 51 characters, so only a long pre-release can make the version too long.
+	if (prerelease !== undefined && prerelease.length > SEMVER_MAX_LENGTH - 51 && `${major}.${minor}.${patch}-`.length + prerelease.length > SEMVER_MAX_LENGTH) return false;
+	if (!includePrerelease && operator === (GREATER | EQUAL) && major === 0 && minor === 0 && patch === 0 && prerelease === undefined && (written === 0 || written === 5)) {
+		return true;
+	}
+	set.push({ operator, major, minor, patch, prerelease: prerelease === undefined ? undefined : splitPrerelease(prerelease) });
+	return true;
+}
+
+/**
+ * Tells whether a text ends at `index` or with build metadata (`+` then dot-separated identifiers of letters, digits and hyphens) there.
+ * @param {string} text - The text
+ * @param {number} index - Where the metadata may start (`-1` for none, which is never the end)
+ * @returns {boolean} `true` when nothing but build metadata follows `index`
+ */
+function endsWithBuild(text: string, index: number): boolean {
+	if (text.charCodeAt(index) !== 43) return index === text.length;
+	let end = index;
+	do {
+		const start = ++end;
+		while (isLetterCode(text.charCodeAt(end)) || isDigitCode(text.charCodeAt(end))) end++;
+		if (end === start) return false;
+	} while (text.charCodeAt(end) === 46);
+	return end === text.length;
+}
+
+/**
+ * Reads a plain comparator (`<=1.2.3`, `v1.2.3+build`, no wildcard) filling a whole string, as node-semver's `Comparator` does.
+ * @param {string} text - The comparator
+ * @param {boolean} includePrerelease - Whether pre-releases are tested like releases
+ * @param {SemverComparator[]} set - The set to add it to
+ * @returns {boolean} `false` when `text` is not a comparator
+ */
+function readComparator(text: string, includePrerelease: boolean, set: SemverComparator[]): boolean {
+	let index = 0;
+	let operator = 0;
+	const code = text.charCodeAt(0);
+	if (code === 60 || code === 62) {
+		operator = code === 60 ? LESS : GREATER;
+		index++;
+	}
+	if (text.charCodeAt(index) === 61) {
+		operator |= EQUAL;
+		index++;
+	}
+	const end = readPartial(text, text.charCodeAt(index) === 118 ? index + 1 : index);
+	if (!endsWithBuild(text, end) || partialMajor < 0 || partialMinor < 0 || partialPatch < 0) return false;
+	return addComparator(set, operator || EQUAL, partialMajor, partialMinor, partialPatch, partialPrerelease, includePrerelease, text.length - index);
+}
+
+/**
+ * Adds the two comparators of a range of versions: `>=lower <upper-0`.
+ * @param {SemverComparator[]} set - The set
+ * @param {number} major - The lower bound's major number
+ * @param {number} minor - The lower bound's minor number
+ * @param {number} patch - The lower bound's patch number
+ * @param {string | undefined} prerelease - The lower bound's pre-release
+ * @param {number} upperMajor - The upper bound's major number
+ * @param {number} upperMinor - The upper bound's minor number
+ * @param {number} upperPatch - The upper bound's patch number
+ * @param {boolean} includePrerelease - Whether pre-releases are tested like releases
+ * @returns {boolean} `false` when node-semver rejects a comparator
+ */
+function addBounds(
+	set: SemverComparator[],
+	major: number,
+	minor: number,
+	patch: number,
+	prerelease: string | undefined,
+	upperMajor: number,
+	upperMinor: number,
+	upperPatch: number,
+	includePrerelease: boolean
+): boolean {
+	return (
+		addComparator(set, GREATER | EQUAL, major, minor, patch, prerelease, includePrerelease) &&
+		addComparator(set, LESS, upperMajor, upperMinor, upperPatch, LOWEST_PRERELEASE, includePrerelease)
+	);
+}
+
+/**
+ * Reads one space-separated token of a range, as node-semver's `parseComparator`: a caret, tilde or X-range desugared into
+ * comparators, or a plain comparator (where, like node-semver, the first `*` and the operator before it are dropped).
+ * @param {string} text - The range
+ * @param {number} start - Where the token starts
+ * @param {number} end - Where it ends (a space or the end of `text`)
+ * @param {boolean} includePrerelease - Whether pre-releases are tested like releases
+ * @param {SemverComparator[]} set - The set to add the comparators to
+ * @returns {boolean} `false` when node-semver rejects the token
+ */
+function readToken(text: string, start: number, end: number, includePrerelease: boolean, set: SemverComparator[]): boolean {
+	if (start === end) return true;
+	const kind = text.charCodeAt(start);
+	let index = start;
+	let operator = 0;
+	if (kind === 94 || kind === 126) {
+		index++;
+		if (kind === 126 && text.charCodeAt(index) === 62) index++;
+	} else {
+		if (kind === 60 || kind === 62) {
+			operator = kind === 60 ? LESS : GREATER;
+			index++;
+		}
+		if (text.charCodeAt(index) === 61) {
+			operator |= EQUAL;
+			index++;
+		}
+	}
+	const prefixStart = index;
+	while (text.charCodeAt(index) === 118 || text.charCodeAt(index) === 61) index++;
+
+	if (readPartial(text, index) !== end) {
+		// Not a caret, tilde or X-range: without a `*`, nor a comparator (a token starting with `^` or `~` fails after one too).
+		const token = text.slice(start, end);
+		const star = token.indexOf('*');
+		if (star < 0) return false;
+		let cut = star;
+		if (token.charCodeAt(cut - 1) === 61) cut--;
+		if (token.charCodeAt(cut - 1) === 60 || token.charCodeAt(cut - 1) === 62) cut--;
+		return readComparator(token.slice(0, cut) + token.slice(star + 1), includePrerelease, set);
+	}
+
+	// A wildcard minor makes the patch a wildcard too (in a caret or tilde; an X-range rejects a number after a wildcard).
+	const major = partialMajor;
+	const minor = partialMinor;
+	const patch = minor < 0 ? -1 : partialPatch;
+	if (kind !== 94 && kind !== 126) {
+		if ((major < 0 && partialMinor >= 0) || (partialMinor < 0 && partialPatch >= 0)) return false;
+		if (major < 0) return operator === LESS || operator === GREATER ? addComparator(set, LESS, 0, 0, 0, LOWEST_PRERELEASE, includePrerelease) : true;
+		if (patch >= 0) {
+			// No wildcard: a plain comparator, where only a single `v` may separate the operator and the version.
+			const prefix = index - prefixStart;
+			if (prefix > 1 || (prefix === 1 && text.charCodeAt(prefixStart) !== 118)) return false;
+			return addComparator(set, operator || EQUAL, major, minor, patch, partialPrerelease, includePrerelease, end - prefixStart);
+		}
+		if (operator !== 0 && operator !== EQUAL) {
+			let upperMajor = major;
+			let upperMinor = minor < 0 ? 0 : minor;
+			if (operator === GREATER || operator === (LESS | EQUAL)) {
+				if (minor < 0) upperMajor++;
+				else upperMinor++;
+			}
+			// `>1.2` is `>=1.3.0`, `<=1.2` is `<1.3.0-0`.
+			const bound = operator === GREATER ? GREATER | EQUAL : operator === (LESS | EQUAL) ? LESS : operator;
+			return addComparator(set, bound, upperMajor, upperMinor, 0, bound === LESS || includePrerelease ? LOWEST_PRERELEASE : undefined, includePrerelease);
+		}
+	}
+
+	if (major < 0) return true;
+	const lowerPrerelease = patch < 0 ? (includePrerelease ? LOWEST_PRERELEASE : undefined) : partialPrerelease;
+	if (minor < 0 || (kind === 94 && major > 0))
+		return addBounds(set, major, minor < 0 ? 0 : minor, patch < 0 ? 0 : patch, lowerPrerelease, major + 1, 0, 0, includePrerelease);
+	if (kind === 94 && minor === 0 && patch >= 0) return addBounds(set, 0, 0, patch, lowerPrerelease, 0, 0, patch + 1, includePrerelease);
+	return addBounds(set, major, minor, patch < 0 ? 0 : patch, lowerPrerelease, major, minor + 1, 0, includePrerelease);
+}
+
+/**
+ * Drops the spaces node-semver drops before splitting a range into tokens: the space between an operator and its version (`>= 1.2.3`),
+ * one of two spaces before a version, and the space after a tilde or caret (`~ 1.2`, `^ 1.2`). The first rule replays node-semver's
+ * global `COMPARATORTRIM` expression in one linear pass: in the run of spaces, operators, `v` and `=` before a version, a match
+ * starts at the run's last `<` or `>` (or at the run's start when it has none), and the search resumes after that version.
+ * @param {string} text - The range, without hyphen ranges
+ * @returns {string} The range with those spaces removed
+ */
+function joinOperators(text: string): string {
+	let output = '';
+	let copied = 0;
+	let position = 0;
+	for (;;) {
+		let version = position;
+		while (version < text.length && !isPartialStart(text.charCodeAt(version))) version++;
+		if (version === text.length) break;
+
+		let start = version;
+		let comparison = -1;
+		for (
+			let code = text.charCodeAt(start - 1);
+			start > position && (code === 32 || code === 60 || code === 61 || code === 62 || code === 118);
+			code = text.charCodeAt(start - 1)
+		) {
+			start--;
+			if (comparison < 0 && (code === 60 || code === 62)) comparison = start;
+		}
+		// The match's optional space, operator and space (the one dropped); starting at a space before `<` or `>` drops the same one.
+		let index = comparison < 0 ? start : comparison;
+		if (text.charCodeAt(index) === 32) index++;
+		if (text.charCodeAt(index) === 60 || text.charCodeAt(index) === 62) index++;
+		if (text.charCodeAt(index) === 61) index++;
+		if (text.charCodeAt(index) === 32) {
+			output += text.slice(copied, index);
+			copied = index + 1;
+		}
+		position = readPartial(text, version);
+	}
+	return (output + text.slice(copied)).replace(/~>? /g, '~').replace(/\^ /g, '^');
+}
+
+/**
+ * Desugars a hyphen range (`1.2.3 - 2.3.4`, `1.2 - 2`), as node-semver's `hyphenReplace`, into the comparators it means, written out
+ * (so that, as in node-semver, they then go through {@link joinOperators} and {@link readToken}).
+ * @param {string} text - The comparator set
+ * @param {boolean} includePrerelease - Whether pre-releases are tested like releases
+ * @returns {string | undefined} The comparators, or `undefined` when `text` is not a hyphen range
+ */
+function readHyphenRange(text: string, includePrerelease: boolean): string | undefined {
+	const fromStart = text.charCodeAt(0) === 32 ? 1 : 0;
+	let index = fromStart;
+	while (text.charCodeAt(index) === 32 || text.charCodeAt(index) === 61 || text.charCodeAt(index) === 118) index++;
+	const fromEnd = readPartial(text, index);
+	if (fromEnd < 0 || !text.startsWith(' - ', fromEnd)) return undefined;
+	const fromMajor = partialMajor;
+	const fromMinor = partialMinor;
+	const fromPatch = partialPatch;
+	const fromPrerelease = partialPrerelease;
+
+	const toStart = fromEnd + 3;
+	index = toStart;
+	while (text.charCodeAt(index) === 32 || text.charCodeAt(index) === 61 || text.charCodeAt(index) === 118) index++;
+	const toEnd = readPartial(text, index);
+	if (toEnd !== text.length && (toEnd !== text.length - 1 || text.charCodeAt(toEnd) !== 32)) return undefined;
+
+	const zero = includePrerelease ? '-0' : '';
+	const from =
+		fromMajor < 0
+			? ''
+			: fromMinor < 0
+				? `>=${fromMajor}.0.0${zero}`
+				: fromPatch < 0
+					? `>=${fromMajor}.${fromMinor}.0${zero}`
+					: `>=${text.slice(fromStart, fromEnd)}${fromPrerelease === undefined ? zero : ''}`;
+	const to =
+		partialMajor < 0
+			? ''
+			: partialMinor < 0
+				? `<${partialMajor + 1}.0.0-0`
+				: partialPatch < 0
+					? `<${partialMajor}.${partialMinor + 1}.0-0`
+					: partialPrerelease !== undefined
+						? `<=${partialMajor}.${partialMinor}.${partialPatch}-${partialPrerelease}`
+						: includePrerelease
+							? `<${partialMajor}.${partialMinor}.${partialPatch + 1}-0`
+							: `<=${text.slice(toStart, toEnd)}`;
+	return `${from} ${to}`;
+}
+
+/** {@link rangeFlags}: white space to collapse (other than single spaces, or perhaps non-ASCII white space). */
+const FLAG_SPACING = 1;
+/** {@link rangeFlags}: a `+` (perhaps build metadata). */
+const FLAG_BUILD = 2;
+/** {@link rangeFlags}: ` - ` (perhaps a hyphen range). */
+const FLAG_HYPHEN = 4;
+/** {@link rangeFlags}: a space after an operator, a tilde or a caret (perhaps one to drop, see {@link joinOperators}). */
+const FLAG_JOIN = 8;
+/** {@link rangeFlags}: a `|` (perhaps `||`). */
+const FLAG_BAR = 16;
+
+/**
+ * Scans a range once for what may need rewriting, so that the common ranges skip every rewrite.
+ * @param {string} text - The range
+ * @returns {number} The `FLAG_*` bits found
+ */
+function rangeFlags(text: string): number {
+	let hints = 0;
+	for (let i = 0; i < text.length; i++) {
+		const code = text.charCodeAt(i);
+		if (code === 32) {
+			const previous = text.charCodeAt(i - 1);
+			if (previous === 32) hints |= FLAG_SPACING;
+			else if (previous === 60 || previous === 61 || previous === 62 || previous === 94 || previous === 126) hints |= FLAG_JOIN;
+			else if (previous === 45 && text.charCodeAt(i - 2) === 32) hints |= FLAG_HYPHEN;
+		} else if (code === 43) hints |= FLAG_BUILD;
+		else if (code === 124) hints |= FLAG_BAR;
+		else if ((code >= 9 && code <= 13) || code >= 128) hints |= FLAG_SPACING;
+	}
+	return hints;
+}
+
+/**
+ * Reads one comparator set of a range (the text between `||`): build metadata dropped, a hyphen range desugared, spaces after
+ * operators dropped, then each space-separated token read.
+ * @param {string} part - The comparator set, trimmed
+ * @param {number} hints - The {@link rangeFlags} of the whole range
+ * @param {boolean} includePrerelease - Whether pre-releases are tested like releases
+ * @returns {SemverComparator[] | undefined} Its comparators (none when it allows any version), or `undefined` when it is invalid
+ */
+function readSet(part: string, hints: number, includePrerelease: boolean): SemverComparator[] | undefined {
+	let text = part;
+	// Once the text is rewritten, the hints no longer describe it.
+	let rewritten = false;
+	if ((hints & FLAG_BUILD) !== 0 && text.includes('+')) {
+		text = text.replace(RANGE_BUILD_PATTERN, '');
+		rewritten = true;
+	}
+	if ((rewritten || (hints & FLAG_HYPHEN) !== 0) && text.includes(' - ')) {
+		const desugared = readHyphenRange(text, includePrerelease);
+		if (desugared !== undefined) {
+			text = desugared;
+			rewritten = true;
+		}
+	}
+	if (rewritten ? OPERATOR_SPACE_PATTERN.test(text) : (hints & FLAG_JOIN) !== 0) text = joinOperators(text);
+
+	const set: SemverComparator[] = [];
+	let start = 0;
+	for (let i = 0; i <= text.length; i++) {
+		if (i === text.length || text.charCodeAt(i) === 32) {
+			if (!readToken(text, start, i, includePrerelease, set)) return undefined;
+			start = i + 1;
+		}
+	}
+	return set;
+}
+
+/**
+ * Compiles a range into comparator sets, as node-semver's `Range` constructor: white space collapsed, `||` alternatives read, and the
+ * whole range reduced to "any version" when one alternative allows any version (which, as in node-semver, also stops the other
+ * alternatives from letting pre-releases through).
+ * @param {string} range - The range
+ * @param {boolean} includePrerelease - Whether pre-releases are tested like releases
+ * @returns {CompiledRange | undefined} The sets, or `undefined` when the range is invalid
+ */
+function compileRange(range: string, includePrerelease: boolean): CompiledRange | undefined {
+	// Surrounding white space collapses into a single space, which each comparator set then trims (node-semver trims both).
+	let text = range;
+	let hints = rangeFlags(text);
+	if ((hints & FLAG_SPACING) !== 0) {
+		text = text.replace(/\s+/g, ' ');
+		hints = rangeFlags(text);
+	}
+
+	const sets: SemverComparator[][] = [];
+	let any = false;
+	let start = 0;
+	for (;;) {
+		const bar = (hints & FLAG_BAR) === 0 ? -1 : text.indexOf('||', start);
+		let end = bar < 0 ? text.length : bar;
+		if (text.charCodeAt(start) === 32) start++;
+		// After skipping the only character of a part (a space), `end` goes before `start`: the slice is empty either way.
+		if (text.charCodeAt(end - 1) === 32) end--;
+		const set = readSet(text.slice(start, end), hints, includePrerelease);
+		if (set === undefined) return undefined;
+		if (set.length === 0) any = true;
+		sets.push(set);
+		if (bar < 0) return any ? [[]] : sets;
+		start = bar + 2;
+	}
+}
+
+/**
+ * Reads the `includePrerelease` option.
+ * @param {string} caller - The public function, for error messages
+ * @param {SemverRangeOptions | undefined} options - The options
+ * @returns {boolean} The option's value (`false` when unset)
+ * @throws {TypeError} when `options` is not an object or `includePrerelease` is not a boolean
+ */
+function readIncludePrerelease(caller: string, options: SemverRangeOptions | undefined): boolean {
+	if (options === undefined) return false;
+	if (typeof options !== 'object' || options === null) throw new TypeError(`${caller}: \`options\` must be an object, got ${describe(options)}`);
+	const value = ownOption(options, 'includePrerelease');
+	if (value !== undefined && typeof value !== 'boolean') throw new TypeError(`${caller}: \`includePrerelease\` must be a boolean, got ${describe(value)}`);
+	return value === true;
+}
+
+/**
+ * Checks whether a version satisfies a semver range, with the semantics of npm and node-semver 7.8.5 (`semver.satisfies` without
+ * `loose`), which it matches on every input of its range grammar:
+ *
+ * - `||` separates alternatives; within one, space-separated comparators must all hold.
+ * - Comparators: `<`, `<=`, `>`, `>=`, `=` or none, before a version that may start with `v`; partial versions are X-ranges
+ *   (`1.x`, `1.2.*`, `1`, `*`, `x` and `''` match any release; `>1.2` is `>=1.3.0`, `<=1.2` is `<1.3.0-0`).
+ * - Hyphen ranges: `1.2.3 - 2.3.4` is `>=1.2.3 <=2.3.4`; partial ends widen (`1.2 - 2` is `>=1.2.0 <3.0.0-0`).
+ * - Tilde: `~1.2.3` is `>=1.2.3 <1.3.0-0`, `~1.2` is `>=1.2.0 <1.3.0-0`, `~1` is `>=1.0.0 <2.0.0-0` (`~>` too).
+ * - Caret: `^1.2.3` is `>=1.2.3 <2.0.0-0`, `^0.2.3` is `>=0.2.3 <0.3.0-0`, `^0.0.3` is `>=0.0.3 <0.0.4-0`, `^1.x` is `>=1.0.0 <2.0.0-0`.
+ * - Pre-releases: unless `includePrerelease` is set, a pre-release version only satisfies an alternative that has a comparator on a
+ *   pre-release of the same `major.minor.patch` (`1.2.3-beta.2` satisfies `>=1.2.3-beta.1`, `1.2.4-beta` does not).
+ * - Build metadata is ignored, in the version and in the range. White space between an operator, `~` or `^` and its version is
+ *   allowed, as node-semver allows it.
+ *
+ * The version follows node-semver's parser: a semantic version as {@link isSemver} accepts it, optionally with one leading `v` and
+ * surrounding white space, at most 256 characters long, with major, minor and patch numbers up to `Number.MAX_SAFE_INTEGER`.
+ * Pre-release numbers are compared exactly at any size (node-semver rounds the ones beyond `Number.MAX_SAFE_INTEGER`).
+ *
+ * Like node-semver, an invalid version or range (or one that is not a string) gives `false` rather than throwing: check ranges with
+ * {@link isSemverRange}, or compile them with {@link compileSemverRange}, which throws, to catch mistakes. Nothing is cached: compile
+ * a range that is tested repeatedly. Linear in the length of the range.
+ * @param {string} version - The version to test
+ * @param {string} range - The range
+ * @param {SemverRangeOptions} [options] - `includePrerelease` (default `false`)
+ * @returns {boolean} `true` when `version` is a valid version that satisfies the valid range `range`
+ * @throws {TypeError} when `options` is not an object or `includePrerelease` is not a boolean
+ * @example
+ * satisfiesSemver('1.4.2', '^1.2.0'); // => true
+ * satisfiesSemver('2.0.0', '^1.2.0'); // => false
+ * satisfiesSemver('0.3.0', '^0.2.3'); // => false
+ * satisfiesSemver('1.2.9', '~1.2'); // => true
+ * satisfiesSemver('3.4.0', '1.2.3 - 3.4'); // => true
+ * satisfiesSemver('1.5.0', '<1.0.0 || >=1.5.0 <2'); // => true
+ * satisfiesSemver('v1.2.3', '>= 1.2.3'); // => true
+ * satisfiesSemver('1.3.0-beta', '^1.2.0'); // => false
+ * satisfiesSemver('1.3.0-beta', '^1.2.0', { includePrerelease: true }); // => true
+ * satisfiesSemver('1.2.0-rc.2', '^1.2.0-rc.1'); // => true
+ * satisfiesSemver('1.2.3', 'not a range'); // => false
+ */
+export function satisfiesSemver(version: string, range: string, options?: SemverRangeOptions): boolean {
+	const includePrerelease = readIncludePrerelease('satisfiesSemver', options);
+	const parsed = readVersion(version);
+	if (parsed === undefined || typeof range !== 'string') return false;
+	const compiled = compileRange(range, includePrerelease);
+	return compiled !== undefined && testRange(compiled, parsed, includePrerelease);
+}
+
+/**
+ * Compiles a semver range into a predicate, for testing many versions against the same range: the range is parsed once, and each
+ * test only reads the version (no regular expression; a release allocates only the small object holding its numbers). The semantics are
+ * those of {@link satisfiesSemver}.
+ * @param {string} range - The range
+ * @param {SemverRangeOptions} [options] - `includePrerelease` (default `false`)
+ * @returns {(version: string) => boolean} A predicate telling whether a version satisfies the range (`false` for an invalid version)
+ * @throws {TypeError} when `range` is not a valid range (see {@link isSemverRange}), `options` is not an object or `includePrerelease` is
+ * not a boolean
+ * @example
+ * const supported = compileSemverRange('^18.18.0 || >=20.9.0');
+ * supported('18.19.1'); // => true
+ * supported('19.0.0'); // => false
+ * ['16.20.2', '20.11.0', '22.1.0'].filter(supported); // => ['20.11.0', '22.1.0']
+ * compileSemverRange('>=1.2.3.4'); // throws TypeError
+ */
+export function compileSemverRange(range: string, options?: SemverRangeOptions): (version: string) => boolean {
+	const includePrerelease = readIncludePrerelease('compileSemverRange', options);
+	if (typeof range !== 'string') throw new TypeError(`compileSemverRange: \`range\` must be a string, got ${describe(range)}`);
+	const compiled = compileRange(range, includePrerelease);
+	if (compiled === undefined) throw new TypeError(`compileSemverRange: ${quoteValue(range)} is not a valid semver range`);
+
+	return function (version: string): boolean {
+		const parsed = readVersion(version);
+		return parsed !== undefined && testRange(compiled, parsed, includePrerelease);
+	};
+}
+
+/**
+ * Checks whether a value is a semver range that {@link satisfiesSemver} and node-semver accept (node-semver's `validRange` not returning `null`).
+ * Like every `value is string` predicate, the `false` branch also removes `string` from the type: when `value` may be a
+ * non-matching string, test `typeof value === 'string'` there.
+ * @param {unknown} value - The value to check
+ * @param {SemverRangeOptions} [options] - `includePrerelease` (default `false`), which makes a few ranges at the edge of
+ * `Number.MAX_SAFE_INTEGER` invalid, as in node-semver
+ * @returns {boolean} `true` when `value` is a string holding a valid range
+ * @throws {TypeError} when `options` is not an object or `includePrerelease` is not a boolean
+ * @example
+ * isSemverRange('^1.2.3 || ~2.0'); // => true
+ * isSemverRange('>= 1.2.3 < 2'); // => true
+ * isSemverRange(''); // => true // any version
+ * isSemverRange('>=1.2.3.4'); // => false
+ * isSemverRange('^1.2.3 ||| 2'); // => false
+ */
+export function isSemverRange(value: unknown, options?: SemverRangeOptions): value is string {
+	const includePrerelease = readIncludePrerelease('isSemverRange', options);
+	return typeof value === 'string' && compileRange(value, includePrerelease) !== undefined;
+}
+
+/**
+ * Finds the highest or lowest version of a list that satisfies a range.
+ * @param {string} caller - The public function, for error messages
+ * @param {Iterable<string>} versions - The versions
+ * @param {string} range - The range
+ * @param {SemverRangeOptions | undefined} options - The options
+ * @param {number} wanted - {@link GREATER} for the highest version, {@link LESS} for the lowest
+ * @returns {string | undefined} The version as given, or `undefined`
+ * @throws {TypeError} when `versions` is not an iterable or is a string, or the options are invalid
+ */
+function pickSatisfying(caller: string, versions: Iterable<string>, range: string, options: SemverRangeOptions | undefined, wanted: number): string | undefined {
+	const includePrerelease = readIncludePrerelease(caller, options);
+	if (typeof versions === 'string' || typeof (versions as Partial<Iterable<string>> | null)?.[Symbol.iterator] !== 'function') {
+		throw new TypeError(`${caller}: \`versions\` must be an iterable of strings, got ${describe(versions)}`);
+	}
+	const compiled = typeof range === 'string' ? compileRange(range, includePrerelease) : undefined;
+	if (compiled === undefined) return undefined;
+
+	let best: string | undefined;
+	let bestVersion: ParsedVersion | undefined;
+	for (const version of versions) {
+		const parsed = readVersion(version);
+		if (parsed !== undefined && testRange(compiled, parsed, includePrerelease) && (bestVersion === undefined || orderVersions(parsed, bestVersion) === wanted)) {
+			best = version;
+			bestVersion = parsed;
+		}
+	}
+	return best;
+}
+
+/**
+ * Finds the highest version of a list that satisfies a range (node-semver's `maxSatisfying`): versions are tested as by
+ * {@link satisfiesSemver} (invalid ones are skipped) and compared by precedence, the first of equal versions winning (`1.0.0+a` and
+ * `1.0.0+b` are equal). One pass, the range compiled once.
+ * @param {Iterable<string>} versions - The candidate versions
+ * @param {string} range - The range
+ * @param {SemverRangeOptions} [options] - `includePrerelease` (default `false`)
+ * @returns {string | undefined} The highest satisfying version, as given, or `undefined` when none satisfies the range or the range is invalid
+ * @throws {TypeError} when `versions` is not an iterable (or is a string), `options` is not an object or `includePrerelease` is not a boolean
+ * @example
+ * maxSatisfyingSemver(['1.2.3', '1.4.0', '2.0.0', '1.5.0-beta'], '^1.2.0'); // => '1.4.0'
+ * maxSatisfyingSemver(['1.2.3', '1.4.0', '2.0.0', '1.5.0-beta'], '^1.2.0', { includePrerelease: true }); // => '1.5.0-beta'
+ * maxSatisfyingSemver(['1.2.3'], '^2.0.0'); // => undefined
+ */
+export function maxSatisfyingSemver(versions: Iterable<string>, range: string, options?: SemverRangeOptions): string | undefined {
+	return pickSatisfying('maxSatisfyingSemver', versions, range, options, GREATER);
+}
+
+/**
+ * Finds the lowest version of a list that satisfies a range (node-semver's `minSatisfying`), like {@link maxSatisfyingSemver}.
+ * @param {Iterable<string>} versions - The candidate versions
+ * @param {string} range - The range
+ * @param {SemverRangeOptions} [options] - `includePrerelease` (default `false`)
+ * @returns {string | undefined} The lowest satisfying version, as given, or `undefined` when none satisfies the range or the range is invalid
+ * @throws {TypeError} when `versions` is not an iterable (or is a string), `options` is not an object or `includePrerelease` is not a boolean
+ * @example
+ * minSatisfyingSemver(['1.2.3', '1.4.0', '2.0.0'], '>=1.3'); // => '1.4.0'
+ * minSatisfyingSemver(new Set(['v2.1.0', 'v2.0.1']), '2.x'); // => 'v2.0.1'
+ */
+export function minSatisfyingSemver(versions: Iterable<string>, range: string, options?: SemverRangeOptions): string | undefined {
+	return pickSatisfying('minSatisfyingSemver', versions, range, options, LESS);
+}
+
+/**
+ * Applies node-semver's `pre` step: bumps the last numeric pre-release identifier (or appends a counter), then switches to
+ * `identifier` unless the pre-release already continues it with a number.
+ * @param {(string | number)[]} prerelease - The pre-release identifiers (modified)
+ * @param {string | undefined} identifier - The wanted identifiers
+ * @param {'0' | '1' | false | undefined} base - The `identifierBase` option
+ * @returns {(string | number)[]} The new pre-release identifiers
+ * @throws {RangeError} when `base` is `false` and the pre-release already is `identifier`
+ */
+function bumpPrerelease(prerelease: (string | number)[], identifier: string | undefined, base: '0' | '1' | false | undefined): (string | number)[] {
+	const counter = base === '1' ? 1 : 0;
+	let index = prerelease.length;
+	while (--index >= 0 && typeof prerelease[index] !== 'number');
+	if (index >= 0) prerelease[index] = (prerelease[index] as number) + 1;
+	else if (base === false && identifier === prerelease.join('.')) {
+		throw new RangeError(`incrementSemver: the pre-release is already ${quoteValue(identifier)}`);
+	} else prerelease.push(counter);
+	if (identifier === undefined) return prerelease;
+
+	const wanted = identifier.split('.');
+	// `Number` as node-semver's `isNaN`: past the end, or an identifier such as `beta`, is not a number (but `1e5` is).
+	let continues = !Number.isNaN(Number(prerelease[wanted.length]));
+	for (let i = 0; continues && i < wanted.length; i++) continues = String(prerelease[i]) === wanted[i];
+	return continues ? prerelease : base === false ? [identifier] : [identifier, counter];
+}
+
+/**
+ * Increments a version, with the semantics of node-semver 7.8.5's `inc` (`semver.inc(version, release, identifier, identifierBase)`):
+ *
+ * - `major`, `minor`, `patch`: the next release of that kind, except that a pre-release of it is released (`1.3.0-rc.1` → `1.3.0` for
+ *   `minor`, `2.0.0-rc.1` → `2.0.0` for `major`, `1.2.4-0` → `1.2.4` for `patch`).
+ * - `premajor`, `preminor`, `prepatch`: the next such release's first pre-release (`1.2.3` → `2.0.0-0`, `1.3.0-0`, `1.2.4-0`).
+ * - `prerelease`: the next pre-release: the last numeric identifier is bumped (`1.2.4-beta.1` → `1.2.4-beta.2`), a counter is appended
+ *   when there is none (`1.2.4-beta` → `1.2.4-beta.0`), and a release becomes the next patch's first pre-release (`1.2.3` → `1.2.4-0`).
+ * - `release`: the release of a pre-release (`1.2.4-rc.1` → `1.2.4`).
+ *
+ * `identifier` names the pre-release (`prerelease` with `'beta'`: `1.2.4-alpha.3` → `1.2.4-beta.0`, `1.2.4-beta.3` → `1.2.4-beta.4`);
+ * `identifierBase: '1'` starts counters at 1 and `false` appends none (`1.2.3` → `1.2.4-beta`). Build metadata is dropped. The version
+ * is read like node-semver reads it (see {@link satisfiesSemver}): a leading `v` and surrounding white space are allowed and dropped.
+ *
+ * Where node-semver returns `null`, this throws, and it also throws instead of producing a number beyond `Number.MAX_SAFE_INTEGER`,
+ * which node-semver cannot read (like node-semver, it does not check that the result fits in 256 characters). `identifier` is
+ * validated for every release kind (node-semver ignores it for `major`, `minor`, `patch` and `release`).
+ * @param {string} version - The version
+ * @param {SemverRelease} releaseType - The kind of increment
+ * @param {IncrementSemverOptions} [options] - `identifier` and `identifierBase` (default `'0'`)
+ * @returns {string} The incremented version, without build metadata
+ * @throws {TypeError} when `version` is not a valid version, `releaseType` or `identifier` is not a string, `options` is not an object or
+ * `identifierBase` is not `'0'`, `'1'` or `false`
+ * @throws {RangeError} when `releaseType` is not a release kind, `identifier` is not dot-separated pre-release identifiers, `releaseType` is
+ * `'release'` and `version` is not a pre-release, a `pre*` release has `identifierBase: false` without `identifier` or would not change
+ * the version, or a number would exceed `Number.MAX_SAFE_INTEGER`
+ * @example
+ * incrementSemver('1.2.3', 'minor'); // => '1.3.0'
+ * incrementSemver('1.3.0-rc.1', 'minor'); // => '1.3.0'
+ * incrementSemver('1.2.3', 'premajor'); // => '2.0.0-0'
+ * incrementSemver('1.2.3', 'prerelease', { identifier: 'beta' }); // => '1.2.4-beta.0'
+ * incrementSemver('1.2.4-beta.0', 'prerelease', { identifier: 'beta' }); // => '1.2.4-beta.1'
+ * incrementSemver('1.2.4-beta.1', 'prerelease', { identifier: 'rc', identifierBase: '1' }); // => '1.2.4-rc.1'
+ * incrementSemver('1.2.3', 'preminor', { identifier: 'alpha', identifierBase: false }); // => '1.3.0-alpha'
+ * incrementSemver('v1.2.4-rc.1+build.5', 'release'); // => '1.2.4'
+ * incrementSemver('1.2.3', 'release'); // throws RangeError
+ * incrementSemver('1.2', 'patch'); // throws TypeError
+ */
+export function incrementSemver(version: string, releaseType: SemverRelease, options?: IncrementSemverOptions): string {
+	const parsed = readVersion(version);
+	if (parsed === undefined) throw new TypeError(`incrementSemver: ${quoteValue(version)} is not a valid semantic version`);
+	if (typeof releaseType !== 'string') throw new TypeError(`incrementSemver: \`releaseType\` must be a string, got ${describe(releaseType)}`);
+	if (options !== undefined && (typeof options !== 'object' || options === null)) {
+		throw new TypeError(`incrementSemver: \`options\` must be an object, got ${describe(options)}`);
+	}
+	const base = options === undefined ? undefined : ownOption(options, 'identifierBase');
+	if (base !== undefined && base !== false && base !== '0' && base !== '1') {
+		throw new (typeof base === 'string' ? RangeError : TypeError)(`incrementSemver: \`identifierBase\` must be '0', '1' or false, got ${quoteValue(base)}`);
+	}
+	const written = options === undefined ? undefined : ownOption(options, 'identifier');
+	if (written !== undefined && typeof written !== 'string') throw new TypeError(`incrementSemver: \`identifier\` must be a string, got ${describe(written)}`);
+	// As in node-semver, an empty identifier is no identifier.
+	const identifier = written === '' ? undefined : written;
+	if (identifier !== undefined && readPrerelease(identifier, 0) !== identifier.length) {
+		throw new RangeError(`incrementSemver: \`identifier\` must be dot-separated pre-release identifiers, got ${quoteValue(identifier)}`);
+	}
+	if (releaseType.startsWith('pre') && identifier === undefined && base === false) {
+		throw new RangeError('incrementSemver: `identifierBase: false` needs an `identifier`');
+	}
+
+	let { major, minor, patch } = parsed;
+	let prerelease = parsed.prerelease ?? [];
+	switch (releaseType) {
+		case 'major':
+			if (minor !== 0 || patch !== 0 || prerelease.length === 0) major++;
+			minor = 0;
+			patch = 0;
+			prerelease = [];
+			break;
+		case 'minor':
+			if (patch !== 0 || prerelease.length === 0) minor++;
+			patch = 0;
+			prerelease = [];
+			break;
+		case 'patch':
+			if (prerelease.length === 0) patch++;
+			prerelease = [];
+			break;
+		case 'release':
+			if (prerelease.length === 0) throw new RangeError(`incrementSemver: ${quoteValue(version)} is not a pre-release`);
+			prerelease = [];
+			break;
+		case 'premajor':
+			major++;
+			minor = 0;
+			patch = 0;
+			prerelease = bumpPrerelease([], identifier, base);
+			break;
+		case 'preminor':
+			minor++;
+			patch = 0;
+			prerelease = bumpPrerelease([], identifier, base);
+			break;
+		case 'prepatch':
+			patch++;
+			prerelease = bumpPrerelease([], identifier, base);
+			break;
+		case 'prerelease':
+			if (prerelease.length === 0) patch++;
+			prerelease = bumpPrerelease(prerelease, identifier, base);
+			break;
+		default:
+			throw new RangeError(
+				`incrementSemver: \`releaseType\` must be 'major', 'minor', 'patch', 'premajor', 'preminor', 'prepatch', 'prerelease' or 'release', got ${quoteValue(releaseType)}`
+			);
+	}
+	if (Math.max(major, minor, patch) > Number.MAX_SAFE_INTEGER) throw new RangeError(`incrementSemver: incrementing ${quoteValue(version)} exceeds Number.MAX_SAFE_INTEGER`);
+	return prerelease.length === 0 ? `${major}.${minor}.${patch}` : `${major}.${minor}.${patch}-${prerelease.join('.')}`;
 }
 
 /**

@@ -604,3 +604,313 @@ describe('parseEnv (non-interference)', function () {
 		);
 	});
 });
+
+/** The parts of node-semver (the reference implementation, a development dependency used only by the tests) that the properties call. */
+interface NodeSemver {
+	satisfies(version: string, range: string, options?: { includePrerelease?: boolean }): boolean;
+	validRange(range: string, options?: { includePrerelease?: boolean }): string | null;
+	maxSatisfying(versions: string[], range: string, options?: { includePrerelease?: boolean }): string | null;
+	minSatisfying(versions: string[], range: string, options?: { includePrerelease?: boolean }): string | null;
+	inc(version: string, release: string, options: undefined, identifier?: string, identifierBase?: '0' | '1' | false): string | null;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const nodeSemver = require('semver') as NodeSemver;
+
+/** Pre-release identifiers, including ones ending in `v` (which node-semver's space handling reads as part of the version). */
+const rangeIdentifierArb = fc.constantFrom('0', '1', '2', 'alpha', 'beta', 'rc', 'a', '-', 'x', 'v', 'dev', '0a', 'X');
+
+/** A version part of a range: mostly small numbers, sometimes a wildcard, a leading zero or a number around `Number.MAX_SAFE_INTEGER`. */
+const rangePartArb = fc.oneof(
+	{ weight: 15, arbitrary: fc.constantFrom('0', '1', '2', '3', '10') },
+	{ weight: 4, arbitrary: fc.constantFrom('x', 'X', '*') },
+	{ weight: 1, arbitrary: fc.constantFrom('01', '9007199254740990', '9007199254740991', '99999999999999999999') }
+);
+
+/** A (partial) version as written in a range, with an optional pre-release and build metadata. */
+const partialArb = fc
+	.tuple(
+		rangePartArb,
+		fc.option(rangePartArb, { nil: undefined }),
+		fc.option(rangePartArb, { nil: undefined }),
+		fc.option(fc.array(rangeIdentifierArb, { minLength: 1, maxLength: 3 }), { nil: undefined }),
+		fc.option(fc.constantFrom('build', 'b.1', '001', 'x-y'), { nil: undefined })
+	)
+	.map(function ([major, minor, patch, prerelease, build]) {
+		let text = major;
+		if (minor !== undefined) text += `.${minor}`;
+		if (minor !== undefined && patch !== undefined) text += `.${patch}${prerelease === undefined ? '' : `-${prerelease.join('.')}`}`;
+		return build === undefined ? text : `${text}+${build}`;
+	});
+
+/** White space between tokens: mostly one space, sometimes more, a tab, a newline or a no-break space. */
+const spaceArb = fc.oneof({ weight: 12, arbitrary: fc.constant(' ') }, { weight: 3, arbitrary: fc.constantFrom('  ', '\t', ' \n ', ' ') });
+
+/** A token of a comparator set: an operator (valid or not), optional white space and prefix, then a partial version. */
+const tokenArb = fc.oneof(
+	{
+		weight: 12,
+		arbitrary: fc
+			.tuple(
+				fc.constantFrom('', '', '', '<', '<=', '>', '>=', '=', '~', '~>', '^', '==', '=>', '<>', '~=', '^='),
+				fc.oneof({ weight: 6, arbitrary: fc.constant('') }, { weight: 1, arbitrary: spaceArb }),
+				fc.constantFrom('', '', '', '', 'v', '=', 'v=', '=v', 'vv', ' ', ' v'),
+				partialArb
+			)
+			.map(function (parts) {
+				return parts.join('');
+			})
+	},
+	{ weight: 1, arbitrary: fc.constantFrom('*', 'x', '', '>=0.0.0', '>=0.0.0-0', '<0.0.0-0', '>*', '<x', '**', '*1.2.3', '1.2.3*', '1.2.3<*', '+b') }
+);
+
+/** A comparator set: space-separated tokens or a hyphen range. */
+const setArb = fc.oneof(
+	{
+		weight: 5,
+		arbitrary: fc.array(fc.tuple(tokenArb, spaceArb), { maxLength: 4 }).map(function (tokens) {
+			return tokens
+				.map(function ([token, space]) {
+					return token + space;
+				})
+				.join('');
+		})
+	},
+	{
+		weight: 1,
+		arbitrary: fc
+			.tuple(fc.constantFrom('', 'v', '=', ' '), partialArb, fc.constantFrom(' - ', ' - ', '  - ', ' -  ', ' -'), fc.constantFrom('', 'v', '=', ' '), partialArb)
+			.map(function (parts) {
+				return parts.join('');
+			})
+	}
+);
+
+/** A range: comparator sets separated by `||` with assorted spacing. */
+const rangeArb = fc.tuple(fc.array(setArb, { minLength: 1, maxLength: 3 }), fc.constantFrom('||', ' || ', '  ||  ', ' ||', '|| ', ' ||| ')).map(function ([sets, separator]) {
+	return sets.join(separator);
+});
+
+/** Character soup from the range alphabet, mostly invalid, to compare what both implementations reject (build metadata, dropped first, leaves odd spacing). */
+const soupArb = fc
+	.array(
+		fc.constantFrom(
+			'0',
+			'1',
+			'2',
+			'.',
+			'.',
+			'x',
+			'X',
+			'*',
+			'v',
+			'=',
+			'<',
+			'>',
+			'~',
+			'^',
+			'-',
+			' ',
+			' ',
+			'|',
+			'||',
+			'+',
+			'a',
+			'\t',
+			'1.2.3',
+			' - ',
+			'0.0.0',
+			'-0',
+			'+b',
+			' +b',
+			'+cv',
+			'1.2.3-v',
+			'>='
+		),
+		{
+			maxLength: 14
+		}
+	)
+	.map(function (pieces) {
+		return pieces.join('');
+	});
+
+/** Versions to test: small numbers so that they fall on range bounds, with pre-releases, and a few written in ways node-semver accepts or rejects. */
+const testVersionArb = fc.oneof(
+	{
+		weight: 10,
+		arbitrary: fc
+			.tuple(fc.nat(3), fc.nat(3), fc.nat(3), fc.option(fc.constantFrom('0', '1', 'alpha', 'beta.1', 'rc.1', 'a.b', '-', 'x', 'v', 'dev', '0a'), { nil: undefined }))
+			.map(function ([major, minor, patch, prerelease]) {
+				return `${major}.${minor}.${patch}${prerelease === undefined ? '' : `-${prerelease}`}`;
+			})
+	},
+	{ weight: 1, arbitrary: fc.constantFrom('10.0.0', '0.0.0-0', 'v1.2.3', ' 1.2.3 ', '=1.2.3', '1.2', '01.2.3', '1.2.3+build', 'v1.2.3-beta+x', '9007199254740991.0.0', '') }
+);
+
+/** Release versions only, for the algebraic laws. */
+const releaseArb = fc.tuple(fc.nat(4), fc.nat(4), fc.nat(4)).map(function ([major, minor, patch]) {
+	return `${major}.${minor}.${patch}`;
+});
+
+describe('satisfiesSemver (properties)', function () {
+	it('gives the answers of node-semver on ranges from its grammar, with white space, prefixes and build metadata', function () {
+		fc.assert(
+			fc.property(rangeArb, fc.array(testVersionArb, { minLength: 1, maxLength: 8 }), fc.boolean(), function (range, versions, includePrerelease) {
+				const options = { includePrerelease };
+				const valid = nodeSemver.validRange(range, options) !== null;
+				expect(helpers.isSemverRange(range, options)).toBe(valid);
+				for (const version of versions) expect(helpers.satisfiesSemver(version, range, options)).toBe(nodeSemver.satisfies(version, range, options));
+			})
+		);
+	});
+
+	it('accepts exactly the ranges node-semver accepts, on character soup', function () {
+		fc.assert(
+			fc.property(soupArb, testVersionArb, fc.boolean(), function (range, version, includePrerelease) {
+				const options = { includePrerelease };
+				expect(helpers.isSemverRange(range, options)).toBe(nodeSemver.validRange(range, options) !== null);
+				expect(helpers.satisfiesSemver(version, range, options)).toBe(nodeSemver.satisfies(version, range, options));
+			})
+		);
+	});
+
+	it('compiles to a predicate that agrees with satisfiesSemver', function () {
+		fc.assert(
+			fc.property(rangeArb, fc.array(testVersionArb, { maxLength: 8 }), function (range, versions) {
+				fc.pre(helpers.isSemverRange(range));
+				const test = helpers.compileSemverRange(range);
+				for (const version of versions) expect(test(version)).toBe(helpers.satisfiesSemver(version, range));
+			})
+		);
+	});
+
+	it('lets a version satisfy itself, and bounds it exactly', function () {
+		fc.assert(
+			fc.property(semverArb, function (version) {
+				expect(helpers.satisfiesSemver(version, version)).toBe(true);
+				expect(helpers.satisfiesSemver(version, `>=${version} <=${version}`)).toBe(true);
+				expect(helpers.satisfiesSemver(version, `<${version}`)).toBe(false);
+				expect(helpers.satisfiesSemver(version, `>${version}`)).toBe(false);
+			})
+		);
+	});
+
+	it('reads hyphen and caret ranges of releases as their bounds', function () {
+		fc.assert(
+			fc.property(releaseArb, releaseArb, releaseArb, function (low, high, version) {
+				const inside = helpers.compareSemver(version, low) >= 0 && helpers.compareSemver(version, high) <= 0;
+				expect(helpers.satisfiesSemver(version, `${low} - ${high}`)).toBe(inside);
+				const [major, minor, patch] = low.split('.').map(Number);
+				const upper = major > 0 ? `${major + 1}.0.0` : minor > 0 ? `0.${minor + 1}.0` : `0.0.${patch + 1}`;
+				const caret = helpers.compareSemver(version, low) >= 0 && helpers.compareSemver(version, upper) < 0;
+				expect(helpers.satisfiesSemver(version, `^${low}`)).toBe(caret);
+			})
+		);
+	});
+
+	it('treats || as a union of comparator sets that each allow some release', function () {
+		fc.assert(
+			fc.property(fc.array(releaseArb, { minLength: 1, maxLength: 3 }), releaseArb, function (bounds, version) {
+				const sets = bounds.map(function (bound) {
+					return `~${bound}`;
+				});
+				expect(helpers.satisfiesSemver(version, sets.join(' || '))).toBe(
+					sets.some(function (set) {
+						return helpers.satisfiesSemver(version, set);
+					})
+				);
+			})
+		);
+	});
+});
+
+describe('maxSatisfyingSemver and minSatisfyingSemver (properties)', function () {
+	it('give the answers of node-semver', function () {
+		fc.assert(
+			fc.property(fc.array(testVersionArb, { maxLength: 12 }), rangeArb, fc.boolean(), function (versions, range, includePrerelease) {
+				const options = { includePrerelease };
+				expect(helpers.maxSatisfyingSemver(versions, range, options)).toBe(nodeSemver.maxSatisfying(versions, range, options) ?? undefined);
+				expect(helpers.minSatisfyingSemver(versions, range, options)).toBe(nodeSemver.minSatisfying(versions, range, options) ?? undefined);
+			})
+		);
+	});
+
+	it('pick a satisfying version that no other satisfying version beats', function () {
+		fc.assert(
+			fc.property(fc.array(semverArb, { maxLength: 12 }), fc.constantFrom('*', '^1.0.0', '>=1.1.0 <2.2.0', '~0.1 || 2.x', '>=1.0.0-0'), function (versions, range) {
+				const best = helpers.maxSatisfyingSemver(versions, range);
+				const worst = helpers.minSatisfyingSemver(versions, range);
+				const satisfying = versions.filter(function (version) {
+					return helpers.satisfiesSemver(version, range);
+				});
+				expect(best === undefined).toBe(satisfying.length === 0);
+				expect(worst === undefined).toBe(satisfying.length === 0);
+				for (const version of satisfying) {
+					expect(helpers.compareSemver(version, best as string)).toBeLessThanOrEqual(0);
+					expect(helpers.compareSemver(version, worst as string)).toBeGreaterThanOrEqual(0);
+				}
+			})
+		);
+	});
+});
+
+describe('incrementSemver (properties)', function () {
+	const releases = ['major', 'minor', 'patch', 'premajor', 'preminor', 'prepatch', 'prerelease', 'release'] as const;
+	const incrementVersionArb = fc
+		.tuple(
+			fc.constantFrom('0', '1', '2', '9007199254740990'),
+			fc.nat(2),
+			fc.nat(2),
+			fc.option(
+				fc.array(fc.constantFrom('0', '1', '9', 'alpha', 'beta', 'rc', '-', '1e5', '0x1', 'Infinity', '9007199254740990', '9007199254740991', 'alpha.1'), {
+					minLength: 1,
+					maxLength: 3
+				}),
+				{
+					nil: undefined
+				}
+			),
+			fc.boolean()
+		)
+		.map(function ([major, minor, patch, prerelease, build]) {
+			return `${major}.${minor}.${patch}${prerelease === undefined ? '' : `-${prerelease.join('.')}`}${build ? '+build.1' : ''}`;
+		});
+	const incrementIdentifierArb = fc.constantFrom(undefined, '', 'alpha', 'beta', 'rc', 'alpha.1', 'beta.0', '0', '1', 'a.b', '1e5', 'x', '-');
+	const baseArb = fc.constantFrom(undefined, '0' as const, '1' as const, false as const);
+
+	it('gives the answers of node-semver (throwing where it returns null)', function () {
+		fc.assert(
+			fc.property(incrementVersionArb, fc.constantFrom(...releases), incrementIdentifierArb, baseArb, function (version, release, identifier, identifierBase) {
+				const expected = nodeSemver.inc(version, release, undefined, identifier, identifierBase);
+				let actual: string | null;
+				try {
+					actual = helpers.incrementSemver(version, release, { identifier, identifierBase });
+				} catch {
+					actual = null;
+				}
+				expect(actual).toBe(expected);
+			})
+		);
+	});
+
+	it('moves the version up, to a valid semantic version, unless it switches to an identifier that sorts lower', function () {
+		fc.assert(
+			fc.property(
+				incrementVersionArb,
+				fc.constantFrom(...releases),
+				fc.constantFrom('0' as const, '1' as const, undefined),
+				function (version, release, identifierBase) {
+					let next: string;
+					try {
+						next = helpers.incrementSemver(version, release, { identifierBase });
+					} catch {
+						return;
+					}
+					expect(helpers.isSemver(next)).toBe(true);
+					expect(helpers.compareSemver(next, version)).toBe(1);
+				}
+			)
+		);
+	});
+});

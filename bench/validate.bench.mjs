@@ -1,5 +1,9 @@
 import {
 	compareSemver,
+	compileSemverRange,
+	incrementSemver,
+	maxSatisfyingSemver,
+	satisfiesSemver,
 	isBase64,
 	isCreditCardNumber,
 	isEmail,
@@ -25,6 +29,8 @@ import {
 } from 'tinkit/validate';
 import { isArrayOf, isInteger, isIntegerInRange, isOneOf, isShape, isString } from 'tinkit/guards';
 import { z } from 'zod';
+// node-semver (a development dependency): the reference implementation of the semver range helpers.
+import semver from 'semver';
 
 // No validation library is installed: the competitors are the snippets people usually paste (a typical regex, `URL.canParse`, ...).
 // Most of them are looser than our validators (they accept inputs we reject on purpose), so a ratio below 1 can be the price of correctness.
@@ -60,6 +66,34 @@ const SEMVER =
 const HEX_COLOR = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
 const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+// Semver ranges: the common shapes (caret, comparators, hyphen, tilde, unions, white space after an operator, pre-releases), each
+// tested against releases, a pre-release and a `v`-prefixed version. node-semver caches the parsing of up to 1000 ranges, so the
+// "distinct ranges" case (5000 ranges, cycled) shows its cost without the cache.
+const semverRanges = ['^1.2.0', '>=1.2.3 <2.0.0', '1.2.3 - 2.3.4', '~1.2', '^0.0.3', '1.x || >=2.5.0 || 5.0.0 - 7.2.3', '>= 1.2.3 < 2', '^1.2.3-beta.1'];
+const semverVersions = ['1.3.0', '2.0.0', '1.2.3-beta.2', '0.0.3', '6.1.0', 'v1.4.0'];
+const compiledRange = compileSemverRange('^1.2.0 || ~2.4');
+const semverRange = new semver.Range('^1.2.0 || ~2.4');
+const distinctRanges = Array.from({ length: 5000 }, function (_, index) {
+	return `^${index % 7}.${index % 13}.${index} || >=${index}.0.0 <${index + 1}.0.0`;
+});
+let distinctIndex = 0;
+const candidateVersions = Array.from({ length: 100 }, function (_, index) {
+	return `${index % 4}.${index % 10}.${index}`;
+});
+
+/**
+ * Tests every range against every version.
+ * @param {(version: string, range: string) => boolean} satisfies - The implementation
+ * @returns {number} How many pairs matched
+ */
+function countSatisfying(satisfies) {
+	let count = 0;
+	for (let r = 0; r < semverRanges.length; r++) {
+		for (let v = 0; v < semverVersions.length; v++) if (satisfies(semverVersions[v], semverRanges[r])) count++;
+	}
+	return count;
+}
 
 /**
  * Applies a predicate to every input.
@@ -368,6 +402,65 @@ export default [
 			return !Number.isNaN(Date.parse(value));
 		}
 	}),
+	{
+		name: 'satisfiesSemver (8 ranges x 6 versions, parsed every time)',
+		fn: function () {
+			return countSatisfying(satisfiesSemver);
+		},
+		competitors: {
+			'semver.satisfies': function () {
+				return countSatisfying(semver.satisfies);
+			}
+		}
+	},
+	{
+		name: 'compileSemverRange predicate (6 versions)',
+		fn: function () {
+			return semverVersions.filter(compiledRange).length;
+		},
+		competitors: {
+			'semver Range#test': function () {
+				return semverVersions.filter(function (version) {
+					return semverRange.test(version);
+				}).length;
+			}
+		}
+	},
+	{
+		name: 'satisfiesSemver (5000 distinct ranges)',
+		fn: function () {
+			distinctIndex = (distinctIndex + 1) % distinctRanges.length;
+			return satisfiesSemver('3.4.5', distinctRanges[distinctIndex]);
+		},
+		competitors: {
+			'semver.satisfies': function () {
+				distinctIndex = (distinctIndex + 1) % distinctRanges.length;
+				return semver.satisfies('3.4.5', distinctRanges[distinctIndex]);
+			}
+		}
+	},
+	{
+		name: 'maxSatisfyingSemver (100 versions)',
+		fn: function () {
+			return maxSatisfyingSemver(candidateVersions, '^1.2.0');
+		},
+		competitors: {
+			'semver.maxSatisfying': function () {
+				return semver.maxSatisfying(candidateVersions, '^1.2.0');
+			}
+		}
+	},
+	{
+		name: 'incrementSemver (prerelease, beta)',
+		fn: function () {
+			return incrementSemver('1.2.4-beta.3', 'prerelease', { identifier: 'beta' });
+		},
+		competitors: {
+			'semver.inc': function () {
+				return semver.inc('1.2.4-beta.3', 'prerelease', 'beta');
+			}
+		}
+	},
 	{
 		name: 'compareSemver sort (8 versions)',
 		fn: function () {

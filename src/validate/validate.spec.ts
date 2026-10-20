@@ -1681,3 +1681,937 @@ describe('parseEnv', function () {
 		});
 	});
 });
+
+/** The parts of node-semver (the reference implementation, a development dependency used only by the tests) that the tests call. */
+interface NodeSemver {
+	satisfies(version: string, range: string, options?: { includePrerelease?: boolean }): boolean;
+	validRange(range: string, options?: { includePrerelease?: boolean }): string | null;
+	inc(version: string, release: string, options: undefined, identifier?: string, identifierBase?: '0' | '1' | false): string | null;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const nodeSemver = require('semver') as NodeSemver;
+
+/** node-semver's `range-include` fixtures that do not need `loose`: [range, version, includePrerelease]. */
+const RANGE_INCLUDE: [string, string, boolean?][] = [
+	['1.0.0 - 2.0.0', '1.2.3'],
+	['^1.2.3+build', '1.2.3'],
+	['^1.2.3+build', '1.3.0'],
+	['1.2.3-pre+asdf - 2.4.3-pre+asdf', '1.2.3'],
+	['1.2.3-pre+asdf - 2.4.3-pre+asdf', '1.2.3-pre.2'],
+	['1.2.3-pre+asdf - 2.4.3-pre+asdf', '2.4.3-alpha'],
+	['1.2.3+asdf - 2.4.3+asdf', '1.2.3'],
+	['1.0.0', '1.0.0'],
+	['>=*', '0.2.4'],
+	['', '1.0.0'],
+	['*', '1.2.3'],
+	['*', 'v1.2.3'],
+	['>=1.0.0', '1.0.0'],
+	['>=1.0.0', '1.0.1'],
+	['>=1.0.0', '1.1.0'],
+	['>1.0.0', '1.0.1'],
+	['>1.0.0', '1.1.0'],
+	['<=2.0.0', '2.0.0'],
+	['<=2.0.0', '1.9999.9999'],
+	['<=2.0.0', '0.2.9'],
+	['<2.0.0', '1.9999.9999'],
+	['<2.0.0', '0.2.9'],
+	['>= 1.0.0', '1.0.0'],
+	['>=  1.0.0', '1.0.1'],
+	['>=   1.0.0', '1.1.0'],
+	['> 1.0.0', '1.0.1'],
+	['>  1.0.0', '1.1.0'],
+	['<=   2.0.0', '2.0.0'],
+	['<= 2.0.0', '1.9999.9999'],
+	['<=  2.0.0', '0.2.9'],
+	['<    2.0.0', '1.9999.9999'],
+	['<\t2.0.0', '0.2.9'],
+	['>=0.1.97', 'v0.1.97'],
+	['>=0.1.97', '0.1.97'],
+	['0.1.20 || 1.2.4', '1.2.4'],
+	['>=0.2.3 || <0.0.1', '0.0.0'],
+	['>=0.2.3 || <0.0.1', '0.2.3'],
+	['>=0.2.3 || <0.0.1', '0.2.4'],
+	['||', '1.3.4'],
+	['2.x.x', '2.1.3'],
+	['1.2.x', '1.2.3'],
+	['1.2.x || 2.x', '2.1.3'],
+	['1.2.x || 2.x', '1.2.3'],
+	['x', '1.2.3'],
+	['2.*.*', '2.1.3'],
+	['1.2.*', '1.2.3'],
+	['1.2.* || 2.*', '2.1.3'],
+	['1.2.* || 2.*', '1.2.3'],
+	['2', '2.1.2'],
+	['2.3', '2.3.1'],
+	['~0.0.1', '0.0.1'],
+	['~0.0.1', '0.0.2'],
+	['~x', '0.0.9'],
+	['~2', '2.0.9'],
+	['~2.4', '2.4.0'],
+	['~2.4', '2.4.5'],
+	['~>3.2.1', '3.2.2'],
+	['~1', '1.2.3'],
+	['~>1', '1.2.3'],
+	['~> 1', '1.2.3'],
+	['~1.0', '1.0.2'],
+	['~ 1.0', '1.0.2'],
+	['~ 1.0.3', '1.0.12'],
+	['>=1', '1.0.0'],
+	['>= 1', '1.0.0'],
+	['<1.2', '1.1.1'],
+	['< 1.2', '1.1.1'],
+	['~v0.5.4-pre', '0.5.5'],
+	['~v0.5.4-pre', '0.5.4'],
+	['=0.7.x', '0.7.2'],
+	['<=0.7.x', '0.7.2'],
+	['>=0.7.x', '0.7.2'],
+	['<=0.7.x', '0.6.2'],
+	['~1.2.1 >=1.2.3', '1.2.3'],
+	['~1.2.1 =1.2.3', '1.2.3'],
+	['~1.2.1 1.2.3', '1.2.3'],
+	['~1.2.1 >=1.2.3 1.2.3', '1.2.3'],
+	['~1.2.1 1.2.3 >=1.2.3', '1.2.3'],
+	['>=1.2.1 1.2.3', '1.2.3'],
+	['1.2.3 >=1.2.1', '1.2.3'],
+	['>=1.2.3 >=1.2.1', '1.2.3'],
+	['>=1.2.1 >=1.2.3', '1.2.3'],
+	['>=1.2', '1.2.8'],
+	['^1.2.3', '1.8.1'],
+	['^0.1.2', '0.1.2'],
+	['^0.1', '0.1.2'],
+	['^0.0.1', '0.0.1'],
+	['^1.2', '1.4.2'],
+	['^1.2 ^1', '1.4.2'],
+	['^1.2.3-alpha', '1.2.3-pre'],
+	['^1.2.0-alpha', '1.2.0-pre'],
+	['^0.0.1-alpha', '0.0.1-beta'],
+	['^0.0.1-alpha', '0.0.1'],
+	['^0.1.1-alpha', '0.1.1-beta'],
+	['^x', '1.2.3'],
+	['x - 1.0.0', '0.9.7'],
+	['x - 1.x', '0.9.7'],
+	['1.0.0 - x', '1.9.7'],
+	['1.x - x', '1.9.7'],
+	['<=7.x', '7.9.9'],
+	['2.x', '2.0.0-pre.0', true],
+	['2.x', '2.1.0-pre.0', true],
+	['1.1.x', '1.1.0-a', true],
+	['1.1.x', '1.1.1-a', true],
+	['*', '1.0.0-rc1', true],
+	['^1.0.0-0', '1.0.1-rc1', true],
+	['^1.0.0-rc2', '1.0.1-rc1', true],
+	['^1.0.0', '1.0.1-rc1', true],
+	['^1.0.0', '1.1.0-rc1', true],
+	['1 - 2', '2.0.0-pre', true],
+	['1 - 2', '1.0.0-pre', true],
+	['1.0 - 2', '1.0.0-pre', true],
+	['=0.7.x', '0.7.0-asdf', true],
+	['>=0.7.x', '0.7.0-asdf', true],
+	['<=0.7.x', '0.7.0-asdf', true],
+	['>=1.0.0 <=1.1.0', '1.1.0-pre', true]
+];
+
+/** node-semver's `range-exclude` fixtures that do not need `loose`: [range, version, includePrerelease]. */
+const RANGE_EXCLUDE: [string, string, boolean?][] = [
+	['1.0.0 - 2.0.0', '2.2.3'],
+	['1.2.3+asdf - 2.4.3+asdf', '1.2.3-pre.2'],
+	['1.2.3+asdf - 2.4.3+asdf', '2.4.3-alpha'],
+	['^1.2.3+build', '2.0.0'],
+	['^1.2.3+build', '1.2.0'],
+	['^1.2.3', '1.2.3-pre'],
+	['^1.2', '1.2.0-pre'],
+	['>1.2', '1.3.0-beta'],
+	['<=1.2.3', '1.2.3-beta'],
+	['^1.2.3', '1.2.3-beta'],
+	['=0.7.x', '0.7.0-asdf'],
+	['>=0.7.x', '0.7.0-asdf'],
+	['<=0.7.x', '0.7.0-asdf'],
+	['1.0.0', '1.0.1'],
+	['>=1.0.0', '0.0.0'],
+	['>=1.0.0', '0.0.1'],
+	['>=1.0.0', '0.1.0'],
+	['>1.0.0', '0.0.1'],
+	['>1.0.0', '0.1.0'],
+	['<=2.0.0', '3.0.0'],
+	['<=2.0.0', '2.9999.9999'],
+	['<=2.0.0', '2.2.9'],
+	['<2.0.0', '2.9999.9999'],
+	['<2.0.0', '2.2.9'],
+	['>=0.1.97', 'v0.1.93'],
+	['>=0.1.97', '0.1.93'],
+	['0.1.20 || 1.2.4', '1.2.3'],
+	['>=0.2.3 || <0.0.1', '0.0.3'],
+	['>=0.2.3 || <0.0.1', '0.2.2'],
+	['2.x.x', '1.1.3'],
+	['2.x.x', '3.1.3'],
+	['1.2.x', '1.3.3'],
+	['1.2.x || 2.x', '3.1.3'],
+	['1.2.x || 2.x', '1.1.3'],
+	['2.*.*', '1.1.3'],
+	['2.*.*', '3.1.3'],
+	['1.2.*', '1.3.3'],
+	['1.2.* || 2.*', '3.1.3'],
+	['1.2.* || 2.*', '1.1.3'],
+	['2', '1.1.2'],
+	['2.3', '2.4.1'],
+	['~0.0.1', '0.1.0-alpha'],
+	['~0.0.1', '0.1.0'],
+	['~2.4', '2.5.0'],
+	['~2.4', '2.3.9'],
+	['~>3.2.1', '3.3.2'],
+	['~>3.2.1', '3.2.0'],
+	['~1', '0.2.3'],
+	['~>1', '2.2.3'],
+	['~1.0', '1.1.0'],
+	['<1', '1.0.0'],
+	['>=1.2', '1.1.1'],
+	['~v0.5.4-beta', '0.5.4-alpha'],
+	['=0.7.x', '0.8.2'],
+	['>=0.7.x', '0.6.2'],
+	['<0.7.x', '0.7.2'],
+	['<1.2.3', '1.2.3-beta'],
+	['=1.2.3', '1.2.3-beta'],
+	['>1.2', '1.2.8'],
+	['^0.0.1', '0.0.2-alpha'],
+	['^0.0.1', '0.0.2'],
+	['^1.2.3', '2.0.0-alpha'],
+	['^1.2.3', '1.2.2'],
+	['^1.2', '1.1.9'],
+	['*', 'v1.2.3-foo'],
+	['*', 'not a version'],
+	['>=2', 'glorp'],
+	['2.x', '3.0.0-pre.0', true],
+	['^1.0.0', '1.0.0-rc1', true],
+	['^1.0.0', '2.0.0-rc1', true],
+	['^1.2.3-rc2', '2.0.0', true],
+	['^1.0.0', '2.0.0-rc1'],
+	['1 - 2', '3.0.0-pre', true],
+	['1 - 2', '2.0.0-pre'],
+	['1 - 2', '1.0.0-pre'],
+	['1.0 - 2', '1.0.0-pre'],
+	['1.1.x', '1.0.0-a'],
+	['1.1.x', '1.1.0-a'],
+	['1.1.x', '1.2.0-a'],
+	['1.1.x', '1.2.0-a', true],
+	['1.1.x', '1.0.0-a', true],
+	['1.x', '1.0.0-a'],
+	['1.x', '1.1.0-a'],
+	['1.x', '1.2.0-a'],
+	['1.x', '0.0.0-a', true],
+	['1.x', '2.0.0-a', true],
+	['>=1.0.0 <1.1.0', '1.1.0'],
+	['>=1.0.0 <1.1.0', '1.1.0', true],
+	['>=1.0.0 <1.1.0', '1.1.0-pre'],
+	['>=1.0.0 <1.1.0-pre', '1.1.0-pre']
+];
+
+/**
+ * Asserts that both implementations give `expected` for a version and a range.
+ * @param {string} range - The range
+ * @param {string} version - The version
+ * @param {boolean} includePrerelease - The option
+ * @param {boolean} expected - The expected answer
+ */
+function expectSatisfies(range: string, version: string, includePrerelease: boolean, expected: boolean): void {
+	const options = { includePrerelease };
+	expect([range, version, nodeSemver.satisfies(version, range, options), helpers.satisfiesSemver(version, range, options)]).toEqual([range, version, expected, expected]);
+	const valid = helpers.isSemverRange(range, options);
+	expect([range, valid]).toEqual([range, nodeSemver.validRange(range, options) !== null]);
+	if (valid) expect(helpers.compileSemverRange(range, options)(version)).toBe(expected);
+}
+
+describe('satisfiesSemver', function () {
+	it.each(RANGE_INCLUDE)('%j includes %j (includePrerelease: %j), as in node-semver', function (range, version, includePrerelease = false) {
+		expectSatisfies(range, version, includePrerelease, true);
+	});
+
+	it.each(RANGE_EXCLUDE)('%j excludes %j (includePrerelease: %j), as in node-semver', function (range, version, includePrerelease = false) {
+		expectSatisfies(range, version, includePrerelease, false);
+	});
+
+	it('desugars carets, tildes, X-ranges and hyphen ranges like node-semver', function () {
+		const cases: [string, string[], string[]][] = [
+			['^1.2.3', ['1.2.3', '1.9.9'], ['1.2.2', '2.0.0', '2.0.0-0']],
+			['^0.2.3', ['0.2.3', '0.2.9'], ['0.3.0', '0.2.2']],
+			['^0.0.3', ['0.0.3'], ['0.0.4', '0.0.2']],
+			['^0.0', ['0.0.0', '0.0.9'], ['0.1.0']],
+			['^0.x', ['0.0.0', '0.9.9'], ['1.0.0']],
+			['^1.x.3', ['1.0.0', '1.9.9'], ['2.0.0']],
+			['~1.2.3', ['1.2.3', '1.2.9'], ['1.3.0', '1.2.2']],
+			['~1.x.3', ['1.0.0', '1.9.9'], ['2.0.0']],
+			['~0', ['0.0.0', '0.9.9'], ['1.0.0']],
+			['1.2.3 - 2.3.4', ['1.2.3', '2.3.4'], ['1.2.2', '2.3.5']],
+			['1.2 - 2.3', ['1.2.0', '2.3.9'], ['1.1.9', '2.4.0']],
+			['1.x.5 - 2', ['1.0.0', '2.9.9'], ['0.9.9', '3.0.0']],
+			['1 - 1.2.0', ['1.0.0', '1.2.0'], ['1.2.1', '1.3.0']],
+			['0.5.0 - 1', ['0.5.0', '1.9.9'], ['0.1.0', '2.0.0']],
+			['0 - 0.5', ['0.0.0', '0.5.9'], ['0.6.0']],
+			['1 - 0.0.0', [], ['0.0.1', '1.0.0']],
+			['1.0.0 - 1.0', ['1.0.0', '1.0.9'], ['1.1.0']],
+			['>1', ['2.0.0'], ['1.9.9']],
+			['>1.2', ['1.3.0'], ['1.2.9']],
+			['<=1', ['1.9.9'], ['2.0.0']],
+			['>=1.x', ['1.0.0'], ['0.9.9']],
+			['<1.x', ['0.9.9'], ['1.0.0']],
+			['>x', [], ['0.0.0', '1.0.0']],
+			['<*', [], ['0.0.0']],
+			['<=*', ['0.0.0', '9.9.9'], []],
+			['=1.x', ['1.5.0'], ['2.0.0']],
+			['>1.0', ['1.1.0', '1.5.0'], ['1.0.9']],
+			['<=1.0', ['1.0.9'], ['1.1.0']],
+			['^0.0.0', ['0.0.0'], ['0.0.1', '0.0.5']],
+			['1.0.5-beta - 2', ['1.0.5-gamma'], ['1.0.4']],
+			['1.2.0-beta - 2', ['1.2.0-gamma'], ['1.1.9']],
+			['==1.x', ['1.5.0'], ['2.0.0']],
+			['v=1.2.x', ['1.2.5'], ['1.3.0']]
+		];
+		for (const [range, inside, outside] of cases) {
+			for (const version of inside) expectSatisfies(range, version, false, true);
+			for (const version of outside) expectSatisfies(range, version, false, false);
+		}
+	});
+
+	it('only lets pre-releases through comparators on the same major.minor.patch, unless includePrerelease is set', function () {
+		expectSatisfies('>=1.2.3-beta.1', '1.2.3-beta.2', false, true);
+		expectSatisfies('>=1.2.3-beta.1', '1.2.4-beta', false, false);
+		expectSatisfies('>=1.2.3-beta.1', '1.2.4-beta', true, true);
+		expectSatisfies('>1.0.0-alpha <2.0.0', '1.5.0-beta', false, false);
+		expectSatisfies('>1.0.0-alpha <2.0.0 || 1.5.0-alpha', '1.5.0-beta', false, false);
+		expectSatisfies('>1.0.0-alpha <2.0.0 || >=1.5.0-alpha', '1.5.0-beta', false, true);
+		expectSatisfies('1.2.3-beta', '1.2.3-beta', false, true);
+		expectSatisfies('<1.2.3-beta', '1.2.3-alpha', false, true);
+		expectSatisfies('<1.2.3-beta', '1.2.3-gamma', false, false);
+		// The range has a pre-release, but the comparator that allows it belongs to another alternative.
+		expectSatisfies('^1.2.3-beta || ^2.0.0', '2.0.0-beta', false, false);
+		// `>=0.0.0` is dropped like `*`, but `>=0.0.0-0` keeps 0.0.0 pre-releases.
+		expectSatisfies('>=0.0.0', '0.0.0-0', false, false);
+		expectSatisfies('>=0.0.0-0', '0.0.0-0', false, true);
+		expectSatisfies('>=0.0.0', '0.0.0-0', true, false);
+		expectSatisfies('>=0.0.0-0', '0.0.0-0', true, true);
+		expectSatisfies('>=v0.0.0', '0.0.1', false, true);
+		expectSatisfies('^0.0.0-alpha', '0.0.0-beta', false, true);
+		// The `-0` of a desugared upper bound still matters when another comparator lets pre-releases of that version through.
+		expectSatisfies('>=1.2.0-alpha <1.2', '1.2.0-beta', false, false);
+		expectSatisfies('>=1.3.0-alpha <=1.2', '1.3.0-beta', false, false);
+		expectSatisfies('<1.2.x >=1.2.0-alpha', '1.2.0-beta', false, false);
+		expectSatisfies('>=1.2.0-alpha <1.2.0', '1.2.0-beta', false, true);
+		// Only `>=0.0.0` allows any release: other comparators on 0.0.0 are kept.
+		expectSatisfies('0.0.0', '1.0.0', false, false);
+		expectSatisfies('=0.0.0', '0.0.1', false, false);
+		expectSatisfies('<0.0.0', '0.0.1', false, false);
+		expectSatisfies('<=0.0.0', '0.0.1', false, false);
+		expectSatisfies('>0.0.0', '0.0.0', false, false);
+		expectSatisfies('<0.0.0 || 1.2.3-beta', '1.2.3-beta', false, true);
+	});
+
+	it('reduces a range with an alternative allowing any version to any release, as node-semver does', function () {
+		expectSatisfies('* || 1.2.3-beta', '1.2.3-beta', false, false);
+		expectSatisfies('1.2.3-beta || *', '1.2.3-beta', false, false);
+		expectSatisfies('1.2.3-beta || >=0.0.0', '1.2.3-beta', false, false);
+		expectSatisfies('1.2.3-beta || x', '1.2.3-beta', false, false);
+		expectSatisfies('1.2.3-beta || <0.0.0-0', '1.2.3-beta', false, true);
+		expectSatisfies('1.2.3-beta ||', '1.2.3-beta', false, false);
+		expectSatisfies('* || 1.2.3-beta', '1.2.3-beta', true, true);
+		expectSatisfies('<0.0.0-0 || <0.0.0-0', '0.0.0-0', true, false);
+		// Only `>=0.0.0` written exactly so, or desugared to it, counts as any version.
+		expectSatisfies('>=v0.0.0 || 1.2.3-beta', '1.2.3-beta', false, true);
+		expectSatisfies('>=0.x || 1.2.3-beta', '1.2.3-beta', false, false);
+	});
+
+	it('ignores build metadata wherever node-semver drops it', function () {
+		expectSatisfies('1.2.3+build', '1.2.3+other', false, true);
+		expectSatisfies('>=1.2.3+build.5 <2', '1.9.0', false, true);
+		expectSatisfies('1+2.3.4', '1.5.0', false, true);
+		expectSatisfies('^1.2+build', '1.3.0', false, true);
+		expectSatisfies('=1.2.3+*b', '1.2.3', false, true);
+		expectSatisfies('1.2.3+', '1.2.3', false, false);
+	});
+
+	it('reads versions like node-semver: a leading v and surrounding white space, at most 256 characters', function () {
+		expectSatisfies('1.2.3', 'v1.2.3', false, true);
+		expectSatisfies('1.2.3', ' \t1.2.3\n ', false, true);
+		expectSatisfies('1.2.3', ' 1.2.3﻿', false, true);
+		expectSatisfies('1.2.3', '=1.2.3', false, false);
+		expectSatisfies('1.2.3', 'V1.2.3', false, false);
+		expectSatisfies('1.2.3', 'vv1.2.3', false, false);
+		expectSatisfies('*', '1.2', false, false);
+		expectSatisfies('*', '01.2.3', false, false);
+		expectSatisfies('*', '1.02.3', false, false);
+		expectSatisfies('*', '1.2.03', false, false);
+		expectSatisfies('*', '1.2.3-01', false, false);
+		// The pre-release is read from after the `-`: the patch's digits do not turn `01` into an alphanumeric identifier.
+		expectSatisfies('*', '1.2.3-01', true, false);
+		expectSatisfies('*', '2.2.2-01', true, false);
+		expectSatisfies('*', '2.2.2-0', true, true);
+		expectSatisfies('*', '1.2.3-', false, false);
+		expectSatisfies('*', '1.2.3-a.', false, false);
+		expectSatisfies('*', '1.2.3+', false, false);
+		expectSatisfies('*', '1.2.3+a.', false, false);
+		expectSatisfies('*', '1.2.3+a+b', false, false);
+		expectSatisfies('*', '1.x.3', false, false);
+		expectSatisfies('*', 'x.2.3', false, false);
+		expectSatisfies('*', '1.2.x', false, false);
+		expectSatisfies('*', '1a2.3', false, false);
+		expectSatisfies('*', '1.2a3', false, false);
+		for (const identifier of ['A', 'Z', 'a', 'z', '0Az-9']) {
+			expectSatisfies('*', `1.2.3-${identifier}`, true, true);
+			expectSatisfies('*', `1.2.3+${identifier}`, false, true);
+		}
+		for (const character of ['@', '[', '_', '`', '{', '|', '~', '/', ':']) {
+			expectSatisfies('*', `1.2.3-a${character}`, true, false);
+			expectSatisfies('*', `1.2.3+a${character}`, false, false);
+		}
+		expectSatisfies('*', '', false, false);
+		expectSatisfies('*', '9007199254740991.9007199254740991.9007199254740991', false, true);
+		expectSatisfies('*', '9007199254740992.0.0', false, false);
+		expectSatisfies('*', '0.9007199254740992.0', false, false);
+		expectSatisfies('*', '0.0.9007199254740992', false, false);
+		const longest = `1.2.3+${'b'.repeat(250)}`;
+		expectSatisfies('*', longest, false, true);
+		expectSatisfies('*', `${longest}b`, false, false);
+		expectSatisfies('*', ` ${longest}`, false, false);
+		expect(helpers.satisfiesSemver(123 as any, '*')).toBe(false);
+		expect(helpers.satisfiesSemver(null as any, '*')).toBe(false);
+	});
+
+	it('compares numeric pre-release identifiers exactly, beyond Number.MAX_SAFE_INTEGER', function () {
+		expect(helpers.satisfiesSemver('1.0.0-9007199254740993', '>1.0.0-9007199254740992')).toBe(true);
+		expect(helpers.satisfiesSemver('1.0.0-9007199254740993', '>1.0.0-9007199254740993')).toBe(false);
+		expect(helpers.satisfiesSemver('1.0.0-9007199254740993', '>1.0.0-9007199254740990')).toBe(true);
+		expect(helpers.satisfiesSemver('1.0.0-9007199254740990', '<1.0.0-9007199254740993')).toBe(true);
+		expect(helpers.satisfiesSemver('1.0.0-9007199254740993', '<1.0.0-a')).toBe(true);
+		expect(helpers.satisfiesSemver('1.0.0-a', '>1.0.0-99999999999999999999')).toBe(true);
+		expect(helpers.satisfiesSemver('1.0.0-alpha.10', '>1.0.0-alpha.9')).toBe(true);
+		expect(helpers.satisfiesSemver('1.0.0-alpha', '<1.0.0-alpha.0')).toBe(true);
+		expect(helpers.satisfiesSemver('1.0.0-alpha.0', '<1.0.0-alpha')).toBe(false);
+		expect(helpers.satisfiesSemver('1.0.0-alpha.0', '>1.0.0-alpha')).toBe(true);
+		expect(helpers.satisfiesSemver('1.0.0-alpha.0', '<=1.0.0-alpha')).toBe(false);
+		expect(helpers.satisfiesSemver('1.0.0-alpha', '>=1.0.0-alpha.0')).toBe(false);
+		expect(helpers.satisfiesSemver('1.0.0-B', '<1.0.0-a')).toBe(true);
+		expect(helpers.satisfiesSemver('1.0.0-1', '<1.0.0-2')).toBe(true);
+		expect(helpers.satisfiesSemver('1.0.0-2', '<1.0.0-10')).toBe(true);
+		expect(helpers.satisfiesSemver('1.0.0-10', '>1.0.0-9')).toBe(true);
+		expect(helpers.satisfiesSemver('1.0.0-1', '<1.0.0-a')).toBe(true);
+		expect(helpers.satisfiesSemver('1.0.0-a', '>1.0.0-1')).toBe(true);
+		// node-semver rounds both to 2^53 and calls them equal.
+		expect(nodeSemver.satisfies('1.0.0-9007199254740993', '>1.0.0-9007199254740992')).toBe(false);
+	});
+
+	it('allows white space between an operator, a tilde or a caret and its version, with node-semver quirks', function () {
+		const cases: [string, string, boolean][] = [
+			['>= 1.2.3', '1.2.3', true],
+			['>=\t1.2.3', '1.2.3', true],
+			['^ 1.2.3', '1.9.0', true],
+			['~ 1.2.3', '1.2.9', true],
+			['~> 1.2.3', '1.2.9', true],
+			['~ > 1.2', '1.2.9', true],
+			['> =1.2.3', '1.2.3', true],
+			['= 1.2.3', '1.2.3', true],
+			['< v1.2.3', '1.2.2', true],
+			['1.2.3 - 2', '2.9.0', true],
+			['1.2.3 -  2', '2.9.0', true],
+			['v1.2.3 - v2.0.0', '2.0.0', true],
+			[' 1.2.3 - 2 ', '1.5.0', true],
+			['1 - v = 2', '2.5.0', true],
+			['1.2.3-v = 1', '1.2.3-v', true],
+			['1.2.3-dev >= 1.2.3-dev', '1.2.3-dev', true],
+			// Not ranges: the operator is cut from its version.
+			['> = 1.2.3', '1.2.3', false],
+			['>= = 1.2.3', '1.2.3', false],
+			['>= v 1.2.3', '1.2.3', false],
+			['v 1.2.3 - 2', '1.5.0', false],
+			['=1.2.3 - 2', '1.5.0', false],
+			['1.2.3  - 2', '1.5.0', true],
+			['1.2.3 - 2 +b', '1.5.0', true],
+			['1.2.3 - 2 +b +c', '1.5.0', false],
+			['> +b 1.2.3', '1.2.4', false],
+			['^ +b 1.2.3', '1.2.4', true],
+			['+a +b +c 1.2.3 - 2', '1.5.0', false],
+			['~ +b > 1', '1.5.0', false],
+			['+a 1.2.3 - 2', '1.5.0', true],
+			['+a +b 1.2.3 - 2', '1.5.0', true],
+			['+a +b v1.2.3 - 2', '1.5.0', true],
+			['+a +b v 1.2.3 - 2', '1.5.0', false],
+			['~> > 1', '1.5.0', true],
+			['~  > 1', '1.5.0', true],
+			['1.2.3 > = 1', '1.2.3', false],
+			['>=1.2.3*', '1.2.3', true],
+			['*1.2.3', '1.2.3', true],
+			['>*1.2.3', '1.2.3', true],
+			['1.x*', '1.2.3', false],
+			['1.2.3<*', '1.2.3', true],
+			['1.2.3>=*', '1.2.3', true],
+			['1.2.3=*', '1.2.3', true],
+			['1<*', '1.2.3', false],
+			['1.', '1.2.3', false],
+			['1.2.', '1.2.3', false],
+			['1.a', '1.2.3', false],
+			['^1.', '1.2.3', false],
+			['**', '1.2.3', false],
+			['^**', '1.2.3', false],
+			['~*.1', '1.2.3', true],
+			['x.1', '1.2.3', false],
+			['*.1', '1.2.3', false],
+			['>=*.1', '1.2.3', false],
+			['1.*.3', '1.2.3', false],
+			['==1.2.3', '1.2.3', false],
+			['vv1.2.3', '1.2.3', false],
+			['=v1.2.3', '1.2.3', true],
+			['=v1.2.x', '1.2.3', true],
+			['<==1.x', '1.2.3', true],
+			['1.2.3 ||| 2', '1.2.3', false],
+			['|| 1.2.3', '1.0.0', true],
+			['1.2.3 - 2 - 3', '1.5.0', false],
+			['1.2.3.4', '1.2.3', false],
+			['^1.2.3-', '1.2.3', false],
+			['~', '1.2.3', false],
+			['^', '1.2.3', false],
+			['>', '1.2.3', false],
+			['-', '1.2.3', false],
+			['1.2-3', '1.2.3', false],
+			['1.2a3', '1.2.3', false],
+			['>= 1.2. 1', '1.2.3', false],
+			// A partial version ending in a dot, where a space is dropped before it.
+			['> 1.', '1.2.3', false],
+			['>= 1.2.', '1.2.3', false],
+			['^ 1.', '1.2.3', false],
+			['> x', '1.2.3', false],
+			['>= X', '1.2.3', true],
+			['< *', '1.2.3', false],
+			['^>1.2.3', '1.2.3', false],
+			['+a - 1', '1.0.0', false],
+			['1a - 2', '1.0.0', false],
+			['1 - 2x', '1.0.0', false],
+			// Build metadata is dropped first, which can leave a hyphen range, a space to drop, or two spaces.
+			['1.2.3 -+b 2', '2.5.0', true],
+			['>+b 1.2.3', '1.2.4', true],
+			['1 +b < 1', '0.5.0', false],
+			['1 +b+cv > 0', '1.5.0', true],
+			['x+b\ufeff+bv > 0', '1.0.0', true],
+			['<1.2.3 +b   < x ', '1.0.0', false],
+			['1 || +a +b 1.2.3 - 2', '2.5.0', true],
+			['1.2.3 - 2 +a || 5', '2.5.0', true],
+			['1.2.3 >=1.2.3*', '1.2.3', true],
+			['*v1.2.3', '1.2.3', true],
+			['*0.1.2', '0.1.2', true],
+			['*1.0.2', '1.0.2', true],
+			['*1.2.0', '1.2.0', true],
+			['x.1.2*', '1.2.3', false],
+			['1.2.x*', '1.2.3', false],
+			['>=1.2.3*', '1.2.4', true],
+			['<=1.2.3*', '1.2.4', false],
+			['>1.2.3*', '1.2.4', true],
+			['<1.2.3*', '1.2.2', true],
+			['>= 1.2.3- 1', '1.2.3', false],
+			['*1.2.3x', '1.2.3', false],
+			['*1.x.3', '1.2.3', false],
+			['x.0', '1.2.3', false],
+			['1.x.0', '1.2.3', false],
+			['v 1.2.3', '1.2.3', false],
+			['> 1 v 1.2.3', '1.2.3', false],
+			['= = 1', '1.2.3', false]
+		];
+		for (const [range, version, expected] of cases) expectSatisfies(range, version, false, expected);
+	});
+
+	it('collapses white space of every kind before reading the range, as node-semver does', function () {
+		const cases: [string, string, boolean][] = [
+			['3.3.2  -  3.4.3', '3.4.0', true],
+			['1.2.3\t-\t2', '1.5.0', true],
+			['^=v3.2.2\n<=X', '3.5.0', true],
+			['2\u3000>=0.2', '2.5.0', true],
+			['>=\u00a01.2.3', '1.2.3', true],
+			['1.2.3\u2028||\ufeff2.0.0', '2.0.0', true],
+			[' \t||\t ', '1.0.0', true],
+			['\v\f1.2.3\r\n', '1.2.3', true],
+			['>\t\t1.2.3', '1.2.4', true],
+			['~\n1.2', '1.2.5', true],
+			// A single white space character other than a space is enough to need collapsing.
+			['\t', '1.0.0', true],
+			['1.2.3\r', '1.2.3', true],
+			['1.2.3\n', '1.2.3', true],
+			['\u00a0', '1.0.0', true],
+			['1.2.3\u0085', '1.2.3', false],
+			['1.2.3 \u200b', '1.2.3', false]
+		];
+		for (const [range, version, expected] of cases) {
+			expectSatisfies(range, version, false, expected);
+			expectSatisfies(range, version, true, expected);
+		}
+	});
+
+	it('desugars like node-semver with includePrerelease', function () {
+		const cases: [string, string, boolean][] = [
+			['^1.0.0', '2.0.0-0', false],
+			['<x', '0.0.0-0', false],
+			['>=1.x', '1.0.0-0', true],
+			['<1.x', '1.0.0-0', false],
+			['1.1.x', '1.1.0-0', true],
+			['~1.2', '1.2.0-0', true],
+			['1.2.3-beta - 2', '1.2.3-beta', true],
+			['1.2.3 - 2', '1.2.3-0', true],
+			['1 - 1.2.3-beta', '1.2.3-gamma', false]
+		];
+		for (const [range, version, expected] of cases) expectSatisfies(range, version, true, expected);
+	});
+
+	it('applies node-semver limits: safe integers, 256-character comparators and the lengths its grammar reads', function () {
+		const cases: [string, boolean][] = [
+			['^9007199254740991.0.0', false],
+			['^9007199254740990.0.0', true],
+			['~0.9007199254740991.0', false],
+			['^0.0.9007199254740991', false],
+			['>1.9007199254740991', false],
+			['<=1.9007199254740990', true],
+			['1 - 1.9007199254740991', false],
+			['1 - 9007199254740991', false],
+			['1 - 1.2.9007199254740991', true],
+			['1.2.9007199254740992', false],
+			['>=99999999999999999999', false],
+			['^1.x.99999999999999999999', true],
+			['~1.x.99999999999999999999', true],
+			['1.x.99999999999999999999 - 2', true],
+			[`^1.x.${'9'.repeat(257)}`, true],
+			[`^1.x.${'9'.repeat(258)}`, false],
+			[`^1.2.x-${'a'.repeat(251)}`, true],
+			[`^1.2.x-${'a'.repeat(252)}`, false],
+			[`^1.2.x-${'1'.repeat(256)}a`, true],
+			[`^1.2.x-${'1'.repeat(257)}a`, false],
+			[`^1.2.x-${'1'.repeat(257)}`, true],
+			[`^1.2.x-${'1'.repeat(258)}`, false],
+			[`1.2.3-${'a'.repeat(250)}`, true],
+			[`1.2.3-${'a'.repeat(251)}`, false],
+			[`v1.2.3-${'a'.repeat(250)}`, false],
+			[`^1.2.3-${'a'.repeat(250)}`, true],
+			[`^1.2.3-${'a'.repeat(251)}`, false],
+			[`1.2.3-${'a'.repeat(240)} - 2`, true],
+			[`1.2.3-${'a'.repeat(250)} - 2`, true],
+			[`1.2.3-${'a'.repeat(251)} - 2`, false],
+			[`=1.2.3+${'b'.repeat(250)}*`, true],
+			[`=1.2.3+*${'b'.repeat(250)}`, true],
+			[`=1.2.3+*${'b'.repeat(251)}`, false]
+		];
+		for (const [range, valid] of cases) {
+			expect([range, nodeSemver.validRange(range) !== null]).toEqual([range, valid]);
+			expect([range, helpers.isSemverRange(range)]).toEqual([range, valid]);
+		}
+		// With includePrerelease, a hyphen range ending in a full version becomes `<x.y.(z+1)-0`.
+		expect(nodeSemver.validRange('1 - 1.2.9007199254740991', { includePrerelease: true })).toBeNull();
+		expect(helpers.isSemverRange('1 - 1.2.9007199254740991', { includePrerelease: true })).toBe(false);
+		expectSatisfies('^9007199254740990.1.2', '9007199254740990.5.0', false, true);
+	});
+
+	it('returns false for an invalid range or a non-string', function () {
+		expect(helpers.satisfiesSemver('1.2.3', 'not a range')).toBe(false);
+		expect(helpers.satisfiesSemver('1.2.3', '>=1.2.3.4')).toBe(false);
+		expect(helpers.satisfiesSemver('1.2.3', undefined as any)).toBe(false);
+		expect(helpers.satisfiesSemver('1.2.3', 123 as any)).toBe(false);
+	});
+
+	it('validates its options', function () {
+		expect(helpers.satisfiesSemver('1.2.3', '^1.0.0', {})).toBe(true);
+		expect(helpers.satisfiesSemver('1.2.3', '^1.0.0', { includePrerelease: undefined })).toBe(true);
+		expect(function () {
+			helpers.satisfiesSemver('1.2.3', '^1.0.0', null as any);
+		}).toThrow(new TypeError('satisfiesSemver: `options` must be an object, got null'));
+		expect(function () {
+			helpers.satisfiesSemver('1.2.3', '^1.0.0', 'yes' as any);
+		}).toThrow(new TypeError('satisfiesSemver: `options` must be an object, got string'));
+		expect(function () {
+			helpers.satisfiesSemver('1.2.3', '^1.0.0', { includePrerelease: 1 as any });
+		}).toThrow(new TypeError('satisfiesSemver: `includePrerelease` must be a boolean, got number'));
+		// Security: an option inherited from a polluted Object.prototype is ignored.
+		const prototype = Object.prototype as Record<string, unknown>;
+		prototype.includePrerelease = true;
+		try {
+			expect(helpers.satisfiesSemver('1.3.0-beta', '^1.2.0', {})).toBe(false);
+		} finally {
+			delete prototype.includePrerelease;
+		}
+	});
+
+	it('runs in linear time on hostile ranges', function () {
+		const hostile = [
+			'= '.repeat(50_000) + '1',
+			'v'.repeat(100_000),
+			'v='.repeat(50_000) + 'x',
+			'> '.repeat(50_000) + '1',
+			'~ '.repeat(50_000) + '1',
+			'^ '.repeat(50_000) + '1',
+			'1.2.3 '.repeat(20_000),
+			'1.2.3 - 2 ||'.repeat(10_000),
+			'+a'.repeat(50_000) + ' 1',
+			'<'.repeat(100_000) + '1',
+			'1.'.repeat(50_000),
+			'1.2.3-' + 'a.'.repeat(50_000),
+			'x '.repeat(50_000) + '- 1',
+			'*'.repeat(100_000),
+			'1.2.3-' + '1'.repeat(100_000),
+			'x.x.x-' + '0'.repeat(100_000),
+			' >'.repeat(50_000) + '1',
+			'> v = '.repeat(20_000) + '1.2.3',
+			'1||'.repeat(30_000),
+			'\t'.repeat(100_000) + '1'
+		];
+		const start = performance.now();
+		for (const range of hostile) {
+			helpers.isSemverRange(range);
+			helpers.isSemverRange(range, { includePrerelease: true });
+		}
+		// About 0.1 s; a quadratic scan would take minutes. Mutation testing instruments the code, so the bound only holds outside it.
+		expect(performance.now() - start).toBeLessThan('__stryker__' in globalThis ? Infinity : 2000);
+		expect(helpers.satisfiesSemver('1.2.3', '1.2.3 '.repeat(20_000))).toBe(true);
+		expect(helpers.isSemverRange('1.2.3 - 2 ||'.repeat(10_000))).toBe(true);
+	});
+});
+
+describe('compileSemverRange', function () {
+	it('returns a predicate testing versions against the range', function () {
+		const test = helpers.compileSemverRange('^1.2.0 || ~2.0.1');
+		expect(['1.1.9', '1.2.0', '1.9.9', '2.0.0', '2.0.1', '2.0.9', '2.1.0'].filter(test)).toEqual(['1.2.0', '1.9.9', '2.0.1', '2.0.9']);
+		expect(test('not a version')).toBe(false);
+		expect(test(undefined as any)).toBe(false);
+		expect(helpers.compileSemverRange('^1.2.0', { includePrerelease: true })('1.3.0-beta')).toBe(true);
+		expect(helpers.compileSemverRange('*')('1.0.0')).toBe(true);
+		expect(helpers.compileSemverRange('')('1.0.0-beta')).toBe(false);
+	});
+
+	it('throws a TypeError for an invalid range', function () {
+		expect(function () {
+			helpers.compileSemverRange('>=1.2.3.4');
+		}).toThrow(new TypeError('compileSemverRange: ">=1.2.3.4" is not a valid semver range'));
+		expect(function () {
+			helpers.compileSemverRange('^'.repeat(1000));
+		}).toThrow(new TypeError(`compileSemverRange: "${'^'.repeat(50)}…" is not a valid semver range`));
+		expect(function () {
+			helpers.compileSemverRange(undefined as any);
+		}).toThrow(new TypeError('compileSemverRange: `range` must be a string, got undefined'));
+		expect(function () {
+			helpers.compileSemverRange('*', { includePrerelease: 'no' as any });
+		}).toThrow(new TypeError('compileSemverRange: `includePrerelease` must be a boolean, got string'));
+	});
+});
+
+describe('isSemverRange', function () {
+	it('accepts what node-semver accepts', function () {
+		for (const range of ['^1.2.3', '1.2.3 - 2.3.4', '>= 1.2.3 < 2', '', '*', '||', 'x || 1', '1.2.3+build', '~>1']) {
+			expect([range, helpers.isSemverRange(range), nodeSemver.validRange(range) !== null]).toEqual([range, true, true]);
+		}
+		for (const range of ['1.2.3.4', 'a', '> = 1', '^1.2.3 ||| 2', '>=x.2', '1.2.3-', '<>1']) {
+			expect([range, helpers.isSemverRange(range), nodeSemver.validRange(range) !== null]).toEqual([range, false, false]);
+		}
+		expect(helpers.isSemverRange(1)).toBe(false);
+		expect(helpers.isSemverRange(null)).toBe(false);
+		expect(function () {
+			helpers.isSemverRange('1', [] as any);
+		}).not.toThrow();
+		expect(function () {
+			helpers.isSemverRange('1', 1 as any);
+		}).toThrow(new TypeError('isSemverRange: `options` must be an object, got number'));
+	});
+});
+
+describe('maxSatisfyingSemver and minSatisfyingSemver', function () {
+	const versions = ['1.2.3', '1.2.4', '1.3.0-beta', '2.0.0', '1.2.4+build', 'v1.2.5', 'junk', '0.9.0'];
+
+	it('find the highest and lowest satisfying version, as given', function () {
+		expect(helpers.maxSatisfyingSemver(versions, '^1.2.3')).toBe('v1.2.5');
+		expect(helpers.minSatisfyingSemver(versions, '^1.2.3')).toBe('1.2.3');
+		expect(helpers.maxSatisfyingSemver(versions, '~1.2.4 <1.2.5')).toBe('1.2.4');
+		expect(helpers.minSatisfyingSemver(['1.2.4+b', '1.2.4+a'], '1.2.4')).toBe('1.2.4+b');
+		expect(helpers.maxSatisfyingSemver(versions, '^1.3.0-0')).toBe('1.3.0-beta');
+		expect(helpers.maxSatisfyingSemver(versions, '>1.2.5 <2', { includePrerelease: true })).toBe('1.3.0-beta');
+		expect(helpers.maxSatisfyingSemver(versions, '>1.2.5 <2')).toBeUndefined();
+		expect(helpers.maxSatisfyingSemver(versions, 'not a range')).toBeUndefined();
+		expect(helpers.minSatisfyingSemver(versions, 42 as any)).toBeUndefined();
+		expect(helpers.maxSatisfyingSemver([], '*')).toBeUndefined();
+		expect(helpers.maxSatisfyingSemver(new Set(['1.0.0', '3.0.0', '2.0.0']), '*')).toBe('3.0.0');
+		expect(
+			helpers.minSatisfyingSemver(
+				(function* (): Generator<string> {
+					yield '2.0.0';
+					yield '1.0.0';
+				})(),
+				'*'
+			)
+		).toBe('1.0.0');
+		expect(helpers.maxSatisfyingSemver([1 as any, '1.0.0'], '*')).toBe('1.0.0');
+	});
+
+	it('throw a TypeError when versions is not an iterable', function () {
+		expect(function () {
+			helpers.maxSatisfyingSemver('1.2.3' as any, '*');
+		}).toThrow(new TypeError('maxSatisfyingSemver: `versions` must be an iterable of strings, got string'));
+		expect(function () {
+			helpers.minSatisfyingSemver(null as any, '*');
+		}).toThrow(new TypeError('minSatisfyingSemver: `versions` must be an iterable of strings, got null'));
+		expect(function () {
+			helpers.minSatisfyingSemver({} as any, '*');
+		}).toThrow(TypeError);
+		expect(function () {
+			helpers.minSatisfyingSemver([], '*', { includePrerelease: null as any });
+		}).toThrow(new TypeError('minSatisfyingSemver: `includePrerelease` must be a boolean, got null'));
+	});
+});
+
+/** node-semver's `increments` fixtures: [version, release, result (`null` when node-semver fails), identifier, identifierBase]. */
+const INCREMENTS: [string, string, string | null, string?, ('0' | '1' | false)?][] = [
+	['1.2.3', 'major', '2.0.0'],
+	['1.2.3', 'minor', '1.3.0'],
+	['1.2.3', 'patch', '1.2.4'],
+	['1.2.3-tag', 'major', '2.0.0'],
+	['1.2.0-0', 'patch', '1.2.0'],
+	['1.2.3-4', 'major', '2.0.0'],
+	['1.2.3-4', 'minor', '1.3.0'],
+	['1.2.3-4', 'patch', '1.2.3'],
+	['1.2.3-alpha.0.beta', 'major', '2.0.0'],
+	['1.2.3-alpha.0.beta', 'minor', '1.3.0'],
+	['1.2.3-alpha.0.beta', 'patch', '1.2.3'],
+	['1.2.4', 'prerelease', '1.2.5-0'],
+	['1.2.3-0', 'prerelease', '1.2.3-1'],
+	['1.2.3-alpha.0', 'prerelease', '1.2.3-alpha.1'],
+	['1.2.3-alpha.1', 'prerelease', '1.2.3-alpha.2'],
+	['1.2.3-alpha.0.beta', 'prerelease', '1.2.3-alpha.1.beta'],
+	['1.2.3-alpha.10.0.beta', 'prerelease', '1.2.3-alpha.10.1.beta'],
+	['1.2.3-alpha.10.beta.0', 'prerelease', '1.2.3-alpha.10.beta.1'],
+	['1.2.3-alpha.9.beta', 'prerelease', '1.2.3-alpha.10.beta'],
+	['1.2.0', 'prepatch', '1.2.1-0'],
+	['1.2.0-1', 'prepatch', '1.2.1-0'],
+	['1.2.0', 'preminor', '1.3.0-0'],
+	['1.2.3-1', 'preminor', '1.3.0-0'],
+	['1.2.0', 'premajor', '2.0.0-0'],
+	['1.2.3-1', 'premajor', '2.0.0-0'],
+	['1.2.0-1', 'minor', '1.2.0'],
+	['1.0.0-1', 'major', '1.0.0'],
+	['1.2.3', 'major', '2.0.0', 'dev'],
+	['1.2.4', 'prerelease', '1.2.5-dev.0', 'dev'],
+	['1.2.3-0', 'prerelease', '1.2.3-dev.0', 'dev'],
+	['1.2.3-alpha.0', 'prerelease', '1.2.3-dev.0', 'dev'],
+	['1.2.3-alpha.0', 'prerelease', '1.2.3-alpha.1', 'alpha'],
+	['1.2.3-alpha.0.beta', 'prerelease', '1.2.3-alpha.1.beta', 'alpha'],
+	['1.2.3-alpha.10.0.beta', 'prerelease', '1.2.3-alpha.10.1.beta', 'alpha'],
+	['1.2.3-alpha.9.beta', 'prerelease', '1.2.3-alpha.10.beta', 'alpha'],
+	['1.2.0', 'prepatch', '1.2.1-dev.0', 'dev'],
+	['1.2.3-1', 'premajor', '2.0.0-dev.0', 'dev'],
+	['1.2.3-1', 'premajor', '2.0.0-dev.1', 'dev', '1'],
+	['1.2.3-dev.bar', 'prerelease', '1.2.3-dev.0', 'dev'],
+	['1.2.3-0', 'prerelease', '1.2.3-1.0', '1'],
+	['1.2.3-1.0', 'prerelease', '1.2.3-1.1', '1'],
+	['1.2.3-1.1', 'prerelease', '1.2.3-2.0', '2'],
+	['1.2.0-1', 'prerelease', '1.2.0-alpha.1', 'alpha', '1'],
+	['1.2.1', 'prerelease', '1.2.2-alpha.1', 'alpha', '1'],
+	['1.2.0', 'prepatch', '1.2.1-dev.1', 'dev', '1'],
+	['1.2.0', 'premajor', '2.0.0-dev.0', 'dev', '0'],
+	['1.2.3-dev.bar', 'prerelease', '1.2.3-dev.1', 'dev', '1'],
+	['1.2.3-dev.bar', 'prerelease', '1.2.3-dev.bar.0', '', '0'],
+	['1.2.3-dev.bar', 'prerelease', '1.2.3-dev.bar.1', '', '1'],
+	['1.2.0', 'prerelease', '1.2.1-1', '', '1'],
+	['1.2.0-1', 'prerelease', '1.2.0-alpha', 'alpha', false],
+	['1.2.1', 'prerelease', '1.2.2-alpha', 'alpha', false],
+	['1.2.0', 'premajor', '2.0.0-dev', 'dev', false],
+	['1.2.3-dev.bar', 'prerelease', '1.2.3-dev', 'dev', false],
+	['1.2.3-dev.bar', 'prerelease', '1.2.3-dev.baz', 'dev.baz', false],
+	['1.2.0-dev', 'premajor', '2.0.0-dev', 'dev', false],
+	['1.2.0-dev', 'preminor', '1.3.0-beta', 'beta', false],
+	['1.2.0-dev', 'prepatch', '1.2.1-dev', 'dev', false],
+	['1.2.3-dev', 'prerelease', null, 'dev', false],
+	['1.2.0', 'prerelease', null, '', false],
+	['1.0.0-rc.1', 'release', '1.0.0'],
+	['1.0.0-rc.1+build.4', 'release', '1.0.0'],
+	['1.0.0', 'release', null],
+	['1.2.3', 'fake', null],
+	['fake', 'major', null],
+	['1.2.3', 'prerelease', null, 'invalid/preid'],
+	['1.2.3', 'prerelease', null, '01'],
+	['v1.2.3', 'patch', '1.2.4'],
+	['1.2.3-1e5', 'prerelease', '1.2.3-1e5.0'],
+	['1.2.3-beta.1e5', 'prerelease', '1.2.3-beta.1e5.0', 'beta'],
+	['1.2.3-beta.x', 'prerelease', '1.2.3-beta.0', 'beta'],
+	['1.2.3-9007199254740990', 'prerelease', '1.2.3-9007199254740991'],
+	['1.2.3-9007199254740991', 'prerelease', '1.2.3-9007199254740991.0'],
+	['1.2.3-dev', 'prerelease', '1.2.3-dev.0', 'dev'],
+	['1.2.3-a.b', 'prerelease', '1.2.3-a.b.0', 'a.b'],
+	['1.2.3-a.b', 'prerelease', null, 'a.b', false]
+];
+
+describe('incrementSemver', function () {
+	// Rows padded to five cells: Jest passes a `done` callback in place of missing arguments.
+	const rows = INCREMENTS.map(function ([version, release, result, identifier, identifierBase]) {
+		return [version, release, result, identifier, identifierBase] as const;
+	});
+
+	it.each(rows)('%j %s gives %j (identifier %j, base %j), as in node-semver', function (version, release, result, identifier, identifierBase) {
+		expect(nodeSemver.inc(version, release, undefined, identifier, identifierBase)).toBe(result);
+		function run(): string {
+			return helpers.incrementSemver(version, release as helpers.SemverRelease, { identifier, identifierBase });
+		}
+		if (result === null) expect(run).toThrow();
+		else expect(run()).toBe(result);
+	});
+
+	it('throws where node-semver returns null, with the reason', function () {
+		expect(function () {
+			helpers.incrementSemver('1.2', 'patch');
+		}).toThrow(new TypeError('incrementSemver: "1.2" is not a valid semantic version'));
+		expect(function () {
+			helpers.incrementSemver(123 as any, 'patch');
+		}).toThrow(new TypeError('incrementSemver: number is not a valid semantic version'));
+		expect(function () {
+			helpers.incrementSemver('1.2.3', 7 as any);
+		}).toThrow(new TypeError('incrementSemver: `releaseType` must be a string, got number'));
+		expect(function () {
+			helpers.incrementSemver('1.2.3', 'pre' as any);
+		}).toThrow(
+			new RangeError("incrementSemver: `releaseType` must be 'major', 'minor', 'patch', 'premajor', 'preminor', 'prepatch', 'prerelease' or 'release', got \"pre\"")
+		);
+		expect(function () {
+			helpers.incrementSemver('1.2.3', 'release');
+		}).toThrow(new RangeError('incrementSemver: "1.2.3" is not a pre-release'));
+		expect(function () {
+			helpers.incrementSemver('1.2.3', 'prerelease', { identifierBase: false });
+		}).toThrow(new RangeError('incrementSemver: `identifierBase: false` needs an `identifier`'));
+		expect(function () {
+			helpers.incrementSemver('1.2.3-dev', 'prerelease', { identifier: 'dev', identifierBase: false });
+		}).toThrow(new RangeError('incrementSemver: the pre-release is already "dev"'));
+		expect(function () {
+			helpers.incrementSemver('1.2.3', 'prerelease', { identifier: 'a..b' });
+		}).toThrow(new RangeError('incrementSemver: `identifier` must be dot-separated pre-release identifiers, got "a..b"'));
+		expect(function () {
+			helpers.incrementSemver('1.2.3', 'prerelease', { identifier: 5 as any });
+		}).toThrow(new TypeError('incrementSemver: `identifier` must be a string, got number'));
+		expect(function () {
+			helpers.incrementSemver('1.2.3', 'prerelease', { identifierBase: '2' as any });
+		}).toThrow(new RangeError("incrementSemver: `identifierBase` must be '0', '1' or false, got \"2\""));
+		expect(function () {
+			helpers.incrementSemver('1.2.3', 'prerelease', { identifierBase: 1 as any });
+		}).toThrow(new TypeError("incrementSemver: `identifierBase` must be '0', '1' or false, got number"));
+		expect(function () {
+			helpers.incrementSemver('1.2.3', 'prerelease', null as any);
+		}).toThrow(new TypeError('incrementSemver: `options` must be an object, got null'));
+		expect(function () {
+			helpers.incrementSemver('1.2.3', 'prerelease', 'beta' as any);
+		}).toThrow(new TypeError('incrementSemver: `options` must be an object, got string'));
+	});
+
+	it('validates identifier for every release kind and never exceeds Number.MAX_SAFE_INTEGER', function () {
+		// node-semver ignores the identifier of a `major` increment, and returns numbers it cannot read back.
+		expect(nodeSemver.inc('1.2.3', 'major', undefined, 'not valid!')).toBe('2.0.0');
+		expect(function () {
+			helpers.incrementSemver('1.2.3', 'major', { identifier: 'not valid!' });
+		}).toThrow(RangeError);
+		expect(nodeSemver.inc('9007199254740991.0.0', 'major', undefined)).toBe('9007199254740992.0.0');
+		expect(function () {
+			helpers.incrementSemver('9007199254740991.0.0', 'major');
+		}).toThrow(new RangeError('incrementSemver: incrementing "9007199254740991.0.0" exceeds Number.MAX_SAFE_INTEGER'));
+		expect(function () {
+			helpers.incrementSemver('0.0.9007199254740991', 'prepatch');
+		}).toThrow(RangeError);
+		expect(helpers.incrementSemver('9007199254740990.9007199254740991.0', 'major')).toBe('9007199254740991.0.0');
+		expect(helpers.incrementSemver(' 1.2.3+build ', 'minor', {})).toBe('1.3.0');
+		expect(helpers.incrementSemver('1.2.3', 'prerelease', { identifier: 'a'.repeat(251) })).toBe(`1.2.4-${'a'.repeat(251)}.0`);
+		expect(function () {
+			helpers.incrementSemver('1.2.3', 'prerelease', { identifier: 'a'.repeat(252) });
+		}).toThrow(RangeError);
+	});
+});
