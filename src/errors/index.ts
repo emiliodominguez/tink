@@ -307,18 +307,46 @@ function readName(error: Error): unknown {
 }
 
 /**
- * Recursive worker of {@link deserializeError}.
- * @param {unknown} data - The serialized error
- * @param {number} depth - Levels of `cause` and `errors` left to rebuild
- * @param {Map<object, Error>} built - The error rebuilt from each data object so far (cycles and shared references)
- * @param {ReadonlyMap<unknown, object>} classes - The prototype to give the errors of each name (the `classes` option)
- * @returns {Error} The error
+ * Whether an object has a property, own or inherited (`key in object`), leaving out the values planted on a polluted `Object.prototype`:
+ * from it, only its methods (`toString`, `hasOwnProperty`…) and `__proto__` count, so that a planted `status` is not taken for a property
+ * of every object.
+ * @param {object} object - The object
+ * @param {string} key - The key
+ * @returns {boolean} Whether the object or a prototype below `Object.prototype` has it, or it is a method of `Object.prototype`
  */
-function rebuild(data: unknown, depth: number, built: Map<object, Error>, classes: ReadonlyMap<unknown, object>): Error {
-	if (isAnyError(data)) return data;
-	if (typeof data !== 'object' || data === null) return new Error(getErrorMessage(data));
-	const done = built.get(data);
-	if (done !== undefined) return done;
+function holds(object: object, key: string): boolean {
+	if (!(key in object)) return false;
+	let current = object;
+	while (current !== Object.prototype && !hasOwn.call(current, key)) current = Object.getPrototypeOf(current) as object;
+	return current !== Object.prototype || key === '__proto__' || typeof (Object.prototype as Record<string, unknown>)[key] === 'function';
+}
+
+/**
+ * An error {@link deserializeError} is rebuilding, and how far the copy of its properties went.
+ */
+interface Rebuilding {
+	readonly data: object;
+	readonly error: Error;
+	/** Levels of `cause` and `errors` left to rebuild below it. */
+	readonly depth: number;
+	/** Whether the `cause` is restored (the items of `errors` come next, then the other keys). */
+	caused: boolean;
+	/** The `errors` array of the data, once read, its items rebuilt so far (holes stay holes), and the next one. */
+	errors: unknown[] | undefined;
+	items: unknown[];
+	index: number;
+}
+
+/**
+ * Creates the error of a data object for {@link deserializeError}: its class, `name`, `message` and `stack` (the other properties are
+ * copied by {@link advance}), and records it, so that a shared or circular reference gives the same error.
+ * @param {object} data - The serialized error
+ * @param {number} depth - Levels of `cause` and `errors` left to rebuild below it
+ * @param {Map<object, Error>} built - The error rebuilt from each data object so far
+ * @param {ReadonlyMap<unknown, object>} classes - The prototype to give the errors of each name (the `classes` option)
+ * @returns {Rebuilding} The error, with nothing else copied yet
+ */
+function create(data: object, depth: number, built: Map<object, Error>, classes: ReadonlyMap<unknown, object>): Rebuilding {
 	const name = readText(data, 'name');
 	const message = readText(data, 'message') ?? '';
 	const Constructor = BUILT_IN_ERRORS.get(name) ?? Error;
@@ -330,26 +358,86 @@ function rebuild(data: unknown, depth: number, built: Map<object, Error>, classe
 	if (name !== undefined && name !== readName(error)) defineHidden(error, 'name', name);
 	const stack = readText(data, 'stack');
 	if (stack !== undefined) defineHidden(error, 'stack', stack);
+	return { data, error, depth, caused: false, errors: undefined, items: [], index: 0 };
+}
+
+/**
+ * Copies the properties of an error being rebuilt, until a nested error-like value needs an error of its own (rebuilt first, so that
+ * the errors are built depth-first, in the order of the data, without recursion).
+ * @param {Rebuilding} entry - The error being rebuilt
+ * @param {Map<object, Error>} built - The error rebuilt from each data object so far
+ * @param {ReadonlyMap<unknown, object>} classes - The prototype to give the errors of each name
+ * @returns {Rebuilding | undefined} The nested error to rebuild before going on, or `undefined` once every property is copied
+ */
+function advance(entry: Rebuilding, built: Map<object, Error>, classes: ReadonlyMap<unknown, object>): Rebuilding | undefined {
+	const { data, error, depth } = entry;
+	let next: Rebuilding | undefined;
 	/**
-	 * Rebuilds a nested error-like value (one level deeper), keeping anything else as it is.
-	 * @param {unknown} nested - A `cause`, or an item of `errors`
-	 * @returns {unknown} The nested value, rebuilt when it is error-like
+	 * The value a nested `cause` or item of `errors` is restored as: its error when it is error-like (created, when it is new, to be
+	 * rebuilt next), anything else as it is.
+	 * @param {unknown} nested - The value
+	 * @returns {unknown} The value to restore
 	 */
-	function nestedValue(nested: unknown): unknown {
-		return depth === 0 || !isErrorLike(nested) ? nested : rebuild(nested, depth - 1, built, classes);
+	function restore(nested: unknown): unknown {
+		if (depth === 0 || !isErrorLike(nested) || isAnyError(nested)) return nested;
+		const done = built.get(nested);
+		if (done !== undefined) return done;
+		next = create(nested, depth - 1, built, classes);
+		return next.error;
 	}
-	try {
-		if (hasOwn.call(data, 'cause')) defineHidden(error, 'cause', nestedValue((data as { cause: unknown }).cause));
+	if (!entry.caused) {
+		entry.caused = true;
+		if (hasOwn.call(data, 'cause')) defineHidden(error, 'cause', restore((data as { cause: unknown }).cause));
+		if (next !== undefined) return next;
+	}
+	if (entry.errors === undefined) {
 		const errors = hasOwn.call(data, 'errors') ? (data as { errors: unknown }).errors : undefined;
-		if (Array.isArray(errors)) defineHidden(error, 'errors', errors.map(nestedValue));
-		for (const key of Object.keys(data)) {
-			// A key the error inherits (`toString`, `valueOf`, `hasOwnProperty`…) would shadow its method: `String(error)` would throw.
-			if (!RESERVED_KEYS.has(key) && !(key in error)) defineValue(error, key, (data as Record<string, unknown>)[key], true, true);
-		}
-	} catch {
-		// A throwing getter, a hostile proxy, or a chain of causes longer than the call stack allows: the properties copied so far are kept.
+		// The length of an array is read once, like `Array#map` does. Anything else is neither restored nor copied: `items` is then
+		// `errors` itself, empty.
+		if (Array.isArray(errors)) entry.items = new Array<unknown>(errors.length);
+		entry.errors = Array.isArray(errors) ? errors : entry.items;
 	}
-	return error;
+	const { errors, items } = entry;
+	while (entry.index < items.length) {
+		const index = entry.index++;
+		// A hole stays a hole, rather than reading a polluted `Object.prototype[index]`.
+		if (hasOwn.call(errors, index)) items[index] = restore(errors[index]);
+		if (next !== undefined) return next;
+	}
+	if (items !== errors) defineHidden(error, 'errors', items);
+	for (const key of Object.keys(data)) {
+		// A key the error has or inherits (`toString`, `valueOf`, `hasOwnProperty`…) would shadow its method: `String(error)` would throw.
+		if (!RESERVED_KEYS.has(key) && !holds(error, key)) defineValue(error, key, (data as Record<string, unknown>)[key], true, true);
+	}
+	return undefined;
+}
+
+/**
+ * The worker of {@link deserializeError}: iterative, with an explicit stack of the errors being rebuilt, so that a chain of causes of
+ * any length is rebuilt whole.
+ * @param {unknown} data - The serialized error
+ * @param {number} depth - Levels of `cause` and `errors` to rebuild
+ * @param {ReadonlyMap<unknown, object>} classes - The prototype to give the errors of each name (the `classes` option)
+ * @returns {Error} The error
+ */
+function rebuild(data: unknown, depth: number, classes: ReadonlyMap<unknown, object>): Error {
+	if (isAnyError(data)) return data;
+	if (typeof data !== 'object' || data === null) return new Error(getErrorMessage(data));
+	const built = new Map<object, Error>();
+	const root = create(data, depth, built, classes);
+	const todo = [root];
+	while (todo.length !== 0) {
+		const entry = todo[todo.length - 1];
+		let next: Rebuilding | undefined;
+		try {
+			next = advance(entry, built, classes);
+		} catch {
+			// A throwing getter or a hostile proxy: the properties copied so far are kept.
+		}
+		if (next === undefined) todo.pop();
+		else todo.push(next);
+	}
+	return root.error;
 }
 
 /**
@@ -359,12 +447,13 @@ function rebuild(data: unknown, depth: number, built: Map<object, Error>, classe
  *   so untrusted data cannot instantiate arbitrary classes. Your own classes are opt-in: with `classes: { NotFoundError: NotFound }`, an
  *   error named `NotFoundError` is built that way and then given `NotFound.prototype` (its constructor is still not called).
  * - `message`, `stack` (when present; otherwise the stack is where `deserializeError` was called), `cause` and `errors` are restored as
- *   the non-enumerable properties the constructors create; an error-like `cause` or item of `errors` is rebuilt recursively (up to
- *   `maxDepth` levels), anything else is kept as data. Shared and circular references between them are preserved.
+ *   the non-enumerable properties the constructors create; an error-like `cause` or item of `errors` is rebuilt the same way (up to
+ *   `maxDepth` levels, without recursion: a chain of any length is rebuilt whole), anything else is kept as data (a hole of `errors`
+ *   stays a hole). Shared and circular references between them are preserved.
  * - Other own enumerable properties (`code`, `status`…) are copied, except `__proto__`, `constructor`, `prototype` and any key the error
  *   inherits (`toString`, `valueOf`, `toLocaleString`, `hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `__defineGetter__`…),
  *   so that hostile data cannot shadow a method of the error and make `String(error)` or a logger throw; their values are kept as they
- *   are (not copied deeply). Values inherited from `Object.prototype` are ignored.
+ *   are (not copied deeply). Values inherited from `Object.prototype` are ignored (a key planted there is copied like any other).
  *
  * An `Error` is returned as it is; any other value that is not an object gives an `Error` with {@link getErrorMessage}'s message. Never
  * throws for any `data`.
@@ -390,7 +479,7 @@ function rebuild(data: unknown, depth: number, built: Map<object, Error>, classe
  * NotFound.is(rebuilt) && rebuilt.code; // => 'E_NOT_FOUND'
  */
 export function deserializeError(data: unknown, options: DeserializeErrorOptions = {}): Error {
-	return rebuild(data, readDepth('deserializeError', options), new Map(), readClasses(readOption(options, 'classes')));
+	return rebuild(data, readDepth('deserializeError', options), readClasses(readOption(options, 'classes')));
 }
 
 /**
@@ -529,7 +618,8 @@ function capturesStack(): boolean {
 			// A throwing `Error.prepareStackTrace`: inconclusive, so no second capture for now (it would call it again).
 		}
 		const differ = stacks[0] !== stacks[1];
-		if (!differ && !(typeof stacks[0] === 'string' && stacks[0].includes('\n'))) return false;
+		// Both stacks are needed: one alone differs from `stacks[1]`, which would also read a polluted `Object.prototype[1]`.
+		if (stacks.length !== 2 || (!differ && !(typeof stacks[0] === 'string' && stacks[0].includes('\n')))) return false;
 		captureNeeded = differ && typeof (Error as { captureStackTrace?: unknown }).captureStackTrace === 'function';
 	}
 	return captureNeeded;
@@ -619,7 +709,9 @@ export function defineError(name: string, options: DefineErrorOptions = {}): Def
 	}
 
 	for (const key of keys) {
-		if (RESERVED_FIELDS.has(key) || key in DefinedError || key in DefinedError.prototype) throw new RangeError(`defineError: \`options.${key}\` is a reserved field name`);
+		// A key planted on a polluted `Object.prototype` is not one the class or its errors have.
+		if (RESERVED_FIELDS.has(key) || holds(DefinedError, key) || holds(DefinedError.prototype, key))
+			throw new RangeError(`defineError: \`options.${key}\` is a reserved field name`);
 	}
 	/**
 	 * Recognises the errors of the class (see {@link DefinedErrorClass}).

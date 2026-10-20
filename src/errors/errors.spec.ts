@@ -604,16 +604,65 @@ describe('errors', function () {
 			expect(deserializeError(data, { maxDepth: 0 }).cause).toBe(data.cause);
 		});
 
-		it('survives cause chains deeper than the call stack', function () {
+		it('rebuilds cause chains deeper than the call stack whole (regression: they were cut where the stack ran out)', function () {
 			const error = deserializeError(serializedChain(100_000));
 			let depth = 0;
 			let current: unknown = error;
 			while (current instanceof Error) {
+				expect(current.message).toBe(String(depth));
 				current = current.cause;
 				depth++;
 			}
-			// The rest of the chain is cut where the stack ran out.
-			expect(depth).toBeGreaterThan(100);
+			expect(depth).toBe(100_000);
+		});
+
+		it('rebuilds depth-first in the order of the data, so a shared error is built where it is met first', function () {
+			const shared = { name: 'RangeError', message: 'shared', cause: { name: 'TypeError', message: 'deep' } };
+			const data = {
+				name: 'AggregateError',
+				message: 'root',
+				cause: { name: 'Error', message: 'cause', cause: shared },
+				errors: [shared, { name: 'Error', message: 'b' }]
+			};
+			const error = deserializeError(data, { maxDepth: 2 }) as AggregateError;
+			const viaCause = (error.cause as Error).cause as Error;
+			expect(viaCause).toBeInstanceOf(RangeError);
+			expect(error.errors[0]).toBe(viaCause);
+			// Built two levels down, below the cause: its own cause is kept as data.
+			expect(viaCause.cause).toBe(shared.cause);
+			expect(error.errors[1]).toBeInstanceOf(Error);
+			expect(Object.keys(error)).toEqual([]);
+		});
+
+		it('keeps copying the other properties when a nested error has a throwing getter', function () {
+			const data = {
+				name: 'Error',
+				message: 'outer',
+				cause: {
+					name: 'TypeError',
+					message: 'inner',
+					get boom(): never {
+						throw new Error('boom');
+					},
+					after: 1
+				},
+				errors: [{ name: 'RangeError', message: 'item' }],
+				code: 'E_OUTER'
+			};
+			const error = deserializeError(data) as Error & { code?: string; errors?: unknown[] };
+			expect(error.cause).toBeInstanceOf(TypeError);
+			expect(Object.hasOwn(error.cause as object, 'after')).toBe(false);
+			expect(error.errors?.[0]).toBeInstanceOf(RangeError);
+			expect(error.code).toBe('E_OUTER');
+			const throwingCause = {
+				name: 'Error',
+				message: 'x',
+				get cause(): never {
+					throw new Error('cause');
+				},
+				code: 'E'
+			};
+			expect(Object.hasOwn(deserializeError(throwingCause), 'code')).toBe(false);
 		});
 
 		it('returns errors as they are', function () {
@@ -880,6 +929,29 @@ describe('errors (1.4)', function () {
 					expect(new (isolated.defineError('PreparedError'))('x').message).toBe('x');
 				});
 				expect(capture).not.toHaveBeenCalled();
+			} finally {
+				Error.prepareStackTrace = prepare;
+			}
+		});
+
+		it('probes again when only one probe stack could be read (regression: one stack differed from none)', function () {
+			const prepare = Error.prepareStackTrace;
+			const capture = jest.spyOn(Error, 'captureStackTrace');
+			let calls = 0;
+			Error.prepareStackTrace = function (error: Error): string {
+				if (++calls === 2) throw new Error('prepare');
+				return `${error.name}\n    at probe (file.js:1:1)`;
+			};
+			try {
+				jest.isolateModules(function () {
+					const isolated = jest.requireActual<typeof import('.')>('.');
+					new (isolated.defineError('HalfError'))('x');
+					expect(capture).not.toHaveBeenCalled();
+					// The next class probes again, and V8 then answers.
+					Error.prepareStackTrace = prepare;
+					new (isolated.defineError('WholeError'))('x');
+					expect(capture).not.toHaveBeenCalled();
+				});
 			} finally {
 				Error.prepareStackTrace = prepare;
 			}
@@ -1482,6 +1554,36 @@ describe('errors under a polluted Object.prototype', function () {
 				expect(NotFound.is(instance)).toBe(true);
 			});
 		}
+	});
+
+	it('copies own fields that a polluted Object.prototype holds too, and accepts them as defineError fields (regression)', function () {
+		polluted({ code: 'E_PLANTED', status: 500 }, function () {
+			const error = deserializeError({ name: 'Error', message: 'x', code: 'ENOENT', status: 404 }) as Error & { code?: string; status?: number };
+			expect([error.code, error.status]).toEqual(['ENOENT', 404]);
+			expect(Object.hasOwn(error, 'status')).toBe(true);
+			const HttpError = defineError('HttpError', { status: 404 });
+			expect(new HttpError('Gone', { status: 410 }).status).toBe(410);
+			expect(HttpError.status).toBe(404);
+		});
+		// The methods of Object.prototype still count, and so does a key below it.
+		polluted({ status: 500 }, function () {
+			const error = deserializeError({ name: 'Error', message: 'x', toString: 'no', valueOf: 'no', __proto__: 'no' } as Record<string, unknown>);
+			expect(String(error)).toBe('Error: x');
+			expect(Object.keys(error)).toEqual([]);
+			expect(function () {
+				defineError('X', { toLocaleString: 1 });
+			}).toThrow(RangeError);
+		});
+	});
+
+	it('keeps a hole of an errors array as a hole, not a polluted Object.prototype[index] (regression)', function () {
+		polluted({ 0: { name: 'EvilError', message: 'planted' } }, function () {
+			// eslint-disable-next-line no-sparse-arrays -- a hole is what is tested
+			const error = deserializeError({ name: 'AggregateError', message: 'x', errors: [, 1] }) as AggregateError;
+			expect(error.errors).toHaveLength(2);
+			expect(Object.hasOwn(error.errors, 0)).toBe(false);
+			expect(error.errors[1]).toBe(1);
+		});
 	});
 
 	it('gives defineError classes and errors the same property attributes', function () {
