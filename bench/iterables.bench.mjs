@@ -1,4 +1,36 @@
-import { chunk, concat, countItems, drop, enumerate, filter, find, flatMap, map, mapConcurrent, reduce, scan, take, toArray, unique, windowed, zip } from 'tinkit/iterables';
+import { createInterface } from 'node:readline';
+import { Readable } from 'node:stream';
+import { partition as partitionArray } from 'tinkit/arrays';
+import {
+	bufferTime,
+	chunk,
+	chunkAsync,
+	concat,
+	countItems,
+	drop,
+	enumerate,
+	filter,
+	find,
+	flatMap,
+	interleave,
+	map,
+	mapConcurrent,
+	mergeAsync,
+	pairwise,
+	parseNdjson,
+	parseSSE,
+	partition,
+	readLines,
+	reduce,
+	scan,
+	streamToBytes,
+	streamToText,
+	take,
+	toArray,
+	unique,
+	windowed,
+	zip
+} from 'tinkit/iterables';
 import { pMapIterable } from 'p-map';
 
 // No library offers the same lazy, closing-aware helpers, so each case is compared with what one would write instead:
@@ -103,6 +135,334 @@ function* takeGenerator(iterable, n) {
 		if (++taken >= n) return;
 	}
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Stream readers and combinators (1.4.0). Each reader is compared with the naive approach on the whole buffer (which needs the
+// entire stream in memory first) and, where Node has one, with the built-in streaming equivalent.
+// ---------------------------------------------------------------------------------------------------------------------
+
+const encoder = new TextEncoder();
+
+/**
+ * Cuts a string or a byte buffer into chunks of `size`.
+ * @template {string | Uint8Array} T
+ * @param {T} whole - The data
+ * @param {number} size - The chunk size
+ * @returns {T[]} The chunks
+ */
+function cut(whole, size) {
+	const chunks = [];
+	for (let start = 0; start < whole.length; start += size) chunks.push(whole.slice(start, start + size));
+	return chunks;
+}
+
+/**
+ * Drains an async iterable, counting its items.
+ * @param {AsyncIterable<unknown>} iterable - The iterable
+ * @returns {Promise<number>} How many items it had
+ */
+async function countAsync(iterable) {
+	let total = 0;
+	for await (const _ of iterable) total++;
+	return total;
+}
+
+/**
+ * The naive line splitting: the whole text at once.
+ * @param {string} text - The text
+ * @returns {string[]} The lines
+ */
+function splitAll(text) {
+	const lines = text.split(/\r\n|\r|\n/);
+	if (lines[lines.length - 1] === '') lines.pop();
+	return lines;
+}
+
+/**
+ * A naive streaming line splitter: appends each chunk to a buffer and searches it again from the start (quadratic on long lines).
+ * @param {string[]} chunks - The chunks
+ * @returns {string[]} The lines
+ */
+function rescanningLines(chunks) {
+	const lines = [];
+	let buffer = '';
+	for (const chunk of chunks) {
+		buffer += chunk;
+		let match;
+		while ((match = /\r\n|\r|\n/.exec(buffer)) !== null) {
+			lines.push(buffer.slice(0, match.index));
+			buffer = buffer.slice(match.index + match[0].length);
+		}
+	}
+	if (buffer !== '') lines.push(buffer);
+	return lines;
+}
+
+/**
+ * Lines through Node's readline.
+ * @param {Array<string | Uint8Array>} chunks - The chunks
+ * @returns {Promise<number>} How many lines
+ */
+function readlineCount(chunks) {
+	return countAsync(createInterface({ input: Readable.from(chunks), crlfDelay: Infinity }));
+}
+
+/**
+ * What one writes without a parser: split events on blank lines, then keep the `data:` lines.
+ * @param {string} text - The whole event stream
+ * @returns {Array<{ event: string, data: string }>} The events
+ */
+function naiveSSE(text) {
+	const events = [];
+	for (const block of text.split('\n\n')) {
+		if (block === '') continue;
+		const data = [];
+		let event = 'message';
+		for (const line of block.split('\n')) {
+			if (line.startsWith('data:')) data.push(line.slice(line[5] === ' ' ? 6 : 5));
+			else if (line.startsWith('event:')) event = line.slice(6).trim();
+		}
+		events.push({ event, data: data.join('\n') });
+	}
+	return events;
+}
+
+/**
+ * A naive merge: `Promise.race` over the pending `next()` of every source, rebuilt for each value.
+ * @param {AsyncIterable<number>[]} sources - The sources
+ * @returns {Promise<number>} How many values
+ */
+async function raceMerge(sources) {
+	const iterators = sources.map(function (source) {
+		return source[Symbol.asyncIterator]();
+	});
+	const pending = new Map();
+	/**
+	 * @param {number} index - The source
+	 * @returns {void}
+	 */
+	function pull(index) {
+		pending.set(
+			index,
+			iterators[index].next().then(function (result) {
+				return { index, result };
+			})
+		);
+	}
+	iterators.forEach(function (_, index) {
+		pull(index);
+	});
+	let total = 0;
+	while (pending.size > 0) {
+		const { index, result } = await Promise.race(pending.values());
+		if (result.done) {
+			pending.delete(index);
+		} else {
+			total++;
+			pull(index);
+		}
+	}
+	return total;
+}
+
+/**
+ * An async generator over the values.
+ * @param {number[]} values - The values
+ * @yields {number} The values
+ * @returns {AsyncGenerator<number>} The values
+ */
+async function* asyncValues(values) {
+	for (const value of values) yield value;
+}
+
+const LOG = Array.from({ length: 20_000 }, function (_, index) {
+	return `2026-10-20T12:00:${String(index % 60).padStart(2, '0')}Z INFO request ${index} ${'x'.repeat(index % 80)}`;
+}).join('\n');
+const LOG_TEXT_CHUNKS = cut(LOG, 65_536);
+const LOG_BYTE_CHUNKS = cut(encoder.encode(LOG), 65_536);
+const LONG_LINE_CHUNKS = cut('y'.repeat(1_000_000) + '\n', 1000);
+const NDJSON = Array.from({ length: 10_000 }, function (_, index) {
+	return JSON.stringify({ id: index, name: `user ${index}`, tags: ['a', 'b'], score: index / 7 });
+}).join('\n');
+const NDJSON_CHUNKS = cut(encoder.encode(NDJSON), 65_536);
+const SSE = Array.from({ length: 10_000 }, function (_, index) {
+	return `data: {"choices":[{"delta":{"content":"token ${index}"}}]}\n\n`;
+}).join('');
+const SSE_CHUNKS = cut(encoder.encode(SSE), 16_384);
+const BYTE_CHUNKS = cut(new Uint8Array(1 << 20).fill(7), 16_384);
+const MERGE_VALUES = Array.from({ length: 2_500 }, function (_, index) {
+	return index;
+});
+const NUMBERS = integers(30_000, 30_000);
+
+const streamCases = [
+	{
+		name: 'readLines (20k lines, 64 KiB string chunks)',
+		fn: function () {
+			return countAsync(readLines(LOG_TEXT_CHUNKS));
+		},
+		baseline: function () {
+			return splitAll(LOG_TEXT_CHUNKS.join('')).length;
+		},
+		competitors: {
+			'node:readline': function () {
+				return readlineCount(LOG_TEXT_CHUNKS);
+			}
+		}
+	},
+	{
+		name: 'readLines (20k lines, 64 KiB UTF-8 chunks)',
+		fn: function () {
+			return countAsync(readLines(LOG_BYTE_CHUNKS));
+		},
+		baseline: function () {
+			return splitAll(new TextDecoder().decode(Buffer.concat(LOG_BYTE_CHUNKS))).length;
+		},
+		competitors: {
+			'node:readline': function () {
+				return readlineCount(LOG_BYTE_CHUNKS);
+			}
+		}
+	},
+	{
+		name: 'readLines (one 1 MB line in 1000 chunks)',
+		fn: function () {
+			return countAsync(readLines(LONG_LINE_CHUNKS));
+		},
+		baseline: function () {
+			return rescanningLines(LONG_LINE_CHUNKS).length;
+		},
+		competitors: {
+			'node:readline': function () {
+				return readlineCount(LONG_LINE_CHUNKS);
+			}
+		}
+	},
+	{
+		name: 'parseNdjson (10k records, 64 KiB chunks)',
+		fn: function () {
+			return countAsync(parseNdjson(NDJSON_CHUNKS));
+		},
+		baseline: function () {
+			return splitAll(new TextDecoder().decode(Buffer.concat(NDJSON_CHUNKS))).map(function (line) {
+				return JSON.parse(line);
+			}).length;
+		}
+	},
+	{
+		name: 'parseSSE (10k LLM deltas, 16 KiB chunks)',
+		fn: function () {
+			return countAsync(parseSSE(SSE_CHUNKS));
+		},
+		baseline: function () {
+			return naiveSSE(new TextDecoder().decode(Buffer.concat(SSE_CHUNKS))).length;
+		}
+	},
+	{
+		name: 'parseSSE (10k LLM deltas, from a ReadableStream)',
+		fn: function () {
+			return countAsync(parseSSE(ReadableStream.from(SSE_CHUNKS)));
+		},
+		baseline: async function () {
+			return naiveSSE(await new Response(ReadableStream.from(SSE_CHUNKS)).text()).length;
+		}
+	},
+	{
+		name: 'streamToText (1.2 MB, ReadableStream of 64 KiB)',
+		fn: function () {
+			return streamToText(ReadableStream.from(LOG_BYTE_CHUNKS));
+		},
+		competitors: {
+			'Response#text()': function () {
+				return new Response(ReadableStream.from(LOG_BYTE_CHUNKS)).text();
+			}
+		}
+	},
+	{
+		name: 'streamToBytes (1 MiB in 16 KiB chunks)',
+		fn: function () {
+			return streamToBytes(BYTE_CHUNKS);
+		},
+		baseline: function () {
+			// Growing the result chunk by chunk copies it again each time.
+			let result = new Uint8Array(0);
+			for (const chunk of BYTE_CHUNKS) {
+				const next = new Uint8Array(result.length + chunk.length);
+				next.set(result);
+				next.set(chunk, result.length);
+				result = next;
+			}
+			return result;
+		},
+		competitors: {
+			'Buffer.concat (sync)': function () {
+				return Buffer.concat(BYTE_CHUNKS);
+			},
+			'Response#arrayBuffer()': function () {
+				return new Response(ReadableStream.from(BYTE_CHUNKS)).arrayBuffer();
+			}
+		}
+	},
+	{
+		name: 'mergeAsync (4 async sources × 2.5k)',
+		fn: function () {
+			return countAsync(mergeAsync(asyncValues(MERGE_VALUES), asyncValues(MERGE_VALUES), asyncValues(MERGE_VALUES), asyncValues(MERGE_VALUES)));
+		},
+		baseline: function () {
+			return raceMerge([asyncValues(MERGE_VALUES), asyncValues(MERGE_VALUES), asyncValues(MERGE_VALUES), asyncValues(MERGE_VALUES)]);
+		}
+	},
+	{
+		name: 'bufferTime (10k items, maxSize 100)',
+		fn: function () {
+			return countAsync(bufferTime(asyncValues(MERGE_VALUES.concat(MERGE_VALUES, MERGE_VALUES, MERGE_VALUES)), 1000, { maxSize: 100 }));
+		},
+		competitors: {
+			'chunkAsync (no timer)': function () {
+				return countAsync(chunkAsync(asyncValues(MERGE_VALUES.concat(MERGE_VALUES, MERGE_VALUES, MERGE_VALUES)), 100));
+			}
+		}
+	},
+	{
+		name: 'interleave (3 arrays × 10k)',
+		fn: function () {
+			return toArray(interleave(NUMBERS.slice(0, 10_000), NUMBERS.slice(10_000, 20_000), NUMBERS.slice(20_000)));
+		},
+		baseline: function () {
+			const lists = [NUMBERS.slice(0, 10_000), NUMBERS.slice(10_000, 20_000), NUMBERS.slice(20_000)];
+			const result = [];
+			for (let index = 0; index < 10_000; index++) for (const list of lists) result.push(list[index]);
+			return result;
+		}
+	},
+	{
+		name: 'pairwise (30k)',
+		fn: function () {
+			return toArray(pairwise(NUMBERS));
+		},
+		baseline: function () {
+			const pairs = [];
+			for (let index = 1; index < NUMBERS.length; index++) pairs.push([NUMBERS[index - 1], NUMBERS[index]]);
+			return pairs;
+		},
+		competitors: {
+			'windowed(…, 2)': function () {
+				return toArray(windowed(NUMBERS, 2));
+			}
+		}
+	},
+	{
+		name: 'partition (30k)',
+		fn: function () {
+			return partition(NUMBERS, isMultipleOf3);
+		},
+		competitors: {
+			'arrays.partition': function () {
+				return partitionArray(NUMBERS, isMultipleOf3);
+			}
+		}
+	}
+];
 
 export default [
 	...sized('map → filter → take → toArray', function (n) {
@@ -378,5 +738,6 @@ export default [
 				}
 			}
 		];
-	})
+	}),
+	...streamCases
 ];

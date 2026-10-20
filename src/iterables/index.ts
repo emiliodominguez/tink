@@ -1,8 +1,8 @@
 import { AbortError } from '../async/index.js';
 import { isAsyncIterable, isIterable } from '../guards/index.js';
-import { assertFunction, assertInteger, assertNumber, describe } from '../utils/assert.js';
+import { assertDelay, assertFunction, assertInteger, assertNumber, describe, readOption } from '../utils/assert.js';
 import type { AbortSignalLike } from '../utils/index.js';
-import { detach, reasonOf } from '../utils/signal.js';
+import { assertOptionalSignal, detach, reasonOf } from '../utils/signal.js';
 
 /**
  * The tuple of item types produced by {@link zip} for a tuple of input iterables.
@@ -1473,4 +1473,1602 @@ async function collect<T>(iterable: AwaitableIterable<T>): Promise<T[]> {
 export function toArrayAsync<T>(iterable: AwaitableIterable<T>): Promise<T[]> {
 	assertAwaitableIterable('toArrayAsync', iterable);
 	return collect(iterable);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// More sync helpers
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * The generator behind {@link interleave} (the arguments are already validated).
+ * @template T
+ * @param {T} iterables - The iterables to interleave
+ * @returns {Generator<ZippedValues<T>[number], void, undefined>} A generator of the items, in round-robin order
+ */
+function* interleaved<T extends Array<Iterable<unknown>>>(iterables: T): Generator<ZippedValues<T>[number], void, undefined> {
+	// The iterators still running: an exhausted one is removed, so that it is skipped and never closed.
+	const iterators: Array<Iterator<unknown>> = [];
+	// Index of the iterator being advanced: when it throws, it must not be closed.
+	let current = -1;
+	let threw = false;
+	try {
+		for (const iterable of iterables) {
+			const iterator: unknown = iterable[Symbol.iterator]();
+
+			if (typeof iterator !== 'object' || iterator === null) throw new TypeError(`interleave: an iterator must be an object, got ${describe(iterator)}`);
+			iterators.push(iterator as Iterator<unknown>);
+		}
+		let index = 0;
+		while (iterators.length > 0) {
+			if (index >= iterators.length) index = 0;
+			current = index;
+			const result = iterators[index].next();
+			if (result.done) {
+				iterators.splice(index, 1);
+			} else {
+				const value = result.value;
+				current = -1;
+				index++;
+				yield value as ZippedValues<T>[number];
+			}
+		}
+	} catch (error) {
+		threw = true;
+		throw error;
+	} finally {
+		closeIterators(iterators, current, threw);
+	}
+}
+
+/**
+ * Lazily take one item from each iterable in turn (round-robin): `a1, b1, c1, a2, b2, c2, ...`. An exhausted iterable is skipped and
+ * the others go on, so every item of every iterable comes out exactly once (infinite iterables are fine: the others are not starved).
+ * When iteration stops early (or an iterable throws), the iterables still running are closed.
+ * @template T
+ * @param {...Iterable<unknown>} iterables - The iterables to interleave
+ * @returns {IterableIterator<ZippedValues<T>[number]>} An iterator of all the items; empty when called without iterables
+ * @throws {TypeError} when an argument is not iterable
+ * @example
+ * toArray(interleave([1, 2, 3], 'ab', [true])); // => [1, 'a', true, 2, 'b', 3] // typed as (number | string | boolean)[]
+ * toArray(take(interleave(count(), repeatValue('x')), 4)); // => [0, 'x', 1, 'x']
+ */
+export function interleave<T extends Array<Iterable<unknown>>>(...iterables: T): IterableIterator<ZippedValues<T>[number]> {
+	for (const iterable of iterables) assertIterable('interleave', iterable, 'iterables');
+	return interleaved(iterables);
+}
+
+/**
+ * The generator behind {@link pairwise} (the argument is already validated).
+ * @template T
+ * @param {Iterable<T>} iterable - The source items
+ * @returns {Generator<[T, T], void, undefined>} A generator of the pairs
+ */
+function* pairs<T>(iterable: Iterable<T>): Generator<[T, T], void, undefined> {
+	let previous: T | undefined;
+	let started = false;
+	for (const value of iterable) {
+		if (started) yield [previous as T, value];
+		previous = value;
+		started = true;
+	}
+}
+
+/**
+ * Lazily yield each item with the next one: `[a, b], [b, c], [c, d], ...` (one pair fewer than items; none for fewer than two items).
+ * Each pair is a fresh array. Same as `windowed(iterable, 2)`, typed as a tuple.
+ * @template T
+ * @param {Iterable<T>} iterable - The source items
+ * @returns {IterableIterator<[T, T]>} An iterator of the consecutive pairs
+ * @throws {TypeError} when `iterable` is not iterable
+ * @example
+ * toArray(pairwise([1, 2, 4, 7])); // => [[1, 2], [2, 4], [4, 7]]
+ * toArray(pairwise([1])); // => []
+ */
+export function pairwise<T>(iterable: Iterable<T>): IterableIterator<[T, T]> {
+	assertIterable('pairwise', iterable);
+	return pairs(iterable);
+}
+
+/**
+ * Split the items of an iterable in two with a type guard: the items it accepts (narrowed) and the others. Order is preserved.
+ * @template T
+ * @template S
+ * @param {Iterable<T>} iterable - The source items (consumed entirely)
+ * @param {(value: T, index: number) => value is S} predicate - Type guard deciding which side an item goes to
+ * @returns {[S[], Exclude<T, S>[]]} `[matching, rest]`
+ * @throws {TypeError} when `iterable` is not iterable or `predicate` is not a function
+ * @example
+ * partition(new Set([1, 'a', 2]), function (v): v is number { return typeof v === 'number'; }); // => [[1, 2], ['a']]
+ */
+export function partition<T, S extends T>(iterable: Iterable<T>, predicate: (value: T, index: number) => value is S): [S[], Exclude<T, S>[]];
+/**
+ * Split the items of an iterable in two: those for which `predicate` returns `true`, and the others. Order is preserved.
+ * @template T
+ * @param {Iterable<T>} iterable - The source items (consumed entirely)
+ * @param {(value: T, index: number) => boolean} predicate - Decides which side an item goes to
+ * @returns {[T[], T[]]} `[matching, rest]`
+ * @throws {TypeError} when `iterable` is not iterable or `predicate` is not a function
+ * @example
+ * partition(take(count(1), 5), function (n) { return n % 2 === 0; }); // => [[2, 4], [1, 3, 5]]
+ */
+export function partition<T>(iterable: Iterable<T>, predicate: (value: T, index: number) => boolean): [T[], T[]];
+/**
+ * Split the items of an iterable in two: those for which `predicate` returns `true`, and the others. Order is preserved.
+ * @template T
+ * @param {Iterable<T>} iterable - The source items (consumed entirely)
+ * @param {(value: T, index: number) => boolean} predicate - Decides which side an item goes to
+ * @returns {[T[], T[]]} `[matching, rest]`
+ * @throws {TypeError} when `iterable` is not iterable or `predicate` is not a function
+ * @example
+ * partition([1, 2, 3, 4], function (n) { return n > 2; }); // => [[3, 4], [1, 2]]
+ */
+export function partition<T>(iterable: Iterable<T>, predicate: (value: T, index: number) => boolean): [T[], T[]] {
+	assertIterable('partition', iterable);
+	assertFunction('partition', 'predicate', predicate);
+	const matching: T[] = [];
+	const rest: T[] = [];
+	let index = 0;
+	for (const value of iterable) {
+		if (predicate(value, index++)) matching.push(value);
+		else rest.push(value);
+	}
+	return [matching, rest];
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Async combinators
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * The union of the item types of a tuple of {@link AwaitableIterable}s, as produced by {@link mergeAsync}.
+ * @example
+ * type R = MergedValue<[AsyncIterable<number>, Array<Promise<string>>]>; // number | string
+ */
+export type MergedValue<T extends ReadonlyArray<AwaitableIterable<unknown>>> = T[number] extends infer S
+	? S extends AsyncIterable<infer U>
+		? U
+		: S extends Iterable<infer U>
+			? Awaited<U>
+			: never
+	: never;
+
+/** {@link mergeAsync}: a `next()` of the source is pending (a source with no state yet, or whose value was handed out, is idle). */
+const PULLING = 1;
+/** {@link mergeAsync}: the source delivered a value that is waiting to be yielded. */
+const BUFFERED = 2;
+/** {@link mergeAsync}: the source ended or failed on its own (it is not closed). */
+const FINISHED = 3;
+/** {@link mergeAsync}: the last value of the source was handed out, and it was not pulled again yet. */
+const HANDED_OUT = 0;
+
+/**
+ * A result delivered by a source of {@link mergeAsync}, in arrival order.
+ */
+interface Arrival {
+	index: number;
+	ok: boolean;
+	value: unknown;
+}
+
+/**
+ * The async generator behind {@link mergeAsync} (the arguments are already validated).
+ * @param {ReadonlyArray<AwaitableIterable<unknown>>} sources - The sources
+ * @returns {AsyncGenerator<unknown, void, undefined>} An async generator of the values, in arrival order
+ */
+async function* merged(sources: ReadonlyArray<AwaitableIterable<unknown>>): AsyncGenerator<unknown, void, undefined> {
+	const iterators: Array<AsyncIterator<unknown>> = [];
+	const states: number[] = [];
+	const arrivals: Arrival[] = [];
+	// Sources not finished: a failed one still counts, its error being among the arrivals, thrown before the end is noticed.
+	let running = 0;
+	let wakeUp: () => void = ignore;
+
+	/**
+	 * Wakes the consumer loop up, if it is waiting.
+	 * @returns {void}
+	 */
+	function notify(): void {
+		const resume = wakeUp;
+
+		wakeUp = ignore;
+		resume();
+	}
+
+	/**
+	 * Records what a source delivered and wakes the consumer up (once the merge is over, nobody reads it any more).
+	 * @param {number} index - The source
+	 * @param {boolean} ok - Whether it delivered a value (`false`: it failed)
+	 * @param {unknown} value - The value or the error
+	 * @returns {void}
+	 */
+	function arrive(index: number, ok: boolean, value: unknown): void {
+		states[index] = ok ? BUFFERED : FINISHED;
+		arrivals.push({ index, ok, value });
+		notify();
+	}
+
+	/**
+	 * Requests the next value of a source.
+	 * @param {number} index - The source
+	 * @returns {void}
+	 */
+	function pull(index: number): void {
+		states[index] = PULLING;
+
+		let step: Promise<IteratorResult<unknown>>;
+
+		// A hand-written source may throw from `next()` or return a plain result: treated like `for await` does.
+		try {
+			step = Promise.resolve(iterators[index].next());
+		} catch (error) {
+			step = Promise.reject(error);
+		}
+		step.then(
+			function (result) {
+				let done: unknown;
+				let value: unknown;
+
+				// Read like `for await` reads it: a non-object, or a `done` / `value` getter that throws, is the source failing.
+				try {
+					if (typeof result !== 'object' || result === null) throw new TypeError(`mergeAsync: iterator result ${describe(result)} is not an object`);
+					done = result.done;
+					if (!done) value = result.value;
+				} catch (error) {
+					arrive(index, false, error);
+					return;
+				}
+				if (!done) {
+					arrive(index, true, value);
+				} else {
+					states[index] = FINISHED;
+					running--;
+					notify();
+				}
+			},
+			function (error: unknown) {
+				arrive(index, false, error);
+			}
+		);
+	}
+
+	let failed = false;
+
+	try {
+		for (const source of sources) {
+			// Sync iterables get the wrapper, which awaits their items and closes them on early exit.
+			iterators.push((isAsyncIterable(source) ? source : awaitedItems(source))[Symbol.asyncIterator]());
+			running++;
+		}
+		for (let index = 0; index < iterators.length; index++) pull(index);
+		for (;;) {
+			const arrival = arrivals.shift();
+
+			if (arrival !== undefined) {
+				if (!arrival.ok) throw arrival.value;
+				states[arrival.index] = HANDED_OUT;
+				yield arrival.value;
+				// Pulled again only once its value was consumed: at most one value per source is buffered.
+				pull(arrival.index);
+			} else if (running === 0) {
+				return;
+			} else {
+				await new Promise<void>(function (resolve) {
+					wakeUp = resolve;
+				});
+			}
+		}
+	} catch (error) {
+		failed = true;
+		throw error;
+	} finally {
+		await closeSources(iterators, states, failed);
+	}
+}
+
+/**
+ * Closes the sources of {@link mergeAsync} that are still open: those with a pending `next()` without waiting (an async generator only
+ * closes once that pull is answered), the others in parallel, waiting for them.
+ * @param {ReadonlyArray<AsyncIterator<unknown>>} iterators - The sources
+ * @param {ReadonlyArray<number>} states - Their states
+ * @param {boolean} failed - Whether the merge is failing (a failure to close is then ignored, like `for await` does)
+ * @returns {Promise<void>} Settles once the sources are closed
+ * @throws {unknown} the first error of a `return()` call (in source order), unless `failed`
+ */
+async function closeSources(iterators: ReadonlyArray<AsyncIterator<unknown>>, states: ReadonlyArray<number>, failed: boolean): Promise<void> {
+	const closing: Array<Promise<unknown>> = [];
+
+	for (let index = 0; index < iterators.length; index++) {
+		const state = states[index];
+
+		if (state === PULLING) {
+			closeLater(iterators[index]);
+		} else if (state !== FINISHED) {
+			try {
+				closing.push(Promise.resolve(iterators[index].return?.()));
+			} catch (error) {
+				closing.push(Promise.reject(error));
+			}
+		}
+	}
+	// `allSettled`: every close is waited for, and no rejection is left unhandled.
+	for (const outcome of await Promise.allSettled(closing)) {
+		if (outcome.status === 'rejected' && !failed) throw outcome.reason;
+	}
+}
+
+/**
+ * Merges several async (or sync) iterables into one, yielding their values as they arrive (the first to settle comes first). Each source
+ * has at most one `next()` pending at a time and is pulled again only once its previous value has been consumed, so at most one value per
+ * source is buffered and a slow consumer slows every source down. Sync iterables may hold promises, which are awaited.
+ *
+ * - It ends once every source has ended (and is empty without sources).
+ * - An error of a source is thrown in arrival order (after the values that arrived before it); the other sources are then closed.
+ * - Early exit (`break`, `return()`, an error) calls `return()` on every source still open: waiting for those that are idle, and
+ *   requesting it without waiting from those with a pending `next()` (an async generator only closes once that pull settles, which an
+ *   idle source may never do). Values or errors arriving afterwards are dropped (and their rejections handled). Like any async
+ *   generator, a `return()` called while a `next()` is pending only runs once that `next()` settles (when some source delivers): there
+ *   is no `signal`, so to stop idle sources at once, give each one its own way to be aborted.
+ * @template T
+ * @param {...AwaitableIterable<unknown>} sources - The iterables to merge
+ * @returns {AsyncIterableIterator<MergedValue<T>>} An async iterator of every value of every source, in arrival order
+ * @throws {TypeError} when an argument is neither async iterable nor iterable
+ * @example
+ * import { sleep } from 'tinkit/async';
+ * async function* ticks(name: string, ms: number): AsyncGenerator<string> { for (let i = 0; i < 2; i++) { await sleep(ms); yield name + i; } }
+ * await toArrayAsync(mergeAsync(ticks('slow', 80), ticks('fast', 10))); // => ['fast0', 'fast1', 'slow0', 'slow1']
+ */
+export function mergeAsync<T extends Array<AwaitableIterable<unknown>>>(...sources: T): AsyncIterableIterator<MergedValue<T>> {
+	for (const source of sources) {
+		if (!isAsyncIterable(source) && !isIterable(source)) throw new TypeError(`mergeAsync: \`sources\` must be iterable, got ${describe(source)}`);
+	}
+	return merged(sources) as AsyncIterableIterator<MergedValue<T>>;
+}
+
+/**
+ * Options accepted by {@link bufferTime}.
+ */
+export interface BufferTimeOptions {
+	/** Largest batch (an integer >= 1, or `Infinity`, the default): a batch that reaches it is flushed at once. */
+	maxSize?: number;
+	/**
+	 * Aborting it stops pulling from the source, which is closed, and makes the iterator throw the signal's `reason` (or an `AbortError`)
+	 * at its next read.
+	 */
+	signal?: AbortSignalLike | null;
+}
+
+/**
+ * The async generator behind {@link bufferTime} (the arguments are already validated).
+ * @param {AwaitableIterable<unknown>} iterable - The source items
+ * @param {number} ms - The time window of a batch
+ * @param {number} maxSize - The largest batch
+ * @param {AbortSignalLike | undefined} signal - The abort signal
+ * @returns {AsyncGenerator<unknown[], void, undefined>} An async generator of the batches
+ */
+async function* batchedByTime(
+	iterable: AwaitableIterable<unknown>,
+	ms: number,
+	maxSize: number,
+	signal: AbortSignalLike | undefined
+): AsyncGenerator<unknown[], void, undefined> {
+	const source = (isAsyncIterable(iterable) ? iterable : awaitedItems(iterable))[Symbol.asyncIterator]();
+	// Batches closed (full, timed out, or at the end) but not yet yielded: at most one while the consumer is busy with another, since
+	// nothing more is pulled then.
+	const ready: unknown[][] = [];
+	let batch: unknown[] = [];
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let pulling = false;
+	let exhausted = false;
+	let stopped = false;
+	let sourceError: { error: unknown } | undefined;
+	let abortedWith: { reason: unknown } | undefined;
+	let wakeUp: () => void = ignore;
+
+	/**
+	 * Wakes the consumer loop up, if it is waiting.
+	 * @returns {void}
+	 */
+	function notify(): void {
+		const resume = wakeUp;
+
+		wakeUp = ignore;
+		resume();
+	}
+
+	/**
+	 * Closes the current batch (when it has items) and stops its timer.
+	 * @returns {void}
+	 */
+	function flush(): void {
+		clearTimeout(timer);
+		timer = undefined;
+		if (batch.length > 0) {
+			ready.push(batch);
+			batch = [];
+		}
+	}
+
+	/**
+	 * The timer of the current batch fired.
+	 * @returns {void}
+	 */
+	function onTimer(): void {
+		flush();
+		notify();
+	}
+
+	/**
+	 * Records a failure of the source (it is not closed then) and wakes the consumer up, which yields the last batch and then throws it
+	 * (once the iteration is over, nobody reads it any more).
+	 * @param {unknown} error - The error
+	 * @returns {void}
+	 */
+	function failSource(error: unknown): void {
+		exhausted = true;
+		sourceError = { error };
+		flush();
+		notify();
+	}
+
+	/**
+	 * Requests the next item of the source.
+	 * @returns {void}
+	 */
+	function pull(): void {
+		pulling = true;
+
+		let step: Promise<IteratorResult<unknown>>;
+
+		try {
+			step = Promise.resolve(source.next());
+		} catch (error) {
+			step = Promise.reject(error);
+		}
+		step.then(function (result) {
+			let done: unknown;
+			let value: unknown;
+
+			try {
+				if (typeof result !== 'object' || result === null) throw new TypeError(`bufferTime: iterator result ${describe(result)} is not an object`);
+				done = result.done;
+				if (!done) value = result.value;
+			} catch (error) {
+				failSource(error);
+				return;
+			}
+			if (stopped) return;
+			pulling = false;
+			if (done) {
+				exhausted = true;
+				flush();
+			} else {
+				batch.push(value);
+				if (batch.length >= maxSize) flush();
+				// The window of a batch opens with its first item.
+				else if (batch.length === 1 && ms !== Infinity) timer = setTimeout(onTimer, ms);
+			}
+			notify();
+		}, failSource);
+	}
+
+	/**
+	 * Abort listener: wakes the consumer up, which then throws the reason.
+	 * @returns {void}
+	 */
+	function onAbort(): void {
+		// Kept here rather than read back from `signal.aborted`, which a signal-like object may not have updated.
+		abortedWith ??= { reason: abortReason(signal as AbortSignalLike) };
+		notify();
+	}
+
+	let failed = false;
+
+	try {
+		signal?.addEventListener('abort', onAbort);
+		for (;;) {
+			if (abortedWith !== undefined) throw abortedWith.reason;
+			if (signal?.aborted) throw abortReason(signal);
+
+			const next = ready.shift();
+
+			if (next !== undefined) {
+				yield next;
+			} else if (exhausted) {
+				if (sourceError !== undefined) throw sourceError.error;
+				return;
+			} else {
+				if (!pulling) pull();
+				await new Promise<void>(function (resolve) {
+					wakeUp = resolve;
+				});
+			}
+		}
+	} catch (error) {
+		failed = true;
+		throw error;
+	} finally {
+		stopped = true;
+		clearTimeout(timer);
+		detach(signal, onAbort);
+		// As in `mapConcurrent`: close the source unless it finished or failed, without waiting when a pull is pending.
+		if (!exhausted) {
+			if (pulling) closeLater(source);
+			else if (failed) await closeQuietly(source);
+			else await source.return?.();
+		}
+	}
+}
+
+/**
+ * Lazily groups the items of an async (or sync) iterable into batches by time: a batch opens with its first item and is flushed `ms`
+ * milliseconds later, or as soon as it holds `maxSize` items, whichever comes first (the timer then restarts with the next item, so an
+ * idle source produces no batches: a batch is never empty). The items left at the end are flushed as a last batch.
+ *
+ * - Pulling: the source is read one item at a time while the consumer waits for a batch; while a ready batch waits to be read, at most
+ *   one more item is read into the next one, so a slow consumer slows the source down. A batch whose time is up while the consumer is
+ *   busy is yielded at its next read.
+ * - Errors: an error of the source is thrown after the batch of the items read before it.
+ * - Early exit (`break`, `return()`, an error, an abort) clears the timer and closes the source, like {@link mapConcurrent} does. Like
+ *   any async generator, a `return()` called while a `next()` is pending only runs once that `next()` settles (a batch, the end, or an
+ *   error): abort `signal` to stop at once while the source is idle.
+ * @template T
+ * @param {AwaitableIterable<T>} iterable - The source items
+ * @param {number} ms - How long a batch stays open, from its first item (0 to 2 ** 31 - 1, or `Infinity` to batch by `maxSize` only)
+ * @param {BufferTimeOptions} [options] - `maxSize` and `signal`
+ * @returns {AsyncIterableIterator<T[]>} An async iterator of non-empty batches (fresh arrays)
+ * @throws {TypeError} when `iterable` is neither async iterable nor iterable, `options` is not an object, `ms` or `maxSize` is not a number, or `signal` is not a signal
+ * @throws {RangeError} when `ms` is negative or too large, or `maxSize` is not an integer >= 1 or `Infinity`
+ * @example
+ * await toArrayAsync(bufferTime([1, 2, 3, 4, 5], 1000, { maxSize: 2 })); // => [[1, 2], [3, 4], [5]]
+ * @example
+ * import { sleep } from 'tinkit/async';
+ * async function* bursts(): AsyncGenerator<number> { yield 1; yield 2; await sleep(100); yield 3; }
+ * await toArrayAsync(bufferTime(bursts(), 20)); // => [[1, 2], [3]]
+ */
+export function bufferTime<T>(iterable: AwaitableIterable<T>, ms: number, options?: BufferTimeOptions): AsyncIterableIterator<T[]> {
+	assertAwaitableIterable('bufferTime', iterable);
+	assertDelay('bufferTime', 'ms', ms, true);
+	const settings = optionsOf('bufferTime', options);
+	const maxSize = readOption(settings, 'maxSize', Infinity);
+	const signal = readOption(settings, 'signal');
+	assertInteger('bufferTime', 'maxSize', maxSize, 1, true);
+	assertOptionalSignal('bufferTime', 'signal', signal);
+	return batchedByTime(iterable, ms, maxSize, signal ?? undefined) as AsyncIterableIterator<T[]>;
+}
+
+/**
+ * Returns the options object of a function, or an empty one when it is `undefined`.
+ * @template O
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {O | undefined} options - The options
+ * @returns {O} The options
+ * @throws {TypeError} when `options` is neither an object nor `undefined`
+ */
+function optionsOf<O extends object>(caller: string, options: O | undefined): O {
+	if (options === undefined) return {} as O;
+	if (typeof options !== 'object' || options === null) throw new TypeError(`${caller}: \`options\` must be an object, got ${describe(options)}`);
+	return options;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Stream readers (WHATWG ReadableStreams, Node streams, fetch bodies, async generators... of bytes or text)
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * The part of a WHATWG `ReadableStream` the stream readers use (structural, so that the streams of every runtime fit, and so that the
+ * declarations do not need the DOM type library): `fetch(...).body`, `Blob#stream()`, Node's `stream/web` and `Readable.toWeb()`.
+ * @template T - The chunk type
+ */
+export interface ReadableStreamLike<T> {
+	getReader(): ReadableStreamReaderLike<T>;
+}
+
+/**
+ * The part of a `ReadableStreamDefaultReader` the stream readers use.
+ * @template T - The chunk type
+ */
+export interface ReadableStreamReaderLike<T> {
+	read(): PromiseLike<{ done: boolean; value?: T }>;
+	cancel(reason?: unknown): PromiseLike<void>;
+	releaseLock(): void;
+}
+
+/**
+ * What the stream readers read from: a WHATWG `ReadableStream` (read through its reader, so it works where streams are not async
+ * iterable yet), or any async iterable (a Node `Readable`, an async generator) or sync iterable of chunks (promises are awaited).
+ * The chunk type is inferred from the async iterator of a stream (`ReadableStream` overloads `getReader`, which defeats inference from
+ * it): pass it explicitly (`streamToArray<number>(stream)`) for a stream type that is not async iterable.
+ * @template T - The chunk type
+ */
+export type StreamSource<T> = ReadableStreamLike<NoInfer<T>> | AwaitableIterable<T>;
+
+/**
+ * What the text readers read from: a {@link StreamSource} of chunks that are strings or UTF-8 bytes (`Uint8Array`, Node's `Buffer`),
+ * mixed freely, or a whole text or byte buffer given as one chunk.
+ */
+export type TextStreamSource = StreamSource<string | Uint8Array> | string | Uint8Array;
+
+/**
+ * The option shared by the stream readers.
+ */
+export interface StreamReadOptions {
+	/**
+	 * Aborting it cancels the stream (or calls the iterator's `return()`) at once, even while a read is pending, and makes the reader throw
+	 * the signal's `reason` (or an `AbortError`) at its next read. An already aborted signal cancels the stream at the first read.
+	 */
+	signal?: AbortSignalLike | null;
+}
+
+/**
+ * The `%TypedArray%.prototype[Symbol.toStringTag]` getter: the constructor name of a genuine typed array of any realm, else `undefined`.
+ * Looked up on first use: bundlers keep a top-level property read, which would ship it with every helper of the module.
+ */
+let typedArrayTag: ((this: unknown) => string | undefined) | undefined;
+
+/**
+ * Tells whether a value is a genuine `Uint8Array` (or `Buffer`) of any realm: a brand check, which a fake `Symbol.toStringTag` cannot fool.
+ * @param {unknown} value - The value
+ * @returns {boolean} Whether it is a `Uint8Array`
+ */
+function isBytes(value: unknown): value is Uint8Array {
+	typedArrayTag ??= (Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag) as PropertyDescriptor).get as (
+		this: unknown
+	) => string | undefined;
+	return typedArrayTag.call(value) === 'Uint8Array';
+}
+
+/**
+ * Throws a `TypeError` unless `source` is something the stream readers can read.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {unknown} source - The value to validate
+ * @returns {void}
+ * @throws {TypeError} when `source` is neither a stream nor an (async) iterable
+ */
+function assertStreamSource(caller: string, source: unknown): void {
+	// Strings and Uint8Arrays (whole buffers for the text readers) are iterable too.
+	if (isStream(source) || isAsyncIterable(source) || isIterable(source)) return;
+	throw new TypeError(`${caller}: \`source\` must be a ReadableStream or an (async) iterable, got ${describe(source)}`);
+}
+
+/**
+ * Tells whether a value has a `getReader` method, like a WHATWG `ReadableStream`.
+ * @param {unknown} value - The value
+ * @returns {value is ReadableStreamLike<unknown>} Whether it looks like a stream
+ */
+function isStream(value: unknown): value is ReadableStreamLike<unknown> {
+	return typeof value === 'object' && value !== null && typeof (value as Partial<ReadableStreamLike<unknown>>).getReader === 'function';
+}
+
+/** Returned by {@link ChunkReader.read} at the end of the stream. */
+const END = {};
+
+/**
+ * Reads the chunks of a {@link StreamSource} one at a time, with abort support and cleanup.
+ */
+interface ChunkReader {
+	/** Opens the source (locks the stream, or gets the iterator) and starts listening to the signal. */
+	open(): void;
+	/** Reads the next chunk, or {@link END}. Throws the source's error, or the abort reason. */
+	read(): Promise<unknown>;
+	/** Throws the abort reason if the signal was aborted. */
+	check(): void;
+	/** Cancels the stream (closes the iterator) unless it ended, failed or was already closed, then releases the lock. */
+	close(failure: { error: unknown } | undefined): Promise<void>;
+}
+
+/**
+ * Creates the {@link ChunkReader} of a source (nothing is read or locked until `open()`).
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {unknown} source - The validated source
+ * @param {boolean} whole - Whether a string or a `Uint8Array` source is one chunk
+ * @param {AbortSignalLike | undefined} signal - The abort signal
+ * @returns {ChunkReader} The reader
+ */
+function chunkReader(caller: string, source: unknown, whole: boolean, signal: AbortSignalLike | undefined): ChunkReader {
+	let reader: ReadableStreamReaderLike<unknown> | undefined;
+	let iterator: AsyncIterator<unknown> | undefined;
+	// Whether there is nothing left to close: the source ended, failed or was closed.
+	let settled = false;
+	let abortedWith: { reason: unknown } | undefined;
+	// Rejects the pending read (with a signal only).
+	let interrupt: ((reason: unknown) => void) | undefined;
+
+	/**
+	 * Releases the lock on the stream, ignoring a reader whose `releaseLock` throws.
+	 * @returns {void}
+	 */
+	function release(): void {
+		try {
+			reader?.releaseLock();
+		} catch {
+			// Nothing more can be done with it.
+		}
+	}
+
+	/**
+	 * Abort listener: rejects the pending read and cancels the source at once (a pending read may never settle otherwise).
+	 * @returns {void}
+	 */
+	function onAbort(): void {
+		if (abortedWith !== undefined) return;
+		const reason = abortReason(signal as AbortSignalLike);
+		abortedWith = { reason };
+		interrupt?.(reason);
+		if (settled) return;
+		settled = true;
+		if (reader === undefined) {
+			closeLater(iterator as AsyncIterator<unknown>);
+			return;
+		}
+		// Cancelling settles a pending read, so the lock can be released at once.
+		try {
+			Promise.resolve(reader.cancel(reason)).then(undefined, ignore);
+		} catch {
+			// A synchronously throwing `cancel()`: nobody is waiting for it.
+		}
+		release();
+	}
+
+	/**
+	 * Throws the abort reason if the signal was aborted (also for a signal-like object that did not dispatch the event).
+	 * @returns {void}
+	 */
+	function check(): void {
+		if (signal?.aborted) onAbort();
+		if (abortedWith !== undefined) throw abortedWith.reason;
+	}
+
+	/**
+	 * Waits for a read, unless the signal is aborted first (used only with a signal).
+	 * @param {PromiseLike<unknown> | unknown} pull - The pending read
+	 * @returns {Promise<unknown>} Its result
+	 */
+	function interruptible(pull: unknown): Promise<unknown> {
+		return new Promise(function (resolve, reject) {
+			interrupt = reject;
+			Promise.resolve(pull).then(resolve, reject);
+		});
+	}
+
+	return {
+		open(): void {
+			if (isStream(source)) {
+				reader = source.getReader();
+			} else {
+				// A whole buffer is read as a single chunk.
+				const chunks = whole && (typeof source === 'string' || isBytes(source)) ? [source] : (source as AwaitableIterable<unknown>);
+				iterator = (isAsyncIterable(chunks) ? chunks : awaitedItems(chunks))[Symbol.asyncIterator]();
+			}
+			// An already aborted signal is noticed by the first read.
+			signal?.addEventListener('abort', onAbort);
+		},
+		async read(): Promise<unknown> {
+			check();
+			try {
+				const pull = reader !== undefined ? reader.read() : (iterator as AsyncIterator<unknown>).next();
+				// Without a signal nothing can interrupt the read: awaiting it directly saves a promise and two ticks per chunk.
+				const step = signal === undefined ? await pull : await interruptible(pull);
+				// Aborted while the chunk was arriving: it is dropped (the source is already cancelled).
+				check();
+				if (typeof step !== 'object' || step === null)
+					throw new TypeError(`${caller}: the source returned a read result that is not an object, got ${describe(step)}`);
+				const { done, value } = step as IteratorResult<unknown>;
+				if (!done) return value;
+				settled = true;
+				return END;
+			} catch (error) {
+				// The source failed on its own (it is not cancelled, like `for await` does), or the read was aborted (it is cancelled already).
+				settled = true;
+				throw error;
+			}
+		},
+		check,
+		async close(failure: { error: unknown } | undefined): Promise<void> {
+			detach(signal, onAbort);
+			try {
+				if (!settled) await (reader !== undefined ? reader.cancel(failure?.error) : iterator?.return?.());
+			} catch (error) {
+				// When the reading failed, that error is the one reported (like `for await`).
+				if (failure === undefined) throw error;
+			} finally {
+				release();
+			}
+		}
+	};
+}
+
+/**
+ * Throws the `TypeError` for a chunk that is neither a string nor a `Uint8Array`.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {unknown} piece - The chunk
+ * @returns {never} Always throws
+ * @throws {TypeError} always
+ */
+function badChunk(caller: string, piece: unknown): never {
+	throw new TypeError(`${caller}: a chunk must be a string or a Uint8Array, got ${describe(piece)}`);
+}
+
+/** Structural subset of the WHATWG `TextDecoder` (not in the ES2022 type library). */
+interface StreamingDecoder {
+	decode(input?: Uint8Array, options?: { stream: boolean }): string;
+}
+
+/** The options of a streaming `decode` call. */
+const STREAM = { stream: true };
+
+/**
+ * The state of the incremental UTF-8 decoding of a text stream.
+ */
+interface TextState {
+	decoder: StreamingDecoder | undefined;
+	// Whether the last chunk was bytes: the decoder may hold the start of a character.
+	pending: boolean;
+	// Whether some text was produced (a byte order mark is only dropped at the very start).
+	started: boolean;
+}
+
+/**
+ * Creates the state of an incremental decoding.
+ * @returns {TextState} A fresh state
+ */
+function textState(): TextState {
+	return { decoder: undefined, pending: false, started: false };
+}
+
+/**
+ * Turns a chunk into text: a string as is, bytes through a streaming UTF-8 decoder (`TextDecoder`, which keeps the start of a character
+ * split across chunks for the next one, and turns malformed bytes into U+FFFD exactly like decoding the whole stream at once). A byte
+ * order mark at the very start of the stream is dropped, like `TextDecoderStream` and `Response#text()` do.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {TextState} state - The decoding state
+ * @param {unknown} piece - The chunk, or {@link END} to flush the decoder
+ * @returns {string} The text of the chunk
+ * @throws {TypeError} when the chunk is neither a string nor a `Uint8Array`, or bytes come and the runtime has no `TextDecoder`
+ */
+function decodeChunk(caller: string, state: TextState, piece: unknown): string {
+	let text: string;
+	if (typeof piece === 'string' || piece === END) {
+		// An empty string does not interrupt a character split across byte chunks.
+		if (piece === '') return '';
+		// Bytes before a string, or at the end, may have left an incomplete character: flushed as U+FFFD.
+		const tail = state.pending ? (state.decoder as StreamingDecoder).decode() : '';
+		state.pending = false;
+		text = piece === END ? tail : tail + (piece as string);
+	} else {
+		if (!isBytes(piece)) badChunk(caller, piece);
+		state.decoder ??= createDecoder(caller);
+		state.pending = true;
+		text = state.decoder.decode(piece, STREAM);
+	}
+	if (state.started || text.length === 0) return text;
+	state.started = true;
+	return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+/**
+ * Creates a streaming UTF-8 decoder that keeps the byte order mark (it is dropped by {@link decodeChunk}, also from string chunks).
+ * @param {string} caller - Name of the public function, used in the error message
+ * @returns {StreamingDecoder} The decoder
+ * @throws {TypeError} when the runtime has no `TextDecoder`
+ */
+function createDecoder(caller: string): StreamingDecoder {
+	const Decoder = (globalThis as { TextDecoder?: new (label: string, options: object) => StreamingDecoder }).TextDecoder;
+	if (typeof Decoder !== 'function') throw new TypeError(`${caller}: decoding Uint8Array chunks needs TextDecoder, which this runtime lacks`);
+	return new Decoder('utf-8', { ignoreBOM: true });
+}
+
+/**
+ * The state of the line splitting of a text stream.
+ */
+interface LineState {
+	caller: string;
+	// Longest line accepted.
+	max: number;
+	// Whether a lone CR ends a line too (otherwise only LF does, and a CR before it stays in the line).
+	cr: boolean;
+	// The pieces of the line being read, and their total length (joined once, so that a long line costs linear time).
+	parts: string[];
+	size: number;
+	// Lines completed so far.
+	count: number;
+	// The last chunk ended with a CR: a LF at the start of the next one belongs to the same line break.
+	skipLF: boolean;
+}
+
+/**
+ * Creates the state of a line splitting.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {number} max - The longest line accepted
+ * @param {boolean} cr - Whether a lone CR ends a line
+ * @returns {LineState} A fresh state
+ */
+function lineState(caller: string, max: number, cr: boolean): LineState {
+	return { caller, max, cr, parts: [], size: 0, count: 0, skipLF: false };
+}
+
+/**
+ * Creates the error thrown for a line longer than `maxLineLength`.
+ * @param {LineState} state - The splitting state
+ * @param {number} line - The 1-based number of the line
+ * @returns {RangeError} The error
+ */
+function lineTooLong(state: LineState, line: number): RangeError {
+	return new RangeError(`${state.caller}: line ${line} is longer than \`maxLineLength\` (${state.max})`);
+}
+
+/**
+ * Appends the lines completed by a piece of text to `lines`, keeping the unfinished last line for the next piece (or appending it too,
+ * when not empty, for the last piece). Lines end at LF, CRLF and (when `state.cr`) a lone CR, also when the CR and the LF of a CRLF
+ * come in different pieces. Each code unit is scanned once.
+ *
+ * A line longer than `state.max` stops the splitting: its error is returned rather than thrown, so that the caller first hands out
+ * the lines before it (the outcome must not depend on where the chunks were cut), then throws it.
+ * @param {LineState} state - The splitting state
+ * @param {string} text - The next piece of text
+ * @param {string[]} lines - Receives the completed lines (without their line breaks)
+ * @param {boolean} atEnd - Whether it is the last piece of the stream
+ * @returns {RangeError | undefined} The error of a line longer than `state.max`, if any
+ */
+function splitLines(state: LineState, text: string, lines: string[], atEnd: boolean): RangeError | undefined {
+	const length = text.length;
+	let start = 0;
+	if (state.skipLF && length > 0) {
+		state.skipLF = false;
+		if (text.charCodeAt(0) === 10) start = 1;
+	}
+	// The next LF and CR at or after `start`, each searched again only once passed: a linear scan.
+	let lf = text.indexOf('\n', start);
+	let cr = state.cr ? text.indexOf('\r', start) : -1;
+	while (lf !== -1 || cr !== -1) {
+		let end: number;
+		let next: number;
+		if (cr === -1 || (lf !== -1 && lf < cr)) {
+			end = lf;
+			next = lf + 1;
+			lf = text.indexOf('\n', next);
+		} else {
+			end = cr;
+			next = cr + 1;
+			if (next === length) {
+				state.skipLF = true;
+			} else if (text.charCodeAt(next) === 10) {
+				next++;
+				lf = text.indexOf('\n', next);
+			}
+			cr = text.indexOf('\r', next);
+		}
+		state.count++;
+		if (state.size + end - start > state.max) return lineTooLong(state, state.count);
+		let line = text.slice(start, end);
+		if (state.parts.length > 0) {
+			state.parts.push(line);
+			line = state.parts.join('');
+			state.parts = [];
+			state.size = 0;
+		}
+		lines.push(line);
+		start = next;
+	}
+	if (start < length) {
+		const size = state.size + length - start;
+		if (size > state.max) return lineTooLong(state, state.count + 1);
+		state.parts.push(text.slice(start));
+		state.size = size;
+	}
+	if (atEnd && state.parts.length > 0) lines.push(state.parts.join(''));
+	return undefined;
+}
+
+/**
+ * Reads the shared options of the line readers.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {ReadLinesOptions | undefined} options - The options
+ * @returns {{ max: number; signal: AbortSignalLike | undefined; settings: ReadLinesOptions }} The validated options
+ * @throws {TypeError} when `options` is not an object, `maxLineLength` is not a number or `signal` is not a signal
+ * @throws {RangeError} when `maxLineLength` is not an integer >= 0 or `Infinity`
+ */
+function lineOptions<O extends ReadLinesOptions>(caller: string, options: O | undefined): { max: number; signal: AbortSignalLike | undefined; settings: O } {
+	const settings = optionsOf(caller, options);
+	const max = readOption(settings, 'maxLineLength', Infinity);
+	const signal = readOption(settings, 'signal');
+	assertInteger(caller, 'maxLineLength', max, 0, true);
+	assertOptionalSignal(caller, 'signal', signal);
+	return { max, signal: signal ?? undefined, settings };
+}
+
+/**
+ * Options accepted by {@link readLines}.
+ */
+export interface ReadLinesOptions extends StreamReadOptions {
+	/**
+	 * Longest line accepted, in UTF-16 code units without the line break (an integer >= 0, or `Infinity`, the default): a longer line
+	 * throws a `RangeError` as soon as that many characters are buffered, so a stream without line breaks cannot exhaust memory.
+	 */
+	maxLineLength?: number;
+}
+
+/**
+ * The async generator behind {@link readLines} (the arguments are already validated).
+ * @param {TextStreamSource} source - The text stream
+ * @param {number} max - The longest line accepted
+ * @param {AbortSignalLike | undefined} signal - The abort signal
+ * @returns {AsyncGenerator<string, void, undefined>} An async generator of the lines
+ */
+async function* linesOf(source: TextStreamSource, max: number, signal: AbortSignalLike | undefined): AsyncGenerator<string, void, undefined> {
+	const chunks = chunkReader('readLines', source, true, signal);
+	const text = textState();
+	const state = lineState('readLines', max, true);
+	const lines: string[] = [];
+	let failure: { error: unknown } | undefined;
+	try {
+		chunks.open();
+		for (;;) {
+			const piece = await chunks.read();
+			const tooLong = splitLines(state, decodeChunk('readLines', text, piece), lines, piece === END);
+			for (let i = 0; i < lines.length; i++) {
+				chunks.check();
+				yield lines[i];
+			}
+			if (tooLong !== undefined) {
+				// An abort while the consumer held the last line wins, as at any read.
+				chunks.check();
+				throw tooLong;
+			}
+			if (piece === END) return;
+			lines.length = 0;
+		}
+	} catch (error) {
+		failure = { error };
+		throw error;
+	} finally {
+		await chunks.close(failure);
+	}
+}
+
+/**
+ * Lazily reads the lines of a text stream: a `fetch` body, a Node stream, a `Blob#stream()`, an async generator... of strings and/or UTF-8
+ * bytes, or a whole string or byte buffer.
+ *
+ * - Line breaks: LF, CRLF and a lone CR, like Node's `readline` with `crlfDelay: Infinity` (a CR ending one chunk and a LF starting
+ *   the next are ONE break, however long the pause between them). Lines are yielded without their line break.
+ * - The last line is yielded when it is not empty, with or without a final line break, so `'a\nb'` and `'a\nb\n'` both give `a`, `b`
+ *   (like `readline`), and `'a\n\n'` gives `a` and an empty line.
+ * - Decoding: UTF-8, incremental (a character split across chunks is decoded whole; malformed bytes become U+FFFD exactly as when
+ *   decoding the whole stream with `TextDecoder`), and a byte order mark at the very start is dropped. Needs `TextDecoder` for bytes.
+ * - Cost: linear in the stream, even for one huge line split over thousands of chunks (its pieces are joined once).
+ * - Cleanup: when the loop stops early (`break`, an error, a line over `maxLineLength`), the stream is cancelled and its lock released
+ *   (an async iterable is closed with `return()`). A stream that fails is not cancelled, and its error is thrown. Like any async
+ *   generator, a `return()` called while a read is pending waits for that read: abort `signal` to stop an idle stream at once.
+ * @param {TextStreamSource} source - The text stream (or the whole text)
+ * @param {ReadLinesOptions} [options] - `maxLineLength` and `signal`
+ * @returns {AsyncIterableIterator<string>} An async iterator of the lines
+ * @throws {TypeError} when `source` is not a stream, an (async) iterable, a string or a `Uint8Array`, `options` is not an object,
+ * `maxLineLength` is not a number or `signal` is not a signal; (while reading) when a chunk is neither a string nor a `Uint8Array`
+ * @throws {RangeError} when `maxLineLength` is not an integer >= 0 or `Infinity`; (while reading) when a line is longer than it
+ * @example
+ * await toArrayAsync(readLines(['one\r', '\ntwo\rthree\n', 'four'])); // => ['one', 'two', 'three', 'four']
+ * await toArrayAsync(readLines('a\n\nb\n')); // => ['a', '', 'b']
+ * // 'é' is the two bytes 0xc3 0xa9, here in different chunks
+ * await toArrayAsync(readLines([new Uint8Array([0x68, 0xc3]), new Uint8Array([0xa9, 0x0a, 0x21])])); // => ['hé', '!']
+ * await toArrayAsync(readLines(['short\n', 'much too long'], { maxLineLength: 8 })); // throws RangeError
+ * @example
+ * // doctest: skip
+ * const response = await fetch('https://example.com/huge.log');
+ * for await (const line of readLines(response.body!, { maxLineLength: 1_000_000 })) {
+ *   if (line.includes('ERROR')) break; // cancels the download
+ * }
+ */
+export function readLines(source: TextStreamSource, options?: ReadLinesOptions): AsyncIterableIterator<string> {
+	assertStreamSource('readLines', source);
+	const { max, signal } = lineOptions('readLines', options);
+	return linesOf(source, max, signal);
+}
+
+/**
+ * An event parsed by {@link parseSSE}, with the fields of the `MessageEvent` an `EventSource` would dispatch.
+ */
+export interface ServerSentEvent {
+	/** The event type: the value of the block's last `event` field, or `'message'` when it has none (or an empty one). */
+	event: string;
+	/** The values of the block's `data` fields, joined with `\n` (an empty `data` field counts: `data` alone gives `''`). */
+	data: string;
+	/**
+	 * The last event ID (`MessageEvent#lastEventId`): the value of the most recent `id` field so far, which PERSISTS across events
+	 * (send it back as `Last-Event-ID` when reconnecting); `''` until one is set, and an empty `id` field resets it to `''`.
+	 */
+	id: string;
+	/**
+	 * The reconnection time in milliseconds, from the most recent valid `retry` field so far (it persists, like `id`, also when the
+	 * block that set it dispatched no event); absent until one is seen. See also {@link ParseSSEOptions.onRetry}.
+	 */
+	retry?: number;
+}
+
+/**
+ * Options accepted by {@link parseSSE}.
+ */
+export interface ParseSSEOptions extends ReadLinesOptions {
+	/**
+	 * Longest `data` of an event, in UTF-16 code units once its values are joined with `\n` (an integer >= 0, or `Infinity`, the
+	 * default): a longer one throws a `RangeError` as soon as its `data` lines exceed it. `maxLineLength` bounds each line, this bounds
+	 * the many `data` lines of an event that a stream never ends with a blank line; set both to bound the memory an event stream takes.
+	 */
+	maxDataLength?: number;
+	/**
+	 * Called with the new reconnection time whenever a valid `retry` field is parsed, even when no event follows (in stream order: after
+	 * the events before it have been read).
+	 */
+	onRetry?: (milliseconds: number) => void;
+}
+
+/**
+ * The state of the event stream interpretation of {@link parseSSE}.
+ */
+interface SseState {
+	// The values of the `data` fields of the current block, and the length of their joined text plus one.
+	data: string[];
+	size: number;
+	maxData: number;
+	type: string;
+	id: string;
+	retry: number | undefined;
+	onRetry: ((milliseconds: number) => void) | undefined;
+}
+
+/** A `retry` value the specification accepts: ASCII digits only. */
+const RETRY_VALUE = /^[0-9]+$/;
+
+/**
+ * Interprets one line of an event stream (WHATWG HTML, "Interpreting an event stream").
+ * @param {SseState} state - The interpretation state
+ * @param {string} line - The line, without its line break
+ * @returns {ServerSentEvent | undefined} The event the line dispatches, if any
+ * @throws {RangeError} when the `data` of the event gets longer than `state.maxData`
+ */
+function interpretLine(state: SseState, line: string): ServerSentEvent | undefined {
+	if (line.length === 0) {
+		// Dispatch: a block without `data` dispatches nothing, but still resets the event type.
+		const type = state.type;
+		state.type = '';
+		if (state.data.length === 0) return undefined;
+		const event = type === '' ? 'message' : type;
+		// Joining with LF is appending LF after each value, then removing the last one.
+		const data = state.data.join('\n');
+		state.data = [];
+		state.size = 0;
+		return state.retry === undefined ? { event, data, id: state.id } : { event, data, id: state.id, retry: state.retry };
+	}
+	const colon = line.indexOf(':');
+	// A comment (a line starting with a colon) has an empty field name, which is no field.
+	const field = colon === -1 ? line : line.slice(0, colon);
+	// One leading space of the value is removed.
+	const value = colon === -1 ? '' : line.slice(line.charCodeAt(colon + 1) === 32 ? colon + 2 : colon + 1);
+	if (field === 'data') {
+		if (state.size + value.length > state.maxData) throw new RangeError(`parseSSE: the data of an event is longer than \`maxDataLength\` (${state.maxData})`);
+		state.size += value.length + 1;
+		state.data.push(value);
+	} else if (field === 'event') {
+		state.type = value;
+	} else if (field === 'id') {
+		if (!value.includes('\0')) state.id = value;
+	} else if (field === 'retry' && RETRY_VALUE.test(value)) {
+		state.retry = Number(value);
+		state.onRetry?.(state.retry);
+	}
+	return undefined;
+}
+
+/**
+ * The async generator behind {@link parseSSE} (the arguments are already validated).
+ * @param {TextStreamSource} source - The event stream
+ * @param {number} max - The longest line accepted
+ * @param {number} maxData - The longest `data` of an event accepted
+ * @param {((milliseconds: number) => void) | undefined} onRetry - The `retry` callback
+ * @param {AbortSignalLike | undefined} signal - The abort signal
+ * @returns {AsyncGenerator<ServerSentEvent, void, undefined>} An async generator of the events
+ */
+async function* sseEvents(
+	source: TextStreamSource,
+	max: number,
+	maxData: number,
+	onRetry: ((milliseconds: number) => void) | undefined,
+	signal: AbortSignalLike | undefined
+): AsyncGenerator<ServerSentEvent, void, undefined> {
+	const chunks = chunkReader('parseSSE', source, true, signal);
+	const text = textState();
+	const lines = lineState('parseSSE', max, true);
+	const state: SseState = { data: [], size: 0, maxData, type: '', id: '', retry: undefined, onRetry };
+	const pending: string[] = [];
+	let failure: { error: unknown } | undefined;
+	try {
+		chunks.open();
+		for (;;) {
+			const piece = await chunks.read();
+			// At the end, an unfinished line is not interpreted and an unfinished event is discarded.
+			if (piece === END) return;
+			const tooLong = splitLines(lines, decodeChunk('parseSSE', text, piece), pending, false);
+			// Each line is interpreted only once the events before it are consumed (so `onRetry` sees them in stream order), and
+			// nothing more is interpreted once aborted.
+			for (let i = 0; i < pending.length; i++) {
+				chunks.check();
+				const event = interpretLine(state, pending[i]);
+				if (event !== undefined) yield event;
+			}
+			if (tooLong !== undefined) {
+				// An abort while the consumer held the last event wins, as at any read.
+				chunks.check();
+				throw tooLong;
+			}
+			pending.length = 0;
+		}
+	} catch (error) {
+		failure = { error };
+		throw error;
+	} finally {
+		await chunks.close(failure);
+	}
+}
+
+/**
+ * Lazily parses a stream of Server-Sent Events (`text/event-stream`) exactly as an `EventSource` does, following the WHATWG HTML
+ * "event stream interpretation" algorithm; usable directly on `fetch(...).body`, for example to read the streaming responses of LLM APIs
+ * (where `EventSource` cannot send a POST body or headers).
+ *
+ * - A byte order mark at the very start is dropped (once); lines end at LF, CRLF or CR (also split across chunks); bytes are decoded as
+ *   UTF-8 incrementally (see {@link readLines}).
+ * - A line starting with `:` is a comment. Otherwise the field name is what precedes the first `:` (the whole line when there is none)
+ *   and the value what follows it, minus one leading space. Field names are case-sensitive; unknown fields are ignored.
+ * - `data` values are joined with `\n`; `event` sets the type (`'message'` by default); `id` sets the last event ID, which persists
+ *   across events, unless its value contains U+0000; `retry` sets the reconnection time when its value is made of ASCII digits only.
+ * - A blank line dispatches the event, unless no `data` field was seen since the last one (then nothing is yielded, as in browsers).
+ *   An event not followed by a blank line when the stream ends is discarded.
+ * - Each event is `{ event, data, id }`, plus `retry` once the stream has set one (see {@link ServerSentEvent}).
+ * - Memory: `maxLineLength` bounds each line and `maxDataLength` the `data` of an event (a stream may send `data` lines forever
+ *   without the blank line that dispatches them); both are unbounded by default, so set them for an untrusted stream.
+ * - Cleanup, `signal` and `maxLineLength` work as in {@link readLines}. The parser never reconnects: that is up to the caller.
+ * @param {TextStreamSource} source - The event stream (or its whole text)
+ * @param {ParseSSEOptions} [options] - `maxLineLength`, `maxDataLength`, `onRetry` and `signal`
+ * @returns {AsyncIterableIterator<ServerSentEvent>} An async iterator of the dispatched events
+ * @throws {TypeError} when `source` is not a stream, an (async) iterable, a string or a `Uint8Array`, `options` is not an object,
+ * `maxLineLength` or `maxDataLength` is not a number, `onRetry` is not a function or `signal` is not a signal; (while reading) for a bad chunk
+ * @throws {RangeError} when `maxLineLength` or `maxDataLength` is not an integer >= 0 or `Infinity`; (while reading) when a line, or
+ * the `data` of an event, is longer than it
+ * @example
+ * const body = new Response('event: greet\ndata: hello\ndata: world\nid: 7\n\n: a comment\ndata: bye\n\ndata: unfinished').body!;
+ * await toArrayAsync(parseSSE(body)); // => [{ event: 'greet', data: 'hello\nworld', id: '7' }, { event: 'message', data: 'bye', id: '7' }]
+ * await toArrayAsync(parseSSE(['retry: 3000\n\nda', 'ta:x\r\n\r\n'])); // => [{ event: 'message', data: 'x', id: '', retry: 3000 }]
+ * await toArrayAsync(parseSSE('data: 1234\ndata: 5678\n', { maxDataLength: 8 })); // throws RangeError // '1234\n5678' is 9 long
+ * @example
+ * // doctest: skip
+ * const response = await fetch('https://api.example.com/v1/chat', { method: 'POST', headers, body, signal });
+ * for await (const { event, data } of parseSSE(response.body!, { signal })) {
+ *   if (data === '[DONE]') break; // cancels the response stream
+ *   render(JSON.parse(data));
+ * }
+ */
+export function parseSSE(source: TextStreamSource, options?: ParseSSEOptions): AsyncIterableIterator<ServerSentEvent> {
+	assertStreamSource('parseSSE', source);
+	const { max, signal, settings } = lineOptions('parseSSE', options);
+	const maxData = readOption(settings, 'maxDataLength', Infinity);
+	const onRetry = readOption(settings, 'onRetry');
+	assertInteger('parseSSE', 'maxDataLength', maxData, 0, true);
+	if (onRetry !== undefined) assertFunction('parseSSE', 'onRetry', onRetry);
+	return sseEvents(source, max, maxData, onRetry, signal);
+}
+
+/**
+ * Options accepted by {@link parseNdjson}.
+ */
+export interface ParseNdjsonOptions extends ReadLinesOptions {
+	/** Passed to `JSON.parse` for each value. */
+	reviver?: (this: unknown, key: string, value: unknown) => unknown;
+}
+
+/**
+ * Tells whether a line holds only JSON white space (space, tab, CR).
+ * @param {string} line - The line
+ * @returns {boolean} Whether it is blank
+ */
+function isBlank(line: string): boolean {
+	for (let i = 0; i < line.length; i++) {
+		const code = line.charCodeAt(i);
+		if (code !== 32 && code !== 9 && code !== 13) return false;
+	}
+	return true;
+}
+
+/**
+ * The async generator behind {@link parseNdjson} (the arguments are already validated).
+ * @param {TextStreamSource} source - The NDJSON stream
+ * @param {number} max - The longest line accepted
+ * @param {((this: unknown, key: string, value: unknown) => unknown) | undefined} reviver - The `JSON.parse` reviver
+ * @param {AbortSignalLike | undefined} signal - The abort signal
+ * @returns {AsyncGenerator<unknown, void, undefined>} An async generator of the values
+ */
+async function* ndjsonValues(
+	source: TextStreamSource,
+	max: number,
+	reviver: ((this: unknown, key: string, value: unknown) => unknown) | undefined,
+	signal: AbortSignalLike | undefined
+): AsyncGenerator<unknown, void, undefined> {
+	const chunks = chunkReader('parseNdjson', source, true, signal);
+	const text = textState();
+	const state = lineState('parseNdjson', max, false);
+	const lines: string[] = [];
+	// Set when the reviver throws: its error is passed through rather than reported as invalid JSON.
+	let revived: { error: unknown } | undefined;
+	const revive =
+		reviver === undefined
+			? undefined
+			: function (this: unknown, key: string, value: unknown): unknown {
+					try {
+						return reviver.call(this, key, value);
+					} catch (error) {
+						revived = { error };
+						throw error;
+					}
+				};
+	let number = 0;
+	let failure: { error: unknown } | undefined;
+	try {
+		chunks.open();
+		for (;;) {
+			const piece = await chunks.read();
+			const tooLong = splitLines(state, decodeChunk('parseNdjson', text, piece), lines, piece === END);
+			for (let i = 0; i < lines.length; i++) {
+				const line = lines[i];
+				number++;
+				if (isBlank(line)) continue;
+				// Nothing more is parsed once aborted.
+				chunks.check();
+				let value: unknown;
+				try {
+					value = JSON.parse(line, revive);
+				} catch (error) {
+					if (revived !== undefined) throw revived.error;
+					throw new SyntaxError(`parseNdjson: line ${number} is not valid JSON: ${(error as Error).message}`, { cause: error });
+				}
+				yield value;
+			}
+			if (tooLong !== undefined) {
+				// An abort while the consumer held the last value wins, as at any read.
+				chunks.check();
+				throw tooLong;
+			}
+			if (piece === END) return;
+			lines.length = 0;
+		}
+	} catch (error) {
+		failure = { error };
+		throw error;
+	} finally {
+		await chunks.close(failure);
+	}
+}
+
+/**
+ * Lazily parses a stream of newline-delimited JSON (NDJSON, JSON Lines): one JSON value per line.
+ *
+ * - Lines end at LF only (a CR before it is JSON white space, so CRLF works, but a lone CR does not end a line: JSON text may not contain
+ *   one outside white space, and NDJSON and JSON Lines both separate values with LF). Lines of white space only are skipped.
+ * - A line that is not valid JSON throws a `SyntaxError` naming its 1-based line number (blank lines count), with the error of `JSON.parse`
+ *   as `cause`; an error thrown by `reviver` is passed through as is. The last line needs no final LF.
+ * - Decoding, cleanup, `signal` and `maxLineLength` (which counts a CR before the LF) work as in {@link readLines}.
+ * @template T - The type of the values (not checked: validate them, e.g. with a `guards` or `validate` schema)
+ * @param {TextStreamSource} source - The NDJSON stream (or its whole text)
+ * @param {ParseNdjsonOptions} [options] - `reviver`, `maxLineLength` and `signal`
+ * @returns {AsyncIterableIterator<T>} An async iterator of the parsed values
+ * @throws {TypeError} when `source` is not a stream, an (async) iterable, a string or a `Uint8Array`, `options` is not an object,
+ * `maxLineLength` is not a number, `reviver` is not a function or `signal` is not a signal; (while reading) for a bad chunk
+ * @throws {RangeError} when `maxLineLength` is not an integer >= 0 or `Infinity`; (while reading) when a line is longer than it
+ * @throws {SyntaxError} (while reading) when a line is not valid JSON
+ * @example
+ * await toArrayAsync(parseNdjson(['{"id":1}\n', '\n[2,', '3]\r\n', '"four"'])); // => [{ id: 1 }, [2, 3], 'four']
+ * await toArrayAsync(parseNdjson('1\n\n{oops}\n')); // throws SyntaxError // parseNdjson: line 3 is not valid JSON: ...
+ */
+export function parseNdjson<T = unknown>(source: TextStreamSource, options?: ParseNdjsonOptions): AsyncIterableIterator<T> {
+	assertStreamSource('parseNdjson', source);
+	const { max, signal, settings } = lineOptions('parseNdjson', options);
+	const reviver = readOption(settings, 'reviver');
+	if (reviver !== undefined) assertFunction('parseNdjson', 'reviver', reviver);
+	return ndjsonValues(source, max, reviver, signal) as AsyncIterableIterator<T>;
+}
+
+/**
+ * Options accepted by {@link streamToText}.
+ */
+export interface StreamToTextOptions extends StreamReadOptions {
+	/** Longest text accepted, in UTF-16 code units (an integer >= 0, or `Infinity`, the default): a longer one rejects with a `RangeError`. */
+	maxLength?: number;
+}
+
+/**
+ * Options accepted by {@link streamToBytes}.
+ */
+export interface StreamToBytesOptions extends StreamReadOptions {
+	/** Largest size accepted, in bytes (an integer >= 0, or `Infinity`, the default): a larger stream rejects with a `RangeError`. */
+	maxBytes?: number;
+}
+
+/**
+ * Options accepted by {@link streamToArray}.
+ */
+export interface StreamToArrayOptions extends StreamReadOptions {
+	/** Most chunks accepted (an integer >= 0, or `Infinity`, the default): a longer stream rejects with a `RangeError`. */
+	maxLength?: number;
+}
+
+/**
+ * Reads the shared options of the stream collectors.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {StreamReadOptions | undefined} options - The options
+ * @param {'maxLength' | 'maxBytes'} key - The name of the limit
+ * @returns {{ max: number; signal: AbortSignalLike | undefined }} The validated options
+ * @throws {TypeError} when `options` is not an object, the limit is not a number or `signal` is not a signal
+ * @throws {RangeError} when the limit is not an integer >= 0 or `Infinity`
+ */
+function collectOptions(caller: string, options: StreamReadOptions | undefined, key: 'maxLength' | 'maxBytes'): { max: number; signal: AbortSignalLike | undefined } {
+	const settings = optionsOf(caller, options) as StreamToTextOptions & StreamToBytesOptions;
+	const max = readOption(settings, key, Infinity);
+	const signal = readOption(settings, 'signal');
+	assertInteger(caller, key, max, 0, true);
+	assertOptionalSignal(caller, 'signal', signal);
+	return { max, signal: signal ?? undefined };
+}
+
+/**
+ * Reads every chunk of a source, passing each to `add` (the shared loop of the stream collectors).
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {unknown} source - The validated source
+ * @param {boolean} whole - Whether a string or a `Uint8Array` source is one chunk
+ * @param {AbortSignalLike | undefined} signal - The abort signal
+ * @param {(piece: unknown) => void} add - Takes each chunk, then {@link END}; throws to stop (the stream is then cancelled)
+ * @returns {Promise<void>} Settles once the stream is read and released
+ */
+async function drain(caller: string, source: unknown, whole: boolean, signal: AbortSignalLike | undefined, add: (piece: unknown) => void): Promise<void> {
+	const chunks = chunkReader(caller, source, whole, signal);
+	let failure: { error: unknown } | undefined;
+	try {
+		chunks.open();
+		for (;;) {
+			const piece = await chunks.read();
+			add(piece);
+			if (piece === END) return;
+		}
+	} catch (error) {
+		failure = { error };
+		throw error;
+	} finally {
+		await chunks.close(failure);
+	}
+}
+
+/**
+ * The async function behind {@link streamToText} (the arguments are already validated).
+ * @param {TextStreamSource} source - The text stream
+ * @param {number} max - The longest text accepted
+ * @param {AbortSignalLike | undefined} signal - The abort signal
+ * @returns {Promise<string>} The text
+ */
+async function collectText(source: TextStreamSource, max: number, signal: AbortSignalLike | undefined): Promise<string> {
+	const state = textState();
+	const parts: string[] = [];
+	let length = 0;
+	await drain('streamToText', source, true, signal, function (piece) {
+		const text = decodeChunk('streamToText', state, piece);
+		length += text.length;
+		if (length > max) throw new RangeError(`streamToText: the text is longer than \`maxLength\` (${max})`);
+		parts.push(text);
+	});
+	return parts.join('');
+}
+
+/**
+ * Reads a whole text stream into a string (like `Response#text()`, for any stream of strings and/or UTF-8 bytes): decoding, the byte order
+ * mark, cleanup and `signal` work as in {@link readLines}. The pieces are joined once, in linear time.
+ * @param {TextStreamSource} source - The text stream
+ * @param {StreamToTextOptions} [options] - `maxLength` and `signal`
+ * @returns {Promise<string>} The text
+ * @throws {TypeError} when `source` is not a stream, an (async) iterable, a string or a `Uint8Array`, `options` is not an object,
+ * `maxLength` is not a number or `signal` is not a signal; (as a rejection) for a bad chunk
+ * @throws {RangeError} when `maxLength` is not an integer >= 0 or `Infinity`; (as a rejection) when the text is longer than it (the
+ * stream is cancelled as soon as it is)
+ * @example
+ * // '€' is the three bytes 0xe2 0x82 0xac
+ * await streamToText([new Uint8Array([0xe2, 0x82]), new Uint8Array([0xac]), '!']); // => '€!'
+ * await streamToText(new Response('\uFEFFhello').body!); // => 'hello'
+ * await streamToText(['abc', 'def'], { maxLength: 5 }); // throws RangeError
+ */
+export function streamToText(source: TextStreamSource, options?: StreamToTextOptions): Promise<string> {
+	assertStreamSource('streamToText', source);
+	const { max, signal } = collectOptions('streamToText', options, 'maxLength');
+	return collectText(source, max, signal);
+}
+
+/**
+ * The async function behind {@link streamToBytes} (the arguments are already validated).
+ * @param {StreamSource<Uint8Array>} source - The byte stream
+ * @param {number} max - The largest size accepted
+ * @param {AbortSignalLike | undefined} signal - The abort signal
+ * @returns {Promise<Uint8Array<ArrayBuffer>>} The bytes
+ */
+async function collectBytes(source: StreamSource<Uint8Array>, max: number, signal: AbortSignalLike | undefined): Promise<Uint8Array<ArrayBuffer>> {
+	const parts: Uint8Array[] = [];
+	let size = 0;
+	await drain('streamToBytes', source, false, signal, function (piece) {
+		if (piece === END) return;
+		if (!isBytes(piece)) throw new TypeError(`streamToBytes: a chunk must be a Uint8Array, got ${describe(piece)}`);
+		size += piece.length;
+		if (size > max) throw new RangeError(`streamToBytes: the stream holds more than \`maxBytes\` (${max}) bytes`);
+		parts.push(piece);
+	});
+	const bytes = new Uint8Array(size);
+	let offset = 0;
+	for (const part of parts) {
+		bytes.set(part, offset);
+		offset += part.length;
+	}
+	return bytes;
+}
+
+/**
+ * Reads a whole byte stream into one new `Uint8Array` (like `Response#bytes()`): the chunks are kept as they come and copied once, into a
+ * buffer of the exact total size (so a source must not reuse a chunk's memory after handing it out, as with any stream). Cleanup and
+ * `signal` work as in {@link readLines}.
+ * @param {StreamSource<Uint8Array>} source - The byte stream (chunks must be `Uint8Array`s, e.g. Node `Buffer`s)
+ * @param {StreamToBytesOptions} [options] - `maxBytes` and `signal`
+ * @returns {Promise<Uint8Array<ArrayBuffer>>} A new `Uint8Array` over its own `ArrayBuffer`
+ * @throws {TypeError} when `source` is not a stream or an (async) iterable, `options` is not an object, `maxBytes` is not a number or
+ * `signal` is not a signal; (as a rejection) when a chunk is not a `Uint8Array`
+ * @throws {RangeError} when `maxBytes` is not an integer >= 0 or `Infinity`; (as a rejection) when the stream is larger (it is cancelled
+ * as soon as it is)
+ * @example
+ * await streamToBytes([new Uint8Array([1, 2]), new Uint8Array([3])]); // => new Uint8Array([1, 2, 3])
+ * await streamToBytes(new Response('hi').body!); // => new Uint8Array([104, 105])
+ * await streamToBytes([new Uint8Array(4)], { maxBytes: 3 }); // throws RangeError
+ */
+export function streamToBytes(source: StreamSource<Uint8Array>, options?: StreamToBytesOptions): Promise<Uint8Array<ArrayBuffer>> {
+	assertStreamSource('streamToBytes', source);
+	const { max, signal } = collectOptions('streamToBytes', options, 'maxBytes');
+	return collectBytes(source, max, signal);
+}
+
+/**
+ * The async function behind {@link streamToArray} (the arguments are already validated).
+ * @template T
+ * @param {StreamSource<T>} source - The stream
+ * @param {number} max - The most chunks accepted
+ * @param {AbortSignalLike | undefined} signal - The abort signal
+ * @returns {Promise<T[]>} The chunks
+ */
+async function collectChunks<T>(source: StreamSource<T>, max: number, signal: AbortSignalLike | undefined): Promise<T[]> {
+	const items: T[] = [];
+	await drain('streamToArray', source, false, signal, function (piece) {
+		if (piece === END) return;
+		if (items.length >= max) throw new RangeError(`streamToArray: the stream holds more than \`maxLength\` (${max}) chunks`);
+		items.push(piece as T);
+	});
+	return items;
+}
+
+/**
+ * Collects the chunks (or values, for an object stream) of a stream into a new array: {@link toArrayAsync} for `ReadableStream`s too,
+ * with a limit and a signal. Cleanup and `signal` work as in {@link readLines}.
+ * @template T
+ * @param {StreamSource<T>} source - The stream, or an (async) iterable
+ * @param {StreamToArrayOptions} [options] - `maxLength` and `signal`
+ * @returns {Promise<T[]>} The chunks, in order
+ * @throws {TypeError} when `source` is not a stream or an (async) iterable, `options` is not an object, `maxLength` is not a number or
+ * `signal` is not a signal
+ * @throws {RangeError} when `maxLength` is not an integer >= 0 or `Infinity`; (as a rejection) when the stream has more chunks (it is
+ * cancelled as soon as it does)
+ * @example
+ * const stream = new ReadableStream({ start(controller) { controller.enqueue('a'); controller.enqueue('b'); controller.close(); } });
+ * await streamToArray(stream); // => ['a', 'b']
+ * await streamToArray(count(), { maxLength: 100 }); // throws RangeError
+ */
+export function streamToArray<T>(source: StreamSource<T>, options?: StreamToArrayOptions): Promise<T[]> {
+	assertStreamSource('streamToArray', source);
+	const { max, signal } = collectOptions('streamToArray', options, 'maxLength');
+	return collectChunks(source, max, signal);
 }
