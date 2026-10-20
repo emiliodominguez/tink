@@ -1,4 +1,4 @@
-import { lazy, measure } from 'tinkit/decorators';
+import { lazy, measure, memoize } from 'tinkit/decorators';
 
 /**
  * Applies a legacy (TypeScript `experimentalDecorators`) member decorator by hand, as the compiled `__decorate` helper does.
@@ -87,6 +87,19 @@ class WeakMapLazy {
 	}
 }
 
+/** A class with a `@memoize`d method: each instance creates its cache on its first call. */
+class PerInstance {
+	/**
+	 * Memoized per instance.
+	 * @param {number} n - A number
+	 * @returns {number} `n + 1`
+	 */
+	cached(n) {
+		return n + 1;
+	}
+}
+decorate(memoize, PerInstance.prototype, 'cached');
+
 const plain = new Plain();
 const decorated = new Decorated();
 const frozen = Object.freeze(new Decorated());
@@ -132,6 +145,15 @@ export default [
 		},
 		baseline: function () {
 			return new Plain().computed;
+		}
+	},
+	{
+		name: '@memoize first call (new instance)',
+		fn: function () {
+			return new PerInstance().cached(1);
+		},
+		baseline: function () {
+			return new Plain().work(1);
 		}
 	},
 	{

@@ -527,7 +527,9 @@ export function memoize(targetOrValue: unknown, keyOrContext?: unknown, descript
 
 	if (typeof targetOrValue !== 'object' || targetOrValue === null) throw new TypeError(`@memoize: \`options\` must be an object, got ${describe(targetOrValue)}`);
 
-	const { resolver, createCache } = targetOrValue as MemoizeMethodOptions;
+	// Own (or deliberately inherited) options only: a polluted `Object.prototype` must not supply them.
+	const resolver = readOption(targetOrValue as MemoizeMethodOptions, 'resolver');
+	const createCache = readOption(targetOrValue as MemoizeMethodOptions, 'createCache');
 
 	if (resolver !== undefined) assertFunction('@memoize', 'options.resolver', resolver);
 	if (createCache !== undefined) assertFunction('@memoize', 'options.createCache', createCache);
@@ -755,10 +757,16 @@ export function throttled(wait: number, options?: ThrottleOptions): UniversalMet
 function copyOptions<O>(options: O): O {
 	if (typeof options !== 'object' || options === null) return options;
 
-	// Every enumerable key, inherited ones included: the wrapped helpers read options by plain property access.
-	const copy: Record<string, unknown> = {};
+	// Every enumerable key, inherited ones included (the helpers honour an inherited option), except a value planted on a polluted
+	// `Object.prototype`, which the helpers ignore, but would read as an own property of the copy. Without a prototype, so that a
+	// `__proto__` key is copied as a key (assigned to an object literal, it would set the copy's prototype).
+	const copy: Record<string, unknown> = Object.create(null);
 
-	for (const key in options) copy[key] = (options as Record<string, unknown>)[key];
+	for (const key in options) {
+		const value = readOption(options as Record<string, unknown>, key);
+
+		if (value !== undefined) copy[key] = value;
+	}
 
 	return copy as O;
 }

@@ -3,7 +3,7 @@ import * as vm from 'vm';
 import * as decorators from '.';
 import { sleep } from '../async/index.js';
 import { createLRUCache, type LRUCache } from '../cache/index.js';
-import { constant, noop } from '../functions/index.js';
+import { constant, noop, type DebounceOptions } from '../functions/index.js';
 
 class Test {
 	@decorators.readonly
@@ -615,6 +615,56 @@ describe('Decorators', function () {
 			expect(spy.mock.calls).toEqual([[1]]);
 		});
 
+		it('should ignore options inherited from a polluted Object.prototype (previously copied as own options)', async function () {
+			jest.useFakeTimers();
+
+			const prototype = Object.prototype as Record<string, unknown>;
+			prototype.leading = true;
+			prototype.trailing = false;
+			prototype.retries = 0;
+			try {
+				const debouncedSpy = jest.fn();
+				const throttledSpy = jest.fn();
+				const debounce = decorators.debounced(10, {})(debouncedSpy, fakeContext('method', 'm').context);
+				const throttle = decorators.throttled(10, { trailing: true })(throttledSpy, fakeContext('method', 'n').context);
+				debounce.call(undefined, 1);
+				throttle.call(undefined, 1);
+				throttle.call(undefined, 2);
+				// Not invoked on the leading edge; the trailing calls still run.
+				expect(debouncedSpy).not.toHaveBeenCalled();
+				jest.advanceTimersByTime(10);
+				expect([debouncedSpy.mock.calls, throttledSpy.mock.calls]).toEqual([[[1]], [[1], [2]]]);
+				// A planted value is not copied either for `retry` (which reads its options by plain property access).
+				let attempts = 0;
+				const flaky = decorators.retryable({ delay: 0 })(function (): Promise<string> {
+					attempts++;
+					return attempts < 2 ? Promise.reject(new Error('busy')) : Promise.resolve('ok');
+				}, fakeContext('method', 'f').context);
+				jest.useRealTimers();
+				delete prototype.retries;
+				await expect(flaky()).resolves.toBe('ok');
+				expect(attempts).toBe(2);
+			} finally {
+				delete prototype.leading;
+				delete prototype.trailing;
+				delete prototype.retries;
+			}
+		});
+
+		it('should copy a `__proto__` option as an option, not as the prototype of the copy', function () {
+			jest.useFakeTimers();
+
+			const spy = jest.fn();
+			// As `JSON.parse` creates it: an own `__proto__` property, which the helpers do not read.
+			const options = JSON.parse('{"__proto__": {"leading": true}, "maxWait": 50}') as DebounceOptions;
+			const wrapped = decorators.debounced(10, options)(spy, fakeContext('method', 'm').context);
+			wrapped.call(undefined, 1);
+			// Previously the copy inherited `leading: true` from it, and invoked on the leading edge.
+			expect(spy).not.toHaveBeenCalled();
+			jest.advanceTimersByTime(10);
+			expect(spy.mock.calls).toEqual([[1]]);
+		});
+
 		it('should use the options it validated, whatever later happens to the object', function () {
 			jest.useFakeTimers();
 
@@ -1150,6 +1200,31 @@ describe('Decorators (security)', function () {
 
 			const legacy = decorate({}, 'm', { value: spy, writable: true, configurable: true, enumerable: false });
 			expect((legacy.value as any).call(self, { id: 2, name: 'c' })).toBe('c');
+		});
+
+		it('should ignore options inherited from a polluted Object.prototype', function () {
+			const prototype = Object.prototype as Record<string, unknown>;
+			const shared = new Map<unknown, unknown>();
+			prototype.resolver = function (): string {
+				return 'same key';
+			};
+			prototype.createCache = function (): Map<unknown, unknown> {
+				return shared;
+			};
+			try {
+				const spy = jest.fn(function (n: number): number {
+					return n * 2;
+				});
+				const wrapped = decorators.memoize({})(spy, fakeContext('method', 'm').context);
+				const self = {};
+				// Previously both calls hit the planted resolver's single key, in the planted (shared) cache: 2, 2.
+				expect([wrapped.call(self, 1), wrapped.call(self, 2), wrapped.call(self, 1)]).toEqual([2, 4, 2]);
+				expect(spy).toHaveBeenCalledTimes(2);
+				expect(shared.size).toBe(0);
+			} finally {
+				delete prototype.resolver;
+				delete prototype.createCache;
+			}
 		});
 
 		it('should validate the options when the decorator is created', function () {
