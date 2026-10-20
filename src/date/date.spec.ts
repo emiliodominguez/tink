@@ -1938,6 +1938,31 @@ describe('Date helpers', function () {
 			});
 		});
 
+		it('ends an hour where the next one starts when the clocks are set back to a full hour (Colombo 2006, Barbados 1944)', function () {
+			withTimeZone('Asia/Colombo', function () {
+				// 2006-04-15 00:30 (+06:00) → 00:00 (+05:30): a new hour 00 starts at the jump, as startOfHour and eachOfInterval say.
+				const before = new Date('2006-04-14T18:10:00Z'); // 00:10 (+06:00)
+				expect(helpers.startOfHour(before).toISOString()).toBe('2006-04-14T18:00:00.000Z');
+				expect(helpers.endOfHour(before).toISOString()).toBe('2006-04-14T18:29:59.999Z'); // not 00:59:59 (+05:30)
+				expect(helpers.startOfHour(new Date('2006-04-14T18:30:00Z')).toISOString()).toBe('2006-04-14T18:30:00.000Z');
+				expect(helpers.endOfHour(new Date('2006-04-14T18:30:00Z')).toISOString()).toBe('2006-04-14T19:29:59.999Z');
+			});
+			withTimeZone('America/Barbados', function () {
+				// 1944-09-10 02:30 (-03:30) → 02:00 (-04:00).
+				expect(helpers.endOfHour(new Date('1944-09-10T05:30:09Z')).toISOString()).toBe('1944-09-10T05:59:59.999Z'); // 02:00:09
+			});
+		});
+
+		it('ends a minute that the clocks repeat part of where it ends for startOfMinute (N’Djamena 1911)', function () {
+			withTimeZone('Africa/Ndjamena', function () {
+				// 1912-01-01 00:00:00 (+01:00:12) → 1911-12-31 23:59:48 (+01:00): the minute 23:59 (+01:00:12) goes on 12 more seconds.
+				const minute = new Date('1911-12-31T22:59:30Z'); // 23:59:42 (+01:00:12)
+				expect(helpers.startOfMinute(minute).toISOString()).toBe('1911-12-31T22:58:48.000Z');
+				expect(helpers.startOfMinute(new Date('1911-12-31T22:59:53Z')).toISOString()).toBe('1911-12-31T22:58:48.000Z');
+				expect(helpers.endOfMinute(minute).toISOString()).toBe('1911-12-31T22:59:59.999Z'); // not 22:59:47.999
+			});
+		});
+
 		it('throws when the boundary is out of range', function () {
 			withTimeZone('UTC', function () {
 				expect(helpers.startOfHour(-8.64e15).getTime()).toBe(-8.64e15);

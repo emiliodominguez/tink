@@ -2929,17 +2929,33 @@ function gridBoundary(date: Date, stepMs: number, mode: string): Date {
 }
 
 /**
- * Returns the instant just before a boundary returned by {@link gridBoundary} (the end of the unit that it closes).
- * @param {Date} boundary - A valid date, which is mutated
- * @returns {Date} `boundary` minus 1 ms
+ * Returns the end of the wall-clock unit of `stepMs` containing `date` (the instant before the first one after it whose unit starts
+ * elsewhere, see {@link gridBoundary}), for {@link endOfHour} and {@link endOfMinute}.
+ * @param {Date} date - A valid date, which may be mutated (callers pass a fresh copy)
+ * @param {number} stepMs - The unit in milliseconds (an hour or a minute)
+ * @returns {Date} The last millisecond of the unit
  * @throws {RangeError} when the result is outside the representable range
  * @example
- * justBefore(new Date(5)).getTime(); // => 4
+ * endOfUnit(new Date(2024, 0, 1, 9, 40), 3_600_000); // => new Date(2024, 0, 1, 9, 59, 59, 999)
  */
-function justBefore(boundary: Date): Date {
-	boundary.setTime(boundary.getTime() - 1);
+function endOfUnit(date: Date, stepMs: number): Date {
+	const time = date.getTime();
+	let next = gridBoundary(date, stepMs, 'next');
 
-	return ensureInRange(boundary);
+	// Where the UTC offset changes in between, the unit may end elsewhere: after clocks are set back by a fraction of it (Lord Howe
+	// Island: 02:00 becomes 01:30), the wall clock shows the same hour again past `next`, so the unit ends later; after they are set
+	// back to the start of a unit (Colombo in 2006: 00:30 became 00:00), a unit starts before `next`, so it ends earlier.
+	if (wallClockDistance(next, new Date(time)) !== next.getTime() - time) {
+		const start = gridBoundary(new Date(time), stepMs, 'floor').getTime();
+		let boundary: number;
+
+		while (gridBoundary(new Date(next), stepMs, 'floor').getTime() === start) next = gridBoundary(next, stepMs, 'next');
+		while ((boundary = gridBoundary(new Date(next.getTime() - 1), stepMs, 'floor').getTime()) !== start && boundary > time) next = new Date(boundary);
+	}
+
+	next.setTime(next.getTime() - 1);
+
+	return ensureInRange(next);
 }
 
 /**
@@ -2969,15 +2985,7 @@ export function startOfHour(date: DateInput): Date {
  * endOfHour(new Date(2024, 4, 10, 15, 42)); // => new Date(2024, 4, 10, 15, 59, 59, 999)
  */
 export function endOfHour(date: DateInput): Date {
-	const valid = toValidDate(date);
-	const start = gridBoundary(new Date(valid), MS_PER_HOUR, 'floor').getTime();
-	let next = gridBoundary(valid, MS_PER_HOUR, 'next');
-
-	// After clocks are set back by a fraction of an hour (Lord Howe Island: 02:00 becomes 01:30), the wall clock shows the same hour
-	// again past the first boundary: the hour that `startOfHour` returns ends where the next hour starts.
-	while (gridBoundary(new Date(next), MS_PER_HOUR, 'floor').getTime() === start) next = gridBoundary(next, MS_PER_HOUR, 'next');
-
-	return justBefore(next);
+	return endOfUnit(toValidDate(date), MS_PER_HOUR);
 }
 
 /**
@@ -3003,7 +3011,7 @@ export function startOfMinute(date: DateInput): Date {
  * endOfMinute(new Date(2024, 4, 10, 15, 42, 7)); // => new Date(2024, 4, 10, 15, 42, 59, 999)
  */
 export function endOfMinute(date: DateInput): Date {
-	return justBefore(gridBoundary(toValidDate(date), MS_PER_MINUTE, 'next'));
+	return endOfUnit(toValidDate(date), MS_PER_MINUTE);
 }
 
 /**
