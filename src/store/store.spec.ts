@@ -2449,6 +2449,32 @@ describe('createHistory', function () {
 	});
 
 	describe('clear, dispose and subscriptions', function () {
+		it('records a change in linear time for many histories of one store', function () {
+			const store = createStore(0);
+			const histories = Array.from({ length: 1000 }, function () {
+				return createHistory(store);
+			});
+			// Each history defers its recording to the end of the notification: deduplicating them by searching an array made one
+			// change quadratic in the number of histories.
+			let scanned = 0;
+			const original = Array.prototype.includes;
+			const includes = jest.spyOn(Array.prototype, 'includes').mockImplementation(function (this: unknown[], value: unknown, from?: number) {
+				scanned += this.length;
+				return original.call(this, value, from);
+			});
+			try {
+				store.setState(1);
+			} finally {
+				includes.mockRestore();
+			}
+			expect(scanned).toBeLessThan(1000);
+			expect(
+				histories.every(function (history) {
+					return history.getState().undoCount === 1;
+				})
+			).toBe(true);
+		});
+
 		it('clears every step, keeping the state', function () {
 			const store = createStore(0);
 			const history = createHistory(store);
@@ -3093,6 +3119,23 @@ describe('computed', function () {
 		expect(good.live()).toBe(0);
 	});
 
+	it('rejects a hole of a sparse array at once, without walking the array to its end', function () {
+		const sparse: unknown[] = [createStore(1)];
+		sparse.length = 2 ** 32 - 1;
+		let reads = 0;
+		// Counts the element reads, and gives up long before the end of the array.
+		const counted = new Proxy(sparse, {
+			get(target, key, receiver) {
+				if (typeof key === 'string' && key !== 'length' && ++reads > 1000) throw new Error('walked the array');
+				return Reflect.get(target, key, receiver) as unknown;
+			}
+		});
+		expect(function () {
+			computed(counted as never, function () {});
+		}).toThrow(new TypeError('computed: `stores[1]` must be a store (an object with getState and subscribe methods), got undefined'));
+		expect(reads).toBe(2);
+	});
+
 	it('validates its arguments and ignores a polluted Object.prototype', function () {
 		const store = createStore(1);
 		expect(function () {
@@ -3513,6 +3556,33 @@ describe('persistStore', function () {
 		expect(raw.getState()).toEqual({ a: 1 });
 		expect(Object.hasOwn(raw.getState(), '__proto__')).toBe(false);
 		expect(Object.getPrototypeOf(raw.getState())).toBe(Object.prototype);
+	});
+
+	it('parses without a reviver (several times slower in V8), at any depth, still dropping the keys inside arrays', function () {
+		const parse = jest.spyOn(JSON, 'parse');
+		const list = createStore<unknown[]>([]);
+		try {
+			persistStore(list, {
+				key: 'k',
+				storage: memoryStorage({ k: '{"state":[1,[{"__proto__":{"polluted":true},"constructor":{"prototype":{}},"ok":[{"__proto__":1}]}]],"version":0}' })
+			});
+			expect(
+				parse.mock.calls.map(function (call) {
+					return call.length;
+				})
+			).toEqual([1]);
+		} finally {
+			parse.mockRestore();
+		}
+		expect(list.getState()).toEqual([1, [{ ok: [{}] }]]);
+		const inner = (list.getState()[1] as Array<Record<string, unknown[]>>)[0];
+		expect([Object.hasOwn(inner, '__proto__'), Object.hasOwn(inner, 'constructor'), Object.hasOwn(inner.ok[0] as object, '__proto__')]).toEqual([false, false, false]);
+		// A reviver recursed once per level: 100,000 levels overflowed the stack.
+		const deep = createStore<unknown>(null);
+		const onError = jest.fn();
+		persistStore(deep, { key: 'k', storage: memoryStorage({ k: `{"state":${'['.repeat(1e5)}${']'.repeat(1e5)},"version":0}` }), onError });
+		expect(onError).not.toHaveBeenCalled();
+		expect(Array.isArray(deep.getState())).toBe(true);
 	});
 
 	it('debounces writes, writing every change made meanwhile at once, and flushes on dispose', function () {

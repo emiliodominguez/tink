@@ -96,8 +96,9 @@ function createNotifier(): Notifier {
 	let notifying = false;
 	// Set by every `run` call before it is read.
 	let pending: boolean;
-	// Callbacks to run once the current notification has finished (see `defer`).
-	let deferred: Array<() => void> = [];
+	// Callbacks to run once the current notification has finished (see `defer`), each once, in order: a set (created by the first
+	// deferral), so that the histories of a store defer theirs in O(1) each (searching an array for each one was quadratic).
+	let deferred: Set<() => void> | undefined;
 	// Whether a notification is held back by a batch.
 	let held = false;
 
@@ -122,10 +123,10 @@ function createNotifier(): Notifier {
 	function settle(errors: unknown[] | undefined): unknown[] | undefined {
 		notifying = false;
 		compact();
-		// Most notifications defer nothing: no array is allocated for them.
-		if (deferred.length === 0) return errors;
+		// Most notifications defer nothing: no set is allocated for them.
+		if (deferred === undefined) return errors;
 		const callbacks = deferred;
-		deferred = [];
+		deferred = undefined;
 		for (const callback of callbacks) {
 			try {
 				callback();
@@ -232,7 +233,7 @@ function createNotifier(): Notifier {
 		defer(callback: () => void): boolean {
 			// A held notification runs when the batch ends, and its last round then runs the callbacks.
 			if (!notifying && !held) return false;
-			if (!deferred.includes(callback)) deferred.push(callback);
+			(deferred ??= new Set()).add(callback);
 			return true;
 		}
 	};
@@ -536,11 +537,14 @@ export function computed<T>(
 	options: ComputedOptions<T> = {}
 ): ReadonlyStore<T> {
 	const many = Array.isArray(stores);
-	// Copied, so that changing the array afterwards has no effect.
-	const sources = many ? Array.from(stores as ReadonlyArray<ReadonlyStore<unknown>>) : [stores as ReadonlyStore<unknown>];
-	sources.forEach(function (source, i) {
+	// Copied, so that changing the array afterwards has no effect, and checked while copied: a hole throws at once (a sparse array of
+	// length 2³² - 1 is not walked to its end first).
+	const sources: Array<ReadonlyStore<unknown>> = [];
+	for (let i = 0, length = many ? (stores as ReadonlyArray<unknown>).length : 1; i < length; i++) {
+		const source = many ? (stores as ReadonlyArray<unknown>)[i] : stores;
 		assertStore(many ? `stores[${i}]` : 'stores', source);
-	});
+		sources.push(source);
+	}
 	assertFunction('computed', 'compute', compute);
 	const equals = readOption(options, 'equals', Object.is as EqualityFn<T>);
 	assertFunction('computed', 'options.equals', equals);
@@ -1640,13 +1644,24 @@ function defaultStorage(): PersistStorage | undefined {
 
 /**
  * The default `deserialize`: `JSON.parse`, dropping prototype-pollution keys (`__proto__`, and `constructor` objects with a `prototype`)
- * at every depth.
+ * at every depth. Dropped by a walk of the parsed value rather than by a reviver, with which V8 parses several times slower (a hundred
+ * times for arrays of numbers: seconds for the 5 MB a `localStorage` holds); the walk is iterative, so any depth works.
  * @param {string} text - The stored text
  * @returns {unknown} The parsed value
  * @throws {SyntaxError} when `text` is not JSON
  */
 function parseJSON(text: string): unknown {
-	return JSON.parse(text, withoutProtoKeys);
+	const parsed: unknown = JSON.parse(text);
+	const pending = [parsed];
+	while (pending.length > 0) {
+		const value = pending.pop();
+		if (isObject(value))
+			for (const key of Object.keys(value)) {
+				if (withoutProtoKeys(key, value[key]) === undefined) delete value[key];
+				else pending.push(value[key]);
+			}
+	}
+	return parsed;
 }
 
 /**
