@@ -1275,3 +1275,23 @@ describe('parseNumber', function () {
 		});
 	});
 });
+
+describe('Format helpers (pass 5 regressions)', function () {
+	it('reads the symbols of parseNumber and the digits of pluralRule without options planted on Object.prototype', function () {
+		const proto = Object.prototype as unknown as Record<string, unknown>;
+		const planted: Record<string, unknown> = { maximumFractionDigits: 0, minimumFractionDigits: 0, notation: 'compact', useGrouping: false, style: 'percent' };
+		for (const key of Object.keys(planted)) proto[key] = planted[key];
+		try {
+			// First reads of these locales: their symbols are cached, so a polluted read would outlive the pollution.
+			expect(helpers.parseNumber('1.234,5', { locale: 'de-DE' })).toBe(1234.5);
+			expect(helpers.parseNumber('1 234,5', { locale: 'fr-CA' })).toBe(1234.5);
+			expect(helpers.parseNumber("1'234.5 CHF", { locale: 'de-CH', currency: 'CHF' })).toBe(1234.5);
+			expect(helpers.parseNumber('12K', { locale: 'en-IE', style: 'compact' })).toBe(12000);
+			expect(helpers.pluralRule(1e21, { locale: 'en-AU' })).toBe('other');
+		} finally {
+			for (const key of Object.keys(planted)) delete proto[key];
+		}
+		expect(helpers.parseNumber('1.234,5', { locale: 'de-DE' })).toBe(1234.5);
+		expect(helpers.parseNumber('1 234,5', { locale: 'fr-CA' })).toBe(1234.5);
+	});
+});

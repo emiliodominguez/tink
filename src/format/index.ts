@@ -766,7 +766,7 @@ export function formatOrdinal(n: number, options: FormatOrdinalOptions = {}): st
 function pluralSubject(value: number): number {
 	if (!Number.isInteger(value) || Number.isSafeInteger(value)) return value;
 
-	const digits = new Intl.NumberFormat('en-US', { useGrouping: false }).format(Math.abs(value));
+	const digits = new Intl.NumberFormat('en-US', ownOptions({ useGrouping: false })).format(Math.abs(value));
 	return 1e15 + Number(digits.slice(-6));
 }
 
@@ -889,6 +889,8 @@ class NumberSymbols {
 	 */
 	constructor(locales: string[], options: NumberSymbolOptions) {
 		const { numberingSystem, style, currency } = options;
+		// Every `Intl` options object below is copied without a prototype (see `ownOptions`): a polluted `Object.prototype.style` or
+		// `maximumFractionDigits` would otherwise change the symbols read, and they stay cached once the pollution is removed.
 		// The style's own separators and grouping, which can differ from those of plain numbers (`de-AT` groups amounts with `.`, numbers
 		// with a space; `mr-IN` groups amounts by threes, numbers the Indian way), and even between the ways of writing an amount.
 		const main: Intl.NumberFormatOptions = { numberingSystem, minimumFractionDigits: 1, maximumFractionDigits: 1 };
@@ -909,7 +911,7 @@ class NumberSymbols {
 		for (const variant of variants) {
 			const sizes: number[] = [];
 
-			for (const { type, value } of new Intl.NumberFormat(locales, variant).formatToParts(-1234567890.5)) {
+			for (const { type, value } of new Intl.NumberFormat(locales, ownOptions(variant)).formatToParts(-1234567890.5)) {
 				if (type === 'integer') {
 					if (variant === plain) integers += value;
 					sizes.push(Array.from(value).length);
@@ -922,7 +924,10 @@ class NumberSymbols {
 			this.groupings.push(sizes[sizes.length - 1], sizes[sizes.length - 2]);
 		}
 
-		for (const { type, value } of new Intl.NumberFormat(locales, { numberingSystem, style: 'percent', notation: 'scientific', signDisplay: 'always' }).formatToParts(1)) {
+		for (const { type, value } of new Intl.NumberFormat(
+			locales,
+			ownOptions({ numberingSystem, style: 'percent', notation: 'scientific', signDisplay: 'always' })
+		).formatToParts(1)) {
 			if (type === 'plusSign') this.add(value, SIGN, false);
 			else if (type === 'exponentSeparator') exponent = normalizeNumberText(value);
 			else if (type === 'percentSign' && style === 'percent') this.add(value, PERCENT, false);
@@ -942,14 +947,17 @@ class NumberSymbols {
 
 		if (style === 'currency' && currency !== undefined) {
 			for (const currencyDisplay of ['symbol', 'narrowSymbol', 'code', 'name'] as const) {
-				const formatter = new Intl.NumberFormat(locales, {
-					numberingSystem,
-					style: 'currency',
-					currency,
-					currencyDisplay,
-					minimumFractionDigits: 0,
-					maximumFractionDigits: 1
-				});
+				const formatter = new Intl.NumberFormat(
+					locales,
+					ownOptions({
+						numberingSystem,
+						style: 'currency',
+						currency,
+						currencyDisplay,
+						minimumFractionDigits: 0,
+						maximumFractionDigits: 1
+					})
+				);
 				for (const sample of PLURAL_SAMPLES) {
 					for (const { type, value } of formatter.formatToParts(sample))
 						if (type === 'currency') this.add(value, currencyDisplay === 'name' ? CURRENCY_NAME : CURRENCY, false);
@@ -959,7 +967,7 @@ class NumberSymbols {
 
 		if (style === 'compact') {
 			for (const compactDisplay of ['short', 'long'] as const) {
-				const formatter = new Intl.NumberFormat(locales, { numberingSystem, notation: 'compact', compactDisplay });
+				const formatter = new Intl.NumberFormat(locales, ownOptions({ numberingSystem, notation: 'compact', compactDisplay }));
 				for (let power = 3; power < 21; power++) {
 					for (const sample of [1, 2, 5, 1.5]) {
 						let digits = 0;
