@@ -789,10 +789,11 @@ function unformat(char: string): string {
  * before it and none after it, looking across case-ignorable characters, which include punctuation between words (`.`, `'`, `’`, `:`),
  * so the same word would give different tokens (`'ΟΔΟΣ.Α'` lower-cases to `'οδοσ.α'`). The text is then lower-cased word by word. Matched
  * when the sigma is followed or preceded, across case-ignorable characters only, by one that is outside words and cased or case-ignorable.
- * Linear: each alternative scans the case-ignorable characters next to one sigma.
+ * Linear: each alternative scans the case-ignorable characters next to one sigma. The scans are lazy (the same answer for `test`): a
+ * greedy one kept a backtracking entry per character, and overflowed the stack on a few million of them (`'’'` repeated).
  */
 const SIGMA_CONTEXT =
-	/\u03a3\p{Case_Ignorable}*(?![\p{L}\p{M}\p{N}])[\p{Case_Ignorable}\p{Cased}]|(?<=(?![\p{L}\p{M}\p{N}])[\p{Case_Ignorable}\p{Cased}]\p{Case_Ignorable}*)\u03a3/u;
+	/\u03a3\p{Case_Ignorable}*?(?![\p{L}\p{M}\p{N}])[\p{Case_Ignorable}\p{Cased}]|(?<=(?![\p{L}\p{M}\p{N}])[\p{Case_Ignorable}\p{Cased}]\p{Case_Ignorable}*?)\u03a3/u;
 
 /**
  * Lower-cases a word (a callback for `replace`).
@@ -1371,14 +1372,18 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 	}
 
 	/**
-	 * Removes the document in a slot, updating every statistic, and vacuums when removed documents outnumber the indexed ones.
+	 * Removes the document in a slot, updating every statistic (the caller vacuums afterwards). Only built-ins are called once the index
+	 * starts changing, so that a stack overflow cannot leave it half updated (some postings without the document, others with it).
 	 * @param {number} slot - The slot of an indexed document
 	 * @returns {void}
 	 */
 	function discard(slot: number): void {
-		for (const posting of termsOf[slot] as Posting[]) {
-			const entry = lowerBound(posting.slots, slot);
-			for (let f = 0; f < fieldCount; f++) if (posting.tfs[entry * fieldCount + f] > 0) posting.df[f]--;
+		const list = termsOf[slot] as Posting[];
+		const entries: number[] = [];
+		for (const posting of list) entries.push(lowerBound(posting.slots, slot));
+		for (let p = 0; p < list.length; p++) {
+			const posting = list[p];
+			for (let f = 0; f < fieldCount; f++) if (posting.tfs[entries[p] * fieldCount + f] > 0) posting.df[f]--;
 			posting.live--;
 		}
 		for (let f = 0; f < fieldCount; f++) {
@@ -1392,15 +1397,15 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 		termsOf[slot] = undefined;
 		live--;
 		version++;
-		if (docs.length > 2 * live) vacuum();
 	}
 
 	/**
-	 * Drops the slots of removed documents: renumbers the indexed ones (keeping their order), compacts every posting list, and deletes the
-	 * ids and terms that no indexed document has.
+	 * Drops the slots of removed documents when they outnumber the indexed ones: renumbers the indexed ones (keeping their order), compacts
+	 * every posting list, and deletes the ids and terms that no indexed document has. It only calls built-ins (see `discard`).
 	 * @returns {void}
 	 */
 	function vacuum(): void {
+		if (docs.length <= 2 * live) return;
 		const renumbered = new Int32Array(docs.length).fill(-1);
 		let next = 0;
 		for (let slot = 0; slot < docs.length; slot++) {
@@ -1437,17 +1442,12 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 			tfs.length = kept * fieldCount;
 		}
 		// Also forget the removed terms of the prefix lists, which would otherwise grow with every new term while no prefix search merges them.
-		sorted = sorted.filter(isIndexed);
-		fresh = fresh.filter(isIndexed);
-	}
-
-	/**
-	 * Whether a term is in the index (or was, until the next vacuum).
-	 * @param {string} term - The term
-	 * @returns {boolean} Whether the term has postings
-	 */
-	function isIndexed(term: string): boolean {
-		return postings.has(term);
+		// (Without a `filter` callback, which could overflow the stack and leave the terms of deleted postings for every prefix search to read.)
+		for (const terms of [sorted, fresh]) {
+			let kept = 0;
+			for (const term of terms) if (postings.has(term)) terms[kept++] = term;
+			terms.length = kept;
+		}
 	}
 
 	/**
@@ -1531,6 +1531,7 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 		termsOf.push(list);
 		live++;
 		version++;
+		vacuum();
 		return existing !== undefined;
 	}
 
@@ -1663,6 +1664,7 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 			const slot = find(id);
 			if (slot === undefined) return false;
 			discard(slot);
+			vacuum();
 			return true;
 		},
 		has(id: SearchId): boolean {

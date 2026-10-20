@@ -788,6 +788,13 @@ describe('tokenize', function () {
 		).toEqual([3, 1, 2]);
 	});
 
+	it('looks for the context of a capital sigma across millions of case-ignorable characters (regression: stack overflow)', function () {
+		// After the sigma, then before it.
+		const run = '’'.repeat(5_000_000);
+		expect(helpers.tokenize('ΑΣ' + run + 'Β')).toEqual(['ας', 'β']);
+		expect(helpers.tokenize('Α' + run + 'ΣΒ')).toEqual(['α', 'σβ']);
+	});
+
 	it('folds diacritics and compatibility characters with ignoreDiacritics', function () {
 		const options = { ignoreDiacritics: true };
 		expect(helpers.tokenize('Crème Brûlée Straße ﬁle Ｃａｆé İ Łódź Æon', options)).toEqual(['creme', 'brulee', 'strasse', 'file', 'cafe', 'i', 'lodz', 'aeon']);
@@ -1665,5 +1672,34 @@ describe('createSearchIndex', function () {
 		}).toThrow(new TypeError('SearchIndex.search: `options.filter` must be a function, got boolean'));
 		expect(search('one', { limit: 0 })).toEqual([]);
 		expect(search('one', { prefix: false, combine: 'or' })).toHaveLength(1);
+	});
+
+	it('stays consistent when a vacuum is interrupted by a stack overflow (regression)', function () {
+		const index = helpers.createSearchIndex<Book>({ fields: ['title'] });
+		for (let id = 0; id < 6; id++) index.add({ id, title: `alpha w${id}` });
+		expect(index.search('w', { prefix: true })).toHaveLength(6);
+		index.remove(0);
+		index.remove(1);
+		index.remove(2);
+		// The fourth removal vacuums (removed documents outnumber the indexed ones). It filtered the prefix lists with a callback, after deleting the postings of the removed terms: an
+		// overflow there (simulated by a throwing `filter`) left those terms in the lists, so that every later prefix search threw.
+		const filter = jest.spyOn(Array.prototype, 'filter').mockImplementation(function () {
+			throw new RangeError('Maximum call stack size exceeded');
+		});
+		try {
+			index.remove(3);
+		} catch {
+			// The simulated overflow, if `filter` is called.
+		} finally {
+			filter.mockRestore();
+		}
+		index.remove(3);
+		expect(index.size).toBe(2);
+		expect(
+			index.search('w', { prefix: true }).map(function (result) {
+				return result.id;
+			})
+		).toEqual([4, 5]);
+		expect(index.search('w3')).toEqual([]);
 	});
 });
