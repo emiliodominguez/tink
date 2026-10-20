@@ -930,3 +930,113 @@ describe('Easing helpers', function () {
 		});
 	});
 });
+
+describe('Easing helpers (pass 5 regressions)', function () {
+	it('cssLinear reads a hole as undefined and each number of a stop once', function () {
+		// eslint-disable-next-line no-sparse-arrays
+		const holeInStop = [0, [0.5, , 0.75], 1] as unknown as helpers.LinearStop[];
+		expect(function () {
+			helpers.cssLinear(holeInStop);
+		}).toThrow(new TypeError('cssLinear: `stops[1]` must be a number or an array [output, input] or [output, start, end], got object'));
+		const proto = Array.prototype as unknown as Record<number, unknown>;
+		proto[1] = 0.9;
+		try {
+			expect(function () {
+				helpers.cssLinear(holeInStop);
+			}).toThrow(TypeError);
+			expect(function () {
+				// eslint-disable-next-line no-sparse-arrays
+				helpers.cssLinear([0, , 1] as unknown as helpers.LinearStop[]);
+			}).toThrow(new TypeError('cssLinear: `stops[1]` must be a number or an array [output, input] or [output, start, end], got undefined'));
+		} finally {
+			delete proto[1];
+		}
+		let reads = 0;
+		const stop = [0.5, 0.25];
+		Object.defineProperty(stop, 1, {
+			get(): number {
+				reads++;
+				return reads > 1 ? Infinity : 0.25;
+			}
+		});
+		const ease = helpers.cssLinear([0, stop as unknown as helpers.LinearStop, 1]);
+		expect(reads).toBe(1);
+		expect(ease(0.125)).toBe(0.25);
+		expect(ease(0.625)).toBe(0.75);
+	});
+
+	it('bounce drops the arcs too short to be seen, so that a huge bounce count stays cheap', function () {
+		for (let k = 0; k <= 64; k++) expect(helpers.bounce()(k / 64)).toBe(helpers.easeInBounce(k / 64));
+		// Each evaluation near t = 0 scanned every arc (2 ** 26 of them here: seconds for 100 calls; 2 ** 53 - 1 looped for ever).
+		const start = performance.now();
+		const scanned = helpers.bounce(2 ** 26, 0.5);
+		for (let i = 0; i < 100; i++) scanned(1e-17);
+		expect(performance.now() - start).toBeLessThan(1000);
+		const many = helpers.bounce(Number.MAX_SAFE_INTEGER, 0.5);
+		const some = helpers.bounce(2000, 0.5);
+		for (const t of [-1, 0, 1e-300, 1e-17, 0.001, 0.25, 0.5, 0.75, 1, 2]) expect(many(t)).toBe(some(t));
+		expect(helpers.bounce(3, 1e-300)(-1)).toBe(-1);
+		expect([0, 0.5, 1].map(helpers.bounce(5, 1e-300))).toEqual([0, 0.75, 1]);
+	});
+
+	it('rejects an argument that is not a number without converting it', function () {
+		const bad = {
+			valueOf(): number {
+				throw new Error('converted');
+			}
+		} as unknown as number;
+		const calls: Array<[string, () => unknown]> = [
+			[
+				'power: `exponent` must be a finite number > 0',
+				function () {
+					return helpers.power(bad);
+				}
+			],
+			[
+				'back: `overshoot` must be a finite number >= 0',
+				function () {
+					return helpers.back(bad);
+				}
+			],
+			[
+				'elastic: `period` must be a finite number > 0',
+				function () {
+					return helpers.elastic(1, bad);
+				}
+			],
+			[
+				'bounce: `restitution` must be a number between 0 and 1 (exclusive)',
+				function () {
+					return helpers.bounce(3, bad);
+				}
+			],
+			[
+				'cubicBezier: `x1` must be a number between 0 and 1',
+				function () {
+					return helpers.cubicBezier(bad, 0, 1, 1);
+				}
+			],
+			[
+				'toCssLinear: `tolerance` must be a number between 0 and 1 (exclusive)',
+				function () {
+					return helpers.toCssLinear(helpers.linear, { tolerance: bad });
+				}
+			],
+			[
+				'spring: `mass` must be a finite number > 0',
+				function () {
+					return helpers.spring({ mass: bad });
+				}
+			]
+		];
+		for (const [message, call] of calls) expect(call).toThrow(new TypeError(`${message}, got object`));
+	});
+
+	it('toCssLinear rejects more than 2 ** 24 samples instead of aborting the process', function () {
+		for (const samples of [2 ** 24 + 1, 2 ** 32, Number.MAX_SAFE_INTEGER]) {
+			expect(function () {
+				helpers.toCssLinear(helpers.linear, { samples });
+			}).toThrow(new RangeError(`toCssLinear: \`samples\` must be an integer from 2 to 2 ** 24, got ${samples}`));
+		}
+	});
+});

@@ -30,7 +30,7 @@ export interface CssLinearOptions {
 	 */
 	tolerance?: number;
 	/**
-	 * Number of evenly spaced intervals the easing is sampled at (it is called `samples + 1` times), an integer >= 2.
+	 * Number of evenly spaced intervals the easing is sampled at (it is called `samples + 1` times), an integer from 2 to `2 ** 24`.
 	 * @default 1000
 	 */
 	samples?: number;
@@ -568,7 +568,7 @@ export function smootherstep(t: number): number {
  * power(0); // throws RangeError
  */
 export function power(exponent: number): EasingFunction {
-	assertNumber('power', 'exponent', exponent, exponent > 0 && exponent < Infinity, 'a finite number > 0');
+	assertNumber('power', 'exponent', exponent, typeof exponent === 'number' && exponent > 0 && exponent < Infinity, 'a finite number > 0');
 	return function (t) {
 		// `+ 0` turns -0 (odd exponents of -0) into 0.
 		return t ** exponent + 0;
@@ -589,7 +589,7 @@ export function power(exponent: number): EasingFunction {
  * easeOut(back(2.5949))(0.5) > 1; // => true
  */
 export function back(overshoot: number = BACK): EasingFunction {
-	assertNumber('back', 'overshoot', overshoot, overshoot >= 0 && overshoot < Infinity, 'a finite number >= 0');
+	assertNumber('back', 'overshoot', overshoot, typeof overshoot === 'number' && overshoot >= 0 && overshoot < Infinity, 'a finite number >= 0');
 	return function (t) {
 		// `+ 0` turns -0 into 0.
 		return t * t * (t + overshoot * (t - 1)) + 0;
@@ -611,8 +611,8 @@ export function back(overshoot: number = BACK): EasingFunction {
  * easeOut(elastic(1, 0.2))(0.1) > 1; // => true
  */
 export function elastic(amplitude = 1, period = 0.3): EasingFunction {
-	assertNumber('elastic', 'amplitude', amplitude, amplitude >= 1 && amplitude < Infinity, 'a finite number >= 1');
-	assertNumber('elastic', 'period', period, period > 0 && period < Infinity, 'a finite number > 0');
+	assertNumber('elastic', 'amplitude', amplitude, typeof amplitude === 'number' && amplitude >= 1 && amplitude < Infinity, 'a finite number >= 1');
+	assertNumber('elastic', 'period', period, typeof period === 'number' && period > 0 && period < Infinity, 'a finite number > 0');
 	const frequency = (2 * Math.PI) / period;
 	const shift = 1 + Math.asin(1 / amplitude) / frequency;
 	return function (t) {
@@ -627,7 +627,8 @@ export function elastic(amplitude = 1, period = 0.3): EasingFunction {
  * the speed of the impact (so each arc is `restitution` times as long and `restitution²` times as high as the previous one). The
  * defaults give {@link easeInBounce}: Robert Penner's bounce is exactly 3 bounces with a restitution of `0.5`.
  *
- * Evaluating it takes `O(bounces)` time in the worst case (the arcs are scanned in order).
+ * Evaluating it takes `O(bounces)` time in the worst case (the arcs are scanned in order); arcs too short to change the length of the
+ * whole motion (in double precision) are dropped, so a huge `bounces` costs no more than the arcs that can be seen.
  * @param {number} [bounces=3] - Number of rebounds, an integer >= 1
  * @param {number} [restitution=0.5] - Coefficient of restitution (rebound speed / impact speed), in `(0, 1)`
  * @returns {EasingFunction} The ease-in function (exactly `0` at `0` and `1` at `1`)
@@ -640,12 +641,18 @@ export function elastic(amplitude = 1, period = 0.3): EasingFunction {
  */
 export function bounce(bounces = 3, restitution = 0.5): EasingFunction {
 	assertInteger('bounce', 'bounces', bounces, 1);
-	assertNumber('bounce', 'restitution', restitution, restitution > 0 && restitution < 1, 'a number between 0 and 1 (exclusive)');
+	assertNumber('bounce', 'restitution', restitution, typeof restitution === 'number' && restitution > 0 && restitution < 1, 'a number between 0 and 1 (exclusive)');
 	// In units of the first fall's duration: the fall takes 1, the rebound k (k >= 1) takes 2·restitution^k.
 	let total = 1;
 	let width = 1;
 	for (let k = 0; k < bounces; k++) {
 		width *= restitution;
+		// The arcs too short to change the total cannot be told apart either: they are dropped (the last one kept ends at `total`), so that
+		// `bounces = 2 ** 53 - 1` neither loops for ever here nor in each evaluation.
+		if (total + 2 * width === total) {
+			bounces = k || 1;
+			break;
+		}
 		total += 2 * width;
 	}
 	return function (t) {
@@ -750,9 +757,10 @@ function solveBezierSafely(a: number, b: number, c: number, t: number): number {
  * cubicBezier(1.5, 0, 0, 1); // throws RangeError
  */
 export function cubicBezier(x1: number, y1: number, x2: number, y2: number): EasingFunction {
-	assertNumber('cubicBezier', 'x1', x1, x1 >= 0 && x1 <= 1, 'a number between 0 and 1');
+	// `typeof` first in each check: comparing an object would convert it (an array is joined, which a sparse one makes endless).
+	assertNumber('cubicBezier', 'x1', x1, typeof x1 === 'number' && x1 >= 0 && x1 <= 1, 'a number between 0 and 1');
 	assertNumber('cubicBezier', 'y1', y1, Number.isFinite(y1), 'a finite number');
-	assertNumber('cubicBezier', 'x2', x2, x2 >= 0 && x2 <= 1, 'a number between 0 and 1');
+	assertNumber('cubicBezier', 'x2', x2, typeof x2 === 'number' && x2 >= 0 && x2 <= 1, 'a number between 0 and 1');
 	assertNumber('cubicBezier', 'y2', y2, Number.isFinite(y2), 'a finite number');
 
 	// Polynomial coefficients: x(s) = ((ax·s + bx)·s + cx)·s, same for y, and for x̄(u) = 1 - x(1 - u), the x of the mirrored curve.
@@ -862,8 +870,12 @@ export function cssLinear(stops: readonly LinearStop[]): EasingFunction {
 	const outputs: number[] = [];
 	let largest = -Infinity;
 	for (let i = 0; i < stops.length; i++) {
-		const stop: unknown = stops[i];
-		const values: unknown[] = typeof stop === 'number' ? [stop] : Array.isArray(stop) && (stop.length === 2 || stop.length === 3) ? stop : [];
+		// A hole is `undefined` (rejected), not a stop or a number planted on a polluted `Array.prototype` or `Object.prototype`, and each
+		// number is read once (a getter could return a finite number to the check, then another).
+		const stop: unknown = Object.hasOwn(stops, i) ? stops[i] : undefined;
+		const size = Array.isArray(stop) ? stop.length : 0;
+		const values: unknown[] = typeof stop === 'number' ? [stop] : [];
+		if (size === 2 || size === 3) for (let j = 0; j < size; j++) values.push(Object.hasOwn(stop as unknown[], j) ? (stop as unknown[])[j] : undefined);
 		if (values.length === 0 || values.some(isNotNumber)) {
 			throw new TypeError(`cssLinear: \`stops[${i}]\` must be a number or an array [output, input] or [output, start, end], got ${typeName(stop)}`);
 		}
@@ -945,7 +957,8 @@ function formatDecimal(value: number, decimals: number): string {
  * @param {CssLinearOptions} [options={}] - `tolerance` (default `0.001`), `samples` (`1000`)
  * @returns {string} The CSS easing, e.g. `'linear(0, 0.25 50%, 1)'`
  * @throws {TypeError} when `easing` is not a function, or an option is not a number
- * @throws {RangeError} when `tolerance` is not in `(0, 1)`, `samples` is not an integer >= 2, or `easing` returns a non-finite number
+ * @throws {RangeError} when `tolerance` is not in `(0, 1)`, `samples` is not an integer from 2 to `2 ** 24`, or `easing` returns a non-finite
+ * number
  * @example
  * toCssLinear(linear); // => 'linear(0, 1)'
  * toCssLinear(easeInQuad, { tolerance: 0.1 }); // => 'linear(0, 0.25 50%, 1)'
@@ -959,8 +972,10 @@ export function toCssLinear(easing: EasingFunction, options: CssLinearOptions = 
 	assertFunction('toCssLinear', 'easing', easing);
 	const tolerance = readOption(options, 'tolerance', 0.001);
 	const samples = readOption(options, 'samples', 1000);
-	assertNumber('toCssLinear', 'tolerance', tolerance, tolerance > 0 && tolerance < 1, 'a number between 0 and 1 (exclusive)');
+	assertNumber('toCssLinear', 'tolerance', tolerance, typeof tolerance === 'number' && tolerance > 0 && tolerance < 1, 'a number between 0 and 1 (exclusive)');
 	assertInteger('toCssLinear', 'samples', samples, 2);
+	// The samples are held in typed arrays: 2^32 of them would abort the process instead of throwing (and take minutes to compute).
+	if (samples > 2 ** 24) throw new RangeError(`toCssLinear: \`samples\` must be an integer from 2 to 2 ** 24, got ${samples}`);
 	// Rounding the printed numbers moves them by at most half a unit of their last decimal: a tenth of the tolerance or less, which the
 	// simplification leaves free (beyond 20 decimals the rounding is below double precision for outputs around 1).
 	const decimals = Math.min(20, Math.ceil(Math.log10(5 / tolerance)));
@@ -1072,11 +1087,11 @@ export function spring(options: SpringOptions = {}): Spring {
 	const mass = readOption(options, 'mass', 1);
 	const velocity = readOption(options, 'velocity', 0);
 	const restDelta = readOption(options, 'restDelta', 0.001);
-	assertNumber('spring', 'stiffness', stiffness, stiffness > 0 && stiffness < Infinity, 'a finite number > 0');
-	assertNumber('spring', 'damping', damping, damping > 0 && damping < Infinity, 'a finite number > 0');
-	assertNumber('spring', 'mass', mass, mass > 0 && mass < Infinity, 'a finite number > 0');
+	assertNumber('spring', 'stiffness', stiffness, typeof stiffness === 'number' && stiffness > 0 && stiffness < Infinity, 'a finite number > 0');
+	assertNumber('spring', 'damping', damping, typeof damping === 'number' && damping > 0 && damping < Infinity, 'a finite number > 0');
+	assertNumber('spring', 'mass', mass, typeof mass === 'number' && mass > 0 && mass < Infinity, 'a finite number > 0');
 	assertNumber('spring', 'velocity', velocity, Number.isFinite(velocity), 'a finite number');
-	assertNumber('spring', 'restDelta', restDelta, restDelta > 0 && restDelta < 1, 'a number between 0 and 1 (exclusive)');
+	assertNumber('spring', 'restDelta', restDelta, typeof restDelta === 'number' && restDelta > 0 && restDelta < 1, 'a number between 0 and 1 (exclusive)');
 
 	// Two square roots: `stiffness / mass` can overflow or underflow where the natural frequency itself does not.
 	const omega = Math.sqrt(stiffness) / Math.sqrt(mass);
