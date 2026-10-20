@@ -1339,6 +1339,27 @@ describe('Arrays helpers', function () {
 			expect(calls).toBeLessThan(80);
 		});
 
+		it('searches array-likes longer than 2 ** 32 in O(log n) steps, and any claimed length in at most 53', function () {
+			// The halving wrapped around past 2 ** 32: 2 ** 40 items took 8,448 steps, 2 ** 53 millions, and `Infinity` never ended.
+			let reads = 0;
+			let length = 2 ** 40;
+			const naturals = new Proxy([] as number[], {
+				get(_target, key) {
+					if (key === 'length') return length;
+					if (++reads > 1000) throw new Error('too many reads');
+					return typeof key === 'string' && /^\d+$/.test(key) ? Number(key) : 0;
+				}
+			});
+			expect(helpers.sortedIndex(naturals, 2 ** 40 - 1.5)).toBe(2 ** 40 - 1);
+			expect(reads).toBeLessThanOrEqual(41);
+			for (length of [2 ** 53 - 1, 1e308, Infinity]) {
+				reads = 0;
+				expect(helpers.sortedLastIndex(naturals, 2 ** 53)).toBe(2 ** 53 - 1);
+				expect(helpers.sortedIndexBy(naturals, 2 ** 53, Number)).toBe(2 ** 53 - 1);
+				expect(reads).toBeLessThanOrEqual(2 * 53);
+			}
+		});
+
 		it('sortedIndex returns the lowest insertion index', function () {
 			expect(helpers.sortedIndex([10, 20, 20, 30], 20)).toBe(1);
 			expect(helpers.sortedIndex([10, 20, 30], 5)).toBe(0);

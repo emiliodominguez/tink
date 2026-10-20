@@ -1145,10 +1145,12 @@ function searchBound<T>(caller: string, sortedArray: ReadonlyArray<T>, value: T,
 	} else assertFunction(caller, 'compare', compare);
 	const order: Comparator<T> = compare ?? naturalCompare;
 	let low = 0;
-	let high = sortedArray.length;
+	// An array-like may claim any length: past `2 ** 53 - 1` (as `ToLength` clamps it), `Infinity` would never be halved.
+	let high = Math.min(sortedArray.length, 2 ** 53 - 1);
 	while (low < high) {
-		// Not `(low + high) >>> 1`, which wraps around past 2 ** 32 (array-likes and sparse arrays can be that long).
-		const middle = low + ((high - low) >>> 1);
+		// Not `(low + high) >>> 1`, which wraps around past 2 ** 32 (sparse arrays can be that long); and `>>>` only below it, where it
+		// is faster: halving a longer span of an array-like with it took O(length / 2 ** 31) steps.
+		const middle = low + (high - low > 4294967295 ? Math.floor((high - low) / 2) : (high - low) >>> 1);
 		const comparison = order(sortedArray[middle], value);
 		if (comparison < 0 || (upper && comparison === 0)) low = middle + 1;
 		else high = middle;
@@ -2055,10 +2057,12 @@ function sortedIndexByKey<T>(
 	const dir = toDirection(caller, 'order', order);
 	const target = rank(selector(value));
 	let low = 0;
-	let high = sortedArray.length;
+	// An array-like may claim any length: past `2 ** 53 - 1` (as `ToLength` clamps it), `Infinity` would never be halved.
+	let high = Math.min(sortedArray.length, 2 ** 53 - 1);
 	while (low < high) {
-		// Not `(low + high) >>> 1`, which wraps around past 2 ** 32 (array-likes and sparse arrays can be that long).
-		const middle = low + ((high - low) >>> 1);
+		// Not `(low + high) >>> 1`, which wraps around past 2 ** 32 (sparse arrays can be that long); and `>>>` only below it, where it
+		// is faster: halving a longer span of an array-like with it took O(length / 2 ** 31) steps.
+		const middle = low + (high - low > 4294967295 ? Math.floor((high - low) / 2) : (high - low) >>> 1);
 		const comparison = compareRanked(rank(selector(sortedArray[middle])), target, dir);
 		if (comparison < 0 || (upper && comparison === 0)) low = middle + 1;
 		else high = middle;
