@@ -370,6 +370,12 @@ describe('Math helpers', function () {
 	});
 
 	describe('modulo', function () {
+		it('should convert a numeric divisor string once', function () {
+			// `rest + divisor` concatenated: `'-13'`.
+			expect(helpers.modulo(-1, '3' as never)).toBe(2);
+			expect(helpers.modulo('7' as never, '3' as never)).toBe(1);
+		});
+
 		it('should return the modulo for positive operands', function () {
 			expect(helpers.modulo(7, 3)).toBe(1);
 			expect(helpers.modulo(10, 4)).toBe(2);
@@ -547,12 +553,22 @@ describe('Math helpers', function () {
 			expect(helpers.toRadians(90)).toBeCloseTo(Math.PI / 2, 12);
 			expect(helpers.toRadians(180)).toBe(Math.PI);
 		});
+
+		it('should convert a numeric string once, also where the product overflows', function () {
+			// The overflow test saw the string, which is not finite for `Number.isFinite`: the result was `Infinity`.
+			expect(helpers.toRadians('1e308' as never)).toBe(helpers.toRadians(1e308));
+			expect(helpers.toRadians('180' as never)).toBe(Math.PI);
+		});
 	});
 
 	describe('toDegrees', function () {
 		it('should convert radians to degrees', function () {
 			expect(helpers.toDegrees(Math.PI / 2)).toBeCloseTo(90, 12);
 			expect(helpers.toDegrees(Math.PI)).toBe(180);
+		});
+
+		it('should convert a numeric string once, also where the product overflows', function () {
+			expect(helpers.toDegrees('3e306' as never)).toBe(helpers.toDegrees(3e306));
 		});
 	});
 
@@ -613,6 +629,13 @@ describe('Math helpers', function () {
 	});
 
 	describe('inverseLerp', function () {
+		it('should convert numeric strings once', function () {
+			// `'1' === 1` is false: the degenerate range was divided by (`Infinity`), and the overflow test saw a string.
+			expect(helpers.inverseLerp('1' as never, 1, 5)).toBe(0);
+			expect(helpers.inverseLerp(-1e308, 0, '1e308' as never)).toBe(2);
+			expect(helpers.inverseLerp('0' as never, '10' as never, '5' as never)).toBe(0.5);
+		});
+
 		it('should not overflow for ranges wider than Number.MAX_VALUE', function () {
 			expect(helpers.inverseLerp(-1e308, 1e308, 0)).toBe(0.5);
 			expect(helpers.inverseLerp(-1e308, 1e308, 1e308)).toBe(1);
@@ -898,6 +921,13 @@ describe('Math helpers', function () {
 	});
 
 	describe('percentage', function () {
+		it('should convert numeric strings once', function () {
+			// A total of `'0'` is not `=== 0`: it gave `Infinity`. The overflow test saw a string.
+			expect(helpers.percentage(3, '0' as never)).toBeNaN();
+			expect(helpers.percentage('1e307' as never, 1e10)).toBe(1e299);
+			expect(helpers.percentage('25' as never, '200' as never)).toBe(12.5);
+		});
+
 		it('should compute the percentage of a total', function () {
 			expect(helpers.percentage(25, 200)).toBe(12.5);
 			expect(helpers.percentage(50, 50)).toBe(100);
@@ -2616,6 +2646,18 @@ describe('Math helpers under prototype pollution', function () {
 		}
 	});
 
+	it('never read past the prime factors when listing divisors', function () {
+		const polluted = Object.prototype as Record<string, unknown>;
+		// `1024` has ten prime factors: index 10 was read as an eleventh `2`.
+		polluted[10] = 2;
+		try {
+			expect(helpers.divisors(1024)).toEqual([1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]);
+			expect(helpers.divisors(3 * 2 ** 9)).toHaveLength(20);
+		} finally {
+			delete polluted[10];
+		}
+	});
+
 	it('read their options as own properties only', function () {
 		const clean = helpers.histogram([1, 2, 3, 4]);
 		const polluted = Object.prototype as Record<string, unknown>;
@@ -2997,6 +3039,12 @@ describe('interquartileRange', function () {
 });
 
 describe('zScore', function () {
+	it('converts a numeric value and mean once', function () {
+		// The overflow test saw strings, which are not finite for `Number.isFinite`: the result was `Infinity`.
+		expect(helpers.zScore('1e308' as never, '-1e308' as never, 1e308)).toBe(2);
+		expect(helpers.zScore('130' as never, '100' as never, 15)).toBe(2);
+	});
+
 	it('measures the distance from the mean in standard deviations', function () {
 		expect(helpers.zScore(130, 100, 15)).toBe(2);
 		expect(helpers.zScore(85, 100, 15)).toBe(-1);
@@ -4323,6 +4371,13 @@ describe('toFraction', function () {
 });
 
 describe('percentageChange', function () {
+	it('should convert numeric strings once', function () {
+		// `'0'` is not `=== 0`: the change was `Infinity`. The overflow test saw strings.
+		expect(helpers.percentageChange('0' as never, 10)).toBeNaN();
+		expect(helpers.percentageChange('-1e308' as never, '1e308' as never)).toBe(200);
+		expect(helpers.percentageChange('50' as never, '75' as never)).toBe(50);
+	});
+
 	it('should give the change relative to the magnitude of the original value', function () {
 		expect(helpers.percentageChange(50, 75)).toBe(50);
 		expect(helpers.percentageChange(80, 60)).toBe(-25);

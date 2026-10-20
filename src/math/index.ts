@@ -459,7 +459,8 @@ function roundDirected(caller: string, method: (value: number) => number, input:
  * (so for a positive divisor it lies in `[0, divisor)`), unlike the JavaScript `%` operator (see {@link remainder}).
  * A zero result is always `+0`. Returns `NaN` when `divisor` is `0` or either argument is `NaN`.
  * When the exact result is so close to `divisor` that it rounds to it (e.g. `modulo(-1e-20, 3)`), `0` — the congruent
- * value nearest on the circle — is returned, so the result never equals a finite `divisor`.
+ * value nearest on the circle — is returned, so the result never equals a finite `divisor`. Both arguments are converted with unary `+`
+ * (numeric strings count as numbers).
  * @param {number} dividend - The number to be divided
  * @param {number} divisor - The number to divide by
  * @returns {number} `dividend mod divisor`
@@ -469,11 +470,13 @@ function roundDirected(caller: string, method: (value: number) => number, input:
  * modulo(1, -3); // => -2
  */
 export function modulo(dividend: number, divisor: number): number {
-	const rest = dividend % divisor;
+	// Converted once with unary `+`: `rest + divisor` would concatenate a numeric string (`modulo(-1, '3')` was `'-13'`).
+	const number = +divisor;
+	const rest = dividend % number;
 	if (rest === 0) return 0;
-	if (rest < 0 === divisor < 0) return rest;
-	const wrapped = rest + divisor;
-	return wrapped === divisor && Number.isFinite(divisor) ? 0 : wrapped;
+	if (rest < 0 === number < 0) return rest;
+	const wrapped = rest + number;
+	return wrapped === number && Number.isFinite(number) ? 0 : wrapped;
 }
 
 /**
@@ -551,30 +554,34 @@ export function randomIntBetween(minimum: number, maximum: number, random: Rando
 
 /**
  * Converts degrees to radians: `degrees * Math.PI / 180`, which does not overflow for the largest angles (`toRadians(1e308)` is
- * `1.7453292519943295e306`, not `Infinity`).
+ * `1.7453292519943295e306`, not `Infinity`). The angle is converted once with unary `+` (numeric strings count as numbers).
  * @param {number} degrees - The angle in degrees
  * @returns {number} The angle in radians
  * @example
  * toRadians(180); // => 3.141592653589793
  */
 export function toRadians(degrees: number): number {
-	const scaled = degrees * Math.PI;
+	// Converted once with unary `+`, so that the test below sees the number multiplied (`Number.isFinite('1e308')` is `false`).
+	const number = +degrees;
+	const scaled = number * Math.PI;
 	// The product overflowed although the angle in radians does not: divide first (one more rounding, only there).
-	return Number.isFinite(scaled) || !Number.isFinite(degrees) ? scaled / 180 : (degrees / 180) * Math.PI;
+	return Number.isFinite(scaled) || !Number.isFinite(number) ? scaled / 180 : (number / 180) * Math.PI;
 }
 
 /**
  * Converts radians to degrees: `radians * 180 / Math.PI`, which only overflows when the angle in degrees does (`toDegrees(3e306)` is
- * `1.7188733853924698e308`, not `Infinity`).
+ * `1.7188733853924698e308`, not `Infinity`). The angle is converted once with unary `+` (numeric strings count as numbers).
  * @param {number} radians - The angle in radians
  * @returns {number} The angle in degrees
  * @example
  * toDegrees(Math.PI); // => 180
  */
 export function toDegrees(radians: number): number {
-	const scaled = radians * 180;
+	// Converted once (see `toRadians`).
+	const number = +radians;
+	const scaled = number * 180;
 	// The product overflowed: divide first (one more rounding, only there).
-	return Number.isFinite(scaled) || !Number.isFinite(radians) ? scaled / Math.PI : (radians / Math.PI) * 180;
+	return Number.isFinite(scaled) || !Number.isFinite(number) ? scaled / Math.PI : (number / Math.PI) * 180;
 }
 
 /**
@@ -614,7 +621,9 @@ export function clamp(value: number, minimum: number, maximum: number): number {
  *
  * A value already in range is returned as is (`-0` included). Otherwise the remainders are taken with `%`, which is exact, so integers stay
  * exact and neither the distance to `minimum` nor the span overflows; when the exact result is so close to `maximum` that it rounds to it,
- * `minimum`, the congruent value nearest on the circle, is returned (as {@link modulo} does), so the result is always below `maximum`.
+ * `minimum`, the congruent value nearest on the circle, is returned (as {@link modulo} does), so the result is always below `maximum`. The
+ * span itself is rounded when it is not a double (integer bounds more than `2 ** 53` apart): the result is then congruent modulo the rounded
+ * span.
  * `NaN` and `±Infinity` give `NaN`.
  * @param {number} value - The value to wrap
  * @param {number} minimum - Inclusive lower bound
@@ -666,7 +675,8 @@ export function lerp(start: number, end: number, t: number): number {
 
 /**
  * Inverse of {@link lerp}: the factor `t` for which `lerp(start, end, t) === value`.
- * Returns `0` when `start === end` (the range is degenerate). The result is not clamped.
+ * Returns `0` when `start === end` (the range is degenerate). The result is not clamped. The arguments are converted once with unary `+`
+ * (numeric strings count as numbers).
  * @param {number} start - Value mapped to `0`
  * @param {number} end - Value mapped to `1`
  * @param {number} value - The value to locate
@@ -676,13 +686,17 @@ export function lerp(start: number, end: number, t: number): number {
  * inverseLerp(10, 20, 12.5); // => 0.25
  */
 export function inverseLerp(start: number, end: number, value: number): number {
-	if (start === end) return 0;
-	const span = end - start;
-	const offset = value - start;
+	// Converted once with unary `+`, so that the tests below see the numbers computed with (`'1' === 1` is `false`).
+	const low = +start;
+	const high = +end;
+	const number = +value;
+	if (low === high) return 0;
+	const span = high - low;
+	const offset = number - low;
 	// An infinite `value` gives `±Infinity` (or `NaN`) directly: halving a subnormal span would round it to zero and lose its sign.
-	if (Number.isFinite(span) && (Number.isFinite(offset) || !Number.isFinite(value))) return offset / span;
+	if (Number.isFinite(span) && (Number.isFinite(offset) || !Number.isFinite(number))) return offset / span;
 	// A difference overflowed (`inverseLerp(-1e308, 1e308, 0)`): the halves do not, and their ratio is the same.
-	return (value / 2 - start / 2) / (end / 2 - start / 2);
+	return (number / 2 - low / 2) / (high / 2 - low / 2);
 }
 
 /**
@@ -1247,7 +1261,8 @@ export function isOdd(number: number): boolean {
  * Expresses `value` as a percentage of `total` (`value / total * 100`).
  * When `total` is `0` the percentage is undefined and `NaN` is returned (rather than `±Infinity`). Like {@link percentageChange}, the value
  * is multiplied by `100` before it is divided, so that a simple ratio comes out as the double nearest to it (`percentage(1, 3)` is
- * `100 / 3`, where `(1 / 3) * 100` is `33.33333333333333`), without overflowing when `100 * value` does.
+ * `100 / 3`, where `(1 / 3) * 100` is `33.33333333333333`), without overflowing when `100 * value` does. Both arguments are converted once
+ * with unary `+` (numeric strings count as numbers).
  * @param {number} value - The part
  * @param {number} total - The whole
  * @returns {number} The percentage, or `NaN` when `total` is `0`
@@ -1257,10 +1272,13 @@ export function isOdd(number: number): boolean {
  * percentage(3, 0); // => NaN
  */
 export function percentage(value: number, total: number): number {
-	if (total === 0) return NaN;
-	const hundredfold = value * 100;
+	// Converted once with unary `+`, so that the tests below see the numbers computed with (`percentage(3, '0')` was `Infinity`).
+	const part = +value;
+	const whole = +total;
+	if (whole === 0) return NaN;
+	const hundredfold = part * 100;
 	// `100 * value` overflowed (so `total` is large if the percentage is finite): divide first.
-	return Number.isFinite(hundredfold) || !Number.isFinite(value) ? hundredfold / total : (value / total) * 100;
+	return Number.isFinite(hundredfold) || !Number.isFinite(part) ? hundredfold / whole : (part / whole) * 100;
 }
 
 /**
@@ -1416,7 +1434,8 @@ export function interquartileRange(numbers: ReadonlyArray<number>): number {
 /**
  * Computes the standard score of a value: how many standard deviations it lies above (positive) or below (negative) the mean,
  * `(value - mean) / standardDeviation`. Pass the mean and standard deviation of the reference population (see {@link average} and
- * {@link standardDeviation}). It only overflows when the score itself does, even when `value - mean` does.
+ * {@link standardDeviation}). It only overflows when the score itself does, even when `value - mean` does. `value` and `mean` are converted
+ * once with unary `+` (numeric strings count as numbers).
  * @param {number} value - The value to score
  * @param {number} mean - The mean of the population
  * @param {number} deviation - Its standard deviation, a number `> 0`
@@ -1430,11 +1449,14 @@ export function interquartileRange(numbers: ReadonlyArray<number>): number {
  */
 export function zScore(value: number, mean: number, deviation: number): number {
 	assertNumber('zScore', 'deviation', deviation, deviation > 0, 'a number > 0');
-	const difference = value - mean;
-	if (Number.isFinite(difference) || !Number.isFinite(value) || !Number.isFinite(mean)) return difference / deviation;
+	// Converted once with unary `+`, so that the test below sees the numbers subtracted (`Number.isFinite('1e308')` is `false`).
+	const number = +value;
+	const centre = +mean;
+	const difference = number - centre;
+	if (Number.isFinite(difference) || !Number.isFinite(number) || !Number.isFinite(centre)) return difference / deviation;
 	// The difference overflowed although both values are finite (`zScore(1e308, -1e308, 1e308)` is `2`): halve all three, exactly for values
 	// that large (halving a subnormal deviation can round it, but the score is then beyond the doubles anyway).
-	return (value / 2 - mean / 2) / (deviation / 2);
+	return (number / 2 - centre / 2) / (deviation / 2);
 }
 
 /**
@@ -2691,7 +2713,8 @@ export function divisors(n: number): number[] {
 		const prime = factors[i];
 		const count = result.length;
 		// Every divisor found so far, times each power of `prime` that divides `n`.
-		for (let power = prime; factors[i] === prime; i++, power *= prime) {
+		// Bounded by the length: `factors[factors.length]` would be read from `Object.prototype`.
+		for (let power = prime; i < factors.length && factors[i] === prime; i++, power *= prime) {
 			for (let j = 0; j < count; j++) result.push(result[j] * power);
 		}
 	}
@@ -3927,7 +3950,7 @@ export function toFraction(value: number, maxDenominator = 1_000_000): [number, 
  * change is undefined and `NaN` is returned (rather than `±Infinity`), like {@link percentage}. The difference is multiplied by `100`
  * before it is divided, so that a change that is a simple ratio comes out as the double nearest to it (`3` to `4` is `100 / 3`); in
  * general the result is within a couple of units in the last place of the exact change. It does not overflow when the difference (or
- * `100` times it) does but the change does not.
+ * `100` times it) does but the change does not. Both values are converted once with unary `+` (numeric strings count as numbers).
  * @param {number} from - The original value
  * @param {number} to - The new value
  * @returns {number} The change in percent (negative for a decrease), or `NaN` when `from` is `0`
@@ -3939,9 +3962,12 @@ export function toFraction(value: number, maxDenominator = 1_000_000): [number, 
  * percentageChange(0, 10); // => NaN
  */
 export function percentageChange(from: number, to: number): number {
-	if (from === 0) return NaN;
-	const magnitude = Math.abs(from);
-	const difference = to - from;
+	// Converted once with unary `+`, so that the tests below see the numbers computed with (`percentageChange('0', 10)` was `Infinity`).
+	const original = +from;
+	const next = +to;
+	if (original === 0) return NaN;
+	const magnitude = Math.abs(original);
+	const difference = next - original;
 	if (Number.isFinite(difference)) {
 		const hundredfold = difference * 100;
 		// `100` times the difference, then divided: dividing first would round twice for the ratio alone (`3` to `4` would be
@@ -3950,7 +3976,7 @@ export function percentageChange(from: number, to: number): number {
 	}
 	// The difference, or `100` times it, overflowed although both values are finite: work on the values divided by 256 (exactly, for values
 	// that large; a tiny `from` makes the change overflow anyway). A non-finite value makes the change `NaN` or infinite.
-	return Number.isFinite(from) && Number.isFinite(to) ? ((to / 256 - from / 256) * 100) / (magnitude / 256) : difference / magnitude;
+	return Number.isFinite(original) && Number.isFinite(next) ? ((next / 256 - original / 256) * 100) / (magnitude / 256) : difference / magnitude;
 }
 
 /**
