@@ -521,6 +521,36 @@ export default [
 		}
 	},
 	{
+		// What a per-instance `@debounced` method pays on each instance's first call.
+		name: 'debounce creation',
+		fn: function () {
+			return debounce(add, 1000);
+		},
+		competitors: {
+			'es-toolkit': function () {
+				return esToolkit.debounce(add, 1000);
+			},
+			lodash: function () {
+				return lodash.debounce(add, 1000);
+			}
+		}
+	},
+	{
+		// What a per-instance `@memoize` method pays on each instance's first call.
+		name: 'memoize creation',
+		fn: function () {
+			return memoize(add);
+		},
+		competitors: {
+			'es-toolkit': function () {
+				return esToolkit.memoize(add);
+			},
+			lodash: function () {
+				return lodash.memoize(add);
+			}
+		}
+	},
+	{
 		name: 'throttle call (inside window)',
 		fn: function () {
 			let total = 0;

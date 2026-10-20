@@ -1,3 +1,4 @@
+import { setFlagsFromString } from 'node:v8';
 import * as vm from 'vm';
 import { AssertionError, isArrayOf, isInstanceOf, isMatching, isOptional } from '../guards/index.js';
 import { _, active, allPass, anyOf, anyPass, capture, captureAs, cons, match, matcher, matchWith, partialRight, type NonExhaustiveError } from '.';
@@ -166,6 +167,16 @@ describe('Functions helpers', function () {
 			expect(function () {
 				helpers.curry('nope' as any);
 			}).toThrow(new TypeError('curry: `fn` must be a function, got string'));
+			// Previously "Cannot read properties of null (reading 'length')": the default arity was read before `fn` was validated.
+			expect(function () {
+				helpers.curry(null as any);
+			}).toThrow(new TypeError('curry: `fn` must be a function, got null'));
+			expect(function () {
+				helpers.curry(undefined as any);
+			}).toThrow(new TypeError('curry: `fn` must be a function, got undefined'));
+			expect(function () {
+				helpers.curry(add3, null as any);
+			}).toThrow(new TypeError('curry: `arity` must be an integer >= 0, got null'));
 		});
 	});
 
@@ -293,6 +304,39 @@ describe('Functions helpers', function () {
 	});
 
 	describe('memoize', function () {
+		it('should ignore options inherited from a polluted Object.prototype', function () {
+			const proto = Object.prototype as Record<string, unknown>;
+			const shared = new Map<unknown, unknown>();
+			proto.resolver = function (): string {
+				return 'same key';
+			};
+			proto.cache = shared;
+			try {
+				const double = helpers.memoize(function (n: number): number {
+					return n * 2;
+				});
+				// Previously both calls hit the planted resolver's single key, in the planted (shared) cache: 2, 2.
+				expect([double(1), double(2)]).toEqual([2, 4]);
+				expect(double.cache).not.toBe(shared);
+				expect(shared.size).toBe(0);
+			} finally {
+				delete proto.resolver;
+				delete proto.cache;
+			}
+			// Options inherited from another prototype still count.
+			const byParity = helpers.memoize(
+				function (n: number): number {
+					return n * 2;
+				},
+				Object.create({
+					resolver: function (n: number): number {
+						return n % 2;
+					}
+				}) as helpers.MemoizeOptions<(n: number) => number>
+			);
+			expect([byParity(1), byParity(3), byParity(2)]).toEqual([2, 2, 4]);
+		});
+
 		it('should use the value read with get without asking has (an expiring cache may drop it in between)', function () {
 			const store = new Map<unknown, unknown>();
 			const forgetfulHas = {
@@ -662,6 +706,79 @@ describe('Functions helpers', function () {
 			expect(fn.mock.calls).toEqual([[1], [3]]);
 			jest.runAllTimers();
 			expect(fn.mock.calls).toEqual([[1], [3]]);
+		});
+
+		it('should keep invoking once per window without a leading edge while the timer cannot fire (previously never invoked)', function () {
+			jest.useFakeTimers({ now: 0 });
+
+			const fn = jest.fn();
+			const throttled = helpers.throttle(fn, 100, { leading: false, trailing: true });
+			const ctx = { throttled };
+			// A synchronous loop: the clock moves, the timers never get a chance to run.
+			for (let now = 0; now < 500; now += 10) {
+				jest.setSystemTime(now);
+				ctx.throttled(now);
+			}
+			// Each window's latest call, performed by the first call after the window.
+			expect(fn.mock.calls).toEqual([[90], [190], [290], [390]]);
+			expect(fn.mock.contexts[0]).toBe(ctx);
+			// The last window's call is still due, once the timers run.
+			jest.runAllTimers();
+			expect(fn.mock.calls).toEqual([[90], [190], [290], [390], [490]]);
+		});
+
+		it('should let a call made by the overdue invocation supersede the call that performed it', function () {
+			jest.useFakeTimers({ now: 0 });
+
+			const calls: number[] = [];
+			const throttled = helpers.throttle(
+				function (n: number): number {
+					calls.push(n);
+					if (n === 1) throttled(3);
+					return n * 10;
+				},
+				100,
+				{ leading: false, trailing: true }
+			);
+			throttled(1);
+			jest.setSystemTime(150);
+			// Performs the overdue call (1), whose own call (3) is newer than this one.
+			expect(throttled(2)).toBe(10);
+			expect(calls).toEqual([1]);
+			jest.advanceTimersByTime(100);
+			expect(calls).toEqual([1, 3]);
+			jest.runAllTimers();
+			expect(calls).toEqual([1, 3]);
+		});
+
+		it('should ignore options inherited from a polluted Object.prototype', function () {
+			jest.useFakeTimers();
+
+			const proto = Object.prototype as Record<string, unknown>;
+			proto.leading = false;
+			proto.trailing = true;
+			try {
+				const fn = jest.fn();
+				const throttled = helpers.throttle(fn, 100);
+				throttled(1);
+				throttled(2);
+				jest.advanceTimersByTime(100);
+				// The defaults: leading edge only.
+				expect(fn.mock.calls).toEqual([[1]]);
+				expect(function () {
+					helpers.throttle(helpers.noop, 100, { leading: false });
+				}).toThrow(new RangeError('throttle: at least one of `leading` or `trailing` must be true'));
+			} finally {
+				delete proto.leading;
+				delete proto.trailing;
+			}
+			// Options inherited from another prototype still count.
+			const fn = jest.fn();
+			const inherited = helpers.throttle(fn, 100, Object.create({ leading: false, trailing: true }) as helpers.ThrottleOptions);
+			inherited(3);
+			expect(fn).not.toHaveBeenCalled();
+			jest.advanceTimersByTime(100);
+			expect(fn.mock.calls).toEqual([[3]]);
 		});
 
 		it('should cancel pending calls and reset the window', function () {
@@ -1113,6 +1230,40 @@ describe('Functions helpers', function () {
 				helpers.debounce('x' as any, 5);
 			}).toThrow(new TypeError('debounce: `fn` must be a function, got string'));
 		});
+
+		it('should ignore options inherited from a polluted Object.prototype', function () {
+			jest.useFakeTimers();
+
+			const proto = Object.prototype as Record<string, unknown>;
+			proto.leading = true;
+			proto.trailing = false;
+			proto.maxWait = 150;
+			try {
+				const fn = jest.fn();
+				const debounced = helpers.debounce(fn, 100);
+				debounced(1);
+				expect(fn).not.toHaveBeenCalled();
+				// No maxWait: a continuous burst only invokes once it ends, on the trailing edge.
+				for (let i = 0; i < 10; i++) {
+					jest.advanceTimersByTime(50);
+					debounced(i + 2);
+				}
+				expect(fn).not.toHaveBeenCalled();
+				expect(debounced.pending()).toBe(true);
+				jest.advanceTimersByTime(100);
+				expect(fn.mock.calls).toEqual([[11]]);
+			} finally {
+				delete proto.leading;
+				delete proto.trailing;
+				delete proto.maxWait;
+			}
+			// Options inherited from another prototype still count.
+			const fn = jest.fn();
+			const inherited = helpers.debounce(fn, 100, Object.create({ leading: true }) as helpers.DebounceOptions);
+			inherited(12);
+			expect(fn.mock.calls).toEqual([[12]]);
+			inherited.cancel();
+		});
 	});
 
 	describe('once', function () {
@@ -1165,6 +1316,32 @@ describe('Functions helpers', function () {
 				helpers.once(1 as any);
 			}).toThrow(new TypeError('once: `fn` must be a function, got number'));
 		});
+
+		it('should release fn once it has been called (previously kept alive with the wrapper)', async function () {
+			const refs: Array<WeakRef<object>> = [];
+			const wrappers = (function () {
+				const kept = { id: 1 };
+				const failing = { id: 2 };
+				refs.push(new WeakRef(kept), new WeakRef(failing));
+				const succeeded = helpers.once(function (): number {
+					return kept.id;
+				});
+				const failed = helpers.once(function (): never {
+					throw new Error(String(failing.id));
+				});
+				succeeded();
+				expect(failed).toThrow('2');
+				return [succeeded, failed];
+			})();
+			await collectGarbage();
+			expect(
+				refs.map(function (ref) {
+					return ref.deref();
+				})
+			).toEqual([undefined, undefined]);
+			expect(wrappers[0]()).toBe(1);
+			expect(wrappers[1]).toThrow('2');
+		});
 	});
 
 	describe('before', function () {
@@ -1182,6 +1359,34 @@ describe('Functions helpers', function () {
 			helpers.before(0, fn)();
 			helpers.before(1, fn)();
 			expect(fn).not.toHaveBeenCalled();
+		});
+
+		it('should release fn after its last invocation (previously kept alive with the wrapper)', async function () {
+			const refs: Array<WeakRef<{ id: number }>> = [];
+			/**
+			 * Restricts a function reading a new object (in a scope of its own: closures of one scope share what they hold).
+			 * @param {number} id - The object's id
+			 * @param {number} n - The `before` count
+			 * @returns {(by: number) => number | undefined} The restricted function
+			 */
+			function limit(id: number, n: number): (by: number) => number | undefined {
+				const value = { id };
+				refs.push(new WeakRef(value));
+				return helpers.before(n, function (by: number): number {
+					return value.id + by;
+				});
+			}
+			const exhausted = limit(1, 3);
+			const never = limit(2, 1);
+			const pending = limit(3, 3);
+			expect([exhausted(1), exhausted(2), exhausted(3), never(0), pending(0)]).toEqual([2, 3, 3, undefined, 3]);
+			await collectGarbage();
+			expect(
+				refs.map(function (ref) {
+					return ref.deref()?.id;
+				})
+			).toEqual([undefined, undefined, 3]);
+			expect([exhausted(4), never(0), pending(1)]).toEqual([3, undefined, 4]);
 		});
 
 		it('should validate its arguments', function () {
@@ -4121,3 +4326,14 @@ describe('Functions helpers (1.4)', function () {
 		});
 	});
 });
+
+/** Runs a garbage collection, once the values a test released are no longer referenced by its stack. */
+async function collectGarbage(): Promise<void> {
+	setFlagsFromString('--expose-gc');
+	const gc = vm.runInNewContext('gc') as () => void;
+	// `setImmediate`, not `setTimeout`: a spy restored after a test with fake timers can leave the fake `setTimeout` behind.
+	await new Promise(function (resolve) {
+		setImmediate(resolve);
+	});
+	gc();
+}
