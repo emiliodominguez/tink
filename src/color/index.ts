@@ -323,46 +323,40 @@ function fromLinear(value: number): number {
 }
 
 /**
- * Multiplies a row-major 3×3 matrix by the column vector `(x, y, z)`.
+ * One row of a row-major 3×3 matrix times the column vector `(x, y, z)`, without allocating.
  * @param {readonly number[]} matrix - Nine coefficients, row by row
+ * @param {number} row - Index of the row's first coefficient (`0`, `3` or `6`)
  * @param {number} x - First component
  * @param {number} y - Second component
  * @param {number} z - Third component
- * @returns {number[]} The product, three components
+ * @returns {number} `matrix[row] * x + matrix[row + 1] * y + matrix[row + 2] * z`
  * @example
- * transform([1, 0, 0, 0, 2, 0, 0, 0, 3], 1, 1, 1); // => [1, 2, 3]
+ * dot([1, 0, 0, 0, 2, 3, 0, 0, 1], 3, 1, 1, 1); // => 5
  */
-function transform(matrix: readonly number[], x: number, y: number, z: number): number[] {
-	return [matrix[0] * x + matrix[1] * y + matrix[2] * z, matrix[3] * x + matrix[4] * y + matrix[5] * z, matrix[6] * x + matrix[7] * y + matrix[8] * z];
+function dot(matrix: readonly number[], row: number, x: number, y: number, z: number): number {
+	return matrix[row] * x + matrix[row + 1] * y + matrix[row + 2] * z;
 }
 
 /**
- * Converts gamma-encoded sRGB channels in `[0, 1]` to OKLab.
- * @param {number} r - Red, `[0, 1]`
- * @param {number} g - Green, `[0, 1]`
- * @param {number} b - Blue, `[0, 1]`
- * @returns {number[]} `[l, a, b]`
- * @example
- * srgbToOklab(0, 0, 0); // => [0, 0, 0]
- */
-function srgbToOklab(r: number, g: number, b: number): number[] {
-	const lms = transform(RGB_TO_LMS, toLinear(r), toLinear(g), toLinear(b));
-	return transform(LMS_TO_OKLAB, Math.cbrt(lms[0]), Math.cbrt(lms[1]), Math.cbrt(lms[2]));
-}
-
-/**
- * Converts OKLab to gamma-encoded sRGB channels, without any clamping (out-of-gamut colours give channels outside `[0, 1]`).
+ * Converts OKLab to linear-light sRGB channels, without any clamping (out-of-gamut colours give channels outside `[0, 1]`), writing
+ * them into `out` without allocating.
  * @param {number} l - Lightness
  * @param {number} a - Green–red axis
  * @param {number} b - Blue–yellow axis
- * @returns {number[]} `[r, g, b]`
+ * @param {number[]} out - The array receiving `r`, `g` and `b` (mutated)
+ * @param {number} offset - Index of `r` in `out`
+ * @returns {number[]} `out`
  * @example
- * oklabToSrgb(0, 0, 0); // => [0, 0, 0]
+ * oklabToLinearInto(0, 0, 0, [9, 9, 9, 9], 1); // => [9, 0, 0, 0]
  */
-function oklabToSrgb(l: number, a: number, b: number): number[] {
-	const lms = transform(OKLAB_TO_LMS, l, a, b);
-	const rgb = transform(LMS_TO_RGB, lms[0] ** 3, lms[1] ** 3, lms[2] ** 3);
-	return [fromLinear(rgb[0]), fromLinear(rgb[1]), fromLinear(rgb[2])];
+function oklabToLinearInto(l: number, a: number, b: number, out: number[], offset: number): number[] {
+	const long = dot(OKLAB_TO_LMS, 0, l, a, b) ** 3;
+	const medium = dot(OKLAB_TO_LMS, 3, l, a, b) ** 3;
+	const short = dot(OKLAB_TO_LMS, 6, l, a, b) ** 3;
+	out[offset] = dot(LMS_TO_RGB, 0, long, medium, short);
+	out[offset + 1] = dot(LMS_TO_RGB, 3, long, medium, short);
+	out[offset + 2] = dot(LMS_TO_RGB, 6, long, medium, short);
+	return out;
 }
 
 /**
@@ -374,23 +368,108 @@ function oklabToSrgb(l: number, a: number, b: number): number[] {
  * oklabOf({ r: 255, g: 255, b: 255 }); // => [1, 0, 0]
  */
 function oklabOf(rgb: Rgb): number[] {
-	const lms = transform(RGB_TO_LMS, linearChannel(rgb.r), linearChannel(rgb.g), linearChannel(rgb.b));
-	const lab = transform(LMS_TO_OKLAB, Math.cbrt(lms[0]), Math.cbrt(lms[1]), Math.cbrt(lms[2]));
-	const grey = Math.hypot(lab[1], lab[2]) < ACHROMATIC;
-	return [Math.min(Math.max(lab[0], 0), 1), grey ? 0 : lab[1], grey ? 0 : lab[2]];
+	return oklabInto(rgb, [0, 0, 0], 0);
 }
 
 /**
- * Tells whether gamma-encoded sRGB channels are inside the gamut (within {@link GAMUT_EPSILON}).
- * @param {number[]} rgb - `[r, g, b]`
- * @returns {boolean} `true` when every channel is in `[0, 1]`
+ * Writes the OKLab coordinates of a normalized colour (as {@link oklabOf} computes them) into `out`, without allocating.
+ * @param {Rgb} rgb - The colour, already normalized by {@link toRgba}
+ * @param {number[]} out - The array receiving `l`, `a` and `b` (mutated)
+ * @param {number} offset - Index of `l` in `out`
+ * @returns {number[]} `out`
  * @example
- * isInside([1, 0.5, 0]); // => true
+ * oklabInto({ r: 0, g: 0, b: 0 }, [9, 9, 9, 9], 1); // => [9, 0, 0, 0]
  */
-function isInside(rgb: number[]): boolean {
-	return rgb.every(function (channel) {
-		return channel >= -GAMUT_EPSILON && channel <= 1 + GAMUT_EPSILON;
-	});
+function oklabInto(rgb: Rgb, out: number[], offset: number): number[] {
+	const r = linearChannel(rgb.r);
+	const g = linearChannel(rgb.g);
+	const b = linearChannel(rgb.b);
+	// The two matrix products, unrolled.
+	const long = Math.cbrt(dot(RGB_TO_LMS, 0, r, g, b));
+	const medium = Math.cbrt(dot(RGB_TO_LMS, 3, r, g, b));
+	const short = Math.cbrt(dot(RGB_TO_LMS, 6, r, g, b));
+	const lightness = dot(LMS_TO_OKLAB, 0, long, medium, short);
+	const greenRed = dot(LMS_TO_OKLAB, 3, long, medium, short);
+	const blueYellow = dot(LMS_TO_OKLAB, 6, long, medium, short);
+	const grey = Math.hypot(greenRed, blueYellow) < ACHROMATIC;
+	out[offset] = Math.min(Math.max(lightness, 0), 1);
+	out[offset + 1] = grey ? 0 : greenRed;
+	out[offset + 2] = grey ? 0 : blueYellow;
+	return out;
+}
+
+/**
+ * Tells whether a linear-light sRGB channel, once gamma encoded, is inside `[0, 1]` within {@link GAMUT_EPSILON}. {@link fromLinear}
+ * is increasing and reaches `-GAMUT_EPSILON` at `-5.80495e-6` and `1 + GAMUT_EPSILON` at `1.00017062`: away from those bounds the
+ * answer needs no `Math.pow`, and near them the channel is encoded and compared exactly, so the result is the same either way.
+ * @param {number} value - The linear channel
+ * @returns {boolean} `true` when the encoded channel is in the gamut (`false` for `NaN`)
+ * @example
+ * isInsideChannel(1); // => true
+ */
+function isInsideChannel(value: number): boolean {
+	if (value > -0.0000058 && value < 1.00017) return true;
+	if (value < -0.0000059 || value > 1.00018) return false;
+	const encoded = fromLinear(value);
+	return encoded >= -GAMUT_EPSILON && encoded <= 1 + GAMUT_EPSILON;
+}
+
+/**
+ * Tells whether linear-light sRGB channels are inside the gamut (within {@link GAMUT_EPSILON} once gamma encoded).
+ * @param {number[]} rgb - The array holding `r`, `g` and `b`
+ * @param {number} offset - Index of `r` in `rgb`
+ * @returns {boolean} `true` when every channel is in the gamut
+ * @example
+ * isInside([1, 0.5, 0], 0); // => true
+ */
+function isInside(rgb: number[], offset: number): boolean {
+	return isInsideChannel(rgb[offset]) && isInsideChannel(rgb[offset + 1]) && isInsideChannel(rgb[offset + 2]);
+}
+
+/**
+ * Clips a linear-light sRGB channel into the gamut once gamma encoded, writing the encoded value into `out[index]`.
+ * {@link fromLinear} is `<= 0` for `value <= 0` and `> 1` above `1.0000000000000004`, and {@link toLinear} maps `0` and `1` to
+ * themselves: those clipped channels skip both `Math.pow` calls, with the same results.
+ * @param {number} value - The linear channel
+ * @param {number[]} out - The array receiving the encoded channel, in `[0, 1]` (mutated)
+ * @param {number} index - Where to write it
+ * @returns {number} The clipped channel, back in linear light
+ * @example
+ * clipChannel(2, [0], 0); // => 1
+ */
+function clipChannel(value: number, out: number[], index: number): number {
+	if (value <= 0) return (out[index] = 0);
+	if (value > 1.0000001) return (out[index] = 1);
+	const encoded = Math.min(fromLinear(value), 1);
+	out[index] = encoded;
+	return toLinear(encoded);
+}
+
+/**
+ * Scratch space of {@link oklchToBytes}, so that the gamut mapping allocates nothing: the gamma-encoded colour being built (indices
+ * 0–2) and the linear-light colour being tested (3–5). Safe to share: {@link oklchToBytes} runs no user code while it uses it.
+ */
+const GAMUT_SCRATCH = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+
+/**
+ * Clips the linear-light colour in `GAMUT_SCRATCH[3..5]` (the OKLab colour `(l, a, b)`) into the gamut, writing the clipped
+ * gamma-encoded channels into `GAMUT_SCRATCH[0..2]`, and measures how far clipping moved it.
+ * @param {number} l - Lightness
+ * @param {number} a - Green–red axis
+ * @param {number} b - Blue–yellow axis
+ * @param {number[]} rgb - {@link GAMUT_SCRATCH} (mutated)
+ * @returns {number} The deltaEOK between the clipped and the unclipped colour
+ * @example
+ * clipInto(1, 0, 0, [0, 0, 0, 1, 1, 1]) < 1e-7; // => true
+ */
+function clipInto(l: number, a: number, b: number, rgb: number[]): number {
+	const r = clipChannel(rgb[3], rgb, 0);
+	const g = clipChannel(rgb[4], rgb, 1);
+	const blue = clipChannel(rgb[5], rgb, 2);
+	const long = Math.cbrt(dot(RGB_TO_LMS, 0, r, g, blue));
+	const medium = Math.cbrt(dot(RGB_TO_LMS, 3, r, g, blue));
+	const short = Math.cbrt(dot(RGB_TO_LMS, 6, r, g, blue));
+	return Math.hypot(dot(LMS_TO_OKLAB, 0, long, medium, short) - l, dot(LMS_TO_OKLAB, 3, long, medium, short) - a, dot(LMS_TO_OKLAB, 6, long, medium, short) - b);
 }
 
 /**
@@ -398,6 +477,7 @@ function isInside(rgb: number[]): boolean {
  * `>= 1` gives white and `<= 0` black; otherwise the chroma is reduced (binary search, keeping lightness and hue) until clipping the
  * colour changes it by less than one just noticeable difference (deltaEOK `0.02`), and that clipped colour is used. Unlike plain
  * clipping, this keeps the hue and lightness of vivid colours. The channels are written into `target` (any other property is kept).
+ * Allocation-free.
  * @template T - Type of the target object
  * @param {number} l - Lightness (not `NaN`)
  * @param {number} c - Chroma (not `NaN`): negative values count as `0`, values above {@link MAX_CHROMA} as `MAX_CHROMA`
@@ -411,46 +491,30 @@ function oklchToBytes<T extends Rgb>(l: number, c: number, h: number, target: T)
 	const radians = (h % 360) / DEGREES;
 	const cos = Math.cos(radians);
 	const sin = Math.sin(radians);
-	let rgb = [1, 1, 1];
-
-	/**
-	 * The sRGB channels of the colour at this chroma (same lightness and hue).
-	 * @param {number} chroma - The chroma
-	 * @returns {number[]} `[r, g, b]`, possibly out of `[0, 1]`
-	 */
-	function at(chroma: number): number[] {
-		return oklabToSrgb(l, chroma * cos, chroma * sin);
-	}
-
-	/**
-	 * Clips the colour at this chroma into the gamut, keeping the result in `rgb`, and measures how far clipping moved it.
-	 * @param {number} chroma - The chroma
-	 * @returns {number} The deltaEOK between the clipped and the unclipped colour
-	 */
-	function clip(chroma: number): number {
-		rgb = at(chroma).map(function (channel) {
-			return Math.min(Math.max(channel, 0), 1);
-		});
-		const lab = srgbToOklab(rgb[0], rgb[1], rgb[2]);
-		return Math.hypot(lab[0] - l, lab[1] - chroma * cos, lab[2] - chroma * sin);
-	}
-
-	if (l <= 0) rgb = [0, 0, 0];
-	else if (l < 1) {
+	const rgb = GAMUT_SCRATCH;
+	if (l > 0 && l < 1) {
 		let max = c > 0 ? Math.min(c, MAX_CHROMA) : 0;
-		rgb = at(max);
+		const a = max * cos;
+		const b = max * sin;
+		oklabToLinearInto(l, a, b, rgb, 3);
 		// CSS Color 4 gamut mapping: done when in gamut, or when clipping is unnoticeable (deltaEOK < JND = 0.02); otherwise binary
 		// search the chroma (to within 0.0001) for the most colourful clipped colour that stays within one JND of its unclipped self.
-		if (!isInside(rgb) && clip(max) >= 0.02) {
+		// `rgb[0..2]` ends up holding the colour at `max` if in gamut, or else the last colour `clipInto` clipped.
+		if (isInside(rgb, 3)) {
+			rgb[0] = fromLinear(rgb[3]);
+			rgb[1] = fromLinear(rgb[4]);
+			rgb[2] = fromLinear(rgb[5]);
+		} else if (clipInto(l, a, b, rgb) >= 0.02) {
 			let min = 0;
 			let minInGamut = true;
 			while (max - min > 0.0001) {
 				const chroma = (min + max) / 2;
-				if (minInGamut && isInside(at(chroma))) {
+				oklabToLinearInto(l, chroma * cos, chroma * sin, rgb, 3);
+				if (minInGamut && isInside(rgb, 3)) {
 					min = chroma;
 					continue;
 				}
-				const delta = clip(chroma);
+				const delta = clipInto(l, chroma * cos, chroma * sin, rgb);
 				if (delta >= 0.02) max = chroma;
 				else if (0.02 - delta < 0.0001) break;
 				else {
@@ -459,6 +523,12 @@ function oklchToBytes<T extends Rgb>(l: number, c: number, h: number, target: T)
 				}
 			}
 		}
+	} else {
+		// White at `l >= 1` (and for a `NaN` lightness, which callers exclude), black at `l <= 0`.
+		const channel = l <= 0 ? 0 : 1;
+		rgb[0] = channel;
+		rgb[1] = channel;
+		rgb[2] = channel;
 	}
 	target.r = toByte(rgb[0] * 255);
 	target.g = toByte(rgb[1] * 255);
@@ -1701,7 +1771,7 @@ export function inGamut(oklch: OklchInput): boolean {
 	const [l, c, h] = readOklch('inGamut', oklch);
 	const radians = (h % 360) / DEGREES;
 	const chroma = c > 0 ? Math.min(c, MAX_CHROMA) : 0;
-	return isInside(oklabToSrgb(l, chroma * Math.cos(radians), chroma * Math.sin(radians)));
+	return isInside(oklabToLinearInto(l, chroma * Math.cos(radians), chroma * Math.sin(radians), [0, 0, 0], 0), 0);
 }
 
 /**
@@ -1755,8 +1825,30 @@ export function withAlpha(color: ColorInput, alpha: number): Rgba {
  * relativeLuminance('#ff0000'); // => 0.2126
  */
 export function relativeLuminance(color: ColorInput): number {
-	const { r, g, b } = toRgba(color);
-	return Math.min(1, 0.2126 * linearChannel(r) + 0.7152 * linearChannel(g) + 0.0722 * linearChannel(b));
+	return luminanceOf(toRgba(color));
+}
+
+/**
+ * Computes the WCAG 2.x relative luminance of a normalized colour, as {@link relativeLuminance} does.
+ * @param {Rgb} rgb - The colour, already normalized by {@link toRgba}
+ * @returns {number} The relative luminance, in `[0, 1]`
+ * @example
+ * luminanceOf({ r: 255, g: 0, b: 0 }); // => 0.2126
+ */
+function luminanceOf(rgb: Rgb): number {
+	return Math.min(1, 0.2126 * linearChannel(rgb.r) + 0.7152 * linearChannel(rgb.g) + 0.0722 * linearChannel(rgb.b));
+}
+
+/**
+ * Computes the WCAG 2.x contrast ratio of two relative luminances, as {@link contrastRatio} does.
+ * @param {number} first - A relative luminance, in `[0, 1]`
+ * @param {number} second - Another one
+ * @returns {number} The contrast ratio, in `[1, 21]`
+ * @example
+ * contrastOf(0, 1); // => 21
+ */
+function contrastOf(first: number, second: number): number {
+	return clamp((Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05), 1, 21);
 }
 
 /**
@@ -1773,9 +1865,7 @@ export function relativeLuminance(color: ColorInput): number {
  * contrastRatio('#abc', '#abc'); // => 1
  */
 export function contrastRatio(a: ColorInput, b: ColorInput): number {
-	const first = relativeLuminance(a);
-	const second = relativeLuminance(b);
-	return clamp((Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05), 1, 21);
+	return contrastOf(relativeLuminance(a), relativeLuminance(b));
 }
 
 /**
@@ -1832,4 +1922,627 @@ export function meetsContrast(foreground: ColorInput, background: ColorInput, op
 	if (level !== 'AA' && level !== 'AAA') throw new RangeError(`meetsContrast: \`level\` must be 'AA' or 'AAA', got ${show(level)}`);
 	const threshold = level === 'AA' ? (largeText ? 3 : 4.5) : largeText ? 4.5 : 7;
 	return contrastRatio(foreground, background) >= threshold;
+}
+
+/**
+ * A colour in the CIELAB (CIE 1976 L\*a\*b\*) space relative to the D50 white, as CSS Color 4 `lab()` and colorjs.io's `lab` space
+ * define it: the space of the classic colour-difference formulas ({@link deltaE}, {@link ciede2000}).
+ */
+export interface Lab {
+	/** Lightness, `0` (black) – `100` (white). */
+	l: number;
+	/** Green (negative) – red (positive) axis, within about `±130` inside sRGB. */
+	a: number;
+	/** Blue (negative) – yellow (positive) axis, within about `±130` inside sRGB. */
+	b: number;
+	/** Alpha, `0` (transparent) – `1` (opaque). Optional on input (ignored by {@link ciede2000}); always set on the values this module returns. */
+	alpha?: number;
+}
+
+/**
+ * Linear-light sRGB to CIE XYZ relative to D50, each row divided by the D50 white's component (so white maps to `(1, 1, 1)` and `f(1)`
+ * in {@link cielabInto} needs no division): CSS Color 4's sRGB → XYZ D65 matrix (from the sRGB primaries and the D65 white
+ * `(0.3127, 0.3290)`), followed by its Bradford adaptation to D50 `(0.3457, 0.3585)`, multiplied out at double precision.
+ */
+const RGB_TO_XYZ_D50 = [
+	0.45221165824248055, 0.399412253942934, 0.1483760878145855, 0.22249317711056518, 0.7168870130944827, 0.06061980979495238, 0.01687534092138682, 0.11765941425612084,
+	0.8654652448224927
+];
+
+/**
+ * The CIELAB companding function `f` of a white-relative XYZ component (CIE 15: `t^(1/3)` above `ε = 216/24389`, linear below it).
+ * @param {number} value - The component, relative to the white
+ * @returns {number} `f(value)`
+ * @example
+ * labCompand(1); // => 1
+ */
+function labCompand(value: number): number {
+	return value > 216 / 24389 ? Math.cbrt(value) : ((24389 / 27) * value + 16) / 116;
+}
+
+/**
+ * Writes the CIELAB (D50) coordinates of a normalized colour into `out`, without allocating: greys (`r = g = b`) get exactly
+ * `a = b = 0` and the lightness is clamped to `[0, 100]` (white's is `100` within an ulp).
+ * @param {Rgb} rgb - The colour, already normalized by {@link toRgba}
+ * @param {number[]} out - The array receiving `l`, `a` and `b` (mutated)
+ * @param {number} offset - Index of `l` in `out`
+ * @returns {number[]} `out`
+ * @example
+ * cielabInto({ r: 0, g: 0, b: 0 }, [9, 9, 9], 0); // => [0, 0, 0]
+ */
+function cielabInto(rgb: Rgb, out: number[], offset: number): number[] {
+	const r = linearChannel(rgb.r);
+	const g = linearChannel(rgb.g);
+	const b = linearChannel(rgb.b);
+	const y = dot(RGB_TO_XYZ_D50, 3, r, g, b);
+	const fy = labCompand(y);
+	// `f(0)` is `16 / 116`, which `116 *` rounds back to exactly 16: black gets exactly `L = 0`, and no `L` is negative.
+	out[offset] = Math.min(116 * fy - 16, 100);
+	const grey = rgb.r === rgb.g && rgb.g === rgb.b;
+	out[offset + 1] = grey ? 0 : 500 * (labCompand(dot(RGB_TO_XYZ_D50, 0, r, g, b)) - fy);
+	out[offset + 2] = grey ? 0 : 200 * (fy - labCompand(dot(RGB_TO_XYZ_D50, 6, r, g, b)));
+	return out;
+}
+
+/**
+ * Converts a colour to CIELAB relative to D50 (see {@link Lab}), as CSS Color 4 `lab()` and colorjs.io do: sRGB is linearized,
+ * converted to XYZ D65, adapted to D50 with the Bradford transform, then to L\*a\*b\*. Greys get exactly `a = b = 0`.
+ * @param {ColorInput} color - The colour (channels are clamped and rounded first, see {@link toRgba})
+ * @returns {Required<Lab>} The colour in CIELAB, with its alpha
+ * @throws {TypeError} when `color` is not a valid colour (see {@link toRgba})
+ * @throws {RangeError} when a channel is `NaN`
+ * @example
+ * toLab('#ffffff'); // => { l: 100, a: 0, b: 0, alpha: 1 }
+ * toLab('#000000'); // => { l: 0, a: 0, b: 0, alpha: 1 }
+ * const red = toLab('#ff0000');
+ * [red.l.toFixed(2), red.a.toFixed(2), red.b.toFixed(2)]; // => ['54.29', '80.80', '69.89'] // CSS Color 4 / colorjs.io
+ */
+export function toLab(color: ColorInput): Required<Lab> {
+	const rgba = toRgba(color);
+	const lab = cielabInto(rgba, [0, 0, 0], 0);
+	return { l: lab[0], a: lab[1], b: lab[2], alpha: rgba.a };
+}
+
+/**
+ * The chroma weight of the CIEDE2000 `G` and `R_C` terms, `sqrt(C^7 / (C^7 + 25^7))`, written as `sqrt(1 / (1 + (25 / C)^7))` so
+ * that it cannot overflow (`C = 0` gives `0`, a huge `C` gives `1`).
+ * @param {number} chroma - The chroma, `>= 0`
+ * @returns {number} The weight, in `[0, 1]`
+ * @example
+ * chromaWeight(25); // => Math.SQRT1_2
+ */
+function chromaWeight(chroma: number): number {
+	const ratio = 25 / chroma;
+	const square = ratio * ratio;
+	return Math.sqrt(1 / (1 + square * square * square * ratio));
+}
+
+/**
+ * The hue angle of `(a, b)` in degrees, in `[0, 360)` (`360` for a negative angle smaller than an ulp of `360`, as in Sharma's
+ * reference code). The hue of a grey (`a = b = 0`, which Sharma sets to `0`) is whatever `atan2` gives: it never matters, since
+ * {@link ciede2000Of} multiplies every hue term by the chroma.
+ * @param {number} a - The `a'` coordinate
+ * @param {number} b - The `b` coordinate
+ * @returns {number} The hue in degrees
+ * @example
+ * hueDegrees(0, -1); // => 270
+ */
+function hueDegrees(a: number, b: number): number {
+	const hue = Math.atan2(b, a) * DEGREES;
+	return hue < 0 ? hue + 360 : hue;
+}
+
+/**
+ * The CIEDE2000 colour difference of two CIELAB colours (Sharma, Wu & Dalal 2005, with `kL = kC = kH = 1`), allocation-free.
+ * @param {number} l1 - First lightness
+ * @param {number} a1 - First `a`
+ * @param {number} b1 - First `b`
+ * @param {number} l2 - Second lightness
+ * @param {number} a2 - Second `a`
+ * @param {number} b2 - Second `b`
+ * @returns {number} ΔE00, `>= 0`
+ * @example
+ * ciede2000Of(50, 2.5, 0, 50, 0, -2.5).toFixed(4); // => '4.3065'
+ */
+function ciede2000Of(l1: number, a1: number, b1: number, l2: number, a2: number, b2: number): number {
+	const scale = 1.5 - 0.5 * chromaWeight((Math.sqrt(a1 * a1 + b1 * b1) + Math.sqrt(a2 * a2 + b2 * b2)) / 2);
+	const aPrime1 = scale * a1;
+	const aPrime2 = scale * a2;
+	const c1 = Math.sqrt(aPrime1 * aPrime1 + b1 * b1);
+	const c2 = Math.sqrt(aPrime2 * aPrime2 + b2 * b2);
+	const h1 = hueDegrees(aPrime1, b1);
+	const h2 = hueDegrees(aPrime2, b2);
+	// Sharma's hue difference `Δh'` is `h2 - h1` brought into [-180°, 180°] by ±360°, which flips the sign of `sin(Δh' / 2)`
+	// whichever way it goes; the mean hue moves by 180° the other way round the circle. With a grey (`c1 c2 = 0`), Sharma sets
+	// `Δh' = 0` and the mean hue to the sum of the hues: `ΔH'` is 0 either way, and the mean hue then only reaches terms multiplied
+	// by `ΔH'`, so the general formulas give the same result.
+	const deltaHue = h2 - h1;
+	const sum = h1 + h2;
+	const wrapped = deltaHue > 180 || deltaHue < -180;
+	const meanHue = (wrapped ? (sum < 360 ? sum + 360 : sum - 360) : sum) / 2;
+	const deltaH = (wrapped ? -2 : 2) * Math.sqrt(c1 * c2) * Math.sin(deltaHue / 2 / DEGREES);
+	const meanL = (l1 + l2) / 2 - 50;
+	const meanC = (c1 + c2) / 2;
+	const t =
+		1 -
+		0.17 * Math.cos((meanHue - 30) / DEGREES) +
+		0.24 * Math.cos((2 * meanHue) / DEGREES) +
+		0.32 * Math.cos((3 * meanHue + 6) / DEGREES) -
+		0.2 * Math.cos((4 * meanHue - 63) / DEGREES);
+	const rotation = 30 * Math.exp(-(((meanHue - 275) / 25) ** 2));
+	const rt = -2 * chromaWeight(meanC) * Math.sin((2 * rotation) / DEGREES);
+	const dl = (l2 - l1) / (1 + (0.015 * meanL * meanL) / Math.sqrt(20 + meanL * meanL));
+	const dc = (c2 - c1) / (1 + 0.045 * meanC);
+	const dh = deltaH / (1 + 0.015 * meanC * t);
+	return Math.sqrt(dl * dl + dc * dc + dh * dh + rt * dc * dh);
+}
+
+/**
+ * Reads a finite component of a {@link Lab} object for `caller`.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {string} name - Name of the validated parameter
+ * @param {Lab} lab - The colour
+ * @param {'l' | 'a' | 'b'} key - The component
+ * @returns {number} The component
+ * @throws {TypeError} when the component is not a number
+ * @throws {RangeError} when it is not finite
+ * @example
+ * readLab('ciede2000', 'first', { l: 50, a: 0, b: 0 }, 'l'); // => 50
+ */
+function readLab(caller: string, name: string, lab: Lab, key: 'l' | 'a' | 'b'): number {
+	const value = readOption(lab, key);
+	if (!Number.isFinite(value)) assertNumber(caller, `${name}.${key}`, value, false, 'a finite number');
+	return value as number;
+}
+
+/**
+ * Computes the CIEDE2000 colour difference ΔE00 (CIE 142-2001) between two CIELAB colours, following Sharma, Wu & Dalal, "The
+ * CIEDE2000 color-difference formula: implementation notes, supplementary test data, and mathematical observations" (2005): it
+ * matches all 34 of their test pairs to 4 decimals, including the hue-angle discontinuities. The weighting factors are the reference
+ * ones (`kL = kC = kH = 1`). Symmetric, `0` for identical colours; about `1` is a just noticeable difference, and `2` to `3` is
+ * visible at a glance. Use it on `Lab` values you already have (from a spectrophotometer or a design tool); for colours of this
+ * module, `deltaE(a, b, { method: '2000' })` converts them first (see {@link toLab}). Alpha is ignored.
+ * @param {Lab} first - First colour (`l`, `a` and `b` finite, of any sign; magnitudes above about `1e150` overflow to `NaN`)
+ * @param {Lab} second - Second colour
+ * @returns {number} ΔE00, `>= 0`
+ * @throws {TypeError} when a colour is not an object or a component is not a number
+ * @throws {RangeError} when a component is not finite
+ * @example
+ * ciede2000({ l: 50, a: 2.6772, b: -79.7751 }, { l: 50, a: 0, b: -82.7485 }).toFixed(4); // => '2.0425' // Sharma et al., pair 1
+ * ciede2000({ l: 50, a: 2.5, b: 0 }, { l: 73, a: 25, b: -18 }).toFixed(4); // => '27.1492'
+ * ciede2000(toLab('#ff0000'), toLab('#ff0000')); // => 0
+ */
+export function ciede2000(first: Lab, second: Lab): number {
+	if (typeof first !== 'object' || first === null) throw new TypeError(`ciede2000: \`first\` must be an { l, a, b } object, got ${describe(first)}`);
+	if (typeof second !== 'object' || second === null) throw new TypeError(`ciede2000: \`second\` must be an { l, a, b } object, got ${describe(second)}`);
+	return ciede2000Of(
+		readLab('ciede2000', 'first', first, 'l'),
+		readLab('ciede2000', 'first', first, 'a'),
+		readLab('ciede2000', 'first', first, 'b'),
+		readLab('ciede2000', 'second', second, 'l'),
+		readLab('ciede2000', 'second', second, 'a'),
+		readLab('ciede2000', 'second', second, 'b')
+	);
+}
+
+/**
+ * Colour-difference formula of {@link deltaE}: `'ok'` (deltaEOK, Euclidean distance in OKLab), `'2000'` (CIEDE2000 in CIELAB) or `'76'`
+ * (CIE76, Euclidean distance in CIELAB).
+ */
+export type DeltaEMethod = 'ok' | '2000' | '76';
+
+/**
+ * Options accepted by {@link deltaE}.
+ */
+export interface DeltaEOptions {
+	/**
+	 * The formula.
+	 * @default 'ok'
+	 */
+	method?: DeltaEMethod;
+}
+
+/**
+ * Measures how different two colours look (ΔE), with the conventions of CSS Color 4 and colorjs.io:
+ *
+ * - `'ok'` (default): **deltaEOK**, the Euclidean distance in OKLab (see {@link toOklab}), on OKLab's own scale where lightness runs
+ *   from `0` to `1`: black to white is `1`, and `0.02` is about one just noticeable difference (the threshold of CSS gamut mapping).
+ *   Not multiplied by 100: multiply it yourself to compare it with the CIELAB formulas (colorjs.io's `deltaEOK` is unscaled too).
+ *   Cheap, and nearly as perceptually uniform as CIEDE2000.
+ * - `'2000'`: **CIEDE2000** ({@link ciede2000}) on CIELAB D50 coordinates (see {@link toLab}: Bradford-adapted, as CSS `lab()` and
+ *   colorjs.io's `deltaE2000`), on the CIELAB scale where about `1` is a just noticeable difference and black to white is `100`.
+ *   The industry standard; the slowest of the three.
+ * - `'76'`: **CIE76**, the Euclidean distance in the same CIELAB D50 coordinates. Overstates differences of saturated colours.
+ *
+ * Every formula is symmetric and gives exactly `0` for colours with the same 8-bit channels. Alpha is ignored (composite translucent
+ * colours over their background first, e.g. with {@link mix}).
+ * @param {ColorInput} a - First colour
+ * @param {ColorInput} b - Second colour
+ * @param {DeltaEOptions} [options={}] - `method` (`'ok'` (default), `'2000'` or `'76'`)
+ * @returns {number} The difference, `>= 0`
+ * @throws {TypeError} when a colour is invalid (see {@link toRgba})
+ * @throws {RangeError} when `options.method` is unknown, or a channel is `NaN`
+ * @example
+ * deltaE('#000000', '#ffffff'); // => 1
+ * deltaE('#ff0000', '#ff0000'); // => 0
+ * deltaE('#ff0000', '#fe0000').toFixed(4); // => '0.0020' // far below one JND (0.02)
+ * deltaE('#ff0000', '#0000ff').toFixed(4); // => '0.5371'
+ * deltaE('#000000', '#ffffff', { method: '2000' }); // => 100
+ * deltaE('#ff0000', '#0000ff', { method: '2000' }).toFixed(2); // => '55.80'
+ * deltaE('#ff0000', '#0000ff', { method: '76' }).toFixed(2); // => '184.02'
+ * deltaE('#000', '#fff', { method: 'cmc' as DeltaEMethod }); // throws RangeError
+ */
+export function deltaE(a: ColorInput, b: ColorInput, options: DeltaEOptions = {}): number {
+	const method = readOption(options, 'method', 'ok');
+	if (method !== 'ok' && method !== '2000' && method !== '76') throw new RangeError(`deltaE: \`options.method\` must be 'ok', '2000' or '76', got ${show(method)}`);
+	const first = toRgba(a);
+	const second = toRgba(b);
+	const coords = [0, 0, 0, 0, 0, 0];
+	if (method === 'ok') {
+		oklabInto(first, coords, 0);
+		oklabInto(second, coords, 3);
+	} else {
+		cielabInto(first, coords, 0);
+		cielabInto(second, coords, 3);
+		if (method === '2000') return ciede2000Of(coords[0], coords[1], coords[2], coords[3], coords[4], coords[5]);
+	}
+	const dl = coords[0] - coords[3];
+	const da = coords[1] - coords[4];
+	const db = coords[2] - coords[5];
+	return Math.sqrt(dl * dl + da * da + db * db);
+}
+
+/**
+ * Options accepted by {@link colorFromString}.
+ */
+export interface ColorFromStringOptions {
+	/**
+	 * The OKLCH lightness, in `[0, 1]`: one value, or a `[min, max]` range the hash picks from (both ends included).
+	 * @default 0.7
+	 */
+	lightness?: number | readonly [min: number, max: number];
+	/**
+	 * The OKLCH chroma, in `[0, 0.4]`: one value, or a `[min, max]` range the hash picks from (both ends included). Hues that cannot
+	 * reach it inside sRGB are gamut mapped (their chroma is reduced, keeping lightness and hue).
+	 * @default 0.15
+	 */
+	chroma?: number | readonly [min: number, max: number];
+	/**
+	 * The OKLCH hues to pick from, in degrees: `[start, end)` with `start <= end <= start + 360` (`[200, 260]` for blues, `[330, 390]`
+	 * for pinks to oranges across red).
+	 * @default [0, 360]
+	 */
+	hueRange?: readonly [start: number, end: number];
+	/**
+	 * A colour the result must stay readable against (the text colour of an avatar, the page background of a tag): when the WCAG
+	 * contrast ratio of the picked colour with it is below `minContrast`, the colour's lightness is moved (darker or lighter, the same
+	 * way for every string) just enough to reach it. Alpha is ignored.
+	 */
+	contrastWith?: ColorInput;
+	/**
+	 * The WCAG 2.x contrast ratio to guarantee against `contrastWith` (which must be set), in `[1, 21]`: `4.5` is AA for normal text,
+	 * `3` for large text and UI components.
+	 * @default 4.5
+	 */
+	minContrast?: number;
+	/**
+	 * `'hex'` returns a `'#rrggbb'` string, `'rgb'` an {@link Rgba} object (opaque).
+	 * @default 'hex'
+	 */
+	format?: 'hex' | 'rgb';
+}
+
+/**
+ * One FNV-1a step: mixes a byte into a 32-bit hash.
+ * @param {number} hash - The hash so far
+ * @param {number} byte - The byte, `0`–`255`
+ * @returns {number} The new hash (a signed 32-bit integer)
+ * @example
+ * fnvByte(0x811c9dc5, 0x61) >>> 0; // => 0xe40c292c
+ */
+function fnvByte(hash: number, byte: number): number {
+	return Math.imul(hash ^ byte, 0x01000193);
+}
+
+/**
+ * Hashes a string: 32-bit FNV-1a over its UTF-8 encoding (computed on the fly, without allocating; a lone surrogate is encoded as
+ * U+FFFD, as `TextEncoder` does), then the MurmurHash3 `fmix32` finalizer, so that every input bit affects every output bit (plain
+ * FNV-1a gives `'user1'` and `'user2'` nearly equal high bits). Exact integer arithmetic: the same in every JavaScript engine, and in
+ * any language that hashes the same bytes.
+ * @param {string} text - The string
+ * @returns {number} The hash, an unsigned 32-bit integer
+ * @example
+ * hashText('') === hashText('\ud800'); // => false
+ */
+function hashText(text: string): number {
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < text.length; i++) {
+		let code = text.charCodeAt(i);
+		if (code < 0x80) {
+			hash = fnvByte(hash, code);
+			continue;
+		}
+		if (code < 0x800) {
+			hash = fnvByte(fnvByte(hash, 0xc0 | (code >> 6)), 0x80 | (code & 63));
+			continue;
+		}
+		if (code >= 0xd800 && code <= 0xdfff) {
+			// `charCodeAt` past the end is `NaN`, which fails both comparisons.
+			const next = text.charCodeAt(i + 1);
+			if (code <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+				code = 0x10000 + ((code - 0xd800) << 10) + (next - 0xdc00);
+				hash = fnvByte(fnvByte(hash, 0xf0 | (code >> 18)), 0x80 | ((code >> 12) & 63));
+				hash = fnvByte(fnvByte(hash, 0x80 | ((code >> 6) & 63)), 0x80 | (code & 63));
+				i++;
+				continue;
+			}
+			code = 0xfffd;
+		}
+		hash = fnvByte(fnvByte(fnvByte(hash, 0xe0 | (code >> 12)), 0x80 | ((code >> 6) & 63)), 0x80 | (code & 63));
+	}
+	hash ^= hash >>> 16;
+	hash = Math.imul(hash, 0x85ebca6b);
+	hash ^= hash >>> 13;
+	hash = Math.imul(hash, 0xc2b2ae35);
+	return (hash ^ (hash >>> 16)) >>> 0;
+}
+
+/**
+ * Shows an array option that should be a pair in an error message: `[a, b]` for two elements, only its length otherwise (an
+ * attacker-sized array must not end up whole in logs).
+ * @param {readonly unknown[]} value - The array
+ * @returns {string} Its text for the message
+ * @example
+ * showPair([1, 'x']); // => '[1, x]'
+ * showPair([1, 2, 3]); // => 'an array of length 3'
+ */
+function showPair(value: readonly unknown[]): string {
+	return value.length === 2 ? `[${show(value[0])}, ${show(value[1])}]` : `an array of length ${value.length}`;
+}
+
+/**
+ * Reads a `number | [min, max]` option of {@link colorFromString} and picks the value at `fraction` of its range.
+ * @param {string} name - The option name, for the error message
+ * @param {unknown} value - The option value (`undefined` gives `fallback`)
+ * @param {number} fallback - The default value
+ * @param {number} high - The largest accepted value (the smallest is `0`)
+ * @param {number} fraction - Where to pick in the range, in `[0, 1]`
+ * @returns {number} `min + fraction * (max - min)`
+ * @throws {TypeError} when the option is neither a number nor an array
+ * @throws {RangeError} when a value is out of `[0, high]`, or `min > max`
+ * @example
+ * pickInRange('lightness', [0.2, 0.4], 0.7, 1, 1); // => 0.4
+ */
+function pickInRange(name: string, value: unknown, fallback: number, high: number, fraction: number): number {
+	const expected = `a number in [0, ${high}] or a [min, max] pair of them`;
+	if (value === undefined) return fallback;
+	if (typeof value === 'number') {
+		assertNumber('colorFromString', `options.${name}`, value, value >= 0 && value <= high, expected);
+		return value;
+	}
+	if (!Array.isArray(value)) throw new TypeError(`colorFromString: \`options.${name}\` must be ${expected}, got ${describe(value)}`);
+	const min: unknown = value[0];
+	const max: unknown = value[1];
+	if (!(value.length === 2 && typeof min === 'number' && typeof max === 'number' && min >= 0 && min <= max && max <= high)) {
+		throw new RangeError(`colorFromString: \`options.${name}\` must be ${expected} with min <= max, got ${showPair(value)}`);
+	}
+	return lerp(min, max, fraction);
+}
+
+/**
+ * Derives a stable colour from a string, for avatars, tags, labels or chart series: the same text always gives the same colour, in
+ * every runtime, and different texts are spread evenly over the hues (similar strings such as `'user1'` and `'user2'` land far apart).
+ *
+ * The string is hashed (32-bit FNV-1a over its UTF-8 bytes, then the MurmurHash3 `fmix32` finalizer; exact integer arithmetic): the
+ * high 16 bits of the hash pick the OKLCH hue in `hueRange`, the next 8 the lightness and the low 8 the chroma within their ranges
+ * (when ranges are given). The colour is built in OKLCH, so every hue looks equally light and colourful (HSL-based schemes give
+ * glaring yellows and murky blues), then gamut mapped into sRGB like {@link oklchToRgb}. Strings with the same UTF-8 encoding (such as
+ * a lone surrogate and U+FFFD) get the same colour.
+ *
+ * With `contrastWith`, the result is guaranteed to have a WCAG contrast ratio of at least `minContrast` (default `4.5`) against that
+ * colour: its lightness is moved towards black or white (whichever reaches the higher contrast against `contrastWith`, so all colours
+ * move the same way) just far enough to reach the ratio (searched to within `0.0005` of lightness, a fraction of an 8-bit step), keeping chroma and hue; a colour that
+ * already reaches it is unchanged.
+ *
+ * The conversion uses `Math.cbrt`, `Math.pow`, `Math.cos` and `Math.sin`, which engines may round differently in the last bit; the
+ * result is rounded to 8-bit channels, so in practice every engine gives the same colour (the tests pin reference outputs).
+ * Linear in the length of the string, without allocating for it.
+ * @param {string} text - The string (any length, `''` included)
+ * @param {ColorFromStringOptions} [options={}] - `lightness` (default `0.7`), `chroma` (default `0.15`), `hueRange` (default
+ * `[0, 360]`), `contrastWith`, `minContrast` (default `4.5`) and `format` (`'hex'` (default) or `'rgb'`)
+ * @returns {string | Rgba} The colour, as `'#rrggbb'` or as an opaque {@link Rgba} object (`format: 'rgb'`)
+ * @throws {TypeError} when `text` is not a string, an option has the wrong type, `contrastWith` is not a valid colour, or `minContrast`
+ * is set without `contrastWith`
+ * @throws {RangeError} when an option is out of range, `format` is unknown, or `minContrast` cannot be reached against `contrastWith`
+ * (it is at most `21` against black or white, and less against mid-tones)
+ * @example
+ * colorFromString('Ada Lovelace'); // => '#7cb145'
+ * colorFromString('Grace Hopper'); // => '#b982e5'
+ * colorFromString('Ada Lovelace', { format: 'rgb' }); // => { r: 124, g: 177, b: 69, a: 1 }
+ * colorFromString('bug', { hueRange: [0, 40], lightness: [0.5, 0.6] }); // => '#b74731' // reds and oranges
+ * // Readable white text on every avatar (AA: 4.5:1):
+ * colorFromString('Ada Lovelace', { contrastWith: '#fff' }); // => '#528409'
+ * contrastRatio(colorFromString('Grace Hopper', { contrastWith: '#fff' }), '#fff') >= 4.5; // => true
+ * colorFromString('x', { lightness: 2 }); // throws RangeError
+ * colorFromString('x', { contrastWith: '#777', minContrast: 7 }); // throws RangeError // 4.69 at most against #777
+ */
+export function colorFromString(text: string, options?: ColorFromStringOptions & { format?: 'hex' }): string;
+export function colorFromString(text: string, options: ColorFromStringOptions & { format: 'rgb' }): Rgba;
+export function colorFromString(text: string, options?: ColorFromStringOptions): string | Rgba;
+/**
+ * Implementation of {@link colorFromString} (see the first overload for the full documentation).
+ * @param {string} text - The string
+ * @param {ColorFromStringOptions} [options={}] - The options
+ * @returns {string | Rgba} The colour
+ */
+export function colorFromString(text: string, options: ColorFromStringOptions = {}): string | Rgba {
+	if (typeof text !== 'string') throw new TypeError(`colorFromString: \`text\` must be a string, got ${describe(text)}`);
+	const format = readOption(options, 'format', 'hex');
+	if (format !== 'hex' && format !== 'rgb') throw new RangeError(`colorFromString: \`options.format\` must be 'hex' or 'rgb', got ${show(format)}`);
+	const hueRange = readOption(options, 'hueRange');
+	let start = 0;
+	let end = 360;
+	if (hueRange !== undefined) {
+		if (!Array.isArray(hueRange)) throw new TypeError(`colorFromString: \`options.hueRange\` must be a [start, end] pair of degrees, got ${describe(hueRange)}`);
+		start = hueRange[0];
+		end = hueRange[1];
+		if (!(hueRange.length === 2 && Number.isFinite(start) && Number.isFinite(end) && start <= end && end - start <= 360)) {
+			throw new RangeError(
+				`colorFromString: \`options.hueRange\` must be a [start, end] pair of finite degrees with start <= end <= start + 360, got ${showPair(hueRange)}`
+			);
+		}
+	}
+	const hash = hashText(text);
+	const l = pickInRange('lightness', readOption(options, 'lightness'), 0.7, 1, ((hash >>> 8) & 255) / 255);
+	const c = pickInRange('chroma', readOption(options, 'chroma'), 0.15, 0.4, (hash & 255) / 255);
+	const h = modulo(start + ((hash >>> 16) / 65536) * (end - start), 360);
+	const contrastWith = readOption(options, 'contrastWith');
+	const minContrast = readOption(options, 'minContrast');
+	const color = oklchToBytes(l, c, h, { r: 0, g: 0, b: 0, a: 1 });
+	if (contrastWith === undefined) {
+		if (minContrast !== undefined) throw new TypeError('colorFromString: `options.contrastWith` must be a colour when `options.minContrast` is set, got undefined');
+	} else {
+		const ratio = minContrast ?? 4.5;
+		assertNumber('colorFromString', 'options.minContrast', ratio, ratio >= 1 && ratio <= 21, 'a number in [1, 21]');
+		const against = luminanceOf(toRgba(contrastWith));
+		// The extremes (black and white, at lightness 0 and 1) have the most contrast each way: go towards the better one.
+		const darkest = contrastOf(against, 0);
+		const lightest = contrastOf(against, 1);
+		const best = Math.max(darkest, lightest);
+		if (ratio > best) throw new RangeError(`colorFromString: \`options.minContrast\` must be at most ${best} against \`options.contrastWith\`, got ${ratio}`);
+		if (contrastOf(against, luminanceOf(color)) < ratio) {
+			// Bisection between the picked lightness (too little contrast) and the extreme (enough), to within 0.0005 (a fraction of an
+			// 8-bit step), keeping a lightness that fails and one that passes: the result always has enough.
+			let fails = l;
+			let passes = darkest >= lightest ? 0 : 1;
+			while (Math.abs(passes - fails) > 0.0005) {
+				const middle = (fails + passes) / 2;
+				if (contrastOf(against, luminanceOf(oklchToBytes(middle, c, h, color))) >= ratio) passes = middle;
+				else fails = middle;
+			}
+			oklchToBytes(passes, c, h, color);
+		}
+	}
+	return format === 'rgb' ? color : `#${((color.r << 16) | (color.g << 8) | color.b).toString(16).padStart(6, '0')}`;
+}
+
+/**
+ * A colour vision deficiency simulated by {@link simulateColorVisionDeficiency}: missing (or, with a severity below `1`, anomalous)
+ * long-wavelength cones (`'protanopia'`, red-weak), medium-wavelength cones (`'deuteranopia'`, green-weak, the most common),
+ * short-wavelength cones (`'tritanopia'`, blue-yellow), or no colour vision at all (`'achromatopsia'`).
+ */
+export type ColorVisionDeficiency = 'protanopia' | 'deuteranopia' | 'tritanopia' | 'achromatopsia';
+
+/**
+ * Machado, Oliveira & Fernandes (2009) simulation matrices for protanomaly, in millionths (the published 6-decimal values): one
+ * row-major 3×3 matrix per severity `0.1`, `0.2`, … `1` (protanopia); severity `0` is the identity.
+ */
+const PROTAN = [
+	856167, 182038, -38205, 29342, 955115, 15544, -2880, -1563, 1004443, 734766, 334872, -69637, 51840, 919198, 28963, -4928, -4209, 1009137, 630323, 465641, -95964, 69181,
+	890046, 40773, -6308, -7724, 1014032, 539009, 579343, -118352, 82546, 866121, 51332, -7136, -11959, 1019095, 458064, 679578, -137642, 92785, 846313, 60902, -7494, -16807,
+	1024301, 385450, 769005, -154455, 100526, 829802, 69673, -7442, -22190, 1029632, 319627, 849633, -169261, 106241, 815969, 77790, -7025, -28051, 1035076, 259411, 923008,
+	-182420, 110296, 804340, 85364, -6276, -34346, 1040622, 203876, 990338, -194214, 112975, 794542, 92483, -5222, -41043, 1046265, 152286, 1052583, -204868, 114503, 786281,
+	99216, -3882, -48116, 1051998
+];
+
+/** Machado et al. (2009) matrices for deuteranomaly, as {@link PROTAN}. */
+const DEUTAN = [
+	866435, 177704, -44139, 49567, 939063, 11370, -3453, 7233, 996220, 760729, 319078, -79807, 90568, 889315, 20117, -6027, 13325, 992702, 675425, 433850, -109275, 125303,
+	847755, 26942, -7950, 18572, 989378, 605511, 528560, -134071, 155318, 812366, 32316, -9376, 23176, 986200, 547494, 607765, -155259, 181692, 781742, 36566, -10410, 27275,
+	983136, 498864, 674741, -173604, 205199, 754872, 39929, -11131, 30969, 980162, 457771, 731899, -189670, 226409, 731012, 42579, -11595, 34333, 977261, 422823, 781057,
+	-203881, 245752, 709602, 44646, -11843, 37423, 974421, 392952, 823610, -216562, 263559, 690210, 46232, -11910, 40281, 971630, 367322, 860646, -227968, 280085, 672501,
+	47413, -11820, 42940, 968881
+];
+
+/** Machado et al. (2009) matrices for tritanomaly, as {@link PROTAN}. */
+const TRITAN = [
+	926670, 92514, -19184, 21191, 964503, 14306, 8437, 54813, 936750, 895720, 133330, -29050, 29997, 945400, 24603, 13027, 104707, 882266, 905871, 127791, -33662, 26856,
+	941251, 31893, 13410, 148296, 838294, 948035, 89490, -37526, 14364, 946792, 38844, 10853, 193991, 795156, 1017277, 27029, -44306, -6113, 958479, 47634, 6379, 248708,
+	744913, 1104996, -46633, -58363, -32137, 971635, 60503, 1336, 317922, 680742, 1193214, -109812, -83402, -58496, 979410, 79086, -2346, 403492, 598854, 1257728, -139648,
+	-118081, -78003, 975409, 102594, -3316, 501214, 502102, 1278864, -125333, -153531, -84748, 957674, 127074, -989, 601151, 399838, 1255528, -76749, -178779, -78411, 930809,
+	147602, 4733, 691367, 303900
+];
+
+/**
+ * One coefficient of a simulation matrix at a severity between two tabulated ones (linear interpolation, the identity below `0.1`).
+ * @param {readonly number[]} table - {@link PROTAN}, {@link DEUTAN} or {@link TRITAN}
+ * @param {number} level - The tabulated severity below, times 10: `0` (the identity) to `9`
+ * @param {number} fraction - The position between it and the next one, in `[0, 1]`
+ * @param {number} index - The coefficient, `0`–`8` (row-major)
+ * @returns {number} The interpolated coefficient
+ * @example
+ * cvdCoefficient(PROTAN, 9, 1, 0); // => 0.152286
+ */
+function cvdCoefficient(table: readonly number[], level: number, fraction: number, index: number): number {
+	const from = level === 0 ? (index % 4 === 0 ? 1 : 0) : table[(level - 1) * 9 + index] / 1e6;
+	return lerp(from, table[level * 9 + index] / 1e6, fraction);
+}
+
+/**
+ * Encodes a linear channel to an 8-bit sRGB channel, clipping it to `[0, 1]` first.
+ * @param {number} value - The linear channel
+ * @returns {number} An integer in `[0, 255]`
+ * @example
+ * encodeLinear(2); // => 255
+ */
+function encodeLinear(value: number): number {
+	return toByte(fromLinear(Math.min(Math.max(value, 0), 1)) * 255);
+}
+
+/**
+ * Simulates how a colour looks to someone with a colour vision deficiency, to check that a palette, chart or UI state stays
+ * distinguishable. Protanopia, deuteranopia and tritanopia use the physiologically based model of Machado, Oliveira & Fernandes, "A
+ * Physiologically-based Model for Simulation of Color Vision Deficiency" (IEEE TVCG, 2009), with their published matrices; a severity
+ * below `1` simulates the anomalous trichromacy (protanomaly, deuteranomaly, tritanomaly), interpolating linearly between their
+ * matrices for severities `0`, `0.1`, … `1`. Achromatopsia replaces the
+ * colour by the grey of the same relative luminance (the WCAG `0.2126 R + 0.7152 G + 0.0722 B`), mixed with the colour in linear light
+ * at severities below `1`.
+ *
+ * The matrices are applied to linear-light sRGB (the channels are linearized first, and the result is clipped to `[0, 1]` and encoded
+ * back), as the model requires; applying them to gamma-encoded channels, as many online simulators do, exaggerates the effect.
+ * Severity `0` returns the colour unchanged. Alpha is kept. The tables (about 1 kB) are only bundled with this function.
+ * @param {ColorInput} color - The colour
+ * @param {ColorVisionDeficiency} type - `'protanopia'`, `'deuteranopia'`, `'tritanopia'` or `'achromatopsia'`
+ * @param {number} [severity=1] - From `0` (normal vision) to `1` (complete deficiency)
+ * @returns {Rgba} The colour as seen with the deficiency
+ * @throws {TypeError} when `color` is invalid (see {@link toRgba}), or `severity` is not a number
+ * @throws {RangeError} when `type` is unknown, `severity` is not in `[0, 1]`, or a channel is `NaN`
+ * @example
+ * simulateColorVisionDeficiency('#ff0000', 'protanopia'); // => { r: 109, g: 95, b: 0, a: 1 } // red looks dark olive
+ * simulateColorVisionDeficiency('#00ff00', 'deuteranopia'); // => { r: 239, g: 214, b: 58, a: 1 }
+ * simulateColorVisionDeficiency('#0000ff', 'tritanopia'); // => { r: 0, g: 107, b: 150, a: 1 }
+ * simulateColorVisionDeficiency('#ff0000', 'achromatopsia'); // => { r: 127, g: 127, b: 127, a: 1 }
+ * simulateColorVisionDeficiency('rgb(255 0 0 / 50%)', 'protanopia', 0.5); // => { r: 180, g: 86, b: 0, a: 0.5 } // protanomaly
+ * simulateColorVisionDeficiency('#ff0000', 'protanopia', 0); // => { r: 255, g: 0, b: 0, a: 1 }
+ * // Can deuteranopes tell a red and a green series apart? (deltaEOK: about 0.02 is a just noticeable difference)
+ * deltaE('#e41a1c', '#4daf4a').toFixed(2); // => '0.35'
+ * deltaE(simulateColorVisionDeficiency('#e41a1c', 'deuteranopia'), simulateColorVisionDeficiency('#4daf4a', 'deuteranopia')).toFixed(2); // => '0.08'
+ * simulateColorVisionDeficiency('#fff', 'colorblind' as ColorVisionDeficiency); // throws RangeError
+ */
+export function simulateColorVisionDeficiency(color: ColorInput, type: ColorVisionDeficiency, severity = 1): Rgba {
+	const caller = 'simulateColorVisionDeficiency';
+	const table = type === 'protanopia' ? PROTAN : type === 'deuteranopia' ? DEUTAN : type === 'tritanopia' ? TRITAN : undefined;
+	if (table === undefined && type !== 'achromatopsia') {
+		throw new RangeError(`${caller}: \`type\` must be 'protanopia', 'deuteranopia', 'tritanopia' or 'achromatopsia', got ${show(type)}`);
+	}
+	assertNumber(caller, 'severity', severity, severity >= 0 && severity <= 1, 'a number in [0, 1]');
+	const rgba = toRgba(color);
+	const r = linearChannel(rgba.r);
+	const g = linearChannel(rgba.g);
+	const b = linearChannel(rgba.b);
+	// `toRgba` returns a fresh object: overwrite its channels, keeping its alpha.
+	if (table === undefined) {
+		const grey = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+		rgba.r = encodeLinear(lerp(r, grey, severity));
+		rgba.g = encodeLinear(lerp(g, grey, severity));
+		rgba.b = encodeLinear(lerp(b, grey, severity));
+		return rgba;
+	}
+	// The tabulated severity below (0 to 9 tenths; 1 is the top of the last interval) and the position above it.
+	const level = Math.min(Math.floor(severity * 10), 9);
+	const fraction = severity * 10 - level;
+	rgba.r = encodeLinear(cvdCoefficient(table, level, fraction, 0) * r + cvdCoefficient(table, level, fraction, 1) * g + cvdCoefficient(table, level, fraction, 2) * b);
+	rgba.g = encodeLinear(cvdCoefficient(table, level, fraction, 3) * r + cvdCoefficient(table, level, fraction, 4) * g + cvdCoefficient(table, level, fraction, 5) * b);
+	rgba.b = encodeLinear(cvdCoefficient(table, level, fraction, 6) * r + cvdCoefficient(table, level, fraction, 7) * g + cvdCoefficient(table, level, fraction, 8) * b);
+	return rgba;
 }

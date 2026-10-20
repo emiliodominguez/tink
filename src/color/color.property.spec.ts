@@ -711,3 +711,497 @@ describe('Scales, names, adjustments and HSV (property-based)', function () {
 		);
 	});
 });
+
+/** CIELAB values, as finite doubles over and beyond the sRGB range, plus exact small integers (greys, axes). */
+const labComponent = fc.oneof(fc.double({ min: -160, max: 160, noNaN: true }), fc.integer({ min: -3, max: 3 }));
+const lab = fc.record({ l: fc.oneof(fc.double({ min: 0, max: 100, noNaN: true }), fc.constantFrom(0, 50, 100)), a: labComponent, b: labComponent });
+
+/**
+ * CIEDE2000 transcribed from Sharma, Wu & Dalal's reference MATLAB code (radians, `Math.pow`, `Math.hypot`): an independent oracle.
+ * Returns `NaN` at the discontinuity (hues 180° apart), where either side is correct.
+ */
+function naiveCiede2000(first: helpers.Lab, second: helpers.Lab): number {
+	const c1 = Math.hypot(first.a, first.b);
+	const c2 = Math.hypot(second.a, second.b);
+	const mean = (c1 + c2) / 2;
+	const g = 0.5 * (1 - Math.sqrt(Math.pow(mean, 7) / (Math.pow(mean, 7) + Math.pow(25, 7))));
+	const a1 = (1 + g) * first.a;
+	const a2 = (1 + g) * second.a;
+	const cp1 = Math.hypot(a1, first.b);
+	const cp2 = Math.hypot(a2, second.b);
+	const product = cp1 * cp2;
+	function hue(a: number, b: number): number {
+		if (Math.abs(a) + Math.abs(b) === 0) return 0;
+		const angle = Math.atan2(b, a);
+		return angle < 0 ? angle + 2 * Math.PI : angle;
+	}
+	const h1 = hue(a1, first.b);
+	const h2 = hue(a2, second.b);
+	// The formula is discontinuous at hues exactly 180° apart, where degrees and radians may round to different sides.
+	if (product !== 0 && Math.abs(Math.abs(h2 - h1) - Math.PI) < 1e-9) return NaN;
+	let dh = h2 - h1;
+	if (dh > Math.PI) dh -= 2 * Math.PI;
+	if (dh < -Math.PI) dh += 2 * Math.PI;
+	if (product === 0) dh = 0;
+	const dH = 2 * Math.sqrt(product) * Math.sin(dh / 2);
+	const lp = (first.l + second.l) / 2;
+	const cp = (cp1 + cp2) / 2;
+	let hp = (h1 + h2) / 2;
+	if (Math.abs(h1 - h2) > Math.PI) hp -= Math.PI;
+	if (hp < 0) hp += 2 * Math.PI;
+	if (product === 0) hp = h1 + h2;
+	const lp50 = Math.pow(lp - 50, 2);
+	const sl = 1 + (0.015 * lp50) / Math.sqrt(20 + lp50);
+	const sc = 1 + 0.045 * cp;
+	const t = 1 - 0.17 * Math.cos(hp - Math.PI / 6) + 0.24 * Math.cos(2 * hp) + 0.32 * Math.cos(3 * hp + Math.PI / 30) - 0.2 * Math.cos(4 * hp - (63 * Math.PI) / 180);
+	const sh = 1 + 0.015 * cp * t;
+	const rotation = ((30 * Math.PI) / 180) * Math.exp(-Math.pow(((180 / Math.PI) * hp - 275) / 25, 2));
+	const rc = 2 * Math.sqrt(Math.pow(cp, 7) / (Math.pow(cp, 7) + Math.pow(25, 7)));
+	const rt = -Math.sin(2 * rotation) * rc;
+	const dl = (second.l - first.l) / sl;
+	const dc = (cp2 - cp1) / sc;
+	const dhs = dH / sh;
+	return Math.sqrt(dl * dl + dc * dc + dhs * dhs + rt * dc * dhs);
+}
+
+/**
+ * CIELAB D50 as the CSS Color 4 sample code computes it, step by step: linear sRGB → XYZ D65 → Bradford → XYZ D50 → Lab.
+ */
+function naiveLab(color: helpers.Rgb): number[] {
+	const toXyz = [
+		[0.41239079926595934, 0.357584339383878, 0.1804807884018343],
+		[0.21263900587151027, 0.715168678767756, 0.07219231536073371],
+		[0.01933081871559182, 0.11919477979462598, 0.9505321522496607]
+	];
+	const bradford = [
+		[1.0479297925449969, 0.022946870601609652, -0.05019226628920524],
+		[0.02962780877005599, 0.9904344267538799, -0.017073799063418826],
+		[-0.009243040646204504, 0.015055191490298152, 0.7518742814281371]
+	];
+	const white = [0.3457 / 0.3585, 1, (1 - 0.3457 - 0.3585) / 0.3585];
+	function multiply(matrix: number[][], vector: number[]): number[] {
+		return matrix.map(function (row) {
+			return row[0] * vector[0] + row[1] * vector[1] + row[2] * vector[2];
+		});
+	}
+	const linear = [color.r, color.g, color.b].map(function (channel) {
+		const unit = channel / 255;
+		return unit <= 0.04045 ? unit / 12.92 : Math.pow((unit + 0.055) / 1.055, 2.4);
+	});
+	const f = multiply(bradford, multiply(toXyz, linear)).map(function (value, index) {
+		const relative = value / white[index];
+		return relative > 216 / 24389 ? Math.cbrt(relative) : ((24389 / 27) * relative + 16) / 116;
+	});
+	return [116 * f[1] - 16, 500 * (f[0] - f[1]), 200 * (f[1] - f[2])];
+}
+
+/**
+ * 32-bit FNV-1a over the `TextEncoder` UTF-8 bytes, then MurmurHash3's fmix32: the documented hash of `colorFromString`.
+ */
+function naiveHash(text: string): number {
+	let hash = 0x811c9dc5;
+	for (const octet of new TextEncoder().encode(text)) hash = Math.imul(hash ^ octet, 16777619);
+	hash ^= hash >>> 16;
+	hash = Math.imul(hash, 0x85ebca6b);
+	hash ^= hash >>> 13;
+	hash = Math.imul(hash, 0xc2b2ae35);
+	return (hash ^ (hash >>> 16)) >>> 0;
+}
+
+/** Machado, Oliveira & Fernandes (2009), the published matrices for severities 0, 0.1, … 1 (row-major, 6 decimals). */
+const MACHADO: Record<'protanopia' | 'deuteranopia' | 'tritanopia', string[]> = {
+	protanopia: [
+		'1.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 0.000000 1.000000',
+		'0.856167 0.182038 -0.038205 0.029342 0.955115 0.015544 -0.002880 -0.001563 1.004443',
+		'0.734766 0.334872 -0.069637 0.051840 0.919198 0.028963 -0.004928 -0.004209 1.009137',
+		'0.630323 0.465641 -0.095964 0.069181 0.890046 0.040773 -0.006308 -0.007724 1.014032',
+		'0.539009 0.579343 -0.118352 0.082546 0.866121 0.051332 -0.007136 -0.011959 1.019095',
+		'0.458064 0.679578 -0.137642 0.092785 0.846313 0.060902 -0.007494 -0.016807 1.024301',
+		'0.385450 0.769005 -0.154455 0.100526 0.829802 0.069673 -0.007442 -0.022190 1.029632',
+		'0.319627 0.849633 -0.169261 0.106241 0.815969 0.077790 -0.007025 -0.028051 1.035076',
+		'0.259411 0.923008 -0.182420 0.110296 0.804340 0.085364 -0.006276 -0.034346 1.040622',
+		'0.203876 0.990338 -0.194214 0.112975 0.794542 0.092483 -0.005222 -0.041043 1.046265',
+		'0.152286 1.052583 -0.204868 0.114503 0.786281 0.099216 -0.003882 -0.048116 1.051998'
+	],
+	deuteranopia: [
+		'1.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 0.000000 1.000000',
+		'0.866435 0.177704 -0.044139 0.049567 0.939063 0.011370 -0.003453 0.007233 0.996220',
+		'0.760729 0.319078 -0.079807 0.090568 0.889315 0.020117 -0.006027 0.013325 0.992702',
+		'0.675425 0.433850 -0.109275 0.125303 0.847755 0.026942 -0.007950 0.018572 0.989378',
+		'0.605511 0.528560 -0.134071 0.155318 0.812366 0.032316 -0.009376 0.023176 0.986200',
+		'0.547494 0.607765 -0.155259 0.181692 0.781742 0.036566 -0.010410 0.027275 0.983136',
+		'0.498864 0.674741 -0.173604 0.205199 0.754872 0.039929 -0.011131 0.030969 0.980162',
+		'0.457771 0.731899 -0.189670 0.226409 0.731012 0.042579 -0.011595 0.034333 0.977261',
+		'0.422823 0.781057 -0.203881 0.245752 0.709602 0.044646 -0.011843 0.037423 0.974421',
+		'0.392952 0.823610 -0.216562 0.263559 0.690210 0.046232 -0.011910 0.040281 0.971630',
+		'0.367322 0.860646 -0.227968 0.280085 0.672501 0.047413 -0.011820 0.042940 0.968881'
+	],
+	tritanopia: [
+		'1.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 0.000000 1.000000',
+		'0.926670 0.092514 -0.019184 0.021191 0.964503 0.014306 0.008437 0.054813 0.936750',
+		'0.895720 0.133330 -0.029050 0.029997 0.945400 0.024603 0.013027 0.104707 0.882266',
+		'0.905871 0.127791 -0.033662 0.026856 0.941251 0.031893 0.013410 0.148296 0.838294',
+		'0.948035 0.089490 -0.037526 0.014364 0.946792 0.038844 0.010853 0.193991 0.795156',
+		'1.017277 0.027029 -0.044306 -0.006113 0.958479 0.047634 0.006379 0.248708 0.744913',
+		'1.104996 -0.046633 -0.058363 -0.032137 0.971635 0.060503 0.001336 0.317922 0.680742',
+		'1.193214 -0.109812 -0.083402 -0.058496 0.979410 0.079086 -0.002346 0.403492 0.598854',
+		'1.257728 -0.139648 -0.118081 -0.078003 0.975409 0.102594 -0.003316 0.501214 0.502102',
+		'1.278864 -0.125333 -0.153531 -0.084748 0.957674 0.127074 -0.000989 0.601151 0.399838',
+		'1.255528 -0.076749 -0.178779 -0.078411 0.930809 0.147602 0.004733 0.691367 0.303900'
+	]
+};
+
+/**
+ * Replaces lone surrogates with U+FFFD (`String.prototype.toWellFormed`, ES2024).
+ */
+function wellFormed(text: string): string {
+	return text.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, '\ufffd');
+}
+
+const cvdType = fc.constantFrom<helpers.ColorVisionDeficiency>('protanopia', 'deuteranopia', 'tritanopia', 'achromatopsia');
+const severity = fc.oneof(
+	fc.double({ min: 0, max: 1, noNaN: true }),
+	fc.integer({ min: 0, max: 10 }).map(function (tenths) {
+		return tenths / 10;
+	})
+);
+
+describe('Colour difference, colours from strings and CVD simulation (property-based)', function () {
+	it('ciede2000 equals the transcription of the reference code, and is symmetric and non-negative', function () {
+		fc.assert(
+			fc.property(lab, lab, function (first, second) {
+				const distance = helpers.ciede2000(first, second);
+				expect(distance).toBeGreaterThanOrEqual(0);
+				const expected = naiveCiede2000(first, second);
+				if (!Number.isNaN(expected)) expect(Math.abs(distance - expected)).toBeLessThanOrEqual(1e-9 * Math.max(1, distance));
+				expect(helpers.ciede2000(second, first)).toBe(distance);
+				expect(helpers.ciede2000(first, first)).toBe(0);
+			})
+		);
+	});
+
+	it('toLab equals the step-by-step CSS Color 4 conversion', function () {
+		fc.assert(
+			fc.property(rgba, function (color) {
+				const actual = helpers.toLab(color);
+				const expected = naiveLab(color);
+				expect(Math.abs(actual.l - expected[0])).toBeLessThan(1e-9);
+				expect(Math.abs(actual.a - expected[1])).toBeLessThan(1e-9);
+				expect(Math.abs(actual.b - expected[2])).toBeLessThan(1e-9);
+				expect(actual.alpha).toBe(color.a);
+			})
+		);
+	});
+
+	it('deltaE is the distance (or CIEDE2000) of the documented coordinates, symmetric, 0 only for equal colours', function () {
+		fc.assert(
+			fc.property(rgba, rgba, function (first, second) {
+				const okA = helpers.toOklab(first);
+				const okB = helpers.toOklab(second);
+				const labA = helpers.toLab(first);
+				const labB = helpers.toLab(second);
+				const ok = helpers.deltaE(first, second);
+				const cie76 = helpers.deltaE(first, second, { method: '76' });
+				const cie2000 = helpers.deltaE(first, second, { method: '2000' });
+				expect(ok).toBeCloseTo(Math.hypot(okA.l - okB.l, okA.a - okB.a, okA.b - okB.b), 14);
+				expect(cie76).toBeCloseTo(Math.hypot(labA.l - labB.l, labA.a - labB.a, labA.b - labB.b), 11);
+				expect(cie2000).toBe(helpers.ciede2000(labA, labB));
+				expect([helpers.deltaE(second, first), helpers.deltaE(second, first, { method: '76' }), helpers.deltaE(second, first, { method: '2000' })]).toEqual([
+					ok,
+					cie76,
+					cie2000
+				]);
+				const same = first.r === second.r && first.g === second.g && first.b === second.b;
+				for (const distance of [ok, cie76, cie2000]) expect(distance === 0).toBe(same);
+			})
+		);
+	});
+
+	it('deltaE ok and 76 satisfy the triangle inequality', function () {
+		fc.assert(
+			fc.property(rgb, rgb, rgb, fc.constantFrom<helpers.DeltaEMethod>('ok', '76'), function (a, b, c, method) {
+				const options = { method };
+				expect(helpers.deltaE(a, c, options)).toBeLessThanOrEqual(helpers.deltaE(a, b, options) + helpers.deltaE(b, c, options) + 1e-12);
+			})
+		);
+	});
+
+	it('colorFromString equals the documented hash and OKLCH mapping', function () {
+		fc.assert(
+			fc.property(
+				fc.string({ unit: 'binary' }),
+				fc.double({ min: 0, max: 1, noNaN: true }),
+				fc.double({ min: 0, max: 1, noNaN: true }),
+				fc.double({ min: 0, max: 0.4, noNaN: true }),
+				fc.double({ min: 0, max: 0.4, noNaN: true }),
+				fc.double({ min: -720, max: 720, noNaN: true }),
+				fc.double({ min: 0, max: 360, noNaN: true }),
+				function (text, l1, l2, c1, c2, start, span) {
+					const hash = naiveHash(text);
+					const lightness = [Math.min(l1, l2), Math.max(l1, l2)] as const;
+					const chroma = [Math.min(c1, c2), Math.max(c1, c2)] as const;
+					function fraction(bits: number): number {
+						return bits / 255;
+					}
+					const expected = helpers.toHex(
+						helpers.oklchToRgb({
+							l: lightness[0] + fraction((hash >>> 8) & 255) * (lightness[1] - lightness[0]),
+							c: chroma[0] + fraction(hash & 255) * (chroma[1] - chroma[0]),
+							h: start + ((hash >>> 16) / 65536) * span
+						})
+					);
+					const actual = helpers.colorFromString(text, { lightness, chroma, hueRange: [start, start + span] });
+					// The interpolations are written differently (lerp vs min + t * span): allow the last 8-bit step.
+					const [a, e] = [helpers.parseHex(actual), helpers.parseHex(expected)];
+					for (const channel of ['r', 'g', 'b'] as const) expect(Math.abs(a[channel] - e[channel])).toBeLessThanOrEqual(1);
+					expect(actual).toMatch(/^#[0-9a-f]{6}$/);
+					expect(helpers.colorFromString(text)).toBe(helpers.toHex(helpers.oklchToRgb({ l: 0.7, c: 0.15, h: ((hash >>> 16) / 65536) * 360 })));
+				}
+			)
+		);
+	});
+
+	it('colorFromString is stable, and equal for strings with the same UTF-8 bytes', function () {
+		fc.assert(
+			fc.property(fc.string({ unit: 'binary' }), function (text) {
+				expect(helpers.colorFromString(text)).toBe(helpers.colorFromString(text));
+				expect(helpers.colorFromString(text)).toBe(helpers.colorFromString(wellFormed(text)));
+				expect(helpers.colorFromString(text, { format: 'rgb' })).toEqual({ ...helpers.parseHex(helpers.colorFromString(text)), a: 1 });
+			})
+		);
+	});
+
+	it('colorFromString with contrastWith always reaches minContrast, and keeps colours that already do', function () {
+		fc.assert(
+			fc.property(fc.string(), rgb, fc.double({ min: 1, max: 21, noNaN: true }), fc.double({ min: 0, max: 1, noNaN: true }), function (text, background, wanted, l) {
+				const best = Math.max(helpers.contrastRatio(background, '#000'), helpers.contrastRatio(background, '#fff'));
+				const ratio = Math.min(wanted, best);
+				const plain = helpers.colorFromString(text, { lightness: l });
+				const readable = helpers.colorFromString(text, { lightness: l, contrastWith: background, minContrast: ratio });
+				expect(helpers.contrastRatio(readable, background)).toBeGreaterThanOrEqual(ratio);
+				if (helpers.contrastRatio(plain, background) >= ratio) expect(readable).toBe(plain);
+				if (wanted > best) {
+					expect(function () {
+						helpers.colorFromString(text, { contrastWith: background, minContrast: wanted });
+					}).toThrow(RangeError);
+				}
+			})
+		);
+	});
+
+	it('simulateColorVisionDeficiency changes nothing at severity 0, keeps alpha, and keeps greys grey', function () {
+		fc.assert(
+			fc.property(rgba, cvdType, severity, byte, function (color, type, strength, level) {
+				expect(helpers.simulateColorVisionDeficiency(color, type, 0)).toEqual(color);
+				const simulated = helpers.simulateColorVisionDeficiency(color, type, strength);
+				expectNormalized(simulated);
+				expect(simulated.a).toBe(color.a);
+				const grey = helpers.simulateColorVisionDeficiency({ r: level, g: level, b: level }, type, strength);
+				for (const channel of [grey.r, grey.g, grey.b]) expect(Math.abs(channel - level)).toBeLessThanOrEqual(1);
+			})
+		);
+	});
+
+	it('simulateColorVisionDeficiency equals the published matrices, interpolated, applied in linear sRGB', function () {
+		fc.assert(
+			fc.property(rgb, fc.constantFrom('protanopia', 'deuteranopia', 'tritanopia' as const), severity, function (color, type, strength) {
+				const level = Math.min(Math.floor(strength * 10), 9);
+				const t = strength * 10 - level;
+				const low = MACHADO[type][level].split(' ').map(Number);
+				const high = MACHADO[type][level + 1].split(' ').map(Number);
+				const matrix = low.map(function (value, index) {
+					return (1 - t) * value + t * high[index];
+				});
+				const linear = [color.r, color.g, color.b].map(function (channel) {
+					const unit = channel / 255;
+					return unit <= 0.04045 ? unit / 12.92 : Math.pow((unit + 0.055) / 1.055, 2.4);
+				});
+				const simulated = helpers.simulateColorVisionDeficiency(color, type, strength);
+				for (const [row, channel] of (['r', 'g', 'b'] as const).entries()) {
+					const value = Math.min(Math.max(matrix[row * 3] * linear[0] + matrix[row * 3 + 1] * linear[1] + matrix[row * 3 + 2] * linear[2], 0), 1);
+					const encoded = Math.round((value <= 0.0031308 ? value * 12.92 : 1.055 * Math.pow(value, 1 / 2.4) - 0.055) * 255);
+					expect(Math.abs(simulated[channel] - encoded)).toBeLessThanOrEqual(1);
+				}
+			})
+		);
+	});
+
+	it('achromatopsia gives the grey of the same luminance', function () {
+		fc.assert(
+			fc.property(rgb, function (color) {
+				const grey = helpers.simulateColorVisionDeficiency(color, 'achromatopsia');
+				expect(grey.r === grey.g && grey.g === grey.b).toBe(true);
+				const target = helpers.relativeLuminance(color);
+				const below = helpers.relativeLuminance({ r: grey.r - 1, g: grey.r - 1, b: grey.r - 1 });
+				const above = helpers.relativeLuminance({ r: grey.r + 1, g: grey.r + 1, b: grey.r + 1 });
+				expect(target).toBeGreaterThanOrEqual(grey.r === 0 ? 0 : below);
+				expect(target).toBeLessThanOrEqual(grey.r === 255 ? 1 : above);
+			})
+		);
+	});
+});
+
+/**
+ * The gamut mapping of `oklchToBytes` as it was before it was made allocation-free (one closure and several arrays per binary-search
+ * step), kept verbatim as the oracle: the rewrite must give exactly the same bytes, and `inGamut` the same answers.
+ */
+const OLD_RGB_TO_LMS = [
+	0.41222146947076305, 0.5363325372617348, 0.05144599326750221, 0.21190349581782522, 0.6806995506452344, 0.10739695353694056, 0.08830245919005643, 0.2817188391361215,
+	0.6299787016738222
+];
+const OLD_LMS_TO_RGB = [
+	4.076741636075958, -3.3077115392580616, 0.2309699031821043, -1.2684379732850317, 2.6097573492876887, -0.34131937600265727, -0.004196076138675564, -0.7034186179359363,
+	1.7076146940746117
+];
+const OLD_LMS_TO_OKLAB = [
+	0.210454268309314, 0.7936177747023054, -0.0040720430116193, 1.9779985324311684, -2.42859224204858, 0.450593709617411, 0.0259040424655478, 0.7827717124575296,
+	-0.8086757549230774
+];
+const OLD_OKLAB_TO_LMS = [1, 0.3963377773761749, 0.2158037573099136, 1, -0.1055613458156586, -0.0638541728258133, 1, -0.0894841775298119, -1.2914855480194092];
+
+/** The old `toLinear`. */
+function oldToLinear(value: number): number {
+	return value <= 0.04045 ? value / 12.92 : Math.pow((value + 0.055) / 1.055, 2.4);
+}
+
+/** The old `fromLinear`. */
+function oldFromLinear(value: number): number {
+	const magnitude = Math.abs(value);
+	return magnitude <= 0.0031308 ? value * 12.92 : Math.sign(value) * (1.055 * Math.pow(magnitude, 1 / 2.4) - 0.055);
+}
+
+/** The old `transform`. */
+function oldTransform(matrix: readonly number[], x: number, y: number, z: number): number[] {
+	return [matrix[0] * x + matrix[1] * y + matrix[2] * z, matrix[3] * x + matrix[4] * y + matrix[5] * z, matrix[6] * x + matrix[7] * y + matrix[8] * z];
+}
+
+/** The old `srgbToOklab`. */
+function oldSrgbToOklab(r: number, g: number, b: number): number[] {
+	const lms = oldTransform(OLD_RGB_TO_LMS, oldToLinear(r), oldToLinear(g), oldToLinear(b));
+	return oldTransform(OLD_LMS_TO_OKLAB, Math.cbrt(lms[0]), Math.cbrt(lms[1]), Math.cbrt(lms[2]));
+}
+
+/** The old `oklabToSrgb`. */
+function oldOklabToSrgb(l: number, a: number, b: number): number[] {
+	const lms = oldTransform(OLD_OKLAB_TO_LMS, l, a, b);
+	const linear = oldTransform(OLD_LMS_TO_RGB, lms[0] ** 3, lms[1] ** 3, lms[2] ** 3);
+	return [oldFromLinear(linear[0]), oldFromLinear(linear[1]), oldFromLinear(linear[2])];
+}
+
+/** The old `isInside`. */
+function oldIsInside(channels: number[]): boolean {
+	return channels.every(function (channel) {
+		return channel >= -0.000075 && channel <= 1 + 0.000075;
+	});
+}
+
+/** The old `oklchToBytes` (bytes only). */
+function oldOklchToBytes(l: number, c: number, h: number): helpers.Rgb {
+	const radians = (h % 360) / (180 / Math.PI);
+	const cos = Math.cos(radians);
+	const sin = Math.sin(radians);
+	let srgb = [1, 1, 1];
+
+	/** The sRGB channels at this chroma. */
+	function at(chroma: number): number[] {
+		return oldOklabToSrgb(l, chroma * cos, chroma * sin);
+	}
+
+	/** Clips the colour at this chroma into `srgb`, returning the deltaEOK moved. */
+	function clip(chroma: number): number {
+		srgb = at(chroma).map(function (channel) {
+			return Math.min(Math.max(channel, 0), 1);
+		});
+		const clipped = oldSrgbToOklab(srgb[0], srgb[1], srgb[2]);
+		return Math.hypot(clipped[0] - l, clipped[1] - chroma * cos, clipped[2] - chroma * sin);
+	}
+
+	if (l <= 0) srgb = [0, 0, 0];
+	else if (l < 1) {
+		let max = c > 0 ? Math.min(c, 1e100) : 0;
+		srgb = at(max);
+		if (!oldIsInside(srgb) && clip(max) >= 0.02) {
+			let min = 0;
+			let minInGamut = true;
+			while (max - min > 0.0001) {
+				const chroma = (min + max) / 2;
+				if (minInGamut && oldIsInside(at(chroma))) {
+					min = chroma;
+					continue;
+				}
+				const delta = clip(chroma);
+				if (delta >= 0.02) max = chroma;
+				else if (0.02 - delta < 0.0001) break;
+				else {
+					minInGamut = false;
+					min = chroma;
+				}
+			}
+		}
+	}
+	return { r: oldByte(srgb[0] * 255), g: oldByte(srgb[1] * 255), b: oldByte(srgb[2] * 255) };
+}
+
+/** The old `toByte`. */
+function oldByte(value: number): number {
+	if (value >= 255) return 255;
+	return value > 0 ? Math.round(value) : 0;
+}
+
+/** OKLCH inputs for the gamut-mapping oracle: everywhere, near the sRGB boundary, and out of range. */
+const gamutInput = fc.oneof(
+	fc.record({ l: fc.double({ min: 0, max: 1, noNaN: true }), c: fc.double({ min: 0, max: 0.5, noNaN: true }), h: fc.double({ min: 0, max: 360, noNaN: true }) }),
+	fc.tuple(rgb, fc.double({ min: -0.02, max: 0.02, noNaN: true })).map(function ([color, nudge]) {
+		const lch = helpers.toOklch(color);
+		return { l: lch.l, c: Math.max(lch.c + nudge, 0), h: Number.isNaN(lch.h) ? 0 : lch.h };
+	}),
+	fc.record({
+		l: fc.double({ min: -1, max: 2, noNaN: true }),
+		c: fc.oneof(fc.double({ min: -1, max: 1e3, noNaN: true }), fc.double({ noNaN: true, noDefaultInfinity: true }), fc.constant(Infinity)),
+		h: fc.double({ noNaN: true, noDefaultInfinity: true })
+	})
+);
+
+describe('Gamut mapping (property-based)', function () {
+	it('oklchToBytes gives exactly the bytes of its previous (allocating) implementation', function () {
+		fc.assert(
+			fc.property(gamutInput, function ({ l, c, h }) {
+				const expected = oldOklchToBytes(l, c, h);
+				expect(helpers.oklchToRgb({ l, c, h })).toEqual({ ...expected, a: 1 });
+				const chroma = c > 0 ? Math.min(c, 1e100) : 0;
+				const radians = (h % 360) / (180 / Math.PI);
+				expect(helpers.inGamut({ l, c, h })).toBe(oldIsInside(oldOklabToSrgb(l, chroma * Math.cos(radians), chroma * Math.sin(radians))));
+			}),
+			{ numRuns: 2000 }
+		);
+	});
+
+	it('inGamut and oklchToBytes agree with the previous implementation right at the gamut boundary (the exact fallback of the fast paths)', function () {
+		fc.assert(
+			fc.property(
+				fc.double({ min: 0.01, max: 0.99, noNaN: true }),
+				fc.double({ min: 0, max: 360, noNaN: true }),
+				fc.integer({ min: -4, max: 4 }),
+				function (l, h, step) {
+					const radians = (h % 360) / (180 / Math.PI);
+
+					/** The old gamut test at this chroma. */
+					function inside(chroma: number): boolean {
+						return oldIsInside(oldOklabToSrgb(l, chroma * Math.cos(radians), chroma * Math.sin(radians)));
+					}
+
+					// Bisect the old test down to adjacent doubles: some channel is then within an ulp of -GAMUT_EPSILON or 1 + GAMUT_EPSILON.
+					let low = 0;
+					let high = 1;
+					for (let middle = 0.5; middle > low && middle < high; middle = (low + high) / 2) {
+						if (inside(middle)) low = middle;
+						else high = middle;
+					}
+					const chroma = (step < 0 ? low : high) * (1 + step * Number.EPSILON);
+					expect(helpers.inGamut({ l, c: chroma, h })).toBe(inside(chroma));
+					expect(helpers.oklchToRgb({ l, c: chroma, h })).toEqual({ ...oldOklchToBytes(l, chroma, h), a: 1 });
+				}
+			)
+		);
+	});
+});

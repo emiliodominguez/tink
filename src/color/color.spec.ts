@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import * as helpers from '.';
 
 describe('Color helpers', function () {
@@ -896,6 +898,13 @@ describe('OKLab / OKLCH', function () {
 			expect(helpers.oklabToRgb({ l: 0.3, a: -0.2, b: -0.3 })).toEqual({ r: 0, g: 50, b: 84, a: 1 });
 		});
 
+		it('clips a colour slightly out of gamut as is when clipping moves it by less than one JND (no chroma search)', function () {
+			// Out of sRGB (blue above 1), but clipping it moves it by less than deltaEOK 0.02: searching the chroma would give 89, 144, 255.
+			const color = { l: 0.6775777763687074, c: 0.19213904778007418, h: 263.9088823646307 };
+			expect(helpers.inGamut(color)).toBe(false);
+			expect(helpers.oklchToRgb(color)).toEqual({ r: 88, g: 144, b: 255, a: 1 });
+		});
+
 		it('keep the lightness and hue where plain clipping would not', function () {
 			const mapped = helpers.toOklch(helpers.oklchToRgb({ l: 0.9, c: 0.4, h: 145 }));
 			expect(Math.abs(mapped.l - 0.9)).toBeLessThan(0.02);
@@ -1640,5 +1649,743 @@ describe('Color scales, names, adjustments and HSV', function () {
 				helpers.hsvToRgb({ h: '0', s: 0, v: 0 } as never);
 			}).toThrow(new TypeError('hsvToRgb: `hsv.h` must be a number other than NaN, got string'));
 		});
+	});
+});
+
+/** Sharma, Wu & Dalal (2005), Table 1: the 34 CIEDE2000 test pairs (L1 a1 b1 L2 a2 b2 ΔE00), from ciede2000testdata.txt. */
+const SHARMA_PAIRS = [
+	'50.0000 2.6772 -79.7751 50.0000 0.0000 -82.7485 2.0425',
+	'50.0000 3.1571 -77.2803 50.0000 0.0000 -82.7485 2.8615',
+	'50.0000 2.8361 -74.0200 50.0000 0.0000 -82.7485 3.4412',
+	'50.0000 -1.3802 -84.2814 50.0000 0.0000 -82.7485 1.0000',
+	'50.0000 -1.1848 -84.8006 50.0000 0.0000 -82.7485 1.0000',
+	'50.0000 -0.9009 -85.5211 50.0000 0.0000 -82.7485 1.0000',
+	'50.0000 0.0000 0.0000 50.0000 -1.0000 2.0000 2.3669',
+	'50.0000 -1.0000 2.0000 50.0000 0.0000 0.0000 2.3669',
+	'50.0000 2.4900 -0.0010 50.0000 -2.4900 0.0009 7.1792',
+	'50.0000 2.4900 -0.0010 50.0000 -2.4900 0.0010 7.1792',
+	'50.0000 2.4900 -0.0010 50.0000 -2.4900 0.0011 7.2195',
+	'50.0000 2.4900 -0.0010 50.0000 -2.4900 0.0012 7.2195',
+	'50.0000 -0.0010 2.4900 50.0000 0.0009 -2.4900 4.8045',
+	'50.0000 -0.0010 2.4900 50.0000 0.0010 -2.4900 4.8045',
+	'50.0000 -0.0010 2.4900 50.0000 0.0011 -2.4900 4.7461',
+	'50.0000 2.5000 0.0000 50.0000 0.0000 -2.5000 4.3065',
+	'50.0000 2.5000 0.0000 73.0000 25.0000 -18.0000 27.1492',
+	'50.0000 2.5000 0.0000 61.0000 -5.0000 29.0000 22.8977',
+	'50.0000 2.5000 0.0000 56.0000 -27.0000 -3.0000 31.9030',
+	'50.0000 2.5000 0.0000 58.0000 24.0000 15.0000 19.4535',
+	'50.0000 2.5000 0.0000 50.0000 3.1736 0.5854 1.0000',
+	'50.0000 2.5000 0.0000 50.0000 3.2972 0.0000 1.0000',
+	'50.0000 2.5000 0.0000 50.0000 1.8634 0.5757 1.0000',
+	'50.0000 2.5000 0.0000 50.0000 3.2592 0.3350 1.0000',
+	'60.2574 -34.0099 36.2677 60.4626 -34.1751 39.4387 1.2644',
+	'63.0109 -31.0961 -5.8663 62.8187 -29.7946 -4.0864 1.2630',
+	'61.2901 3.7196 -5.3901 61.4292 2.2480 -4.9620 1.8731',
+	'35.0831 -44.1164 3.7933 35.0232 -40.0716 1.5901 1.8645',
+	'22.7233 20.0904 -46.6940 23.0331 14.9730 -42.5619 2.0373',
+	'36.4612 47.8580 18.3852 36.2715 50.5065 21.2231 1.4146',
+	'90.8027 -2.0831 1.4410 91.1528 -1.6435 0.0447 1.4441',
+	'90.9257 -0.5406 -0.9208 88.6381 -0.8985 -0.7239 1.5381',
+	'6.7747 -0.2908 -2.4247 5.8714 -0.0985 -2.2286 0.6377',
+	'2.0776 0.0795 -1.1350 0.9033 -0.0636 -0.5514 0.9082'
+].map(function (line) {
+	return line.split(' ').map(Number);
+});
+
+/** Machado, Oliveira & Fernandes (2009), the published simulation matrices for severities 0, 0.1, … 1 (row-major, 6 decimals). */
+const MACHADO: Record<'protanopia' | 'deuteranopia' | 'tritanopia', string[]> = {
+	protanopia: [
+		'1.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 0.000000 1.000000',
+		'0.856167 0.182038 -0.038205 0.029342 0.955115 0.015544 -0.002880 -0.001563 1.004443',
+		'0.734766 0.334872 -0.069637 0.051840 0.919198 0.028963 -0.004928 -0.004209 1.009137',
+		'0.630323 0.465641 -0.095964 0.069181 0.890046 0.040773 -0.006308 -0.007724 1.014032',
+		'0.539009 0.579343 -0.118352 0.082546 0.866121 0.051332 -0.007136 -0.011959 1.019095',
+		'0.458064 0.679578 -0.137642 0.092785 0.846313 0.060902 -0.007494 -0.016807 1.024301',
+		'0.385450 0.769005 -0.154455 0.100526 0.829802 0.069673 -0.007442 -0.022190 1.029632',
+		'0.319627 0.849633 -0.169261 0.106241 0.815969 0.077790 -0.007025 -0.028051 1.035076',
+		'0.259411 0.923008 -0.182420 0.110296 0.804340 0.085364 -0.006276 -0.034346 1.040622',
+		'0.203876 0.990338 -0.194214 0.112975 0.794542 0.092483 -0.005222 -0.041043 1.046265',
+		'0.152286 1.052583 -0.204868 0.114503 0.786281 0.099216 -0.003882 -0.048116 1.051998'
+	],
+	deuteranopia: [
+		'1.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 0.000000 1.000000',
+		'0.866435 0.177704 -0.044139 0.049567 0.939063 0.011370 -0.003453 0.007233 0.996220',
+		'0.760729 0.319078 -0.079807 0.090568 0.889315 0.020117 -0.006027 0.013325 0.992702',
+		'0.675425 0.433850 -0.109275 0.125303 0.847755 0.026942 -0.007950 0.018572 0.989378',
+		'0.605511 0.528560 -0.134071 0.155318 0.812366 0.032316 -0.009376 0.023176 0.986200',
+		'0.547494 0.607765 -0.155259 0.181692 0.781742 0.036566 -0.010410 0.027275 0.983136',
+		'0.498864 0.674741 -0.173604 0.205199 0.754872 0.039929 -0.011131 0.030969 0.980162',
+		'0.457771 0.731899 -0.189670 0.226409 0.731012 0.042579 -0.011595 0.034333 0.977261',
+		'0.422823 0.781057 -0.203881 0.245752 0.709602 0.044646 -0.011843 0.037423 0.974421',
+		'0.392952 0.823610 -0.216562 0.263559 0.690210 0.046232 -0.011910 0.040281 0.971630',
+		'0.367322 0.860646 -0.227968 0.280085 0.672501 0.047413 -0.011820 0.042940 0.968881'
+	],
+	tritanopia: [
+		'1.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 0.000000 1.000000',
+		'0.926670 0.092514 -0.019184 0.021191 0.964503 0.014306 0.008437 0.054813 0.936750',
+		'0.895720 0.133330 -0.029050 0.029997 0.945400 0.024603 0.013027 0.104707 0.882266',
+		'0.905871 0.127791 -0.033662 0.026856 0.941251 0.031893 0.013410 0.148296 0.838294',
+		'0.948035 0.089490 -0.037526 0.014364 0.946792 0.038844 0.010853 0.193991 0.795156',
+		'1.017277 0.027029 -0.044306 -0.006113 0.958479 0.047634 0.006379 0.248708 0.744913',
+		'1.104996 -0.046633 -0.058363 -0.032137 0.971635 0.060503 0.001336 0.317922 0.680742',
+		'1.193214 -0.109812 -0.083402 -0.058496 0.979410 0.079086 -0.002346 0.403492 0.598854',
+		'1.257728 -0.139648 -0.118081 -0.078003 0.975409 0.102594 -0.003316 0.501214 0.502102',
+		'1.278864 -0.125333 -0.153531 -0.084748 0.957674 0.127074 -0.000989 0.601151 0.399838',
+		'1.255528 -0.076749 -0.178779 -0.078411 0.930809 0.147602 0.004733 0.691367 0.303900'
+	]
+};
+
+/**
+ * The published Machado et al. matrix for a tabulated severity (0 to 10 tenths).
+ */
+function machado(type: 'protanopia' | 'deuteranopia' | 'tritanopia', tenths: number): number[] {
+	return MACHADO[type][tenths].split(' ').map(Number);
+}
+
+/**
+ * Applies a row-major 3×3 matrix to a colour in linear sRGB, as the CVD simulation must: linearize, multiply, clip, encode, round.
+ */
+function applyLinear(matrix: readonly number[], color: helpers.Rgb): number[] {
+	function linear(channel: number): number {
+		const unit = channel / 255;
+		return unit <= 0.04045 ? unit / 12.92 : ((unit + 0.055) / 1.055) ** 2.4;
+	}
+	function encode(value: number): number {
+		const clipped = Math.min(Math.max(value, 0), 1);
+		return Math.round((clipped <= 0.0031308 ? clipped * 12.92 : 1.055 * clipped ** (1 / 2.4) - 0.055) * 255);
+	}
+	const rgb = [linear(color.r), linear(color.g), linear(color.b)];
+	return [0, 1, 2].map(function (row) {
+		return encode(matrix[row * 3] * rgb[0] + matrix[row * 3 + 1] * rgb[1] + matrix[row * 3 + 2] * rgb[2]);
+	});
+}
+
+describe('Colour difference, colours from strings and colour vision deficiencies', function () {
+	describe('toLab', function () {
+		it('matches the CSS Color 4 / colorjs.io CIELAB (D50, Bradford) reference values', function () {
+			expectClose(helpers.toLab('#ff0000'), { l: 54.2905, a: 80.8049, b: 69.891, alpha: 1 }, 0.0001);
+			expectClose(helpers.toLab('#00ff00'), { l: 87.8185, a: -79.2711, b: 80.9946, alpha: 1 }, 0.0001);
+			expectClose(helpers.toLab('#0000ff'), { l: 29.5683, a: 68.2874, b: -112.0297, alpha: 1 }, 0.0001);
+			expect(helpers.toLab('#ffffff')).toEqual({ l: 100, a: 0, b: 0, alpha: 1 });
+			expect(helpers.toLab('#000000')).toEqual({ l: 0, a: 0, b: 0, alpha: 1 });
+		});
+
+		it('gives greys exactly a = b = 0, keeps alpha, and is monotonic in the grey level', function () {
+			let previous = -1;
+			for (let level = 0; level <= 255; level++) {
+				const lab = helpers.toLab({ r: level, g: level, b: level, a: 0.25 });
+				expect([lab.a, lab.b, lab.alpha]).toEqual([0, 0, 0.25]);
+				expect(lab.l).toBeGreaterThan(previous);
+				expect(lab.l).toBeLessThanOrEqual(100);
+				previous = lab.l;
+			}
+			// The linear segment of the CIELAB companding (Y <= 216/24389): #010101 has L = 903.3 * Y.
+			expect(helpers.toLab('#010101').l).toBeCloseTo((24389 / 27) * (1 / 255 / 12.92), 12);
+			expect(helpers.toLab('#000000').l).toBe(0);
+		});
+
+		it('handles colours whose a or b component falls in the linear segment', function () {
+			// Nearly-black blue: X and Y below ε, Z above it.
+			const lab = helpers.toLab({ r: 0, g: 0, b: 40 });
+			expect(lab.l).toBeGreaterThan(0);
+			expect(lab.b).toBeLessThan(0);
+			expect(lab.a).toBeGreaterThan(0);
+		});
+	});
+
+	describe('ciede2000', function () {
+		it('matches all 34 test pairs of Sharma, Wu & Dalal (2005) to 4 decimals, in both orders', function () {
+			for (const [l1, a1, b1, l2, a2, b2, expected] of SHARMA_PAIRS) {
+				const forward = helpers.ciede2000({ l: l1, a: a1, b: b1 }, { l: l2, a: a2, b: b2 });
+				expect(forward.toFixed(4)).toBe(expected.toFixed(4));
+				expect(helpers.ciede2000({ l: l2, a: a2, b: b2 }, { l: l1, a: a1, b: b1 })).toBe(forward);
+			}
+		});
+
+		it('is 0 for identical colours, ignores alpha, and handles greys and opposite hues', function () {
+			expect(helpers.ciede2000({ l: 50, a: 0, b: 0 }, { l: 50, a: 0, b: 0 })).toBe(0);
+			expect(helpers.ciede2000({ l: 50, a: 10, b: -3, alpha: 0 }, { l: 50, a: 10, b: -3 })).toBe(0);
+			expect(helpers.ciede2000({ l: 0, a: 0, b: 0 }, { l: 100, a: 0, b: 0 })).toBe(100);
+			// -0 components: the hue of a grey is 0, not atan2(0, -0) = 180°.
+			expect(helpers.ciede2000({ l: 50, a: -0, b: 0 }, { l: 50, a: 10, b: 0 })).toBe(helpers.ciede2000({ l: 50, a: 0, b: 0 }, { l: 50, a: 10, b: 0 }));
+			// Hues exactly 180° apart, either way round, and a hue just below 360°.
+			const opposite = helpers.ciede2000({ l: 50, a: 10, b: 0 }, { l: 50, a: -10, b: 0 });
+			expect(opposite).toBe(helpers.ciede2000({ l: 50, a: -10, b: 0 }, { l: 50, a: 10, b: 0 }));
+			expect(opposite.toFixed(4)).toBe('26.0273');
+			expect(helpers.ciede2000({ l: 50, a: 10, b: -1e-300 }, { l: 50, a: 10, b: 0 })).toBeCloseTo(0, 12);
+			// Far outside any gamut, the chroma weights do not overflow.
+			expect(Number.isFinite(helpers.ciede2000({ l: 0, a: 1e100, b: 0 }, { l: 0, a: 0, b: 0 }))).toBe(true);
+			expect(helpers.ciede2000({ l: 0, a: 1e-300, b: 0 }, { l: 0, a: 0, b: 0 })).toBeCloseTo(0, 12);
+		});
+
+		it('rejects non-objects and non-finite components', function () {
+			const lab = { l: 50, a: 0, b: 0 };
+			expect(function () {
+				helpers.ciede2000(null as unknown as helpers.Lab, lab);
+			}).toThrow(new TypeError('ciede2000: `first` must be an { l, a, b } object, got null'));
+			expect(function () {
+				helpers.ciede2000(lab, '#fff' as unknown as helpers.Lab);
+			}).toThrow(new TypeError('ciede2000: `second` must be an { l, a, b } object, got string'));
+			expect(function () {
+				helpers.ciede2000({ l: '50', a: 0, b: 0 } as unknown as helpers.Lab, lab);
+			}).toThrow(new TypeError('ciede2000: `first.l` must be a finite number, got string'));
+			expect(function () {
+				helpers.ciede2000(lab, { l: 50, a: NaN, b: 0 });
+			}).toThrow(new RangeError('ciede2000: `second.a` must be a finite number, got NaN'));
+			expect(function () {
+				helpers.ciede2000(lab, { l: 50, a: 0, b: -Infinity });
+			}).toThrow(new RangeError('ciede2000: `second.b` must be a finite number, got -Infinity'));
+			expect(function () {
+				helpers.ciede2000({ l: 50, a: 0 } as helpers.Lab, lab);
+			}).toThrow(new TypeError('ciede2000: `first.b` must be a finite number, got undefined'));
+		});
+	});
+
+	describe('deltaE', function () {
+		it('defaults to deltaEOK, unscaled (black to white is 1)', function () {
+			expect(helpers.deltaE('#000', '#fff')).toBe(1);
+			expect(helpers.deltaE('#000', '#fff', {})).toBe(1);
+			expect(helpers.deltaE('#f00', '#f00')).toBe(0);
+			const red = helpers.toOklab('#ff0000');
+			const blue = helpers.toOklab('#0000ff');
+			expect(helpers.deltaE('#ff0000', '#0000ff', { method: 'ok' })).toBeCloseTo(Math.hypot(red.l - blue.l, red.a - blue.a, red.b - blue.b), 14);
+			expect(helpers.deltaE('#ff0000', '#0000ff').toFixed(4)).toBe('0.5371');
+		});
+
+		it('computes CIE76 and CIEDE2000 on CIELAB D50 coordinates', function () {
+			const red = helpers.toLab('#ff0000');
+			const blue = helpers.toLab('#0000ff');
+			expect(helpers.deltaE('#ff0000', '#0000ff', { method: '76' })).toBeCloseTo(Math.hypot(red.l - blue.l, red.a - blue.a, red.b - blue.b), 12);
+			expect(helpers.deltaE('#ff0000', '#0000ff', { method: '2000' })).toBe(helpers.ciede2000(red, blue));
+			expect(helpers.deltaE('#000', '#fff', { method: '76' })).toBe(100);
+			expect(helpers.deltaE('#000', '#fff', { method: '2000' })).toBe(100);
+			expect(helpers.deltaE('#123456', { r: 0x12, g: 0x34, b: 0x56, a: 0 }, { method: '2000' })).toBe(0);
+			// The formulas disagree on saturated colours: CIE76 overstates their differences.
+			expect(helpers.deltaE('#ff0000', '#0000ff', { method: '76' })).toBeGreaterThan(3 * helpers.deltaE('#ff0000', '#0000ff', { method: '2000' }));
+		});
+
+		it('rejects unknown methods and invalid colours', function () {
+			expect(function () {
+				helpers.deltaE('#000', '#fff', { method: 'cmc' as helpers.DeltaEMethod });
+			}).toThrow(new RangeError("deltaE: `options.method` must be 'ok', '2000' or '76', got cmc"));
+			expect(function () {
+				helpers.deltaE('#000', '#fff', { method: 2000 as unknown as helpers.DeltaEMethod });
+			}).toThrow(new RangeError("deltaE: `options.method` must be 'ok', '2000' or '76', got 2000"));
+			expect(function () {
+				helpers.deltaE('#000', 'red');
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.deltaE({ r: NaN, g: 0, b: 0 }, '#fff', { method: '76' });
+			}).toThrow(RangeError);
+		});
+	});
+
+	describe('colorFromString', function () {
+		it('pins reference outputs (any change of hash or mapping breaks stored colours)', function () {
+			const reference: Array<[string, string, string, string, string]> = [
+				['', '#2aa8f2', '#60839d', '#007cc2', '#39b3fd'],
+				['a', '#eb7957', '#00b1a9', '#c35433', '#fe8a67'],
+				['A', '#a7a507', '#0093a4', '#7d7a00', '#b1af21'],
+				['user1', '#948ff8', '#71a5dd', '#716acf', '#a3a0ff'],
+				['user2', '#d478c6', '#7d93be', '#ae55a2', '#e78ad8'],
+				['user3', '#aba300', '#6cc0cb', '#807900', '#b5ae1c'],
+				['Ada Lovelace', '#7cb145', '#20525c', '#528409', '#83b94d'],
+				['ñandú', '#9f8cf4', '#4da7ff', '#7c67cb', '#af9cff'],
+				['日本語', '#d179cb', '#3058a8', '#ab57a6', '#e48bdd'],
+				['😀', '#d78c01', '#699ea0', '#aa6600', '#e69a24'],
+				['x'.repeat(1000), '#3db973', '#66c6e2', '#008846', '#45c079']
+			];
+			for (const [text, plain, ranged, readable, light] of reference) {
+				expect(helpers.colorFromString(text)).toBe(plain);
+				expect(helpers.colorFromString(text, { lightness: [0.4, 0.8], chroma: [0.05, 0.2], hueRange: [180, 270] })).toBe(ranged);
+				expect(helpers.colorFromString(text, { contrastWith: '#ffffff' })).toBe(readable);
+				expect(helpers.colorFromString(text, { contrastWith: '#000', minContrast: 9 })).toBe(light);
+			}
+		});
+
+		it('returns an opaque Rgba object with format rgb, and the same colour as the hex string', function () {
+			const color = helpers.colorFromString('Ada Lovelace', { format: 'rgb' });
+			expect(color).toEqual({ r: 124, g: 177, b: 69, a: 1 });
+			expect(helpers.toHex(color)).toBe(helpers.colorFromString('Ada Lovelace', { format: 'hex' }));
+			expect(helpers.colorFromString('Ada Lovelace', { format: 'rgb' })).not.toBe(color);
+		});
+
+		it('uses fixed values and ends of ranges as given', function () {
+			const fixed = helpers.toOklch(helpers.colorFromString('tag', { lightness: 0.5, chroma: 0, hueRange: [10, 10] }));
+			expect(fixed.c).toBe(0);
+			expect(helpers.colorFromString('tag', { lightness: 0, chroma: 0.4 })).toBe('#000000');
+			expect(helpers.colorFromString('tag', { lightness: 1 })).toBe('#ffffff');
+			expect(helpers.colorFromString('tag', { lightness: [0.6, 0.6] })).toBe(helpers.colorFromString('tag', { lightness: 0.6 }));
+			expect(helpers.colorFromString('tag', { chroma: [0.1, 0.1] })).toBe(helpers.colorFromString('tag', { chroma: 0.1 }));
+			expect(helpers.colorFromString('tag', { hueRange: [0, 360] })).toBe(helpers.colorFromString('tag'));
+			expect(helpers.colorFromString('tag', { hueRange: [-360, 0] })).toBe(helpers.colorFromString('tag'));
+			expect(helpers.colorFromString('tag', { hueRange: [720, 1080] })).toBe(helpers.colorFromString('tag'));
+			// A zero-width hue range gives that hue.
+			const hue = helpers.toOklch(helpers.colorFromString('tag', { hueRange: [145, 145], chroma: 0.1 })).h;
+			expect(Math.abs(hue - 145)).toBeLessThan(1);
+		});
+
+		it('spreads hues evenly, and similar strings far apart', function () {
+			const buckets = new Array<number>(12).fill(0);
+			let gaps = 0;
+			let previous = NaN;
+			for (let i = 0; i < 6000; i++) {
+				const hue = helpers.toOklch(helpers.colorFromString(`user${i}`, { chroma: 0.05 })).h;
+				buckets[Math.floor(hue / 30) % 12]++;
+				if (i > 0) gaps += 180 - Math.abs(180 - Math.abs(hue - previous));
+				previous = hue;
+			}
+			for (const count of buckets) expect(Math.abs(count - 500)).toBeLessThan(90);
+			// Independent hues are 90° apart on average.
+			expect(gaps / 5999).toBeGreaterThan(80);
+		});
+
+		it('encodes the string as UTF-8, with lone surrogates as U+FFFD', function () {
+			expect(helpers.colorFromString('\ud800')).toBe(helpers.colorFromString('�'));
+			expect(helpers.colorFromString('a\udc00b')).toBe(helpers.colorFromString('a�b'));
+			expect(helpers.colorFromString('\ud83d')).toBe(helpers.colorFromString('�'));
+			expect(helpers.colorFromString('\ud83d\ud83d')).toBe(helpers.colorFromString('��'));
+			expect(helpers.colorFromString('😀')).not.toBe(helpers.colorFromString('��'));
+		});
+
+		it('guarantees the contrast against contrastWith, moving lightness the better way', function () {
+			for (const [background, ratio] of [
+				['#ffffff', 4.5],
+				['#000000', 7],
+				['#777777', 4.6],
+				['#1e3a8a', 3],
+				['#fde68a', 21 / 2]
+			] as const) {
+				for (let i = 0; i < 50; i++) {
+					const color = helpers.colorFromString(`name ${i}`, { contrastWith: background, minContrast: ratio });
+					expect(helpers.contrastRatio(color, background)).toBeGreaterThanOrEqual(ratio);
+				}
+			}
+			// Against #777, black reaches more contrast than white: colours get darker.
+			const plain = helpers.colorFromString('Ada Lovelace', { lightness: 0.6 });
+			const darker = helpers.colorFromString('Ada Lovelace', { lightness: 0.6, contrastWith: '#777', minContrast: 4.6 });
+			expect(helpers.relativeLuminance(darker)).toBeLessThan(helpers.relativeLuminance(plain));
+			// Against a dark background, lighter.
+			const lighter = helpers.colorFromString('Ada Lovelace', { lightness: 0.3, contrastWith: '#000' });
+			expect(helpers.relativeLuminance(lighter)).toBeGreaterThan(helpers.relativeLuminance(helpers.colorFromString('Ada Lovelace', { lightness: 0.3 })));
+			// Already readable: unchanged.
+			expect(helpers.colorFromString('Ada Lovelace', { lightness: 0.2, contrastWith: '#fff' })).toBe(helpers.colorFromString('Ada Lovelace', { lightness: 0.2 }));
+			// minContrast 1 always holds; the extremes are reachable exactly.
+			expect(helpers.colorFromString('Ada Lovelace', { contrastWith: '#fff', minContrast: 1 })).toBe(helpers.colorFromString('Ada Lovelace'));
+			expect(helpers.colorFromString('Ada Lovelace', { contrastWith: '#fff', minContrast: 21 })).toBe('#000000');
+			expect(helpers.colorFromString('Ada Lovelace', { contrastWith: '#000', minContrast: 21 })).toBe('#ffffff');
+			expect(helpers.colorFromString('Ada Lovelace', { contrastWith: '#fff', minContrast: 21, format: 'rgb' })).toEqual({ r: 0, g: 0, b: 0, a: 1 });
+			// A translucent background counts as opaque.
+			expect(helpers.colorFromString('x', { contrastWith: 'rgb(255 255 255 / 0)' })).toBe(helpers.colorFromString('x', { contrastWith: '#fff' }));
+		});
+
+		it('rejects invalid arguments with clear messages', function () {
+			const cases: Array<[() => unknown, Error]> = [
+				[
+					function () {
+						return helpers.colorFromString(42 as unknown as string);
+					},
+					new TypeError('colorFromString: `text` must be a string, got number')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { format: 'hsl' as 'hex' });
+					},
+					new RangeError("colorFromString: `options.format` must be 'hex' or 'rgb', got hsl")
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { lightness: 1.5 });
+					},
+					new RangeError('colorFromString: `options.lightness` must be a number in [0, 1] or a [min, max] pair of them, got 1.5')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { lightness: -0.1 });
+					},
+					new RangeError('colorFromString: `options.lightness` must be a number in [0, 1] or a [min, max] pair of them, got -0.1')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { chroma: NaN });
+					},
+					new RangeError('colorFromString: `options.chroma` must be a number in [0, 0.4] or a [min, max] pair of them, got NaN')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { chroma: '0.1' as unknown as number });
+					},
+					new TypeError('colorFromString: `options.chroma` must be a number in [0, 0.4] or a [min, max] pair of them, got string')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { chroma: [0.2, 0.1] });
+					},
+					new RangeError('colorFromString: `options.chroma` must be a number in [0, 0.4] or a [min, max] pair of them with min <= max, got [0.2, 0.1]')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { chroma: [0.1, 0.5] });
+					},
+					new RangeError('colorFromString: `options.chroma` must be a number in [0, 0.4] or a [min, max] pair of them with min <= max, got [0.1, 0.5]')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { lightness: [-0.1, 0.5] });
+					},
+					new RangeError('colorFromString: `options.lightness` must be a number in [0, 1] or a [min, max] pair of them with min <= max, got [-0.1, 0.5]')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { lightness: [0.1, 0.5, 0.7] as unknown as [number, number] });
+					},
+					new RangeError('colorFromString: `options.lightness` must be a number in [0, 1] or a [min, max] pair of them with min <= max, got an array of length 3')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { lightness: [0.1, '0.5'] as unknown as [number, number] });
+					},
+					new RangeError('colorFromString: `options.lightness` must be a number in [0, 1] or a [min, max] pair of them with min <= max, got [0.1, 0.5]')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { lightness: ['0.1', 0.5] as unknown as [number, number] });
+					},
+					new RangeError('colorFromString: `options.lightness` must be a number in [0, 1] or a [min, max] pair of them with min <= max, got [0.1, 0.5]')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { lightness: [0.5] as unknown as [number, number] });
+					},
+					new RangeError('colorFromString: `options.lightness` must be a number in [0, 1] or a [min, max] pair of them with min <= max, got an array of length 1')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { hueRange: 90 as unknown as [number, number] });
+					},
+					new TypeError('colorFromString: `options.hueRange` must be a [start, end] pair of degrees, got number')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { hueRange: [90, 30] });
+					},
+					new RangeError('colorFromString: `options.hueRange` must be a [start, end] pair of finite degrees with start <= end <= start + 360, got [90, 30]')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { hueRange: [0, 361] });
+					},
+					new RangeError('colorFromString: `options.hueRange` must be a [start, end] pair of finite degrees with start <= end <= start + 360, got [0, 361]')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { hueRange: [0, Infinity] });
+					},
+					new RangeError('colorFromString: `options.hueRange` must be a [start, end] pair of finite degrees with start <= end <= start + 360, got [0, Infinity]')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { hueRange: [NaN, 10] });
+					},
+					new RangeError('colorFromString: `options.hueRange` must be a [start, end] pair of finite degrees with start <= end <= start + 360, got [NaN, 10]')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { hueRange: [0, 10, 20] as unknown as [number, number] });
+					},
+					new RangeError(
+						'colorFromString: `options.hueRange` must be a [start, end] pair of finite degrees with start <= end <= start + 360, got an array of length 3'
+					)
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { minContrast: 3 });
+					},
+					new TypeError('colorFromString: `options.contrastWith` must be a colour when `options.minContrast` is set, got undefined')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { contrastWith: '#fff', minContrast: 0.5 });
+					},
+					new RangeError('colorFromString: `options.minContrast` must be a number in [1, 21], got 0.5')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { contrastWith: '#fff', minContrast: 22 });
+					},
+					new RangeError('colorFromString: `options.minContrast` must be a number in [1, 21], got 22')
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { contrastWith: '#777', minContrast: 7 });
+					},
+					new RangeError(`colorFromString: \`options.minContrast\` must be at most ${helpers.contrastRatio('#777', '#000')} against \`options.contrastWith\`, got 7`)
+				],
+				[
+					function () {
+						return helpers.colorFromString('x', { contrastWith: '#888', minContrast: 6 });
+					},
+					new RangeError(`colorFromString: \`options.minContrast\` must be at most ${helpers.contrastRatio('#888', '#000')} against \`options.contrastWith\`, got 6`)
+				]
+			];
+			for (const [fn, error] of cases) expect(fn).toThrow(error);
+			expect(function () {
+				helpers.colorFromString('x', { contrastWith: 'red' });
+			}).toThrow(TypeError);
+			// Security: an attacker-sized array is described by its length, not written out.
+			expect(function () {
+				helpers.colorFromString('x', { chroma: new Array(100_000).fill(0) as unknown as [number, number] });
+			}).toThrow(
+				new RangeError('colorFromString: `options.chroma` must be a number in [0, 0.4] or a [min, max] pair of them with min <= max, got an array of length 100000')
+			);
+			expect(function () {
+				helpers.colorFromString('x', { hueRange: new Array(100_000).fill(0) as unknown as [number, number] });
+			}).toThrow(
+				new RangeError(
+					'colorFromString: `options.hueRange` must be a [start, end] pair of finite degrees with start <= end <= start + 360, got an array of length 100000'
+				)
+			);
+			// eslint-disable-next-line no-sparse-arrays
+			const sparse = [, 0.5] as unknown as [number, number];
+			expect(function () {
+				helpers.colorFromString('x', { lightness: sparse });
+			}).toThrow(new RangeError('colorFromString: `options.lightness` must be a number in [0, 1] or a [min, max] pair of them with min <= max, got [undefined, 0.5]'));
+		});
+	});
+
+	describe('simulateColorVisionDeficiency', function () {
+		it('stores the published Machado, Oliveira & Fernandes (2009) matrices digit for digit', function () {
+			// The source keeps the matrices in millionths: parse them back and compare with the published 6-decimal table.
+			const source = readFileSync(join(__dirname, 'index.ts'), 'utf8');
+			// A static check of the real file: Stryker's instrumented copy wraps every negative literal in a mutant switch.
+			if (source.includes('stryMutAct_')) return;
+			for (const [name, type] of [
+				['PROTAN', 'protanopia'],
+				['DEUTAN', 'deuteranopia'],
+				['TRITAN', 'tritanopia']
+			] as const) {
+				const literal = new RegExp(`const ${name} = \\[([^\\]]*)\\]`).exec(source);
+				expect(literal).not.toBeNull();
+				const values = (literal as RegExpExecArray)[1].split(',').map(Number);
+				expect(values).toHaveLength(90);
+				for (let tenths = 1; tenths <= 10; tenths++) {
+					expect(
+						values.slice((tenths - 1) * 9, tenths * 9).map(function (value) {
+							return value / 1e6;
+						})
+					).toEqual(machado(type, tenths));
+				}
+			}
+		});
+
+		it('the published matrices keep white white (every row sums to 1 within their rounding)', function () {
+			for (const type of ['protanopia', 'deuteranopia', 'tritanopia'] as const) {
+				for (let tenths = 0; tenths <= 10; tenths++) {
+					const matrix = machado(type, tenths);
+					for (let row = 0; row < 3; row++) expect(Math.abs(matrix[row * 3] + matrix[row * 3 + 1] + matrix[row * 3 + 2] - 1)).toBeLessThanOrEqual(1.5e-6);
+					expect(helpers.simulateColorVisionDeficiency('#ffffff', type, tenths / 10)).toEqual({ r: 255, g: 255, b: 255, a: 1 });
+					expect(helpers.simulateColorVisionDeficiency('#000000', type, tenths / 10)).toEqual({ r: 0, g: 0, b: 0, a: 1 });
+				}
+			}
+		});
+
+		it('applies the published matrices in linear sRGB at every tabulated severity', function () {
+			const colors = ['#ff0000', '#00ff00', '#0000ff', '#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00', '#ffff33', '#a65628', '#f781bf', '#999999'];
+			for (const type of ['protanopia', 'deuteranopia', 'tritanopia'] as const) {
+				for (let tenths = 0; tenths <= 10; tenths++) {
+					for (const color of colors) {
+						const { r, g, b } = helpers.simulateColorVisionDeficiency(color, type, tenths / 10);
+						const expected = applyLinear(machado(type, tenths), helpers.toRgba(color));
+						for (const [index, channel] of [r, g, b].entries()) expect(Math.abs(channel - expected[index])).toBeLessThanOrEqual(1);
+					}
+				}
+			}
+			expect(helpers.simulateColorVisionDeficiency('#ff0000', 'protanopia')).toEqual({ r: 109, g: 95, b: 0, a: 1 });
+			expect(helpers.simulateColorVisionDeficiency('#ff0000', 'deuteranopia')).toEqual({ r: 163, g: 144, b: 0, a: 1 });
+			expect(helpers.simulateColorVisionDeficiency('#ff0000', 'tritanopia')).toEqual({ r: 255, g: 0, b: 15, a: 1 });
+			expect(helpers.simulateColorVisionDeficiency('#0000ff', 'tritanopia', 1)).toEqual({ r: 0, g: 107, b: 150, a: 1 });
+		});
+
+		it('interpolates linearly between tabulated severities', function () {
+			const between = helpers.simulateColorVisionDeficiency('#4daf4a', 'deuteranopia', 0.35);
+			const low = machado('deuteranopia', 3);
+			const high = machado('deuteranopia', 4);
+			const expected = applyLinear(
+				low.map(function (value, index) {
+					return (value + high[index]) / 2;
+				}),
+				helpers.toRgba('#4daf4a')
+			);
+			for (const [index, channel] of [between.r, between.g, between.b].entries()) expect(Math.abs(channel - expected[index])).toBeLessThanOrEqual(1);
+			// Below 0.1: between the identity and the 0.1 matrix.
+			const slight = helpers.simulateColorVisionDeficiency('#ff0000', 'protanopia', 0.05);
+			expect(slight.r).toBeLessThan(255);
+			expect(slight.r).toBeGreaterThan(helpers.simulateColorVisionDeficiency('#ff0000', 'protanopia', 0.1).r);
+		});
+
+		it('turns colours into the grey of the same luminance for achromatopsia', function () {
+			expect(helpers.simulateColorVisionDeficiency('#ff0000', 'achromatopsia')).toEqual({ r: 127, g: 127, b: 127, a: 1 });
+			expect(helpers.simulateColorVisionDeficiency('#ffffff', 'achromatopsia')).toEqual({ r: 255, g: 255, b: 255, a: 1 });
+			const half = helpers.simulateColorVisionDeficiency('#ff0000', 'achromatopsia', 0.5);
+			expect(half.r).toBeGreaterThan(127);
+			expect(half.g).toBeGreaterThan(0);
+			expect(half.g).toBeLessThan(127);
+			expect(half.g).toBe(half.b);
+		});
+
+		it('returns the colour unchanged at severity 0, keeps alpha, and defaults to severity 1', function () {
+			for (const type of ['protanopia', 'deuteranopia', 'tritanopia', 'achromatopsia'] as const) {
+				expect(helpers.simulateColorVisionDeficiency({ r: 12, g: 200, b: 99, a: 0.3 }, type, 0)).toEqual({ r: 12, g: 200, b: 99, a: 0.3 });
+				expect(helpers.simulateColorVisionDeficiency('#4daf4a80', type).a).toBe(128 / 255);
+				expect(helpers.simulateColorVisionDeficiency('#4daf4a', type)).toEqual(helpers.simulateColorVisionDeficiency('#4daf4a', type, 1));
+			}
+		});
+
+		it('rejects unknown types and invalid severities', function () {
+			expect(function () {
+				helpers.simulateColorVisionDeficiency('#fff', 'colorblind' as helpers.ColorVisionDeficiency);
+			}).toThrow(new RangeError("simulateColorVisionDeficiency: `type` must be 'protanopia', 'deuteranopia', 'tritanopia' or 'achromatopsia', got colorblind"));
+			expect(function () {
+				helpers.simulateColorVisionDeficiency('#fff', 'protanopia', 1.1);
+			}).toThrow(new RangeError('simulateColorVisionDeficiency: `severity` must be a number in [0, 1], got 1.1'));
+			expect(function () {
+				helpers.simulateColorVisionDeficiency('#fff', 'achromatopsia', -0.1);
+			}).toThrow(new RangeError('simulateColorVisionDeficiency: `severity` must be a number in [0, 1], got -0.1'));
+			expect(function () {
+				helpers.simulateColorVisionDeficiency('#fff', 'tritanopia', NaN);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.simulateColorVisionDeficiency('#fff', 'tritanopia', '1' as unknown as number);
+			}).toThrow(new TypeError('simulateColorVisionDeficiency: `severity` must be a number in [0, 1], got string'));
+			expect(function () {
+				helpers.simulateColorVisionDeficiency('nope', 'deuteranopia');
+			}).toThrow(TypeError);
+		});
+	});
+
+	describe('under prototype pollution', function () {
+		it('reads the options and Lab components as own properties only', function () {
+			const clean = [helpers.deltaE('#f00', '#00f'), helpers.colorFromString('Ada'), helpers.ciede2000({ l: 50, a: 1, b: 2 }, { l: 60, a: 3, b: 4 })];
+			const keys = Object.prototype as Record<string, unknown>;
+			Object.assign(keys, { method: '76', format: 'rgb', lightness: 0.1, chroma: 0.4, hueRange: [0, 10], contrastWith: '#fff', minContrast: 21 });
+			try {
+				expect([helpers.deltaE('#f00', '#00f'), helpers.colorFromString('Ada'), helpers.ciede2000({ l: 50, a: 1, b: 2 }, { l: 60, a: 3, b: 4 })]).toEqual(clean);
+				keys.l = 50;
+				expect(function () {
+					helpers.ciede2000({ a: 0, b: 0 } as helpers.Lab, { l: 50, a: 0, b: 0 });
+				}).toThrow(TypeError);
+			} finally {
+				for (const key of ['method', 'format', 'lightness', 'chroma', 'hueRange', 'contrastWith', 'minContrast', 'l']) delete keys[key];
+			}
+		});
+
+		it('still reads options and components from class getters', function () {
+			class Options {
+				get method(): '2000' {
+					return '2000';
+				}
+				get format(): 'rgb' {
+					return 'rgb';
+				}
+			}
+			class Point {
+				get l(): number {
+					return 50;
+				}
+				get a(): number {
+					return 2.5;
+				}
+				get b(): number {
+					return 0;
+				}
+			}
+			expect(helpers.deltaE('#f00', '#00f', new Options())).toBe(helpers.deltaE('#f00', '#00f', { method: '2000' }));
+			expect(helpers.colorFromString('Ada', new Options())).toEqual(helpers.colorFromString('Ada', { format: 'rgb' }));
+			expect(helpers.ciede2000(new Point(), { l: 50, a: 0, b: -2.5 }).toFixed(4)).toBe('4.3065');
+		});
+	});
+});
+
+describe('Colour difference and colours from strings: edge cases', function () {
+	it('ciede2000 takes the mean hue the short way round when hues straddle 0° (Sharma, Wu & Dalal, eq. 14)', function () {
+		// Conjugate colours: hues θ and 360° - θ, whose sum is exactly 360°: the mean hue is 0°, not 360°.
+		expect(helpers.ciede2000({ l: 50, a: 20, b: 5 }, { l: 60, a: 40, b: -10 })).toBeCloseTo(15.527956416660242, 11);
+		expect(helpers.ciede2000({ l: 50, a: 20, b: 0.5 }, { l: 50, a: 30, b: -1 })).toBeCloseTo(5.091413242701706, 11);
+		// Hues more than 180° apart with a sum below and above 360°.
+		expect(helpers.ciede2000({ l: 40, a: -20, b: 30 }, { l: 45, a: 15, b: -30 })).toBeCloseTo(42.69230806853317, 11);
+		expect(helpers.ciede2000({ l: 60, a: 1, b: 30 }, { l: 55, a: -2, b: -31 })).toBeCloseTo(42.01146551297721, 11);
+	});
+
+	it('ciede2000 names the right argument and component in its errors', function () {
+		const lab = { l: 50, a: 0, b: 0 };
+		expect(function () {
+			helpers.ciede2000(42 as unknown as helpers.Lab, lab);
+		}).toThrow(new TypeError('ciede2000: `first` must be an { l, a, b } object, got number'));
+		expect(function () {
+			helpers.ciede2000(lab, null as unknown as helpers.Lab);
+		}).toThrow(new TypeError('ciede2000: `second` must be an { l, a, b } object, got null'));
+		expect(function () {
+			helpers.ciede2000({ l: 50, a: Infinity, b: 0 }, lab);
+		}).toThrow(new RangeError('ciede2000: `first.a` must be a finite number, got Infinity'));
+		expect(function () {
+			helpers.ciede2000(lab, { l: -Infinity, a: 0, b: 0 });
+		}).toThrow(new RangeError('ciede2000: `second.l` must be a finite number, got -Infinity'));
+	});
+
+	it('colorFromString hashes the UTF-8 encoding exactly at every encoding boundary', function () {
+		/** The documented hash, over `TextEncoder` bytes. */
+		function hash(text: string): number {
+			let value = 0x811c9dc5;
+			for (const octet of new TextEncoder().encode(text)) value = Math.imul(value ^ octet, 16777619);
+			value ^= value >>> 16;
+			value = Math.imul(value, 0x85ebca6b);
+			value ^= value >>> 13;
+			value = Math.imul(value, 0xc2b2ae35);
+			return (value ^ (value >>> 16)) >>> 0;
+		}
+		const samples = [
+			'\u007f',
+			'\u0080',
+			'߿',
+			'ࠀ',
+			'퟿',
+			'\ud800',
+			'\udbff',
+			'\udc00',
+			'\udfff',
+			'',
+			'￿',
+			'𐀀',
+			'􏿿',
+			'\ud800\udbff',
+			'\udc00\udc00',
+			'\udbff',
+			'\ud800\udbffx',
+			'a\ud800'
+		];
+		for (const text of samples) {
+			const expected = helpers.toHex(helpers.oklchToRgb({ l: 0.7, c: 0.15, h: ((hash(text) >>> 16) / 65536) * 360 }));
+			expect([text, helpers.colorFromString(text)]).toEqual([text, expected]);
+		}
+	});
+
+	it('colorFromString accepts the ends of the lightness and chroma ranges', function () {
+		expect(helpers.colorFromString('tag', { lightness: [0.5, 1], chroma: [0, 0.4] })).toMatch(/^#[0-9a-f]{6}$/);
+		expect(helpers.colorFromString('tag', { lightness: [1, 1] })).toBe('#ffffff');
+	});
+
+	it('colorFromString keeps a colour whose contrast equals minContrast exactly, and stops at the exact threshold', function () {
+		const plain = helpers.colorFromString('Ada Lovelace');
+		const exact = helpers.contrastRatio(plain, '#123456');
+		expect(helpers.colorFromString('Ada Lovelace', { contrastWith: '#123456', minContrast: exact })).toBe(plain);
+		// Even at the very edge of its 8-bit level (lightness 0.56412 is the boundary between #757575 and #767676).
+		const edge = { chroma: 0, lightness: 0.56413 };
+		expect(helpers.colorFromString('x', edge)).toBe('#767676');
+		expect(helpers.colorFromString('x', { ...edge, contrastWith: '#fff', minContrast: helpers.contrastRatio('#767676', '#fff') })).toBe('#767676');
+		// Greys: every lightness that rounds to #767676 has exactly its contrast with white, so the search ends on it (not on #757575).
+		const threshold = helpers.contrastRatio('#767676', '#fff');
+		expect(helpers.colorFromString('x', { chroma: 0, contrastWith: '#fff', minContrast: threshold })).toBe('#767676');
+		expect(helpers.colorFromString('x', { chroma: 0, contrastWith: '#000', minContrast: helpers.contrastRatio('#767676', '#000') })).toBe('#9e9e9e');
+		expect(helpers.colorFromString('x', { chroma: 0, lightness: 0.3, contrastWith: '#000', minContrast: helpers.contrastRatio('#767676', '#000') })).toBe('#767676');
 	});
 });

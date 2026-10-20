@@ -1,4 +1,4 @@
-import { contrastRatio, hslToRgb, lighten, mix, parseColor, parseHex, rgbToHsl, toCssRgb, toHex } from 'tinkit/color';
+import { colorFromString, contrastRatio, deltaE, hslToRgb, lighten, mix, parseColor, parseHex, rgbToHsl, simulateColorVisionDeficiency, toCssRgb, toHex } from 'tinkit/color';
 
 // No colour library is installed as a competitor: the `hand-written` implementations below are the straightforward
 // code one would write inline (no validation, no CSS Color 4 syntax, no alpha), i.e. a lower bound for the work.
@@ -141,6 +141,144 @@ function naiveHslToRgb(hsl) {
 		return Math.round((l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1))) * 255);
 	}
 	return { r: f(0), g: f(8), b: f(4) };
+}
+
+// Hand-written baselines for deltaE, colorFromString and simulateColorVisionDeficiency: the textbook code (arrays per step,
+// `Math.pow`, `TextEncoder`), without validation, gamut mapping or CSS parsing beyond `#rrggbb`.
+const names = Array.from({ length: 1000 }, function (_, index) {
+	return `user-${index}@example.com`;
+});
+
+/**
+ * Multiplies a 3×3 matrix (array of rows) by a vector.
+ * @param {number[][]} matrix - The matrix
+ * @param {number[]} vector - The vector
+ * @returns {number[]} The product
+ */
+function naiveMultiply(matrix, vector) {
+	return matrix.map(function (row) {
+		return row[0] * vector[0] + row[1] * vector[1] + row[2] * vector[2];
+	});
+}
+
+/**
+ * Hand-written `#rrggbb` to linear-light sRGB.
+ * @param {string} hex - The colour
+ * @returns {number[]} The linear channels
+ */
+function naiveLinearRgb(hex) {
+	const { r, g, b } = naiveParseHex(hex);
+	return [r, g, b].map(naiveLinear);
+}
+
+const NAIVE_LMS = [
+	[0.4122214708, 0.5363325363, 0.0514459929],
+	[0.2119034982, 0.6806995451, 0.1073969566],
+	[0.0883024619, 0.2817188376, 0.6299787005]
+];
+const NAIVE_OKLAB = [
+	[0.2104542553, 0.793617785, -0.0040720468],
+	[1.9779984951, -2.428592205, 0.4505937099],
+	[0.0259040371, 0.7827717662, -0.808675766]
+];
+
+/**
+ * Hand-written hex to OKLab (Ottosson's reference code).
+ * @param {string} hex - The colour
+ * @returns {number[]} `[l, a, b]`
+ */
+function naiveOklab(hex) {
+	return naiveMultiply(NAIVE_OKLAB, naiveMultiply(NAIVE_LMS, naiveLinearRgb(hex)).map(Math.cbrt));
+}
+
+const NAIVE_XYZ = [
+	[0.41239079926595934, 0.357584339383878, 0.1804807884018343],
+	[0.21263900587151027, 0.715168678767756, 0.07219231536073371],
+	[0.01933081871559182, 0.11919477979462598, 0.9505321522496607]
+];
+const NAIVE_BRADFORD = [
+	[1.0479297925449969, 0.022946870601609652, -0.05019226628920524],
+	[0.02962780877005599, 0.9904344267538799, -0.017073799063418826],
+	[-0.009243040646204504, 0.015055191490298152, 0.7518742814281371]
+];
+const NAIVE_D50 = [0.3457 / 0.3585, 1, (1 - 0.3457 - 0.3585) / 0.3585];
+
+/**
+ * Hand-written hex to CIELAB D50 (the CSS Color 4 sample code).
+ * @param {string} hex - The colour
+ * @returns {number[]} `[l, a, b]`
+ */
+function naiveLab(hex) {
+	const f = naiveMultiply(NAIVE_BRADFORD, naiveMultiply(NAIVE_XYZ, naiveLinearRgb(hex))).map(function (value, index) {
+		const relative = value / NAIVE_D50[index];
+		return relative > 216 / 24389 ? Math.cbrt(relative) : ((24389 / 27) * relative + 16) / 116;
+	});
+	return [116 * f[1] - 16, 500 * (f[0] - f[1]), 200 * (f[1] - f[2])];
+}
+
+/**
+ * Hand-written CIEDE2000 (Sharma et al.'s reference code, in degrees).
+ * @param {number[]} first - `[l, a, b]`
+ * @param {number[]} second - `[l, a, b]`
+ * @returns {number} ΔE00
+ */
+function naiveCiede2000(first, second) {
+	const rad = Math.PI / 180;
+	const mean = (Math.hypot(first[1], first[2]) + Math.hypot(second[1], second[2])) / 2;
+	const g = 0.5 * (1 - Math.sqrt(Math.pow(mean, 7) / (Math.pow(mean, 7) + Math.pow(25, 7))));
+	const a1 = (1 + g) * first[1];
+	const a2 = (1 + g) * second[1];
+	const c1 = Math.hypot(a1, first[2]);
+	const c2 = Math.hypot(a2, second[2]);
+	const h1 = (Math.atan2(first[2], a1) / rad + 360) % 360;
+	const h2 = (Math.atan2(second[2], a2) / rad + 360) % 360;
+	let dh = h2 - h1;
+	if (dh > 180) dh -= 360;
+	else if (dh < -180) dh += 360;
+	const dH = 2 * Math.sqrt(c1 * c2) * Math.sin((dh / 2) * rad);
+	const lp = (first[0] + second[0]) / 2;
+	const cp = (c1 + c2) / 2;
+	let hp = (h1 + h2) / 2;
+	if (Math.abs(h1 - h2) > 180) hp += hp < 180 ? 180 : -180;
+	const t = 1 - 0.17 * Math.cos((hp - 30) * rad) + 0.24 * Math.cos(2 * hp * rad) + 0.32 * Math.cos((3 * hp + 6) * rad) - 0.2 * Math.cos((4 * hp - 63) * rad);
+	const sl = 1 + (0.015 * Math.pow(lp - 50, 2)) / Math.sqrt(20 + Math.pow(lp - 50, 2));
+	const sc = 1 + 0.045 * cp;
+	const sh = 1 + 0.015 * cp * t;
+	const rt = -2 * Math.sqrt(Math.pow(cp, 7) / (Math.pow(cp, 7) + Math.pow(25, 7))) * Math.sin(60 * Math.exp(-Math.pow((hp - 275) / 25, 2)) * rad);
+	const dl = (second[0] - first[0]) / sl;
+	const dc = (c2 - c1) / sc;
+	const dhs = dH / sh;
+	return Math.sqrt(dl * dl + dc * dc + dhs * dhs + rt * dc * dhs);
+}
+
+/**
+ * Hand-written string colour: FNV-1a over `TextEncoder` bytes, the hue into `hsl(h 65% 55%)` (what most avatar snippets do).
+ * @param {string} text - The string
+ * @returns {string} A `#rrggbb` colour
+ */
+function naiveColorFromString(text) {
+	let hash = 0x811c9dc5;
+	for (const byte of new TextEncoder().encode(text)) hash = Math.imul(hash ^ byte, 16777619);
+	return naiveToHex(naiveHslToRgb({ h: (hash >>> 0) % 360, s: 65, l: 55 }));
+}
+
+const NAIVE_DEUTERANOPIA = [
+	[0.367322, 0.860646, -0.227968],
+	[0.280085, 0.672501, 0.047413],
+	[-0.01182, 0.04294, 0.968881]
+];
+
+/**
+ * Hand-written deuteranopia simulation: Machado's matrix in linear sRGB, clipped and encoded back.
+ * @param {string} hex - The colour
+ * @returns {{ r: number, g: number, b: number }} The simulated colour
+ */
+function naiveDeuteranopia(hex) {
+	const [r, g, b] = naiveMultiply(NAIVE_DEUTERANOPIA, naiveLinearRgb(hex)).map(function (value) {
+		const clipped = Math.min(Math.max(value, 0), 1);
+		return Math.round((clipped <= 0.0031308 ? clipped * 12.92 : 1.055 * Math.pow(clipped, 1 / 2.4) - 0.055) * 255);
+	});
+	return { r, g, b };
 }
 
 export default [
@@ -306,6 +444,78 @@ export default [
 					const hsl = naiveRgbToHsl(naiveParseHex(hexes[i]));
 					total += naiveHslToRgb({ h: hsl.h, s: hsl.s, l: Math.min(100, hsl.l + 10) }).r;
 				}
+				return total;
+			}
+		}
+	},
+	{
+		name: 'deltaE ok (1000 hex pairs)',
+		fn: function () {
+			let total = 0;
+			for (let i = 0; i < hexes.length; i++) total += deltaE(hexes[i], hexes[(i + 1) % hexes.length]);
+			return total;
+		},
+		competitors: {
+			'hand-written': function () {
+				let total = 0;
+				for (let i = 0; i < hexes.length; i++) {
+					const a = naiveOklab(hexes[i]);
+					const b = naiveOklab(hexes[(i + 1) % hexes.length]);
+					total += Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+				}
+				return total;
+			}
+		}
+	},
+	{
+		name: 'deltaE 2000 (1000 hex pairs)',
+		fn: function () {
+			let total = 0;
+			for (let i = 0; i < hexes.length; i++) total += deltaE(hexes[i], hexes[(i + 1) % hexes.length], { method: '2000' });
+			return total;
+		},
+		competitors: {
+			'hand-written': function () {
+				let total = 0;
+				for (let i = 0; i < hexes.length; i++) total += naiveCiede2000(naiveLab(hexes[i]), naiveLab(hexes[(i + 1) % hexes.length]));
+				return total;
+			}
+		}
+	},
+	{
+		name: 'colorFromString (1000 e-mails)',
+		fn: function () {
+			let length = 0;
+			for (let i = 0; i < names.length; i++) length += colorFromString(names[i]).length;
+			return length;
+		},
+		competitors: {
+			'hand-written (HSL, no gamut mapping)': function () {
+				let length = 0;
+				for (let i = 0; i < names.length; i++) length += naiveColorFromString(names[i]).length;
+				return length;
+			}
+		}
+	},
+	{
+		name: 'colorFromString with contrastWith (1000 e-mails)',
+		fn: function () {
+			let length = 0;
+			for (let i = 0; i < names.length; i++) length += colorFromString(names[i], { contrastWith: '#ffffff' }).length;
+			return length;
+		}
+	},
+	{
+		name: 'simulateColorVisionDeficiency deuteranopia (1000 hexes)',
+		fn: function () {
+			let total = 0;
+			for (let i = 0; i < hexes.length; i++) total += simulateColorVisionDeficiency(hexes[i], 'deuteranopia').r;
+			return total;
+		},
+		competitors: {
+			'hand-written': function () {
+				let total = 0;
+				for (let i = 0; i < hexes.length; i++) total += naiveDeuteranopia(hexes[i]).r;
 				return total;
 			}
 		}
