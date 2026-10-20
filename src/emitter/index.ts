@@ -65,6 +65,75 @@ function createAbortError(): AbortError {
 }
 
 /**
+ * The `waitFor` calls waiting on one abort signal, and the single listener that stops them all.
+ */
+interface SignalWaiters {
+	readonly stops: Set<(reason: unknown) => void>;
+	readonly listener: () => void;
+}
+
+/**
+ * The `waitFor` calls of every emitter waiting on each signal, with ONE abort listener per signal: adding and removing a listener costs a
+ * scan of the signal's listener list (a platform `AbortSignal` checks for duplicates), so one listener per call made n calls waiting on
+ * one signal cost O(n²) (30,000 took 6 s to start).
+ */
+const signalWaiters = new WeakMap<AbortSignalLike, SignalWaiters>();
+
+/**
+ * Registers a `waitFor` call on `signal` (none: nothing to do), adding the abort listener for its first call. `stop` is called once,
+ * with the signal's reason, unless {@link unwatch} unregisters it first (also from a call stopped before it).
+ * @param {AbortSignalLike | null | undefined} signal - The signal (`null` from untyped code)
+ * @param {(reason: unknown) => void} stop - Stops the call
+ * @returns {void}
+ * @throws {unknown} the error of a throwing `addEventListener` (the call is not registered then)
+ */
+function watch(signal: AbortSignalLike | null | undefined, stop: (reason: unknown) => void): void {
+	if (signal === null || signal === undefined) return;
+
+	const existing = signalWaiters.get(signal);
+
+	if (existing !== undefined) {
+		existing.stops.add(stop);
+		return;
+	}
+
+	const stops = new Set([stop]);
+	const waiters: SignalWaiters = {
+		stops,
+		listener: function onAbort(): void {
+			const reason = reasonOf(signal, createAbortError);
+
+			// Live, each call removed before it is stopped: one unregistered meanwhile is skipped, and none is stopped twice.
+			for (const each of stops) {
+				stops.delete(each);
+				each(reason);
+			}
+			if (signalWaiters.get(signal) === waiters) signalWaiters.delete(signal);
+		}
+	};
+
+	// Mapped once added: when adding it throws, the waiter is not registered, and when the signal calls it while it is being added, the
+	// waiter is stopped already. `capture` is given: one inherited from a polluted `Object.prototype` would keep `removeEventListener`
+	// from finding the listener.
+	signal.addEventListener('abort', waiters.listener, { once: true, capture: false } as { once: boolean });
+	if (stops.size > 0) signalWaiters.set(signal, waiters);
+}
+
+/**
+ * Unregisters a `waitFor` call that settled (idempotent), removing the abort listener once no call waits on the signal.
+ * @param {AbortSignalLike | null | undefined} signal - The signal
+ * @param {(reason: unknown) => void} stop - The call's stop function
+ * @returns {void}
+ */
+function unwatch(signal: AbortSignalLike | null | undefined, stop: (reason: unknown) => void): void {
+	const waiters = signal === null || signal === undefined ? undefined : signalWaiters.get(signal);
+
+	if (waiters === undefined || !waiters.stops.delete(stop) || waiters.stops.size > 0) return;
+	signalWaiters.delete(signal as AbortSignalLike);
+	detach(signal, waiters.listener);
+}
+
+/**
  * A strictly typed, synchronous event emitter. See {@link createEmitter} for the exact semantics.
  * @template Events - Maps each event name to its payload type
  */
@@ -383,9 +452,6 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 					return;
 				}
 
-				// The abort listener first: when adding it throws, neither the event listener nor the timer is left behind.
-				signal?.addEventListener('abort', onAbort);
-
 				const unsubscribe = add(event, onEvent, false);
 				const timer =
 					timeout === Infinity
@@ -404,15 +470,16 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 					unsubscribe();
 					clearTimeout(timer);
 					settle(value as never);
-					detach(signal, onAbort);
+					unwatch(signal, onAbort);
 				}
 
 				/**
 				 * Abort listener.
+				 * @param {unknown} reason - The abort reason
 				 * @returns {void}
 				 */
-				function onAbort(): void {
-					finish(reject, reasonOf(signal as AbortSignalLike, createAbortError));
+				function onAbort(reason: unknown): void {
+					finish(reject, reason);
 				}
 
 				/**
@@ -431,6 +498,16 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 					}
 
 					if (accepted) finish(resolve, payload);
+				}
+
+				// The abort listener last, so that a signal calling it while it is being added finds everything to release; when adding it
+				// throws, neither the event listener nor the timer is left behind.
+				try {
+					watch(signal, onAbort);
+				} catch (error) {
+					unsubscribe();
+					clearTimeout(timer);
+					throw error;
 				}
 			});
 		}

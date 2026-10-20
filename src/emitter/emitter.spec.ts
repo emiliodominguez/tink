@@ -968,6 +968,100 @@ describe('createEmitter', function () {
 			await expect((events.waitFor as any)('*')).rejects.toThrow(new RangeError("waitFor: `event` must not be '*' (reserved for wildcard listeners), got '*'"));
 			expect(events.listenerCount()).toBe(0);
 		});
+
+		it('adds one abort listener per signal, however many waitFor calls share it (previously one each: quadratic)', async function () {
+			const first = createEmitter<{ x: number }>();
+			const second = createEmitter<{ x: number }>();
+			const signal = createSignal();
+			const waits = [first.waitFor('x', { signal }), first.waitFor('x', { signal }), second.waitFor('x', { signal })];
+			expect(signal.listeners).toBe(1);
+			first.emit('x', 1);
+			await expect(Promise.all(waits.slice(0, 2))).resolves.toEqual([1, 1]);
+			// Still listening for the call left.
+			expect(signal.listeners).toBe(1);
+			const later = first.waitFor('x', { signal });
+			signal.abort('stop');
+			await expect(waits[2]).rejects.toBe('stop');
+			await expect(later).rejects.toBe('stop');
+			expect(signal.listeners).toBe(0);
+			expect(first.listenerCount() + second.listenerCount()).toBe(0);
+			// And once every call has settled, none is left either.
+			const other = createSignal();
+			const settled = [first.waitFor('x', { signal: other }), first.waitFor('x', { signal: other, timeout: 0 })];
+			first.emit('x', 2);
+			await expect(settled[0]).resolves.toBe(2);
+			await expect(settled[1]).resolves.toBe(2);
+			expect(other.listeners).toBe(0);
+		});
+
+		it('starts and aborts many waitFor calls sharing a platform signal in linear time', async function () {
+			/**
+			 * Times 30,000 waitFor calls, with or without a shared signal, settled by an emit or an abort.
+			 * @param {boolean} shared - Whether the calls share a signal
+			 * @returns {Promise<number>} The time in ms
+			 */
+			async function time(shared: boolean): Promise<number> {
+				const events = createEmitter<{ x: number }>();
+				const controller = new AbortController();
+				const options = shared ? { signal: controller.signal } : {};
+				const waits: Array<Promise<unknown>> = [];
+				const start = performance.now();
+				for (let i = 0; i < 30_000; i++) waits.push(events.waitFor('x', options));
+				if (shared) controller.abort();
+				else events.emit('x', 1);
+				const elapsed = performance.now() - start;
+				await Promise.allSettled(waits);
+				expect(events.listenerCount()).toBe(0);
+				return elapsed;
+			}
+			const alone = await time(false);
+			// Quadratic, it took hundreds of times as long (6 s).
+			expect(await time(true)).toBeLessThan(alone * 20 + 100);
+		});
+
+		it('rejects with the reason when the signal calls the listener while it is being added (previously a ReferenceError)', async function () {
+			const events = createEmitter<{ x: number }>();
+			/**
+			 * A signal that aborts as soon as a listener is added, calling it at once, then (optionally) throws.
+			 * @param {boolean} thenThrow - Whether adding the listener throws after calling it
+			 * @returns {AbortSignalLike} The signal
+			 */
+			function abortingOnAdd(thenThrow: boolean): AbortSignalLike {
+				const signal = {
+					aborted: false,
+					reason: 'stop',
+					addEventListener: function (_type: string, listener: () => void) {
+						signal.aborted = true;
+						listener();
+						if (thenThrow) throw new Error('add');
+					},
+					removeEventListener: jest.fn()
+				};
+				return signal;
+			}
+			jest.useFakeTimers();
+			try {
+				await expect(events.waitFor('x', { signal: abortingOnAdd(false), timeout: 1000 })).rejects.toBe('stop');
+				await expect(events.waitFor('x', { signal: abortingOnAdd(true), timeout: 1000 })).rejects.toBe('stop');
+				expect(events.listenerCount()).toBe(0);
+				expect(jest.getTimerCount()).toBe(0);
+			} finally {
+				jest.useRealTimers();
+			}
+		});
+
+		it('keeps waiting on a signal whose removeEventListener throws, and is stopped once by its abort', async function () {
+			const events = createEmitter<{ x: number }>();
+			const signal = hostileSignal({ remove: true });
+			const settled = events.waitFor('x', { signal });
+			events.emit('x', 1);
+			await expect(settled).resolves.toBe(1);
+			// The first listener could not be removed: a new one is added for the next call, and the old one stops nobody.
+			const waiting = events.waitFor('x', { signal });
+			signal.fire();
+			await expect(waiting).rejects.toBeInstanceOf(AbortError);
+			expect(events.listenerCount()).toBe(0);
+		});
 	});
 });
 
