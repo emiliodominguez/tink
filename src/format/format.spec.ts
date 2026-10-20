@@ -549,6 +549,15 @@ describe('Format helpers', function () {
 				delete proto[1];
 			}
 		});
+
+		it('should reject a huge sparse array at its first hole, without copying it (out of memory)', function () {
+			const huge = ['a'];
+			huge.length = 2 ** 32 - 1;
+
+			expect(function () {
+				helpers.formatList(huge);
+			}).toThrow(new TypeError('formatList: every item must be a string, got undefined'));
+		});
 	});
 
 	describe('formatDateTime', function () {
@@ -848,6 +857,16 @@ describe('Format helpers (hostile inputs)', function () {
 	it('skips the holes of a sparse locale list, as Intl does', function () {
 		// eslint-disable-next-line no-sparse-arrays
 		expect(helpers.formatNumber(1234.5, { locale: [, 'de-DE'] as string[] })).toBe('1.234,5');
+		// Without visiting every hole: a list of length 2^32 - 1 took 100 seconds. Named properties are not locales.
+		const huge = ['de-DE'];
+		huge[2 ** 32 - 2] = 'fr-FR';
+		Object.assign(huge, { name: 'ja-JP', '01': 'ja-JP', '4294967295': 'ja-JP' });
+		const started = Date.now();
+		expect(helpers.formatNumber(1234.5, { locale: huge })).toBe('1.234,5');
+		const last: string[] = [];
+		last[2 ** 32 - 2] = 'fr-FR';
+		expect(helpers.formatNumber(1234.5, { locale: last })).toBe('1\u202f234,5');
+		expect(Date.now() - started).toBeLessThan(1000);
 	});
 
 	it('rejects a non-number decimals and a non-string unit with a TypeError', function () {

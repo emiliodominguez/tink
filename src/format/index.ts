@@ -211,18 +211,29 @@ function resolveLocales(locale: LocaleInput | undefined): string[] {
 	if (locale === undefined) return [DEFAULT_LOCALE];
 	if (typeof locale !== 'string' && !Array.isArray(locale)) throw new TypeError(`format: \`locale\` must be a string or an array of strings, got ${describe(locale)}`);
 
-	// `filter` skips the holes of a sparse list, as `Intl` does (a spread would turn them into `undefined`).
-	const requested: string[] = typeof locale === 'string' ? [locale] : locale.filter(present);
+	// The holes of a sparse list are skipped, as `Intl` does (a spread would turn them into `undefined`), and without visiting each of
+	// them: `Object.keys` lists the indexes holding an element, in order, so a list of length 2^32 - 1 holding one locale is read at once.
+	const requested: string[] =
+		typeof locale === 'string'
+			? [locale]
+			: Object.keys(locale)
+					.filter(isIndex)
+					.map(function (key: string): string {
+						return locale[Number(key)];
+					});
 
 	return requested.includes(DEFAULT_LOCALE) ? requested : [...requested, DEFAULT_LOCALE];
 }
 
 /**
- * Keeps every element (holes are not visited by `filter`).
- * @returns {boolean} Always `true`
+ * Whether a key of an array is an index (an integer below 2^32 - 1, written canonically), not a named property.
+ * @param {string} key - The key
+ * @returns {boolean} `true` for an index
  */
-function present(): boolean {
-	return true;
+function isIndex(key: string): boolean {
+	const index = Number(key);
+
+	return index >>> 0 === index && index !== 4294967295 && String(index) === key;
 }
 
 /**
@@ -618,17 +629,15 @@ export function formatUnit(value: number | bigint, unit: string, options: Format
 export function formatList(items: Iterable<string> & { readonly charAt?: never }, options: FormatListOptions = {}): string {
 	if (typeof items === 'string' || !isIterable(items)) throw new TypeError(`formatList: \`items\` must be an iterable of strings, got ${describe(items)}`);
 
-	const list = Array.from(items);
-	const array = Array.isArray(items);
-
-	for (let index = 0; index < list.length; index++) {
-		const item = list[index];
-
-		// A hole of an array is `undefined` (iterating would read it from a polluted `Array.prototype` or `Object.prototype`).
-		if (typeof item !== 'string' || (array && !Object.hasOwn(items, index))) {
-			throw new TypeError(`formatList: every item must be a string, got ${describe(typeof item === 'string' ? undefined : item)}`);
-		}
+	// A hole of an array is `undefined` (iterating would read it from a polluted `Array.prototype` or `Object.prototype`): checked before
+	// the copy, so that a sparse array of length 2^32 - 1 throws at its first hole instead of exhausting the memory.
+	if (Array.isArray(items)) {
+		for (let index = 0; index < items.length; index++) if (!Object.hasOwn(items, index)) throw new TypeError('formatList: every item must be a string, got undefined');
 	}
+
+	const list = Array.from(items);
+
+	for (const item of list) if (typeof item !== 'string') throw new TypeError(`formatList: every item must be a string, got ${describe(item)}`);
 
 	const type = readOption(options, 'type', 'conjunction');
 	const style = readOption(options, 'style', 'long');
