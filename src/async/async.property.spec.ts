@@ -3,7 +3,10 @@ import {
 	abortable,
 	anySignal,
 	attemptAsync,
+	backoff,
+	CircuitOpenError,
 	createBatcher,
+	createCircuitBreaker,
 	createDeferred,
 	createKeyedMutex,
 	createLimiter,
@@ -11,8 +14,11 @@ import {
 	createQueue,
 	createRateLimiter,
 	createSemaphore,
+	createStopwatch,
 	debounceAsync,
 	filterWithConcurrency,
+	fromEvent,
+	interval,
 	mapSettledWithConcurrency,
 	mapWithConcurrency,
 	memoizeAsync,
@@ -21,7 +27,10 @@ import {
 	reduceAsync,
 	retry,
 	sequence,
-	waitForEvent
+	sleep,
+	waitForEvent,
+	type CircuitState,
+	type Deferred
 } from '.';
 import { EventEmitter } from 'node:events';
 import { createEmitter } from '../emitter/index.js';
@@ -520,10 +529,10 @@ describe('Async helpers (round 11 properties)', function () {
 				fc.integer({ min: 1, max: 3 }),
 				fc.integer({ min: 1, max: 50 }),
 				fc.array(fc.integer({ min: 0, max: 40 }), { maxLength: 15 }),
-				async function (limit, interval, gaps) {
+				async function (limit, period, gaps) {
 					jest.useFakeTimers({ now: 0 });
 					try {
-						const limiter = createRateLimiter({ limit, interval });
+						const limiter = createRateLimiter({ limit, interval: period });
 						const starts: number[] = [];
 						const requests: number[] = [];
 						let time = 0;
@@ -535,11 +544,11 @@ describe('Async helpers (round 11 properties)', function () {
 								starts.push(Date.now());
 							});
 						}
-						await jest.advanceTimersByTimeAsync(interval * (gaps.length + 1));
+						await jest.advanceTimersByTimeAsync(period * (gaps.length + 1));
 						// Reference: call i starts at max(its request, the previous start, the start `limit` calls earlier + interval).
 						const expected: number[] = [];
 						requests.forEach(function (request, i) {
-							expected.push(Math.max(request, i > 0 ? expected[i - 1] : 0, i >= limit ? expected[i - limit] + interval : 0));
+							expected.push(Math.max(request, i > 0 ? expected[i - 1] : 0, i >= limit ? expected[i - limit] + period : 0));
 						});
 						expect(starts).toEqual(expected);
 						expect(jest.getTimerCount()).toBe(0);
@@ -1070,7 +1079,11 @@ describe('Async helpers (properties: locks, events, reduceAsync, minDelay)', fun
 								outcome = error.message;
 							}
 						);
-						for (let t = 0; t <= 100 && settledAt < 0; t++) await jest.advanceTimersByTimeAsync(t === 0 ? 0 : 1);
+						// One advance past both timers: fake timers run each timer at its own time, and drain the microtasks it queues before the
+						// next one, so `Date.now()` in the handlers is the exact settling time (stepping 1 ms at a time is ~100× slower).
+						await jest.advanceTimersByTimeAsync(100);
+						// Both timers have fired, or the minimum-delay one was cleared by an early rejection.
+						expect(jest.getTimerCount()).toBe(0);
 						expect(outcome).toBe(fails ? 'failed' : 'done');
 						expect(settledAt).toBe(fails && delayRejection === false ? takes : Math.max(ms, takes));
 					} finally {
@@ -1080,5 +1093,512 @@ describe('Async helpers (properties: locks, events, reduceAsync, minDelay)', fun
 				}
 			)
 		);
+	});
+});
+
+describe('Async helpers (properties: circuit breaker, backoff, fromEvent, interval, stopwatch)', function () {
+	afterEach(function () {
+		jest.restoreAllMocks();
+		jest.clearAllTimers();
+		jest.useRealTimers();
+	});
+
+	describe('backoff', function () {
+		type Jitter = 'none' | 'full' | 'equal' | 'decorrelated';
+
+		/**
+		 * The AWS Architecture Blog formulas ("Exponential Backoff And Jitter"), written as in the article's Python code, with `factor` in
+		 * place of its `2` (exponential) and `3` (decorrelated).
+		 */
+		function reference(initial: number, factor: number, max: number, jitter: Jitter, count: number, randoms: number[]): number[] {
+			const delays: number[] = [];
+			let sleepValue = initial;
+			let draws = 0;
+			function uniform(low: number, high: number): number {
+				return low + (high - low) * randoms[draws++ % randoms.length];
+			}
+			for (let n = 0; n < count; n++) {
+				const expo = Math.min(max, initial * factor ** n);
+				if (jitter === 'none') delays.push(expo);
+				else if (jitter === 'full') delays.push(uniform(0, expo));
+				else if (jitter === 'equal') delays.push(expo / 2 + uniform(0, expo / 2));
+				else delays.push((sleepValue = Math.min(max, uniform(initial, sleepValue * factor))));
+			}
+			return delays;
+		}
+
+		function replay(randoms: number[]): () => number {
+			let index = 0;
+			return function () {
+				return randoms[index++ % randoms.length];
+			};
+		}
+
+		const jitters = fc.constantFrom<Jitter>('none', 'full', 'equal', 'decorrelated');
+		const randoms = fc.array(fc.double({ min: 0, max: 1, maxExcluded: true, noNaN: true }), { minLength: 1, maxLength: 20 });
+
+		it('matches the AWS formulas exactly for integer parameters', function () {
+			fc.assert(
+				fc.property(
+					fc.integer({ min: 0, max: 10_000 }),
+					fc.integer({ min: 1, max: 10 }),
+					fc.integer({ min: 0, max: 2 ** 31 - 1 }),
+					jitters,
+					fc.integer({ min: 0, max: 60 }),
+					randoms,
+					function (initial, factor, max, jitter, retries, values) {
+						const delays = [...backoff({ delay: initial, factor, maxDelay: max, jitter, retries, random: replay(values) })];
+						expect(delays).toEqual(reference(initial, factor, max, jitter, retries, values));
+					}
+				)
+			);
+		});
+
+		it('matches the AWS formulas to within rounding for any parameters', function () {
+			fc.assert(
+				fc.property(
+					fc.double({ min: 0, max: 2 ** 31 - 1, noNaN: true }),
+					fc.double({ min: 1, max: 1000, noNaN: true }),
+					fc.double({ min: 0, max: 2 ** 31 - 1, noNaN: true }),
+					jitters,
+					fc.integer({ min: 0, max: 40 }),
+					randoms,
+					function (initial, factor, max, jitter, retries, values) {
+						const delays = [...backoff({ delay: initial, factor, maxDelay: max, jitter, retries, random: replay(values) })];
+						const expected = reference(initial, factor, max, jitter, retries, values);
+						expect(delays).toHaveLength(retries);
+						delays.forEach(function (delay, index) {
+							// Repeated multiplication versus `factor ** n`: a few ulps per step, compounded by the decorrelated recurrence.
+							expect(Math.abs(delay - expected[index])).toBeLessThanOrEqual(1e-9 * Math.max(1, expected[index]));
+						});
+					}
+				)
+			);
+		});
+
+		it('only yields finite delays in [0, max], non-decreasing without jitter, within the jitter bounds otherwise', function () {
+			fc.assert(
+				fc.property(
+					fc.double({ min: 0, max: 2 ** 31 - 1, noNaN: true }),
+					fc.oneof(fc.double({ min: 1, max: 4, noNaN: true }), fc.double({ min: 1, max: Number.MAX_VALUE, noNaN: true })),
+					fc.double({ min: 0, max: 2 ** 31 - 1, noNaN: true }),
+					jitters,
+					randoms,
+					function (initial, factor, max, jitter, values) {
+						const iterator = backoff({ delay: initial, factor, maxDelay: max, jitter, random: replay(values) })[Symbol.iterator]();
+						const plain = backoff({ delay: initial, factor, maxDelay: max })[Symbol.iterator]();
+						let previous = -Infinity;
+						for (let i = 0; i < 80; i++) {
+							const delay = iterator.next().value as number;
+							const exponential = plain.next().value as number;
+							expect(Number.isFinite(delay)).toBe(true);
+							expect(delay).toBeGreaterThanOrEqual(0);
+							expect(delay).toBeLessThanOrEqual(max);
+							expect(exponential).toBeGreaterThanOrEqual(previous);
+							previous = exponential;
+							if (jitter === 'none') expect(delay).toBe(exponential);
+							if (jitter === 'full') expect(delay).toBeLessThanOrEqual(exponential);
+							if (jitter === 'equal') {
+								expect(delay).toBeGreaterThanOrEqual(exponential / 2);
+								expect(delay).toBeLessThanOrEqual(exponential);
+							}
+							if (jitter === 'decorrelated') expect(delay).toBeGreaterThanOrEqual(Math.min(initial, max));
+						}
+					}
+				)
+			);
+		});
+	});
+
+	describe('createCircuitBreaker', function () {
+		type Command = { kind: 'call'; ok: boolean; ignored: boolean } | { kind: 'advance'; ms: number } | { kind: 'open' } | { kind: 'reset' };
+
+		const commands = fc.array(
+			fc.oneof(
+				{ weight: 6, arbitrary: fc.record({ kind: fc.constant('call' as const), ok: fc.boolean(), ignored: fc.boolean() }) },
+				{ weight: 3, arbitrary: fc.record({ kind: fc.constant('advance' as const), ms: fc.integer({ min: 0, max: 150 }) }) },
+				{ weight: 1, arbitrary: fc.record({ kind: fc.constant('open' as const) }) },
+				{ weight: 1, arbitrary: fc.record({ kind: fc.constant('reset' as const) }) }
+			),
+			{ maxLength: 60 }
+		);
+
+		it('matches a sequential model of the closed / open / half-open state machine', async function () {
+			await fc.assert(
+				fc.asyncProperty(
+					fc.integer({ min: 1, max: 4 }),
+					fc.integer({ min: 0, max: 200 }),
+					fc.integer({ min: 1, max: 3 }),
+					commands,
+					async function (failureThreshold, resetTimeout, halfOpenMaxCalls, script) {
+						let clock = 0;
+						const transitions: string[] = [];
+						class Ignored extends Error {}
+						let next: Command & { kind: 'call' } = { kind: 'call', ok: true, ignored: false };
+						const guarded = createCircuitBreaker(
+							async function (): Promise<string> {
+								if (next.ok) return 'ok';
+								throw next.ignored ? new Ignored('ignored') : new Error('failed');
+							},
+							{
+								failureThreshold,
+								resetTimeout,
+								halfOpenMaxCalls,
+								now: function () {
+									return clock;
+								},
+								isFailure: function (error) {
+									return !(error instanceof Ignored);
+								},
+								onStateChange: function (state, previous) {
+									transitions.push(`${previous}>${state}`);
+								}
+							}
+						);
+						// The model.
+						let state = 'closed' as CircuitState;
+						let streak = 0;
+						let openedAt = 0;
+						let passed = 0;
+						const expectedTransitions: string[] = [];
+						const counts = { successes: 0, failures: 0, shortCircuited: 0 };
+						function move(to: CircuitState): void {
+							if (to === 'open') openedAt = clock;
+							if (to !== state) expectedTransitions.push(`${state}>${to}`);
+							state = to;
+							streak = 0;
+							passed = 0;
+						}
+
+						for (const command of script) {
+							if (command.kind === 'advance') {
+								clock += command.ms;
+							} else if (command.kind === 'open') {
+								guarded.open();
+								move('open');
+							} else if (command.kind === 'reset') {
+								guarded.reset();
+								move('closed');
+							} else {
+								next = command;
+								const outcome = await guarded().then(
+									function (value) {
+										return value;
+									},
+									function (error: unknown) {
+										return error instanceof CircuitOpenError ? `open ${error.retryAfter}` : (error as Error).message;
+									}
+								);
+								if (state === 'open' && clock - openedAt >= resetTimeout) move('half-open');
+								let expected: string;
+								if (state === 'open') {
+									counts.shortCircuited++;
+									expected = `open ${resetTimeout - (clock - openedAt)}`;
+								} else {
+									const failed = !command.ok && !command.ignored;
+									expected = command.ok ? 'ok' : command.ignored ? 'ignored' : 'failed';
+									if (failed) counts.failures++;
+									else counts.successes++;
+									if (state === 'closed') {
+										streak = failed ? streak + 1 : 0;
+										if (streak >= failureThreshold) move('open');
+									} else if (failed) {
+										move('open');
+									} else if (++passed >= halfOpenMaxCalls) {
+										move('closed');
+									}
+								}
+								expect(outcome).toBe(expected);
+							}
+							if (state === 'open' && clock - openedAt >= resetTimeout) move('half-open');
+							expect(guarded.stats).toEqual({ state, consecutiveFailures: streak, ...counts });
+						}
+						expect(transitions).toEqual(expectedTransitions);
+					}
+				)
+			);
+		});
+
+		type ConcurrentCommand = { kind: 'start' } | { kind: 'settle'; pick: number; ok: boolean } | { kind: 'advance'; ms: number } | { kind: 'open' } | { kind: 'reset' };
+
+		it('under any interleaving: never calls the operation while open, admits at most halfOpenMaxCalls trials, and only lets calls of the current period change the state', async function () {
+			await fc.assert(
+				fc.asyncProperty(
+					fc.integer({ min: 1, max: 3 }),
+					fc.integer({ min: 1, max: 3 }),
+					fc.array(
+						fc.oneof(
+							{ weight: 4, arbitrary: fc.record({ kind: fc.constant('start' as const) }) },
+							{ weight: 4, arbitrary: fc.record({ kind: fc.constant('settle' as const), pick: fc.nat(), ok: fc.boolean() }) },
+							{ weight: 2, arbitrary: fc.record({ kind: fc.constant('advance' as const), ms: fc.integer({ min: 0, max: 60 }) }) },
+							{ weight: 1, arbitrary: fc.record({ kind: fc.constant('open' as const) }) },
+							{ weight: 1, arbitrary: fc.record({ kind: fc.constant('reset' as const) }) }
+						) as fc.Arbitrary<ConcurrentCommand>,
+						{ maxLength: 80 }
+					),
+					async function (failureThreshold, halfOpenMaxCalls, script) {
+						let clock = 0;
+						// A period is the time between two changes of state or calls of open() / reset(): calls only count in their own.
+						let period = 0;
+						let state = 'closed' as CircuitState;
+						let trialsThisPeriod = 0;
+						const inFlight: Array<{ deferred: Deferred<string>; period: number }> = [];
+						let starting: { deferred: Deferred<string>; period: number } | undefined;
+						// Errors thrown in the operation or the listener would only reject a call: they are collected instead.
+						const violations: string[] = [];
+						const guarded = createCircuitBreaker(
+							function (): Promise<string> {
+								if (state === 'open') violations.push('called while open');
+								if (state === 'half-open' && ++trialsThisPeriod > halfOpenMaxCalls) violations.push('too many trials');
+								starting = { deferred: createDeferred<string>(), period };
+								return starting.deferred.promise;
+							},
+							{
+								failureThreshold,
+								resetTimeout: 50,
+								halfOpenMaxCalls,
+								now: function () {
+									return clock;
+								},
+								onStateChange: function (next, previous) {
+									if (previous !== state) violations.push(`from ${previous}, not ${state}`);
+									// `open>closed` and `half-open>closed` also come from reset(), `closed>open` from open().
+									if (!['closed>open', 'open>half-open', 'half-open>open', 'half-open>closed', 'open>closed'].includes(`${previous}>${next}`)) {
+										violations.push(`${previous}>${next}`);
+									}
+									state = next;
+									period++;
+									trialsThisPeriod = 0;
+								}
+							}
+						);
+						for (const command of script) {
+							if (command.kind === 'advance') {
+								clock += command.ms;
+							} else if (command.kind === 'open') {
+								guarded.open();
+								state = 'open';
+								period++;
+							} else if (command.kind === 'reset') {
+								guarded.reset();
+								state = 'closed';
+								period++;
+							} else if (command.kind === 'start') {
+								starting = undefined;
+								guarded().catch(function () {
+									// Failures and short-circuits are checked through the state.
+								});
+								if (starting !== undefined) inFlight.push(starting);
+							} else if (inFlight.length > 0) {
+								const [call] = inFlight.splice(command.pick % inFlight.length, 1);
+								const before = { state, period };
+								if (command.ok) call.deferred.resolve('ok');
+								else call.deferred.reject(new Error('failed'));
+								for (let i = 0; i < 5; i++) await Promise.resolve();
+								// A call of an earlier period never changes the state.
+								if (call.period !== before.period) expect({ state, period }).toEqual(before);
+								// A success never opens the circuit, a failure never closes it.
+								if (period !== before.period) expect(state).toBe(command.ok ? 'closed' : 'open');
+							}
+							expect(guarded.state).toBe(state);
+						}
+						expect(violations).toEqual([]);
+					}
+				)
+			);
+		});
+	});
+
+	describe('fromEvent', function () {
+		type Step = { kind: 'emit'; value: number } | { kind: 'read' };
+
+		it('yields what a naive queue model yields, for any interleaving of emits and reads, buffer size and overflow policy', async function () {
+			await fc.assert(
+				fc.asyncProperty(
+					fc.array(
+						fc.oneof(
+							fc.record({ kind: fc.constant('emit' as const), value: fc.integer() }),
+							fc.record({ kind: fc.constant('read' as const) })
+						) as fc.Arbitrary<Step>,
+						{ maxLength: 60 }
+					),
+					fc.oneof(fc.integer({ min: 0, max: 5 }), fc.constant(Infinity)),
+					fc.constantFrom<'throw' | 'drop-oldest' | 'drop-newest'>('throw', 'drop-oldest', 'drop-newest'),
+					async function (steps, bufferSize, overflow) {
+						const emitter = new EventEmitter();
+						const iterator = fromEvent<number>(emitter, 'n', { bufferSize, overflow });
+						const reads: Array<Promise<IteratorResult<number>>> = [];
+						// The model.
+						const queue: number[] = [];
+						let waiting = 0;
+						let failed = false;
+						const expected: string[] = [];
+						const expectedOrder: Array<number | 'pending'> = [];
+						for (const step of steps) {
+							if (step.kind === 'emit') {
+								emitter.emit('n', step.value);
+								if (failed) continue;
+								const pendingIndex = expectedOrder.indexOf('pending');
+								if (waiting > 0 && pendingIndex !== -1) {
+									waiting--;
+									expectedOrder[pendingIndex] = step.value;
+								} else if (queue.length < bufferSize) {
+									queue.push(step.value);
+								} else if (overflow === 'drop-oldest') {
+									queue.push(step.value);
+									queue.shift();
+								} else if (overflow === 'throw') {
+									failed = true;
+								}
+							} else {
+								reads.push(iterator.next());
+								if (queue.length > 0) expectedOrder.push(queue.shift() as number);
+								else if (failed) expectedOrder.push(Number.NaN);
+								else {
+									waiting++;
+									expectedOrder.push('pending');
+								}
+							}
+						}
+						expect(emitter.listenerCount('n')).toBe(failed ? 0 : 1);
+						await iterator.return?.();
+						expect(emitter.listenerCount('n')).toBe(0);
+						const settled = await Promise.allSettled(reads);
+						let threw = false;
+						for (const want of expectedOrder) {
+							if (typeof want === 'number' && !Number.isNaN(want)) {
+								expected.push(String(want));
+							} else if (typeof want === 'number' && !threw) {
+								threw = true;
+								expected.push('error');
+							} else {
+								expected.push('done');
+							}
+						}
+						expect(
+							settled.map(function (result) {
+								if (result.status === 'rejected') return 'error';
+								return result.value.done ? 'done' : String(result.value.value);
+							})
+						).toEqual(expected);
+					}
+				)
+			);
+		});
+	});
+
+	describe('interval', function () {
+		it('runs each tick within its slot (start + n × ms), never overlapping, skipping only the slots that passed while the callback ran', async function () {
+			await fc.assert(
+				fc.asyncProperty(
+					fc.integer({ min: 1, max: 50 }),
+					fc.array(fc.integer({ min: 0, max: 150 }), { minLength: 1, maxLength: 15 }),
+					fc.boolean(),
+					async function (ms, durations, immediate) {
+						jest.useFakeTimers({ now: 0 });
+						try {
+							const start = performance.now();
+							const runs: Array<{ tick: number; begin: number; end: number }> = [];
+							let running = false;
+							let overlapped = false;
+							const stop = interval(
+								async function (tick) {
+									if (running) overlapped = true;
+									running = true;
+									const begin = performance.now();
+									const duration = durations[runs.length % durations.length];
+									if (duration > 0) await sleep(duration);
+									running = false;
+									runs.push({ tick, begin, end: performance.now() });
+								},
+								ms,
+								{ immediate }
+							);
+							await jest.advanceTimersByTimeAsync(ms * 40);
+							stop();
+							// Lets a callback still sleeping finish.
+							await jest.advanceTimersByTimeAsync(200);
+							expect(jest.getTimerCount()).toBe(0);
+							expect(overlapped).toBe(false);
+							expect(runs[0]).toMatchObject(immediate ? { tick: 0, begin: start } : { tick: 1, begin: start + ms });
+							runs.forEach(function (run, index) {
+								// Each run is the latest due tick: it starts within that tick's slot.
+								expect(run.tick).toBe(Math.floor((run.begin - start) / ms));
+								if (index > 0) {
+									const previous = runs[index - 1];
+									expect(run.tick).toBeGreaterThan(previous.tick);
+									expect(run.begin).toBeGreaterThanOrEqual(previous.end);
+									// No needless wait: the next run comes at the first slot after the previous one that is not over when it ends (a slot
+									// due exactly then gets a 0 ms timeout, which fake timers, like Node, run 1 ms later).
+									const due = start + Math.max(previous.tick + 1, Math.ceil((previous.end - start) / ms)) * ms;
+									expect(run.begin).toBe(due === previous.end ? due + 1 : due);
+								}
+							});
+						} finally {
+							jest.useRealTimers();
+						}
+					}
+				),
+				{ numRuns: 50 }
+			);
+		});
+	});
+
+	describe('createStopwatch', function () {
+		type Op = { kind: 'start' } | { kind: 'stop' } | { kind: 'lap' } | { kind: 'reset' } | { kind: 'advance'; ms: number };
+
+		it('measures the clock advances made while running (never a step back), and its laps add up to the elapsed time', function () {
+			fc.assert(
+				fc.property(
+					fc.array(
+						fc.oneof(
+							fc.record({ kind: fc.constantFrom('start' as const, 'stop' as const, 'lap' as const, 'reset' as const) }),
+							fc.record({ kind: fc.constant('advance' as const), ms: fc.integer({ min: -50, max: 1000 }) })
+						) as fc.Arbitrary<Op>,
+						{ maxLength: 50 }
+					),
+					function (ops) {
+						let clock = 10_000;
+						const watch = createStopwatch({
+							now: function () {
+								return clock;
+							}
+						});
+						let running = false;
+						let measured = 0;
+						let lapsTotal = 0;
+						let last = clock;
+						for (const op of ops) {
+							if (op.kind === 'advance') {
+								clock += op.ms;
+								if (running) {
+									measured += Math.max(clock - last, 0);
+									last = clock;
+								}
+							} else if (op.kind === 'start') {
+								watch.start();
+								if (!running) last = clock;
+								running = true;
+							} else if (op.kind === 'stop') {
+								expect(watch.stop()).toBe(measured);
+								running = false;
+							} else if (op.kind === 'reset') {
+								watch.reset();
+								running = false;
+								measured = 0;
+								lapsTotal = 0;
+							} else {
+								const split = watch.lap();
+								expect(split).toBeGreaterThanOrEqual(0);
+								lapsTotal += split;
+								expect(lapsTotal).toBe(measured);
+							}
+							expect(watch.running).toBe(running);
+							expect(watch.elapsed).toBe(measured);
+						}
+					}
+				)
+			);
+		});
 	});
 });

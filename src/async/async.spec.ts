@@ -3,7 +3,10 @@ import {
 	abortable,
 	anySignal,
 	attemptAsync,
+	backoff,
+	CircuitOpenError,
 	createBatcher,
+	createCircuitBreaker,
 	createDeferred,
 	createKeyedMutex,
 	createLimiter,
@@ -11,8 +14,13 @@ import {
 	createQueue,
 	createRateLimiter,
 	createSemaphore,
+	createStopwatch,
 	debounceAsync,
 	filterWithConcurrency,
+	fromEvent,
+	interval,
+	isAbortError,
+	isTimeoutError,
 	mapSettledWithConcurrency,
 	mapWithConcurrency,
 	memoizeAsync,
@@ -29,6 +37,7 @@ import {
 	timeoutSignal,
 	waitForEvent,
 	withTimeout,
+	type Deferred,
 	type Release
 } from '.';
 import { EventEmitter } from 'node:events';
@@ -3081,10 +3090,14 @@ describe('createBatcher', function () {
 
 		it('waits for a macrotask with `delay: 0`', async function () {
 			const { calls, batchLoad } = recorder();
+			// Fake timers: with real ones, a busy event loop can fire the `setTimeout(0)` before any `setImmediate` used to wait here.
+			jest.useFakeTimers();
 			const batcher = createBatcher(batchLoad, { delay: 0 });
 			const first = batcher.load(1);
-			await nextTurn();
+			await flush();
+			expect(calls).toEqual([]);
 			const second = batcher.load(2);
+			jest.advanceTimersByTime(0);
 			await expect(Promise.all([first, second])).resolves.toEqual(['value 1', 'value 2']);
 			expect(calls).toEqual([[1, 2]]);
 		});
@@ -4609,6 +4622,41 @@ describe('Async helpers (locks, events, reduceAsync, minDelay)', function () {
 			expect(removed).toEqual(['ready']);
 		});
 
+		it('removes the listeners added before as soon as one replayed while being added settles it (review regression)', async function () {
+			const log: string[] = [];
+			let listeners: Array<[unknown, (value: unknown) => void]> = [];
+			const emitter = {
+				on(type: string, listener: (value: unknown) => void): void {
+					log.push(`on ${type}`);
+					listeners.push([type, listener]);
+					// Replays a `ready` event while its `error` listener is added.
+					if (type === 'error') for (const [t, l] of listeners.slice()) if (t === 'ready') l('replayed');
+					log.push(`on ${type} returned`);
+				},
+				off(type: string, listener: (value: unknown) => void): void {
+					log.push(`off ${type}`);
+					listeners = listeners.filter(function ([t, l]) {
+						return t !== type || l !== listener;
+					});
+				}
+			};
+			// As in 1.3: the `ready` listener goes during the replay, the `error` one once it has been added, and no `close` one is added.
+			await expect(waitForEvent(emitter, 'ready', { rejectOn: ['error', 'close'] })).resolves.toBe('replayed');
+			expect(log).toEqual(['on ready', 'on ready returned', 'on error', 'off ready', 'on error returned', 'off error']);
+			expect(listeners).toEqual([]);
+			// fromEvent shares that code: a filter throwing on the replayed event ends the iteration the same way.
+			log.length = 0;
+			const iterator = fromEvent(emitter, 'ready', {
+				rejectOn: ['error', 'close'],
+				filter: function (): boolean {
+					throw new Error('filter failed');
+				}
+			});
+			expect(log).toEqual(['on ready', 'on ready returned', 'on error', 'off ready', 'on error returned', 'off error']);
+			expect(listeners).toEqual([]);
+			await expect(iterator.next()).rejects.toThrow('filter failed');
+		});
+
 		it('removes the listeners already added when adding one throws', async function () {
 			const emitter = new EventEmitter();
 			const on = emitter.on.bind(emitter);
@@ -5041,6 +5089,1568 @@ describe('Async helpers (locks, events, reduceAsync, minDelay)', function () {
 			} finally {
 				process.off('unhandledRejection', unhandled);
 			}
+		});
+	});
+});
+
+describe('Async helpers (1.4: error checks, circuit breaker, backoff, fromEvent, interval, stopwatch)', function () {
+	afterEach(function () {
+		// Spies on the fake `performance.now` go first: restoring them after the real timers are back would reinstall the fake one.
+		jest.restoreAllMocks();
+		jest.clearAllTimers();
+		jest.useRealTimers();
+	});
+
+	/**
+	 * A manual clock for the `now` options.
+	 */
+	function manualClock(start = 0): { now: () => number; set: (time: number) => void; advance: (ms: number) => void } {
+		let time = start;
+		return {
+			now: function () {
+				return time;
+			},
+			set: function (value: number) {
+				time = value;
+			},
+			advance: function (ms: number) {
+				time += ms;
+			}
+		};
+	}
+
+	/**
+	 * Collects the rejections of the promises derived with `.then` while `fn` runs, which nothing else handles (Jest would report them
+	 * as unhandled rejections, failing the test, and does not let the test observe them through `process`).
+	 */
+	async function unhandledDuring(fn: () => Promise<void>): Promise<unknown[]> {
+		const reasons: unknown[] = [];
+		const then = Promise.prototype.then;
+		const spy = jest.spyOn(Promise.prototype, 'then').mockImplementation(function (this: Promise<unknown>, ...args: Parameters<Promise<unknown>['then']>) {
+			const derived = then.apply(this, args);
+			then.call(derived, undefined, function (reason: unknown) {
+				reasons.push(reason);
+			});
+			return derived;
+		} as Promise<unknown>['then']);
+		try {
+			await fn();
+		} finally {
+			spy.mockRestore();
+		}
+		return reasons;
+	}
+
+	describe('isAbortError / isTimeoutError', function () {
+		it('recognizes the module errors, DOMExceptions, Node errors and errors of other realms by name', async function () {
+			expect(isAbortError(new AbortError())).toBe(true);
+			expect(isAbortError(new DOMException('stop', 'AbortError'))).toBe(true);
+			const controller = new AbortController();
+			controller.abort();
+			expect(isAbortError(controller.signal.reason)).toBe(true);
+			const { setTimeout: delay } = await import('node:timers/promises');
+			const nodeError = await delay(10, undefined, { signal: controller.signal }).catch(function (error: unknown) {
+				return error;
+			});
+			expect(isAbortError(nodeError)).toBe(true);
+			const vm = await import('node:vm');
+			const foreign: unknown = vm.runInNewContext('const e = new Error("elsewhere"); e.name = "AbortError"; e');
+			expect(foreign instanceof Error).toBe(false);
+			expect(isAbortError(foreign)).toBe(true);
+			expect(isAbortError(JSON.parse('{"name":"AbortError","message":"from JSON"}'))).toBe(true);
+			expect(isAbortError(Object.assign(new Error('x'), { name: 'AbortError' }))).toBe(true);
+			expect(isAbortError(Object.assign(Object.create(null), { name: 'AbortError', message: '' }))).toBe(true);
+
+			expect(isTimeoutError(new TimeoutError())).toBe(true);
+			expect(isTimeoutError(new DOMException('late', 'TimeoutError'))).toBe(true);
+			const timedOut = AbortSignal.timeout(0);
+			await sleep(10);
+			expect(isTimeoutError(timedOut.reason)).toBe(true);
+			expect(
+				isTimeoutError(
+					await withTimeout(new Promise(function () {}), 1).catch(function (error: unknown) {
+						return error;
+					})
+				)
+			).toBe(true);
+			expect(isTimeoutError(vm.runInNewContext('const e = new Error("x"); e.name = "TimeoutError"; e'))).toBe(true);
+		});
+
+		it('rejects other names, values that are not error-like objects, and functions', function () {
+			expect(isAbortError(new TimeoutError())).toBe(false);
+			expect(isTimeoutError(new AbortError())).toBe(false);
+			expect(isAbortError(new Error('AbortError'))).toBe(false);
+			expect(isAbortError(new DOMException('x', 'TimeoutError'))).toBe(false);
+			for (const value of ['AbortError', null, undefined, 0, true, Symbol('AbortError'), 1n]) {
+				expect(isAbortError(value)).toBe(false);
+				expect(isTimeoutError(value)).toBe(false);
+			}
+			expect(isAbortError({ name: 'AbortError' })).toBe(false);
+			expect(isAbortError({ name: 'AbortError', message: 1 })).toBe(false);
+			expect(isAbortError({ name: 'aborterror', message: '' })).toBe(false);
+			// Functions have a `name` too.
+			function AbortErrorLike(): void {}
+			Object.defineProperty(AbortErrorLike, 'name', { value: 'AbortError' });
+			Object.defineProperty(AbortErrorLike, 'message', { value: 'x' });
+			expect(isAbortError(AbortErrorLike)).toBe(false);
+		});
+
+		it('never throws, and ignores names and messages inherited from a polluted Object.prototype', function () {
+			const throwing = {
+				get name(): string {
+					throw new Error('getter');
+				},
+				message: 'x'
+			};
+			expect(isAbortError(throwing)).toBe(false);
+			const trap = new Proxy(
+				{},
+				{
+					get: function () {
+						throw new Error('trap');
+					}
+				}
+			);
+			expect(isAbortError(trap)).toBe(false);
+			const { proxy, revoke } = Proxy.revocable({ name: 'AbortError', message: 'x' }, {});
+			expect(isAbortError(proxy)).toBe(true);
+			revoke();
+			expect(isAbortError(proxy)).toBe(false);
+			const prototype = Object.prototype as Record<string, unknown>;
+			prototype.name = 'AbortError';
+			prototype.message = 'polluted';
+			try {
+				expect(isAbortError({})).toBe(false);
+				expect(isAbortError({ name: 'AbortError' })).toBe(false);
+				expect(isAbortError({ message: 'x' })).toBe(false);
+				expect(isAbortError(new AbortError())).toBe(true);
+			} finally {
+				delete prototype.name;
+				delete prototype.message;
+			}
+		});
+	});
+
+	describe('CircuitOpenError', function () {
+		it('has a name, a default message and a retryAfter', function () {
+			const error = new CircuitOpenError();
+			expect(error).toBeInstanceOf(Error);
+			expect(error.name).toBe('CircuitOpenError');
+			expect(error.message).toBe('The circuit is open.');
+			expect(error.retryAfter).toBe(0);
+			expect(new CircuitOpenError('down', 250).retryAfter).toBe(250);
+		});
+	});
+
+	describe('createCircuitBreaker', function () {
+		/**
+		 * An operation whose outcome is controlled by the test.
+		 */
+		function controlled(): { fn: jest.Mock<Promise<string>, [string?]>; healthy: (value: boolean) => void } {
+			let ok = true;
+			const fn = jest.fn(async function (value?: string): Promise<string> {
+				if (!ok) throw new Error(`failed ${value}`);
+				return `ok ${value}`;
+			});
+			return {
+				fn,
+				healthy: function (value: boolean) {
+					ok = value;
+				}
+			};
+		}
+
+		it('passes calls through while closed, forwarding this and the arguments, and turns synchronous throws into rejections', async function () {
+			const target = {
+				prefix: '>',
+				run(this: { prefix: string }, a: number, b: number): string {
+					return `${this.prefix}${a + b}`;
+				}
+			};
+			const guarded = createCircuitBreaker(target.run);
+			await expect(guarded.call(target, 1, 2)).resolves.toBe('>3');
+			const throwing = createCircuitBreaker(function (): never {
+				throw new Error('sync');
+			});
+			const result = throwing();
+			expect(result).toBeInstanceOf(Promise);
+			await expect(result).rejects.toThrow('sync');
+			expect(throwing.state).toBe('closed');
+		});
+
+		it('opens after failureThreshold consecutive failures and short-circuits without calling the operation', async function () {
+			const clock = manualClock(1000);
+			const { fn, healthy } = controlled();
+			const changes: string[] = [];
+			const guarded = createCircuitBreaker(fn, {
+				failureThreshold: 3,
+				resetTimeout: 500,
+				now: clock.now,
+				onStateChange: function (state, previous) {
+					changes.push(`${previous}->${state}`);
+				}
+			});
+			healthy(false);
+			await expect(guarded('a')).rejects.toThrow('failed a');
+			await expect(guarded('b')).rejects.toThrow('failed b');
+			expect(guarded.stats.consecutiveFailures).toBe(2);
+			healthy(true);
+			await guarded('c');
+			// A success resets the streak.
+			expect(guarded.stats.consecutiveFailures).toBe(0);
+			healthy(false);
+			for (const value of ['d', 'e', 'f']) await expect(guarded(value)).rejects.toThrow(`failed ${value}`);
+			expect(guarded.state).toBe('open');
+			expect(changes).toEqual(['closed->open']);
+			clock.advance(120);
+			const rejection = guarded('g');
+			await expect(rejection).rejects.toBeInstanceOf(CircuitOpenError);
+			const error = (await rejection.catch(function (reason: unknown) {
+				return reason;
+			})) as CircuitOpenError;
+			expect(error.retryAfter).toBe(380);
+			expect(error.message).toBe('createCircuitBreaker: the circuit is open, retry in 380 ms');
+			expect(fn).toHaveBeenCalledTimes(6);
+			expect(guarded.stats).toEqual({ state: 'open', consecutiveFailures: 0, successes: 1, failures: 5, shortCircuited: 1 });
+		});
+
+		it('turns half-open lazily after resetTimeout: a successful trial closes it, a failed one reopens it', async function () {
+			const clock = manualClock();
+			const { fn, healthy } = controlled();
+			const changes: string[] = [];
+			const guarded = createCircuitBreaker(fn, {
+				failureThreshold: 1,
+				resetTimeout: 100,
+				now: clock.now,
+				onStateChange: function (state, previous) {
+					changes.push(`${previous}->${state}`);
+				}
+			});
+			healthy(false);
+			await expect(guarded()).rejects.toThrow('failed');
+			clock.advance(99);
+			expect(guarded.state).toBe('open');
+			clock.advance(1);
+			// Nothing happens until the breaker is used.
+			expect(changes).toEqual(['closed->open']);
+			await expect(guarded('trial')).rejects.toThrow('failed trial');
+			expect(changes).toEqual(['closed->open', 'open->half-open', 'half-open->open']);
+			// Reopened for a full resetTimeout from the failed trial.
+			await expect(guarded()).rejects.toMatchObject({ retryAfter: 100 });
+			clock.advance(100);
+			expect(guarded.state).toBe('half-open');
+			healthy(true);
+			await expect(guarded('trial')).resolves.toBe('ok trial');
+			expect(guarded.state).toBe('closed');
+			expect(changes).toEqual(['closed->open', 'open->half-open', 'half-open->open', 'open->half-open', 'half-open->closed']);
+		});
+
+		it('lets halfOpenMaxCalls trials through, rejects the others with retryAfter 0, and closes once all of them succeed', async function () {
+			const clock = manualClock();
+			const deferreds: Array<Deferred<string>> = [];
+			let failing = true;
+			const fn = jest.fn(function (): Promise<string> {
+				if (failing) return Promise.reject(new Error('down'));
+				const deferred = createDeferred<string>();
+				deferreds.push(deferred);
+				return deferred.promise;
+			});
+			const guarded = createCircuitBreaker(fn, { failureThreshold: 1, resetTimeout: 10, halfOpenMaxCalls: 2, now: clock.now });
+			await expect(guarded()).rejects.toThrow('down');
+			clock.advance(10);
+			failing = false;
+			const first = guarded();
+			const second = guarded();
+			const third = guarded();
+			await expect(third).rejects.toThrow(new CircuitOpenError('createCircuitBreaker: the circuit is half-open and its trial calls are in flight'));
+			await expect(third).rejects.toMatchObject({ retryAfter: 0 });
+			expect(fn).toHaveBeenCalledTimes(3);
+			deferreds[0].resolve('a');
+			await expect(first).resolves.toBe('a');
+			expect(guarded.state).toBe('half-open');
+			// The trial slots are used up for this half-open period, even though one has settled.
+			await expect(guarded()).rejects.toBeInstanceOf(CircuitOpenError);
+			deferreds[1].resolve('b');
+			await expect(second).resolves.toBe('b');
+			expect(guarded.state).toBe('closed');
+			expect(guarded.stats.shortCircuited).toBe(2);
+		});
+
+		it('reopens on the first failed trial; a later success of another trial does not close it', async function () {
+			const clock = manualClock();
+			const deferreds: Array<Deferred<string>> = [];
+			const fn = jest.fn(function (): Promise<string> {
+				const deferred = createDeferred<string>();
+				deferreds.push(deferred);
+				return deferred.promise;
+			});
+			const guarded = createCircuitBreaker(fn, { failureThreshold: 1, resetTimeout: 10, halfOpenMaxCalls: 2, now: clock.now });
+			guarded.open();
+			clock.advance(10);
+			const first = guarded();
+			const second = guarded();
+			deferreds[0].reject(new Error('still down'));
+			await expect(first).rejects.toThrow('still down');
+			expect(guarded.state).toBe('open');
+			deferreds[1].resolve('late');
+			await expect(second).resolves.toBe('late');
+			expect(guarded.state).toBe('open');
+			expect(guarded.stats).toEqual({ state: 'open', consecutiveFailures: 0, successes: 1, failures: 1, shortCircuited: 0 });
+		});
+
+		it('ignores the outcome of calls that started in an earlier generation', async function () {
+			const clock = manualClock();
+			const deferreds: Array<Deferred<string>> = [];
+			const fn = jest.fn(function (): Promise<string> {
+				const deferred = createDeferred<string>();
+				deferreds.push(deferred);
+				return deferred.promise;
+			});
+			const onStateChange = jest.fn();
+			const guarded = createCircuitBreaker(fn, { failureThreshold: 2, resetTimeout: 1000, now: clock.now, onStateChange });
+			const slow = guarded();
+			const calls = [guarded(), guarded(), guarded()];
+			for (let i = 1; i <= 3; i++) deferreds[i].reject(new Error(`boom ${i}`));
+			await Promise.allSettled(calls);
+			// Concurrent failures open the circuit once.
+			expect(onStateChange).toHaveBeenCalledTimes(1);
+			expect(guarded.state).toBe('open');
+			// A slow call made while closed succeeds after the circuit opened: it does not close it.
+			deferreds[0].resolve('late');
+			await expect(slow).resolves.toBe('late');
+			expect(guarded.state).toBe('open');
+
+			// A slow failure from before a reset does not count toward the new streak.
+			guarded.reset();
+			const before = guarded();
+			guarded.reset();
+			const after = guarded();
+			deferreds[4].reject(new Error('old'));
+			await expect(before).rejects.toThrow('old');
+			expect(guarded.stats.consecutiveFailures).toBe(0);
+			deferreds[5].reject(new Error('new'));
+			await expect(after).rejects.toThrow('new');
+			expect(guarded.stats.consecutiveFailures).toBe(1);
+			expect(guarded.state).toBe('closed');
+		});
+
+		it('counts errors that isFailure rejects as successes, and a throwing isFailure as a failure with its error', async function () {
+			const clock = manualClock();
+			class NotFound extends Error {}
+			let error: Error = new NotFound('404');
+			const guarded = createCircuitBreaker(
+				function (): Promise<never> {
+					return Promise.reject(error);
+				},
+				{
+					failureThreshold: 2,
+					now: clock.now,
+					isFailure: function (reason) {
+						if ((reason as Error).message === 'filter') throw new TypeError('isFailure broke');
+						return (reason instanceof NotFound ? 0 : 'yes') as unknown as boolean;
+					}
+				}
+			);
+			await expect(guarded()).rejects.toBe(error);
+			expect(guarded.stats).toMatchObject({ successes: 1, failures: 0, consecutiveFailures: 0 });
+			error = new Error('500');
+			await expect(guarded()).rejects.toBe(error);
+			expect(guarded.stats.consecutiveFailures).toBe(1);
+			error = new NotFound('404');
+			await expect(guarded()).rejects.toBe(error);
+			expect(guarded.stats.consecutiveFailures).toBe(0);
+			error = new Error('filter');
+			await expect(guarded()).rejects.toThrow(new TypeError('isFailure broke'));
+			await expect(guarded()).rejects.toThrow(new TypeError('isFailure broke'));
+			expect(guarded.state).toBe('open');
+			expect(guarded.stats.failures).toBe(3);
+		});
+
+		it('passes the error of onStateChange to whoever caused the change, the change standing', async function () {
+			const clock = manualClock();
+			let throwing = true;
+			const guarded = createCircuitBreaker(
+				function (): Promise<never> {
+					return Promise.reject(new Error('down'));
+				},
+				{
+					failureThreshold: 1,
+					resetTimeout: 10,
+					now: clock.now,
+					onStateChange: function (state) {
+						if (throwing) throw new Error(`listener: ${state}`);
+					}
+				}
+			);
+			await expect(guarded()).rejects.toThrow('listener: open');
+			expect(guarded.state).toBe('open');
+			expect(function () {
+				guarded.reset();
+			}).toThrow('listener: closed');
+			expect(guarded.state).toBe('closed');
+			expect(function () {
+				guarded.open();
+			}).toThrow('listener: open');
+			clock.advance(10);
+			// The switch to half-open at a call: that call rejects with the error, and the next one is the trial.
+			await expect(guarded()).rejects.toThrow('listener: half-open');
+			throwing = false;
+			await expect(guarded()).rejects.toThrow('down');
+			expect(guarded.state).toBe('open');
+			throwing = true;
+			clock.advance(10);
+			expect(function () {
+				return guarded.state;
+			}).toThrow('listener: half-open');
+			expect(guarded.state).toBe('half-open');
+		});
+
+		it('handles an onStateChange that reopens the circuit or calls the breaker while it turns half-open', async function () {
+			const clock = manualClock();
+			let reopen = false;
+			let reenter = false;
+			let inner: Promise<unknown> | undefined;
+			const fn = jest.fn(function (): string {
+				return 'ok';
+			});
+			const guarded = createCircuitBreaker(fn, {
+				resetTimeout: 50,
+				now: clock.now,
+				onStateChange: function (state) {
+					if (state !== 'half-open') return;
+					if (reopen) guarded.open();
+					if (reenter) inner = guarded();
+				}
+			});
+			guarded.open();
+			clock.advance(50);
+			reopen = true;
+			await expect(guarded()).rejects.toMatchObject({ name: 'CircuitOpenError', retryAfter: 50 });
+			expect(fn).not.toHaveBeenCalled();
+			expect(guarded.state).toBe('open');
+			reopen = false;
+			reenter = true;
+			clock.advance(50);
+			// The call made by the listener takes the trial slot.
+			await expect(guarded()).rejects.toMatchObject({ retryAfter: 0 });
+			await expect(inner).resolves.toBe('ok');
+			expect(fn).toHaveBeenCalledTimes(1);
+			expect(guarded.state).toBe('closed');
+		});
+
+		it('supports open() and reset() in every state, reporting only actual changes', async function () {
+			const clock = manualClock();
+			const changes: string[] = [];
+			const guarded = createCircuitBreaker(
+				function (): number {
+					return 1;
+				},
+				{
+					resetTimeout: 100,
+					now: clock.now,
+					onStateChange: function (state, previous) {
+						changes.push(`${previous}->${state}`);
+					}
+				}
+			);
+			guarded.reset();
+			expect(changes).toEqual([]);
+			guarded.open();
+			clock.advance(60);
+			// Opening again restarts the reset timeout.
+			guarded.open();
+			expect(changes).toEqual(['closed->open']);
+			await expect(guarded()).rejects.toMatchObject({ retryAfter: 100 });
+			clock.advance(100);
+			expect(guarded.state).toBe('half-open');
+			guarded.open();
+			expect(guarded.state).toBe('open');
+			guarded.reset();
+			await expect(guarded()).resolves.toBe(1);
+			expect(changes).toEqual(['closed->open', 'open->half-open', 'half-open->open', 'open->closed']);
+		});
+
+		it('stays open with resetTimeout: Infinity and turns half-open at once with resetTimeout: 0', async function () {
+			const clock = manualClock();
+			const forever = createCircuitBreaker(
+				function (): number {
+					return 1;
+				},
+				{ resetTimeout: Infinity, now: clock.now }
+			);
+			forever.open();
+			clock.advance(Number.MAX_SAFE_INTEGER);
+			await expect(forever()).rejects.toMatchObject({ retryAfter: Infinity, message: 'createCircuitBreaker: the circuit is open, until reset()' });
+			forever.reset();
+			await expect(forever()).resolves.toBe(1);
+			const instant = createCircuitBreaker(
+				function (): number {
+					return 2;
+				},
+				{ resetTimeout: 0, now: clock.now }
+			);
+			instant.open();
+			expect(instant.state).toBe('half-open');
+			await expect(instant()).resolves.toBe(2);
+		});
+
+		it('treats a clock going back as no time passing, without ever waiting longer than resetTimeout', async function () {
+			const clock = manualClock(10_000);
+			const guarded = createCircuitBreaker(
+				function (): number {
+					return 1;
+				},
+				{ resetTimeout: 100, now: clock.now }
+			);
+			guarded.open();
+			clock.set(0);
+			await expect(guarded()).rejects.toMatchObject({ retryAfter: 100 });
+			clock.set(99);
+			expect(guarded.state).toBe('open');
+			clock.set(100);
+			expect(guarded.state).toBe('half-open');
+		});
+
+		it('defaults to Date.now, a threshold of 5 and a reset timeout of 30 s', async function () {
+			jest.useFakeTimers({ now: 0 });
+			const guarded = createCircuitBreaker(function (): Promise<never> {
+				return Promise.reject(new Error('down'));
+			});
+			for (let i = 0; i < 4; i++) await expect(guarded()).rejects.toThrow('down');
+			expect(guarded.state).toBe('closed');
+			await expect(guarded()).rejects.toThrow('down');
+			expect(guarded.state).toBe('open');
+			jest.setSystemTime(29_999);
+			expect(guarded.state).toBe('open');
+			jest.setSystemTime(30_000);
+			expect(guarded.state).toBe('half-open');
+		});
+
+		it('reads the clock only while the circuit opens or is open', async function () {
+			let time = 0;
+			const now = jest.fn(function () {
+				return time;
+			});
+			const guarded = createCircuitBreaker(
+				function (): string {
+					return 'ok';
+				},
+				{ resetTimeout: 10, now }
+			);
+			await guarded();
+			guarded.reset();
+			expect(guarded.state).toBe('closed');
+			expect(now).not.toHaveBeenCalled();
+			guarded.open();
+			expect(now).toHaveBeenCalledTimes(1);
+			time = 10;
+			// The switch to half-open and the trial's success read it once more (to see that the timeout elapsed), not when entering.
+			await guarded();
+			expect(now).toHaveBeenCalledTimes(2);
+			guarded.open();
+			now.mockReturnValue(NaN);
+			guarded.reset();
+			expect(guarded.stats.state).toBe('closed');
+		});
+
+		it('validates now() whenever it reads the clock, changing nothing when it is invalid', async function () {
+			let time: unknown = 0;
+			const guarded = createCircuitBreaker(
+				function (): Promise<never> {
+					return Promise.reject(new Error('down'));
+				},
+				{
+					failureThreshold: 1,
+					now: function () {
+						return time as number;
+					}
+				}
+			);
+			for (const [value, message] of [
+				[NaN, 'createCircuitBreaker: `now()` must be a finite number, got NaN'],
+				[Infinity, 'createCircuitBreaker: `now()` must be a finite number, got Infinity'],
+				['5', 'createCircuitBreaker: `now()` must be a finite number, got string']
+			]) {
+				time = value;
+				expect(function () {
+					guarded.open();
+				}).toThrow(message as string);
+				expect(guarded.state).toBe('closed');
+				// The failure that should open the circuit rejects with the clock's error.
+				await expect(guarded()).rejects.toThrow(message as string);
+				expect(guarded.state).toBe('closed');
+			}
+			time = 0;
+			guarded.open();
+			time = NaN;
+			await expect(guarded()).rejects.toThrow(RangeError);
+			time = null;
+			expect(function () {
+				return guarded.stats;
+			}).toThrow(TypeError);
+		});
+
+		it('returns a null-prototype snapshot from stats', function () {
+			const guarded = createCircuitBreaker(function (): number {
+				return 1;
+			});
+			const stats = guarded.stats;
+			expect(Object.getPrototypeOf(stats)).toBe(null);
+			guarded.open();
+			expect(stats.state).toBe('closed');
+			expect(guarded.stats.state).toBe('open');
+			expect(guarded.stats).not.toBe(guarded.stats);
+		});
+
+		it('validates its arguments and ignores options inherited from a polluted Object.prototype', async function () {
+			function ok(): number {
+				return 1;
+			}
+			expect(function () {
+				createCircuitBreaker('x' as never);
+			}).toThrow(new TypeError('createCircuitBreaker: `fn` must be a function, got string'));
+			expect(function () {
+				createCircuitBreaker(ok, { failureThreshold: 0 });
+			}).toThrow(new RangeError('createCircuitBreaker: `failureThreshold` must be an integer >= 1, got 0'));
+			expect(function () {
+				createCircuitBreaker(ok, { failureThreshold: 1.5 });
+			}).toThrow(RangeError);
+			expect(function () {
+				createCircuitBreaker(ok, { resetTimeout: -1 });
+			}).toThrow(new RangeError('createCircuitBreaker: `resetTimeout` must be Infinity or a number between 0 and 2147483647, got -1'));
+			expect(function () {
+				createCircuitBreaker(ok, { resetTimeout: 2 ** 31 });
+			}).toThrow(RangeError);
+			expect(function () {
+				createCircuitBreaker(ok, { halfOpenMaxCalls: 0 });
+			}).toThrow(new RangeError('createCircuitBreaker: `halfOpenMaxCalls` must be an integer >= 1, got 0'));
+			expect(function () {
+				createCircuitBreaker(ok, { isFailure: 1 as never });
+			}).toThrow(new TypeError('createCircuitBreaker: `isFailure` must be a function, got number'));
+			expect(function () {
+				createCircuitBreaker(ok, { onStateChange: {} as never });
+			}).toThrow(new TypeError('createCircuitBreaker: `onStateChange` must be a function, got object'));
+			expect(function () {
+				createCircuitBreaker(ok, { now: null as never });
+			}).toThrow(new TypeError('createCircuitBreaker: `now` must be a function, got null'));
+			expect(function () {
+				createCircuitBreaker(ok, null as never);
+			}).toThrow(TypeError);
+			const prototype = Object.prototype as Record<string, unknown>;
+			prototype.failureThreshold = 1;
+			prototype.isFailure = 'nope';
+			try {
+				const guarded = createCircuitBreaker(function (): Promise<never> {
+					return Promise.reject(new Error('down'));
+				});
+				await expect(guarded()).rejects.toThrow('down');
+				expect(guarded.state).toBe('closed');
+			} finally {
+				delete prototype.failureThreshold;
+				delete prototype.isFailure;
+			}
+		});
+	});
+
+	describe('backoff', function () {
+		/**
+		 * The first `count` delays of an (endless) backoff.
+		 */
+		function take(delays: Iterable<number>, count: number): number[] {
+			const result: number[] = [];
+			for (const delay of delays) {
+				if (result.length === count) break;
+				result.push(delay);
+			}
+			return result;
+		}
+
+		/**
+		 * A random source replaying `values` (cycling).
+		 */
+		function replay(values: number[]): jest.Mock<number, []> {
+			let index = 0;
+			return jest.fn(function () {
+				return values[index++ % values.length];
+			});
+		}
+
+		it('grows exponentially from delay up to maxDelay, endlessly by default', function () {
+			expect(take(backoff(), 12)).toEqual([100, 200, 400, 800, 1600, 3200, 6400, 12_800, 25_600, 30_000, 30_000, 30_000]);
+			expect([...backoff({ delay: 1000, factor: 3, maxDelay: 5000, retries: 4 })]).toEqual([1000, 3000, 5000, 5000]);
+			expect([...backoff({ delay: 10, factor: 1, retries: 3 })]).toEqual([10, 10, 10]);
+			expect([...backoff({ delay: 10, factor: 1.5, retries: 4 })]).toEqual([10, 15, 22.5, 33.75]);
+			// Above max from the start, or zero.
+			expect([...backoff({ delay: 500, maxDelay: 100, retries: 2 })]).toEqual([100, 100]);
+			expect([...backoff({ delay: 0, retries: 3 })]).toEqual([0, 0, 0]);
+			expect([...backoff({ maxDelay: 0, retries: 2 })]).toEqual([0, 0]);
+			expect([...backoff({ retries: 0 })]).toEqual([]);
+		});
+
+		it('never overflows, whatever the factor and the number of delays', function () {
+			expect([...backoff({ delay: 2 ** 31 - 1, factor: Number.MAX_VALUE, maxDelay: 2 ** 31 - 1, retries: 3 })]).toEqual([2 ** 31 - 1, 2 ** 31 - 1, 2 ** 31 - 1]);
+			expect([...backoff({ delay: 1, factor: 1e300, maxDelay: 1000, retries: 3 })]).toEqual([1, 1000, 1000]);
+			const iterator = backoff({ factor: 1e300, jitter: 'decorrelated', random: replay([0.5, 0.999_999]) })[Symbol.iterator]();
+			for (let i = 0; i < 1000; i++) {
+				const { value } = iterator.next();
+				expect(Number.isFinite(value)).toBe(true);
+				expect(value).toBeGreaterThanOrEqual(0);
+				expect(value).toBeLessThanOrEqual(30_000);
+			}
+		});
+
+		it('applies full, equal and decorrelated jitter as in the AWS article', function () {
+			expect([...backoff({ retries: 3, jitter: 'full', random: replay([0.5]) })]).toEqual([50, 100, 200]);
+			expect([...backoff({ retries: 3, jitter: 'full', random: replay([0]) })]).toEqual([0, 0, 0]);
+			expect([...backoff({ retries: 3, jitter: 'equal', random: replay([0.5]) })]).toEqual([75, 150, 300]);
+			expect([...backoff({ retries: 3, jitter: 'equal', random: replay([0]) })]).toEqual([50, 100, 200]);
+			// sleep = min(maxDelay, uniform(delay, sleep * factor)), from sleep = delay.
+			expect([...backoff({ retries: 4, factor: 3, jitter: 'decorrelated', random: replay([0.5]) })]).toEqual([200, 350, 575, 912.5]);
+			expect([...backoff({ retries: 3, factor: 3, jitter: 'decorrelated', random: replay([0]) })]).toEqual([100, 100, 100]);
+			expect([...backoff({ retries: 3, factor: 3, maxDelay: 250, jitter: 'decorrelated', random: replay([0.9]) })]).toEqual([250, 250, 250]);
+			expect([...backoff({ delay: 500, maxDelay: 100, retries: 2, jitter: 'decorrelated', random: replay([0.5]) })]).toEqual([100, 100]);
+		});
+
+		it('draws exactly once per delay, never for no jitter, and validates what random() returns', function () {
+			const random = replay([0.25]);
+			expect([...backoff({ retries: 5, jitter: 'equal', random })]).toHaveLength(5);
+			expect(random).toHaveBeenCalledTimes(5);
+			const unused = replay([0.25]);
+			expect([...backoff({ retries: 5, random: unused })]).toHaveLength(5);
+			expect(unused).not.toHaveBeenCalled();
+			expect([...backoff({ retries: 5, random: 'ignored' as never })]).toHaveLength(5);
+			for (const jitter of ['full', 'equal', 'decorrelated'] as const) {
+				expect(function () {
+					return [
+						...backoff({
+							retries: 1,
+							jitter,
+							random: function () {
+								return 1;
+							}
+						})
+					];
+				}).toThrow(new RangeError('backoff: `random()` must return a number in [0, 1), got 1'));
+			}
+			const spy = jest.spyOn(Math, 'random');
+			// The default is read when `backoff` is called.
+			expect([...backoff({ retries: 2, jitter: 'full' })]).toHaveLength(2);
+			expect(spy).toHaveBeenCalledTimes(2);
+		});
+
+		it('starts over at each iteration; its iterators are iterable and stay done', function () {
+			const delays = backoff({ retries: 3, jitter: 'decorrelated', random: replay([0.1, 0.7, 0.4]) });
+			const first = [...delays];
+			expect(first).toHaveLength(3);
+			const iterator = delays[Symbol.iterator]() as IterableIterator<number>;
+			expect(iterator[Symbol.iterator]()).toBe(iterator);
+			expect([...iterator]).toEqual(first);
+			expect(iterator.next()).toEqual({ value: undefined, done: true });
+			expect(iterator.next()).toEqual({ value: undefined, done: true });
+		});
+
+		it('validates its options', function () {
+			expect(function () {
+				backoff({ delay: -1 });
+			}).toThrow(new RangeError('backoff: `delay` must be a number between 0 and 2147483647, got -1'));
+			expect(function () {
+				backoff({ delay: NaN });
+			}).toThrow(RangeError);
+			expect(function () {
+				backoff({ delay: '1' as never });
+			}).toThrow(TypeError);
+			expect(function () {
+				backoff({ factor: 0.5 });
+			}).toThrow(new RangeError('backoff: `factor` must be a finite number >= 1, got 0.5'));
+			expect(function () {
+				backoff({ factor: 1 - Number.EPSILON / 2 });
+			}).toThrow(RangeError);
+			expect(function () {
+				backoff({ factor: Infinity });
+			}).toThrow(RangeError);
+			expect(function () {
+				backoff({ factor: '2' as never });
+			}).toThrow(TypeError);
+			expect(function () {
+				backoff({ maxDelay: 2 ** 31 });
+			}).toThrow(new RangeError('backoff: `maxDelay` must be a number between 0 and 2147483647, got 2147483648'));
+			expect(function () {
+				backoff({ maxDelay: Infinity });
+			}).toThrow(RangeError);
+			expect(function () {
+				backoff({ jitter: 'random' as never });
+			}).toThrow(new RangeError("backoff: `jitter` must be 'none', 'full', 'equal' or 'decorrelated', got random"));
+			expect(function () {
+				backoff({ jitter: true as never });
+			}).toThrow(new TypeError("backoff: `jitter` must be 'none', 'full', 'equal' or 'decorrelated', got true"));
+			expect(function () {
+				backoff({ retries: -1 });
+			}).toThrow(new RangeError('backoff: `retries` must be an integer >= 0 or Infinity, got -1'));
+			expect(function () {
+				backoff({ jitter: 'full', random: 'x' as never });
+			}).toThrow(new TypeError('backoff: `random` must be a function, got string'));
+			expect(function () {
+				backoff(null as never);
+			}).toThrow(TypeError);
+		});
+	});
+
+	describe('fromEvent', function () {
+		/**
+		 * An EventTarget-like object that tracks its listeners (dispatching to a snapshot, like `EventTarget`).
+		 */
+		class CountingTarget {
+			readonly listeners = new Map<string, Set<(event: unknown) => void>>();
+			addThrows = false;
+			removeThrows = false;
+
+			get size(): number {
+				let count = 0;
+				for (const set of this.listeners.values()) count += set.size;
+				return count;
+			}
+
+			addEventListener(type: string, listener: (event: unknown) => void): void {
+				if (this.addThrows) throw new Error('add failed');
+				let set = this.listeners.get(type);
+				if (set === undefined) this.listeners.set(type, (set = new Set()));
+				set.add(listener);
+			}
+
+			removeEventListener(type: string, listener: (event: unknown) => void): void {
+				this.listeners.get(type)?.delete(listener);
+				if (this.removeThrows) throw new Error('remove failed');
+			}
+
+			dispatch(type: string, event: unknown): void {
+				for (const listener of [...(this.listeners.get(type) ?? [])]) listener(event);
+			}
+		}
+
+		it('buffers the events of an EventTarget until they are read, in order, and removes its listener on break', async function () {
+			const target = new EventTarget();
+			const iterator = fromEvent(target, 'ping');
+			const first = new Event('ping');
+			target.dispatchEvent(first);
+			target.dispatchEvent(new Event('pong'));
+			target.dispatchEvent(new Event('ping'));
+			const seen: Event[] = [];
+			for await (const event of iterator) {
+				seen.push(event as Event);
+				if (seen.length === 2) break;
+			}
+			expect(seen[0]).toBe(first);
+			expect(seen.map(String)).toHaveLength(2);
+			target.dispatchEvent(new Event('ping'));
+			await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
+			const counting = new CountingTarget();
+			const counted = fromEvent(counting as unknown as EventTarget, 'x');
+			expect(counting.size).toBe(1);
+			expect(counted[Symbol.asyncIterator]()).toBe(counted);
+			await counted.return?.();
+			expect(counting.size).toBe(0);
+		});
+
+		it('yields the first argument of Node-style emitters (on/off and addListener/removeListener)', async function () {
+			const emitter = new EventEmitter();
+			const messages = fromEvent<string>(emitter, 'message');
+			emitter.emit('message', 'a', 'ignored');
+			emitter.emit('message', 'b');
+			await expect(messages.next()).resolves.toEqual({ value: 'a', done: false });
+			await expect(messages.next()).resolves.toEqual({ value: 'b', done: false });
+			const pending = messages.next();
+			emitter.emit('message', 'c');
+			await expect(pending).resolves.toEqual({ value: 'c', done: false });
+			await messages.return?.();
+			expect(emitter.listenerCount('message')).toBe(0);
+
+			const listeners = new Set<(value: unknown) => void>();
+			const legacy = {
+				addListener: function (_type: string, listener: (value: unknown) => void) {
+					listeners.add(listener);
+				},
+				removeListener: function (_type: string, listener: (value: unknown) => void) {
+					listeners.delete(listener);
+				}
+			};
+			const symbol = Symbol('tick');
+			const ticks = fromEvent<number>(legacy, symbol);
+			for (const listener of listeners) listener(1);
+			await expect(ticks.next()).resolves.toEqual({ value: 1, done: false });
+			await ticks.return?.();
+			expect(listeners.size).toBe(0);
+
+			const events = createEmitter<{ saved: { id: number } }>();
+			const saves = fromEvent<{ id: number }>(events, 'saved');
+			events.emit('saved', { id: 7 });
+			await expect(saves.next()).resolves.toEqual({ value: { id: 7 }, done: false });
+			await saves.return?.();
+		});
+
+		it('serves concurrent reads in order', async function () {
+			const emitter = new EventEmitter();
+			const iterator = fromEvent<number>(emitter, 'n');
+			const reads = [iterator.next(), iterator.next(), iterator.next()];
+			emitter.emit('n', 1);
+			emitter.emit('n', 2);
+			await expect(reads[0]).resolves.toEqual({ value: 1, done: false });
+			await expect(reads[1]).resolves.toEqual({ value: 2, done: false });
+			expect(await stateOf(reads[2])).toBe('pending');
+			await expect(iterator.return?.()).resolves.toEqual({ value: undefined, done: true });
+			await expect(reads[2]).resolves.toEqual({ value: undefined, done: true });
+			await expect(iterator.return?.()).resolves.toEqual({ value: undefined, done: true });
+			// return() discards the unread events.
+			const unread = fromEvent<number>(emitter, 'n');
+			emitter.emit('n', 1);
+			emitter.emit('n', 2);
+			await unread.return?.();
+			await expect(unread.next()).resolves.toEqual({ value: undefined, done: true });
+		});
+
+		it('fails with a rejectOn event after the buffered events, removing every listener at once', async function () {
+			const emitter = new EventEmitter();
+			const iterator = fromEvent<string>(emitter, 'data', { rejectOn: ['error', 'close'] });
+			expect(emitter.listenerCount('error') + emitter.listenerCount('close')).toBe(2);
+			const failure = new Error('reset');
+			emitter.emit('data', 'a');
+			emitter.emit('error', failure);
+			expect(emitter.listenerCount('data') + emitter.listenerCount('error') + emitter.listenerCount('close')).toBe(0);
+			emitter.emit('data', 'b');
+			await expect(iterator.next()).resolves.toEqual({ value: 'a', done: false });
+			await expect(iterator.next()).rejects.toBe(failure);
+			await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
+
+			const pendingTarget = new EventEmitter();
+			const pendingIterator = fromEvent(pendingTarget, 'data', { rejectOn: ['close'] });
+			const reads = [pendingIterator.next(), pendingIterator.next()];
+			pendingTarget.emit('close', 'closed');
+			await expect(reads[0]).rejects.toBe('closed');
+			await expect(reads[1]).resolves.toEqual({ value: undefined, done: true });
+			await expect(pendingIterator.next()).resolves.toEqual({ value: undefined, done: true });
+		});
+
+		it('skips the events filter rejects, and fails with the error filter throws', async function () {
+			const emitter = new EventEmitter();
+			const iterator = fromEvent<number>(emitter, 'n', {
+				filter: function (n) {
+					if (n < 0) throw new RangeError('negative');
+					return n % 2 === 0;
+				}
+			});
+			emitter.emit('n', 1);
+			emitter.emit('n', 2);
+			emitter.emit('n', -1);
+			emitter.emit('n', 4);
+			expect(emitter.listenerCount('n')).toBe(0);
+			await expect(iterator.next()).resolves.toEqual({ value: 2, done: false });
+			await expect(iterator.next()).rejects.toThrow(new RangeError('negative'));
+			await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
+		});
+
+		it('drops an event whose filter ended the iteration', async function () {
+			const emitter = new EventEmitter();
+			const failure = new Error('during filter');
+			const failing = fromEvent<number>(emitter, 'n', {
+				rejectOn: ['error'],
+				filter: function () {
+					emitter.emit('error', failure);
+					return true;
+				}
+			});
+			emitter.emit('n', 1);
+			await expect(failing.next()).rejects.toBe(failure);
+			const closing: AsyncIterableIterator<number> = fromEvent<number>(emitter, 'm', {
+				filter: function () {
+					void closing.return?.();
+					return true;
+				}
+			});
+			const pending = closing.next();
+			emitter.emit('m', 1);
+			await expect(pending).resolves.toEqual({ value: undefined, done: true });
+			await expect(closing.next()).resolves.toEqual({ value: undefined, done: true });
+		});
+
+		it('bounds the buffer: throw (the default), drop-oldest and drop-newest', async function () {
+			const emitter = new EventEmitter();
+			const strict = fromEvent<number>(emitter, 'n', { bufferSize: 2 });
+			const oldest = fromEvent<number>(emitter, 'n', { bufferSize: 2, overflow: 'drop-oldest' });
+			const newest = fromEvent<number>(emitter, 'n', { bufferSize: 2, overflow: 'drop-newest' });
+			const none = fromEvent<number>(emitter, 'n', { bufferSize: 0, overflow: 'drop-oldest' });
+			const pending = none.next();
+			for (let n = 1; n <= 4; n++) emitter.emit('n', n);
+			expect(emitter.listenerCount('n')).toBe(3);
+			await expect(strict.next()).resolves.toEqual({ value: 1, done: false });
+			await expect(strict.next()).resolves.toEqual({ value: 2, done: false });
+			await expect(strict.next()).rejects.toThrow(new RangeError('fromEvent: more than 2 events are waiting to be read (`bufferSize` is 2)'));
+			await expect(strict.next()).resolves.toEqual({ value: undefined, done: true });
+			await expect(pending).resolves.toEqual({ value: 1, done: false });
+			const values: number[] = [];
+			for (const iterator of [oldest, newest]) {
+				values.push(((await iterator.next()).value as number) * 10 + ((await iterator.next()).value as number));
+			}
+			expect(values).toEqual([34, 12]);
+			const empty = none.next();
+			emitter.emit('n', 5);
+			await expect(empty).resolves.toEqual({ value: 5, done: false });
+			emitter.emit('n', 6);
+			for (const iterator of [oldest, newest, none]) await iterator.return?.();
+			expect(emitter.listenerCount('n')).toBe(0);
+		});
+
+		it('keeps reading in order across buffer compactions', async function () {
+			const emitter = new EventEmitter();
+			const iterator = fromEvent<number>(emitter, 'n');
+			let emitted = 0;
+			let read = 0;
+			for (let round = 0; round < 4; round++) {
+				for (let i = 0; i < 3000; i++) emitter.emit('n', emitted++);
+				for (let i = 0; i < 2000; i++) expect((await iterator.next()).value).toBe(read++);
+			}
+			while (read < emitted) expect((await iterator.next()).value).toBe(read++);
+			await iterator.return?.();
+		});
+
+		it('ends at once when signal aborts: the next read rejects with its reason, unread events are discarded', async function () {
+			const emitter = new EventEmitter();
+			const controller = new AbortController();
+			const signal = new CountingSignal();
+			const iterator = fromEvent<number>(emitter, 'n', { signal });
+			expect(signal.listenerCount).toBe(1);
+			emitter.emit('n', 1);
+			signal.abort(new Error('stop'));
+			expect(signal.listenerCount).toBe(0);
+			expect(emitter.listenerCount('n')).toBe(0);
+			await expect(iterator.next()).rejects.toThrow('stop');
+			await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
+
+			const waiting = fromEvent(emitter, 'n', { signal: controller.signal });
+			const reads = [waiting.next(), waiting.next()];
+			controller.abort();
+			await expect(reads[0]).rejects.toBeInstanceOf(DOMException);
+			await expect(reads[1]).resolves.toEqual({ value: undefined, done: true });
+
+			const reasonless = new CountingSignal();
+			const plain = fromEvent(emitter, 'n', { signal: reasonless });
+			reasonless.abort();
+			await expect(plain.next()).rejects.toThrow(new AbortError());
+
+			// Closed first: the abort listener is gone.
+			const closedSignal = new CountingSignal();
+			const closed = fromEvent(emitter, 'n', { signal: closedSignal });
+			await closed.return?.();
+			expect(closedSignal.listenerCount).toBe(0);
+		});
+
+		it('adds no listener for an already-aborted signal, and rejects the first read', async function () {
+			const target = new CountingTarget();
+			const signal = new CountingSignal();
+			signal.abort('gone');
+			const iterator = fromEvent(target as unknown as EventTarget, 'x', { signal });
+			expect(target.size).toBe(0);
+			expect(signal.listenerCount).toBe(0);
+			await expect(iterator.next()).rejects.toBe('gone');
+			await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
+		});
+
+		it('ignores events delivered to a listener that was being removed', async function () {
+			const emitter = new EventEmitter();
+			const iterator = fromEvent<number>(emitter, 'n');
+			// Registered second: Node's emitter still calls it during the emit that closes the iterator.
+			emitter.prependListener('n', function () {
+				void iterator.return?.();
+			});
+			emitter.emit('n', 1);
+			await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
+			// The same for a `rejectOn` listener: the iteration stays ended, not failed.
+			const failing = fromEvent(emitter, 'n', { rejectOn: ['error'] });
+			emitter.prependListener('error', function () {
+				void failing.return?.();
+			});
+			emitter.emit('error', new Error('late'));
+			await expect(failing.next()).resolves.toEqual({ value: undefined, done: true });
+		});
+
+		it('handles emitters calling listeners while they are added', async function () {
+			const listeners: Array<[unknown, (value: unknown) => void]> = [];
+			const replaying = {
+				on: function (type: unknown, listener: (value: unknown) => void) {
+					listeners.push([type, listener]);
+					listener(type === 'data' ? 'replayed' : new Error(`replayed ${String(type)}`));
+				},
+				off: function (type: unknown, listener: (value: unknown) => void) {
+					const index = listeners.findIndex(function ([t, l]) {
+						return t === type && l === listener;
+					});
+					listeners.splice(index, 1);
+				}
+			};
+			const quiet = fromEvent(replaying, 'data');
+			await expect(quiet.next()).resolves.toEqual({ value: 'replayed', done: false });
+			await quiet.return?.();
+			expect(listeners).toHaveLength(0);
+			const failing = fromEvent(replaying, 'data', { rejectOn: ['error', 'close'] });
+			// The replayed error ended the iteration: no `close` listener was added, the others were removed.
+			expect(listeners).toHaveLength(0);
+			await expect(failing.next()).resolves.toEqual({ value: 'replayed', done: false });
+			await expect(failing.next()).rejects.toThrow('replayed error');
+		});
+
+		it('shares its listener code with waitForEvent, which starts no timer for an event replayed while its listener is added', async function () {
+			jest.useFakeTimers();
+			const replaying = {
+				on: function (_type: string, listener: (value: unknown) => void) {
+					listener('now');
+				},
+				off: function () {}
+			};
+			await expect(waitForEvent(replaying, 'ready', { timeout: 1000 })).resolves.toBe('now');
+			expect(jest.getTimerCount()).toBe(0);
+		});
+
+		it('rethrows when adding a listener fails, leaving no listener behind; tolerates removals that throw', async function () {
+			const target = new CountingTarget();
+			const signal = new CountingSignal();
+			let adds = 0;
+			const flaky = {
+				addEventListener: function (type: string, listener: (event: unknown) => void) {
+					if (++adds === 2) throw new Error('add failed');
+					target.addEventListener(type, listener);
+				},
+				removeEventListener: function (type: string, listener: (event: unknown) => void) {
+					target.removeEventListener(type, listener);
+				}
+			};
+			expect(function () {
+				fromEvent(flaky as unknown as EventTarget, 'x', { rejectOn: ['error'], signal });
+			}).toThrow('add failed');
+			expect(target.size).toBe(0);
+			expect(signal.listenerCount).toBe(0);
+			target.addThrows = true;
+			expect(function () {
+				fromEvent(target as unknown as EventTarget, 'x');
+			}).toThrow('add failed');
+			target.addThrows = false;
+			const iterator = fromEvent(target as unknown as EventTarget, 'x', { rejectOn: ['error'] });
+			target.removeThrows = true;
+			await iterator.return?.();
+			expect(target.size).toBe(0);
+		});
+
+		it('validates its arguments', function () {
+			const target = new EventTarget();
+			expect(function () {
+				fromEvent({} as never, 'x');
+			}).toThrow(new TypeError('fromEvent: `target` must be an EventTarget or an event emitter, got object'));
+			expect(function () {
+				fromEvent(null as never, 'x');
+			}).toThrow(new TypeError('fromEvent: `target` must be an EventTarget or an event emitter, got null'));
+			expect(function () {
+				fromEvent(target, 1 as never);
+			}).toThrow(new TypeError('fromEvent: `type` must be a string or a symbol, got number'));
+			expect(function () {
+				fromEvent(target, 'x', { filter: 'x' as never });
+			}).toThrow(new TypeError('fromEvent: `filter` must be a function, got string'));
+			expect(function () {
+				fromEvent(target, 'x', { rejectOn: 'error' as never });
+			}).toThrow(new TypeError('fromEvent: `rejectOn` must be an array, got string'));
+			expect(function () {
+				fromEvent(target, 'x', { rejectOn: ['error', 1 as never] });
+			}).toThrow(new TypeError('fromEvent: `rejectOn[1]` must be a string or a symbol, got number'));
+			expect(function () {
+				fromEvent(target, 'x', { bufferSize: -1 });
+			}).toThrow(new RangeError('fromEvent: `bufferSize` must be an integer >= 0 or Infinity, got -1'));
+			expect(function () {
+				fromEvent(target, 'x', { overflow: 'drop' as never });
+			}).toThrow(new RangeError("fromEvent: `overflow` must be 'throw', 'drop-oldest' or 'drop-newest', got drop"));
+			expect(function () {
+				fromEvent(target, 'x', { overflow: 1 as never });
+			}).toThrow(new TypeError("fromEvent: `overflow` must be 'throw', 'drop-oldest' or 'drop-newest', got 1"));
+			expect(function () {
+				fromEvent(target, 'x', { signal: {} as never });
+			}).toThrow(new TypeError('fromEvent: `signal` must be an AbortSignal, null or undefined, got object'));
+			expect(function () {
+				fromEvent(target, 'x', null as never);
+			}).toThrow(TypeError);
+			// waitForEvent keeps its own messages.
+			return expect(waitForEvent(target, 1 as never)).rejects.toThrow(new TypeError('waitForEvent: `type` must be a string or a symbol, got number'));
+		});
+	});
+
+	describe('interval', function () {
+		it('ticks every ms milliseconds, numbering the ticks, until stopped', async function () {
+			jest.useFakeTimers({ now: 0 });
+			const ticks: Array<[number, number]> = [];
+			const stop = interval(function (tick) {
+				ticks.push([tick, performance.now()]);
+			}, 100);
+			expect(ticks).toEqual([]);
+			await jest.advanceTimersByTimeAsync(350);
+			expect(ticks).toEqual([
+				[1, 100],
+				[2, 200],
+				[3, 300]
+			]);
+			stop();
+			stop();
+			expect(jest.getTimerCount()).toBe(0);
+			await jest.advanceTimersByTimeAsync(1000);
+			expect(ticks).toHaveLength(3);
+		});
+
+		it('runs tick 0 at once with immediate', async function () {
+			jest.useFakeTimers({ now: 0 });
+			const ticks: number[] = [];
+			const stop = interval(
+				function (tick) {
+					ticks.push(tick);
+				},
+				50,
+				{ immediate: true }
+			);
+			expect(ticks).toEqual([0]);
+			await jest.advanceTimersByTimeAsync(100);
+			expect(ticks).toEqual([0, 1, 2]);
+			stop();
+		});
+
+		it('does not drift: each tick is scheduled relative to the start, whatever the callback costs', async function () {
+			jest.useFakeTimers({ now: 0 });
+			let clock = 0;
+			jest.spyOn(performance, 'now').mockImplementation(function () {
+				return clock;
+			});
+			const delays: number[] = [];
+			const realSetTimeout = globalThis.setTimeout;
+			jest.spyOn(globalThis, 'setTimeout').mockImplementation(function (handler: () => void, ms?: number) {
+				delays.push(ms as number);
+				return realSetTimeout(handler, ms);
+			} as typeof setTimeout);
+			const ticks: number[] = [];
+			const stop = interval(function (tick) {
+				ticks.push(tick);
+				// Each call takes 30 ms.
+				clock += 30;
+			}, 100);
+			clock = 100;
+			await jest.advanceTimersByTimeAsync(100);
+			expect(delays).toEqual([100, 70]);
+			clock = 200;
+			await jest.advanceTimersByTimeAsync(70);
+			expect(delays).toEqual([100, 70, 70]);
+			expect(ticks).toEqual([1, 2]);
+			stop();
+		});
+
+		it('skips the ticks missed while an async callback runs, without overlapping it', async function () {
+			jest.useFakeTimers({ now: 0 });
+			const ticks: Array<[number, number]> = [];
+			let running = 0;
+			let overlap = false;
+			const stop = interval(async function (tick) {
+				ticks.push([tick, performance.now()]);
+				if (++running > 1) overlap = true;
+				if (tick === 1) {
+					await sleep(250);
+					// No timer of the interval while the callback runs (only this sleep's).
+				}
+				running--;
+			}, 100);
+			await jest.advanceTimersByTimeAsync(100);
+			expect(jest.getTimerCount()).toBe(1);
+			await jest.advanceTimersByTimeAsync(450);
+			stop();
+			expect(overlap).toBe(false);
+			// Tick 1 ran from 100 to 350: ticks 2 and 3 are skipped, tick 4 comes on schedule.
+			expect(ticks).toEqual([
+				[1, 100],
+				[4, 400],
+				[5, 500]
+			]);
+		});
+
+		it('runs a tick that is due exactly when an async callback settles', async function () {
+			jest.useFakeTimers({ now: 0 });
+			const ticks: Array<[number, number]> = [];
+			const stop = interval(async function (tick) {
+				ticks.push([tick, performance.now()]);
+				if (tick === 1) await sleep(100);
+			}, 100);
+			await jest.advanceTimersByTimeAsync(300);
+			stop();
+			// Due at once: a 0 ms timeout, which Node (and the fake timers) runs 1 ms later; tick 3 is back on schedule.
+			expect(ticks).toEqual([
+				[1, 100],
+				[2, 201],
+				[3, 300]
+			]);
+		});
+
+		it('runs the latest due tick when a timer fires late, then goes back on schedule', async function () {
+			jest.useFakeTimers({ now: 0 });
+			let clock = 0;
+			jest.spyOn(performance, 'now').mockImplementation(function () {
+				return clock;
+			});
+			const delays: number[] = [];
+			const realSetTimeout = globalThis.setTimeout;
+			jest.spyOn(globalThis, 'setTimeout').mockImplementation(function (handler: () => void, ms?: number) {
+				delays.push(ms as number);
+				return realSetTimeout(handler, ms);
+			} as typeof setTimeout);
+			const ticks: number[] = [];
+			const stop = interval(function (tick) {
+				ticks.push(tick);
+			}, 100);
+			expect(delays).toEqual([100]);
+			// The first timer fires at 345 (the event loop was blocked): tick 3 runs, the next one is due at 400.
+			clock = 345;
+			await jest.advanceTimersByTimeAsync(100);
+			expect(ticks).toEqual([3]);
+			expect(delays).toEqual([100, 55]);
+			// A timer firing a little early still runs the tick it was armed for.
+			clock = 399.5;
+			await jest.advanceTimersByTimeAsync(55);
+			expect(ticks).toEqual([3, 4]);
+			expect(delays).toEqual([100, 55, 100]);
+			// A clock that went back: the wait is capped at ms.
+			clock = 100;
+			await jest.advanceTimersByTimeAsync(100);
+			expect(ticks).toEqual([3, 4, 5]);
+			expect(delays).toEqual([100, 55, 100, 100]);
+			stop();
+		});
+
+		it('falls back to Date.now without performance', async function () {
+			jest.useFakeTimers({ now: 0 });
+			jest.replaceProperty(globalThis, 'performance', undefined as never);
+			const ticks: number[] = [];
+			const stop = interval(function (tick) {
+				ticks.push(tick);
+			}, 10);
+			await jest.advanceTimersByTimeAsync(30);
+			stop();
+			expect(ticks).toEqual([1, 2, 3]);
+		});
+
+		it('can be stopped from within the callback, and by its signal', async function () {
+			jest.useFakeTimers({ now: 0 });
+			const ticks: number[] = [];
+			const stop = interval(function (tick) {
+				ticks.push(tick);
+				if (tick === 2) stop();
+			}, 10);
+			await jest.advanceTimersByTimeAsync(100);
+			expect(ticks).toEqual([1, 2]);
+			expect(jest.getTimerCount()).toBe(0);
+
+			const signal = new CountingSignal();
+			const signalled: number[] = [];
+			interval(
+				function (tick) {
+					signalled.push(tick);
+				},
+				10,
+				{ signal }
+			);
+			expect(signal.listenerCount).toBe(1);
+			await jest.advanceTimersByTimeAsync(25);
+			signal.abort();
+			expect(signal.listenerCount).toBe(0);
+			expect(jest.getTimerCount()).toBe(0);
+			await jest.advanceTimersByTimeAsync(100);
+			expect(signalled).toEqual([1, 2]);
+		});
+
+		it('stops after an async tick that was pending when it was stopped', async function () {
+			jest.useFakeTimers({ now: 0 });
+			const ticks: number[] = [];
+			const stop = interval(async function (tick) {
+				ticks.push(tick);
+				await sleep(50);
+			}, 10);
+			await jest.advanceTimersByTimeAsync(20);
+			stop();
+			await jest.advanceTimersByTimeAsync(200);
+			expect(ticks).toEqual([1]);
+			expect(jest.getTimerCount()).toBe(0);
+		});
+
+		it('starts nothing with an already-aborted signal', async function () {
+			jest.useFakeTimers({ now: 0 });
+			const signal = new CountingSignal();
+			signal.abort();
+			const callback = jest.fn();
+			const stop = interval(callback, 10, { signal, immediate: true });
+			expect(jest.getTimerCount()).toBe(0);
+			expect(signal.listenerCount).toBe(0);
+			await jest.advanceTimersByTimeAsync(100);
+			expect(callback).not.toHaveBeenCalled();
+			stop();
+		});
+
+		it('stops on an error of the callback, which surfaces as an unhandled rejection', async function () {
+			const error = new Error('tick failed');
+			const syncSignal = new CountingSignal();
+			const syncCalls: number[] = [];
+			const asyncCalls: number[] = [];
+			const reasons = await unhandledDuring(async function () {
+				interval(
+					function (tick) {
+						syncCalls.push(tick);
+						throw error;
+					},
+					1,
+					{ signal: syncSignal, immediate: true }
+				);
+				interval(async function (tick) {
+					asyncCalls.push(tick);
+					throw error;
+				}, 1);
+				await sleep(20);
+			});
+			expect(reasons).toEqual([error, error]);
+			expect(syncCalls).toEqual([0]);
+			expect(asyncCalls).toHaveLength(1);
+			expect(syncSignal.listenerCount).toBe(0);
+		});
+
+		it('leaves no timer behind when adding the abort listener throws', function () {
+			jest.useFakeTimers({ now: 0 });
+			const signal = new CountingSignal();
+			signal.addEventListener = function () {
+				throw new Error('listener rejected');
+			};
+			expect(function () {
+				interval(jest.fn(), 10, { signal });
+			}).toThrow('listener rejected');
+			expect(jest.getTimerCount()).toBe(0);
+		});
+
+		it('validates its arguments', function () {
+			function tick(): void {}
+			expect(function () {
+				interval('x' as never, 10);
+			}).toThrow(new TypeError('interval: `callback` must be a function, got string'));
+			for (const ms of [0, 0.5, -1, NaN, 2 ** 31, Infinity]) {
+				expect(function () {
+					interval(tick, ms);
+				}).toThrow(new RangeError(`interval: \`ms\` must be a number between 1 and 2147483647, got ${ms}`));
+			}
+			expect(function () {
+				interval(tick, '10' as never);
+			}).toThrow(new TypeError('interval: `ms` must be a number between 1 and 2147483647, got string'));
+			expect(function () {
+				interval(tick, 10, { signal: 'x' as never });
+			}).toThrow(new TypeError('interval: `signal` must be an AbortSignal, null or undefined, got string'));
+			expect(function () {
+				interval(tick, 10, null as never);
+			}).toThrow(TypeError);
+			jest.useFakeTimers();
+			interval(tick, 1)();
+			interval(tick, 2 ** 31 - 1)();
+			expect(jest.getTimerCount()).toBe(0);
+		});
+	});
+
+	describe('createStopwatch', function () {
+		it('measures running time, pauses on stop, resumes on start, and laps', function () {
+			const clock = manualClock(500);
+			const watch = createStopwatch({ now: clock.now });
+			expect(watch.running).toBe(false);
+			expect(watch.elapsed).toBe(0);
+			expect(watch.lap()).toBe(0);
+			expect(watch.start()).toBe(watch);
+			clock.advance(100);
+			expect(watch.running).toBe(true);
+			expect(watch.elapsed).toBe(100);
+			// Starting again does nothing (the time since the last reading is kept).
+			clock.advance(20);
+			watch.start();
+			clock.advance(30);
+			expect(watch.elapsed).toBe(150);
+			expect(watch.lap()).toBe(150);
+			clock.advance(25);
+			expect(watch.stop()).toBe(175);
+			expect(watch.running).toBe(false);
+			clock.advance(1000);
+			expect(watch.elapsed).toBe(175);
+			expect(watch.stop()).toBe(175);
+			watch.start();
+			clock.advance(5);
+			expect(watch.lap()).toBe(30);
+			expect(watch.elapsed).toBe(180);
+			expect(watch.reset()).toBe(watch);
+			expect(watch.running).toBe(false);
+			expect(watch.elapsed).toBe(0);
+			clock.advance(10);
+			expect(watch.elapsed).toBe(0);
+			watch.start();
+			clock.advance(10);
+			expect(watch.lap()).toBe(10);
+		});
+
+		it('counts a clock going back as no time passing: the measured time never decreases', function () {
+			const clock = manualClock(1000);
+			const watch = createStopwatch({ now: clock.now }).start();
+			clock.advance(100);
+			expect(watch.lap()).toBe(100);
+			clock.set(0);
+			expect(watch.elapsed).toBe(100);
+			expect(watch.lap()).toBe(0);
+			clock.set(50);
+			expect(watch.stop()).toBe(150);
+		});
+
+		it('does not depend on this', function () {
+			const clock = manualClock();
+			const { start, stop, lap } = createStopwatch({ now: clock.now });
+			start();
+			clock.advance(7);
+			expect(lap()).toBe(7);
+			expect(stop()).toBe(7);
+		});
+
+		it('uses performance.now by default, and Date.now without performance', function () {
+			jest.useFakeTimers({ now: 0 });
+			const spy = jest.spyOn(performance, 'now');
+			const watch = createStopwatch().start();
+			jest.advanceTimersByTime(40);
+			expect(watch.elapsed).toBe(40);
+			expect(spy).toHaveBeenCalled();
+			jest.replaceProperty(globalThis, 'performance', { now: 'broken' } as never);
+			const fallback = createStopwatch().start();
+			jest.setSystemTime(1000);
+			expect(fallback.stop()).toBe(960);
+		});
+
+		it('validates now and what it returns', function () {
+			expect(function () {
+				createStopwatch({ now: 1 as never });
+			}).toThrow(new TypeError('createStopwatch: `now` must be a function, got number'));
+			expect(function () {
+				createStopwatch(null as never);
+			}).toThrow(TypeError);
+			let time: unknown = NaN;
+			const watch = createStopwatch({
+				now: function () {
+					return time as number;
+				}
+			});
+			expect(function () {
+				watch.start();
+			}).toThrow(new RangeError('createStopwatch: `now()` must be a finite number, got NaN'));
+			expect(watch.running).toBe(false);
+			time = 'soon';
+			expect(function () {
+				watch.start();
+			}).toThrow(new TypeError('createStopwatch: `now()` must be a finite number, got string'));
+			time = 0;
+			watch.start();
+			time = -Infinity;
+			expect(function () {
+				return watch.elapsed;
+			}).toThrow(new RangeError('createStopwatch: `now()` must be a finite number, got -Infinity'));
 		});
 	});
 });

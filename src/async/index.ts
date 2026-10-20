@@ -1,7 +1,7 @@
 import { createLRUCache, createPriorityQueue } from '../cache/index.js';
 import { debounce, defaultMemoizeKey, noop, type MemoizeCache, type Result } from '../functions/index.js';
 import { isError } from '../guards/index.js';
-import { assertDelay, assertFunction, assertInteger, assertNumber, describe, draw, MAX_TIMEOUT, readOption } from '../utils/assert.js';
+import { assertDelay, assertFunction, assertInteger, assertNumber, describe, draw, MAX_TIMEOUT, readOption, show } from '../utils/assert.js';
 import { assertOptionalSignal, detach, reasonOf } from '../utils/signal.js';
 import type { AbortSignalLike, AnyFunction, RandomGenerator } from '../utils/index.js';
 
@@ -1164,10 +1164,10 @@ interface RateLimitedCall {
 export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
 	if (typeof options !== 'object' || options === null) throw new TypeError(`createRateLimiter: \`options\` must be an object, got ${describe(options)}`);
 
-	const { limit, interval, signal } = options;
+	const { limit, interval: period, signal } = options;
 
 	assertInteger('createRateLimiter', 'limit', limit, 1);
-	assertDelay('createRateLimiter', 'interval', interval);
+	assertDelay('createRateLimiter', 'interval', period);
 	assertOptionalSignal('createRateLimiter', 'signal', signal);
 
 	// The start times of the last `limit` calls, as a ring buffer whose oldest entry is at `cursor` once it is full.
@@ -1192,7 +1192,7 @@ export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
 		if (full && starts[cursor] > now) starts[cursor] = now;
 
 		// The oldest of the last `limit` starts must be `interval` ms old.
-		const wait = full ? starts[cursor] + interval - now : 0;
+		const wait = full ? starts[cursor] + period - now : 0;
 
 		if (wait <= 0) {
 			if (full) {
@@ -1783,10 +1783,10 @@ export interface PollOptions {
  */
 export function pollUntil<T>(check: () => T | PromiseLike<T>, options: PollOptions = {}): Promise<Truthy<Awaited<T>>> {
 	return new Promise<Truthy<Awaited<T>>>(function (resolve, reject) {
-		const { interval = 100, timeout = Infinity, signal } = options;
+		const { interval: period = 100, timeout = Infinity, signal } = options;
 
 		assertFunction('pollUntil', 'check', check);
-		assertDelay('pollUntil', 'interval', interval);
+		assertDelay('pollUntil', 'interval', period);
 		assertDelay('pollUntil', 'timeout', timeout, true);
 		assertOptionalSignal('pollUntil', 'signal', signal);
 
@@ -1835,7 +1835,7 @@ export function pollUntil<T>(check: () => T | PromiseLike<T>, options: PollOptio
 					if (value) {
 						finish(resolve, value);
 					} else {
-						pollTimer = setTimeout(poll, interval);
+						pollTimer = setTimeout(poll, period);
 					}
 				},
 				function (error: unknown) {
@@ -3150,12 +3150,113 @@ export interface WaitForEventOptions<T> {
 
 /**
  * Throws a `TypeError` unless `value` is a string or a symbol.
+ * @param {string} caller - Name of the public function, used in the error message
  * @param {string} name - Name of the validated parameter
  * @param {unknown} value - The value to validate
  * @returns {void}
  */
-function assertEventType(name: string, value: unknown): void {
-	if (typeof value !== 'string' && typeof value !== 'symbol') throw new TypeError(`waitForEvent: \`${name}\` must be a string or a symbol, got ${describe(value)}`);
+function assertEventType(caller: string, name: string, value: unknown): void {
+	if (typeof value !== 'string' && typeof value !== 'symbol') throw new TypeError(`${caller}: \`${name}\` must be a string or a symbol, got ${describe(value)}`);
+}
+
+/**
+ * Finds the methods that add and remove listeners on an event target or emitter (see {@link waitForEvent}), and validates the event type.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {unknown} target - The event target or emitter
+ * @param {unknown} type - The event type
+ * @returns {[AnyFunction, AnyFunction]} The add and remove methods (unbound)
+ * @throws {TypeError} when `target` has no supported listener methods, or `type` is neither a string nor a symbol
+ */
+function listenerMethods(caller: string, target: unknown, type: unknown): [AnyFunction, AnyFunction] {
+	const methods = target as Record<string, unknown>;
+	let add: unknown;
+	let remove: unknown;
+
+	if ((typeof target === 'object' && target !== null) || typeof target === 'function') {
+		for (const [adder, remover] of [
+			['addEventListener', 'removeEventListener'],
+			['on', 'off'],
+			['addListener', 'removeListener']
+		]) {
+			add = methods[adder];
+			remove = methods[remover];
+			if (typeof add === 'function' && typeof remove === 'function') break;
+		}
+	}
+	if (typeof add !== 'function' || typeof remove !== 'function') {
+		throw new TypeError(`${caller}: \`target\` must be an EventTarget or an event emitter, got ${describe(target)}`);
+	}
+	assertEventType(caller, 'type', type);
+
+	return [add as AnyFunction, remove as AnyFunction];
+}
+
+/**
+ * Throws a `TypeError` unless `rejectOn` is an array of strings and symbols.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {unknown} rejectOn - The value to validate
+ * @returns {void}
+ */
+function assertRejectOn(caller: string, rejectOn: unknown): asserts rejectOn is ReadonlyArray<string | symbol> {
+	if (!Array.isArray(rejectOn)) throw new TypeError(`${caller}: \`rejectOn\` must be an array, got ${describe(rejectOn)}`);
+	rejectOn.forEach(function (rejectType: unknown, index) {
+		assertEventType(caller, `rejectOn[${index}]`, rejectType);
+	});
+}
+
+/**
+ * Removes the listeners recorded in `added` from `target`, and empties it (each listener is removed once, also when another removal
+ * throws).
+ * @param {unknown} target - The event target or emitter
+ * @param {AnyFunction} remove - Its remove method
+ * @param {Array<[unknown, (event: unknown) => void]>} added - The listeners added so far, as `[type, listener]` pairs
+ * @returns {void}
+ */
+function removeListeners(target: unknown, remove: AnyFunction, added: Array<[unknown, (event: unknown) => void]>): void {
+	for (const pair of added.splice(0)) {
+		try {
+			Reflect.apply(remove, target, pair);
+		} catch {
+			// The other listeners must still be removed.
+		}
+	}
+}
+
+/**
+ * Adds `listener` for `type`, and `onReject` for each of the `rejectOn` types, to `target`, recording each one in `added` as soon as it
+ * is added, so that the caller can remove those added so far at any time (see {@link removeListeners}). A listener called while being
+ * added (an emitter replaying its last event) may have ended the operation: once `stopped()` is true, no more are added. When adding one
+ * throws, the error propagates; removing the listeners already added is left to the caller in both cases.
+ * @param {unknown} target - The event target or emitter
+ * @param {AnyFunction} add - Its add method
+ * @param {Array<[unknown, (event: unknown) => void]>} added - Receives the listeners added
+ * @param {unknown} type - The event type
+ * @param {(event: unknown) => void} listener - The listener of `type`
+ * @param {ReadonlyArray<string | symbol>} rejectOn - The event types that end the operation with an error
+ * @param {(event: unknown) => void} onReject - Their listener
+ * @param {() => boolean} stopped - Whether the operation has ended
+ * @returns {void}
+ */
+function addListeners(
+	target: unknown,
+	add: AnyFunction,
+	added: Array<[unknown, (event: unknown) => void]>,
+	type: unknown,
+	listener: (event: unknown) => void,
+	rejectOn: ReadonlyArray<string | symbol>,
+	onReject: (event: unknown) => void,
+	stopped: () => boolean
+): void {
+	for (const pair of [
+		[type, listener],
+		...rejectOn.map(function (rejectType) {
+			return [rejectType, onReject];
+		})
+	] as Array<[unknown, (event: unknown) => void]>) {
+		Reflect.apply(add, target, pair);
+		added.push(pair);
+		if (stopped()) return;
+	}
 }
 
 /**
@@ -3218,50 +3319,24 @@ export function waitForEvent(target: EventTargetLike | EventEmitterLike, type: s
 		const timeout = readOption(options, 'timeout', Infinity);
 		const filter = readOption(options, 'filter');
 		const rejectOn = readOption(options, 'rejectOn', []);
-		const methods = target as unknown as Record<string, unknown>;
-		let add: unknown;
-		let remove: unknown;
+		const [add, remove] = listenerMethods('waitForEvent', target, type);
 
-		if ((typeof target === 'object' && target !== null) || typeof target === 'function') {
-			for (const [adder, remover] of [
-				['addEventListener', 'removeEventListener'],
-				['on', 'off'],
-				['addListener', 'removeListener']
-			]) {
-				add = methods[adder];
-				remove = methods[remover];
-				if (typeof add === 'function' && typeof remove === 'function') break;
-			}
-		}
-		if (typeof add !== 'function' || typeof remove !== 'function') {
-			throw new TypeError(`waitForEvent: \`target\` must be an EventTarget or an event emitter, got ${describe(target)}`);
-		}
-		assertEventType('type', type);
 		assertDelay('waitForEvent', 'timeout', timeout, true);
 		if (filter !== undefined) assertFunction('waitForEvent', 'filter', filter);
-		if (!Array.isArray(rejectOn)) throw new TypeError(`waitForEvent: \`rejectOn\` must be an array, got ${describe(rejectOn)}`);
-		rejectOn.forEach(function (rejectType: unknown, index) {
-			assertEventType(`rejectOn[${index}]`, rejectType);
-		});
+		assertRejectOn('waitForEvent', rejectOn);
 		assertOptionalSignal('waitForEvent', 'signal', signal);
 		if (signal?.aborted) throw abortReason(signal);
 
-		const added: Array<[unknown, (value: unknown) => void]> = [];
+		const added: Array<[unknown, (event: unknown) => void]> = [];
 		let done = false;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 
 		/**
-		 * Removes the listeners added to `target` so far (each one once, also when another removal throws).
+		 * Removes the listeners added to `target` so far.
 		 * @returns {void}
 		 */
 		function unlisten(): void {
-			for (const pair of added.splice(0)) {
-				try {
-					Reflect.apply(remove as AnyFunction, target, pair);
-				} catch {
-					// The other listeners must still be removed.
-				}
-			}
+			removeListeners(target, remove, added);
 		}
 
 		/**
@@ -3317,22 +3392,16 @@ export function waitForEvent(target: EventTargetLike | EventEmitterLike, type: s
 		signal?.addEventListener('abort', onAbort);
 
 		try {
-			for (const pair of [
-				[type, onEvent],
-				...rejectOn.map(function (rejectType) {
-					return [rejectType, onReject];
-				})
-			] as Array<[unknown, (value: unknown) => void]>) {
-				Reflect.apply(add, target, pair);
-				added.push(pair);
-				// A listener called while being added (an emitter replaying its last event) has settled the promise.
-				if (done) {
-					unlisten();
-					return;
-				}
-			}
+			addListeners(target, add, added, type, onEvent, rejectOn, onReject, function () {
+				return done;
+			});
 		} catch (error) {
 			finish(reject, error);
+			return;
+		}
+		// A listener called while being added has settled the promise (and removed the listeners added before it).
+		if (done) {
+			unlisten();
 			return;
 		}
 
@@ -3515,4 +3584,1132 @@ export function minDelay<T>(promise: PromiseLike<T> | T, ms: number, options: Mi
 			}
 		);
 	});
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// isAbortError / isTimeoutError / createCircuitBreaker / backoff
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Whether `value` is an error-like object (a string `message`) whose `name` is `name`. Realm-independent (no `instanceof`), and never
+ * throws: a throwing getter or a revoked proxy gives `false`. A `name` or `message` inherited from a polluted `Object.prototype` does
+ * not count.
+ * @param {unknown} value - The value to check
+ * @param {string} name - The expected `name`
+ * @returns {boolean} Whether `value` is such an error
+ */
+function isErrorNamed(value: unknown, name: string): boolean {
+	if (typeof value !== 'object' || value === null) return false;
+	try {
+		const error = value as { name?: unknown; message?: unknown };
+		return readOption(error, 'name') === name && typeof readOption(error, 'message') === 'string';
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Checks whether a value is an abort error: an error-like object (with a string `message`) whose `name` is `'AbortError'`. That covers
+ * this module's {@link AbortError}, the `DOMException` that `AbortController.abort()` gives without a reason (and that `fetch` rejects
+ * with), Node's `AbortError`, and such errors from other realms (iframes, workers, `vm` contexts) or rebuilt from JSON, where
+ * `instanceof` fails. Never throws: a throwing getter or a revoked proxy gives `false`.
+ *
+ * `AbortSignal.timeout()` aborts with a `'TimeoutError'` instead (as does {@link timeoutSignal}): check {@link isTimeoutError} too to
+ * catch both.
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether `value` is an abort error
+ * @example
+ * isAbortError(new AbortError()); // => true
+ * const controller = new AbortController();
+ * controller.abort();
+ * isAbortError(controller.signal.reason); // => true // a DOMException
+ * isAbortError({ name: 'AbortError', message: 'from JSON' }); // => true
+ * isAbortError(new TimeoutError()); // => false
+ * isAbortError('AbortError'); // => false
+ */
+export function isAbortError(value: unknown): value is Error & { readonly name: 'AbortError' } {
+	return isErrorNamed(value, 'AbortError');
+}
+
+/**
+ * Checks whether a value is a timeout error: an error-like object (with a string `message`) whose `name` is `'TimeoutError'`. That
+ * covers this module's {@link TimeoutError} (from {@link withTimeout}, {@link pollUntil}, {@link timeoutSignal}…), the `DOMException`
+ * that `AbortSignal.timeout()` aborts with, and such errors from other realms or rebuilt from JSON. Never throws.
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether `value` is a timeout error
+ * @example
+ * isTimeoutError(new TimeoutError()); // => true
+ * const signal = AbortSignal.timeout(0);
+ * await sleep(10);
+ * isTimeoutError(signal.reason); // => true // a DOMException
+ * isTimeoutError(new AbortError()); // => false
+ * isTimeoutError(null); // => false
+ */
+export function isTimeoutError(value: unknown): value is Error & { readonly name: 'TimeoutError' } {
+	return isErrorNamed(value, 'TimeoutError');
+}
+
+/**
+ * Error with which a {@link createCircuitBreaker} breaker rejects the calls it does not let through.
+ * @example
+ * const error = new CircuitOpenError('the payment service is down', 5000);
+ * error.name; // => 'CircuitOpenError'
+ * error.retryAfter; // => 5000
+ */
+export class CircuitOpenError extends Error {
+	override name = 'CircuitOpenError';
+	/**
+	 * Milliseconds until the circuit lets a trial call through: the rest of the reset timeout while it is open (`Infinity` when it never
+	 * resets by itself), `0` while it is half-open and its trial calls are in flight.
+	 */
+	readonly retryAfter: number;
+
+	/**
+	 * @param {string} [message='The circuit is open.'] - The error message
+	 * @param {number} [retryAfter=0] - Milliseconds until a call may be let through
+	 */
+	constructor(message = 'The circuit is open.', retryAfter = 0) {
+		super(message);
+		this.retryAfter = retryAfter;
+	}
+}
+
+/**
+ * The state of a {@link CircuitBreaker}: `'closed'` (calls go through), `'open'` (calls are rejected at once) or `'half-open'` (a few
+ * trial calls go through to test whether the operation works again).
+ */
+export type CircuitState = 'closed' | 'open' | 'half-open';
+
+/**
+ * Options accepted by {@link createCircuitBreaker}.
+ */
+export interface CircuitBreakerOptions {
+	/** Number of consecutive failures that opens the circuit (an integer >= 1). Defaults to `5`. */
+	failureThreshold?: number;
+	/**
+	 * Milliseconds the circuit stays open before letting trial calls through (`0` to `2^31 - 1`, or `Infinity`: only `reset()` closes it).
+	 * Defaults to `30_000`.
+	 */
+	resetTimeout?: number;
+	/** Number of trial calls let through while half-open (an integer >= 1); all of them must succeed to close the circuit. Defaults to `1`. */
+	halfOpenMaxCalls?: number;
+	/**
+	 * Decides whether an error thrown or rejected by the operation counts as a failure (defaults to always). An error that does not (a
+	 * `404`, a validation error) still reaches the caller, but counts as a success: the operation answered. When it throws, the call
+	 * counts as a failure and rejects with that error.
+	 */
+	isFailure?(error: unknown): boolean;
+	/**
+	 * Called after each change of state, with the new and the previous state. An error it throws takes the place of the outcome of the
+	 * call (or is thrown by the `open()` / `reset()` call, or the `state` / `stats` read) that caused the change; the change stands.
+	 */
+	onStateChange?(state: CircuitState, previous: CircuitState): void;
+	/**
+	 * Clock in milliseconds, read only while the circuit opens or is open. Defaults to `Date.now`. It must return a finite number (or the
+	 * operation reading it throws); a clock going back counts as no time passing. It is called without a receiver: pass
+	 * `performance.now.bind(performance)` rather than `performance.now`.
+	 */
+	now?(): number;
+}
+
+/**
+ * Counters of a {@link CircuitBreaker}, as read from its `stats` property (a snapshot).
+ */
+export interface CircuitBreakerStats {
+	/** The current state. */
+	readonly state: CircuitState;
+	/** Failures in a row in the current closed period (`0` while open or half-open). */
+	readonly consecutiveFailures: number;
+	/** Calls of the operation that settled without a counted failure. */
+	readonly successes: number;
+	/** Calls of the operation that settled with a counted failure. */
+	readonly failures: number;
+	/** Calls rejected with a {@link CircuitOpenError} without calling the operation. */
+	readonly shortCircuited: number;
+}
+
+/**
+ * A function guarded by {@link createCircuitBreaker}.
+ * @template F - The guarded function type
+ */
+export interface CircuitBreaker<F extends AnyFunction> {
+	/**
+	 * Calls the operation (forwarding `this` and the arguments) when the circuit lets the call through, and settles like it; otherwise
+	 * rejects with a {@link CircuitOpenError} without calling it. Synchronous throws become rejections.
+	 */
+	(this: ThisParameterType<F>, ...args: Parameters<F>): Promise<Awaited<ReturnType<F>>>;
+	/** The current state (an open circuit whose reset timeout has elapsed turns half-open when this is read). */
+	readonly state: CircuitState;
+	/** A snapshot of the counters (a null-prototype object). */
+	readonly stats: CircuitBreakerStats;
+	/** Opens the circuit now, as if the failure threshold had been reached: calls are rejected for `resetTimeout` ms. */
+	open(): void;
+	/** Closes the circuit and forgets the failures counted so far. */
+	reset(): void;
+}
+
+/**
+ * The settlement handlers of the calls a {@link CircuitBreaker} lets through in one generation.
+ */
+interface Settlers {
+	readonly value: (value: unknown) => unknown;
+	readonly error: (error: unknown) => never;
+}
+
+/**
+ * Wraps an async (or sync) operation in a circuit breaker, which stops calling a dependency that keeps failing, so that callers fail fast
+ * instead of piling up on timeouts, and the dependency gets time to recover:
+ * - **Closed** (initially): calls go through. `failureThreshold` failures in a row (as decided by `isFailure`) open the circuit; a
+ *   success resets the count.
+ * - **Open**: calls are rejected at once with a {@link CircuitOpenError} whose `retryAfter` tells how long the circuit stays open.
+ *   After `resetTimeout` ms, it turns half-open. There are no timers: the switch happens when the breaker is next called or its
+ *   `state` read, so an idle breaker costs nothing and never keeps a process alive.
+ * - **Half-open**: up to `halfOpenMaxCalls` trial calls go through, the others are rejected (`retryAfter` is `0`). The first failing trial
+ *   reopens the circuit for another `resetTimeout`; once all of them have succeeded, it closes.
+ *
+ * Calls in flight while the state changes are handled by generations: every change of state, `open()` and `reset()` start a new one, and
+ * a call only affects the state if it settles in the generation it started in. So a slow call made while closed that succeeds after the
+ * circuit opened does not close it, a slow failure does not reopen a circuit that was reset or count toward a new streak, and concurrent
+ * failures open the circuit once. Such a call still settles its caller, and counts in `stats`.
+ *
+ * A trial call that never settles keeps the circuit half-open: bound the operation with {@link withTimeout} or a `signal`.
+ * @template F - The type of the operation
+ * @param {F} fn - The operation
+ * @param {CircuitBreakerOptions} [options] - `failureThreshold` (5), `resetTimeout` (30 000), `halfOpenMaxCalls` (1), `isFailure`, `onStateChange` and `now` (`Date.now`)
+ * @returns {CircuitBreaker<F>} The guarded function, with `state`, `stats`, `open()` and `reset()`
+ * @throws {TypeError} when `fn`, `isFailure`, `onStateChange` or `now` is not a function, or a numeric option is not a number
+ * @throws {RangeError} when `failureThreshold` or `halfOpenMaxCalls` is not an integer >= 1, or `resetTimeout` is neither a number
+ * between `0` and `2^31 - 1` nor `Infinity`
+ * @example
+ * let clock = 0;
+ * let healthy = false;
+ * async function charge(amount: number): Promise<number> { if (!healthy) throw new Error('payment service down'); return amount; }
+ * const guarded = createCircuitBreaker(charge, { failureThreshold: 2, resetTimeout: 1000, now: function () { return clock; } });
+ * await guarded(10); // throws Error
+ * await guarded(10); // throws Error // the second failure in a row opens the circuit
+ * guarded.state; // => 'open'
+ * await guarded(10); // throws CircuitOpenError // rejected without calling `charge`
+ * clock = 1000;
+ * healthy = true;
+ * await guarded(10); // => 10 // the trial call succeeds and closes the circuit
+ * guarded.state; // => 'closed'
+ * guarded.stats; // => { state: 'closed', consecutiveFailures: 0, successes: 1, failures: 2, shortCircuited: 1 }
+ * @example
+ * // doctest: skip
+ * const getUser = createCircuitBreaker(function (id: string) { return withTimeout(fetchUser(id), 2000); }, {
+ *   isFailure: function (error) { return !(error instanceof NotFoundError); }, // a 404 means the service is up
+ *   onStateChange: function (state) { logger.warn(`users circuit is ${state}`); }
+ * });
+ * try { await getUser('42'); } catch (error) { if (error instanceof CircuitOpenError) return cached('42'); throw error; }
+ */
+export function createCircuitBreaker<F extends AnyFunction>(fn: F, options: CircuitBreakerOptions = {}): CircuitBreaker<F> {
+	const caller = 'createCircuitBreaker';
+	const failureThreshold = readOption(options, 'failureThreshold', 5);
+	const resetTimeout = readOption(options, 'resetTimeout', 30_000);
+	const halfOpenMaxCalls = readOption(options, 'halfOpenMaxCalls', 1);
+	const isFailure = readOption(options, 'isFailure');
+	const onStateChange = readOption(options, 'onStateChange');
+	const now = readOption(options, 'now', Date.now);
+
+	assertFunction(caller, 'fn', fn);
+	assertInteger(caller, 'failureThreshold', failureThreshold, 1);
+	assertDelay(caller, 'resetTimeout', resetTimeout, true);
+	assertInteger(caller, 'halfOpenMaxCalls', halfOpenMaxCalls, 1);
+	if (isFailure !== undefined) assertFunction(caller, 'isFailure', isFailure);
+	if (onStateChange !== undefined) assertFunction(caller, 'onStateChange', onStateChange);
+	assertFunction(caller, 'now', now);
+
+	let state: CircuitState = 'closed';
+	// The handlers of the calls let through in the current generation, created by the first of them: the generation is their identity,
+	// so a call settling in a later one is recognized at no cost, and calls allocate no closures.
+	let current: Settlers | undefined;
+	let consecutiveFailures = 0;
+	let openedAt = 0;
+	// Trial calls let through, and those that succeeded, in the current half-open period.
+	let trials = 0;
+	let passed = 0;
+	let successes = 0;
+	let failures = 0;
+	let shortCircuited = 0;
+
+	/**
+	 * Reads the clock.
+	 * @returns {number} The current time
+	 * @throws {TypeError} when `now()` does not return a number
+	 * @throws {RangeError} when `now()` returns `NaN` or an infinity
+	 */
+	function readClock(): number {
+		const time = now();
+		assertNumber(caller, 'now()', time, Number.isFinite(time), 'a finite number');
+		return time;
+	}
+
+	/**
+	 * Enters a state (again, for `open()` and `reset()`), starting a new generation, then reports a change of state.
+	 * @param {CircuitState} next - The new state
+	 * @returns {void}
+	 */
+	function enter(next: CircuitState): void {
+		// The clock first: when it throws, nothing changes.
+		if (next === 'open') openedAt = readClock();
+
+		const previous = state;
+
+		state = next;
+		current = undefined;
+		consecutiveFailures = 0;
+		trials = 0;
+		passed = 0;
+		if (next !== previous) onStateChange?.(next, previous);
+	}
+
+	/**
+	 * Turns an open circuit whose reset timeout has elapsed half-open.
+	 * @returns {number} While the circuit is (still) open, how many milliseconds it stays open; otherwise meaningless
+	 */
+	function refresh(): number {
+		if (state !== 'open') return 0;
+
+		const time = readClock();
+
+		// A clock that went back: no time has passed, but the wait never exceeds `resetTimeout`.
+		openedAt = Math.min(openedAt, time);
+
+		const wait = resetTimeout - (time - openedAt);
+
+		if (wait > 0) return wait;
+		enter('half-open');
+		// In case `onStateChange` reopened it.
+		return resetTimeout;
+	}
+
+	/**
+	 * Records the outcome of a call.
+	 * @param {Settlers} admitted - The handlers of the generation the call started in
+	 * @param {boolean} failed - Whether it failed
+	 * @returns {void}
+	 */
+	function settle(admitted: Settlers, failed: boolean): void {
+		if (failed) failures++;
+		else successes++;
+		// A call from an earlier generation does not affect the state.
+		if (admitted !== current) return;
+		if (state === 'closed') {
+			if (!failed) consecutiveFailures = 0;
+			else if (++consecutiveFailures >= failureThreshold) enter('open');
+		} else if (failed) {
+			enter('open');
+		} else if (++passed >= halfOpenMaxCalls) {
+			enter('closed');
+		}
+	}
+
+	/**
+	 * Creates the handlers of the calls let through in a new generation.
+	 * @returns {Settlers} The handlers
+	 */
+	function settlers(): Settlers {
+		const own: Settlers = {
+			value: function (value: unknown): unknown {
+				settle(own, false);
+				return value;
+			},
+			error: function (error: unknown): never {
+				let failed: boolean;
+
+				try {
+					failed = isFailure === undefined || Boolean(isFailure(error));
+				} catch (filterError) {
+					settle(own, true);
+					throw filterError;
+				}
+				settle(own, failed);
+				throw error;
+			}
+		};
+
+		return own;
+	}
+
+	/**
+	 * The guarded function.
+	 * @param {...unknown} args - The call arguments
+	 * @returns {Promise<unknown>} Settles like the operation, or rejects with a `CircuitOpenError`
+	 */
+	function breaker(this: unknown, ...args: unknown[]): Promise<unknown> {
+		let wait: number;
+
+		try {
+			wait = refresh();
+		} catch (error) {
+			return Promise.reject(error);
+		}
+		if (state === 'half-open' && trials < halfOpenMaxCalls) trials++;
+		else if (state !== 'closed') {
+			shortCircuited++;
+			return Promise.reject(
+				state === 'half-open'
+					? new CircuitOpenError(`${caller}: the circuit is half-open and its trial calls are in flight`, 0)
+					: new CircuitOpenError(`${caller}: the circuit is open, ${wait === Infinity ? 'until reset()' : `retry in ${wait} ms`}`, wait)
+			);
+		}
+
+		const handlers = (current ??= settlers());
+
+		return invoke(fn, this, args).then(handlers.value, handlers.error);
+	}
+
+	Object.defineProperties(breaker, {
+		state: {
+			get: function (): CircuitState {
+				refresh();
+				return state;
+			}
+		},
+		stats: {
+			get: function (): CircuitBreakerStats {
+				refresh();
+
+				const stats = Object.create(null) as { -readonly [K in keyof CircuitBreakerStats]: CircuitBreakerStats[K] };
+
+				stats.state = state;
+				stats.consecutiveFailures = consecutiveFailures;
+				stats.successes = successes;
+				stats.failures = failures;
+				stats.shortCircuited = shortCircuited;
+				return stats;
+			}
+		},
+		open: {
+			value: function open(): void {
+				enter('open');
+			}
+		},
+		reset: {
+			value: function reset(): void {
+				enter('closed');
+			}
+		}
+	});
+
+	return breaker as unknown as CircuitBreaker<F>;
+}
+
+/**
+ * How {@link backoff} randomizes its delays (see the AWS Architecture Blog, "Exponential Backoff And Jitter", Marc Brooker, 2015), where
+ * `exp(n)` is `min(maxDelay, delay × factor^n)`:
+ * - `'none'`: `exp(n)`, deterministic.
+ * - `'full'`: uniform in `[0, exp(n))`: the fewest collisions between competing clients, the least total waiting.
+ * - `'equal'`: `exp(n) / 2` plus uniform in `[0, exp(n) / 2)`: never less than half the exponential delay.
+ * - `'decorrelated'`: `min(maxDelay, uniform in [delay, previous × factor))`, starting from `previous = delay` (the article multiplies by
+ *   `3`: pass `factor: 3` for its exact formula).
+ */
+export type BackoffJitter = 'none' | 'full' | 'equal' | 'decorrelated';
+
+/**
+ * Options accepted by {@link backoff}.
+ */
+export interface BackoffOptions {
+	/** The first (base) delay in ms (`0` to `2^31 - 1`). Defaults to `100`. */
+	delay?: number;
+	/** Growth factor between consecutive delays (a finite number >= 1). Defaults to `2`. */
+	factor?: number;
+	/** Upper bound of every delay in ms (`0` to `2^31 - 1`, so each delay can be passed to `setTimeout` or {@link sleep}). Defaults to `30_000`. */
+	maxDelay?: number;
+	/** The randomization (see {@link BackoffJitter}). Defaults to `'none'`. */
+	jitter?: BackoffJitter;
+	/** Number of delays (an integer >= 0, or `Infinity`, the default: the sequence never ends). */
+	retries?: number;
+	/** Random source used for jitter (defaults to `Math.random`): inject a seeded generator for reproducible delays. */
+	random?: RandomGenerator;
+}
+
+/**
+ * Creates the sequence of delays (in ms) of an exponential backoff, for retry loops written by hand (or for a `retry` policy of your
+ * own): `delay`, `delay × factor`, `delay × factor²`… capped at `maxDelay`, optionally randomized (see {@link BackoffJitter}), and
+ * `retries` long (endless by default).
+ *
+ * The result is an iterable that starts over each time it is iterated, so one policy can serve many loops. Every delay is a finite
+ * number between `0` and `maxDelay`, never `NaN`: growth is by repeated multiplication clamped to `maxDelay` at each step, so it is monotonic
+ * (without jitter) and cannot overflow, however many delays are drawn. `random` is called once per delay (never for `'none'`).
+ * @param {BackoffOptions} [options] - `delay` (100), `factor` (2), `maxDelay` (30 000), `jitter` (`'none'`), `retries` (Infinity) and `random` (`Math.random`)
+ * @returns {Iterable<number>} The delays, an iterable that can be iterated any number of times
+ * @throws {TypeError} when a numeric option is not a number, `jitter` is not a string, or (with jitter) `random` is not a function
+ * @throws {RangeError} when `delay` or `maxDelay` is not a number between `0` and `2^31 - 1`, `factor` is not a finite number >= 1,
+ * `retries` is not an integer >= 0 or `Infinity`, `jitter` is not one of the {@link BackoffJitter} names, or (while iterating)
+ * `random()` returns a value outside [0, 1)
+ * @example
+ * [...backoff({ retries: 5 })]; // => [100, 200, 400, 800, 1600]
+ * [...backoff({ delay: 1000, factor: 3, maxDelay: 5000, retries: 4 })]; // => [1000, 3000, 5000, 5000]
+ * [...backoff({ retries: 3, jitter: 'full', random: function () { return 0.5; } })]; // => [50, 100, 200]
+ * @example
+ * async function fetchWithRetries(url: string): Promise<Response> {
+ *   for (const delay of backoff({ retries: 4, jitter: 'full' })) {
+ *     const response = await fetch(url);
+ *     if (response.status !== 503) return response;
+ *     await sleep(delay);
+ *   }
+ *   return fetch(url); // the last attempt
+ * }
+ */
+export function backoff(options: BackoffOptions = {}): Iterable<number> {
+	const initial = readOption(options, 'delay', 100);
+	const factor = readOption(options, 'factor', 2);
+	const max = readOption(options, 'maxDelay', 30_000);
+	const jitter = readOption(options, 'jitter', 'none');
+	const retries = readOption(options, 'retries', Infinity);
+	const random = readOption(options, 'random', Math.random);
+
+	assertDelay('backoff', 'delay', initial);
+	assertNumber('backoff', 'factor', factor, factor >= 1 && factor < Infinity, 'a finite number >= 1');
+	assertDelay('backoff', 'maxDelay', max);
+	if (jitter !== 'none' && jitter !== 'full' && jitter !== 'equal' && jitter !== 'decorrelated') {
+		const message = `backoff: \`jitter\` must be 'none', 'full', 'equal' or 'decorrelated', got ${show(jitter)}`;
+		throw typeof jitter === 'string' ? new RangeError(message) : new TypeError(message);
+	}
+	assertInteger('backoff', 'retries', retries, 0, true);
+	if (jitter !== 'none') assertFunction('backoff', 'random', random);
+
+	return new BackoffPolicy(initial, factor, max, jitter, retries, random);
+}
+
+/**
+ * The iterable returned by {@link backoff}, holding its validated options. A class rather than an object literal: an object with a
+ * computed `[Symbol.iterator]` key is several times slower to create.
+ */
+class BackoffPolicy implements Iterable<number> {
+	readonly initial: number;
+	readonly factor: number;
+	readonly max: number;
+	readonly jitter: BackoffJitter;
+	readonly retries: number;
+	readonly random: RandomGenerator;
+
+	/**
+	 * Creates a policy.
+	 * @param {number} initial - The first delay
+	 * @param {number} factor - The growth factor
+	 * @param {number} max - The largest delay
+	 * @param {BackoffJitter} jitter - The randomization
+	 * @param {number} retries - The number of delays
+	 * @param {RandomGenerator} random - The random source
+	 */
+	constructor(initial: number, factor: number, max: number, jitter: BackoffJitter, retries: number, random: RandomGenerator) {
+		this.initial = initial;
+		this.factor = factor;
+		this.max = max;
+		this.jitter = jitter;
+		this.retries = retries;
+		this.random = random;
+	}
+
+	/**
+	 * Starts the sequence over.
+	 * @returns {IterableIterator<number>} An iterator of the delays, from the first one
+	 */
+	[Symbol.iterator](): IterableIterator<number> {
+		return new BackoffIterator(this);
+	}
+}
+
+/**
+ * An iterator over the delays of a {@link BackoffPolicy}.
+ */
+class BackoffIterator implements IterableIterator<number> {
+	readonly policy: BackoffPolicy;
+	/** Delays produced so far. */
+	count: number;
+	/** `min(max, initial × factor^count)`. */
+	exponential: number;
+	/** The previous delay of the decorrelated jitter. */
+	previous: number;
+
+	/**
+	 * Creates an iterator at the first delay.
+	 * @param {BackoffPolicy} policy - The options
+	 */
+	constructor(policy: BackoffPolicy) {
+		this.policy = policy;
+		this.count = 0;
+		this.exponential = Math.min(policy.initial, policy.max);
+		this.previous = policy.initial;
+	}
+
+	/**
+	 * Produces the next delay.
+	 * @returns {IteratorResult<number>} The delay, or the end after `retries` delays
+	 */
+	next(): IteratorResult<number> {
+		const { initial, factor, max, jitter, random } = this.policy;
+		const exponential = this.exponential;
+
+		if (this.count >= this.policy.retries) return { value: undefined, done: true };
+
+		let delay = exponential;
+
+		if (jitter === 'full') {
+			delay = draw('backoff', random) * exponential;
+		} else if (jitter === 'equal') {
+			// Rather than `exponential / 2 + uniform(0, exponential / 2)`: the same, but rounding can never take it past `exponential`.
+			delay = (exponential + draw('backoff', random) * exponential) / 2;
+		} else if (jitter === 'decorrelated') {
+			// `previous × factor` may overflow: `Number.MAX_VALUE` keeps the uniform draw finite (the cap then applies anyway).
+			delay = this.previous = Math.min(max, initial + draw('backoff', random) * (Math.min(this.previous * factor, Number.MAX_VALUE) - initial));
+		}
+		this.count++;
+		// Clamped at every step: the product never exceeds `max × factor`, which is finite for any `factor` (or `Infinity`, clamped).
+		this.exponential = Math.min(exponential * factor, max);
+		return { value: delay, done: false };
+	}
+
+	/**
+	 * Iterators are iterable.
+	 * @returns {this} This iterator
+	 */
+	[Symbol.iterator](): this {
+		return this;
+	}
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// fromEvent / interval / createStopwatch
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * What {@link fromEvent} does with an event that arrives when `bufferSize` events are already waiting to be read:
+ * - `'throw'` (the default): the iteration fails with a `RangeError`, after the waiting events have been read;
+ * - `'drop-oldest'`: the oldest waiting event is discarded (the buffer keeps the latest ones);
+ * - `'drop-newest'`: the new event is discarded.
+ */
+export type FromEventOverflow = 'throw' | 'drop-oldest' | 'drop-newest';
+
+/**
+ * Options accepted by {@link fromEvent}.
+ * @template T - The event (or first listener argument) type
+ */
+export interface FromEventOptions<T> {
+	/** Ends the iteration: the next read rejects with the signal's `reason` (or an {@link AbortError}), and unread events are discarded. */
+	signal?: AbortSignalLike | null;
+	/** Only events for which this returns a truthy value are yielded. If it throws, the iteration fails with that error. */
+	filter?(event: T): boolean;
+	/** Event types that make the iteration fail with their event (or first listener argument), such as `['error']`. Defaults to none. */
+	rejectOn?: ReadonlyArray<string | symbol>;
+	/**
+	 * Largest number of events kept while nobody reads them (an integer >= 0, or `Infinity`, the default). Bound it for sources that may
+	 * emit faster than they are consumed: an unbounded buffer grows until the process runs out of memory.
+	 */
+	bufferSize?: number;
+	/** What happens to an event that does not fit in the buffer (see {@link FromEventOverflow}). Defaults to `'throw'`. */
+	overflow?: FromEventOverflow;
+}
+
+/**
+ * An event buffered by {@link fromEvent}.
+ */
+interface QueuedEvent {
+	readonly value: unknown;
+	next: QueuedEvent | undefined;
+}
+
+/**
+ * Turns the `type` events of a DOM `EventTarget` (yielding the `Event`s) or of a Node-style emitter (yielding the first argument the
+ * listeners receive) into an async iterator, for `for await` loops, like Node's `events.on` but for any target, with:
+ * - **Buffering:** listening starts at once, and events that arrive while the consumer is not reading are kept, in order, up to
+ *   `bufferSize` (unbounded by default: see `overflow` for what happens beyond). Several pending `next()` calls get events in order.
+ * - **Errors:** `rejectOn: ['error']` makes the iteration fail with the first `error` event instead of hanging; a throwing `filter` and an
+ *   `overflow: 'throw'` fail it too. The events received before the failure are read first, then the next read rejects with it.
+ * - **Cancellation:** aborting `signal` ends the iteration at once: the next read rejects with the signal's `reason` (unread events are
+ *   discarded), and later reads report the end. An already-aborted signal adds no listener.
+ * - **Cleanup:** the listeners (on `target` and `signal`) are removed as soon as the iteration ends: on `return()` (a `break`, a `return` or
+ *   an exception out of a `for await` loop), on a failure, or on abort. Pending reads then report the end (or the error, for the first).
+ *   An iterator that is neither read to its end nor closed keeps its listeners: close it with `return()` when abandoning it by hand.
+ *
+ * Listeners are added like {@link waitForEvent} adds them, and never with `once`.
+ * @template E - The event type for an `EventTarget` (defaults to the platform's `Event`)
+ * @param {EventTargetLike} target - The event target
+ * @param {string} type - The event type to listen to
+ * @param {FromEventOptions<E>} [options] - `signal`, `filter`, `rejectOn`, `bufferSize` and `overflow`
+ * @returns {AsyncIterableIterator<E>} An async iterator of the accepted events (it never ends by itself)
+ * @throws {TypeError} when `target` has no supported listener methods, `type` or an entry of `rejectOn` is neither a string nor a symbol,
+ *   `filter` is not a function, `rejectOn` is not an array, `bufferSize` is not a number, `overflow` is not a string, or `signal` is not a signal
+ * @throws {RangeError} when `bufferSize` is not an integer >= 0 or `Infinity`, or `overflow` is not one of the {@link FromEventOverflow} names
+ * @throws {unknown} the error thrown by `target` while adding a listener
+ * @example
+ * const target = new EventTarget();
+ * const clicks = fromEvent(target, 'click');
+ * target.dispatchEvent(new Event('click')); // buffered until read
+ * target.dispatchEvent(new Event('click'));
+ * let count = 0;
+ * for await (const event of clicks) {
+ *   event.type; // => 'click'
+ *   if (++count === 2) break; // removes the listener
+ * }
+ * @example
+ * import { EventEmitter } from 'node:events';
+ * const socket = new EventEmitter();
+ * const messages: string[] = [];
+ * setTimeout(function () { socket.emit('message', 'a'); socket.emit('message', 'b'); socket.emit('error', new Error('reset')); }, 10);
+ * try {
+ *   for await (const message of fromEvent<string>(socket, 'message', { rejectOn: ['error'] })) messages.push(message);
+ * } catch (error) {
+ *   (error as Error).message; // => 'reset'
+ * }
+ * messages; // => ['a', 'b']
+ * socket.listenerCount('message') + socket.listenerCount('error'); // => 0
+ */
+export function fromEvent<E = PlatformEvent>(target: EventTargetLike, type: string, options?: FromEventOptions<E>): AsyncIterableIterator<E>;
+/**
+ * Turns the `type` events of a Node-style emitter into an async iterator (see the first overload).
+ * @template T - The type of the first listener argument
+ * @param {EventEmitterLike} target - The emitter
+ * @param {string | symbol} type - The event type to listen to
+ * @param {FromEventOptions<T>} [options] - `signal`, `filter`, `rejectOn`, `bufferSize` and `overflow`
+ * @returns {AsyncIterableIterator<T>} An async iterator of the first arguments of the accepted events
+ * @example
+ * import { createEmitter } from 'tinkit/emitter';
+ * const events = createEmitter<{ saved: { id: number } }>();
+ * const saves = fromEvent<{ id: number }>(events, 'saved', { bufferSize: 100, overflow: 'drop-oldest' });
+ * events.emit('saved', { id: 7 });
+ * await saves.next(); // => { value: { id: 7 }, done: false }
+ * await saves.return?.(); // => { value: undefined, done: true }
+ */
+export function fromEvent<T = unknown>(target: EventEmitterLike, type: string | symbol, options?: FromEventOptions<T>): AsyncIterableIterator<T>;
+/**
+ * Turns the `type` events of `target` into an async iterator (see the first overload).
+ * @param {EventTargetLike | EventEmitterLike} target - The event target or emitter
+ * @param {string | symbol} type - The event type to listen to
+ * @param {FromEventOptions<unknown>} [options] - `signal`, `filter`, `rejectOn`, `bufferSize` and `overflow`
+ * @returns {AsyncIterableIterator<unknown>} An async iterator of the accepted events
+ */
+export function fromEvent(target: EventTargetLike | EventEmitterLike, type: string | symbol, options: FromEventOptions<unknown> = {}): AsyncIterableIterator<unknown> {
+	const signal = readOption(options, 'signal');
+	const filter = readOption(options, 'filter');
+	const rejectOn = readOption(options, 'rejectOn', []);
+	const bufferSize = readOption(options, 'bufferSize', Infinity);
+	const overflow = readOption(options, 'overflow', 'throw');
+	const [add, remove] = listenerMethods('fromEvent', target, type);
+
+	if (filter !== undefined) assertFunction('fromEvent', 'filter', filter);
+	assertRejectOn('fromEvent', rejectOn);
+	assertInteger('fromEvent', 'bufferSize', bufferSize, 0, true);
+	if (overflow !== 'throw' && overflow !== 'drop-oldest' && overflow !== 'drop-newest') {
+		const message = `fromEvent: \`overflow\` must be 'throw', 'drop-oldest' or 'drop-newest', got ${show(overflow)}`;
+		throw typeof overflow === 'string' ? new RangeError(message) : new TypeError(message);
+	}
+	assertOptionalSignal('fromEvent', 'signal', signal);
+
+	// The unread events, as a linked FIFO queue (O(1) at both ends, nothing to compact).
+	let first: QueuedEvent | undefined;
+	let last: QueuedEvent | undefined;
+	let buffered = 0;
+	// The reads waiting for an event.
+	const reads: Array<Deferred<IteratorResult<unknown>>> = [];
+	// Whether the listeners are gone (no event is accepted any more), and the error the iteration fails with once the buffer is read.
+	let closed = false;
+	let failure: { error: unknown } | undefined;
+	const added: Array<[unknown, (event: unknown) => void]> = [];
+
+	/**
+	 * Removes every listener.
+	 * @returns {void}
+	 */
+	function close(): void {
+		closed = true;
+		removeListeners(target, remove, added);
+		detach(signal, onAbort);
+	}
+
+	/**
+	 * Ends the waiting reads: the first one rejects with `error` (when given), the others report the end.
+	 * @param {{ error: unknown } | undefined} error - The error, if any
+	 * @returns {{ error: unknown } | undefined} `error` when no read was waiting for it (it is then thrown by the next read)
+	 */
+	function endReads(error: { error: unknown } | undefined): { error: unknown } | undefined {
+		for (const read of reads.splice(0)) {
+			if (error === undefined) {
+				read.resolve({ value: undefined, done: true });
+			} else {
+				read.reject(error.error);
+				error = undefined;
+			}
+		}
+		return error;
+	}
+
+	/**
+	 * Ends the iteration with an error, thrown once the buffered events have been read.
+	 * @param {unknown} error - The error
+	 * @returns {void}
+	 */
+	function fail(error: unknown): void {
+		if (closed) return;
+		close();
+		failure = endReads({ error });
+	}
+
+	/**
+	 * Abort listener: ends the iteration at once.
+	 * @returns {void}
+	 */
+	function onAbort(): void {
+		discard();
+		fail(abortReason(signal as AbortSignalLike));
+	}
+
+	/**
+	 * Discards the buffered events.
+	 * @returns {void}
+	 */
+	function discard(): void {
+		first = undefined;
+		last = undefined;
+		buffered = 0;
+	}
+
+	/**
+	 * Removes the oldest buffered event.
+	 * @returns {unknown} The event
+	 */
+	function shift(): unknown {
+		const node = first as QueuedEvent;
+
+		first = node.next;
+		// Not to keep the event alive through `last`.
+		if (first === undefined) last = undefined;
+		buffered--;
+		return node.value;
+	}
+
+	/**
+	 * Listener of `type`: hands an accepted event to the first waiting read, or buffers it.
+	 * @param {unknown} event - The event, or the first listener argument
+	 * @returns {void}
+	 */
+	function onEvent(event: unknown): void {
+		// An emitter may still call a listener it is removing.
+		if (closed) return;
+		try {
+			// A filter may also have ended the iteration (by closing it, or making the target emit a `rejectOn` event).
+			if (filter !== undefined && (!filter(event) || closed)) return;
+		} catch (error) {
+			fail(error);
+			return;
+		}
+
+		const read = reads.shift();
+
+		if (read !== undefined) {
+			read.resolve({ value: event, done: false });
+		} else if (buffered < bufferSize || overflow === 'drop-oldest') {
+			const node: QueuedEvent = { value: event, next: undefined };
+
+			if (first === undefined) first = node;
+			else (last as QueuedEvent).next = node;
+			last = node;
+			// Over the limit only with `drop-oldest`, which then drops the oldest one (the new one itself, for a `bufferSize` of 0).
+			if (++buffered > bufferSize) shift();
+		} else if (overflow === 'throw') {
+			fail(new RangeError(`fromEvent: more than ${bufferSize} events are waiting to be read (\`bufferSize\` is ${bufferSize})`));
+		}
+	}
+
+	const iterator: AsyncIterableIterator<unknown> = {
+		next(): Promise<IteratorResult<unknown>> {
+			if (first !== undefined) return Promise.resolve({ value: shift(), done: false });
+			if (failure !== undefined) {
+				const { error } = failure;
+
+				failure = undefined;
+				return Promise.reject(error);
+			}
+			if (closed) return Promise.resolve({ value: undefined, done: true });
+
+			const read = createDeferred<IteratorResult<unknown>>();
+
+			reads.push(read);
+			return read.promise;
+		},
+		return(): Promise<IteratorResult<unknown>> {
+			// Idempotent: the listeners are only removed once.
+			close();
+			discard();
+			failure = undefined;
+			endReads(undefined);
+			return Promise.resolve({ value: undefined, done: true });
+		},
+		[Symbol.asyncIterator](): AsyncIterableIterator<unknown> {
+			return iterator;
+		}
+	};
+
+	if (signal?.aborted) {
+		closed = true;
+		failure = { error: abortReason(signal) };
+		return iterator;
+	}
+	// The abort listener first: when adding it throws, nothing else is left behind.
+	signal?.addEventListener('abort', onAbort);
+	try {
+		addListeners(target, add, added, type, onEvent, rejectOn, fail, function () {
+			return closed;
+		});
+	} catch (error) {
+		removeListeners(target, remove, added);
+		detach(signal, onAbort);
+		throw error;
+	}
+	// A listener called while being added has ended the iteration (and removed the listeners added before it).
+	if (closed) removeListeners(target, remove, added);
+
+	return iterator;
+}
+
+/**
+ * Reads a monotonic clock in milliseconds: `performance.now()` where available, `Date.now()` otherwise.
+ * @returns {number} The current time
+ */
+function monotonicNow(): number {
+	const clock = (globalThis as { performance?: { now?: () => number } }).performance;
+
+	return typeof clock?.now === 'function' ? clock.now() : Date.now();
+}
+
+/**
+ * Options accepted by {@link interval}.
+ */
+export interface IntervalOptions {
+	/** Aborting it stops the interval, like calling the returned function. An already-aborted signal starts nothing. */
+	signal?: AbortSignalLike | null;
+	/** When `true`, the callback is also called at once (synchronously) with tick `0`. Defaults to `false`. */
+	immediate?: boolean;
+}
+
+/**
+ * Calls `callback` every `ms` milliseconds, without drift: tick `n` is scheduled at `start + n × ms` (on a monotonic clock), not `ms`
+ * after the previous one, so late timers do not add up as they do with `setInterval` or a chain of `setTimeout`s. The callback receives
+ * the tick number `n`.
+ * - **Missed ticks are skipped, not bursted:** when a timer fires late (the event loop was blocked), the ticks whose time has passed are
+ *   not made up for: the callback runs once, with the number of the latest due tick, and then on schedule again. The ticks that come due
+ *   while the callback itself runs (longer than `ms`) are skipped too: the next run is the first tick not yet past when it returns. Gaps in
+ *   the tick numbers show how many were skipped.
+ * - **No overlap:** when the callback returns a promise, the next tick waits for it to settle, and the ticks due meanwhile are skipped.
+ * - **Errors:** an error thrown or rejected by the callback stops the interval, and is not caught: it surfaces as an unhandled rejection
+ *   (catch inside the callback to keep going).
+ * - **No leaks:** at most one timer exists at a time, none while an async callback runs, and none once stopped, so a stopped interval
+ *   never keeps a process alive. Stopping is idempotent, and works from within the callback.
+ * @param {(tick: number) => unknown} callback - Called with the tick number (`1`, `2`…, or `0` first with `immediate`)
+ * @param {number} ms - The period in milliseconds (`1` to `2^31 - 1`)
+ * @param {IntervalOptions} [options] - `signal` and `immediate` (default `false`)
+ * @returns {() => void} Stops the interval
+ * @throws {TypeError} when `callback` is not a function, `ms` is not a number, or `signal` is not a signal
+ * @throws {RangeError} when `ms` is not a number between `1` and `2^31 - 1`
+ * @example
+ * const ticks: number[] = [];
+ * const stop = interval(function (tick) { ticks.push(tick); }, 25, { immediate: true });
+ * await sleep(90); // ticks at 0, 25, 50 and 75 ms
+ * stop();
+ * ticks; // => [0, 1, 2, 3]
+ * @example
+ * // doctest: skip
+ * const controller = new AbortController();
+ * interval(async function () { await refreshDashboard(); }, 60_000, { signal: controller.signal }); // refreshes never overlap
+ */
+export function interval(callback: (tick: number) => unknown, ms: number, options: IntervalOptions = {}): () => void {
+	const signal = readOption(options, 'signal');
+	const immediate = readOption(options, 'immediate', false);
+
+	assertFunction('interval', 'callback', callback);
+	assertNumber('interval', 'ms', ms, ms >= 1 && ms <= MAX_TIMEOUT, `a number between 1 and ${MAX_TIMEOUT}`);
+	assertOptionalSignal('interval', 'signal', signal);
+
+	const start = monotonicNow();
+	let stopped = false;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	// The number of the next tick to run.
+	let next = 1;
+
+	/**
+	 * Stops the interval (idempotent).
+	 * @returns {void}
+	 */
+	function stop(): void {
+		stopped = true;
+		clearTimeout(timer);
+		timer = undefined;
+		detach(signal, stop);
+	}
+
+	/**
+	 * Arms the timer for the first tick due now or later (a tick due while the callback ran is skipped).
+	 * @returns {void}
+	 */
+	function schedule(): void {
+		if (stopped) return;
+
+		const time = monotonicNow();
+
+		next = Math.max(next, Math.ceil((time - start) / ms));
+		// At most `ms`: with a clock that went back, the wait would otherwise grow by as much.
+		timer = setTimeout(fire, Math.min(start + next * ms - time, ms));
+	}
+
+	/**
+	 * Runs one tick, then schedules the next one once the callback has settled.
+	 * @param {number} tick - The tick number
+	 * @returns {void}
+	 */
+	function run(tick: number): void {
+		next = tick + 1;
+		invoke(callback, undefined, [tick]).then(schedule, function (error: unknown) {
+			stop();
+			throw error;
+		});
+	}
+
+	/**
+	 * Timer callback: runs the latest due tick (a timer may fire a little early, never with an earlier number than scheduled).
+	 * @returns {void}
+	 */
+	function fire(): void {
+		timer = undefined;
+		run(Math.max(next, Math.floor((monotonicNow() - start) / ms)));
+	}
+
+	if (signal?.aborted) return stop;
+	// The listener first: when adding it throws, no timer is left behind. `stop` removes it.
+	signal?.addEventListener('abort', stop);
+	if (immediate) run(0);
+	else schedule();
+
+	return stop;
+}
+
+/**
+ * Options accepted by {@link createStopwatch}.
+ */
+export interface StopwatchOptions {
+	/**
+	 * Clock in milliseconds. Defaults to `performance.now()` (monotonic, sub-millisecond), or `Date.now()` where `performance` is missing.
+	 * It must return a finite number (or the operation reading it throws); a clock going back counts as no time passing. It is called
+	 * without a receiver: pass `performance.now.bind(performance)` rather than `performance.now`.
+	 */
+	now?(): number;
+}
+
+/**
+ * A stopwatch as returned by {@link createStopwatch}. Its methods do not depend on `this`.
+ */
+export interface Stopwatch {
+	/** Starts (or resumes) measuring; does nothing when already running. Returns the stopwatch. */
+	start(): Stopwatch;
+	/** Pauses measuring and returns the elapsed time; does nothing else when not running. */
+	stop(): number;
+	/** Stops and sets the elapsed time (and the lap) back to `0`. Returns the stopwatch, so `reset().start()` restarts it. */
+	reset(): Stopwatch;
+	/** Returns the time measured since the previous `lap()` (or since the first start), and starts a new lap. */
+	lap(): number;
+	/** The measured time in milliseconds, paused periods excluded; it grows while running. */
+	readonly elapsed: number;
+	/** Whether it is measuring. */
+	readonly running: boolean;
+}
+
+/**
+ * Creates a stopwatch measuring elapsed time in milliseconds on a monotonic clock (`performance.now()` by default, so changes of the
+ * system time do not affect it), with pause and resume (`stop()` / `start()`), laps and an injectable clock for tests. The measured
+ * time never decreases (an injected clock that goes back counts as no time passing), so laps are never negative.
+ * @param {StopwatchOptions} [options] - `now`, the clock
+ * @returns {Stopwatch} A stopped stopwatch at `0`
+ * @throws {TypeError} when `now` is not a function
+ * @example
+ * let clock = 0;
+ * const watch = createStopwatch({ now: function () { return clock; } }).start();
+ * clock = 150;
+ * watch.elapsed; // => 150 // live while running
+ * watch.lap(); // => 150
+ * clock = 200;
+ * watch.stop(); // => 200
+ * clock = 1000; // paused: not counted
+ * watch.start();
+ * clock = 1100;
+ * watch.lap(); // => 150 // since the previous lap
+ * watch.elapsed; // => 300
+ * watch.reset().elapsed; // => 0
+ * @example
+ * const watch = createStopwatch().start();
+ * await sleep(20);
+ * watch.stop() >= 19; // => true
+ */
+export function createStopwatch(options: StopwatchOptions = {}): Stopwatch {
+	const now = readOption(options, 'now', monotonicNow);
+
+	assertFunction('createStopwatch', 'now', now);
+
+	// The measured time, the clock when it was last added to, and the measured time at the last lap.
+	let accumulated = 0;
+	let last = 0;
+	let lapped = 0;
+	let running = false;
+
+	/**
+	 * Reads the clock.
+	 * @returns {number} The current time
+	 * @throws {TypeError} when `now()` does not return a number
+	 * @throws {RangeError} when `now()` returns `NaN` or an infinity
+	 */
+	function readClock(): number {
+		const time = now();
+		assertNumber('createStopwatch', 'now()', time, Number.isFinite(time), 'a finite number');
+		return time;
+	}
+
+	/**
+	 * Adds the time passed since the last reading, if running.
+	 * @returns {number} The elapsed milliseconds
+	 */
+	function elapsed(): number {
+		if (running) {
+			const time = readClock();
+
+			accumulated += Math.max(time - last, 0);
+			last = time;
+		}
+		return accumulated;
+	}
+
+	const stopwatch: Stopwatch = {
+		start(): Stopwatch {
+			if (!running) {
+				last = readClock();
+				running = true;
+			}
+			return stopwatch;
+		},
+		stop(): number {
+			accumulated = elapsed();
+			running = false;
+			return accumulated;
+		},
+		reset(): Stopwatch {
+			accumulated = 0;
+			lapped = 0;
+			running = false;
+			return stopwatch;
+		},
+		lap(): number {
+			const total = elapsed();
+			const split = total - lapped;
+
+			lapped = total;
+			return split;
+		},
+		get elapsed(): number {
+			return elapsed();
+		},
+		get running(): boolean {
+			return running;
+		}
+	};
+
+	return stopwatch;
 }
