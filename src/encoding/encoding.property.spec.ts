@@ -385,6 +385,19 @@ describe('Encoding helpers (property-based)', function () {
 			);
 		});
 
+		it('should read back a row without cells as one empty field, wherever it is', function () {
+			fc.assert(
+				fc.property(fc.array(fc.array(cell, { maxLength: 3 }), { maxLength: 6 }), csvOptions, function (rows, options) {
+					const text = helpers.toCsv(rows, options);
+					expect(helpers.parseCsv(text, { delimiter: options.delimiter })).toEqual(
+						rows.map(function (row) {
+							return row.length === 0 ? [''] : row;
+						})
+					);
+				})
+			);
+		});
+
 		it('should read back exactly the records it wrote', function () {
 			fc.assert(
 				fc.property(

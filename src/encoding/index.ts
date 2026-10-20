@@ -213,6 +213,16 @@ function booleanOption(caller: string, name: string, value: unknown, fallback: b
 }
 
 /**
+ * Reads an element of an array as an own property.
+ * @param {readonly unknown[]} array - The array
+ * @param {number} index - The index
+ * @returns {unknown} The element, `undefined` for a hole (never a value inherited from a polluted `Object.prototype`)
+ */
+function ownItem(array: readonly unknown[], index: number): unknown {
+	return Object.hasOwn(array, index) ? array[index] : undefined;
+}
+
+/**
  * Quotes the character at `index` of `text` (a whole code point) for an error message.
  * @param {string} text - The text
  * @param {number} index - The UTF-16 index of the character
@@ -2144,7 +2154,8 @@ const FORMULA_START = /^[\t\r]|^\s*[=+\-@＝＋－＠]/;
  *   key is an empty field. The column names are written as the first row unless `header` is `false`. With arrays, `columns` (when given)
  *   is the header row.
  * - Rows are separated by `newline` (CRLF by default), with none after the last one. A row with no cells is written as an empty line,
- *   which `parseCsv` reads as one empty field.
+ *   which `parseCsv` reads as one empty field; as the last row, it is written `""` (one empty field), since a line break ending the text
+ *   does not start a row.
  *
  * ⚠️ CSV injection: a cell such as `=HYPERLINK(...)` or `@SUM(...)` runs as a formula when the file is opened in a spreadsheet. When
  * the data comes from users and the file is meant for Excel, LibreOffice or Google Sheets, set `formulaEscape: true` (OWASP's advice),
@@ -2201,14 +2212,12 @@ export function toCsv(rows: ReadonlyArray<unknown>, options?: ToCsvOptions): str
 		throw new RangeError(`toCsv: \`newline\` must be '\\r\\n' or '\\n', got ${typeof newline === 'string' ? JSON.stringify(newline) : show(newline)}`);
 	if (quote !== 'needed' && quote !== 'all') throw new RangeError(`toCsv: \`quote\` must be 'needed' or 'all', got ${show(quote)}`);
 	if (columns !== undefined) {
-		const bad = Array.isArray(columns)
-			? columns.findIndex(function (name: unknown): boolean {
-					return typeof name !== 'string';
-				})
-			: -2;
+		// Every index, holes included: `findIndex` would read a hole from a (possibly polluted) `Object.prototype`.
+		let bad = Array.isArray(columns) ? -1 : -2;
+		for (let i = 0; bad === -1 && i < (columns as unknown[]).length; i++) if (typeof ownItem(columns as unknown[], i) !== 'string') bad = i;
 		if (bad !== -1) {
 			throw new TypeError(
-				`toCsv: \`columns\` must be an array of strings, got ${bad === -2 ? describe(columns) : `${describe((columns as unknown[])[bad])} at index ${bad}`}`
+				`toCsv: \`columns\` must be an array of strings, got ${bad === -2 ? describe(columns) : `${describe(ownItem(columns as unknown[], bad))} at index ${bad}`}`
 			);
 		}
 	}
@@ -2218,11 +2227,15 @@ export function toCsv(rows: ReadonlyArray<unknown>, options?: ToCsvOptions): str
 	const quoteAll = quote === 'all' || formulaEscape;
 	if (!Array.isArray(rows)) throw new TypeError(`toCsv: \`rows\` must be an array, got ${describe(rows)}`);
 
-	const records = rows.length > 0 ? !Array.isArray(rows[0]) : false;
+	// Rows are read as own elements: a hole is an invalid (`undefined`) row, never a row planted on a polluted `Object.prototype`.
+	const records = rows.length > 0 ? !Array.isArray(ownItem(rows, 0)) : false;
 	let names = columns as string[] | undefined;
 	if (records && names === undefined) {
 		const keys = new Set<string>();
-		for (const row of rows) if (typeof row === 'object' && row !== null) for (const key of Object.keys(row)) keys.add(key);
+		for (let index = 0; index < rows.length; index++) {
+			const row = ownItem(rows, index);
+			if (typeof row === 'object' && row !== null) for (const key of Object.keys(row)) keys.add(key);
+		}
 		names = [...keys];
 	}
 
@@ -2271,7 +2284,7 @@ export function toCsv(rows: ReadonlyArray<unknown>, options?: ToCsvOptions): str
 	const lines: string[] = [];
 	if (names !== undefined && header) lines.push(line(names, -1));
 	for (let index = 0; index < rows.length; index++) {
-		const row = rows[index] as Readonly<Record<string, unknown>> | ReadonlyArray<unknown>;
+		const row = ownItem(rows, index) as Readonly<Record<string, unknown>> | ReadonlyArray<unknown>;
 		const isArray = Array.isArray(row);
 		if (records ? isArray || typeof row !== 'object' || row === null : !isArray) {
 			throw new TypeError(
@@ -2285,6 +2298,9 @@ export function toCsv(rows: ReadonlyArray<unknown>, options?: ToCsvOptions): str
 			: (row as ReadonlyArray<unknown>);
 		lines.push(line(cells, index));
 	}
+	// A line break ending the text does not start another row in `parseCsv` (nor, by RFC 4180, anywhere): a last row without cells, an
+	// empty line there, would be lost. It is written as one empty field instead, which is how `parseCsv` reads an empty line elsewhere.
+	if (lines.length > 0 && lines[lines.length - 1] === '') lines[lines.length - 1] = '""';
 	// With the delimiter U+FEFF, a text starting with an empty field would start with the delimiter, which `parseCsv` (and spreadsheets)
 	// would drop as a byte order mark, losing the field: it is quoted instead. (A field starting with U+FEFF is already quoted.)
 	if (lines.length > 0 && lines[0].charCodeAt(0) === 0xfeff) lines[0] = `""${lines[0]}`;

@@ -1458,7 +1458,7 @@ describe('toCsv', function () {
 	});
 
 	it('should keep rows that would otherwise read back differently', function () {
-		expect(helpers.toCsv([[''], [null], ['', ''], []])).toBe('""\r\n""\r\n,\r\n');
+		expect(helpers.toCsv([[''], [null], ['', ''], []])).toBe('""\r\n""\r\n,\r\n""');
 		expect(helpers.toCsv([['﻿a', 'b﻿']])).toBe('"﻿a",b﻿');
 	});
 
@@ -1495,7 +1495,7 @@ describe('toCsv', function () {
 		expect(helpers.toCsv([cells], { formulaEscape: true })).toBe(`"'=1+2","'+1","'-1","'@SUM(A1)","'\tx","'\rx","a=b","' =x","","'=x"`);
 		expect(helpers.toCsv([[-1, -1n, '-1', true, null]], { formulaEscape: true })).toBe(`"-1","-1","'-1","true",""`);
 		expect(helpers.toCsv([{ '=a': '=b' }], { formulaEscape: true })).toBe(`"'=a"\r\n"'=b"`);
-		expect(helpers.toCsv([[''], []], { formulaEscape: true })).toBe('""\r\n');
+		expect(helpers.toCsv([[''], []], { formulaEscape: true })).toBe('""\r\n""');
 		expect(helpers.toCsv([cells])).toBe('=1+2,+1,-1,@SUM(A1),\tx,"\rx",a=b, =x,,\'=x');
 	});
 
@@ -1563,6 +1563,43 @@ describe('toCsv', function () {
 			expect(helpers.toCsv([['a', , 'b']])).toBe('a,,b');
 		} finally {
 			delete (Array.prototype as unknown as Record<number, unknown>)[1];
+		}
+	});
+
+	it('should write a last row without cells as one empty field, which a final line break would lose (regression)', function () {
+		// Regression: the row was written as an empty line, so the text ended with a line break, which `parseCsv` reads as the end of the
+		// previous row: the row was lost.
+		expect(helpers.toCsv([['a'], []])).toBe('a\r\n""');
+		expect(helpers.parseCsv(helpers.toCsv([['a'], []]))).toEqual([['a'], ['']]);
+		expect(helpers.toCsv([[]])).toBe('""');
+		expect(helpers.parseCsv(helpers.toCsv([[], []], { newline: '\n' }))).toEqual([[''], ['']]);
+		expect(helpers.toCsv([], { columns: [] })).toBe('""');
+		// An empty line elsewhere still reads back as one empty field.
+		expect(helpers.toCsv([['a'], [], ['b']])).toBe('a\r\n\r\nb');
+	});
+
+	it('should read only own rows and column names, never ones planted on a polluted Object.prototype (regression)', function () {
+		// oxlint-disable-next-line no-sparse-arrays
+		const sparse = [['a'], , ['b']] as string[][];
+		// oxlint-disable-next-line no-sparse-arrays
+		const columns = ['a', , 'c'] as string[];
+		const proto = Object.prototype as Record<number, unknown>;
+		proto[0] = { planted: 'yes' };
+		proto[1] = ['planted'];
+		try {
+			expect(function () {
+				helpers.toCsv(sparse);
+			}).toThrow(new TypeError('toCsv: `rows[1]` must be an array like the first row, got undefined'));
+			expect(function () {
+				// oxlint-disable-next-line no-sparse-arrays
+				helpers.toCsv([, { a: 1 }] as never);
+			}).toThrow(new TypeError('toCsv: `rows[0]` must be a record (a non-array object) like the first row, got undefined'));
+			expect(function () {
+				helpers.toCsv([{ a: 1 }], { columns: columns as never });
+			}).toThrow(new TypeError('toCsv: `columns` must be an array of strings, got undefined at index 1'));
+		} finally {
+			delete proto[0];
+			delete proto[1];
 		}
 	});
 
