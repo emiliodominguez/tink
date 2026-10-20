@@ -194,12 +194,12 @@ function fromState(seedState: SeededRandomState): SeededRandom {
 		return Object.freeze([a >>> 0, b >>> 0, c >>> 0, d >>> 0] as const);
 	};
 	rng.restore = function restore(snapshot: SeededRandomState): void {
-		// An index loop (not `every`, which skips holes) so sparse arrays are rejected too. Each word is read once: what is validated is
-		// what is installed, and a getter that throws leaves the state unchanged.
+		// An index loop (not `every`, which skips holes) so sparse arrays are rejected too, also when a polluted `Object.prototype` would
+		// fill a hole in. Each word is read once: what is validated is what is installed, and a getter that throws leaves the state unchanged.
 		const words: number[] = [];
 		let valid = Array.isArray(snapshot) && snapshot.length === 4;
 		for (let i = 0; valid && i < 4; i++) {
-			const word: unknown = snapshot[i];
+			const word: unknown = Object.hasOwn(snapshot, i) ? snapshot[i] : undefined;
 			valid = Number.isInteger(word) && (word as number) >= 0 && (word as number) < UINT32_RANGE;
 			words.push(word as number);
 		}
@@ -922,11 +922,12 @@ export function weightedRandom<T>(items: ReadonlyArray<T>, weights: ReadonlyArra
 	let largest = 0;
 	// Index of the last positive weight: there is one once the total weight is known to be positive.
 	let lastPositive = 0;
-	// Each weight is read once: the selection uses the validated values (a getter cannot turn a zero weight into a chosen one).
+	// Each weight is read once: the selection uses the validated values (a getter cannot turn a zero weight into a chosen one). A hole is
+	// `undefined` (rejected), not a weight planted on a polluted `Object.prototype`.
 	const values: number[] = [];
 	for (let i = 0; i < weights.length; i++) {
-		const weight = weights[i];
-		values.push(weight);
+		const weight = Object.hasOwn(weights, i) ? weights[i] : undefined;
+		values.push(weight as number);
 		if (!(typeof weight === 'number' && weight >= 0 && weight < Infinity)) assertNumber('weightedRandom', `weights[${i}]`, weight, false, 'a finite number >= 0');
 		total += weight;
 		if (weight > largest) largest = weight;

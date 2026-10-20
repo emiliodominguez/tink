@@ -1474,6 +1474,22 @@ describe('Time-ordered ids (polluted Object.prototype)', function () {
 		}).toThrow(new TypeError('createUlid: `options` must be an object, got function'));
 	});
 
+	it('should reject holes of weights and snapshots instead of reading them from Object.prototype (regression)', function () {
+		polluted({ 0: 1e9 }, function () {
+			expect(function () {
+				// oxlint-disable-next-line no-sparse-arrays
+				helpers.weightedRandom(['a', 'b'], [, 1] as number[]);
+			}).toThrow(new TypeError('weightedRandom: `weights[0]` must be a finite number >= 0, got undefined'));
+			const rng = helpers.createRandom('restore');
+			const before = rng.state();
+			expect(function () {
+				// oxlint-disable-next-line no-sparse-arrays
+				rng.restore([, 1, 2, 3] as never);
+			}).toThrow(TypeError);
+			expect(rng.state()).toEqual(before);
+		});
+	});
+
 	it('should return random bytes over their own (non-shared) ArrayBuffer', function () {
 		const bytes = helpers.randomBytes(4);
 		expect(Object.prototype.toString.call(bytes.buffer)).toBe('[object ArrayBuffer]');
