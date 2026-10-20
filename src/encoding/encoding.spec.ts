@@ -1,5 +1,6 @@
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { runInNewContext } from 'node:vm';
+import { crc32 } from 'node:zlib';
 import * as helpers from '.';
 
 /**
@@ -1562,5 +1563,592 @@ describe('toCsv', function () {
 			delete proto.delimiter;
 			delete proto.header;
 		}
+	});
+});
+
+describe('hmacSha256 / hmacSha256Hex', function () {
+	/** The reference: Node's HMAC. */
+	function nodeHmac(key: string | Uint8Array, message: string | Uint8Array): string {
+		return createHmac('sha256', key).update(message).digest('hex');
+	}
+
+	it('should compute the RFC 4231 test vectors', function () {
+		function hex(digits: string): Uint8Array {
+			return new Uint8Array(Buffer.from(digits, 'hex'));
+		}
+		const cases: [Uint8Array | string, Uint8Array | string, string][] = [
+			[new Uint8Array(20).fill(0x0b), 'Hi There', 'b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7'],
+			['Jefe', 'what do ya want for nothing?', '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843'],
+			[new Uint8Array(20).fill(0xaa), new Uint8Array(50).fill(0xdd), '773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe'],
+			[hex('0102030405060708090a0b0c0d0e0f10111213141516171819'), new Uint8Array(50).fill(0xcd), '82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b'],
+			[new Uint8Array(131).fill(0xaa), 'Test Using Larger Than Block-Size Key - Hash Key First', '60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54'],
+			[
+				new Uint8Array(131).fill(0xaa),
+				'This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.',
+				'9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2'
+			]
+		];
+		for (const [key, message, expected] of cases) {
+			expect(helpers.hmacSha256Hex(key, message)).toBe(expected);
+			expect(helpers.hmacSha256(key, message)).toEqual(hex(expected));
+		}
+		// Test case 5 is truncated to 128 bits.
+		expect(helpers.hmacSha256Hex(new Uint8Array(20).fill(0x0c), 'Test With Truncation').slice(0, 32)).toBe('a3b6167473100ee06e0c796c2955552b');
+	});
+
+	it('should match node:crypto around the key-block and message-padding boundaries', function () {
+		for (const keyLength of [0, 1, 31, 32, 63, 64, 65, 128, 129, 200]) {
+			const key = new Uint8Array(keyLength);
+			for (let i = 0; i < keyLength; i++) key[i] = (i * 37 + keyLength) % 256;
+			for (let length = 0; length <= 140; length++) {
+				const message = new Uint8Array(length);
+				for (let i = 0; i < length; i++) message[i] = (i * 151 + length) % 256;
+				expect(helpers.hmacSha256Hex(key, message)).toBe(nodeHmac(key, message));
+			}
+		}
+	});
+
+	it('should write message lengths past 2 MiB into the padding (all four low bytes of the bit count)', function () {
+		const message = new Uint8Array(3 * 1024 * 1024 + 5).fill(0x61);
+		expect(helpers.hmacSha256Hex('k', message)).toBe(nodeHmac('k', message));
+		expect(helpers.sha256Hex(message)).toBe(createHash('sha256').update(message).digest('hex'));
+	});
+
+	it('should hash a key longer than a block first, and zero-pad a shorter one', function () {
+		const long = new Uint8Array(65).fill(7);
+		expect(helpers.hmacSha256Hex(long, 'm')).toBe(helpers.hmacSha256Hex(helpers.sha256(long), 'm'));
+		expect(helpers.hmacSha256Hex(new Uint8Array(64).fill(7), 'm')).not.toBe(helpers.hmacSha256Hex(helpers.sha256(new Uint8Array(64).fill(7)), 'm'));
+		expect(helpers.hmacSha256Hex('k', 'm')).toBe(helpers.hmacSha256Hex(new Uint8Array([107, 0, 0]), 'm'));
+	});
+
+	it('should take strings as UTF-8 (lone surrogates as U+FFFD) and any binary data', function () {
+		for (const value of ['é', '😀', '\uD800', 'key with spaces']) {
+			expect(helpers.hmacSha256Hex(value, value)).toBe(createHmac('sha256', Buffer.from(value, 'utf8')).update(value, 'utf8').digest('hex'));
+		}
+		const buffer = new Uint8Array([1, 2, 3, 4, 5]).buffer;
+		expect(helpers.hmacSha256Hex(new DataView(buffer, 1, 3), new Uint16Array(buffer, 0, 2))).toBe(nodeHmac(new Uint8Array([2, 3, 4]), new Uint8Array([1, 2, 3, 4])));
+		expect(helpers.hmacSha256Hex(buffer, new Uint8Array(new SharedArrayBuffer(3)))).toBe(nodeHmac(new Uint8Array(buffer), new Uint8Array(3)));
+	});
+
+	it('should return 32 fresh bytes over their own buffer and leave the inputs alone', function () {
+		const key = new Uint8Array(80).fill(1);
+		const message = new Uint8Array(100).fill(2);
+		const mac = helpers.hmacSha256(key, message);
+		expect(mac.length).toBe(32);
+		expect(mac.byteLength).toBe(mac.buffer.byteLength);
+		expect(key).toEqual(new Uint8Array(80).fill(1));
+		expect(message).toEqual(new Uint8Array(100).fill(2));
+		mac[0] ^= 1;
+		expect(helpers.hmacSha256(key, message)[0]).toBe(mac[0] ^ 1);
+	});
+
+	it('should reject anything but strings and binary data, naming the parameter', function () {
+		expect(function () {
+			helpers.hmacSha256(1 as never, 'm');
+		}).toThrow(new TypeError('hmacSha256: `key` must be a string, an ArrayBuffer or an ArrayBuffer view, got number'));
+		expect(function () {
+			helpers.hmacSha256Hex('k', null as never);
+		}).toThrow(new TypeError('hmacSha256: `message` must be a string, an ArrayBuffer or an ArrayBuffer view, got null'));
+	});
+});
+
+describe('crc32', function () {
+	it('should compute the standard check value and known checksums', function () {
+		expect(helpers.crc32('123456789')).toBe(0xcbf43926);
+		expect(helpers.crc32('')).toBe(0);
+		expect(helpers.crc32(new Uint8Array([0]))).toBe(0xd202ef8d);
+		expect(helpers.crc32(new Uint8Array(32).fill(0xff))).toBe(0xff6cab0b);
+		expect(helpers.crc32('The quick brown fox jumps over the lazy dog')).toBe(0x414fa339);
+	});
+
+	it('should match node:zlib for every tail length and many initial values', function () {
+		for (let length = 0; length <= 70; length++) {
+			const data = new Uint8Array(length);
+			for (let i = 0; i < length; i++) data[i] = (i * 151 + length) % 256;
+			for (const initial of [0, 1, 0x7fffffff, 0x80000000, 0xcbf43926, 0xffffffff]) {
+				expect(helpers.crc32(data, initial)).toBe(crc32(data, initial));
+			}
+		}
+	});
+
+	it('should continue a checksum, chunk by chunk', function () {
+		const sentence = 'The quick brown fox jumps over the lazy dog';
+		for (let cut = 0; cut <= sentence.length; cut++) {
+			expect(helpers.crc32(sentence.slice(cut), helpers.crc32(sentence.slice(0, cut)))).toBe(helpers.crc32(sentence));
+		}
+		expect(helpers.crc32('', 0xdeadbeef)).toBe(0xdeadbeef);
+	});
+
+	it('should take strings as UTF-8 and any binary data', function () {
+		expect(helpers.crc32('é😀\uD800')).toBe(crc32(Buffer.from('é😀\uD800', 'utf8')));
+		const buffer = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]).buffer;
+		expect(helpers.crc32(new DataView(buffer, 1, 9))).toBe(crc32(new Uint8Array(buffer, 1, 9)));
+		expect(helpers.crc32(new Uint32Array(buffer, 4, 1))).toBe(crc32(new Uint8Array([5, 6, 7, 8])));
+		expect(helpers.crc32(buffer)).toBe(crc32(new Uint8Array(buffer)));
+	});
+
+	it('should reject an invalid initial value or data', function () {
+		for (const initial of [-1, 2 ** 32, 1.5, NaN, Infinity]) {
+			expect(function () {
+				helpers.crc32('x', initial);
+			}).toThrow(new RangeError(`crc32: \`initial\` must be an integer between 0 and 4294967295, got ${initial}`));
+		}
+		expect(function () {
+			helpers.crc32('x', '1' as never);
+		}).toThrow(new TypeError('crc32: `initial` must be an integer between 0 and 4294967295, got string'));
+		expect(function () {
+			helpers.crc32([1, 2] as never);
+		}).toThrow(new TypeError('crc32: `data` must be a string, an ArrayBuffer or an ArrayBuffer view, got object'));
+		expect(helpers.crc32('x', undefined)).toBe(helpers.crc32('x'));
+	});
+});
+
+describe('signJwt / verifyJwt', function () {
+	const SECRET = 'a-string-secret-at-least-256-bits-long';
+	const NOW = 1_700_000_000_000;
+
+	/** Builds a token from JSON texts, signed with the HMAC of node:crypto (or with the given signature). */
+	function token(header: string, payload: string, secret: string | Uint8Array = SECRET, signature?: string): string {
+		const input = `${Buffer.from(header).toString('base64url')}.${Buffer.from(payload).toString('base64url')}`;
+		return `${input}.${signature ?? createHmac('sha256', secret).update(input).digest('base64url')}`;
+	}
+
+	/** The error `fn` throws. */
+	function thrown(fn: () => unknown): Error {
+		try {
+			fn();
+		} catch (error) {
+			return error as Error;
+		}
+		throw new Error('did not throw');
+	}
+
+	/** Expects `verifyJwt(input, secret, options)` to throw a JwtVerificationError with this code and message. */
+	function rejects(input: string, code: helpers.JwtVerificationErrorCode, message: string, options?: helpers.VerifyJwtOptions, secret: string = SECRET): void {
+		const error = thrown(function () {
+			helpers.verifyJwt(input, secret, options);
+		});
+		expect(error).toBeInstanceOf(helpers.JwtVerificationError);
+		expect(error).toEqual(expect.objectContaining({ name: 'JwtVerificationError', code, message: `verifyJwt: ${message}` }));
+	}
+
+	const HS256 = '{"alg":"HS256","typ":"JWT"}';
+
+	/** Runs `fn` with `values` defined on `Object.prototype` (as a prototype-pollution attack would), removing them afterwards. */
+	function polluted(values: Record<string, unknown>, fn: () => void): void {
+		for (const [key, value] of Object.entries(values)) Object.defineProperty(Object.prototype, key, { value, configurable: true, writable: true });
+		try {
+			fn();
+		} finally {
+			for (const key of Object.keys(values)) delete (Object.prototype as Record<string, unknown>)[key];
+		}
+	}
+
+	describe('signJwt', function () {
+		it('should sign the jwt.io example exactly', function () {
+			expect(helpers.signJwt({ sub: '1234567890', name: 'John Doe', iat: 1516239022 }, 'your-256-bit-secret')).toBe(
+				'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c'
+			);
+		});
+
+		it('should write the header and claims as JSON, signed with the HMAC of node:crypto', function () {
+			const signed = helpers.signJwt({ sub: 'ada', name: 'Zoë 😀', nested: { a: [1, null] }, skip: undefined }, SECRET, { now: NOW, expiresIn: 60, notBefore: -5 });
+			expect(signed).toBe(token(HS256, '{"sub":"ada","name":"Zoë 😀","nested":{"a":[1,null]},"iat":1700000000,"nbf":1699999995,"exp":1700000060}'));
+		});
+
+		it('should add iat from now (a Date, a number, or Date.now()), in whole seconds, unless present or disabled', function () {
+			expect(helpers.decodeJwt(helpers.signJwt({}, SECRET, { now: new Date(NOW + 999) })).payload).toEqual({ iat: 1700000000 });
+			expect(helpers.decodeJwt(helpers.signJwt({}, SECRET, { now: -1500 })).payload).toEqual({ iat: -2 });
+			jest.spyOn(Date, 'now').mockReturnValue(NOW + 1000);
+			expect(helpers.decodeJwt(helpers.signJwt({ a: 1 }, SECRET)).payload).toEqual({ a: 1, iat: 1700000001 });
+			expect(helpers.decodeJwt(helpers.signJwt({ iat: 5 }, SECRET)).payload).toEqual({ iat: 5 });
+			expect(helpers.decodeJwt(helpers.signJwt({ iat: undefined }, SECRET)).payload).toEqual({ iat: 1700000001 });
+			expect(helpers.decodeJwt(helpers.signJwt({ a: 1 }, SECRET, { timestamp: false, expiresIn: 1.5 })).payload).toEqual({ a: 1, exp: 1700000002.5 });
+			expect(helpers.decodeJwt(helpers.signJwt({ a: 1 }, SECRET, { timestamp: true })).payload).toEqual({ a: 1, iat: 1700000001 });
+		});
+
+		it('should refuse expiresIn or notBefore when the payload has that claim', function () {
+			expect(function () {
+				helpers.signJwt({ exp: 1 }, SECRET, { expiresIn: 60 });
+			}).toThrow(new TypeError('signJwt: `expiresIn` must be left out when `payload` has an `exp` claim'));
+			expect(function () {
+				helpers.signJwt({ nbf: 1 }, SECRET, { notBefore: 0 });
+			}).toThrow(new TypeError('signJwt: `notBefore` must be left out when `payload` has an `nbf` claim'));
+			expect(helpers.decodeJwt(helpers.signJwt({ exp: 1, nbf: 2 }, SECRET, { now: NOW })).payload).toEqual({ exp: 1, nbf: 2, iat: 1700000000 });
+		});
+
+		it('should add extra header parameters after alg and typ, which can be replaced or removed, but never alg', function () {
+			expect(helpers.decodeJwt(helpers.signJwt({}, SECRET, { header: { kid: 'k1', typ: 'at+jwt', alg: 'HS256' } })).header).toEqual({
+				alg: 'HS256',
+				typ: 'at+jwt',
+				kid: 'k1'
+			});
+			const untyped = helpers.signJwt({}, SECRET, { header: { typ: undefined }, timestamp: false });
+			expect(untyped).toBe(token('{"alg":"HS256"}', '{}'));
+			expect(helpers.signJwt({ 1: 'one', a: 'b' }, SECRET, { header: { 2: 'two' }, timestamp: false })).toBe(
+				token('{"2":"two","alg":"HS256","typ":"JWT"}', '{"1":"one","a":"b"}')
+			);
+			for (const alg of ['none', 'RS256', 'hs256', undefined, 1]) {
+				expect(function () {
+					helpers.signJwt({}, SECRET, { header: { alg } as never });
+				}).toThrow(new RangeError(`signJwt: \`header.alg\` must be 'HS256' (the only algorithm signJwt supports), got ${String(alg)}`));
+			}
+		});
+
+		it('should refuse a crit header parameter, which verifyJwt would reject', function () {
+			for (const crit of [[], ['exp'], 'b64', null]) {
+				expect(function () {
+					helpers.signJwt({}, SECRET, { header: { crit } });
+				}).toThrow(new RangeError('signJwt: `header` must not have a `crit` parameter (no extension is supported)'));
+			}
+			// An undefined parameter is not written (as with `typ: undefined`), so the token stays verifiable.
+			const signed = helpers.signJwt({ sub: 'a' }, SECRET, { header: { crit: undefined } });
+			expect(helpers.verifyJwt(signed, SECRET).header).toEqual({ alg: 'HS256', typ: 'JWT' });
+		});
+
+		it('should copy only own enumerable properties, ignoring a polluted Object.prototype', function () {
+			polluted({ exp: 1, iat: 2, nbf: 3, alg: 'none', typ: 'x', crit: ['exp'], expiresIn: -1000, timestamp: false }, function () {
+				const payload = Object.create({ inherited: true }) as Record<string, unknown>;
+				payload.own = 1;
+				Object.defineProperty(payload, 'hidden', { value: 2, enumerable: false });
+				expect(helpers.signJwt(payload, SECRET, { now: NOW })).toBe(token(HS256, '{"own":1,"iat":1700000000}'));
+				expect(helpers.signJwt({}, SECRET, { now: NOW, expiresIn: 1, notBefore: 0 })).toBe(token(HS256, '{"iat":1700000000,"nbf":1700000000,"exp":1700000001}'));
+			});
+			// A polluted toJSON would replace the claims: refused rather than signed.
+			polluted({ toJSON: function () {} }, function () {
+				expect(function () {
+					helpers.signJwt({}, SECRET);
+				}).toThrow(new TypeError('signJwt: `header` must not have a toJSON method, which would replace it'));
+				// Even for null-prototype arguments: their plain-object copies would inherit it.
+				expect(function () {
+					helpers.signJwt(Object.create(null) as object, SECRET, { header: Object.create(null) as Record<string, unknown> });
+				}).toThrow(new TypeError('signJwt: `header` must not have a toJSON method, which would replace it'));
+			});
+			// An own __proto__ key is copied as a plain key (which decodeJwt and verifyJwt drop), not as the prototype of the copy.
+			const proto = JSON.parse('{"__proto__":{"admin":true},"a":1}') as object;
+			expect(helpers.signJwt(proto, SECRET, { timestamp: false })).toBe(token(HS256, '{"__proto__":{"admin":true},"a":1}'));
+		});
+
+		it('should write values with JSON.stringify, and throw for what it cannot write', function () {
+			expect(helpers.decodeJwt(helpers.signJwt({ at: new Date(0), fn: function () {} }, SECRET, { timestamp: false })).payload).toEqual({
+				at: '1970-01-01T00:00:00.000Z'
+			});
+			expect(function () {
+				helpers.signJwt({ big: 1n }, SECRET);
+			}).toThrow(TypeError);
+			const cyclic: Record<string, unknown> = {};
+			cyclic.self = cyclic;
+			expect(function () {
+				helpers.signJwt(cyclic, SECRET);
+			}).toThrow(TypeError);
+		});
+
+		it('should validate its arguments', function () {
+			for (const [payload, got] of [
+				[null, 'null'],
+				[[1], 'array'],
+				['{}', 'string'],
+				[undefined, 'undefined']
+			] as const) {
+				expect(function () {
+					helpers.signJwt(payload as never, SECRET);
+				}).toThrow(new TypeError(`signJwt: \`payload\` must be an object, got ${got}`));
+			}
+			expect(function () {
+				helpers.signJwt({ toJSON: function () {} }, SECRET);
+			}).toThrow(new TypeError('signJwt: `payload` must not have a toJSON method, which would replace it'));
+			expect(function () {
+				helpers.signJwt({}, SECRET, { header: { toJSON: function () {} } });
+			}).toThrow(new TypeError('signJwt: `header` must not have a toJSON method, which would replace it'));
+			expect(helpers.signJwt({ toJSON: 'not a method' }, SECRET, { timestamp: false })).toBe(token(HS256, '{"toJSON":"not a method"}'));
+			// An inherited toJSON (a class's, a Date's) would replace the object in JSON.stringify just as well: refused, not dropped.
+			class Claims {
+				sub = 'own';
+
+				/** Replaces the claims in JSON. */
+				toJSON(): object {
+					return { sub: 'replaced' };
+				}
+			}
+			for (const payload of [new Claims(), new Date(0)]) {
+				expect(function () {
+					helpers.signJwt(payload, SECRET);
+				}).toThrow(new TypeError('signJwt: `payload` must not have a toJSON method, which would replace it'));
+			}
+			for (const [header, got] of [
+				[null, 'null'],
+				[[], 'array'],
+				['kid', 'string']
+			] as const) {
+				expect(function () {
+					helpers.signJwt({}, SECRET, { header: header as never });
+				}).toThrow(new TypeError(`signJwt: \`header\` must be an object, got ${got}`));
+			}
+			expect(function () {
+				helpers.signJwt({}, '');
+			}).toThrow(new RangeError('signJwt: `secret` must not be empty, got 0 bytes'));
+			expect(function () {
+				helpers.signJwt({}, new ArrayBuffer(0));
+			}).toThrow(new RangeError('signJwt: `secret` must not be empty, got 0 bytes'));
+			expect(function () {
+				helpers.signJwt({}, 5 as never);
+			}).toThrow(new TypeError('signJwt: `secret` must be a string, an ArrayBuffer or an ArrayBuffer view, got number'));
+			expect(function () {
+				helpers.signJwt({}, SECRET, 'x' as never);
+			}).toThrow(new TypeError('signJwt: `options` must be an object, got string'));
+			expect(function () {
+				helpers.signJwt({}, SECRET, { timestamp: 1 as never });
+			}).toThrow(new TypeError('signJwt: `timestamp` must be a boolean, got number'));
+			expect(function () {
+				helpers.signJwt({}, SECRET, { now: new Date(NaN) });
+			}).toThrow(new RangeError('signJwt: `now` must be a valid Date or a finite number of milliseconds, got NaN'));
+			for (const name of ['expiresIn', 'notBefore']) {
+				expect(function () {
+					helpers.signJwt({}, SECRET, { [name]: Infinity } as never);
+				}).toThrow(new RangeError(`signJwt: \`${name}\` must be a finite number of seconds, got Infinity`));
+				expect(function () {
+					helpers.signJwt({}, SECRET, { [name]: '60' } as never);
+				}).toThrow(new TypeError(`signJwt: \`${name}\` must be a finite number of seconds, got string`));
+			}
+		});
+
+		it('should sign with binary secrets', function () {
+			const secret = new Uint8Array(32).fill(9);
+			expect(helpers.signJwt({}, secret, { timestamp: false })).toBe(token(HS256, '{}', secret));
+			expect(helpers.signJwt({}, secret.buffer, { timestamp: false })).toBe(token(HS256, '{}', secret));
+		});
+	});
+
+	describe('verifyJwt', function () {
+		const VALID = token(HS256, '{"sub":"ada","iss":"https://issuer.example","aud":["api","admin"],"iat":1700000000,"nbf":1700000000,"exp":1700000060}');
+
+		it('should return the header and the payload of an authentic token', function () {
+			const verified = helpers.verifyJwt(VALID, SECRET, { now: NOW });
+			expect(verified).toEqual({
+				header: { alg: 'HS256', typ: 'JWT' },
+				payload: { sub: 'ada', iss: 'https://issuer.example', aud: ['api', 'admin'], iat: 1700000000, nbf: 1700000000, exp: 1700000060 }
+			});
+			expect(Object.keys(verified)).toEqual(['header', 'payload']);
+			expect(helpers.verifyJwt(token('{"alg":"HS256"}', '{}'), SECRET)).toEqual({ header: { alg: 'HS256' }, payload: {} });
+			const secret = new Uint8Array([1, 2, 3]);
+			expect(helpers.verifyJwt(token('{"alg":"HS256"}', '{"a":1}', secret), new DataView(secret.buffer)).payload).toEqual({ a: 1 });
+		});
+
+		it('should verify what signJwt signs', function () {
+			const signed = helpers.signJwt({ sub: 'ada', roles: ['x'] }, SECRET, { now: NOW, expiresIn: 60, header: { kid: 'k' } });
+			expect(helpers.verifyJwt<{ sub: string; roles: string[] }>(signed, SECRET, { now: NOW + 59_999 }).payload.roles).toEqual(['x']);
+		});
+
+		it('should reject every algorithm but HS256, before the signature (alg none and algorithm confusion)', function () {
+			const unsigned = `${Buffer.from('{"alg":"none"}').toString('base64url')}.${Buffer.from('{"admin":true}').toString('base64url')}.`;
+			rejects(unsigned, 'invalid_algorithm', "the `alg` header parameter of `token` must be 'HS256'");
+			for (const header of ['{"alg":"none"}', '{"alg":"RS256"}', '{"alg":"hs256"}', '{"alg":"HS256 "}', '{"alg":["HS256"]}', '{"typ":"JWT"}', '{"alg":"HS384"}']) {
+				// Correctly HMAC-signed with the secret, yet rejected: the header must say HS256.
+				rejects(token(header, '{}'), 'invalid_algorithm', "the `alg` header parameter of `token` must be 'HS256'");
+			}
+			polluted({ alg: 'HS256' }, function () {
+				rejects(token('{}', '{}'), 'invalid_algorithm', "the `alg` header parameter of `token` must be 'HS256'");
+			});
+		});
+
+		it('should reject a crit header, and check typ only when asked', function () {
+			rejects(
+				token('{"alg":"HS256","crit":["b64"],"b64":false}', '{}'),
+				'invalid_header',
+				'the header of `token` must not have a `crit` parameter (no extension is supported)'
+			);
+			for (const typ of ['JWT', 'jwt', 'application/JWT', 'Application/jwt']) {
+				expect(helpers.verifyJwt(token(`{"alg":"HS256","typ":"${typ}"}`, '{}'), SECRET, { typ: 'jwt' }).header.typ).toBe(typ);
+				expect(helpers.verifyJwt(token('{"alg":"HS256","typ":"jwt"}', '{}'), SECRET, { typ }).header.typ).toBe('jwt');
+			}
+			for (const header of ['{"alg":"HS256"}', '{"alg":"HS256","typ":"at+jwt"}', '{"alg":"HS256","typ":1}', '{"alg":"HS256","typ":"application/"}']) {
+				rejects(token(header, '{}'), 'invalid_header', 'the `typ` header parameter of `token` must be "JWT"', { typ: 'JWT' });
+			}
+			expect(helpers.verifyJwt(token('{"alg":"HS256","typ":"anything"}', '{}'), SECRET).header.typ).toBe('anything');
+		});
+
+		it('should reject a token not signed with the secret', function () {
+			const message = 'the signature of `token` must match `secret`';
+			rejects(VALID, 'invalid_signature', message, { now: NOW }, 'another secret');
+			const [header, payload, signature] = VALID.split('.');
+			const forged = Buffer.from('{"sub":"admin","iat":1700000000,"exp":1700000060}').toString('base64url');
+			rejects(`${header}.${forged}.${signature}`, 'invalid_signature', message, { now: NOW });
+			rejects(`${header}.${payload}.`, 'invalid_signature', message, { now: NOW });
+			rejects(`${header}.${payload}.${Buffer.from(Buffer.from(signature, 'base64url').subarray(0, 31)).toString('base64url')}`, 'invalid_signature', message, {
+				now: NOW
+			});
+			rejects(`${header}.${payload}.${signature}AAAA`, 'invalid_signature', message, { now: NOW });
+			const flipped = Buffer.from(signature, 'base64url');
+			flipped[31] ^= 1;
+			rejects(`${header}.${payload}.${flipped.toString('base64url')}`, 'invalid_signature', message, { now: NOW });
+		});
+
+		it('should reject malformed tokens as strictly as decodeJwt, without quoting them', function () {
+			const [header, payload, signature] = VALID.split('.');
+			const cases: [string, string][] = [
+				['', '`token` must have 3 parts separated by dots, got 1'],
+				[`${header}.${payload}`, '`token` must have 3 parts separated by dots, got 2'],
+				[`${VALID}.x`, '`token` must have 3 parts separated by dots, got 4'],
+				[`${header}=.${payload}.${signature}`, 'the header of `token` must be base64url text without padding'],
+				[`${header}.${payload}.${signature}=`, 'the signature of `token` must be base64url text without padding'],
+				[`${header}.${payload.slice(0, -1)}+.${signature}`, 'the payload of `token` must be base64url text without padding'],
+				[`${header}. ${payload}.${signature}`, 'the payload of `token` must be base64url text without padding'],
+				[`${Buffer.from('{"alg":').toString('base64url')}.${payload}.${signature}`, 'the header of `token` must be UTF-8 JSON'],
+				[`${Buffer.from('["HS256"]').toString('base64url')}.${payload}.${signature}`, 'the header of `token` must be a JSON object, got array']
+			];
+			for (const [input, message] of cases) rejects(input, 'malformed', message);
+			// A payload that is not a JSON object, correctly signed: rejected after the signature check.
+			rejects(token('{"alg":"HS256"}', '{"exp":'), 'malformed', 'the payload of `token` must be UTF-8 JSON');
+			rejects(token('{"alg":"HS256"}', '"text"'), 'malformed', 'the payload of `token` must be a JSON object, got string');
+			const input = `${Buffer.from('{"alg":"HS256"}').toString('base64url')}.${Buffer.from([0x7b, 0xff, 0x7d]).toString('base64url')}`;
+			rejects(`${input}.${createHmac('sha256', SECRET).update(input).digest('base64url')}`, 'malformed', 'the payload of `token` must be UTF-8 JSON');
+			// Not authentic, and malformed: the signature check comes first, so the payload is never parsed.
+			rejects(token('{"alg":"HS256"}', '{"exp":', 'other'), 'invalid_signature', 'the signature of `token` must match `secret`');
+			expect(
+				thrown(function () {
+					helpers.verifyJwt(`${Buffer.from('{"alg":"secret-looking"').toString('base64url')}.e30.`, SECRET);
+				}).message
+			).not.toContain('secret-looking');
+		});
+
+		it('should require exp, nbf and iat to be finite numbers', function () {
+			for (const claim of ['exp', 'nbf', 'iat']) {
+				for (const value of ['"1700000000"', 'null', '1e400', '-1e400', 'true', '[1]']) {
+					rejects(token(HS256, `{"${claim}":${value}}`), 'invalid_claim', `the \`${claim}\` claim of \`token\` must be a finite number of seconds since the epoch`, {
+						now: NOW
+					});
+				}
+			}
+		});
+
+		it('should reject an expired token from its exp time on, with the tolerance', function () {
+			const expiring = token(HS256, '{"exp":1700000000}');
+			const message = '`token` has expired (its `exp` time has passed)';
+			expect(helpers.verifyJwt(expiring, SECRET, { now: NOW - 1 }).payload.exp).toBe(1700000000);
+			rejects(expiring, 'expired', message, { now: NOW });
+			rejects(expiring, 'expired', message, { now: new Date(NOW) });
+			expect(helpers.verifyJwt(expiring, SECRET, { now: NOW + 29_999, clockTolerance: 30 }).payload).toEqual({ exp: 1700000000 });
+			rejects(expiring, 'expired', message, { now: NOW + 30_000, clockTolerance: 30 });
+			expect(helpers.verifyJwt(token(HS256, '{"exp":1.7e308}'), SECRET, { now: Number.MAX_VALUE }).payload).toEqual({ exp: 1.7e308 });
+			rejects(token(HS256, '{"exp":-1.7e308}'), 'expired', message, { now: -Number.MAX_VALUE });
+			jest.spyOn(Date, 'now').mockReturnValue(NOW);
+			rejects(expiring, 'expired', message);
+			expect(helpers.verifyJwt(token(HS256, '{}'), SECRET, { now: Number.MAX_VALUE }).payload).toEqual({});
+		});
+
+		it('should reject a token before its nbf time, with the tolerance', function () {
+			const early = token(HS256, '{"nbf":1700000000}');
+			const message = '`token` is not valid yet (its `nbf` time has not come)';
+			expect(helpers.verifyJwt(early, SECRET, { now: NOW }).payload).toEqual({ nbf: 1700000000 });
+			rejects(early, 'not_before', message, { now: NOW - 1 });
+			expect(helpers.verifyJwt(early, SECRET, { now: NOW - 30_000, clockTolerance: 30 }).payload).toEqual({ nbf: 1700000000 });
+			rejects(early, 'not_before', message, { now: NOW - 30_001, clockTolerance: 30 });
+			rejects(token(HS256, '{"nbf":1.7e308}'), 'not_before', message, { now: Number.MAX_VALUE });
+			expect(helpers.verifyJwt(token(HS256, '{"nbf":-1.7e308}'), SECRET, { now: -Number.MAX_VALUE }).payload).toEqual({ nbf: -1.7e308 });
+		});
+
+		it('should check maxAge against iat, with the tolerance', function () {
+			const issued = token(HS256, '{"iat":1700000000}');
+			// The age is counted in whole seconds, like jose (`iat` itself is truncated to the second): 60.999 s is 60 s.
+			expect(helpers.verifyJwt(issued, SECRET, { now: NOW + 60_999, maxAge: 60 }).payload).toEqual({ iat: 1700000000 });
+			rejects(issued, 'too_old', '`token` must have been issued at most `maxAge` seconds ago (its `iat` claim)', { now: NOW + 61_000, maxAge: 60 });
+			expect(helpers.verifyJwt(issued, SECRET, { now: NOW + 65_999, maxAge: 60, clockTolerance: 5 }).payload).toEqual({ iat: 1700000000 });
+			rejects(issued, 'too_old', '`token` must have been issued at most `maxAge` seconds ago (its `iat` claim)', { now: NOW + 66_000, maxAge: 60, clockTolerance: 5 });
+			expect(helpers.verifyJwt(issued, SECRET, { now: NOW, maxAge: 0 }).payload).toEqual({ iat: 1700000000 });
+			// A token signed at this very instant is not too old, whatever the milliseconds of `now`.
+			const fresh = helpers.signJwt({}, SECRET, { now: NOW + 999 });
+			expect(helpers.verifyJwt(fresh, SECRET, { now: NOW + 999, maxAge: 0 }).payload).toEqual({ iat: 1700000000 });
+			expect(helpers.verifyJwt(issued, SECRET, { now: NOW - 5000, maxAge: 0, clockTolerance: 5 }).payload).toEqual({ iat: 1700000000 });
+			rejects(issued, 'invalid_claim', 'the `iat` claim of `token` must not be in the future', { now: NOW - 5001, maxAge: 0, clockTolerance: 5 });
+			rejects(issued, 'invalid_claim', 'the `iat` claim of `token` must not be in the future', { now: NOW - 1, maxAge: 100 });
+			rejects(token(HS256, '{}'), 'invalid_claim', 'the `iat` claim of `token` must be present to check `maxAge`', { now: NOW, maxAge: 60 });
+			rejects(token(HS256, '{"iat":-1.7e308}'), 'too_old', '`token` must have been issued at most `maxAge` seconds ago (its `iat` claim)', { now: 0, maxAge: 1e300 });
+			// Without maxAge, iat is only type-checked: a future iat is accepted, like jose.
+			expect(helpers.verifyJwt(issued, SECRET, { now: 0 }).payload).toEqual({ iat: 1700000000 });
+		});
+
+		it('should check the issuer, the subject and the audience when asked', function () {
+			function verify(payload: string, options: helpers.VerifyJwtOptions): unknown {
+				return helpers.verifyJwt(token(HS256, payload), SECRET, options).payload;
+			}
+			expect(verify('{"iss":"a"}', { issuer: 'a' })).toEqual({ iss: 'a' });
+			expect(verify('{"iss":"b"}', { issuer: ['a', 'b'] })).toEqual({ iss: 'b' });
+			for (const payload of ['{}', '{"iss":"c"}', '{"iss":["a"]}', '{"iss":null}']) {
+				rejects(token(HS256, payload), 'invalid_issuer', 'the `iss` claim of `token` must be an accepted `issuer`', { issuer: ['a', 'b'] });
+			}
+			expect(verify('{"sub":"ada"}', { subject: 'ada' })).toEqual({ sub: 'ada' });
+			for (const payload of ['{}', '{"sub":"bob"}', '{"sub":["ada"]}']) {
+				rejects(token(HS256, payload), 'invalid_subject', 'the `sub` claim of `token` must be `subject`', { subject: 'ada' });
+			}
+			expect(verify('{"aud":"api"}', { audience: 'api' })).toEqual({ aud: 'api' });
+			expect(verify('{"aud":["web",1,"api"]}', { audience: 'api' })).toEqual({ aud: ['web', 1, 'api'] });
+			expect(verify('{"aud":"api"}', { audience: ['web', 'api'] })).toEqual({ aud: 'api' });
+			expect(verify('{"aud":["x","web"]}', { audience: ['web', 'api'] })).toEqual({ aud: ['x', 'web'] });
+			for (const payload of ['{}', '{"aud":"web"}', '{"aud":["web"]}', '{"aud":[]}', '{"aud":1}', '{"aud":{"api":true}}', '{"aud":[["api"]]}']) {
+				rejects(token(HS256, payload), 'invalid_audience', 'the `aud` claim of `token` must hold an accepted `audience`', { audience: 'api' });
+			}
+			// Unchecked when not asked.
+			expect(verify('{"iss":1,"sub":2,"aud":3}', {})).toEqual({ iss: 1, sub: 2, aud: 3 });
+		});
+
+		it('should read only own claims and options, ignoring a polluted Object.prototype', function () {
+			const values = { exp: 1, nbf: 1e300, iat: 'x', crit: ['x'], typ: 'other', issuer: 'x', audience: 'x', subject: 'x', maxAge: 0, clockTolerance: -1, now: NaN };
+			polluted(values, function () {
+				expect(helpers.verifyJwt(token(HS256, '{}'), SECRET, {}).payload).toEqual({});
+				expect(helpers.verifyJwt(token(HS256, '{"iss":"i"}'), SECRET, { issuer: 'i' }).payload).toEqual({ iss: 'i' });
+				expect(helpers.verifyJwt(token(HS256, '{"__proto__":{"admin":true}}'), SECRET).payload).toEqual({});
+			});
+		});
+
+		it('should validate its arguments', function () {
+			const invalid: [helpers.VerifyJwtOptions, Error][] = [
+				[{ now: new Date(NaN) }, new RangeError('verifyJwt: `now` must be a valid Date or a finite number of milliseconds, got NaN')],
+				[{ now: '1' as never }, new TypeError('verifyJwt: `now` must be a valid Date or a finite number of milliseconds, got string')],
+				[{ clockTolerance: -1 }, new RangeError('verifyJwt: `clockTolerance` must be a finite number of seconds >= 0, got -1')],
+				[{ clockTolerance: Infinity }, new RangeError('verifyJwt: `clockTolerance` must be a finite number of seconds >= 0, got Infinity')],
+				[{ clockTolerance: '5' as never }, new TypeError('verifyJwt: `clockTolerance` must be a finite number of seconds >= 0, got string')],
+				[{ maxAge: -1 }, new RangeError('verifyJwt: `maxAge` must be a finite number of seconds >= 0, got -1')],
+				[{ maxAge: NaN }, new RangeError('verifyJwt: `maxAge` must be a finite number of seconds >= 0, got NaN')],
+				[{ issuer: [] }, new RangeError('verifyJwt: `issuer` must not be an empty array')],
+				[{ issuer: ['a', 1] as never }, new TypeError('verifyJwt: `issuer` must be a string or an array of strings, got object')],
+				[{ issuer: 1 as never }, new TypeError('verifyJwt: `issuer` must be a string or an array of strings, got number')],
+				[{ audience: [] }, new RangeError('verifyJwt: `audience` must not be an empty array')],
+				[{ audience: null as never }, new TypeError('verifyJwt: `audience` must be a string or an array of strings, got null')],
+				[{ subject: 1 as never }, new TypeError('verifyJwt: `subject` must be a string, got number')],
+				[{ typ: 1 as never }, new TypeError('verifyJwt: `typ` must be a string, got number')]
+			];
+			for (const [options, error] of invalid) {
+				expect(function () {
+					helpers.verifyJwt(VALID, SECRET, options);
+				}).toThrow(error);
+			}
+			expect(function () {
+				helpers.verifyJwt(VALID, SECRET, null as never);
+			}).toThrow(new TypeError('verifyJwt: `options` must be an object, got null'));
+			expect(function () {
+				helpers.verifyJwt(VALID, '');
+			}).toThrow(new RangeError('verifyJwt: `secret` must not be empty, got 0 bytes'));
+			expect(function () {
+				helpers.verifyJwt(VALID, undefined as never);
+			}).toThrow(new TypeError('verifyJwt: `secret` must be a string, an ArrayBuffer or an ArrayBuffer view, got undefined'));
+			expect(function () {
+				helpers.verifyJwt(undefined as never, SECRET);
+			}).toThrow(new TypeError('verifyJwt: `token` must be a string, got undefined'));
+		});
+
+		it('should throw a JwtVerificationError that never quotes the token or the secret', function () {
+			const error = new helpers.JwtVerificationError('verifyJwt: x', 'expired');
+			expect(error).toBeInstanceOf(Error);
+			expect(error.name).toBe('JwtVerificationError');
+			expect(error.code).toBe('expired');
+			expect(error.message).toBe('verifyJwt: x');
+			const secretPayload = token(HS256, '{"sub":"s3cr3t-subject"}');
+			const rejected = thrown(function () {
+				helpers.verifyJwt(secretPayload, SECRET, { subject: 'other' });
+			});
+			expect(rejected.message).not.toContain('s3cr3t');
+			expect(rejected.message).not.toContain(SECRET);
+			expect(rejected.cause).toBeUndefined();
+		});
 	});
 });

@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
+import { crc32 } from 'node:zlib';
 import fc from 'fast-check';
 import { isBase64 } from '../validate';
 import * as helpers from '.';
@@ -501,6 +502,178 @@ describe('Encoding helpers (property-based)', function () {
 							return row.map(String);
 						})
 					);
+				})
+			);
+		});
+	});
+});
+
+describe('HMAC, CRC-32 and signed JWTs (property-based)', function () {
+	const data = fc.oneof(fc.uint8Array({ maxLength: 300 }), fc.string({ unit: 'binary', maxLength: 100 }));
+
+	describe('hmacSha256', function () {
+		it('should equal the HMAC of node:crypto for any key and message', function () {
+			fc.assert(
+				fc.property(data, data, function (key, message) {
+					const keyBytes = typeof key === 'string' ? Buffer.from(key, 'utf8') : key;
+					expect(helpers.hmacSha256Hex(key, message)).toBe(createHmac('sha256', keyBytes).update(message).digest('hex'));
+				})
+			);
+		});
+
+		it('should treat a key longer than a block as its digest', function () {
+			fc.assert(
+				fc.property(fc.uint8Array({ minLength: 65, maxLength: 300 }), fc.uint8Array({ maxLength: 100 }), function (key, message) {
+					expect(helpers.hmacSha256(key, message)).toEqual(helpers.hmacSha256(helpers.sha256(key), message));
+				})
+			);
+		});
+	});
+
+	describe('crc32', function () {
+		const initial = fc.integer({ min: 0, max: 0xffffffff });
+
+		it('should equal zlib.crc32 for any data and initial value', function () {
+			fc.assert(
+				fc.property(data, initial, function (value, start) {
+					expect(helpers.crc32(value, start)).toBe(crc32(value, start));
+				})
+			);
+		});
+
+		it('should continue a checksum: crc32(b, crc32(a)) === crc32(a + b)', function () {
+			fc.assert(
+				fc.property(fc.uint8Array({ maxLength: 200 }), fc.uint8Array({ maxLength: 200 }), initial, function (a, b, start) {
+					const whole = new Uint8Array(a.length + b.length);
+					whole.set(a);
+					whole.set(b, a.length);
+					expect(helpers.crc32(b, helpers.crc32(a, start))).toBe(helpers.crc32(whole, start));
+				})
+			);
+		});
+
+		it('should detect every single-bit error', function () {
+			fc.assert(
+				fc.property(fc.uint8Array({ minLength: 1, maxLength: 200 }), fc.nat(), function (value, at) {
+					const corrupted = value.slice();
+					const bit = at % (value.length * 8);
+					corrupted[bit >> 3] ^= 1 << (bit & 7);
+					expect(helpers.crc32(corrupted)).not.toBe(helpers.crc32(value));
+				})
+			);
+		});
+	});
+
+	describe('signJwt / verifyJwt', function () {
+		/** JSON objects without prototype-pollution keys (removed on decoding) nor registered time claims (checked on verification). */
+		const claims = fc.dictionary(fc.string(), fc.jsonValue()).filter(function (value) {
+			return !/__proto__|constructor|"(exp|nbf|iat)"/.test(JSON.stringify(value));
+		});
+		const secret = fc.oneof(fc.string({ minLength: 1, maxLength: 80 }), fc.uint8Array({ minLength: 1, maxLength: 100 }));
+
+		it('should sign tokens that node:crypto verifies and verifyJwt returns as signed', function () {
+			fc.assert(
+				fc.property(claims, secret, fc.integer({ min: 0, max: 4e12 }), function (payload, key, now) {
+					const token = helpers.signJwt(payload, key, { now });
+					const [header, body, signature] = token.split('.');
+					const keyBytes = typeof key === 'string' ? Buffer.from(key, 'utf8') : key;
+					expect(signature).toBe(createHmac('sha256', keyBytes).update(`${header}.${body}`).digest('base64url'));
+					expect(JSON.parse(Buffer.from(header, 'base64url').toString())).toEqual({ alg: 'HS256', typ: 'JWT' });
+					const expected = { ...JSON.parse(JSON.stringify(payload)), iat: Math.floor(now / 1000) };
+					expect(JSON.parse(Buffer.from(body, 'base64url').toString())).toEqual(expected);
+					expect(helpers.verifyJwt(token, key, { now, maxAge: 1 })).toEqual({ header: { alg: 'HS256', typ: 'JWT' }, payload: expected });
+				})
+			);
+		});
+
+		it('should reject any change to a signed token', function () {
+			fc.assert(
+				fc.property(claims, fc.nat(), fc.constantFrom(...'ABCabc019-_.=+/ é'), function (payload, at, character) {
+					const token = helpers.signJwt(payload, 'secret', { timestamp: false });
+					const index = at % token.length;
+					fc.pre(token[index] !== character);
+					const changed = token.slice(0, index) + character + token.slice(index + 1);
+					expect(function () {
+						helpers.verifyJwt(changed, 'secret');
+					}).toThrow(helpers.JwtVerificationError);
+					expect(function () {
+						helpers.verifyJwt(token, 'secret!');
+					}).toThrow(expect.objectContaining({ code: 'invalid_signature' }));
+				})
+			);
+		});
+
+		it('should accept a token exactly while nbf - tolerance <= now < exp + tolerance', function () {
+			fc.assert(
+				fc.property(
+					fc.integer({ min: 0, max: 4e9 }),
+					fc.integer({ min: 0, max: 600 }),
+					fc.integer({ min: -4e12, max: 8e12 }),
+					fc.nat({ max: 120 }),
+					function (nbf, lifetime, now, tolerance) {
+						const token = helpers.signJwt({ nbf, exp: nbf + lifetime }, 'secret', { timestamp: false });
+						let code: string | undefined;
+						try {
+							helpers.verifyJwt(token, 'secret', { now, clockTolerance: tolerance });
+						} catch (error) {
+							code = (error as helpers.JwtVerificationError).code;
+						}
+						const expired = now >= (nbf + lifetime + tolerance) * 1000;
+						expect(code).toBe(expired ? 'expired' : now < (nbf - tolerance) * 1000 ? 'not_before' : undefined);
+					}
+				)
+			);
+		});
+
+		it('should accept a token with maxAge exactly while iat - tolerance <= now < iat + maxAge + tolerance + 1 second', function () {
+			fc.assert(
+				fc.property(
+					fc.integer({ min: 0, max: 4e9 }),
+					fc.integer({ min: 0, max: 600 }),
+					fc.nat({ max: 120 }),
+					// Near either boundary (iat - tolerance or iat + maxAge + tolerance), to the millisecond.
+					fc.boolean(),
+					fc.integer({ min: -2000, max: 2000 }),
+					function (iat, maxAge, tolerance, upper, offset) {
+						const now = (upper ? iat + maxAge + tolerance : iat - tolerance) * 1000 + offset;
+						const token = helpers.signJwt({ iat }, 'secret');
+						let code: string | undefined;
+						try {
+							helpers.verifyJwt(token, 'secret', { now, maxAge, clockTolerance: tolerance });
+						} catch (error) {
+							code = (error as helpers.JwtVerificationError).code;
+						}
+						const future = now < (iat - tolerance) * 1000;
+						expect(code).toBe(future ? 'invalid_claim' : now >= (iat + maxAge + tolerance + 1) * 1000 ? 'too_old' : undefined);
+					}
+				)
+			);
+		});
+
+		it('should never quote the token or the secret in its errors', function () {
+			const marker = fc.string({ minLength: 12, maxLength: 20, unit: fc.constantFrom(...'abcdefghijklmnopqrstuvwxyz') });
+			fc.assert(
+				fc.property(marker, marker, fc.integer({ min: 0, max: 6 }), function (key, claim, variant) {
+					const valid = helpers.signJwt({ sub: claim, iss: claim, aud: claim, exp: 1000, nbf: 0, iat: 0 }, key, { timestamp: false });
+					const [header, body] = valid.split('.');
+					const tokens = [
+						valid,
+						`${header}.${body}.`,
+						`${Buffer.from(`{"alg":"${claim}"}`).toString('base64url')}.${body}.`,
+						`${Buffer.from(`{"alg":"HS256","x":${claim}}`).toString('base64url')}.${body}.`,
+						`${header}.${Buffer.from(`{"sub":${claim}}`).toString('base64url')}.`,
+						`${claim}.${claim}.${claim}`,
+						claim
+					];
+					const options = [{ now: 2e6 }, { now: 0, issuer: 'x' }, { now: 0, audience: 'x' }, { now: 0, subject: 'x' }, { now: 1e9, maxAge: 1 }];
+					for (const option of options) {
+						try {
+							helpers.verifyJwt(tokens[variant], key, option);
+						} catch (error) {
+							expect((error as Error).message).not.toContain(claim);
+							expect((error as Error).message).not.toContain(key);
+						}
+					}
 				})
 			);
 		});

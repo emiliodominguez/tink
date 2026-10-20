@@ -837,18 +837,31 @@ function compress(state: Int32Array, block: Uint8Array, offset: number, k: Int32
 export function sha256(data: string | BytesInput): Uint8Array<ArrayBuffer> {
 	const bytes = dataOf('sha256', data);
 	const k = (SHA256_CONSTANTS ??= sha256Constants());
-	const state = k.slice(64);
+	return sha256Finish(k.slice(64), bytes, 0, k);
+}
+
+/**
+ * Hashes the rest of a message into a SHA-256 state and returns the digest: the whole blocks of `bytes` are compressed in place (never
+ * copied), then the padding (FIPS 180-4 §5.1.1) with the length of the WHOLE message, `absorbed + bytes.length` bytes.
+ * @param {Int32Array} state - The 8-word hash state (mutated), which has already absorbed `absorbed` bytes
+ * @param {Uint8Array} bytes - The rest of the message
+ * @param {number} absorbed - The number of bytes the state has already absorbed (a multiple of 64)
+ * @param {Int32Array} k - The constants
+ * @returns {Uint8Array} The 32-byte digest
+ */
+function sha256Finish(state: Int32Array, bytes: Uint8Array, absorbed: number, k: Int32Array): Uint8Array<ArrayBuffer> {
 	const length = bytes.length;
 	const full = length - (length % 64);
 	for (let offset = 0; offset < full; offset += 64) compress(state, bytes, offset, k);
 
 	// Padding: the leftover bytes, a 1 bit, zeros, and the message length in bits as a 64-bit big-endian integer (one or two blocks).
 	const tail = new Uint8Array(length - full < 56 ? 64 : 128);
-	for (let i = full; i < length; i++) tail[i - full] = bytes[i];
+	tail.set(bytes.subarray(full));
 	tail[length - full] = 0x80;
 	const end = tail.length;
-	const high = Math.floor(length / 0x20000000);
-	const low = (length << 3) >>> 0;
+	const total = absorbed + length;
+	const high = Math.floor(total / 0x20000000);
+	const low = (total << 3) >>> 0;
 	tail[end - 8] = high >>> 24;
 	tail[end - 7] = high >>> 16;
 	tail[end - 6] = high >>> 8;
@@ -884,6 +897,60 @@ export function sha256Hex(data: string | BytesInput): string {
 }
 
 /**
+ * Computes the HMAC-SHA256 (RFC 2104, FIPS 198-1) of a message under a key, synchronously and in plain JavaScript: the keyed digest
+ * behind HS256 JWTs, webhook signatures (Stripe, GitHub, Slack…), signed cookies and AWS Signature V4.
+ *
+ * Gives the same bytes as Node's `createHmac('sha256', key).update(message).digest()` and `crypto.subtle.sign('HMAC', …)`, without a
+ * secure context, `await` or the Node `crypto` module. Strings (the key and the message alike) are taken as UTF-8. A key longer than
+ * 64 bytes is hashed first, as the standard requires; a shorter one is zero-padded (so an empty key is valid, though useless as a
+ * secret: use at least 32 random bytes). The message is hashed in place, never copied, and the cost is that of hashing it plus three
+ * blocks (four with a long key). To check a received MAC, compare it with {@link timingSafeEqual}, never with `===`.
+ * @param {string | BytesInput} key - The secret key, or a string to use as UTF-8
+ * @param {string | BytesInput} message - The bytes to authenticate, or a string to authenticate as UTF-8
+ * @returns {Uint8Array} The 32-byte MAC
+ * @throws {TypeError} when `key` or `message` is neither a string nor binary data
+ * @example
+ * toHex(hmacSha256('key', 'The quick brown fox jumps over the lazy dog')); // => 'f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8'
+ * hmacSha256(new Uint8Array(0), '').length; // => 32
+ * @example
+ * // Checking a webhook signature sent as hex in a header:
+ * const secret = 'whsec_test';
+ * const body = '{"event":"paid"}';
+ * const header = hmacSha256Hex(secret, body); // what the sender computed
+ * timingSafeEqual(fromHex(header), hmacSha256(secret, body)); // => true
+ */
+export function hmacSha256(key: string | BytesInput, message: string | BytesInput): Uint8Array<ArrayBuffer> {
+	let secret = dataOf('hmacSha256', key, 'key');
+	const bytes = dataOf('hmacSha256', message, 'message');
+	const k = (SHA256_CONSTANTS ??= sha256Constants());
+	if (secret.length > 64) secret = sha256Finish(k.slice(64), secret, 0, k);
+	// The key block, XORed with the inner pad, is absorbed by the inner state; then XORed with the outer pad instead, by the outer state.
+	const block = new Uint8Array(64);
+	block.set(secret);
+	for (let i = 0; i < 64; i++) block[i] ^= 0x36;
+	const inner = k.slice(64);
+	compress(inner, block, 0, k);
+	for (let i = 0; i < 64; i++) block[i] ^= 0x36 ^ 0x5c;
+	const outer = k.slice(64);
+	compress(outer, block, 0, k);
+	return sha256Finish(outer, sha256Finish(inner, bytes, 64, k), 64, k);
+}
+
+/**
+ * Computes the HMAC-SHA256 of a message under a key as 64 lowercase hex digits (see {@link hmacSha256}).
+ * @param {string | BytesInput} key - The secret key, or a string to use as UTF-8
+ * @param {string | BytesInput} message - The bytes to authenticate, or a string to authenticate as UTF-8
+ * @returns {string} The MAC in hex
+ * @throws {TypeError} when `key` or `message` is neither a string nor binary data
+ * @example
+ * hmacSha256Hex('key', 'The quick brown fox jumps over the lazy dog'); // => 'f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8'
+ * hmacSha256Hex('', ''); // => 'b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad'
+ */
+export function hmacSha256Hex(key: string | BytesInput, message: string | BytesInput): string {
+	return toHex(hmacSha256(key, message));
+}
+
+/**
  * Compares two byte sequences (or the UTF-8 encodings of two strings) in a time that depends only on their length, not on where they
  * first differ: use it to check a secret (an HMAC, an API key, a CSRF or reset token) against the expected value, where an early-exit
  * `===` lets an attacker recover it byte by byte by timing the responses.
@@ -910,6 +977,70 @@ export function timingSafeEqual(a: string | BytesInput, b: string | BytesInput):
 	let difference = 0;
 	for (let i = 0; i < length; i++) difference |= left[i] ^ right[i];
 	return difference === 0;
+}
+
+/** The CRC-32 lookup tables for slicing-by-8 (8 × 256 words, table `t` at `256 * t`), built on first use. */
+let CRC32_TABLES: Int32Array | undefined;
+
+/**
+ * Builds the slicing-by-8 tables of the reflected CRC-32 polynomial `0xEDB88320`: table 0 holds the CRC of each byte value, and
+ * table `t` that of the byte followed by `t` zero bytes.
+ * @returns {Int32Array} 2,048 words
+ */
+function crc32Tables(): Int32Array {
+	const tables = new Int32Array(2048);
+	for (let n = 0; n < 256; n++) {
+		let crc = n;
+		for (let bit = 0; bit < 8; bit++) crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+		tables[n] = crc;
+	}
+	for (let i = 256; i < 2048; i++) tables[i] = tables[tables[i - 256] & 255] ^ (tables[i - 256] >>> 8);
+	return tables;
+}
+
+/**
+ * Computes the CRC-32 checksum of binary data or of the UTF-8 encoding of a string: the IEEE 802.3 polynomial with the usual
+ * reflection and final inversion (often called "CRC-32" or "CRC-32/ISO-HDLC"), as in zlib, gzip, ZIP, PNG and Ethernet, and as Node's
+ * `zlib.crc32` computes it.
+ *
+ * Incremental: pass the checksum of the bytes before as `initial` to continue it, so that `crc32(b, crc32(a))` is the checksum of `a`
+ * followed by `b` (streaming a file chunk by chunk). Runs in linear time with slicing-by-8 (eight bytes per step; the 8 kB of tables are
+ * built on first use). A checksum detects accidental corruption, NOT tampering: use {@link hmacSha256} to authenticate data.
+ * @param {string | BytesInput} data - The bytes to checksum, or a string to checksum as UTF-8
+ * @param {number} [initial=0] - The checksum of the preceding bytes, to continue from (`0` for none)
+ * @returns {number} The checksum, an unsigned 32-bit integer
+ * @throws {TypeError} when `data` is neither a string nor binary data, or `initial` is not a number
+ * @throws {RangeError} when `initial` is not an integer between 0 and 4294967295
+ * @example
+ * crc32('123456789'); // => 0xcbf43926 // the standard check value
+ * crc32(''); // => 0
+ * crc32('hello world').toString(16).padStart(8, '0'); // => '0d4a1185'
+ * crc32(' world', crc32('hello')) === crc32('hello world'); // => true
+ * crc32('x', -1); // throws RangeError
+ */
+export function crc32(data: string | BytesInput, initial = 0): number {
+	assertNumber('crc32', 'initial', initial, Number.isInteger(initial) && initial >= 0 && initial <= 0xffffffff, 'an integer between 0 and 4294967295');
+	const bytes = dataOf('crc32', data);
+	const t = (CRC32_TABLES ??= crc32Tables());
+	const length = bytes.length;
+	const full = length - (length % 8);
+	let crc = ~initial;
+	let i = 0;
+	for (; i < full; i += 8) {
+		// The first four bytes are folded into the running CRC; the next four only go through their tables.
+		crc ^= bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16) | (bytes[i + 3] << 24);
+		crc =
+			t[1792 + (crc & 255)] ^
+			t[1536 + ((crc >>> 8) & 255)] ^
+			t[1280 + ((crc >>> 16) & 255)] ^
+			t[1024 + (crc >>> 24)] ^
+			t[768 + bytes[i + 4]] ^
+			t[512 + bytes[i + 5]] ^
+			t[256 + bytes[i + 6]] ^
+			t[bytes[i + 7]];
+	}
+	for (; i < length; i++) crc = t[(crc ^ bytes[i]) & 255] ^ (crc >>> 8);
+	return ~crc >>> 0;
 }
 
 /**
@@ -1186,17 +1317,29 @@ export function decodeJwt<P extends object = JwtPayload, H extends object = JwtH
  */
 function decodeToken(caller: string, token: unknown): DecodedJwt {
 	if (typeof token !== 'string') throw new TypeError(`${caller}: \`token\` must be a string, got ${describe(token)}`);
+	const [first, second] = jwtDots(caller, token);
+	return {
+		header: jwtObject(caller, token.slice(0, first), 'header'),
+		payload: jwtObject(caller, token.slice(first + 1, second), 'payload'),
+		signature: jwtBytes(caller, token.slice(second + 1), 'signature')
+	};
+}
+
+/**
+ * Finds the two dots of a JWT in compact serialization.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {string} token - The token
+ * @returns {number[]} The indexes of the first and second dots
+ * @throws {SyntaxError} when `token` does not have exactly two dots
+ */
+function jwtDots(caller: string, token: string): number[] {
 	const first = token.indexOf('.');
 	// Without a first dot, `second` is -1 too.
 	const second = token.indexOf('.', first + 1);
 	if (second === -1 || token.includes('.', second + 1)) {
 		throw new SyntaxError(`${caller}: \`token\` must have 3 parts separated by dots, got ${token.split('.').length}`);
 	}
-	return {
-		header: jwtObject(caller, token.slice(0, first), 'header'),
-		payload: jwtObject(caller, token.slice(first + 1, second), 'payload'),
-		signature: jwtBytes(caller, token.slice(second + 1), 'signature')
-	};
+	return [first, second];
 }
 
 /**
@@ -1224,7 +1367,18 @@ function jwtBytes(caller: string, part: string, name: string): Uint8Array<ArrayB
  * @throws {SyntaxError} when `part` is not the base64url encoding of a UTF-8 JSON object
  */
 function jwtObject(caller: string, part: string, name: string): Record<string, unknown> {
-	const bytes = jwtBytes(caller, part, name);
+	return jwtJson(caller, jwtBytes(caller, part, name), name);
+}
+
+/**
+ * Parses the decoded bytes of a JWT part as a JSON object, without prototype-pollution keys.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {Uint8Array} bytes - The decoded part
+ * @param {string} name - Its name, for error messages
+ * @returns {Record<string, unknown>} The object
+ * @throws {SyntaxError} when `bytes` is not a UTF-8 JSON object
+ */
+function jwtJson(caller: string, bytes: Uint8Array, name: string): Record<string, unknown> {
 	let value: unknown;
 	try {
 		value = JSON.parse(decodeUtf8(bytes, { fatal: true }), withoutProtoKeys);
@@ -1291,12 +1445,420 @@ export function getJwtExpiration(token: string): Date | undefined {
  */
 export function isJwtExpired(token: string, options?: IsJwtExpiredOptions): boolean {
 	const [nowOption, leeway = 0] = readOptions('isJwtExpired', options, ['now', 'leeway']);
-	const now = nowOption === undefined ? Date.now() : nowOption instanceof Date ? nowOption.getTime() : nowOption;
-	assertNumber('isJwtExpired', 'now', now, Number.isFinite(now), 'a valid Date or a finite number of milliseconds');
-	assertNumber('isJwtExpired', 'leeway', leeway, Number.isFinite(leeway) && (leeway as number) >= 0, 'a finite number of seconds >= 0');
+	const now = jwtNow('isJwtExpired', nowOption);
+	jwtSeconds('isJwtExpired', 'leeway', leeway, true);
 	const expiration = expirationOf('isJwtExpired', token);
 	// Compared in seconds: `leeway * 1000` overflows to `Infinity` past 1.8e305 seconds, while the difference of two times cannot.
-	return expiration !== undefined && (now - expiration.getTime()) / 1000 >= leeway;
+	return expiration !== undefined && (now - expiration.getTime()) / 1000 >= (leeway as number);
+}
+
+/**
+ * Validates the `now` option of the JWT functions.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {unknown} now - The option (`undefined` when absent)
+ * @returns {number} The time in milliseconds since the epoch (`Date.now()` by default)
+ * @throws {TypeError} when `now` is neither a `Date` nor a number
+ * @throws {RangeError} when `now` is an invalid date or not finite
+ */
+function jwtNow(caller: string, now: unknown): number {
+	const time = now === undefined ? Date.now() : now instanceof Date ? now.getTime() : now;
+	assertNumber(caller, 'now', time, Number.isFinite(time), 'a valid Date or a finite number of milliseconds');
+	return time;
+}
+
+/**
+ * Validates a duration option of the JWT functions, in seconds.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {string} name - Name of the option
+ * @param {unknown} value - Its value
+ * @param {boolean} positive - Whether it must also be `>= 0`
+ * @returns {void}
+ * @throws {TypeError} when `value` is not a number
+ * @throws {RangeError} when `value` is not finite (or, when `positive`, negative)
+ */
+function jwtSeconds(caller: string, name: string, value: unknown, positive: boolean): asserts value is number {
+	assertNumber(caller, name, value, Number.isFinite(value) && (!positive || (value as number) >= 0), `a finite number of seconds${positive ? ' >= 0' : ''}`);
+}
+
+/**
+ * Reads an own property of a decoded JWT part, ignoring anything inherited (from a polluted `Object.prototype`, say).
+ * @param {Record<string, unknown>} part - The header or the payload
+ * @param {string} key - The parameter or claim
+ * @returns {unknown} Its value, `undefined` when it is not an own property
+ */
+function ownValue(part: Record<string, unknown>, key: string): unknown {
+	return Object.hasOwn(part, key) ? part[key] : undefined;
+}
+
+/**
+ * Validates the secret of {@link signJwt} and {@link verifyJwt}.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {unknown} secret - The `secret` argument
+ * @returns {Uint8Array} Its bytes
+ * @throws {TypeError} when `secret` is neither a string nor binary data
+ * @throws {RangeError} when `secret` is empty
+ */
+function jwtSecret(caller: string, secret: unknown): Uint8Array {
+	const bytes = dataOf(caller, secret, 'secret');
+	if (bytes.length === 0) throw new RangeError(`${caller}: \`secret\` must not be empty, got 0 bytes`);
+	return bytes;
+}
+
+/** The options of {@link toBase64} that the JWT functions use. */
+const BASE64_URL_OPTIONS = { urlSafe: true };
+
+/** The header parameters {@link signJwt} writes first. */
+const JWT_HEADER = { alg: 'HS256', typ: 'JWT' };
+
+/**
+ * Copies the header or the claims that {@link signJwt} writes (own enumerable properties only, defined rather than assigned, so that an own
+ * `__proto__` key stays a plain key) into a plain object, which `JSON.stringify` writes several times faster than a null-prototype one.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {string} name - Name of the argument or option
+ * @param {unknown} value - The object to copy
+ * @param {object} [defaults] - Properties written first, which `value` can replace
+ * @returns {Record<string, unknown>} The copy
+ * @throws {TypeError} when `value` is not a non-array object, or has a `toJSON` method (which would replace it in the JSON)
+ */
+function jwtCopy(caller: string, name: string, value: unknown, defaults?: object): Record<string, unknown> {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		throw new TypeError(`${caller}: \`${name}\` must be an object, got ${Array.isArray(value) ? 'array' : describe(value)}`);
+	}
+	const copy: Record<string, unknown> = { ...defaults, ...value };
+	// `JSON.stringify` would call a `toJSON` of `value` (own, or inherited from a class or `Date`) instead of writing it, and the copy's (a
+	// polluted `Object.prototype`) instead of writing the copy.
+	if (typeof (value as Record<string, unknown>).toJSON === 'function' || typeof copy.toJSON === 'function') {
+		throw new TypeError(`${caller}: \`${name}\` must not have a toJSON method, which would replace it`);
+	}
+	return copy;
+}
+
+/**
+ * Options accepted by {@link signJwt}.
+ */
+export interface SignJwtOptions {
+	/**
+	 * Extra JOSE header parameters (`kid`, `cty`…), written after `alg` and `typ`. `typ` (`'JWT'` by default) can be replaced, or left
+	 * out by setting it to `undefined`; `alg` is always `'HS256'`.
+	 */
+	readonly header?: { readonly alg?: 'HS256'; readonly typ?: string; readonly kid?: string; readonly [parameter: string]: unknown };
+	/** Add an `exp` claim this many seconds after `now` (the token expires then). Not allowed when `payload` has an `exp` claim. */
+	readonly expiresIn?: number;
+	/** Add an `nbf` claim this many seconds after `now` (the token is not valid before). Not allowed when `payload` has an `nbf` claim. */
+	readonly notBefore?: number;
+	/** Add an `iat` claim (the time of `now`) when `payload` has none. Defaults to `true`. */
+	readonly timestamp?: boolean;
+	/** The current time, as a `Date` or in milliseconds since the epoch. Defaults to `Date.now()`. */
+	readonly now?: Date | number;
+}
+
+/**
+ * Signs a JWT with HMAC-SHA256 (`alg: 'HS256'`, RFC 7519 and RFC 7515), synchronously: the JSON header (`{"alg":"HS256","typ":"JWT"}`
+ * plus `options.header`), the JSON claims, each base64url-encoded without padding, then the HMAC of both under `secret`. The token is
+ * accepted by {@link verifyJwt} and by every JOSE library (jose, jsonwebtoken…).
+ *
+ * The claims are the own enumerable properties of `payload`, plus `iat` (the current time in whole seconds, unless `payload` has one or
+ * `timestamp` is `false`), and with `notBefore` or `expiresIn`, `nbf` or `exp` that many seconds after it. Values are written with
+ * `JSON.stringify` (so `undefined` and functions are left out, and a `Date` becomes its ISO text). Choose a secret of at least 32 random
+ * bytes (RFC 7518 §3.2): a short or guessable one can be found offline from any token.
+ * @param {object} payload - The claims: a JSON-serializable object, not an array
+ * @param {string | BytesInput} secret - The HMAC key, or a string to use as UTF-8 (not empty)
+ * @param {SignJwtOptions} [options={}] - `header`: extra header parameters; `expiresIn`, `notBefore`: lifetimes in seconds;
+ * `timestamp` (default `true`): add `iat`; `now` (default `Date.now()`): the current time
+ * @returns {string} The token, `header.payload.signature`
+ * @throws {TypeError} when `payload` is not a non-array object or has a `toJSON` method, `secret` is neither a string nor binary data,
+ * `options` or `header` is not an object, an option has the wrong type, `expiresIn` (`notBefore`) is given for a payload with an `exp`
+ * (`nbf`) claim, or a value cannot be serialized (a bigint, a cycle)
+ * @throws {RangeError} when `secret` is empty, `header.alg` is not `'HS256'`, `header` has a `crit` parameter (which `verifyJwt` would
+ * reject), `now` is an invalid date or not finite, or `expiresIn` or `notBefore` is not finite
+ * @example
+ * signJwt({ sub: '1234567890', name: 'John Doe', iat: 1516239022 }, 'your-256-bit-secret'); // => 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c'
+ * const token = signJwt({ sub: 'ada' }, 'secret', { expiresIn: 3600, now: 1_700_000_000_000, header: { kid: 'k1' } });
+ * decodeJwt(token).header; // => { alg: 'HS256', typ: 'JWT', kid: 'k1' }
+ * decodeJwt(token).payload; // => { sub: 'ada', iat: 1700000000, exp: 1700003600 }
+ * signJwt({}, 'secret', { header: { alg: 'none' } as never }); // throws RangeError
+ */
+export function signJwt(payload: object, secret: string | BytesInput, options?: SignJwtOptions): string {
+	const [headerOption, expiresIn, notBefore, timestampOption, nowOption] = readOptions('signJwt', options, ['header', 'expiresIn', 'notBefore', 'timestamp', 'now']);
+	const now = jwtNow('signJwt', nowOption);
+	const timestamp = booleanOption('signJwt', 'timestamp', timestampOption, true);
+	if (expiresIn !== undefined) jwtSeconds('signJwt', 'expiresIn', expiresIn, false);
+	if (notBefore !== undefined) jwtSeconds('signJwt', 'notBefore', notBefore, false);
+	// `alg` and `typ` come first; the extra parameters can replace (or remove) `typ`, and replacing `alg` is an error.
+	const header = jwtCopy('signJwt', 'header', headerOption === undefined ? {} : headerOption, JWT_HEADER);
+	if (header.alg !== 'HS256') throw new RangeError(`signJwt: \`header.alg\` must be 'HS256' (the only algorithm signJwt supports), got ${show(header.alg)}`);
+	// `verifyJwt` rejects every `crit` (no extension is supported), so a token carrying one could never be verified.
+	if (Object.hasOwn(header, 'crit') && header.crit !== undefined) throw new RangeError('signJwt: `header` must not have a `crit` parameter (no extension is supported)');
+	const claims = jwtCopy('signJwt', 'payload', payload);
+	const key = jwtSecret('signJwt', secret);
+	const seconds = Math.floor(now / 1000);
+	if (timestamp && ownValue(claims, 'iat') === undefined) claims.iat = seconds;
+	for (const [name, claim, offset] of [
+		['notBefore', 'nbf', notBefore],
+		['expiresIn', 'exp', expiresIn]
+	] as const) {
+		if (offset === undefined) continue;
+		if (ownValue(claims, claim) !== undefined) throw new TypeError(`signJwt: \`${name}\` must be left out when \`payload\` has an \`${claim}\` claim`);
+		claims[claim] = seconds + offset;
+	}
+	const input = `${toBase64(JSON.stringify(header), BASE64_URL_OPTIONS)}.${toBase64(JSON.stringify(claims), BASE64_URL_OPTIONS)}`;
+	return `${input}.${toBase64(hmacSha256(key, input), BASE64_URL_OPTIONS)}`;
+}
+
+/**
+ * Why {@link verifyJwt} rejected a token:
+ * - `'malformed'`: not three canonical base64url parts, or a header or payload that is not a UTF-8 JSON object (see {@link decodeJwt});
+ * - `'invalid_algorithm'`: the `alg` header parameter is not exactly `'HS256'` (`'none'`, `'RS256'`, `'hs256'`, missing…);
+ * - `'invalid_header'`: a `crit` header parameter (no extension is supported), or a `typ` other than the `typ` option;
+ * - `'invalid_signature'`: the signature is not the HMAC-SHA256 of the token under the secret;
+ * - `'invalid_claim'`: an `exp`, `nbf` or `iat` claim that is not a finite number, or, with `maxAge`, an `iat` claim missing or in the future;
+ * - `'expired'`: the `exp` time has passed; `'not_before'`: the `nbf` time has not come; `'too_old'`: `iat` is more than `maxAge` ago;
+ * - `'invalid_issuer'`, `'invalid_audience'`, `'invalid_subject'`: the `iss`, `aud` or `sub` claim is missing or not an expected value.
+ */
+export type JwtVerificationErrorCode =
+	| 'malformed'
+	| 'invalid_algorithm'
+	| 'invalid_header'
+	| 'invalid_signature'
+	| 'invalid_claim'
+	| 'expired'
+	| 'not_before'
+	| 'too_old'
+	| 'invalid_issuer'
+	| 'invalid_audience'
+	| 'invalid_subject';
+
+/**
+ * Error thrown by {@link verifyJwt} when a token is malformed, forged, or not acceptable; `code` tells why. The message never quotes the
+ * token, its claims or the secret, so it can be logged as is.
+ * @example
+ * try {
+ *   verifyJwt(signJwt({}, 'secret'), 'other secret');
+ * } catch (error) {
+ *   error instanceof JwtVerificationError; // => true
+ *   (error as JwtVerificationError).code; // => 'invalid_signature'
+ * }
+ */
+export class JwtVerificationError extends Error {
+	override name = 'JwtVerificationError';
+	/** Why the token was rejected. */
+	readonly code: JwtVerificationErrorCode;
+
+	/**
+	 * @param {string} message - The error message
+	 * @param {JwtVerificationErrorCode} code - Why the token was rejected
+	 */
+	constructor(message: string, code: JwtVerificationErrorCode) {
+		super(message);
+		this.code = code;
+	}
+}
+
+/**
+ * A JWT verified by {@link verifyJwt}.
+ * @template P - The payload type
+ * @template H - The header type
+ */
+export interface VerifiedJwt<P extends object = JwtPayload, H extends object = JwtHeader> {
+	/** The JOSE header. */
+	readonly header: H;
+	/** The claims. */
+	readonly payload: P;
+}
+
+/**
+ * Options accepted by {@link verifyJwt}.
+ */
+export interface VerifyJwtOptions {
+	/** The current time, as a `Date` or in milliseconds since the epoch. Defaults to `Date.now()`. */
+	readonly now?: Date | number;
+	/** Tolerated clock skew, in seconds, for `exp`, `nbf` and `maxAge`. Defaults to `0`. */
+	readonly clockTolerance?: number;
+	/** The accepted issuer(s): the `iss` claim must be one of them. */
+	readonly issuer?: string | readonly string[];
+	/** The accepted audience(s): the `aud` claim (a string or an array) must hold at least one of them. */
+	readonly audience?: string | readonly string[];
+	/** The expected `sub` claim. */
+	readonly subject?: string;
+	/** The greatest accepted age, in whole seconds: the token must have an `iat` claim at most this long ago. */
+	readonly maxAge?: number;
+	/** The expected `typ` header parameter (such as `'at+jwt'`), compared ignoring case and an `application/` prefix. */
+	readonly typ?: string;
+}
+
+/**
+ * Reads an issuer or audience option of {@link verifyJwt}.
+ * @param {string} name - Name of the option
+ * @param {unknown} value - Its value (`undefined` when absent)
+ * @returns {readonly string[] | undefined} The accepted values, `undefined` when the option is absent
+ * @throws {TypeError} when `value` is neither a string nor an array of strings
+ * @throws {RangeError} when `value` is an empty array
+ */
+function stringsOption(name: string, value: unknown): readonly string[] | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value === 'string') return [value];
+	if (
+		!Array.isArray(value) ||
+		!value.every(function (entry: unknown): boolean {
+			return typeof entry === 'string';
+		})
+	) {
+		throw new TypeError(`verifyJwt: \`${name}\` must be a string or an array of strings, got ${describe(value)}`);
+	}
+	if (value.length === 0) throw new RangeError(`verifyJwt: \`${name}\` must not be an empty array`);
+	return value as string[];
+}
+
+/**
+ * Throws the error of {@link verifyJwt} for a rejected token.
+ * @param {JwtVerificationErrorCode} code - Why the token is rejected
+ * @param {string} problem - The message, after the function name
+ * @returns {never} Never returns
+ * @throws {JwtVerificationError} always
+ */
+function reject(code: JwtVerificationErrorCode, problem: string): never {
+	throw new JwtVerificationError(`verifyJwt: ${problem}`, code);
+}
+
+/**
+ * Normalizes a `typ` value for comparison (RFC 7515 §4.1.9: media types are case-insensitive, and `application/` may be left out).
+ * @param {string} typ - The value
+ * @returns {string} It in lowercase, without an `application/` prefix
+ */
+function normalizeTyp(typ: string): string {
+	const lower = typ.toLowerCase();
+	return lower.startsWith('application/') ? lower.slice(12) : lower;
+}
+
+/**
+ * Verifies a JWT signed with HMAC-SHA256 (`alg: 'HS256'`), synchronously, and returns its header and claims; anything else throws a
+ * {@link JwtVerificationError} whose `code` tells why. The checks, in order:
+ *
+ * 1. **Structure**, as strictly as {@link decodeJwt}: three canonical base64url parts without padding; a JSON-object header.
+ * 2. **Algorithm**: the `alg` header parameter must be exactly `'HS256'`. Anything else is rejected BEFORE the signature is looked at,
+ *    which rules out the classic attacks: `alg: 'none'` (an unsigned token) and algorithm confusion (an `RS256` token "signed" with a
+ *    public key used as an HMAC secret). A `crit` parameter is rejected (no extension is supported); with the `typ` option, the `typ`
+ *    parameter must match it. Without it, `typ` may be anything or absent.
+ * 3. **Signature**: the HMAC-SHA256 of `header.payload` under `secret`, compared in constant time (see {@link timingSafeEqual}).
+ * 4. **Claims**, only once the token is authentic (the payload is parsed only then, without prototype-pollution keys): `exp`, `nbf` and
+ *    `iat` must be finite numbers when present; the token is expired from its `exp` time on (`now >= exp + clockTolerance`, as in
+ *    {@link isJwtExpired} and jose) and not valid before `nbf - clockTolerance`; with `maxAge`, `iat` must be present, not in the future
+ *    and at most `maxAge + clockTolerance` whole seconds ago (the age is truncated to the second, like `iat` and as in jose); `issuer`,
+ *    `audience` and `subject`, when given, must match `iss`, `aud` (a string or an array of strings, matching when one of them is
+ *    accepted) and `sub`.
+ *
+ * A token without an `exp` claim never expires: issue tokens with `expiresIn` (see {@link signJwt}), or require a recent `iat` with
+ * `maxAge`. Error messages never quote the token, its claims or the secret.
+ * @template P - The payload type (not validated beyond the registered claims checked above)
+ * @template H - The header type
+ * @param {string} token - The JWT
+ * @param {string | BytesInput} secret - The HMAC key it was signed with, or a string to use as UTF-8 (not empty)
+ * @param {VerifyJwtOptions} [options={}] - `now` (default `Date.now()`), `clockTolerance` (default `0`, in seconds), `issuer`,
+ * `audience`, `subject`, `maxAge` (in seconds) and `typ`
+ * @returns {VerifiedJwt<P, H>} The header and the claims
+ * @throws {TypeError} when `token` is not a string, `secret` is neither a string nor binary data, `options` is not an object, or an option
+ * has the wrong type
+ * @throws {RangeError} when `secret` is empty, `now` is an invalid date or not finite, `clockTolerance` or `maxAge` is negative or not
+ * finite, or `issuer` or `audience` is an empty array
+ * @throws {JwtVerificationError} when the token is malformed, not signed with `secret`, or its claims are not acceptable
+ * @example
+ * const token = signJwt({ sub: 'ada', aud: 'api' }, 'secret', { expiresIn: 60, now: 1_700_000_000_000 });
+ * verifyJwt(token, 'secret', { audience: 'api', now: 1_700_000_030_000 }).payload; // => { sub: 'ada', aud: 'api', iat: 1700000000, exp: 1700000060 }
+ * verifyJwt(token, 'wrong', { now: 1_700_000_030_000 }); // throws JwtVerificationError // code 'invalid_signature'
+ * verifyJwt(token, 'secret', { now: 1_700_000_060_000 }); // throws JwtVerificationError // code 'expired'
+ * verifyJwt(token, 'secret', { now: 1_700_000_065_000, clockTolerance: 10 }).payload.sub; // => 'ada'
+ * verifyJwt('eyJhbGciOiJub25lIn0.e30.', 'secret'); // throws JwtVerificationError // code 'invalid_algorithm'
+ */
+export function verifyJwt<P extends object = JwtPayload, H extends object = JwtHeader>(
+	token: string,
+	secret: string | BytesInput,
+	options?: VerifyJwtOptions
+): VerifiedJwt<P, H> {
+	const [nowOption, tolerance = 0, issuerOption, audienceOption, subject, maxAge, typ] = readOptions('verifyJwt', options, [
+		'now',
+		'clockTolerance',
+		'issuer',
+		'audience',
+		'subject',
+		'maxAge',
+		'typ'
+	]);
+	const now = jwtNow('verifyJwt', nowOption);
+	jwtSeconds('verifyJwt', 'clockTolerance', tolerance, true);
+	const issuers = stringsOption('issuer', issuerOption);
+	const audiences = stringsOption('audience', audienceOption);
+	if (subject !== undefined && typeof subject !== 'string') throw new TypeError(`verifyJwt: \`subject\` must be a string, got ${describe(subject)}`);
+	if (maxAge !== undefined) jwtSeconds('verifyJwt', 'maxAge', maxAge, true);
+	if (typ !== undefined && typeof typ !== 'string') throw new TypeError(`verifyJwt: \`typ\` must be a string, got ${describe(typ)}`);
+	const key = jwtSecret('verifyJwt', secret);
+	if (typeof token !== 'string') throw new TypeError(`verifyJwt: \`token\` must be a string, got ${describe(token)}`);
+
+	let second: number;
+	let header: Record<string, unknown>;
+	let payloadBytes: Uint8Array;
+	let signature: Uint8Array;
+	try {
+		let first: number;
+		[first, second] = jwtDots('verifyJwt', token);
+		header = jwtObject('verifyJwt', token.slice(0, first), 'header');
+		payloadBytes = jwtBytes('verifyJwt', token.slice(first + 1, second), 'payload');
+		signature = jwtBytes('verifyJwt', token.slice(second + 1), 'signature');
+	} catch (error) {
+		// The message of the SyntaxError, not its cause, which may quote the token.
+		throw new JwtVerificationError((error as Error).message, 'malformed');
+	}
+	if (ownValue(header, 'alg') !== 'HS256') reject('invalid_algorithm', "the `alg` header parameter of `token` must be 'HS256'");
+	if (Object.hasOwn(header, 'crit')) reject('invalid_header', 'the header of `token` must not have a `crit` parameter (no extension is supported)');
+	const tokenTyp = ownValue(header, 'typ');
+	if (typ !== undefined && !(typeof tokenTyp === 'string' && normalizeTyp(tokenTyp) === normalizeTyp(typ))) {
+		reject('invalid_header', `the \`typ\` header parameter of \`token\` must be ${JSON.stringify(typ)}`);
+	}
+	if (!timingSafeEqual(hmacSha256(key, token.slice(0, second)), signature)) reject('invalid_signature', 'the signature of `token` must match `secret`');
+
+	let payload: Record<string, unknown>;
+	try {
+		payload = jwtJson('verifyJwt', payloadBytes, 'payload');
+	} catch (error) {
+		throw new JwtVerificationError((error as Error).message, 'malformed');
+	}
+	const exp = ownValue(payload, 'exp');
+	const nbf = ownValue(payload, 'nbf');
+	const iat = ownValue(payload, 'iat');
+	for (const [claim, value] of [
+		['exp', exp],
+		['nbf', nbf],
+		['iat', iat]
+	] as const) {
+		if (value !== undefined && !Number.isFinite(value)) reject('invalid_claim', `the \`${claim}\` claim of \`token\` must be a finite number of seconds since the epoch`);
+	}
+	// Compared in seconds, like `isJwtExpired`: a claim's time in milliseconds may overflow to ±Infinity, which still compares correctly.
+	// An absent claim makes the difference NaN, and every comparison with NaN is false.
+	if ((now - (exp as number) * 1000) / 1000 >= (tolerance as number)) reject('expired', '`token` has expired (its `exp` time has passed)');
+	if (((nbf as number) * 1000 - now) / 1000 > (tolerance as number)) reject('not_before', '`token` is not valid yet (its `nbf` time has not come)');
+	if (maxAge !== undefined) {
+		if (iat === undefined) reject('invalid_claim', 'the `iat` claim of `token` must be present to check `maxAge`');
+		if ((now - (iat as number) * 1000) / 1000 < -(tolerance as number)) reject('invalid_claim', 'the `iat` claim of `token` must not be in the future');
+		// The age in whole seconds, like jose: `iat` is itself truncated to the second, so a token issued 60.9 seconds ago may be 60 seconds old.
+		if (Math.floor(now / 1000) - (iat as number) - (tolerance as number) > maxAge) {
+			reject('too_old', '`token` must have been issued at most `maxAge` seconds ago (its `iat` claim)');
+		}
+	}
+	const iss = ownValue(payload, 'iss');
+	// The accepted values are strings: a claim of any other type is not among them.
+	if (issuers !== undefined && !issuers.includes(iss as string)) reject('invalid_issuer', 'the `iss` claim of `token` must be an accepted `issuer`');
+	if (subject !== undefined && ownValue(payload, 'sub') !== subject) reject('invalid_subject', 'the `sub` claim of `token` must be `subject`');
+	if (audiences !== undefined) {
+		const aud = ownValue(payload, 'aud');
+		const values: unknown[] = Array.isArray(aud) ? aud : [aud];
+		if (
+			!values.some(function (value: unknown): boolean {
+				return audiences.includes(value as string);
+			})
+		) {
+			reject('invalid_audience', 'the `aud` claim of `token` must hold an accepted `audience`');
+		}
+	}
+	return { header: header as H, payload: payload as P };
 }
 
 /**
