@@ -10,14 +10,23 @@ import {
 	floor,
 	formatBytes,
 	inRange,
+	covariance,
+	harmonicMean,
+	linearRegression,
 	median,
+	mode,
 	normalize,
+	nthRoot,
 	parseBytes,
 	quantile,
 	randomBetween,
 	randomIntBetween,
+	rootMeanSquare,
 	round,
 	roundToStep,
+	skewness,
+	softmax,
+	standardize,
 	sum,
 	variance,
 	weightedAverage
@@ -35,6 +44,12 @@ const integers = Array.from({ length: 1000 }, function (_, index) {
 });
 const weights = medium.map(function (_, index) {
 	return (index % 13) + 1;
+});
+const related = medium.map(function (value, index) {
+	return value * 0.5 + ((index * 31) % 17);
+});
+const positive = medium.map(function (value) {
+	return Math.abs(value) + 1;
 });
 const toRound = medium.slice(0, 1000);
 const byteStrings = Array.from({ length: 1000 }, function (_, index) {
@@ -137,6 +152,67 @@ export default [
 			return weightedAverage(medium, weights);
 		}
 	},
+	{
+		name: 'weightedAverage (10 floats)',
+		fn: function () {
+			return weightedAverage(ten, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+		}
+	},
+	{
+		name: 'covariance (10k pairs)',
+		fn: function () {
+			return covariance(medium, related);
+		}
+	},
+	{
+		name: 'linearRegression (10 pairs)',
+		fn: function () {
+			return linearRegression(ten, related.slice(0, 10)).slope;
+		}
+	},
+	{
+		name: 'rootMeanSquare (10k floats)',
+		fn: function () {
+			return rootMeanSquare(medium);
+		}
+	},
+	{
+		name: 'skewness (10k floats)',
+		fn: function () {
+			return skewness(medium);
+		}
+	},
+	{
+		name: 'standardize (10k floats)',
+		fn: function () {
+			return standardize(medium)[0];
+		}
+	},
+	{
+		name: 'softmax (1k floats)',
+		fn: function () {
+			return softmax(thousand)[0];
+		}
+	},
+	{
+		name: 'harmonicMean (10k floats)',
+		fn: function () {
+			return harmonicMean(positive);
+		}
+	},
+	{
+		name: 'mode (10k floats)',
+		fn: function () {
+			return mode(medium).length;
+		}
+	},
+	scalarCase(
+		'nthRoot (1000 floats, n = 7)',
+		function (value) {
+			return nthRoot(value * 1e200, 7);
+		},
+		{}
+	),
 	{
 		name: 'normalize (10k floats)',
 		fn: function () {

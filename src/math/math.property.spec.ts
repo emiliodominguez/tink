@@ -3137,3 +3137,166 @@ describe('Math helpers (property-based, exact references)', function () {
 		);
 	});
 });
+
+/**
+ * The integer quotient and remainder of `top * 2 ** shift / bottom`.
+ * @param {bigint} top - A non-negative numerator
+ * @param {bigint} bottom - A positive denominator
+ * @param {number} shift - The power of two applied to the ratio
+ * @returns {[bigint, bigint]} `[quotient, remainder]`
+ */
+function shiftedRatio(top: bigint, bottom: bigint, shift: number): [bigint, bigint] {
+	const numerator = shift >= 0 ? top << BigInt(shift) : top;
+	const denominator = shift >= 0 ? bottom : bottom << BigInt(-shift);
+	return [numerator / denominator, numerator % denominator];
+}
+
+/**
+ * Whether a number is zero or at least `1e-100` in magnitude.
+ * @param {number} value - The number
+ * @returns {boolean} `true` unless it is tiny
+ */
+function notTiny(value: number): boolean {
+	return value === 0 || Math.abs(value) >= 1e-100;
+}
+
+/**
+ * The `n`-th power of a finite double, exactly, as a fraction of BigInts.
+ * @param {number} value - A finite number
+ * @param {number} n - A positive integer
+ * @returns {[bigint, bigint]} `[numerator, denominator]`
+ */
+function exactPower(value: number, n: number): [bigint, bigint] {
+	const [top, bottom] = exactFraction(value);
+	return [top ** BigInt(n), bottom ** BigInt(n)];
+}
+
+/**
+ * The double nearest to `numerator / denominator` (ties to even), in exact BigInt arithmetic, for a ratio that is a normal double.
+ * @param {bigint} numerator - The numerator
+ * @param {bigint} denominator - The denominator, not zero
+ * @returns {number} The correctly rounded ratio
+ */
+function nearestRatio(numerator: bigint, denominator: bigint): number {
+	if (numerator === 0n) return 0;
+	const negative = numerator < 0n !== denominator < 0n;
+	const top = numerator < 0n ? -numerator : numerator;
+	const bottom = denominator < 0n ? -denominator : denominator;
+	// A quotient of 54 bits (53 and a rounding bit), the remainder deciding exact ties.
+	let shift = 53 - (top.toString(2).length - bottom.toString(2).length);
+	if (shiftedRatio(top, bottom, shift)[0] < 1n << 53n) shift++;
+	const [quotient, rest] = shiftedRatio(top, bottom, shift);
+	const exact = rest === 0n;
+	let kept = quotient >> 1n;
+	if ((quotient & 1n) === 1n && (!exact || (kept & 1n) === 1n)) kept++;
+	const exponent = 1 - shift;
+	const magnitude = Number(kept) * 2 ** Math.trunc(exponent / 2) * 2 ** (exponent - Math.trunc(exponent / 2));
+	return negative ? -magnitude : magnitude;
+}
+
+describe('Floating-point audit (property-based)', function () {
+	it('weightedAverage is the correctly rounded exact weighted mean', function () {
+		// Weights within 2 ** 700 of each other, and products well above the subnormals: a weight below 2 ** -1000 times the largest one is
+		// rounded, and so is a product below the normal doubles.
+		const value = fc.oneof(
+			fc.double({ min: -1e6, max: 1e6, noNaN: true }).filter(notTiny),
+			fc.integer({ min: -1000, max: 1000 }),
+			fc.double({ min: -1e300, max: 1e300, noNaN: true }).filter(notTiny)
+		);
+		const weight = fc.oneof(
+			fc.integer({ min: 0, max: 20 }),
+			fc.double({ min: 0, max: 1e6, noNaN: true }).filter(notTiny),
+			fc.double({ min: 1e-100, max: 1e100, noNaN: true })
+		);
+		fc.assert(
+			fc.property(fc.array(fc.tuple(value, weight), { minLength: 1, maxLength: 12 }), function (pairs) {
+				let numerator = 0n;
+				let denominator = 0n;
+				for (const [v, w] of pairs) {
+					numerator += scaledExact(v) * scaledExact(w);
+					denominator += scaledExact(w);
+				}
+				fc.pre(denominator > 0n);
+				// Both sums are in units of 2 ** -1074, the numerator in units of 2 ** -2148.
+				const expected = nearestRatio(numerator, denominator << 1074n);
+				fc.pre(expected === 0 ? numerator === 0n : Math.abs(expected) >= 2 ** -900);
+				const result = helpers.weightedAverage(
+					pairs.map(function (pair) {
+						return pair[0];
+					}),
+					pairs.map(function (pair) {
+						return pair[1];
+					})
+				);
+				if (result !== expected) {
+					// Only next to a tie between two doubles, which terms below 2 ** -100 of the mean can tip (the residual is rounded once).
+					expect(helpers.nextAfter(expected, result)).toBe(result);
+					const twiceMidpoint = scaledExact(expected) + scaledExact(result);
+					const offset = 2n * numerator - twiceMidpoint * denominator;
+					expect((offset < 0n ? -offset : offset) << 100n < (twiceMidpoint < 0n ? -twiceMidpoint : twiceMidpoint) * denominator).toBe(true);
+				}
+			}),
+			{ numRuns: 2000 }
+		);
+	});
+
+	it('nthRoot is within an ulp of the exact root, whatever the magnitude', function () {
+		fc.assert(
+			fc.property(anyFiniteDouble, fc.integer({ min: 4, max: 40 }), function (x, n) {
+				const value = Math.abs(x);
+				fc.pre(value > 0);
+				const root = helpers.nthRoot(value, n);
+				// The exact root lies strictly between the doubles on either side of the result: below^n < value < above^n.
+				const [numerator, denominator] = exactFraction(value);
+				const [belowTop, belowBottom] = exactPower(helpers.nextAfter(root, 0), n);
+				const [aboveTop, aboveBottom] = exactPower(helpers.nextAfter(root, Infinity), n);
+				expect(belowTop * denominator < numerator * belowBottom).toBe(true);
+				expect(numerator * aboveBottom < aboveTop * denominator).toBe(true);
+			}),
+			{ numRuns: 2000 }
+		);
+	});
+
+	it('nthRoot gives exact roots exactly', function () {
+		fc.assert(
+			fc.property(
+				fc.integer({ min: 4, max: 60 }),
+				fc.double({ min: 0, max: 1, maxExcluded: true, noNaN: true }),
+				fc.integer({ min: -20, max: 20 }),
+				function (n, fraction, exponent) {
+					// An odd mantissa whose n-th power has at most 53 bits, times a power of two.
+					const mantissa = 2 * Math.floor((fraction * 2 ** (53 / n)) / 2) + 1;
+					fc.pre(BigInt(mantissa) ** BigInt(n) < 1n << 53n);
+					const root = mantissa * 2 ** exponent;
+					let power = 1;
+					for (let i = 0; i < n; i++) power *= root;
+					fc.pre(power >= 2 ** -1022 && power < Infinity);
+					expect(helpers.nthRoot(power, n)).toBe(root);
+					if (n % 2 === 1) expect(helpers.nthRoot(-power, n)).toBe(-root);
+				}
+			),
+			{ numRuns: 3000 }
+		);
+	});
+
+	it('percentage of integers is the correctly rounded exact ratio', function () {
+		fc.assert(
+			fc.property(fc.integer({ min: -1e12, max: 1e12 }), fc.integer({ min: -1e12, max: 1e12 }), function (value, total) {
+				fc.pre(total !== 0 && value !== 0);
+				expect(helpers.percentage(value, total)).toBe(nearestRatio(BigInt(value) * 100n, BigInt(total)));
+			})
+		);
+	});
+
+	it('toRadians, toDegrees and zScore are finite whenever their exact result is', function () {
+		fc.assert(
+			fc.property(anyFiniteDouble, anyFiniteDouble, function (a, b) {
+				expect(Number.isFinite(helpers.toRadians(a))).toBe(true);
+				if (Math.abs(a) <= Number.MAX_VALUE / 60) expect(Number.isFinite(helpers.toDegrees(a))).toBe(true);
+				const score = helpers.zScore(a, b, Number.MAX_VALUE);
+				expect(Number.isFinite(score)).toBe(true);
+				expect(Math.abs(score)).toBeLessThanOrEqual(2);
+			})
+		);
+	});
+});

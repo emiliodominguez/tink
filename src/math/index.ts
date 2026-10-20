@@ -534,29 +534,37 @@ export function randomIntBetween(minimum: number, maximum: number, random: Rando
 	let r = draw('randomIntBetween', random);
 	// A single 32-bit draw could only reach 2 ** 32 evenly spaced integers of a wider range.
 	if (span > 4294967296) r = (Math.floor(r * 2097152) * 4294967296 + Math.floor(draw('randomIntBetween', random) * 4294967296)) / 9007199254740992;
-	return Math.min(high, low + Math.floor(r * span)) + 0;
+	// A span beyond `Number.MAX_VALUE` (huge bounds of opposite signs) would make every draw `high`, or `NaN` for `r = 0`: interpolate
+	// between the bounds instead, as `randomBetween` does (doubles that large are all integers).
+	return Math.min(high, span < Infinity ? low + Math.floor(r * span) : Math.floor(low * (1 - r) + high * r)) + 0;
 }
 
 /**
- * Converts degrees to radians.
+ * Converts degrees to radians: `degrees * Math.PI / 180`, which does not overflow for the largest angles (`toRadians(1e308)` is
+ * `1.7453292519943295e306`, not `Infinity`).
  * @param {number} degrees - The angle in degrees
  * @returns {number} The angle in radians
  * @example
  * toRadians(180); // => 3.141592653589793
  */
 export function toRadians(degrees: number): number {
-	return (degrees * Math.PI) / 180;
+	const scaled = degrees * Math.PI;
+	// The product overflowed although the angle in radians does not: divide first (one more rounding, only there).
+	return Number.isFinite(scaled) || !Number.isFinite(degrees) ? scaled / 180 : (degrees / 180) * Math.PI;
 }
 
 /**
- * Converts radians to degrees.
+ * Converts radians to degrees: `radians * 180 / Math.PI`, which only overflows when the angle in degrees does (`toDegrees(3e306)` is
+ * `1.718873385392471e308`, not `Infinity`).
  * @param {number} radians - The angle in radians
  * @returns {number} The angle in degrees
  * @example
  * toDegrees(Math.PI); // => 180
  */
 export function toDegrees(radians: number): number {
-	return (radians * 180) / Math.PI;
+	const scaled = radians * 180;
+	// The product overflowed: divide first (one more rounding, only there).
+	return Number.isFinite(scaled) || !Number.isFinite(radians) ? scaled / Math.PI : (radians / Math.PI) * 180;
 }
 
 /**
@@ -759,19 +767,25 @@ function sortedMedian(sorted: ArrayLike<number>): number {
  * mode([]); // => []
  */
 export function mode(numbers: ReadonlyArray<number>): number[] {
-	const counts = new Map<number, number>();
-	let highest = 0;
-	for (const item of numbers) {
-		const value = +item;
-		const count = (counts.get(value) ?? 0) + 1;
-		counts.set(value, count);
-		highest = Math.max(highest, count);
-	}
+	// Sorted (equal values, `-0` and `0` included, are then adjacent, and `NaN`s last), then counted run by run: faster than counting in a
+	// `Map`, and the modes come out in ascending order.
+	const sorted = sortedCopy(toNumbers(numbers));
 	const result: number[] = [];
-	for (const [value, count] of counts) {
-		if (count === highest) result.push(value);
+	let highest = 0;
+	for (let start = 0; start < sorted.length;) {
+		const value = sorted[start];
+		let end = start + 1;
+		// SameValueZero: `NaN` equals `NaN`.
+		while (end < sorted.length && (sorted[end] === value || (value !== value && sorted[end] !== sorted[end]))) end++;
+		if (end - start > highest) {
+			highest = end - start;
+			result.length = 0;
+		}
+		// `+ 0` turns `-0` into `0`, the value `0` and `-0` share.
+		if (end - start === highest) result.push(value + 0);
+		start = end;
 	}
-	return Array.from(sortedCopy(result));
+	return result;
 }
 
 /**
@@ -880,6 +894,18 @@ interface PairedMoments {
 }
 
 /**
+ * Copies some numbers into a new array, each converted with unary `+`: `Array.from(numbers, (value) => +value)`, several times faster
+ * (copying an array is a fast path of `Array.from`, its mapping callback is not).
+ * @param {Iterable<number> | ArrayLike<number>} numbers - The numbers (an array, an array-like or an iterable)
+ * @returns {number[]} The converted copy
+ */
+function toNumbers(numbers: Iterable<number> | ArrayLike<number>): number[] {
+	const values = Array.from(numbers);
+	for (let i = 0; i < values.length; i++) values[i] = +values[i];
+	return values;
+}
+
+/**
  * Converts a sample with unary `+` and multiplies it by a power of two that brings its largest magnitude close to `1` (by `1` when that is
  * `0` or not finite), between `2 ** -1000` and `2 ** 1000` so that it is a normal double. The scaling is exact (subnormal values become
  * normal), and the scaled values, their sums and their squares neither overflow nor underflow.
@@ -887,19 +913,14 @@ interface PairedMoments {
  * @returns {[number[], number]} The scaled values and the scale
  */
 function scaledSample(numbers: ReadonlyArray<number>): [number[], number] {
-	const values = Array.from(numbers, function (value) {
-		return +value;
-	});
+	const values = toNumbers(numbers);
 	let largest = 0;
 	// `NaN` once a value is `NaN`.
-	for (const value of values) largest = Math.max(largest, Math.abs(value));
+	for (let i = 0; i < values.length; i++) largest = Math.max(largest, Math.abs(values[i]));
 	const scale = largest > 0 && largest < Infinity ? 2 ** Math.min(1000, Math.max(-1000, -Math.floor(Math.log2(largest)))) : 1;
-	return [
-		values.map(function (value) {
-			return value * scale;
-		}),
-		scale
-	];
+	// In place: the values are a copy.
+	if (scale !== 1) for (let i = 0; i < values.length; i++) values[i] *= scale;
+	return [values, scale];
 }
 
 /**
@@ -1213,17 +1234,22 @@ export function isOdd(number: number): boolean {
 
 /**
  * Expresses `value` as a percentage of `total` (`value / total * 100`).
- * When `total` is `0` the percentage is undefined and `NaN` is returned (rather than `±Infinity`).
+ * When `total` is `0` the percentage is undefined and `NaN` is returned (rather than `±Infinity`). Like {@link percentageChange}, the value
+ * is multiplied by `100` before it is divided, so that a simple ratio comes out as the double nearest to it (`percentage(1, 3)` is
+ * `100 / 3`, where `(1 / 3) * 100` is `33.33333333333333`), without overflowing when `100 * value` does.
  * @param {number} value - The part
  * @param {number} total - The whole
  * @returns {number} The percentage, or `NaN` when `total` is `0`
  * @example
  * percentage(25, 200); // => 12.5
+ * percentage(1, 3); // => 33.333333333333336
  * percentage(3, 0); // => NaN
  */
 export function percentage(value: number, total: number): number {
 	if (total === 0) return NaN;
-	return (value / total) * 100;
+	const hundredfold = value * 100;
+	// `100 * value` overflowed (so `total` is large if the percentage is finite): divide first.
+	return Number.isFinite(hundredfold) || !Number.isFinite(value) ? hundredfold / total : (value / total) * 100;
 }
 
 /**
@@ -1377,7 +1403,7 @@ export function interquartileRange(numbers: ReadonlyArray<number>): number {
 /**
  * Computes the standard score of a value: how many standard deviations it lies above (positive) or below (negative) the mean,
  * `(value - mean) / standardDeviation`. Pass the mean and standard deviation of the reference population (see {@link average} and
- * {@link standardDeviation}).
+ * {@link standardDeviation}). It only overflows when the score itself does, even when `value - mean` does.
  * @param {number} value - The value to score
  * @param {number} mean - The mean of the population
  * @param {number} deviation - Its standard deviation, a number `> 0`
@@ -1391,7 +1417,11 @@ export function interquartileRange(numbers: ReadonlyArray<number>): number {
  */
 export function zScore(value: number, mean: number, deviation: number): number {
 	assertNumber('zScore', 'deviation', deviation, deviation > 0, 'a number > 0');
-	return (value - mean) / deviation;
+	const difference = value - mean;
+	if (Number.isFinite(difference) || !Number.isFinite(value) || !Number.isFinite(mean)) return difference / deviation;
+	// The difference overflowed although both values are finite (`zScore(1e308, -1e308, 1e308)` is `2`): halve all three, exactly for values
+	// that large (halving a subnormal deviation can round it, but the score is then beyond the doubles anyway).
+	return (value / 2 - mean / 2) / (deviation / 2);
 }
 
 /**
@@ -1452,9 +1482,15 @@ export function approximatelyEqual(a: number, b: number, options?: Approximately
 }
 
 /**
- * Computes the weighted arithmetic mean `Σ(value × weight) / Σ(weight)`, using the compensated {@link sum}.
- * Weights are rescaled by the largest one first, so only their ratios matter and very large or tiny (subnormal) weights neither overflow nor underflow.
- * Values and weights are converted with unary `+` (numeric strings count as numbers).
+ * Computes the weighted arithmetic mean `Σ(value × weight) / Σ(weight)`, correctly rounded: each product is split exactly into its rounded
+ * value and its rounding error, both go into a compensated sum (as in {@link dot}), the weights into another, and the quotient of the two is
+ * corrected by one Newton step, so `weightedAverage([1, 2], [1, 3])` is exactly `1.75` (dividing the weights by the largest one gave
+ * `1.7500000000000002`). The exceptions are an exact tie between two doubles that terms below `2 ** -100` of the mean tip one way, products
+ * below the normal doubles, and weights below about `2 ** -1022` times the largest one, which are rounded (an ulp at most, for the first).
+ * Weights are rescaled by a power of two first (exactly), so only their ratios matter and very large or tiny (subnormal) weights neither
+ * overflow nor underflow, and the result does not overflow when the mean is finite.
+ * Values and weights are converted with unary `+` (numeric strings count as numbers). An infinite or `NaN` value makes the result
+ * `±Infinity` or `NaN` (also with a weight of `0`, since `Infinity * 0` is `NaN`).
  * @param {ReadonlyArray<number>} values - The values to average
  * @param {ReadonlyArray<number>} weights - One finite, non-negative weight per value
  * @returns {number} The weighted mean, or `NaN` when the total weight is `0` (including empty arrays)
@@ -1462,41 +1498,86 @@ export function approximatelyEqual(a: number, b: number, options?: Approximately
  * @throws {RangeError} when `values` and `weights` have different lengths, or a weight is negative, `NaN` or infinite
  * @example
  * weightedAverage([80, 90], [1, 3]); // => 87.5
+ * weightedAverage([1, 2], [1, 3]); // => 1.75
  * weightedAverage([10, 20], [1, 1]); // => 15
  * weightedAverage([10, 20], [0, 0]); // => NaN
  */
 export function weightedAverage(values: ReadonlyArray<number>, weights: ReadonlyArray<number>): number {
-	if (values.length !== weights.length) {
-		throw new RangeError(`weightedAverage: \`values\` and \`weights\` must have the same length, got ${values.length} and ${weights.length}`);
+	const count = weights.length;
+	if (values.length !== count) {
+		throw new RangeError(`weightedAverage: \`values\` and \`weights\` must have the same length, got ${values.length} and ${count}`);
 	}
 	let largestWeight = 0;
 	// Each weight is read and converted once: the values validated are the values used.
-	const checkedWeights: number[] = [];
-	for (let i = 0; i < weights.length; i++) {
+	const scaledWeights: number[] = [];
+	for (let i = 0; i < count; i++) {
 		const raw = weights[i];
 		const weight = typeof raw === 'number' ? raw : +raw;
 		if (!(weight >= 0 && weight < Infinity)) assertNumber('weightedAverage', `weights[${i}]`, raw, false, 'a finite number >= 0');
-		checkedWeights.push(weight);
+		scaledWeights.push(weight);
 		largestWeight = Math.max(largestWeight, weight);
 	}
-	// Rescaling the weights into [0, 1] keeps the products and the total weight from overflowing or underflowing. A zero total weight
-	// (including empty arrays) needs no special case: `0 / 0` makes every scaled weight, and so the result, `NaN`.
-	const scaledWeights = checkedWeights.map(function (weight) {
-		return weight / largestWeight;
-	});
-	const products = values.map(function (value, index) {
-		return value * scaledWeights[index];
-	});
-	const totalWeight = sum(scaledWeights);
-	const total = sum(products);
-	if (Number.isFinite(total)) return total / totalWeight;
-	// The sum of the products overflowed (or a value is infinite, possibly meeting an overflow as `Infinity - Infinity`): dividing each product by the total weight first cannot overflow
-	// when the mean is finite.
-	return sum(
-		products.map(function (weighted) {
-			return weighted / totalWeight;
-		})
-	);
+	// A power of two (exact) that brings the largest weight close to `1` (see `vectorScale`): neither the products nor the total weight
+	// overflow or underflow. A zero total weight (including empty arrays) gives `1`, and `0 / 0` makes the result `NaN`.
+	const scale = largestWeight > 0 ? 2 ** Math.min(1000, -Math.floor(Math.log2(largestWeight))) : 1;
+	const numbers: number[] = [];
+	// The sum of the products of the values that are not finite: it decides the result alone, without the spurious `Infinity - Infinity` of
+	// finite products that overflow.
+	let special = 0;
+	for (let i = 0; i < count; i++) {
+		const value = +values[i];
+		numbers.push(value);
+		scaledWeights[i] *= scale;
+		if (!Number.isFinite(value)) special += value * scaledWeights[i];
+	}
+	if (special !== 0) return special;
+	const mean = weightedMean(numbers, scaledWeights, 1);
+	// A product or the sum overflowed: the same with the weights divided by a power of two of at least `4 * count` (exactly, as far as the
+	// result is concerned), which keeps every product and partial sum below `Number.MAX_VALUE`, and does not change their ratios.
+	return mean === Infinity ? weightedMean(numbers, scaledWeights, 2 ** -(Math.ceil(Math.log2(count)) + 2)) : mean;
+}
+
+/**
+ * The weighted mean of finite values (see {@link weightedAverage}), in double-double precision: the products split exactly into `high + low`
+ * (Dekker's TwoProduct; a value beyond `2 ** 996`, where Veltkamp's splitting would overflow, is split scaled down) and added up with
+ * Neumaier's compensation, the weights likewise, and the quotient of the two sums corrected by one Newton step on the exact residual (as in
+ * {@link harmonicMean}), scaled down when it is beyond `2 ** 900`, so that the quotient splits without overflow either.
+ * @param {ReadonlyArray<number>} values - The finite values
+ * @param {ReadonlyArray<number>} weights - Their weights, scaled so that the largest is in `[0.5, 2)` (or as close as subnormal weights allow)
+ * @param {number} scale - A power of two the weights are multiplied by (`1`, or small enough that the sums cannot overflow)
+ * @returns {number} The weighted mean: `Infinity` when a product or the sum overflows, `NaN` when the total weight is `0`
+ */
+function weightedMean(values: ReadonlyArray<number>, weights: ReadonlyArray<number>, scale: number): number {
+	let total = 0;
+	let compensation = 0;
+	let totalWeight = 0;
+	let weightCompensation = 0;
+	for (let i = 0; i < values.length; i++) {
+		const value = values[i];
+		const weight = weights[i] * scale;
+		const term = value * weight;
+		const error = Math.abs(value) < 2 ** 996 ? productError(value, weight) : productError(value * 2 ** -128, weight) * 2 ** 128;
+		let next = total + term;
+		compensation += (Math.abs(total) >= Math.abs(term) ? total - next + term : term - next + total) + error;
+		total = next;
+		next = totalWeight + weight;
+		weightCompensation += totalWeight >= weight ? totalWeight - next + weight : weight - next + totalWeight;
+		totalWeight = next;
+	}
+	const high = total + compensation;
+	const low = compensation - (high - total);
+	const divisor = totalWeight + weightCompensation;
+	const divisorLow = weightCompensation - (divisor - totalWeight);
+	// A product or the sum overflowed (to `±Infinity`, or `NaN` when overflows of both signs met).
+	if (!Number.isFinite(high)) return Infinity;
+	// `(high + low) / (divisor + divisorLow)`: the quotient by `divisor`, corrected by the residual `numerator - quotient * divisor`, whose
+	// first part is exact (see `harmonicMean`). Scaling the numerator by a power of two scales the quotient exactly.
+	const rounded = high / divisor;
+	const shift = Math.abs(rounded) > 2 ** 900 ? 2 ** -200 : 1;
+	const quotient = rounded * shift;
+	const residual = high * shift - quotient * divisor - productError(quotient, divisor) + low * shift - quotient * divisorLow;
+	// No mean of finite values exceeds the largest double, but the last rounding can push it there.
+	return Math.min(Math.max((quotient + residual / divisor) / shift, -Number.MAX_VALUE), Number.MAX_VALUE);
 }
 
 /**
@@ -1791,8 +1872,10 @@ export function ordinal(n: number): string {
 
 /**
  * Computes the real `n`-th root of a number. Odd roots of negative numbers are negative (`nthRoot(-8, 3) === -2`),
- * even roots of negative numbers are `NaN`. Uses `Math.sqrt` / `Math.cbrt` for `n = 2` / `n = 3`, and otherwise snaps the
- * result to an integer `k` when `k ** n === |value|` exactly (so `nthRoot(16, 4) === 2`, not `1.9999999999999998`).
+ * even roots of negative numbers are `NaN`. Uses `Math.sqrt` / `Math.cbrt` for `n = 2` / `n = 3`; other roots are within an ulp of the
+ * exact root (usually correctly rounded), for any magnitude, where `Math.pow(x, 1 / n)` is off by tens of ulps for large or tiny `x` (the
+ * rounding of `1 / n` is magnified by `ln(x) / n`). An exact root is returned exactly (`nthRoot(16, 4) === 2`, not `1.9999999999999998`,
+ * and `nthRoot(5.0625, 4) === 1.5`), and so is an integer `k` with `k ** n === |value|` in floating point.
  * @param {number} value - The radicand
  * @param {number} n - The degree of the root, a positive integer
  * @returns {number} The real `n`-th root of `value`, or `NaN` when it does not exist
@@ -1802,6 +1885,7 @@ export function ordinal(n: number): string {
  * nthRoot(27, 3); // => 3
  * nthRoot(-32, 5); // => -2
  * nthRoot(16, 4); // => 2
+ * nthRoot(1e300, 5); // => 1e60 // Math.pow(1e300, 1 / 5) is 1.0000000000000076e60
  * nthRoot(-16, 4); // => NaN
  */
 export function nthRoot(value: number, n: number): number {
@@ -1810,11 +1894,20 @@ export function nthRoot(value: number, n: number): number {
 	if (n === 3) return Math.cbrt(value);
 	if (value < 0 && n % 2 === 0) return NaN;
 	const magnitude = Math.abs(value);
-	let root = Math.pow(magnitude, 1 / n);
+	// `n = 1`, `±0`, `±Infinity` and `NaN` are their own roots (a zero keeps its sign).
+	if (n === 1 || !(magnitude > 0 && magnitude < Infinity)) return value;
+	// `Math.pow(x, inverse)` is off by a factor `x ** (1 / n - inverse)` from the root, `ln(x) * (1 / n - inverse)` relatively, which is up
+	// to tens of ulps for large or tiny `x`: correct by it, from the exact rounding error of `inverse`, `-(n * inverse - 1) / n` (the rounded
+	// product minus 1 is exact, and so is its own error; from `n = 2 ** 52` on, the correction is far below an ulp, and splitting a huge `n`
+	// could overflow).
+	const inverse = 1 / n;
+	let root = Math.pow(magnitude, inverse);
+	if (n < 2 ** 52) root -= root * Math.log(magnitude) * ((n * inverse - 1 + productError(n, inverse)) / n);
+	root = exactRoot(root, magnitude, n);
+	// An integer whose power rounds to the value (`3 ** 40` is not exact) is the root as far as doubles can tell.
 	const nearest = Math.round(root);
-	if (Math.pow(nearest, n) === magnitude) root = nearest;
-	// `n = 1` and `±0` need no special case: the root is `|value|` and the sign (of a zero too) is restored here.
-	return Math.sign(value) * root;
+	if (Math.abs(root - nearest) <= root * 2 ** -50 && Math.pow(nearest, n) === magnitude) root = nearest;
+	return value < 0 ? -root : root;
 }
 
 /**
@@ -3083,21 +3176,28 @@ export function geometricMean(numbers: ReadonlyArray<number>): number {
 
 /**
  * Snaps an approximate `n`-th root to the exact one when the radicand is the `n`-th power of a double: an exact root `r` of a double has at
- * most `floor(53 / n)` significant bits (its `n`-th power has at most 53), so the approximation rounded to that many bits is `r` if `r`
- * exists, which its exact `n`-th power (computed by `n - 1` exact multiplications) confirms (`geometricMean([81, 1, 1, 1])` is then exactly
- * `3`, and `geometricMean([2.25, 1])` exactly `1.5`).
- * @param {number} root - The approximate root, at least `1`
- * @param {number} radicand - The radicand, at least `1`
+ * most `floor(52 / n) + 1` significant bits (an odd mantissa of `b` bits has an `n`-th power of at least `n * (b - 1) + 1` bits, and the
+ * power has at most 53), so the approximation rounded to that many bits (by Veltkamp's splitting) is `r` if `r` exists, which its exact
+ * `n`-th power (computed by `n - 1` multiplications, exact since every partial power has fewer bits than the last) confirms
+ * (`geometricMean([81, 1, 1, 1])` is then exactly `3`, `geometricMean([2.25, 1])` exactly `1.5`, and `nthRoot(3 ** 33, 33)` exactly `3`).
+ * @param {number} root - The approximate root, within an ulp or so of the exact one
+ * @param {number} radicand - The radicand, a positive finite double
  * @param {number} n - The degree of the root, a positive integer
  * @returns {number} The exact root if there is one, else `root`
  * @example
  * exactRoot(1.4999999999999998, 5.0625, 4); // => 1.5
  */
 function exactRoot(root: number, radicand: number, n: number): number {
-	// Beyond 26, an exact root has a single significant bit: in `[1, 2)` that is `1`, the root of `1`, which `nthRoot` gives exactly.
-	if (n > 26) return root;
-	const unit = 2 ** (Math.floor(Math.log2(root)) + 1 - Math.floor(53 / n));
-	const candidate = Math.round(root / unit) * unit;
+	// Beyond 52, an exact root has a single significant bit: a power of two, whose power is one too (and exact).
+	if (n > 52) {
+		const exponent = Math.round(Math.log2(root));
+		return 2 ** (exponent * n) === radicand ? 2 ** exponent : root;
+	}
+	// `root` rounded to `floor(52 / n) + 1` bits: the high part of its split by `2 ** (52 - floor(52 / n)) + 1`.
+	const split = (2 ** (52 - Math.floor(52 / n)) + 1) * root;
+	const candidate = split - (split - root);
+	// Not within a few ulps of a number that short: no exact root (and no need for its power).
+	if (Math.abs(candidate - root) > root * 2 ** -50) return root;
 	let power = candidate;
 	for (let i = 1; i < n; i++) power *= candidate;
 	return power === radicand ? candidate : root;
@@ -3149,8 +3249,12 @@ export function harmonicMean(numbers: ReadonlyArray<number>): number {
 		compensation += Math.abs(total) >= Math.abs(term) ? total - next + term : term - next + total;
 		total = next;
 	}
+	// `scaleByPowerOfTwo(value, exponent)`, with its two factors computed once.
+	const half = Math.trunc(exponent / 2);
+	const lowFactor = 2 ** half;
+	const highFactor = 2 ** (exponent - half);
 	for (const value of values) {
-		const scaled = scaleByPowerOfTwo(value, exponent);
+		const scaled = value * lowFactor * highFactor;
 		const reciprocal = 1 / scaled;
 		add(reciprocal);
 		// Splitting multiplies by `2 ** 27 + 1`, which would overflow for the largest doubles; the reciprocals of values beyond `2 ** 900`
@@ -3205,10 +3309,9 @@ export function rootMeanSquare(numbers: ReadonlyArray<number>): number {
 	const count = numbers.length;
 	if (count === 0) return NaN;
 	const [values, scale] = scaledSample(numbers);
-	const squares = values.map(function (value) {
-		return value * value;
-	});
-	return Math.sqrt(scaledSum(squares, count)) / scale;
+	// The scaled values are a copy: squared in place.
+	for (let i = 0; i < count; i++) values[i] *= values[i];
+	return Math.sqrt(scaledSum(values, count)) / scale;
 }
 
 /**
@@ -3329,11 +3432,9 @@ export function kurtosis(numbers: ReadonlyArray<number>, options: VarianceOption
 export function medianAbsoluteDeviation(numbers: ReadonlyArray<number>): number {
 	const sorted = sortedCopy(numbers);
 	const center = sortedMedian(sorted);
-	return median(
-		Array.from(sorted, function (value) {
-			return Math.abs(value - center);
-		})
-	);
+	const deviations: number[] = [];
+	for (let i = 0; i < sorted.length; i++) deviations.push(Math.abs(sorted[i] - center));
+	return median(deviations);
 }
 
 /**
@@ -3377,9 +3478,7 @@ export function trimmedMean(numbers: ReadonlyArray<number>, proportion: number):
  * ranks([3, NaN, 1]); // => [2, NaN, 1]
  */
 export function ranks(numbers: ReadonlyArray<number>): number[] {
-	const values = Array.from(numbers, function (value) {
-		return +value;
-	});
+	const values = toNumbers(numbers);
 	const result = new Array<number>(values.length).fill(NaN);
 	const order: number[] = [];
 	for (let i = 0; i < values.length; i++) {
@@ -3440,15 +3539,13 @@ export function standardize(numbers: ReadonlyArray<number>, options: VarianceOpt
 	const [values] = scaledSample(numbers);
 	const mean = average(values);
 	const deviation = standardDeviation(values, options);
-	const deviations = values.map(function (value) {
-		return value - mean;
-	});
+	// The scaled values are a copy: they become the deviations, then the scores, in place.
+	for (let i = 0; i < values.length; i++) values[i] -= mean;
 	// The mean of data far from zero cannot be held exactly (that of `1e15 + k` values is a multiple of `0.125`): the deviations from the
 	// rounded mean, which are exact for such data, are off by its rounding error, which is their own mean. Subtracting it centres them again.
-	const correction = sum(deviations) / deviations.length;
-	return deviations.map(function (offset) {
-		return deviation === 0 ? 0 : (offset - correction) / deviation;
-	});
+	const correction = sum(values) / values.length;
+	for (let i = 0; i < values.length; i++) values[i] = deviation === 0 ? 0 : (values[i] - correction) / deviation;
+	return values;
 }
 
 /**
@@ -3466,32 +3563,23 @@ export function standardize(numbers: ReadonlyArray<number>, options: VarianceOpt
  * softmax([]); // => []
  */
 export function softmax(numbers: ReadonlyArray<number>): number[] {
-	const values = Array.from(numbers, function (value) {
-		return +value;
-	});
+	// A copy, which becomes the weights in place.
+	const values = toNumbers(numbers);
+	const count = values.length;
 	const largest = max(values);
 	if (largest === Infinity) {
-		const infinities = values.filter(function (value) {
-			return value === Infinity;
-		}).length;
-		return values.map(function (value) {
-			return value === Infinity ? 1 / infinities : 0;
-		});
+		let infinities = 0;
+		for (let i = 0; i < count; i++) if (values[i] === Infinity) infinities++;
+		for (let i = 0; i < count; i++) values[i] = values[i] === Infinity ? 1 / infinities : 0;
+		return values;
 	}
-	// `NaN` (a `NaN` score), or `-Infinity` (every score is, or there are none: then the map is empty).
-	if (!(largest > -Infinity)) {
-		return values.map(function () {
-			return NaN;
-		});
-	}
-	const exponentials = values.map(function (value) {
-		return Math.exp(value - largest);
-	});
+	// `NaN` (a `NaN` score), or `-Infinity` (every score is, or there are none: then the array is empty).
+	if (!(largest > -Infinity)) return values.fill(NaN);
+	for (let i = 0; i < count; i++) values[i] = Math.exp(values[i] - largest);
 	// At least `1`: the largest score contributes `exp(0)`.
-	const total = sum(exponentials);
-	return exponentials.map(function (exponential) {
-		return exponential / total;
-	});
+	const total = sum(values);
+	for (let i = 0; i < count; i++) values[i] /= total;
+	return values;
 }
 
 /**
@@ -3572,9 +3660,7 @@ export interface Summary {
  * summarize([]).count; // => 0
  */
 export function summarize(numbers: ReadonlyArray<number>): Summary {
-	const values = Array.from(numbers, function (value) {
-		return +value;
-	});
+	const values = toNumbers(numbers);
 	const count = values.length;
 	const sorted = sortedCopy(values);
 	// `NaN` sorts last.

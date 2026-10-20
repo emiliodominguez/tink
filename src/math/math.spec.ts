@@ -5160,3 +5160,137 @@ describe('Regressions found by the reference reviews', function () {
 		expect(scores[2]).toBeCloseTo(Math.SQRT2, 15);
 	});
 });
+
+describe('Regressions found by the floating-point audit', function () {
+	it('weightedAverage is correctly rounded: the weights are scaled by a power of two and the products kept exactly', function () {
+		// Dividing the weights by the largest one rounded 1/3, and the mean came out an ulp off.
+		expect(helpers.weightedAverage([1, 2], [1, 3])).toBe(1.75);
+		expect(helpers.weightedAverage(['1', '2'] as never, ['1', '3'] as never)).toBe(1.75);
+		expect(helpers.weightedAverage([0.1, 0.2, 0.3], [1, 2, 3])).toBe(0.23333333333333334);
+		expect(helpers.weightedAverage([3.7, 1.2, 9.9], [2, 5, 7])).toBe(5.9071428571428575);
+		expect(helpers.weightedAverage([1e15 + 1, 1e15 + 3], [1, 2])).toBe(1000000000000002.4);
+	});
+
+	it('weightedAverage does not overflow when a product or the sum does but the mean does not', function () {
+		// The products were divided by the total weight only after overflowing to Infinity.
+		expect(helpers.weightedAverage([MAX, MAX], [3, 1])).toBe(MAX);
+		expect(helpers.weightedAverage([MAX, MAX, MAX], [1, 1, 1])).toBe(MAX);
+		expect(helpers.weightedAverage([MAX, MAX, -MAX, -MAX, 1], [1, 1, 1, 1, 1])).toBe(0.2);
+		expect(helpers.weightedAverage([MAX, MAX, -MAX, -MAX, 1e-300], [1, 1, 1, 1, 1])).toBe(2e-301);
+		expect(helpers.weightedAverage([MAX], [1])).toBe(MAX);
+		expect(helpers.weightedAverage([-MAX, 1], [1, 0])).toBe(-MAX);
+		expect(helpers.weightedAverage([MAX, 1e-300], [0, 1])).toBe(1e-300);
+		expect(helpers.weightedAverage([1e300], [5e-324])).toBe(1e300);
+		expect(helpers.weightedAverage([1e300, 3e300], [5e-324, 5e-324])).toBe(2e300);
+	});
+
+	it('weightedAverage lets non-finite values decide alone', function () {
+		expect(helpers.weightedAverage([Infinity, MAX, MAX], [1, 1, 1])).toBe(Infinity);
+		expect(helpers.weightedAverage([-Infinity, 1], [1, 3])).toBe(-Infinity);
+		expect(helpers.weightedAverage([Infinity, 1], [0, 1])).toBeNaN();
+		expect(helpers.weightedAverage([Infinity, -Infinity], [1, 1])).toBeNaN();
+		expect(helpers.weightedAverage([NaN, 1], [1, 1])).toBeNaN();
+		expect(helpers.weightedAverage([1, 2], [0, 0])).toBeNaN();
+	});
+
+	it('nthRoot is within an ulp of the exact root for any magnitude (Math.pow(x, 1 / n) was tens of ulps off)', function () {
+		expect(helpers.nthRoot(1e300, 5)).toBe(1e60);
+		expect(helpers.nthRoot(9.728650972174982e291, 5)).toBe(2.498104056273293e58);
+		expect(helpers.nthRoot(-9.728650972174982e291, 5)).toBe(-2.498104056273293e58);
+		expect(helpers.nthRoot(1e-300, 7)).toBe(1.3894954943731376e-43);
+		expect(helpers.nthRoot(7, 60)).toBe(1.0329634796331102);
+		// From 2 ** 52 on, the rounding of 1 / n is negligible.
+		expect(helpers.nthRoot(2, 2 ** 53)).toBe(1);
+		expect(helpers.nthRoot(0.5, 1e300)).toBe(1);
+	});
+
+	it('nthRoot returns exact roots exactly, fractions and powers of two included', function () {
+		expect(helpers.nthRoot(5.0625, 4)).toBe(1.5);
+		expect(helpers.nthRoot(1.5 ** 20, 20)).toBe(1.5);
+		expect(helpers.nthRoot(-(1.5 ** 21), 21)).toBe(-1.5);
+		expect(helpers.nthRoot(0.0001220703125 ** 10, 10)).toBe(0.0001220703125);
+		expect(helpers.nthRoot(2 ** -735, 35)).toBe(2 ** -21);
+		// An exact root of more than floor(53 / n) bits: 3 ** 33 is a double, and so is 8193 ** 4.
+		expect(helpers.nthRoot(3 ** 33, 33)).toBe(3);
+		expect(helpers.nthRoot(8193 ** 4, 4)).toBe(8193);
+		// Beyond 52, only powers of two have exact roots.
+		expect(helpers.nthRoot(2 ** -159, 53)).toBe(0.125);
+		expect(helpers.nthRoot(2 ** 1000, 1000)).toBe(2);
+		expect(helpers.nthRoot(2 ** -1074, 537)).toBe(0.25);
+		expect(helpers.nthRoot(3, 53)).toBe(3 ** (1 / 53));
+		// An integer whose power rounds to the value is still the root.
+		expect(helpers.nthRoot(3 ** 40, 40)).toBe(3);
+		expect(helpers.nthRoot(5e-324, 1074)).toBe(0.5);
+	});
+
+	it('toRadians and toDegrees do not overflow when only the intermediate product does', function () {
+		expect(helpers.toRadians(1e308)).toBe(1.7453292519943295e306);
+		expect(helpers.toRadians(-MAX)).toBe((-MAX / 180) * Math.PI);
+		expect(helpers.toDegrees(3e306)).toBe(1.7188733853924698e308);
+		expect(helpers.toDegrees(-MAX)).toBe(-Infinity);
+		expect(helpers.toRadians(Infinity)).toBe(Infinity);
+		expect(helpers.toRadians(NaN)).toBeNaN();
+		expect(helpers.toDegrees(-Infinity)).toBe(-Infinity);
+		expect(helpers.toDegrees(NaN)).toBeNaN();
+	});
+
+	it('percentage multiplies before it divides, as percentageChange does', function () {
+		// (1 / 3) * 100 is 33.33333333333333, an ulp below the double nearest to 100 / 3.
+		expect(helpers.percentage(1, 3)).toBe(100 / 3);
+		expect(helpers.percentage(2, 3)).toBe(200 / 3);
+		expect(helpers.percentage(1, 7)).toBe(100 / 7);
+		expect(helpers.percentage(1, MAX)).toBe(100 / MAX);
+		// 100 times the value overflows: divided first.
+		expect(helpers.percentage(1e308, 1e10)).toBe((1e308 / 1e10) * 100);
+		expect(helpers.percentage(MAX, MAX)).toBe(100);
+		expect(helpers.percentage(Infinity, 2)).toBe(Infinity);
+		expect(helpers.percentage(-Infinity, 2)).toBe(-Infinity);
+		expect(helpers.percentage(Infinity, Infinity)).toBeNaN();
+	});
+
+	it('zScore does not overflow when only the difference does', function () {
+		expect(helpers.zScore(1e308, -1e308, 1e308)).toBe(2);
+		expect(helpers.zScore(-MAX, MAX, MAX)).toBe(-2);
+		expect(helpers.zScore(MAX, -MAX, 5e-324)).toBe(Infinity);
+		expect(helpers.zScore(Infinity, 0, 1)).toBe(Infinity);
+		expect(helpers.zScore(0, Infinity, 1)).toBe(-Infinity);
+		expect(helpers.zScore(Infinity, Infinity, 1)).toBeNaN();
+	});
+
+	it('randomIntBetween draws over a range wider than Number.MAX_VALUE', function () {
+		// Every draw was MAX (r * Infinity), and NaN for r = 0 (0 * Infinity).
+		expect(helpers.randomIntBetween(-MAX, MAX, constant(0))).toBe(-MAX);
+		expect(helpers.randomIntBetween(-MAX, MAX, constant(ALMOST_ONE))).toBe(1.7976931348623153e308);
+		// Two draws: r = 0.5 + 2 ** -22.
+		expect(helpers.randomIntBetween(-MAX, MAX, constant(0.5))).toBe(-MAX * (0.5 - 2 ** -22) + MAX * (0.5 + 2 ** -22));
+		for (let i = 0; i < 100; i++) {
+			const value = helpers.randomIntBetween(-MAX, MAX);
+			expect(Number.isInteger(value)).toBe(true);
+			expect(Math.abs(value)).toBeLessThanOrEqual(MAX);
+		}
+	});
+
+	it('mode counts runs of the sorted values, with the semantics of a Map count', function () {
+		expect(helpers.mode([-0, 0, 1])).toEqual([0]);
+		expect(Object.is(helpers.mode([-0, -0, 1])[0], 0)).toBe(true);
+		expect(helpers.mode(['2', 2, 1] as never)).toEqual([2]);
+		expect(helpers.mode([Infinity, -Infinity, Infinity, -Infinity, 5])).toEqual([-Infinity, Infinity]);
+		expect(helpers.mode([3, 1, 2])).toEqual([1, 2, 3]);
+		expect(helpers.mode(new Set([3, 1]) as never)).toEqual([1, 3]);
+		const many = Array.from({ length: 100 }, function (_, index) {
+			return index % 7;
+		});
+		expect(helpers.mode(many)).toEqual([0, 1]);
+	});
+
+	it('the aggregates that copy their input still accept iterables and array-likes, as Array.from does', function () {
+		expect(helpers.softmax(new Set([1, 2]) as never)).toEqual(helpers.softmax([1, 2]));
+		expect(helpers.ranks({ length: 2, 0: 5, 1: 3 } as never)).toEqual([2, 1]);
+		expect(helpers.skewness(new Set([1, 2, 3, 10]) as never)).toBe(helpers.skewness([1, 2, 3, 10]));
+		expect(helpers.standardize(new Set([1, 2, 3]) as never, { sample: true })).toEqual([-1, 0, 1]);
+		const holey = new Array<number>(2);
+		holey[1] = 1;
+		expect(helpers.summarize(holey).mean).toBeNaN();
+		expect(helpers.rootMeanSquare(holey)).toBeNaN();
+	});
+});
