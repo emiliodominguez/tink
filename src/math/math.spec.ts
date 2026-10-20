@@ -376,6 +376,15 @@ describe('Math helpers', function () {
 			expect(helpers.modulo('7' as never, '3' as never)).toBe(1);
 		});
 
+		it('should keep working on two bigints (regression: the conversion of the divisor threw a TypeError)', function () {
+			expect(helpers.modulo(-5n as never, 3n as never)).toBe(1n);
+			expect(helpers.modulo(5n as never, -3n as never)).toBe(-1n);
+			expect(helpers.modulo(6n as never, 3n as never)).toBe(0n);
+			expect(function () {
+				helpers.modulo(5 as never, 3n as never);
+			}).toThrow(TypeError);
+		});
+
 		it('should return the modulo for positive operands', function () {
 			expect(helpers.modulo(7, 3)).toBe(1);
 			expect(helpers.modulo(10, 4)).toBe(2);
@@ -726,6 +735,23 @@ describe('Math helpers', function () {
 			expect(Object.is(helpers.median([0, -0, -0]), -0)).toBe(true);
 			expect(Object.is(helpers.median(new Array(17).fill(0).concat(new Array(16).fill(-0))), 0)).toBe(true);
 			expect(Object.is(helpers.median(new Array(16).fill(0).concat(new Array(17).fill(-0))), -0)).toBe(true);
+		});
+
+		it('should read long inputs by index (regression: collected through the iterator, a sparse array aborted the process)', function () {
+			// `Float64Array.from` gathered the elements through the iterator into a list first: for a sparse array of length about `1.2e8` or
+			// more, V8 aborted out of memory. An iterator that throws shows that the elements are read by index, as for short inputs.
+			const numbers = Array.from({ length: 41 }, function (_, index) {
+				return 40 - index;
+			});
+			Object.defineProperty(numbers, Symbol.iterator, {
+				value: function () {
+					throw new Error('iterated');
+				}
+			});
+			expect(helpers.median(numbers)).toBe(20);
+			expect(helpers.quantile(numbers, 0.25)).toBe(10);
+			expect(helpers.interquartileRange(numbers)).toBe(20);
+			expect(helpers.trimmedMean(numbers, 0.1)).toBe(20);
 		});
 
 		it('should return the mean of the middle values for even lengths', function () {

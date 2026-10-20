@@ -69,7 +69,13 @@ function sortsAfter(a: number, b: number): boolean {
  */
 function sortedCopy(numbers: ArrayLike<number>): ArrayLike<number> {
 	const length = numbers.length;
-	if (length > 32) return Float64Array.from(numbers).sort();
+	if (length > 32) {
+		// Filled by index, not with `Float64Array.from`, which collects the elements through the iterator first: on a sparse array of length
+		// about `1.2e8` or more, that list aborted the process out of memory.
+		const values = new Float64Array(length);
+		for (let i = 0; i < length; i++) values[i] = +numbers[i];
+		return values.sort();
+	}
 	const sorted: number[] = [];
 	for (let i = 0; i < length; i++) {
 		// The same conversion as the typed array's (`+` throws on BigInts too).
@@ -470,8 +476,9 @@ function roundDirected(caller: string, method: (value: number) => number, input:
  * modulo(1, -3); // => -2
  */
 export function modulo(dividend: number, divisor: number): number {
-	// Converted once with unary `+`: `rest + divisor` would concatenate a numeric string (`modulo(-1, '3')` was `'-13'`).
-	const number = +divisor;
+	// Converted once, with a double negation rather than unary `+`: `rest + divisor` would concatenate a numeric string (`modulo(-1, '3')`
+	// was `'-13'`), and two bigints keep working (`+` throws on them).
+	const number = -(-divisor);
 	const rest = dividend % number;
 	if (rest === 0) return 0;
 	if (rest < 0 === number < 0) return rest;
