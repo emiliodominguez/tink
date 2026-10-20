@@ -7081,6 +7081,21 @@ describe('Async helpers (options inherited from a polluted Object.prototype)', f
 		}
 	}
 
+	it('listens to a platform signal whatever listener options Object.prototype holds', async function () {
+		for (const [key, value] of [
+			['signal', pollutedSignal],
+			['capture', true],
+			['once', false]
+		] as const) {
+			const controller = new AbortController();
+			await polluted(key, value, async function () {
+				const slept = sleep(60_000, { signal: controller.signal });
+				controller.abort(new Error('stop'));
+				await expect(slept).rejects.toThrow('stop');
+			});
+		}
+	});
+
 	it('sleep and pollUntil ignore an inherited signal, interval or timeout', async function () {
 		await polluted('signal', pollutedSignal, function () {
 			return expect(sleep(0, {})).resolves.toBeUndefined();
