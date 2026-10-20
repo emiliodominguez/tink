@@ -909,7 +909,7 @@ function alphabetCharacters(alphabet: string): string[] {
  * @param {RandomGenerator} [random=Math.random] - Source of uniform numbers in `[0, 1)`, injectable for deterministic results
  * @returns {T} The chosen item
  * @throws {TypeError} when `random` is not a function, or a weight is not a number
- * @throws {RangeError} when the arrays differ in length, a weight is negative, NaN or infinite, the total weight is zero or not finite, or `random()` returns a value outside `[0, 1)`
+ * @throws {RangeError} when the arrays differ in length, a weight is negative, NaN or infinite, every weight is zero, or `random()` returns a value outside `[0, 1)`
  * @example
  * weightedRandom(['common', 'rare'], [9, 1]); // 'common' ~90% of the time
  * weightedRandom(['a', 'b', 'c'], [0, 1, 0]); // => 'b' // always
@@ -932,12 +932,15 @@ export function weightedRandom<T>(items: ReadonlyArray<T>, weights: ReadonlyArra
 		if (weight > largest) largest = weight;
 		if (weight > 0) lastPositive = i;
 	}
-	if (!(total > 0 && total < Infinity)) {
-		throw new RangeError(`weightedRandom: the total weight must be positive and finite, got ${total}`);
+	if (!(total > 0)) throw new RangeError(`weightedRandom: the total weight must be positive and finite, got ${total}`);
+	// Weights are scaled by the largest one, so that the draw times the total keeps its precision for tiny (subnormal) weights too. When
+	// the total of finite weights overflows (`[1e308, 1e308]`), the scaled weights are added up instead: at most one per item.
+	let scaledTotal = total / largest;
+	if (total === Infinity) {
+		scaledTotal = 0;
+		for (let i = 0; i < values.length; i++) scaledTotal += values[i] / largest;
 	}
-
-	// Weights are scaled by the largest one, so that the draw times the total keeps its precision for tiny (subnormal) weights too.
-	const target = draw('weightedRandom', random) * (total / largest);
+	const target = draw('weightedRandom', random) * scaledTotal;
 	let cumulative = 0;
 	// A zero-weight item can never satisfy `target < cumulative` before an earlier positive item did, so it is never chosen.
 	// The last positive item takes whatever remains, which also absorbs floating-point rounding at the top end.

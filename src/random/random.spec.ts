@@ -649,6 +649,12 @@ describe('random', function () {
 			// The draw times a subnormal total rounds up to the total itself: the trailing zero-weight item must still not be picked.
 			expect(helpers.weightedRandom(['a', 'b'], [Number.MIN_VALUE, 0], constant(1 - Number.EPSILON / 2))).toBe('a');
 			expect(helpers.weightedRandom(['only'], [3])).toBe('only');
+			// The total of finite weights overflows: the scaled weights are added up instead.
+			expect(helpers.weightedRandom(['a', 'b'], [1e308, 1e308], constant(0.49))).toBe('a');
+			expect(helpers.weightedRandom(['a', 'b'], [1e308, 1e308], constant(0.5))).toBe('b');
+			expect(helpers.weightedRandom(['a', 'b', 'c'], [Number.MAX_VALUE, 0, Number.MAX_VALUE], constant(1 - Number.EPSILON / 2))).toBe('c');
+			expect(helpers.weightedRandom(['a', 'b', 'c'], [1.5e308, 1.5e308, 1e308], constant(0.74))).toBe('b');
+			expect(helpers.weightedRandom(['a', 'b', 'c'], [1.5e308, 1.5e308, 1e308], constant(0.76))).toBe('c');
 		});
 
 		it('should follow the weights statistically', function () {
@@ -679,10 +685,6 @@ describe('random', function () {
 				[
 					['a', 'b'],
 					[1, Infinity]
-				],
-				[
-					['a', 'b'],
-					[1e308, 1e308]
 				]
 			];
 			for (const [items, weights] of cases) {
