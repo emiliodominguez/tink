@@ -1873,6 +1873,452 @@ describe('New math helpers (property-based)', function () {
 			);
 		});
 	});
+
+	describe('smoothstep and smootherstep', function () {
+		const edges = fc.tuple(finiteDouble, finiteDouble).filter(function ([a, b]) {
+			return a !== b;
+		});
+		const anyDouble = fc.double({ noNaN: true });
+
+		it('should stay in [0, 1] and be monotonic in x', function () {
+			fc.assert(
+				fc.property(edges, anyDouble, anyDouble, function ([a, b], x, y) {
+					const low = Math.min(a, b);
+					const high = Math.max(a, b);
+					const [first, second] = x <= y ? [x, y] : [y, x];
+					for (const fn of [helpers.smoothstep, helpers.smootherstep]) {
+						const value = fn(low, high, first);
+						expect(value).toBeGreaterThanOrEqual(0);
+						expect(value).toBeLessThanOrEqual(1);
+						expect(value).toBeLessThanOrEqual(fn(low, high, second) + 1e-14);
+					}
+				})
+			);
+		});
+
+		it('should be symmetric about the middle of the edges, and mirrored by reversing them', function () {
+			fc.assert(
+				fc.property(smallInt, smallInt, smallInt, function (a, b, x) {
+					fc.pre(a !== b);
+					for (const fn of [helpers.smoothstep, helpers.smootherstep]) {
+						expect(fn(a, b, x) + fn(a, b, a + b - x)).toBeCloseTo(1, 14);
+						expect(fn(b, a, x)).toBeCloseTo(1 - fn(a, b, x), 14);
+					}
+				})
+			);
+		});
+	});
+
+	describe('damp', function () {
+		const rate = fc.double({ min: 0, max: 100, noNaN: true });
+		const time = fc.double({ min: 0, max: 10, noNaN: true });
+
+		it('should move towards the target without overshooting it', function () {
+			fc.assert(
+				fc.property(finiteDouble, finiteDouble, rate, time, function (current, target, lambda, deltaTime) {
+					const result = helpers.damp(current, target, lambda, deltaTime);
+					expect(result).toBeGreaterThanOrEqual(Math.min(current, target));
+					expect(result).toBeLessThanOrEqual(Math.max(current, target));
+					expect(Math.abs(target - result)).toBeLessThanOrEqual(Math.abs(target - current));
+				})
+			);
+		});
+
+		it('should not depend on how a time span is split into steps', function () {
+			fc.assert(
+				fc.property(finiteDouble, finiteDouble, rate, time, function (current, target, lambda, deltaTime) {
+					const once = helpers.damp(current, target, lambda, deltaTime);
+					const twice = helpers.damp(helpers.damp(current, target, lambda, deltaTime / 2), target, lambda, deltaTime / 2);
+					// Up to rounding, and to the ulp a step too small to change the value moves it by.
+					const ulps = 4 * Number.EPSILON * Math.max(Math.abs(current), Math.abs(target)) + 2 * Number.MIN_VALUE;
+					expect(Math.abs(twice - once)).toBeLessThanOrEqual(1e-12 * Math.abs(target - current) + ulps);
+				})
+			);
+		});
+
+		it('should reach the target exactly after enough steps', function () {
+			fc.assert(
+				fc.property(finiteDouble, finiteDouble, fc.double({ min: 10, max: 100, noNaN: true }), function (current, target, lambda) {
+					let value = current;
+					let steps = 0;
+					while (value !== target && steps < 20_000) {
+						value = helpers.damp(value, target, lambda, 1 / 60);
+						steps++;
+					}
+					expect(value === target).toBe(true);
+				})
+			);
+		});
+	});
+
+	describe('angleDifference and lerpAngle', function () {
+		it('should give the congruent rotation in (-180, 180] (exactly, for integer angles)', function () {
+			fc.assert(
+				fc.property(smallInt, smallInt, function (from, to) {
+					const difference = helpers.angleDifference(from, to);
+					expect(difference).toBeGreaterThan(-180);
+					expect(difference).toBeLessThanOrEqual(180);
+					expect(helpers.modulo(from + difference - to, 360)).toBe(0);
+					if (difference !== 180) expect(helpers.angleDifference(to, from)).toBe(-difference + 0);
+				})
+			);
+		});
+
+		it('should give a rotation in (-π, π] congruent up to rounding, in radians', function () {
+			fc.assert(
+				fc.property(finiteDouble, finiteDouble, function (from, to) {
+					const difference = helpers.angleDifference(from, to, 2 * Math.PI);
+					expect(difference).toBeGreaterThan(-Math.PI);
+					expect(difference).toBeLessThanOrEqual(Math.PI);
+					expect(Math.abs(helpers.angleDifference(from + difference, to, 2 * Math.PI))).toBeLessThan(1e-9);
+				})
+			);
+		});
+
+		it('should start at start, end at an angle congruent to end, and never go more than a half turn away', function () {
+			fc.assert(
+				fc.property(smallInt, smallInt, unit, function (start, end, t) {
+					expect(helpers.lerpAngle(start, end, 0)).toBe(start);
+					expect(helpers.modulo(helpers.lerpAngle(start, end, 1) - end, 360)).toBe(0);
+					expect(Math.abs(helpers.lerpAngle(start, end, t) - start)).toBeLessThanOrEqual(180);
+				})
+			);
+		});
+	});
+
+	describe('pingPong', function () {
+		const length = fc.integer({ min: 1, max: 1000 });
+
+		it('should equal the triangle wave for integers, and be even and periodic', function () {
+			fc.assert(
+				fc.property(smallInt, length, function (value, top) {
+					const result = helpers.pingPong(value, top);
+					expect(result).toBe(top - Math.abs(helpers.modulo(value, 2 * top) - top));
+					expect(helpers.pingPong(-value, top)).toBe(result);
+					expect(helpers.pingPong(value + 2 * top, top)).toBe(result);
+				})
+			);
+		});
+
+		it('should stay in [0, length]', function () {
+			fc.assert(
+				fc.property(
+					fc.double({ noNaN: true, noDefaultInfinity: true }),
+					fc.double({ min: Number.MIN_VALUE, max: Number.MAX_VALUE, noNaN: true }),
+					function (value, top) {
+						const result = helpers.pingPong(value, top);
+						expect(result).toBeGreaterThanOrEqual(0);
+						expect(result).toBeLessThanOrEqual(top);
+					}
+				)
+			);
+		});
+	});
+
+	describe('linspace', function () {
+		const anyFinite = fc.double({ noNaN: true, noDefaultInfinity: true });
+		const count = fc.integer({ min: 0, max: 200 });
+
+		it('should have exact endpoints and monotonic values within the bounds', function () {
+			fc.assert(
+				fc.property(anyFinite, anyFinite, count, fc.boolean(), function (start, end, n, endpoint) {
+					const values = helpers.linspace(start, end, n, { endpoint });
+					expect(values).toHaveLength(n);
+					if (n === 0) return;
+					expect(values[0]).toBe(start);
+					if (endpoint && n > 1) expect(values[n - 1]).toBe(end);
+					const direction = start <= end ? 1 : -1;
+					for (let i = 0; i < n; i++) {
+						expect(values[i]).toBeGreaterThanOrEqual(Math.min(start, end));
+						expect(values[i]).toBeLessThanOrEqual(Math.max(start, end));
+						if (i > 0) expect((values[i] - values[i - 1]) * direction).toBeGreaterThanOrEqual(0);
+					}
+				})
+			);
+		});
+
+		it('should exclude the endpoint like the first n values of n + 1', function () {
+			fc.assert(
+				fc.property(anyFinite, anyFinite, fc.integer({ min: 1, max: 100 }), function (start, end, n) {
+					expect(helpers.linspace(start, end, n, { endpoint: false })).toEqual(helpers.linspace(start, end, n + 1).slice(0, n));
+				})
+			);
+		});
+
+		it('should be evenly spaced up to rounding', function () {
+			fc.assert(
+				fc.property(finiteDouble, finiteDouble, fc.integer({ min: 2, max: 100 }), function (start, end, n) {
+					const values = helpers.linspace(start, end, n);
+					for (let i = 0; i < n; i++) {
+						expect(Math.abs(values[i] - (start + ((end - start) * i) / (n - 1)))).toBeLessThanOrEqual(4 * Number.EPSILON * (Math.abs(start) + Math.abs(end)));
+					}
+				})
+			);
+		});
+	});
+
+	describe('ticks and niceDomain', function () {
+		/** d3-array 3.2's `ticks` (ISC license), the reference. */
+		function d3Ticks(start: number, stop: number, count: number): number[] {
+			const e10 = Math.sqrt(50);
+			const e5 = Math.sqrt(10);
+			const e2 = Math.sqrt(2);
+			function tickSpec(low: number, high: number, n: number): [number, number, number] {
+				const step = (high - low) / Math.max(0, n);
+				const power = Math.floor(Math.log10(step));
+				const error = step / Math.pow(10, power);
+				const factor = error >= e10 ? 10 : error >= e5 ? 5 : error >= e2 ? 2 : 1;
+				let i1: number;
+				let i2: number;
+				let inc: number;
+				if (power < 0) {
+					inc = Math.pow(10, -power) / factor;
+					i1 = Math.round(low * inc);
+					i2 = Math.round(high * inc);
+					if (i1 / inc < low) ++i1;
+					if (i2 / inc > high) --i2;
+					inc = -inc;
+				} else {
+					inc = Math.pow(10, power) * factor;
+					i1 = Math.round(low / inc);
+					i2 = Math.round(high / inc);
+					if (i1 * inc < low) ++i1;
+					if (i2 * inc > high) --i2;
+				}
+				if (i2 < i1 && 0.5 <= n && n < 2) return tickSpec(low, high, n * 2);
+				return [i1, i2, inc];
+			}
+			if (start === stop) return [start];
+			const reverse = stop < start;
+			const [i1, i2, inc] = reverse ? tickSpec(stop, start, count) : tickSpec(start, stop, count);
+			if (!(i2 >= i1)) return [];
+			const n = i2 - i1 + 1;
+			const result = new Array<number>(n);
+			if (reverse) {
+				if (inc < 0) for (let i = 0; i < n; ++i) result[i] = (i2 - i) / -inc;
+				else for (let i = 0; i < n; ++i) result[i] = (i2 - i) * inc;
+			} else {
+				if (inc < 0) for (let i = 0; i < n; ++i) result[i] = (i1 + i) / -inc;
+				else for (let i = 0; i < n; ++i) result[i] = (i1 + i) * inc;
+			}
+			return result.map(function (tick) {
+				return tick + 0;
+			});
+		}
+
+		/** A domain whose width is not negligible next to its bounds (where d3's ticks are not distinct). */
+		const domain = fc
+			.tuple(fc.double({ min: -1e9, max: 1e9, noNaN: true }), fc.double({ min: -1e9, max: 1e9, noNaN: true }), fc.integer({ min: 1, max: 60 }))
+			.filter(function ([a, b]) {
+				return Math.abs(b - a) > 1e-6 * Math.max(Math.abs(a), Math.abs(b), 1e-300);
+			});
+
+		it('should match d3-array', function () {
+			fc.assert(
+				fc.property(domain, function ([start, stop, count]) {
+					expect(helpers.ticks(start, stop, count)).toEqual(d3Ticks(start, stop, count));
+				})
+			);
+		});
+
+		it('should give evenly spaced, strictly monotonic ticks inside the domain, about count of them', function () {
+			fc.assert(
+				fc.property(domain, function ([start, stop, count]) {
+					const values = helpers.ticks(start, stop, count);
+					const direction = start <= stop ? 1 : -1;
+					expect(values.length).toBeLessThanOrEqual(1.6 * count + 1);
+					expect(values.length).toBeGreaterThanOrEqual(count / 1.6 - 1);
+					for (let i = 0; i < values.length; i++) {
+						expect(values[i]).toBeGreaterThanOrEqual(Math.min(start, stop));
+						expect(values[i]).toBeLessThanOrEqual(Math.max(start, stop));
+						if (i > 0) expect((values[i] - values[i - 1]) * direction).toBeGreaterThan(0);
+						if (i > 1) expect(values[i] - values[i - 1]).toBeCloseTo(values[1] - values[0], 6);
+					}
+				})
+			);
+		});
+
+		it('should stay inside any finite domain, strictly monotonic', function () {
+			const anyFinite = fc.double({ noNaN: true, noDefaultInfinity: true });
+			fc.assert(
+				fc.property(anyFinite, anyFinite, fc.double({ min: 0.1, max: 2000, noNaN: true }), function (start, stop, count) {
+					const values = helpers.ticks(start, stop, count);
+					// A step capped at 1e308 gives up to 4 ticks over the whole range of doubles.
+					expect(values.length).toBeLessThanOrEqual(Math.max(1.6 * count + 2, 4));
+					for (let i = 0; i < values.length; i++) {
+						expect(values[i]).toBeGreaterThanOrEqual(Math.min(start, stop));
+						expect(values[i]).toBeLessThanOrEqual(Math.max(start, stop));
+						if (i > 0) expect(start <= stop ? values[i] > values[i - 1] : values[i] < values[i - 1]).toBe(true);
+					}
+				})
+			);
+		});
+
+		it('should contain the domain, keep its direction, and be idempotent', function () {
+			const anyFinite = fc.double({ noNaN: true, noDefaultInfinity: true });
+			fc.assert(
+				fc.property(anyFinite, anyFinite, fc.integer({ min: 1, max: 60 }), function (start, stop, count) {
+					const [niceStart, niceStop] = helpers.niceDomain(start, stop, count);
+					expect(Math.min(niceStart, niceStop)).toBeLessThanOrEqual(Math.min(start, stop));
+					expect(Math.max(niceStart, niceStop)).toBeGreaterThanOrEqual(Math.max(start, stop));
+					expect(niceStart <= niceStop).toBe(start <= stop);
+					expect(helpers.niceDomain(stop, start, count)).toEqual([niceStop, niceStart]);
+				})
+			);
+		});
+
+		it('should give bounds that are the first and last ticks (for 2 ticks or more)', function () {
+			fc.assert(
+				fc.property(domain, function ([start, stop, count]) {
+					// With fewer, the nice bounds widen the domain enough to double the step, every round (as in d3).
+					fc.pre(count >= 2);
+					const [niceStart, niceStop] = helpers.niceDomain(start, stop, count);
+					const values = helpers.ticks(niceStart, niceStop, count);
+					expect(values[0]).toBe(niceStart);
+					expect(values[values.length - 1]).toBe(niceStop);
+					expect(helpers.niceDomain(niceStart, niceStop, count)).toEqual([niceStart, niceStop]);
+				})
+			);
+		});
+	});
+
+	describe('dot, norm, distance and cosineSimilarity', function () {
+		function first(pair: [number, number]): number {
+			return pair[0];
+		}
+
+		function second(pair: [number, number]): number {
+			return pair[1];
+		}
+
+		/** Doubles with at most 50 significant bits after the binary point of 2 ** -20: their products are exact rationals over 2 ** 40. */
+		const fixed = fc.integer({ min: -(2 ** 30), max: 2 ** 30 }).map(function (n) {
+			return n / 2 ** 20;
+		});
+		const pairs = fc.array(fc.tuple(fixed, fixed), { maxLength: 20 });
+
+		it('should be as accurate as twice the precision of doubles (against an exact BigInt reference)', function () {
+			fc.assert(
+				fc.property(pairs, function (list) {
+					const xs = list.map(first);
+					const ys = list.map(second);
+					let numerator = 0n;
+					let absolute = 0;
+					for (const [x, y] of list) {
+						numerator += BigInt(x * 2 ** 20) * BigInt(y * 2 ** 20);
+						absolute += Math.abs(x * y);
+					}
+					const exact = Number(numerator) / 2 ** 40;
+					expect(Math.abs(helpers.dot(xs, ys) - exact)).toBeLessThanOrEqual(Math.abs(exact) * Number.EPSILON + absolute * 2 ** -95);
+				})
+			);
+		});
+
+		it('should cancel exactly where the plain loop loses everything', function () {
+			fc.assert(
+				fc.property(fixed, fc.integer({ min: 30, max: 300 }), function (small, power) {
+					const big = 2 ** power;
+					expect(helpers.dot([big, small, -big], [1, 1, 1])).toBe(small);
+					expect(helpers.dot([big, small, big], [big, 1, -big])).toBe(small);
+				})
+			);
+		});
+
+		it('should be symmetric, odd and scale exactly by powers of two', function () {
+			fc.assert(
+				fc.property(pairs, fc.integer({ min: -20, max: 20 }), function (list, power) {
+					const xs = list.map(first);
+					const ys = list.map(second);
+					const product = helpers.dot(xs, ys);
+					expect(helpers.dot(ys, xs)).toBe(product);
+					expect(
+						helpers.dot(
+							xs.map(function (x) {
+								return -x;
+							}),
+							ys
+						)
+					).toBe(-product + 0);
+					expect(
+						helpers.dot(
+							xs.map(function (x) {
+								return x * 2 ** power;
+							}),
+							ys
+						)
+					).toBe(product * 2 ** power);
+				})
+			);
+		});
+
+		const vector = fc.array(finiteDouble, { minLength: 1, maxLength: 20 });
+
+		it('should give the length of Math.hypot (within an ulp), scaled exactly by powers of two', function () {
+			fc.assert(
+				fc.property(vector, fc.integer({ min: -900, max: 900 }), function (xs, power) {
+					const length = helpers.norm(xs);
+					expect(Math.abs(length - Math.hypot(...xs))).toBeLessThanOrEqual(2 * Number.EPSILON * length);
+					// Subnormal lengths are rounded more coarsely than their doubled or halved counterparts.
+					fc.pre(length > 1e-290 && length * 2 ** power > 1e-290);
+					expect(
+						helpers.norm(
+							xs.map(function (x) {
+								return x * 2 ** power;
+							})
+						)
+					).toBe(length * 2 ** power);
+				})
+			);
+		});
+
+		it('should give a symmetric distance, the length of the difference, with the triangle inequality', function () {
+			const points = fc.integer({ min: 1, max: 10 }).chain(function (n) {
+				const point = fc.array(finiteDouble, { minLength: n, maxLength: n });
+				return fc.tuple(point, point, point);
+			});
+			fc.assert(
+				fc.property(points, function ([a, b, c]) {
+					const ab = helpers.distance(a, b);
+					expect(helpers.distance(b, a)).toBe(ab);
+					expect(ab).toBe(
+						helpers.norm(
+							a.map(function (value, i) {
+								return value - b[i];
+							})
+						)
+					);
+					expect(helpers.distance(a, c)).toBeLessThanOrEqual((ab + helpers.distance(b, c)) * (1 + 4 * Number.EPSILON));
+				})
+			);
+		});
+
+		it('should give a symmetric, odd, scale-invariant cosine in [-1, 1]', function () {
+			fc.assert(
+				fc.property(pairs, fc.integer({ min: -500, max: 500 }), fc.double({ min: 1e-3, max: 1e3, noNaN: true }), function (list, power, factor) {
+					const xs = list.map(first);
+					const ys = list.map(second);
+					const cosine = helpers.cosineSimilarity(xs, ys);
+					fc.pre(!Number.isNaN(cosine));
+					expect(cosine).toBeGreaterThanOrEqual(-1);
+					expect(cosine).toBeLessThanOrEqual(1);
+					expect(helpers.cosineSimilarity(ys, xs)).toBe(cosine);
+					const negated = ys.map(function (y) {
+						return -y;
+					});
+					expect(helpers.cosineSimilarity(xs, negated)).toBe(-cosine + 0);
+					const scaled = xs.map(function (x) {
+						return x * 2 ** power;
+					});
+					expect(helpers.cosineSimilarity(scaled, ys)).toBe(cosine);
+					const stretched = xs.map(function (x) {
+						return x * factor;
+					});
+					expect(helpers.cosineSimilarity(stretched, ys)).toBeCloseTo(cosine, 12);
+					expect(helpers.cosineSimilarity(xs, xs)).toBeCloseTo(1, 15);
+				})
+			);
+		});
+	});
 });
 
 describe('Statistics helpers (property-based)', function () {

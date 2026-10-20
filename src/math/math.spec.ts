@@ -4515,3 +4515,571 @@ describe('findRoot', function () {
 		}
 	});
 });
+
+describe('smoothstep and smootherstep', function () {
+	it('follows the Hermite curves between the edges', function () {
+		expect(helpers.smoothstep(0, 10, 5)).toBe(0.5);
+		expect(helpers.smoothstep(0, 10, 2.5)).toBe(0.15625);
+		expect(helpers.smoothstep(0, 10, 7.5)).toBe(0.84375);
+		expect(helpers.smootherstep(0, 10, 5)).toBe(0.5);
+		expect(helpers.smootherstep(0, 10, 2.5)).toBe(0.103515625);
+		expect(helpers.smootherstep(-1, 1, 0)).toBe(0.5);
+	});
+
+	it('clamps outside the edges, infinities included', function () {
+		for (const fn of [helpers.smoothstep, helpers.smootherstep]) {
+			expect(fn(0, 10, -3)).toBe(0);
+			expect(fn(0, 10, 0)).toBe(0);
+			expect(fn(0, 10, 10)).toBe(1);
+			expect(fn(0, 10, 12)).toBe(1);
+			expect(fn(0, 10, Infinity)).toBe(1);
+			expect(fn(0, 10, -Infinity)).toBe(0);
+			expect(fn(0, 10, NaN)).toBeNaN();
+		}
+	});
+
+	it('mirrors the curve for reversed edges', function () {
+		expect(helpers.smoothstep(10, 0, 2.5)).toBe(0.84375);
+		expect(helpers.smoothstep(10, 0, 12)).toBe(0);
+		expect(helpers.smoothstep(10, 0, -1)).toBe(1);
+		expect(helpers.smootherstep(10, 0, 5)).toBe(0.5);
+	});
+
+	it('is a step when the edges are equal', function () {
+		expect(helpers.smoothstep(5, 5, 4.9)).toBe(0);
+		expect(helpers.smoothstep(5, 5, 5)).toBe(1);
+		expect(helpers.smoothstep(5, 5, Infinity)).toBe(1);
+		expect(helpers.smootherstep(5, 5, -Infinity)).toBe(0);
+		expect(helpers.smoothstep(5, 5, NaN)).toBeNaN();
+	});
+
+	it('handles edges further apart than Number.MAX_VALUE', function () {
+		expect(helpers.smoothstep(-MAX, MAX, 0)).toBe(0.5);
+		expect(helpers.smootherstep(-MAX, MAX, MAX)).toBe(1);
+	});
+
+	it('rejects edges that are not finite numbers', function () {
+		expect(function () {
+			helpers.smoothstep(Infinity, 1, 0);
+		}).toThrow(new RangeError('smoothstep: `edge0` must be a finite number, got Infinity'));
+		expect(function () {
+			helpers.smootherstep(0, NaN, 0);
+		}).toThrow(new RangeError('smootherstep: `edge1` must be a finite number, got NaN'));
+		expect(function () {
+			helpers.smoothstep('0' as never, 1, 0);
+		}).toThrow(new TypeError('smoothstep: `edge0` must be a finite number, got string'));
+	});
+});
+
+describe('damp', function () {
+	it('decays exponentially towards the target', function () {
+		expect(helpers.damp(0, 100, Math.LN2, 1)).toBe(50);
+		expect(helpers.damp(100, 0, Math.LN2, 2)).toBe(25);
+		expect(helpers.damp(0, 100, 5, 0)).toBe(0);
+		expect(helpers.damp(0, 100, 0, 10)).toBe(0);
+	});
+
+	it('reaches the target exactly once the remaining distance rounds away', function () {
+		expect(helpers.damp(0, 100, 5, 100)).toBe(100);
+		expect(helpers.damp(-3, 0.1, 1e300, 1e300)).toBe(0.1);
+		let value = 0;
+		let frames = 0;
+		while (value !== 1 && frames < 10_000) {
+			value = helpers.damp(value, 1, 10, 1 / 60);
+			frames++;
+		}
+		expect(value).toBe(1);
+		expect(frames).toBeLessThan(10_000);
+	});
+
+	it('moves by an ulp when the step rounds back to the current value', function () {
+		expect(helpers.damp(0.9999999999999991, 1, 10, 1 / 60)).toBe(0.9999999999999992);
+		expect(helpers.damp(1.0000000000000009, 1, 10, 1 / 60)).toBe(1.0000000000000007);
+		expect(helpers.damp(1e10, 0, 1, 1e-30)).toBe(9999999999.999998);
+		expect(helpers.damp(Infinity, 0, 1, 1e-30)).toBe(Infinity);
+		expect(helpers.damp(-Infinity, 0, 0.5, 1)).toBe(-Infinity);
+	});
+
+	it('keeps tiny steps that 1 - Math.exp(-x) would round away', function () {
+		expect(helpers.damp(0, 1, 1e-17, 1)).toBe(1e-17);
+	});
+
+	it('does not depend on how a time span is split into frames', function () {
+		const once = helpers.damp(3, 42, 2, 1);
+		let split = 3;
+		for (let i = 0; i < 4; i++) split = helpers.damp(split, 42, 2, 0.25);
+		expect(split).toBeCloseTo(once, 12);
+	});
+
+	it('propagates NaN values', function () {
+		expect(helpers.damp(NaN, 1, 1, 1)).toBeNaN();
+		expect(helpers.damp(0, NaN, 1, 1)).toBeNaN();
+	});
+
+	it('rejects a negative or non-finite rate or time', function () {
+		expect(function () {
+			helpers.damp(0, 1, -1, 1);
+		}).toThrow(new RangeError('damp: `lambda` must be a finite number >= 0, got -1'));
+		expect(function () {
+			helpers.damp(0, 1, Infinity, 1);
+		}).toThrow(new RangeError('damp: `lambda` must be a finite number >= 0, got Infinity'));
+		expect(function () {
+			helpers.damp(0, 1, 1, NaN);
+		}).toThrow(new RangeError('damp: `deltaTime` must be a finite number >= 0, got NaN'));
+		expect(function () {
+			helpers.damp(0, 1, 1, '1' as never);
+		}).toThrow(new TypeError('damp: `deltaTime` must be a finite number >= 0, got string'));
+	});
+});
+
+describe('angleDifference and lerpAngle', function () {
+	it('gives the shortest signed rotation', function () {
+		expect(helpers.angleDifference(350, 10)).toBe(20);
+		expect(helpers.angleDifference(10, 350)).toBe(-20);
+		expect(helpers.angleDifference(0, 90)).toBe(90);
+		expect(helpers.angleDifference(-720, 30)).toBe(30);
+		expect(helpers.angleDifference(0, 540)).toBe(180);
+		expect(helpers.angleDifference(45, 45)).toBe(0);
+	});
+
+	it('gives +period / 2 for a half turn in either direction', function () {
+		expect(helpers.angleDifference(0, 180)).toBe(180);
+		expect(helpers.angleDifference(0, -180)).toBe(180);
+		expect(helpers.angleDifference(180, 0)).toBe(180);
+		expect(helpers.angleDifference(0, Math.PI, 2 * Math.PI)).toBe(Math.PI);
+	});
+
+	it('works in radians and other periods', function () {
+		expect(helpers.angleDifference(0, (3 * Math.PI) / 2, 2 * Math.PI)).toBe(-Math.PI / 2);
+		expect(helpers.angleDifference(23, 1, 24)).toBe(2);
+		expect(helpers.angleDifference(0, 1, 5e-324)).toBe(0);
+	});
+
+	it('reduces large angles exactly before subtracting', function () {
+		// 1e20 ≡ 280 (mod 360), and 98304 ≡ 24 (mod 360); 1e20 + 98304 is exact (a multiple of the ulp, 16384).
+		expect(helpers.angleDifference(0, 1e20)).toBe(-80);
+		expect(helpers.angleDifference(1e20 + 98304, 1e20)).toBe(-24);
+	});
+
+	it('returns +0 for no rotation, and NaN for angles that are not finite', function () {
+		expect(Object.is(helpers.angleDifference(-0, 0), 0)).toBe(true);
+		expect(Object.is(helpers.angleDifference(0, -0), 0)).toBe(true);
+		expect(Object.is(helpers.angleDifference(10, 370), 0)).toBe(true);
+		expect(helpers.angleDifference(NaN, 0)).toBeNaN();
+		expect(helpers.angleDifference(0, Infinity)).toBeNaN();
+	});
+
+	it('interpolates along the shortest arc, unwrapped', function () {
+		expect(helpers.lerpAngle(350, 10, 0.5)).toBe(360);
+		expect(helpers.lerpAngle(350, 10, 1)).toBe(370);
+		expect(helpers.lerpAngle(10, 350, 0.5)).toBe(0);
+		expect(helpers.lerpAngle(0, 90, 0.5)).toBe(45);
+		expect(helpers.lerpAngle(0, 90, 2)).toBe(180);
+		expect(helpers.lerpAngle(0, 180, 0.5)).toBe(90);
+		expect(helpers.lerpAngle(0, Math.PI / 2, 0.5, 2 * Math.PI)).toBe(Math.PI / 4);
+		expect(helpers.wrap(helpers.lerpAngle(350, 10, 0.75), 0, 360)).toBe(5);
+	});
+
+	it('returns exactly start at t = 0', function () {
+		expect(Object.is(helpers.lerpAngle(-0, 90, 0), -0)).toBe(true);
+		expect(helpers.lerpAngle(1e20, 0, 0)).toBe(1e20);
+	});
+
+	it('rejects a period that is not a finite number > 0', function () {
+		expect(function () {
+			helpers.angleDifference(0, 1, 0);
+		}).toThrow(new RangeError('angleDifference: `period` must be a finite number > 0, got 0'));
+		expect(function () {
+			helpers.angleDifference(0, 1, Infinity);
+		}).toThrow(new RangeError('angleDifference: `period` must be a finite number > 0, got Infinity'));
+		expect(function () {
+			helpers.lerpAngle(0, 1, 0.5, -360);
+		}).toThrow(new RangeError('lerpAngle: `period` must be a finite number > 0, got -360'));
+		expect(function () {
+			helpers.lerpAngle(0, 1, 0.5, '360' as never);
+		}).toThrow(new TypeError('lerpAngle: `period` must be a finite number > 0, got string'));
+	});
+});
+
+describe('pingPong', function () {
+	it('bounces between 0 and length', function () {
+		expect(helpers.pingPong(0, 3)).toBe(0);
+		expect(helpers.pingPong(2, 3)).toBe(2);
+		expect(helpers.pingPong(3, 3)).toBe(3);
+		expect(helpers.pingPong(4, 3)).toBe(2);
+		expect(helpers.pingPong(6, 3)).toBe(0);
+		expect(helpers.pingPong(7.5, 3)).toBe(1.5);
+		expect(helpers.pingPong(13, 3)).toBe(1);
+	});
+
+	it('mirrors negative values', function () {
+		expect(helpers.pingPong(-1, 3)).toBe(1);
+		expect(helpers.pingPong(-4, 3)).toBe(2);
+		expect(helpers.pingPong(-0, 3)).toBe(0);
+	});
+
+	it('keeps values as written on the rising half', function () {
+		expect(helpers.pingPong(0.1, 3)).toBe(0.1);
+		expect(helpers.pingPong(0.7, 1)).toBe(0.7);
+	});
+
+	it('handles lengths whose cycle exceeds Number.MAX_VALUE', function () {
+		expect(helpers.pingPong(1e308, 1e308)).toBe(1e308);
+		expect(helpers.pingPong(-1e308, 1e308)).toBe(1e308);
+		expect(helpers.pingPong(1.7e308, 1e308)).toBe(2 * (1e308 - 0.85e308));
+		expect(helpers.pingPong(5, MAX)).toBe(5);
+	});
+
+	it('returns NaN for values that are not finite', function () {
+		expect(helpers.pingPong(NaN, 3)).toBeNaN();
+		expect(helpers.pingPong(Infinity, 3)).toBeNaN();
+	});
+
+	it('rejects a length that is not a finite number > 0', function () {
+		expect(function () {
+			helpers.pingPong(1, 0);
+		}).toThrow(new RangeError('pingPong: `length` must be a finite number > 0, got 0'));
+		expect(function () {
+			helpers.pingPong(1, NaN);
+		}).toThrow(new RangeError('pingPong: `length` must be a finite number > 0, got NaN'));
+		expect(function () {
+			helpers.pingPong(1, null as never);
+		}).toThrow(new TypeError('pingPong: `length` must be a finite number > 0, got null'));
+	});
+});
+
+describe('linspace', function () {
+	it('spaces values evenly, endpoints included', function () {
+		expect(helpers.linspace(0, 1, 5)).toEqual([0, 0.25, 0.5, 0.75, 1]);
+		expect(helpers.linspace(10, 0, 3)).toEqual([10, 5, 0]);
+		expect(helpers.linspace(-1, 1, 2)).toEqual([-1, 1]);
+		expect(helpers.linspace(2, 5, 1)).toEqual([2]);
+		expect(helpers.linspace(2, 5, 0)).toEqual([]);
+		expect(helpers.linspace(3, 3, 3)).toEqual([3, 3, 3]);
+	});
+
+	it('gives decimal fractions as written, without accumulated error', function () {
+		expect(helpers.linspace(0, 1, 11)).toEqual([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]);
+		expect(helpers.linspace(1, 2, 11)[3]).toBe(1.3);
+		const many = helpers.linspace(0.1, 0.7, 1_000_001);
+		expect(many[0]).toBe(0.1);
+		expect(many[1_000_000]).toBe(0.7);
+	});
+
+	it('excludes the end with { endpoint: false }', function () {
+		expect(helpers.linspace(0, 1, 4, { endpoint: false })).toEqual([0, 0.25, 0.5, 0.75]);
+		expect(helpers.linspace(0, 1, 1, { endpoint: false })).toEqual([0]);
+		expect(helpers.linspace(0, 360, 3, { endpoint: false })).toEqual([0, 120, 240]);
+		expect(helpers.linspace(0, 1, 2, { endpoint: true })).toEqual([0, 1]);
+	});
+
+	it('handles spans and offsets that overflow', function () {
+		expect(helpers.linspace(0, 1e308, 5)).toEqual([0, 2.5e307, 5e307, 7.5e307, 1e308]);
+		const wide = helpers.linspace(-MAX, MAX, 3);
+		expect(wide).toEqual([-MAX, 0, MAX]);
+		const values = helpers.linspace(-1e308, 1.7e308, 4);
+		expect(values[0]).toBe(-1e308);
+		expect(values[3]).toBe(1.7e308);
+		expect(values[1]).toBeCloseTo(-1e307, -300);
+	});
+
+	it('ignores an endpoint option inherited from a polluted Object.prototype', function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		proto.endpoint = false;
+		try {
+			expect(helpers.linspace(0, 1, 3)).toEqual([0, 0.5, 1]);
+		} finally {
+			delete proto.endpoint;
+		}
+	});
+
+	it('rejects non-finite bounds and invalid counts', function () {
+		expect(function () {
+			helpers.linspace(NaN, 1, 2);
+		}).toThrow(new RangeError('linspace: `start` must be a finite number, got NaN'));
+		expect(function () {
+			helpers.linspace(0, Infinity, 2);
+		}).toThrow(new RangeError('linspace: `end` must be a finite number, got Infinity'));
+		expect(function () {
+			helpers.linspace(0, 1, -1);
+		}).toThrow(new RangeError('linspace: `count` must be an integer between 0 and 16777216, got -1'));
+		expect(function () {
+			helpers.linspace(0, 1, 2.5);
+		}).toThrow(new RangeError('linspace: `count` must be an integer between 0 and 16777216, got 2.5'));
+		expect(function () {
+			helpers.linspace(0, 1, 2 ** 24 + 1);
+		}).toThrow(new RangeError('linspace: `count` must be an integer between 0 and 16777216, got 16777217'));
+		expect(function () {
+			helpers.linspace(0, 1, '3' as never);
+		}).toThrow(new TypeError('linspace: `count` must be an integer between 0 and 16777216, got string'));
+	});
+});
+
+describe('ticks', function () {
+	it('picks round steps of 1, 2 or 5 times a power of ten', function () {
+		expect(helpers.ticks(0, 10, 5)).toEqual([0, 2, 4, 6, 8, 10]);
+		expect(helpers.ticks(0, 10)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+		expect(helpers.ticks(0, 100, 2)).toEqual([0, 50, 100]);
+		expect(helpers.ticks(-3.7, 12.1, 4)).toEqual([0, 5, 10]);
+		expect(helpers.ticks(1993, 2026, 4)).toEqual([2000, 2010, 2020]);
+		expect(helpers.ticks(0, 1e9, 3)).toEqual([0, 5e8, 1e9]);
+	});
+
+	it('writes fractional ticks as they print', function () {
+		expect(helpers.ticks(0, 1, 10)).toEqual([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]);
+		expect(helpers.ticks(0, 1, 5)).toEqual([0, 0.2, 0.4, 0.6, 0.8, 1]);
+		expect(helpers.ticks(-0.3, 0.3, 4)).toEqual([-0.2, 0, 0.2]);
+		expect(helpers.ticks(0.001, 0.0035, 3)).toEqual([0.001, 0.002, 0.003]);
+	});
+
+	it('follows the direction of the domain', function () {
+		expect(helpers.ticks(1, 0, 2)).toEqual([1, 0.5, 0]);
+		expect(helpers.ticks(10, 0, 5)).toEqual([10, 8, 6, 4, 2, 0]);
+		expect(helpers.ticks(100, -100, 2)).toEqual([100, 0, -100]);
+	});
+
+	it('gives the value of a single-value domain, and [] when no round value fits', function () {
+		expect(helpers.ticks(5, 5)).toEqual([5]);
+		expect(helpers.ticks(0.1, 0.9, 0.1)).toEqual([]);
+	});
+
+	it('asks for twice as many ticks when about one is asked for and none fits', function () {
+		expect(helpers.ticks(0.1, 0.9, 1)).toEqual([0.5]);
+		expect(helpers.ticks(0, 10, 1)).toEqual([0, 10]);
+	});
+
+	it('never yields +0 as -0', function () {
+		const values = helpers.ticks(-0.3, 1, 5);
+		expect(Object.is(values[values.indexOf(0)], 0)).toBe(true);
+	});
+
+	it('stays within the doubles for huge and tiny domains', function () {
+		expect(helpers.ticks(-MAX, MAX, 0.5)).toEqual([-1e308, 0, 1e308]);
+		expect(helpers.ticks(0, MAX, 1)).toEqual([0, 1e308]);
+		expect(helpers.ticks(0, 5e-324, 10)).toEqual([0]);
+		const tiny = helpers.ticks(0, 1e-320, 10);
+		expect(tiny.length).toBe(11);
+		expect(tiny[0]).toBe(0);
+		expect(tiny[10]).toBeLessThanOrEqual(1e-320);
+	});
+
+	it('keeps distinct increasing ticks when the step is finer than the precision of the domain', function () {
+		const values = helpers.ticks(1, 1 + 2 ** -40, 2 ** 20);
+		expect(values[0]).toBe(1);
+		for (let i = 1; i < values.length; i++) {
+			expect(values[i]).toBeGreaterThan(values[i - 1]);
+			expect(values[i]).toBeLessThanOrEqual(1 + 2 ** -40);
+		}
+		const narrow = helpers.ticks(31745.354136225673, 31745.354136225717, 9);
+		for (const tick of narrow) {
+			expect(tick).toBeGreaterThanOrEqual(31745.354136225673);
+			expect(tick).toBeLessThanOrEqual(31745.354136225717);
+		}
+	});
+
+	it('rejects non-finite bounds and invalid counts', function () {
+		expect(function () {
+			helpers.ticks(NaN, 1);
+		}).toThrow(new RangeError('ticks: `start` must be a finite number, got NaN'));
+		expect(function () {
+			helpers.ticks(0, -Infinity);
+		}).toThrow(new RangeError('ticks: `stop` must be a finite number, got -Infinity'));
+		expect(function () {
+			helpers.ticks(0, 1, 0);
+		}).toThrow(new RangeError('ticks: `count` must be a number > 0 and <= 1048576, got 0'));
+		expect(function () {
+			helpers.ticks(0, 1, 2 ** 20 + 1);
+		}).toThrow(new RangeError('ticks: `count` must be a number > 0 and <= 1048576, got 1048577'));
+		expect(function () {
+			helpers.ticks(0, 1, '5' as never);
+		}).toThrow(new TypeError('ticks: `count` must be a number > 0 and <= 1048576, got string'));
+	});
+});
+
+describe('niceDomain', function () {
+	it('extends the bounds to multiples of the tick step', function () {
+		expect(helpers.niceDomain(0.201, 0.996)).toEqual([0.2, 1]);
+		expect(helpers.niceDomain(-3.7, 12.1, 4)).toEqual([-5, 15]);
+		expect(helpers.niceDomain(1.1, 10.9)).toEqual([1, 11]);
+		expect(helpers.niceDomain(0, 97)).toEqual([0, 100]);
+		expect(helpers.niceDomain(0, 1)).toEqual([0, 1]);
+	});
+
+	it('keeps the direction of the domain', function () {
+		expect(helpers.niceDomain(130, 2, 5)).toEqual([140, 0]);
+		expect(helpers.niceDomain(0.996, 0.201)).toEqual([1, 0.2]);
+	});
+
+	it('returns a single-value domain as is', function () {
+		expect(helpers.niceDomain(3, 3)).toEqual([3, 3]);
+	});
+
+	it('gives bounds whose ticks start and end the axis', function () {
+		const [start, stop] = helpers.niceDomain(-3.7, 12.1, 4);
+		const values = helpers.ticks(start, stop, 4);
+		expect(values[0]).toBe(start);
+		expect(values[values.length - 1]).toBe(stop);
+	});
+
+	it('never moves a bound inwards when the rounding of the quotient does', function () {
+		const cases: Array<[number, number, number]> = [
+			[31745.354136225673, 31745.354136225717, 9],
+			[-1.3968718411749657, -1.396871841174964, 893],
+			[853884.2819717355, 853884.281971736, 974],
+			[2.718252717404468e19, 2.7182527174044684e19, 731],
+			[2.1631124372192722e21, 2.1631124372192753e21, 188],
+			[-2.9332594135219304e23, -2.9332594135219278e23, 811],
+			[-5.7810589769871305e23, -5.781058976987129e23, 170],
+			[16224199018749.531, 16224199018749.578, 285]
+		];
+		for (const [start, stop, count] of cases) {
+			const [low, high] = helpers.niceDomain(start, stop, count);
+			expect(low).toBeLessThanOrEqual(start);
+			expect(high).toBeGreaterThanOrEqual(stop);
+		}
+	});
+
+	it('stays within the doubles', function () {
+		expect(helpers.niceDomain(-MAX, MAX)).toEqual([-MAX, MAX]);
+		expect(helpers.niceDomain(0, MAX, 1)).toEqual([0, MAX]);
+		expect(helpers.niceDomain(-1.5e308, 1e307)).toEqual([-1.6e308, 2e307]);
+	});
+
+	it('rejects non-finite bounds and invalid counts', function () {
+		expect(function () {
+			helpers.niceDomain(Infinity, 1);
+		}).toThrow(new RangeError('niceDomain: `start` must be a finite number, got Infinity'));
+		expect(function () {
+			helpers.niceDomain(0, 1, -1);
+		}).toThrow(new RangeError('niceDomain: `count` must be a number > 0 and <= 1048576, got -1'));
+	});
+});
+
+describe('dot, norm, distance and cosineSimilarity', function () {
+	it('computes the dot product', function () {
+		expect(helpers.dot([1, 2, 3], [4, 5, 6])).toBe(32);
+		expect(helpers.dot([], [])).toBe(0);
+		expect(helpers.dot([0.1, 0.2], [10, 10])).toBe(3);
+		expect(helpers.dot(['1', '2'] as never, [3, 4])).toBe(11);
+	});
+
+	it('keeps products that cancel', function () {
+		expect(helpers.dot([1e16, 1, -1e16], [1, 1, 1])).toBe(1);
+		expect(helpers.dot([1, 1e100, 1, -1e100], [1, 1, 1, 1])).toBe(2);
+		// The plain loop gives 2 ** -30: each product loses its lowest bits.
+		expect(helpers.dot([1 + 2 ** -30, 1 - 2 ** -30], [1 + 2 ** -30, -(1 + 2 ** -29)])).toBe(2 ** -30 + 2 ** -59 + 2 ** -60);
+	});
+
+	it('neither overflows nor underflows on the way', function () {
+		expect(helpers.dot([1e200, 1e200], [1e200, -1e200])).toBe(0);
+		expect(helpers.dot([1e200, 1e200], [1e100, 1e100])).toBe(2e300);
+		expect(helpers.dot([1e-200, 1e-200], [1e-150, 1e-150])).toBe(2e-300 * 1e-50); // below the subnormals: 0
+		expect(helpers.dot([1e-200, 1e-200], [1e-110, 1e-110])).toBe(2e-310);
+		expect(helpers.dot([1e300, 1e-300], [1e-300, 1e300])).toBe(2);
+		expect(helpers.dot([1e200, 1e200], [1e200, 1e200])).toBe(Infinity);
+		expect(helpers.dot([1e-300, 1e-300], [1e-300, 1e-300])).toBe(0);
+		expect(helpers.dot([5e-324], [1])).toBe(5e-324);
+	});
+
+	it('gives the IEEE result for values that are not finite', function () {
+		expect(helpers.dot([Infinity, 1e200], [1, -1e200])).toBe(Infinity);
+		expect(helpers.dot([1, 2], [-Infinity, 1])).toBe(-Infinity);
+		expect(helpers.dot([Infinity, 1], [-1, Infinity])).toBeNaN();
+		expect(helpers.dot([Infinity], [0])).toBeNaN();
+		expect(helpers.dot([NaN, 1], [1, 1])).toBeNaN();
+	});
+
+	it('computes the length of a vector like Math.hypot, without overflow', function () {
+		expect(helpers.norm([3, 4])).toBe(5);
+		expect(helpers.norm([1, 2, 2])).toBe(3);
+		expect(helpers.norm([-5])).toBe(5);
+		expect(helpers.norm([])).toBe(0);
+		expect(helpers.norm([0, -0])).toBe(0);
+		expect(helpers.norm([1e200, 1e200])).toBe(1.414213562373095e200);
+		expect(helpers.norm([3e-200, 4e-200])).toBe(5e-200);
+		expect(helpers.norm([5e-324, 5e-324])).toBe(Math.hypot(5e-324, 5e-324));
+		expect(helpers.norm(new Array(1_000).fill(0.1))).toBe(Math.sqrt(10));
+	});
+
+	it('follows Math.hypot for values that are not finite', function () {
+		expect(helpers.norm([NaN, -Infinity])).toBe(Infinity);
+		expect(helpers.norm([Infinity, 1])).toBe(Infinity);
+		expect(helpers.norm([NaN, 1])).toBeNaN();
+	});
+
+	it('computes the distance between points', function () {
+		expect(helpers.distance([0, 0], [3, 4])).toBe(5);
+		expect(helpers.distance([1, 2, 3], [1, 2, 3])).toBe(0);
+		expect(helpers.distance([], [])).toBe(0);
+		expect(helpers.distance([1, 1], [4, 5])).toBe(helpers.distance([4, 5], [1, 1]));
+		expect(helpers.distance(['0', '0'] as never, [3, 4])).toBe(5);
+	});
+
+	it('handles differences beyond Number.MAX_VALUE', function () {
+		expect(helpers.distance([-8e307], [8e307])).toBe(1.6e308);
+		expect(helpers.distance([-8e307, 0], [8e307, 0])).toBe(1.6e308);
+		expect(helpers.distance([-1e308], [1e308])).toBe(Infinity);
+		expect(helpers.distance([1e308, 0], [-1e308, 1])).toBe(Infinity);
+	});
+
+	it('gives Infinity for an infinite difference and NaN otherwise', function () {
+		expect(helpers.distance([Infinity], [1])).toBe(Infinity);
+		expect(helpers.distance([NaN, Infinity], [0, 0])).toBe(Infinity);
+		expect(helpers.distance([Infinity], [Infinity])).toBeNaN();
+		expect(helpers.distance([NaN, 1e308], [0, -1e308])).toBeNaN();
+	});
+
+	it('computes the cosine of the angle between vectors', function () {
+		expect(helpers.cosineSimilarity([1, 0], [0, 1])).toBe(0);
+		expect(helpers.cosineSimilarity([1, 2, 3], [2, 4, 6])).toBe(1);
+		expect(helpers.cosineSimilarity([1, 1], [-1, -1])).toBe(-1);
+		expect(helpers.cosineSimilarity([3, 4], [4, 3])).toBe(0.96);
+		expect(helpers.cosineSimilarity([1, 1], [1, 0])).toBeCloseTo(Math.SQRT1_2, 15);
+		expect(helpers.cosineSimilarity([0.1, 0.2, 0.3], [0.1, 0.2, 0.3])).toBe(1);
+	});
+
+	it('neither overflows nor underflows', function () {
+		expect(helpers.cosineSimilarity([1e300, 1e300], [1e-300, 1e-300])).toBe(1);
+		expect(helpers.cosineSimilarity([1e300, 0], [0, 1e-300])).toBe(0);
+		expect(helpers.cosineSimilarity([5e-324, 5e-324], [5e-324, -5e-324])).toBe(0);
+	});
+
+	it('stays in [-1, 1] against rounding', function () {
+		const xs = [0.1, 0.7, 0.3, 1 / 3];
+		for (let scale = 1; scale < 50; scale++) {
+			const ys = xs.map(function (x) {
+				return x * scale * 1.1;
+			});
+			const cosine = helpers.cosineSimilarity(xs, ys);
+			expect(cosine).toBeLessThanOrEqual(1);
+			expect(cosine).toBeCloseTo(1, 14);
+			const opposite = helpers.cosineSimilarity(
+				xs,
+				ys.map(function (y) {
+					return -y;
+				})
+			);
+			expect(opposite).toBeGreaterThanOrEqual(-1);
+		}
+	});
+
+	it('is NaN for a zero vector or a value that is not finite', function () {
+		expect(helpers.cosineSimilarity([0, 0], [1, 2])).toBeNaN();
+		expect(helpers.cosineSimilarity([], [])).toBeNaN();
+		expect(helpers.cosineSimilarity([Infinity, 1], [1, 1])).toBeNaN();
+		expect(helpers.cosineSimilarity([Infinity, 1], [0, 1])).toBeNaN();
+		expect(helpers.cosineSimilarity([NaN, 1], [1, 1])).toBeNaN();
+	});
+
+	it('rejects vectors of different lengths', function () {
+		expect(function () {
+			helpers.dot([1, 2], [1]);
+		}).toThrow(new RangeError('dot: `xs` and `ys` must have the same length, got 2 and 1'));
+		expect(function () {
+			helpers.distance([1], []);
+		}).toThrow(new RangeError('distance: `xs` and `ys` must have the same length, got 1 and 0'));
+		expect(function () {
+			helpers.cosineSimilarity([1], [1, 2, 3]);
+		}).toThrow(new RangeError('cosineSimilarity: `xs` and `ys` must have the same length, got 1 and 3'));
+	});
+});

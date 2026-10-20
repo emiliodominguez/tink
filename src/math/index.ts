@@ -2784,7 +2784,7 @@ export function extendedGcd(a: number, b: number): ExtendedGcd {
  * @returns {number} The `x` in `[0, modulus)` with `a * x ≡ 1 (mod modulus)`
  * @throws {RangeError} when `a` and `modulus` are not coprime
  */
-function inverse(message: string, a: number, modulus: number): number {
+function modularInverse(message: string, a: number, modulus: number): number {
 	const { gcd: divisor, x } = bezout(a, modulus);
 	if (divisor !== 1) throw new RangeError(`${message}, got ${a} and ${modulus}`);
 	return modulo(x, modulus);
@@ -2809,7 +2809,7 @@ function inverse(message: string, a: number, modulus: number): number {
 export function modInverse(a: number, modulus: number): number {
 	assertNumber('modInverse', 'a', a, Number.isSafeInteger(a), 'a safe integer');
 	assertNumber('modInverse', 'modulus', modulus, Number.isSafeInteger(modulus) && modulus >= 1, 'a safe integer >= 1');
-	return inverse('modInverse: `a` must be coprime to `modulus`', a, modulus);
+	return modularInverse('modInverse: `a` must be coprime to `modulus`', a, modulus);
 }
 
 /** The largest modulus whose residues multiply exactly in doubles: `94906265 ** 2` is below `2 ** 53`. */
@@ -2841,7 +2841,7 @@ export function modPow(base: number, exponent: number, modulus: number): number 
 	let power = modulo(base, modulus);
 	let rest = exponent;
 	if (exponent < 0) {
-		power = inverse('modPow: `base` must be coprime to `modulus` for a negative `exponent`', base, modulus);
+		power = modularInverse('modPow: `base` must be coprime to `modulus` for a negative `exponent`', base, modulus);
 		rest = -exponent;
 	}
 	if (modulus <= SQRT_SAFE) {
@@ -3982,4 +3982,672 @@ export function findRoot(fn: (x: number) => number, lower: number, upper: number
 		fa = fb;
 		fb = evaluateRoot(fn, b);
 	}
+}
+
+/**
+ * Hermite interpolation between two edges, as GLSL's `smoothstep`: `0` up to `edge0`, `1` from `edge1` on, and the S-shaped curve
+ * `3t² - 2t³` in between (`t` being the position of `x` between the edges, see {@link inverseLerp}), whose slope is `0` at both edges. For
+ * fades, easing a scroll position into an opacity, or soft thresholds.
+ *
+ * Reversed edges (`edge0 > edge1`) give the mirrored, decreasing curve (`1` up to `edge1`, `0` from `edge0` on), as the GLSL formula
+ * does in practice, although the specification leaves it undefined. Equal edges give a step: `0` below the edge, `1` from it on (GLSL's
+ * `step`). `x = ±Infinity` gives `0` or `1`, and `NaN` gives `NaN`.
+ * @param {number} edge0 - Where the curve starts rising (the result is `0` at and before it)
+ * @param {number} edge1 - Where it reaches `1`
+ * @param {number} x - The value to interpolate
+ * @returns {number} A number in `[0, 1]` (or `NaN`)
+ * @throws {RangeError} when an edge is not finite
+ * @throws {TypeError} when an edge is not a number
+ * @example
+ * smoothstep(0, 10, 5); // => 0.5
+ * smoothstep(0, 10, 2.5); // => 0.15625
+ * smoothstep(0, 10, -3); // => 0
+ * smoothstep(10, 0, 2.5); // => 0.84375 // reversed edges: decreasing
+ * smoothstep(5, 5, 5); // => 1 // equal edges: a step
+ */
+export function smoothstep(edge0: number, edge1: number, x: number): number {
+	const t = stepPosition('smoothstep', edge0, edge1, x);
+	// Within a few ulps of 1, the rounding of the polynomial can exceed 1.
+	return Math.min(t * t * (3 - 2 * t), 1);
+}
+
+/**
+ * Ken Perlin's smoother variant of {@link smoothstep}: the curve `6t⁵ - 15t⁴ + 10t³`, whose first and second derivatives are both `0` at
+ * the edges, so a motion that follows it starts and stops without a jolt. Same edges, clamping and special values as {@link smoothstep}.
+ * @param {number} edge0 - Where the curve starts rising (the result is `0` at and before it)
+ * @param {number} edge1 - Where it reaches `1`
+ * @param {number} x - The value to interpolate
+ * @returns {number} A number in `[0, 1]` (or `NaN`)
+ * @throws {RangeError} when an edge is not finite
+ * @throws {TypeError} when an edge is not a number
+ * @example
+ * smootherstep(0, 10, 5); // => 0.5
+ * smootherstep(0, 10, 2.5); // => 0.103515625
+ * smootherstep(0, 10, 12); // => 1
+ */
+export function smootherstep(edge0: number, edge1: number, x: number): number {
+	const t = stepPosition('smootherstep', edge0, edge1, x);
+	// Within a few ulps of 1, the rounding of the polynomial can exceed 1 (`smootherstep(0, 1, 0.9999955)` would be `1.0000000000000009`).
+	return Math.min(t * t * t * (t * (6 * t - 15) + 10), 1);
+}
+
+/**
+ * The position of `x` between two edges, clamped to `[0, 1]`, shared by {@link smoothstep} and {@link smootherstep}: a step when the
+ * edges are equal, and {@link inverseLerp} otherwise (which neither overflows nor loses the direction of a reversed range).
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {number} edge0 - The edge mapped to `0`
+ * @param {number} edge1 - The edge mapped to `1`
+ * @param {number} x - The value
+ * @returns {number} The clamped position (`NaN` for a `NaN` value)
+ * @throws {RangeError} when an edge is not finite
+ * @throws {TypeError} when an edge is not a number
+ */
+function stepPosition(caller: string, edge0: number, edge1: number, x: number): number {
+	assertNumber(caller, 'edge0', edge0, Number.isFinite(edge0), 'a finite number');
+	assertNumber(caller, 'edge1', edge1, Number.isFinite(edge1), 'a finite number');
+	// Equal edges: a step (`NaN` is neither below nor at or above the edge).
+	if (edge0 === edge1) return x < edge0 ? 0 : x >= edge0 ? 1 : NaN;
+	const t = inverseLerp(edge0, edge1, x);
+	// Plain comparisons: `NaN` fails both and is returned.
+	return t <= 0 ? 0 : t >= 1 ? 1 : t;
+}
+
+/**
+ * Moves `current` towards `target` by exponential decay over `deltaTime`, independently of the frame rate: two steps of `deltaTime / 2`
+ * land where one step of `deltaTime` does (up to rounding), which `lerp(current, target, 0.1)` called once per frame does not (it is twice
+ * as fast at 120 fps as at 60 fps). This is the `lerp(current, target, 1 - exp(-lambda * deltaTime))` of game engines, with
+ * `1 - exp(-x)` computed as `-expm1(-x)`, so that tiny steps are not rounded away.
+ *
+ * `lambda` is the decay rate: after `1 / lambda` units of time, about 63% of the distance is covered (`ln(2) / lambda` is the half-life).
+ * The result always lies between `current` and `target` and never overshoots. It is exactly `target` when `lambda * deltaTime` is large,
+ * and a step too small to change `current` (one below half an ulp, close to the target) moves it by an ulp instead, so repeated steps reach
+ * `target` exactly and an animation that waits for `value === target` ends: rounding to nearest alone can leave the value a few ulps short
+ * forever.
+ * @param {number} current - The current value
+ * @param {number} target - The value to approach
+ * @param {number} lambda - The decay rate per unit of time, a finite number `>= 0` (`0` never moves)
+ * @param {number} deltaTime - The time elapsed since the last step, a finite number `>= 0`, in the unit of `lambda`
+ * @returns {number} The new value, between `current` and `target`
+ * @throws {RangeError} when `lambda` or `deltaTime` is negative or not finite
+ * @throws {TypeError} when `lambda` or `deltaTime` is not a number
+ * @example
+ * damp(0, 100, Math.LN2, 1); // => 50 // half the distance after one half-life
+ * damp(0, 100, 5, 0); // => 0
+ * damp(0, 100, 5, 100); // => 100
+ * damp(0, 1, 1e-17, 1); // => 1e-17 // 1 - Math.exp(-1e-17) is 0: the step would be lost
+ */
+export function damp(current: number, target: number, lambda: number, deltaTime: number): number {
+	assertNumber('damp', 'lambda', lambda, lambda >= 0 && lambda < Infinity, 'a finite number >= 0');
+	assertNumber('damp', 'deltaTime', deltaTime, deltaTime >= 0 && deltaTime < Infinity, 'a finite number >= 0');
+	const factor = -Math.expm1(-lambda * deltaTime);
+	// A safety net: no rounding of `(1 - t) * current + t * target` past an end has been found, but the guarantee is cheap.
+	const result = Math.min(Math.max(lerp(current, target, factor), Math.min(current, target)), Math.max(current, target));
+	// `(1 - t) * current + t * target` rounds back to `current` a few ulps from the target (`damp(x, 1, 10, 1 / 60)` stops at
+	// `0.9999999999999991`): move by one ulp, which is within an ulp of the exact step and can only end at `target`.
+	if (result !== current || factor === 0 || current === target || !Number.isFinite(current)) return result;
+	return current < target ? -nextDown(-current) : nextDown(current);
+}
+
+/**
+ * The shortest signed rotation from one angle to another: the value of `(-period / 2, period / 2]` congruent to `to - from` modulo the
+ * period, as Unity's `DeltaAngle` (`angleDifference(350, 10) === 20`, not `-340`). Degrees by default; pass `2 * Math.PI` as the period
+ * for radians, or any other period (`24` for hours on a clock). A half turn is `+period / 2`.
+ *
+ * Both angles are reduced modulo the period first (with the exact `%`), so angles accumulated over many turns lose no precision in the
+ * subtraction. A zero difference is `+0`, and `NaN` or `±Infinity` angles give `NaN`.
+ * @param {number} from - The starting angle
+ * @param {number} to - The target angle
+ * @param {number} [period=360] - The size of a full turn, a finite number `> 0`
+ * @returns {number} The signed difference, in `(-period / 2, period / 2]`
+ * @throws {RangeError} when `period` is not a finite number `> 0`
+ * @throws {TypeError} when `period` is not a number
+ * @example
+ * angleDifference(350, 10); // => 20
+ * angleDifference(10, 350); // => -20
+ * angleDifference(0, 180); // => 180
+ * angleDifference(0, 540); // => 180
+ * angleDifference(0, (3 * Math.PI) / 2, 2 * Math.PI) === -Math.PI / 2; // => true
+ */
+export function angleDifference(from: number, to: number, period = 360): number {
+	return shortestRotation('angleDifference', from, to, period);
+}
+
+/**
+ * The shortest rotation from `from` to `to` (see {@link angleDifference}).
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {number} from - The starting angle
+ * @param {number} to - The target angle
+ * @param {number} period - The size of a full turn
+ * @returns {number} The signed difference, in `(-period / 2, period / 2]`
+ * @throws {RangeError} when `period` is not a finite number `> 0`
+ * @throws {TypeError} when `period` is not a number
+ */
+function shortestRotation(caller: string, from: number, to: number, period: number): number {
+	assertNumber(caller, 'period', period, period > 0 && period < Infinity, 'a finite number > 0');
+	// The remainders are exact and lie in `(-period, period)`, so their difference cannot overflow. Wrapping into `[0, period)` and then
+	// subtracting the period from the upper half (exactly: both are within a factor 2 of each other) gives `(-period / 2, period / 2]`
+	// without `±period / 2` bounds, which a subnormal period would round to 0.
+	const turn = wrap((to % period) - (from % period), 0, period);
+	// `+ 0` turns `-0` into `0`; `NaN` fails the comparison and is returned.
+	return (turn > period / 2 ? turn - period : turn) + 0;
+}
+
+/**
+ * Interpolates between two angles along the shortest arc: `start + angleDifference(start, end) * t`, as Unity's `LerpAngle` (without its
+ * clamping of `t`) and Godot's `lerp_angle`: from 350° to 10° it goes up through 360°, not down through 180°. Degrees by default; pass
+ * `2 * Math.PI` as the period for radians.
+ *
+ * The result is not wrapped, so it moves continuously with `t` and can be fed to a rotation without a jump: `lerpAngle(350, 10, 1)` is
+ * `370`, the same direction as `10` (wrap it with {@link wrap} for `[0, 360)`). `t = 0` gives exactly `start`, and `t` outside `[0, 1]`
+ * extrapolates. Opposite angles are half a turn apart either way; the rotation is then positive.
+ * @param {number} start - The angle at `t = 0`
+ * @param {number} end - The angle at `t = 1` (modulo the period)
+ * @param {number} t - Interpolation factor
+ * @param {number} [period=360] - The size of a full turn, a finite number `> 0`
+ * @returns {number} The interpolated angle, unwrapped
+ * @throws {RangeError} when `period` is not a finite number `> 0`
+ * @throws {TypeError} when `period` is not a number
+ * @example
+ * lerpAngle(350, 10, 0.5); // => 360
+ * lerpAngle(350, 10, 1); // => 370
+ * lerpAngle(10, 350, 0.5); // => 0
+ * lerpAngle(0, 90, 0.5); // => 45
+ * wrap(lerpAngle(350, 10, 0.75), 0, 360); // => 5
+ */
+export function lerpAngle(start: number, end: number, t: number, period = 360): number {
+	const rotation = shortestRotation('lerpAngle', start, end, period);
+	return t === 0 ? start : start + rotation * t;
+}
+
+/**
+ * Bounces a value back and forth between `0` and `length`, as Unity's `Mathf.PingPong`: a triangle wave that rises from `0` to `length`
+ * as `value` goes from `0` to `length`, falls back to `0` at `2 * length`, and so on. For animations driven by a time that only grows
+ * (a pulsing glow, a patrolling sprite), or to reflect an index at the ends of a range. Negative values mirror positive ones.
+ *
+ * The value is reduced with the exact {@link modulo} of `2 * length`, and the falling half is `2 * length` minus the reduced value, which
+ * is exact too, so `pingPong(0.1, 3)` is `0.1` (where `length - |value mod 2·length - length|` gives `0.10000000000000009`). `NaN` and
+ * `±Infinity` give `NaN`.
+ * @param {number} value - The ever-changing input (typically a time)
+ * @param {number} length - The top of the bounce, a finite number `> 0`
+ * @returns {number} A number in `[0, length]`
+ * @throws {RangeError} when `length` is not a finite number `> 0`
+ * @throws {TypeError} when `length` is not a number
+ * @example
+ * pingPong(2, 3); // => 2
+ * pingPong(4, 3); // => 2
+ * pingPong(6, 3); // => 0
+ * pingPong(7.5, 3); // => 1.5
+ * pingPong(-1, 3); // => 1
+ * pingPong(0.1, 3); // => 0.1
+ */
+export function pingPong(value: number, length: number): number {
+	assertNumber('pingPong', 'length', length, length > 0 && length < Infinity, 'a finite number > 0');
+	const cycle = 2 * length;
+	// A cycle beyond `Number.MAX_VALUE`: halving the value and the length is exact for such a large length (and for any value that is not
+	// subnormal; a subnormal one is then off by at most the smallest subnormal).
+	if (cycle === Infinity) return 2 * pingPong(value / 2, length / 2);
+	const phase = modulo(value, cycle);
+	// `cycle - phase` is exact for `phase` in `[length, cycle)` (Sterbenz), and `NaN` fails the comparison and is returned.
+	return phase > length ? cycle - phase : phase;
+}
+
+/**
+ * Options accepted by {@link linspace}.
+ */
+export interface LinspaceOptions {
+	/**
+	 * Whether `end` is the last value (`count - 1` intervals), or the end of the last interval, excluded (`count` intervals), as in NumPy:
+	 * `linspace(0, 1, 4, { endpoint: false })` is `[0, 0.25, 0.5, 0.75]`, the sample positions of a periodic signal.
+	 * @default true
+	 */
+	readonly endpoint?: boolean;
+}
+
+/**
+ * The largest `count` of {@link linspace}: 2 ** 24 (16,777,216) numbers take about 130 MB. An uncapped count, such as one read from a query
+ * string, could make the runtime abort with an out-of-memory error, which cannot be caught.
+ */
+const MAX_LINSPACE = 16_777_216;
+
+/**
+ * Returns `count` evenly spaced numbers from `start` to `end`, as NumPy's `linspace`: for chart axes, sampling a function, gradient stops
+ * or animation keyframes. Unlike adding a step repeatedly (or `range(0, 1.1, 0.1)`), each value is computed from its index as
+ * `start + (end - start) * i / (count - 1)`, so errors do not accumulate, the first value is exactly `start`, the last one exactly `end`,
+ * and fractions come out as written (`linspace(0, 1, 11)` holds `0.3`, not `0.30000000000000004`).
+ *
+ * The values are monotonic (increasing, or decreasing when `end < start`) and never leave `[start, end]`, even when the span exceeds
+ * `Number.MAX_VALUE`. A single value is `[start]`, and none is `[]`.
+ * @param {number} start - The first value, a finite number
+ * @param {number} end - The last value (or, with `{ endpoint: false }`, the excluded end), a finite number
+ * @param {number} count - How many values, an integer from 0 to 2 ** 24
+ * @param {LinspaceOptions} [options={}] - `endpoint` (default `true`): whether `end` is included
+ * @returns {number[]} The values
+ * @throws {RangeError} when `start` or `end` is not finite, or `count` is not an integer from 0 to 2 ** 24
+ * @throws {TypeError} when `start`, `end` or `count` is not a number
+ * @example
+ * linspace(0, 1, 5); // => [0, 0.25, 0.5, 0.75, 1]
+ * linspace(0, 1, 11)[3]; // => 0.3
+ * linspace(10, 0, 3); // => [10, 5, 0]
+ * linspace(0, 1, 4, { endpoint: false }); // => [0, 0.25, 0.5, 0.75]
+ * linspace(2, 5, 1); // => [2]
+ * linspace(0, 1, -1); // throws RangeError
+ */
+export function linspace(start: number, end: number, count: number, options: LinspaceOptions = {}): number[] {
+	const endpoint = readOption(options, 'endpoint') !== false;
+	assertNumber('linspace', 'start', start, Number.isFinite(start), 'a finite number');
+	assertNumber('linspace', 'end', end, Number.isFinite(end), 'a finite number');
+	assertNumber('linspace', 'count', count, Number.isInteger(count) && count >= 0 && count <= MAX_LINSPACE, `an integer between 0 and ${MAX_LINSPACE}`);
+	const result: number[] = count === 0 ? [] : [start];
+	const intervals = endpoint ? count - 1 : count;
+	// When the bounds are further apart than `Number.MAX_VALUE`, their halves are used (exactly: such bounds are far from the subnormals).
+	const scale = Number.isFinite(end - start) ? 1 : 0.5;
+	const first = start * scale;
+	const span = end * scale - first;
+	// `(span * i) / intervals` is correctly rounded (`0.3` rather than `0.30000000000000004` for 3 tenths), unless it can overflow.
+	const exact = Number.isFinite(span * intervals);
+	// The offsets grow with `i` (each rounding is monotonic) and stay below the rounded span for every `i < intervals` (each rounding is off by
+	// less than `2 ** -52` of the span, and the last interval is a fraction `1 / intervals` of it, `intervals` being below `2 ** 52`), so no
+	// value but the one at `end` can round beyond it. That one is set to `end` exactly.
+	for (let i = 1; i < count; i++) result.push((first + (exact ? (span * i) / intervals : (span / intervals) * i)) / scale);
+	if (endpoint && count > 1) result[count - 1] = end;
+	return result;
+}
+
+/**
+ * The largest `count` of {@link ticks} and {@link niceDomain}: they produce at most about `1.6 * count + 2` ticks, and a count of 2 ** 20
+ * already makes far more than any axis can show. An uncapped count, such as one read from a query string, could make the runtime abort with
+ * an out-of-memory error, which cannot be caught.
+ */
+const MAX_TICKS = 1_048_576;
+
+/** `√50`, `√10` and `√2`: the geometric means of the neighbouring nice factors 10, 5, 2 and 1, d3's thresholds for picking one. */
+const TICK_THRESHOLDS: readonly [number, number, number] = [Math.sqrt(50), Math.sqrt(10), Math.sqrt(2)];
+
+/**
+ * Picks the tick step of an increasing domain, as d3-array's `tickSpec`: the power of ten of `span / count`, times 1, 2, 5 or 10, whichever
+ * is nearest on a logarithmic scale. A step below 1 is returned as a negative inverse (`-5` for a step of `0.2`): the ticks are then
+ * computed as `i / 5`, which is correctly rounded (`0.6`), where `i * 0.2` is not (`0.6000000000000001`). The step is kept within the
+ * doubles (a subnormal, or `1e308`) for domains whose `span / count` underflows or overflows.
+ * @param {number} start - The lower bound, finite
+ * @param {number} stop - The upper bound, finite and greater than `start`
+ * @param {number} count - The approximate number of ticks wanted, a number `> 0`
+ * @returns {[number, number, number]} The indices of the first and last ticks inside the domain, and the step (negative: its inverse)
+ * @example
+ * tickSpec(0, 1, 5); // => [0, 5, -5]
+ */
+function tickSpec(start: number, stop: number, count: number): [number, number, number] {
+	const span = stop - start;
+	const step = Math.min(Math.max(Number.isFinite(span) ? span / count : stop / count - start / count, Number.MIN_VALUE), Number.MAX_VALUE);
+	// `10 ** -324` is 0: the smallest power used is `10 ** -323` (a subnormal, about twice `Number.MIN_VALUE`).
+	const power = Math.max(Math.floor(Math.log10(step)), -323);
+	const error = step / 10 ** power;
+	const factor = error >= TICK_THRESHOLDS[0] ? 10 : error >= TICK_THRESHOLDS[1] ? 5 : error >= TICK_THRESHOLDS[2] ? 2 : 1;
+	let first: number;
+	let last: number;
+	let increment: number;
+	// Steps below 1 divide by their inverse, except below `1e-308`, where `10 ** -power` overflows: the subnormal step multiplies then.
+	const inverse = 10 ** -power / factor;
+	if (power < 0 && inverse < Infinity) {
+		first = Math.round(start * inverse);
+		last = Math.round(stop * inverse);
+		// The same expressions as the ticks themselves, so that the first and last ticks are inside the domain.
+		if (first / inverse < start) first++;
+		if (last / inverse > stop) last--;
+		increment = -inverse;
+	} else {
+		// `2e308` overflows: a step of `1e308` gives at most four ticks over the whole range of doubles anyway.
+		increment = 10 ** power * factor;
+		if (increment === Infinity) increment = 10 ** power;
+		first = Math.round(start / increment);
+		last = Math.round(stop / increment);
+		if (first * increment < start) first++;
+		if (last * increment > stop) last--;
+	}
+	// No tick fits a domain asked for one tick or so: d3 asks for twice as many.
+	if (last < first && count >= 0.5 && count < 2) return tickSpec(start, stop, count * 2);
+	return [first, last, increment];
+}
+
+/**
+ * Validates the arguments of {@link ticks} and {@link niceDomain}.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {number} start - One end of the domain
+ * @param {number} stop - The other end
+ * @param {number} count - The approximate number of ticks
+ * @returns {void}
+ * @throws {RangeError} when a bound is not finite, or `count` is not a number in `(0, 2 ** 20]`
+ * @throws {TypeError} when an argument is not a number
+ */
+function assertTickDomain(caller: string, start: number, stop: number, count: number): void {
+	assertNumber(caller, 'start', start, Number.isFinite(start), 'a finite number');
+	assertNumber(caller, 'stop', stop, Number.isFinite(stop), 'a finite number');
+	assertNumber(caller, 'count', count, count > 0 && count <= MAX_TICKS, `a number > 0 and <= ${MAX_TICKS}`);
+}
+
+/**
+ * Returns round, human-friendly values for the ticks of a chart axis over `[start, stop]`, as d3's `ticks`: multiples of a step of
+ * `1`, `2` or `5` times a power of ten, chosen so that there are about `count` of them (the result can hold somewhat more or fewer). Values
+ * print as written: below 1 they are computed by dividing by the inverse of the step, so `ticks(0, 1, 10)` holds `0.3`, not
+ * `0.30000000000000004`.
+ *
+ * Every tick lies inside the domain (its bounds are ticks only when they are round), in the order of the domain: decreasing when
+ * `stop < start`. A domain of one value gives that value, and a domain too narrow for any round value gives `[]`. Pair it with
+ * {@link niceDomain} to extend the domain to round bounds first, so that the axis starts and ends with a tick.
+ * @param {number} start - One end of the domain, a finite number
+ * @param {number} stop - The other end, a finite number
+ * @param {number} [count=10] - The approximate number of ticks wanted, a number in `(0, 2 ** 20]` (not necessarily an integer)
+ * @returns {number[]} The ticks, in the order of the domain
+ * @throws {RangeError} when a bound is not finite, or `count` is not a number in `(0, 2 ** 20]`
+ * @throws {TypeError} when an argument is not a number
+ * @example
+ * ticks(0, 10, 5); // => [0, 2, 4, 6, 8, 10]
+ * ticks(0, 1, 5); // => [0, 0.2, 0.4, 0.6, 0.8, 1]
+ * ticks(-3.7, 12.1, 4); // => [0, 5, 10]
+ * ticks(1, 0, 2); // => [1, 0.5, 0]
+ * ticks(0, 1, 10)[3]; // => 0.3
+ * ticks(5, 5); // => [5]
+ */
+export function ticks(start: number, stop: number, count = 10): number[] {
+	assertTickDomain('ticks', start, stop, count);
+	if (start === stop) return [start];
+	const reverse = stop < start;
+	const low = reverse ? stop : start;
+	const high = reverse ? start : stop;
+	const [first, last, increment] = tickSpec(low, high, count);
+	const result: number[] = [];
+	// Counted with `k`: beyond `2 ** 53` (a step finer than the precision of the domain) `first + k` can stop growing. Such ticks are not
+	// distinct, and are only kept when they are inside the domain and above the previous one.
+	for (let k = 0; k <= last - first; k++) {
+		const index = first + k;
+		const tick = increment < 0 ? index / -increment : index * increment;
+		if (tick >= low && tick <= high && !(tick <= result[result.length - 1])) result.push(tick);
+	}
+	return reverse ? result.reverse() : result;
+}
+
+/**
+ * Extends a domain to round bounds, as d3's `scale.nice()`: each bound moves outwards to the nearest multiple of the {@link ticks} step,
+ * repeatedly, until the step no longer changes (at most 10 times), so that an axis over the result starts and ends with a tick
+ * (`niceDomain(0.201, 0.996)` is `[0.2, 1]`). The bounds are computed with the same expressions as the ticks, so
+ * `ticks(...niceDomain(a, b, n), n)` starts and ends exactly with them, and a domain that is already nice is returned as is (d3 floors the
+ * rounded quotients, which can move a bound that is already round out by a step, or in by an ulp).
+ *
+ * The result always contains the domain and keeps its direction: a decreasing domain stays decreasing. A domain of one value is returned as
+ * is, and the bounds never go beyond `±Number.MAX_VALUE`. With a `count` below 2, widening the bounds can double the step every round, as in
+ * d3: the result is then the bounds of the tenth round, which are not always ticks.
+ * @param {number} start - One end of the domain, a finite number
+ * @param {number} stop - The other end, a finite number
+ * @param {number} [count=10] - The approximate number of ticks wanted, a number in `(0, 2 ** 20]`
+ * @returns {[number, number]} The extended `[start, stop]`
+ * @throws {RangeError} when a bound is not finite, or `count` is not a number in `(0, 2 ** 20]`
+ * @throws {TypeError} when an argument is not a number
+ * @example
+ * niceDomain(0.201, 0.996); // => [0.2, 1]
+ * niceDomain(-3.7, 12.1, 4); // => [-5, 15]
+ * niceDomain(130, 2, 5); // => [140, 0]
+ * niceDomain(3, 3); // => [3, 3]
+ */
+export function niceDomain(start: number, stop: number, count = 10): [number, number] {
+	assertTickDomain('niceDomain', start, stop, count);
+	const reverse = stop < start;
+	let low = reverse ? stop : start;
+	let high = reverse ? start : stop;
+	let previous = 0;
+	for (let pass = 0; pass < 10 && low < high; pass++) {
+		const increment = tickSpec(low, high, count)[2];
+		if (increment === previous) break;
+		previous = increment;
+		// The bounds go to the nearest tick, moved out by a step when that is inside the domain: with the same expressions as the ticks, so
+		// that a bound that is already a tick stays (flooring `low * inverse` would move it out whenever the product rounds up).
+		let nextLow: number;
+		let nextHigh: number;
+		if (increment < 0) {
+			const inverse = -increment;
+			let first = Math.round(low * inverse);
+			let last = Math.round(high * inverse);
+			if (first / inverse > low) first--;
+			if (last / inverse < high) last++;
+			nextLow = first / inverse;
+			nextHigh = last / inverse;
+		} else {
+			let first = Math.round(low / increment);
+			let last = Math.round(high / increment);
+			if (first * increment > low) first--;
+			if (last * increment < high) last++;
+			nextLow = first * increment;
+			nextHigh = last * increment;
+		}
+		// Beyond `2 ** 53` steps from zero (a step finer than the precision of the bounds), moving an index by one can leave it unchanged:
+		// the bounds then stay where they are rather than move inwards. Nor do they go beyond the doubles.
+		// (`+ 0` turns a `-0` bound, which the ticks write `0`, into `0`.)
+		low = Math.max(Math.min(nextLow, low), -Number.MAX_VALUE) + 0;
+		high = Math.min(Math.max(nextHigh, high), Number.MAX_VALUE) + 0;
+	}
+	return reverse ? [high, low] : [low, high];
+}
+
+/** Veltkamp's splitting constant, `2 ** 27 + 1`: `x * SPLITTER` cuts a double into two halves of at most 26 bits, whose products are exact. */
+const SPLITTER = 134217729;
+
+/**
+ * Converts the elements of a vector once with unary `+` (the conversion of the aggregates of this module), into a typed array.
+ * @param {ReadonlyArray<number>} numbers - The vector
+ * @returns {Float64Array} The converted elements
+ */
+function toFloat64(numbers: ReadonlyArray<number>): Float64Array {
+	const values = new Float64Array(numbers.length);
+	for (let i = 0; i < values.length; i++) values[i] = +numbers[i];
+	return values;
+}
+
+/**
+ * The power of two that brings the largest magnitude of some values close to `1`, as {@link scaledSample} picks it: between `2 ** -1000`
+ * and `2 ** 1000`, so that the scaled values are normal doubles, and `1` when that magnitude is `0` or not finite.
+ * @param {Float64Array} values - The values
+ * @returns {number} The scale
+ */
+function vectorScale(values: Float64Array): number {
+	let largest = 0;
+	// `NaN` once a value is `NaN`.
+	for (let i = 0; i < values.length; i++) largest = Math.max(largest, Math.abs(values[i]));
+	return largest > 0 && largest < Infinity ? 2 ** Math.min(1000, Math.max(-1000, -Math.floor(Math.log2(largest)))) : 1;
+}
+
+/**
+ * Ogita, Rump and Oishi's `Dot2` on two vectors scaled by powers of two (exactly, so that their values are at most about 2 in magnitude):
+ * a dot product as accurate as if it were computed in twice the precision of doubles, then rounded. Each product is split exactly into
+ * `high + low` (Dekker's TwoProduct with Veltkamp's splitting, since JavaScript has no fused multiply-add, which needs values below about
+ * `2 ** 996`), the high parts are added with Knuth's TwoSum, and every error term goes into a second sum. A value that is not finite makes
+ * the result `NaN`.
+ * @param {Float64Array} xs - The first vector
+ * @param {number} scaleX - The power of two its values are multiplied by
+ * @param {Float64Array} ys - The second vector, as long as `xs`
+ * @param {number} scaleY - The power of two its values are multiplied by
+ * @returns {number} The dot product of the scaled vectors
+ */
+function dot2(xs: Float64Array, scaleX: number, ys: Float64Array, scaleY: number): number {
+	let high = 0;
+	let low = 0;
+	for (let i = 0; i < xs.length; i++) {
+		const x = xs[i] * scaleX;
+		const y = ys[i] * scaleY;
+		const productHigh = x * y;
+		let split = SPLITTER * x;
+		const xHigh = split - (split - x);
+		const xLow = x - xHigh;
+		split = SPLITTER * y;
+		const yHigh = split - (split - y);
+		const yLow = y - yHigh;
+		// `productHigh + productLow` is exactly `x * y` (unless it underflows).
+		const productLow = xLow * yLow - (productHigh - xHigh * yHigh - xLow * yHigh - xHigh * yLow);
+		// `sumHigh + sumLow` is exactly `high + productHigh`.
+		const sumHigh = high + productHigh;
+		const virtual = sumHigh - high;
+		const sumLow = high - (sumHigh - virtual) + (productHigh - virtual);
+		high = sumHigh;
+		low += sumLow + productLow;
+	}
+	return high + low;
+}
+
+/**
+ * Throws unless two vectors have the same length.
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {ReadonlyArray<number>} xs - The first vector
+ * @param {ReadonlyArray<number>} ys - The second vector
+ * @returns {void}
+ * @throws {RangeError} when `xs` and `ys` have different lengths
+ */
+function assertSameLength(caller: string, xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): void {
+	if (xs.length !== ys.length) throw new RangeError(`${caller}: \`xs\` and \`ys\` must have the same length, got ${xs.length} and ${ys.length}`);
+}
+
+/**
+ * Computes the dot (scalar) product of two vectors, `Σ xs[i] · ys[i]`, as accurately as if it were computed in twice the precision of
+ * doubles and then rounded (Ogita, Rump and Oishi's `Dot2`), so that products that cancel do not wipe out the result:
+ * `dot([1e16, 1, -1e16], [1, 1, 1])` is `1`, where the plain loop gives `0`. The error is at most about an ulp of the result plus
+ * `n² · 2 ** -106` times `Σ |xs[i] · ys[i]|`, for `n` elements. When a product or the sum overflows, or the result is so small (below
+ * `2 ** -900`) that the rounding of products below the normal doubles could matter, it is computed again on both vectors scaled by powers of
+ * two (exactly), so that only a result beyond the doubles overflows. About five times as slow as the plain loop on long vectors.
+ *
+ * Values are converted once with unary `+`. When one is not finite, the result is the IEEE sum of the products (`Infinity`, `-Infinity` or
+ * `NaN`), without the spurious `Infinity - Infinity` of products that overflow.
+ * @param {ReadonlyArray<number>} xs - The first vector
+ * @param {ReadonlyArray<number>} ys - The second vector, as long as `xs`
+ * @returns {number} The dot product (`0` for empty vectors)
+ * @throws {RangeError} when `xs` and `ys` have different lengths
+ * @example
+ * dot([1, 2, 3], [4, 5, 6]); // => 32
+ * dot([1e16, 1, -1e16], [1, 1, 1]); // => 1 // the plain loop gives 0
+ * dot([1e200, 1e200], [1e200, -1e200]); // => 0 // the plain loop gives NaN (Infinity - Infinity)
+ * dot([Infinity, 1e200], [1, -1e200]); // => Infinity
+ * dot([], []); // => 0
+ * dot([1, 2], [1]); // throws RangeError
+ */
+export function dot(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): number {
+	assertSameLength('dot', xs, ys);
+	const x = toFloat64(xs);
+	const y = toFloat64(ys);
+	// Scaling each vector by its largest magnitude would flush values far smaller than it (`dot([1e300, 1e-300], [1e-300, 1e300])` is `2`),
+	// so the products are first taken as they are: an overflow makes the result infinite or `NaN` (`Infinity - Infinity`).
+	const direct = dot2(x, 1, y, 1);
+	if (Math.abs(direct) >= 2 ** -900 && Math.abs(direct) < Infinity) return direct;
+	const scaleX = vectorScale(x);
+	const scaleY = vectorScale(y);
+	const scaled = dot2(x, scaleX, y, scaleY);
+	if (scaled !== scaled) {
+		// A value is not finite (its vector's scale is then 1): the plain sum of the scaled products, where an infinity or a `NaN` decides.
+		let total = 0;
+		for (let i = 0; i < x.length; i++) total += x[i] * scaleX * (y[i] * scaleY);
+		return total;
+	}
+	// Scaled back by the smaller scale first: the intermediate result grows, so it cannot underflow before the final one does.
+	return scaled / Math.min(scaleX, scaleY) / Math.max(scaleX, scaleY);
+}
+
+/**
+ * The Euclidean norm of some values, computed on the values scaled by a power of two (so that the squares neither overflow nor underflow)
+ * with the accurate {@link dot2}, with the semantics of `Math.hypot` for values that are not finite: an infinity gives `Infinity`, even
+ * next to a `NaN`.
+ * @param {Float64Array} values - The values
+ * @returns {number} `√(Σ values[i]²)`
+ */
+function euclideanNorm(values: Float64Array): number {
+	const scale = vectorScale(values);
+	const squares = dot2(values, scale, values, scale);
+	if (squares === squares) return Math.sqrt(squares) / scale;
+	return values.some(function (value) {
+		return value === Infinity || value === -Infinity;
+	})
+		? Infinity
+		: NaN;
+}
+
+/**
+ * Computes the Euclidean length (L2 norm) of a vector, `√(Σ xs[i]²)`, like `Math.hypot(...xs)` but for arrays of any length (without
+ * spreading) and more accurately: the squares are added as if in twice the precision of doubles (see {@link dot}), on the values scaled by a
+ * power of two, so it neither overflows nor underflows unless the length itself does (`norm([1e200, 1e200])` is `1.414213562373095e200`,
+ * where the square root of the summed squares is `Infinity`).
+ *
+ * Values are converted once with unary `+`. As with `Math.hypot`, an infinite value gives `Infinity` (even next to a `NaN`), and otherwise a
+ * `NaN` gives `NaN`.
+ * @param {ReadonlyArray<number>} xs - The vector
+ * @returns {number} Its length (`0` for an empty vector)
+ * @example
+ * norm([3, 4]); // => 5
+ * norm([1, 2, 2]); // => 3
+ * norm([1e200, 1e200]); // => 1.414213562373095e200
+ * norm([]); // => 0
+ * norm([NaN, -Infinity]); // => Infinity
+ */
+export function norm(xs: ReadonlyArray<number>): number {
+	return euclideanNorm(toFloat64(xs));
+}
+
+/**
+ * Computes the Euclidean distance between two points given as coordinate arrays, `√(Σ (xs[i] - ys[i])²)`, as Python's `math.dist`, in any
+ * number of dimensions: each difference is rounded once, then their {@link norm} is taken (accurate, and safe from overflow and
+ * underflow). Differences that overflow (`1e308 - -1e308`) are taken on halved coordinates instead, so the distance is only `Infinity` when it
+ * is beyond the doubles. It is symmetric (`distance(a, b) === distance(b, a)`).
+ *
+ * Coordinates are converted once with unary `+`. An infinite difference gives `Infinity` (even next to a `NaN`), and otherwise a `NaN`
+ * gives `NaN` (`Infinity - Infinity` is `NaN`).
+ * @param {ReadonlyArray<number>} xs - The coordinates of the first point
+ * @param {ReadonlyArray<number>} ys - The coordinates of the second point, as many as `xs`
+ * @returns {number} The distance (`0` for points without coordinates)
+ * @throws {RangeError} when `xs` and `ys` have different lengths
+ * @example
+ * distance([0, 0], [3, 4]); // => 5
+ * distance([1, 2, 3], [1, 2, 3]); // => 0
+ * distance([-8e307], [8e307]); // => 1.6e308
+ * distance([-1e308], [1e308]); // => Infinity // 2e308 is beyond the doubles
+ * distance([1, 2], [1]); // throws RangeError
+ */
+export function distance(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): number {
+	assertSameLength('distance', xs, ys);
+	const x = toFloat64(xs);
+	const y = toFloat64(ys);
+	const differences = new Float64Array(x.length);
+	let overflow = false;
+	for (let i = 0; i < x.length; i++) {
+		differences[i] = x[i] - y[i];
+		if (!Number.isFinite(differences[i]) && Number.isFinite(x[i]) && Number.isFinite(y[i])) overflow = true;
+	}
+	if (!overflow) return euclideanNorm(differences);
+	// Halving is exact for coordinates that are not subnormal (a subnormal one is then off by at most the smallest subnormal, negligible next
+	// to a difference beyond `Number.MAX_VALUE`).
+	for (let i = 0; i < x.length; i++) differences[i] = x[i] / 2 - y[i] / 2;
+	return 2 * euclideanNorm(differences);
+}
+
+/**
+ * Computes the cosine similarity of two vectors, `dot(xs, ys) / (|xs| · |ys|)`: the cosine of the angle between them, from `-1` (opposite)
+ * through `0` (orthogonal) to `1` (same direction), whatever their lengths. The usual measure of how close two text embeddings are.
+ *
+ * Both vectors are scaled by powers of two first (which does not change the cosine), and the dot product and the norms are computed as if in
+ * twice the precision of doubles (see {@link dot}), so the result neither overflows nor underflows, stays accurate when the vectors are almost
+ * orthogonal, and is clamped to `[-1, 1]` against rounding. Values are converted once with unary `+`.
+ * @param {ReadonlyArray<number>} xs - The first vector
+ * @param {ReadonlyArray<number>} ys - The second vector, as long as `xs`
+ * @returns {number} The cosine similarity, in `[-1, 1]`; `NaN` when a vector is all zeros (or empty: the angle is undefined) or holds a value
+ * that is not finite
+ * @throws {RangeError} when `xs` and `ys` have different lengths
+ * @example
+ * cosineSimilarity([1, 0], [0, 1]); // => 0
+ * cosineSimilarity([1, 2, 3], [2, 4, 6]); // => 1
+ * cosineSimilarity([1, 1], [-1, -1]); // => -1
+ * cosineSimilarity([3, 4], [4, 3]); // => 0.96
+ * cosineSimilarity([1e300, 1e300], [1e-300, 1e-300]); // => 1 // the plain formula gives 0
+ * cosineSimilarity([0, 0], [1, 2]); // => NaN
+ */
+export function cosineSimilarity(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): number {
+	assertSameLength('cosineSimilarity', xs, ys);
+	const x = toFloat64(xs);
+	const y = toFloat64(ys);
+	const scaleX = vectorScale(x);
+	const scaleY = vectorScale(y);
+	// The scaled vectors have norms between 1 and `2 * √n` (or 0): the product of their squares cannot overflow or underflow. A value that
+	// is not finite makes `dot2`, and so the result, `NaN`.
+	const cosine = dot2(x, scaleX, y, scaleY) / Math.sqrt(dot2(x, scaleX, x, scaleX) * dot2(y, scaleY, y, scaleY));
+	return cosine > 1 ? 1 : cosine < -1 ? -1 : cosine;
 }
