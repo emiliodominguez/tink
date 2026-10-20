@@ -233,6 +233,13 @@ describe('URL helpers', function () {
 		it('should apply the options to the new parameters', function () {
 			expect(helpers.withQuery('/a?z=1', { c: [1, 2], b: 0 }, { arrayFormat: 'brackets', sort: true })).toBe('/a?z=1&b=0&c[]=1&c[]=2');
 		});
+
+		it('should replace the keys the brackets format writes, so that no parameter is smuggled in twice', function () {
+			// `ids[]` in the brackets format writes `ids[][]`: an existing `ids[][]` pair is replaced too.
+			const result = helpers.withQuery('/a?ids[][]=evil&ids=0&x=1', { 'ids[]': ['1'] }, { arrayFormat: 'brackets' });
+			expect(result).toBe('/a?x=1&ids%5B%5D[]=1');
+			expect({ ...helpers.parseQueryString(result.slice(3)) }).toEqual({ x: '1', 'ids[]': ['1'] });
+		});
 	});
 
 	describe('joinUrl / withQuery edge cases', function () {

@@ -336,8 +336,9 @@ function splitUrl(url: string): { base: string; query: string; hash: string } {
  *
  * Existing pairs whose key (decoded, with `[]` removed) is not in `params` (with `[]` removed) are kept verbatim, in place. Every key of
  * `params` whose value is not `undefined` replaces all existing occurrences of that key, in both its plain and its bracket form (`a` and
- * `a[]`), so a parameter can never be smuggled in twice; its new pairs are appended at the end, serialized by {@link buildQueryString}
- * with `options` (which apply to the appended pairs only). A `null` value therefore removes the key (with the default `skipNull: true`).
+ * `a[]`), and so does every key the new pairs are written with (`a[]` in the brackets format writes `a[][]`), so a parameter can never
+ * be smuggled in twice; its new pairs are appended at the end, serialized by {@link buildQueryString} with `options` (which apply to the
+ * appended pairs only). A `null` value therefore removes the key (with the default `skipNull: true`).
  * The fragment is preserved at the end; a dangling `?` is dropped when no pair remains.
  * @param {string} url - The URL (absolute or relative)
  * @param {QueryParamsOf<P>} input - The parameters to set
@@ -364,6 +365,12 @@ export function withQuery<P extends QueryParamsOf<P>>(url: string, input: P & No
 		if (value !== undefined) replaced.add(withoutBrackets(key.replace(LONE_SURROGATES, '\ufffd')));
 	}
 
+	const added = buildFromEntries('withQuery', entries, options);
+
+	// The keys actually written are replaced too: `a[]` in the brackets format writes `a[][]` (`a%5B%5D[]`), which is not a form of `a`.
+	// (Encoded keys and values hold no other literal `[]`, so the parse is skipped otherwise.)
+	if (added.includes('%5B%5D[]')) for (const [key] of new URLSearchParams(added)) replaced.add(withoutBrackets(key));
+
 	const pairs = query.split('&').filter(function (pair: string): boolean {
 		if (pair === '') return false;
 
@@ -372,7 +379,6 @@ export function withQuery<P extends QueryParamsOf<P>>(url: string, input: P & No
 
 		return !replaced.has(withoutBrackets(key));
 	});
-	const added = buildFromEntries('withQuery', entries, options);
 
 	if (added !== '') pairs.push(added);
 
