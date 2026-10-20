@@ -207,6 +207,27 @@ describe('String helpers', function () {
 			expect(helpers.truncate('', 0)).toEqual('');
 		});
 
+		it('should only split the start of a long text into graphemes (regression: the whole text was segmented)', function () {
+			const segment = jest.spyOn(Intl.Segmenter.prototype, 'segment');
+			try {
+				for (const text of ['привет '.repeat(100_000), 'é' + 'a'.repeat(1_000_000), 'नमस्ते '.repeat(100_000)]) {
+					const expected = Array.from(new Intl.Segmenter().segment(text.slice(0, 100)), function (data) {
+						return data.segment;
+					})
+						.slice(0, 10)
+						.join('');
+					segment.mockClear();
+					expect(helpers.truncate(text, 10)).toBe(expected + '...');
+					for (const [input] of segment.mock.calls) expect(input.length).toBeLessThan(1000);
+				}
+				expect(helpers.truncate('привет мир', 6, { separator: ' ' })).toBe('привет...');
+				expect(helpers.truncate('é'.repeat(40), 30)).toBe('é'.repeat(30) + '...');
+				expect(helpers.truncate('é'.repeat(30), 30)).toBe('é'.repeat(30));
+			} finally {
+				segment.mockRestore();
+			}
+		});
+
 		it('should never split a surrogate pair or a grapheme cluster', function () {
 			expect(helpers.truncate('😀😀😀', 1)).toEqual('😀...');
 			expect(helpers.truncate('👍🏽👍🏽👍🏽', 2)).toEqual('👍🏽👍🏽...');
@@ -287,6 +308,19 @@ describe('String helpers', function () {
 			expect(helpers.toTitleCase('ΑΘΗΝΑ')).toEqual('Αθηνα');
 			expect(helpers.toTitleCase('straße ßa')).toEqual('Straße Ssa');
 			expect(helpers.toTitleCase('ﬁne')).toEqual('Fine');
+		});
+
+		it('should skip modifier letters without case at the start of a word (regression: the Hawaiian ʻokina, toTitleCase not idempotent)', function () {
+			expect(helpers.toTitleCase('ʻiolani palace, ʻōlelo hawaiʻi')).toBe('ʻIolani Palace, ʻŌlelo Hawaiʻi');
+			expect(helpers.toTitleCase(helpers.toTitleCase('ŉ'))).toBe('ʼN');
+			expect(helpers.toTitleCase('ʼnaff')).toBe('ʼNaff');
+			expect(helpers.toPascalCase('ʻiolani palace')).toBe('ʻIolaniPalace');
+			expect(helpers.toStartCase('ʻōlelo')).toBe('ʻŌlelo');
+			expect(helpers.toSentenceCase('ʻaiea town')).toBe('ʻAiea town');
+			expect(helpers.toCamelCase('the ʻewa beach')).toBe('theʻEwaBeach');
+			// Cased modifier letters (ʰ, ᴬ) are letters like any other; a word of modifier letters only is left as it is.
+			expect(helpers.toTitleCase('ʰa ᴬb ʻ ʻʻ')).toBe('ʰa ᴬb ʻ ʻʻ');
+			expect(helpers.toPascalCase('ʻ ʻʻ')).toBe('ʻʻʻ');
 		});
 
 		it('should use the Unicode title-case form of digraphs (regression)', function () {
@@ -993,6 +1027,20 @@ describe('String helpers', function () {
 			expect(helpers.wordWrap('a\n\n  b  c ', 80)).toBe('a\n\nb c');
 			expect(helpers.wordWrap('a b\r\nc d', 3)).toBe('a b\nc d');
 			expect(helpers.wordWrap('', 5)).toBe('');
+		});
+
+		it('should neither break at nor replace non-breaking spaces (regression)', function () {
+			const nbsp = String.fromCharCode(0xa0);
+			const narrow = String.fromCharCode(0x202f);
+			const figure = String.fromCharCode(0x2007);
+			const zwnbsp = String.fromCharCode(0xfeff);
+			const text = `Bonjour${narrow}! Comment allez-vous${nbsp}? 10${narrow}000 et 1${figure}234${zwnbsp}5 euros`;
+			expect(helpers.wordWrap(text, 10)).toBe(`Bonjour${narrow}!\nComment\nallez-vous${nbsp}?\n10${narrow}000 et\n1${figure}234${zwnbsp}5\neuros`);
+			expect(helpers.wordWrap(`a${nbsp}${nbsp}b`, 2, { breakLongWords: true })).toBe(`a${nbsp}\n${nbsp}b`);
+			// The other Unicode spaces still break (and collapse).
+			const em = String.fromCharCode(0x2003);
+			const ideographic = String.fromCharCode(0x3000);
+			expect(helpers.wordWrap(`a${em}b${ideographic}c`, 1)).toBe('a\nb\nc');
 		});
 
 		it('should keep long words whole by default', function () {
@@ -2327,6 +2375,35 @@ describe('stripHtml', function () {
 		expect(helpers.stripHtml('a<script')).toBe('a');
 		expect(helpers.stripHtml('a<scripts>b</scripts>c<styles>d')).toBe('abcd');
 		expect(helpers.stripHtml('a<script>x</script')).toBe('a');
+		expect(helpers.stripHtml('a<style>p { }</styles>')).toBe('a');
+	});
+
+	it('ends a script where browsers do, in its escaped states (regression: the double-escaped form leaked script text)', function () {
+		expect(helpers.stripHtml('a<script><!--document.write("<script src=x></script>");//--></script>b')).toBe('ab');
+		expect(helpers.stripHtml('a<script><!--<SCRIPT>x</script>y</script>z')).toBe('az');
+		expect(helpers.stripHtml('a<script><!--<script>x</script/>y</script >z')).toBe('az');
+		// `-->` leaves either escaped state, after which `<script` does not double-escape any more.
+		expect(helpers.stripHtml('a<script><!--<script>x-->y<script></script>z')).toBe('az');
+		expect(helpers.stripHtml('a<script><!--x--><script>y</script>z')).toBe('az');
+		expect(helpers.stripHtml('a<script><!--></script>z')).toBe('az');
+		expect(helpers.stripHtml('a<script><!---></script>z')).toBe('az');
+		// Escaped (one `<!--`, no `<script`): the end tag still ends it.
+		expect(helpers.stripHtml('a<script><!-- x </script>z')).toBe('az');
+		// `<scripts` is no script start tag.
+		expect(helpers.stripHtml('a<script><!--<scripts></script>z')).toBe('az');
+		expect(helpers.stripHtml('a<script><!--<script>never closed</script>b')).toBe('a');
+		expect(helpers.stripHtml('a<script><!--<script')).toBe('a');
+	});
+
+	it('keeps the content of title and textarea elements as text (regression: tags in it were removed, a <script> hid the rest)', function () {
+		expect(helpers.stripHtml('<title>How to use <script> tags</title><p>Body &amp; soul</p>')).toBe('How to use <script> tags' + 'Body & soul');
+		expect(helpers.stripHtml('<textarea name="embed"><script src="x.js"></script></textarea>after')).toBe('<script src="x.js"></script>after');
+		expect(helpers.stripHtml('<TEXTAREA><!-- not a comment --></textarea >b')).toBe('<!-- not a comment -->b');
+		expect(helpers.stripHtml('<title>a &lt;b&gt; <b>c</b></title>d')).toBe('a <b> <b>c</b>d');
+		expect(helpers.stripHtml('<title>a</titles></title>b')).toBe('a</titles>b');
+		expect(helpers.stripHtml('<textarea/>x<b>y')).toBe('x<b>y');
+		expect(helpers.stripHtml('a<title')).toBe('a');
+		expect(helpers.stripHtml('<titles>a<b>c</b></titles>')).toBe('ac');
 	});
 
 	it('reads attributes like the HTML tokenizer', function () {
@@ -2379,6 +2456,9 @@ describe('stripHtml', function () {
 		expect(helpers.stripHtml('<a b=c '.repeat(20_000) + '>x')).toBe('x');
 		expect(helpers.stripHtml('<script>' + '</scrip'.repeat(20_000))).toBe('');
 		expect(helpers.stripHtml('<!--'.repeat(30_000))).toBe('');
+		expect(helpers.stripHtml('<script>' + '<!--<script></script>-->'.repeat(20_000))).toBe('');
+		expect(helpers.stripHtml('<script><!--' + '<script></script x'.repeat(20_000))).toBe('');
+		expect(helpers.stripHtml('<title>' + '</titl'.repeat(20_000))).toBe('</titl'.repeat(20_000));
 		expect(helpers.stripHtml('<!-'.repeat(30_000))).toBe('');
 		expect(helpers.stripHtml('</'.repeat(30_000) + 'x')).toBe('');
 		expect(Date.now() - started).toBeLessThan('__stryker__' in globalThis ? Infinity : 1000);

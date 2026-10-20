@@ -227,8 +227,11 @@ function titleCaseLetter(letter: string): string {
 	return head + upper.slice(head.length).toLowerCase();
 }
 
+/** The modifier letters without case at the start of a word (the Hawaiian ʻokina, the apostrophe of `'ʼN'`), which title-casing skips. */
+const UNCASED_MODIFIERS = /^(?:(?!\p{Cased})\p{Lm})+/u;
+
 /**
- * Lower-cases a word and title-cases its first code point.
+ * Lower-cases a word and title-cases its first code point (after any modifier letters without case: `'ʻiolani'` → `'ʻIolani'`).
  * @param {string} word - The word to convert
  * @returns {string} The converted word (`'hELLO'` → `'Hello'`)
  */
@@ -238,9 +241,14 @@ function upperFirstLowerRest(word: string): string {
 	// An ASCII first letter title-cases to its upper case (no exception, no expansion): skip the code point handling.
 	if (lower.charCodeAt(0) < 0x80) return lower.charAt(0).toUpperCase() + lower.slice(1);
 
-	const first = String.fromCodePoint(lower.codePointAt(0) as number);
+	const skipped = UNCASED_MODIFIERS.exec(lower);
+	const start = skipped === null ? 0 : skipped[0].length;
 
-	return titleCaseLetter(first) + lower.slice(first.length);
+	if (start === lower.length) return lower;
+
+	const first = String.fromCodePoint(lower.codePointAt(start) as number);
+
+	return lower.slice(0, start) + titleCaseLetter(first) + lower.slice(start + first.length);
 }
 
 /**
@@ -451,8 +459,9 @@ function separatorCut(string: string, cut: number, separator: string | RegExp, b
  * The suffix is not counted in `length`.
  *
  * The third argument is the suffix, or an options object with the `suffix` and a `separator` that keeps words whole (see
- * {@link TruncateOptions}). Cost: O(`length`), whatever the length of the string, except with a RegExp separator, which is matched from the start of
- * the string up to its first match after the cut.
+ * {@link TruncateOptions}). Cost: O(`length`) (the code units of the first `length + 1` graphemes), whatever the length of the string: only
+ * a prefix of it is split into graphemes. Except with a RegExp separator, which is matched from the start of the string up to its first
+ * match after the cut.
  * @param {string} string - The original string
  * @param {number} length - The maximum number of graphemes to keep (non-negative integer)
  * @param {string | TruncateOptions} [options='...'] - The suffix appended when the string is truncated, or `{ suffix, separator }`
@@ -492,7 +501,8 @@ export function truncate(string: string, length: number, options: string | Trunc
 	// When the first `length + 1` code units are graphemes on their own, the cut falls right after the first `length` of them, and every
 	// position before it is a grapheme boundary.
 	if (!isSimpleText(string.slice(0, length + 1))) {
-		const graphemes = splitGraphemes(string, length);
+		// Only a prefix of the string is split (the regions of complex text found by `splitGraphemes` may span all of it).
+		const graphemes = leadingGraphemes(string, length);
 
 		if (graphemes.length <= length) return string;
 
@@ -535,8 +545,11 @@ export function trim(string: string): string {
 	return string.trim();
 }
 
-/** The first letter of every whitespace-separated word that does not start with a digit (after any leading punctuation), with that punctuation. */
-const TITLE_CASE_TARGET = /(?<!\S)([^\s\p{L}\p{N}]*)(\p{L})/gu;
+/**
+ * The first letter of every whitespace-separated word that does not start with a digit (after any leading punctuation and modifier
+ * letters without case, such as the Hawaiian ʻokina or the apostrophe that `'ŉ'` title-cases to), with what it skipped.
+ */
+const TITLE_CASE_TARGET = /(?<!\S)((?:[^\s\p{L}\p{N}]|(?!\p{Cased})\p{Lm})*)(\p{L})/gu;
 
 /**
  * Lower-cases a string (a callback for `replace`).
@@ -549,14 +562,16 @@ function toLowerCase(text: string): string {
 
 /**
  * Converts a string to title case: in every whitespace-separated word the first letter is upper-cased and everything else is lower-cased.
- * Whitespace and punctuation are preserved exactly. Leading punctuation is skipped (`'(hello)'` → `'(Hello)'`),
- * but a word starting with a digit is left lower-case (`'1st'` stays `'1st'`). Works with Unicode letters, with their Unicode title case
+ * Whitespace and punctuation are preserved exactly. Leading punctuation is skipped (`'(hello)'` → `'(Hello)'`), and so are modifier
+ * letters without case (`'ʻiolani'` → `'ʻIolani'`, with the Hawaiian ʻokina), but a word starting with a digit is left lower-case
+ * (`'1st'` stays `'1st'`). Works with Unicode letters, with their Unicode title case
  * (`'ǆ'` → `'ǅ'`, `'ß'` → `'Ss'`, `'ᾳ'` → `'ᾼ'`; Georgian letters are their own title case).
  * @param {string} string - The string to be converted to title case
  * @returns {string} The string in title case
  * @example
  * toTitleCase('hello  WORLD'); // => 'Hello  World'
  * toTitleCase('élan vital, "quoted"'); // => 'Élan Vital, "Quoted"'
+ * toTitleCase('ʻiolani palace'); // => 'ʻIolani Palace'
  */
 export function toTitleCase(string: string): string {
 	// Lower-casing the whole string equals lower-casing each word (only final sigma is context-sensitive, and white space is neither cased
@@ -1467,8 +1482,16 @@ export interface WordWrapOptions {
 }
 
 /**
+ * A word of {@link wordWrap}: a run of anything but white space, where the non-breaking spaces (U+00A0 NO-BREAK SPACE, U+2007 FIGURE
+ * SPACE, U+202F NARROW NO-BREAK SPACE and U+FEFF ZERO WIDTH NO-BREAK SPACE, which `\s` matches) are not white space: they join words
+ * (`'Bonjour\u202f!'`, `'10\u202f000'`), as line breaking does it (UAX #14).
+ */
+const WRAP_WORD = /[^\t\n\v\f\r \u1680\u2000-\u2006\u2008-\u200a\u2028\u2029\u205f\u3000]+/g;
+
+/**
  * Wraps text to lines of at most `width` user-perceived characters (grapheme clusters) using a greedy algorithm: words are separated
- * by whitespace and added to the current line while they fit, with a single space between them.
+ * by whitespace and added to the current line while they fit, with a single space between them. Non-breaking spaces (U+00A0, U+2007,
+ * U+202F, U+FEFF) are not breaks: they are kept, inside the word they join (`'Bonjour\u00a0!'` is one word).
  *
  * Existing line breaks (`\n`, `\r\n`, `\r`) are kept as hard breaks (each input line is wrapped on its own, blank lines are preserved),
  * every output line break is `newline`, and runs of other whitespace (including indentation and trailing spaces) collapse into the
@@ -1484,6 +1507,7 @@ export interface WordWrapOptions {
  * wordWrap('The quick brown fox jumps', 10); // => 'The quick\nbrown fox\njumps'
  * wordWrap('abcdefghij xy', 4, { breakLongWords: true }); // => 'abcd\nefgh\nij\nxy'
  * wordWrap('a b c', 3, { newline: '<br>' }); // => 'a b<br>c'
+ * wordWrap('Prix\u00a0: 10\u202f000 EUR', 10); // => 'Prix\u00a0:\n10\u202f000 EUR'
  */
 export function wordWrap(string: string, width: number, options: WordWrapOptions = {}): string {
 	assertInteger('wordWrap', 'width', width, 1, true);
@@ -1497,7 +1521,7 @@ export function wordWrap(string: string, width: number, options: WordWrapOptions
 		let current = '';
 		let currentLength = 0;
 
-		for (const word of line.match(/\S+/g) ?? []) {
+		for (const word of line.match(WRAP_WORD) ?? []) {
 			const wordLength = graphemeLength(word);
 
 			if (wordLength > width && breakLongWords) {
@@ -2058,8 +2082,9 @@ function pad(caller: string, string: string, width: number, fill: string, share:
  * are counted in graphemes, and so is the cut of the last repetition of a multi-character `fill`.
  *
  * Width means grapheme count: East Asian wide characters (CJK ideographs, full-width forms) and emoji, which terminals usually draw two
- * columns wide, count as 1. A string that starts with a combining mark (or a fill that ends with a zero-width joiner) can merge with the
- * padding into fewer graphemes.
+ * columns wide, count as 1. A string that starts with a combining mark or ends with a prepended mark (such as U+0600 ARABIC NUMBER SIGN,
+ * which joins the character after it), or a fill that ends with a zero-width joiner or a prepended mark, can merge with the padding (or
+ * the next repetition of the fill) into fewer graphemes.
  * @param {string} string - The string to pad
  * @param {number} width - The target width in graphemes (a non-negative integer); a string at least that wide is returned unchanged
  * @param {string} [fill=' '] - The padding, repeated and cut as needed (must not be empty)
@@ -2684,11 +2709,65 @@ function tagEnd(html: string, index: number): number {
 	}
 }
 
-/** The end tags that close the raw text elements whose content {@link stripHtml} removes (followed by what may end a tag name). */
-const RAW_TEXT_ENDS: Readonly<Record<string, RegExp>> = { script: /<\/script[\t\n\f\r />]/gi, style: /<\/style[\t\n\f\r />]/gi };
+/** The end tag that closes a `<style>` element (followed by what may end a tag name); a `<script>` element ends where {@link scriptEnd} says. */
+const STYLE_END = /<\/style[\t\n\f\r />]/gi;
 
-/** A start tag (from its name, as a sticky match) of an element in {@link RAW_TEXT_ENDS}. */
+/** A start tag (from its name, as a sticky match) of a script or style element, whose content {@link stripHtml} removes. */
 const RAW_TEXT_START = /(script|style)(?=[\t\n\f\r />])/iy;
+
+/** A start tag (from its name, as a sticky match) of a title or textarea element, whose content is text even where it looks like markup. */
+const ESCAPABLE_RAW_TEXT_START = /(title|textarea)(?=[\t\n\f\r />])/iy;
+
+/** The end tags that close the elements of {@link ESCAPABLE_RAW_TEXT_START}. */
+const ESCAPABLE_RAW_TEXT_ENDS: Readonly<Record<string, RegExp>> = { title: /<\/title[\t\n\f\r />]/gi, textarea: /<\/textarea[\t\n\f\r />]/gi };
+
+/**
+ * What changes the state of the HTML tokenizer in the content of a `<script>` element (see {@link scriptEnd}), in each state: in script
+ * data, its end tag or `<!--` (which escapes it); once escaped, its end tag, a `<script` start tag (which double-escapes it) or `-->`;
+ * double-escaped, a `</script` end tag (back to escaped, not the end) or `-->`.
+ */
+const SCRIPT_STATES = [/<\/script[\t\n\f\r />]|<!--/gi, /<\/?script[\t\n\f\r />]|-->/gi, /<\/script[\t\n\f\r />]|-->/gi];
+
+/**
+ * Finds the end tag of a `<script>` element as the HTML tokenizer does: in the "double escaped" state, entered by a `<script` after a
+ * `<!--` (`<script><!-- document.write('<script></script>') --></script>`), a `</script>` does not end the element, and `-->` leaves
+ * either escaped state. Linear: each state's pattern is matched from where the previous one stopped.
+ * @param {string} html - The HTML
+ * @param {number} from - The position after the start tag
+ * @returns {number} The position of the end tag's `<`, or `-1` when the element is not closed
+ */
+function scriptEnd(html: string, from: number): number {
+	// 0: script data, 1: escaped, 2: double escaped.
+	let state = 0;
+	let index = from;
+
+	for (;;) {
+		const pattern = SCRIPT_STATES[state];
+
+		pattern.lastIndex = index;
+
+		const match = pattern.exec(html);
+
+		if (match === null) return -1;
+
+		const token = match[0];
+
+		if (token === '-->') {
+			state = 0;
+			index = pattern.lastIndex;
+		} else if (token === '<!--') {
+			// Its dashes may already be those of `-->` (`<!-->` leaves the escaped state at once).
+			state = 1;
+			index = match.index + 2;
+		} else if (token[1] !== '/') {
+			state = 2;
+			index = pattern.lastIndex;
+		} else if (state === 2) {
+			state = 1;
+			index = pattern.lastIndex;
+		} else return match.index;
+	}
+}
 
 /** The end of a comment: `-->`, or `--!>` as browsers also accept. */
 const COMMENT_END = /--!?>/g;
@@ -2712,11 +2791,15 @@ function markupEnd(html: string, open: number): number {
 		if (raw === null) return end;
 
 		// A script or style element: its content is not markup, and is removed up to its end tag (or to the end of the text).
-		const closing = RAW_TEXT_ENDS[raw[1].toLowerCase()];
+		let close = -1;
 
-		closing.lastIndex = end;
+		if (raw[1].length === 6) close = scriptEnd(html, end);
+		else {
+			STYLE_END.lastIndex = end;
+			if (STYLE_END.exec(html) !== null) close = STYLE_END.lastIndex - 8;
+		}
 
-		return closing.exec(html) === null ? html.length : tagEnd(html, closing.lastIndex - 1);
+		return close === -1 ? html.length : tagEnd(html, close + 2);
 	}
 
 	if (next === 33 && html.startsWith('--', open + 2)) {
@@ -2746,6 +2829,33 @@ function markupEnd(html: string, open: number): number {
 }
 
 /**
+ * Finds where the text after a piece of markup ends (see {@link stripHtml}): at the next `<`, or, after the start tag of a title or
+ * textarea element, whose content is text even where it looks like markup (`<title>a <b> c</title>`), at its end tag.
+ * @param {string} html - The HTML
+ * @param {number} open - The position of the markup's `<`
+ * @param {number} end - The position after the markup
+ * @returns {number} The position of the next `<` that may start markup, or `-1` when there is none
+ */
+function textEnd(html: string, open: number, end: number): number {
+	if (isAsciiLetter(html.charCodeAt(open + 1))) {
+		ESCAPABLE_RAW_TEXT_START.lastIndex = open + 1;
+
+		const raw = ESCAPABLE_RAW_TEXT_START.exec(html);
+
+		if (raw !== null) {
+			const closing = ESCAPABLE_RAW_TEXT_ENDS[raw[1].toLowerCase()];
+
+			closing.lastIndex = end;
+
+			// Without an end tag, the rest of the text is the element's.
+			return closing.exec(html) === null ? -1 : closing.lastIndex - raw[1].length - 3;
+		}
+	}
+
+	return html.indexOf('<', end);
+}
+
+/**
  * Extracts the text of an HTML fragment, for previews, search indexes, notifications or plain-text e-mails: tags, comments, doctypes and
  * processing instructions are removed, the content of `<script>` and `<style>` elements is dropped, and `&lt;`, `&gt;`, `&quot;`,
  * `&#39;`/`&apos;` and `&amp;` are decoded (see {@link unescapeHtml}; other entities, such as `&nbsp;`, are kept as they are). The text
@@ -2754,7 +2864,10 @@ function markupEnd(html: string, open: number): number {
  *
  * The markup is read the way browsers tokenize it, in one linear pass without regular expression backtracking: a `>` inside a quoted
  * attribute value does not end the tag, a `<` that does not start a tag (`a < b`, `<3`) is text, a tag or comment left open at the end
- * is removed to the end (as browsers drop it), and a script or style element without an end tag hides the rest of the text.
+ * is removed to the end (as browsers drop it), and a script or style element without an end tag hides the rest of the text. A script
+ * ends where browsers end it: a `</script>` written inside `<!--` and `<script` within the script does not end it
+ * (`<script><!-- document.write('<script></script>') --></script>`). The content of `<title>` and `<textarea>` elements is text, also
+ * where it looks like markup (`'<textarea><b>x</b></textarea>'` gives `'<b>x</b>'`), up to their end tag.
  *
  * NOT A SANITIZER: this is text extraction, not XSS protection. The output is plain text, and it is not safe to insert into HTML: decoding
  * turns `'&lt;img src=x onerror=alert(1)&gt;'` into a real-looking tag, and even without entities, the text around a removed tag can
@@ -2768,6 +2881,7 @@ function markupEnd(html: string, open: number): number {
  * stripHtml('Tom &amp; Jerry<script>alert("<b>")</script><!-- note -->'); // => 'Tom & Jerry'
  * stripHtml('<a title="a > b" href="/x">link</a> 1 < 2'); // => 'link 1 < 2'
  * stripHtml('&lt;b&gt;not a tag&lt;/b&gt;'); // => '<b>not a tag</b>' // plain text: escape it before inserting it into HTML
+ * stripHtml('<textarea><b>x</b></textarea>'); // => '<b>x</b>'
  */
 export function stripHtml(html: string): string {
 	assertString('stripHtml', 'html', html);
@@ -2785,7 +2899,7 @@ export function stripHtml(html: string): string {
 			// Each run of text is decoded on its own: an entity never spans a tag.
 			text += unescapeHtml(html.slice(start, open));
 			start = end;
-			open = html.indexOf('<', end);
+			open = textEnd(html, open, end);
 		}
 	}
 
