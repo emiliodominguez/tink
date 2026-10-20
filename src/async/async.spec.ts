@@ -2200,6 +2200,78 @@ describe('Async helpers (round 11)', function () {
 			expect(idle).toBe(true);
 		});
 
+		it('keeps the priority and FIFO orders when aborted tasks are dropped from the middle of the queue', async function () {
+			const queue = createQueue({ concurrency: 1 });
+			queue.pause();
+			const order: string[] = [];
+			const controllers = [new AbortController(), new AbortController()];
+			const specs = [
+				['a', 0, 0],
+				['b', 1, 1],
+				['c', 0, -1],
+				['d', 2, 0],
+				['e', 1, -1],
+				['f', 0, 1],
+				['g', 2, -1],
+				['h', 1, 0]
+			] as const;
+			const tasks = specs.map(function ([name, priority, controller]) {
+				return queue.add(
+					function () {
+						order.push(name);
+					},
+					{ priority, signal: controller < 0 ? undefined : controllers[controller].signal }
+				);
+			});
+			controllers[0].abort();
+			expect(queue.size).toBe(5);
+			controllers[1].abort();
+			expect(queue.size).toBe(3);
+			tasks.push(
+				queue.add(
+					function () {
+						order.push('i');
+					},
+					{ priority: 1 }
+				)
+			);
+			queue.resume();
+			const outcomes = await Promise.allSettled(tasks);
+			expect(order).toEqual(['g', 'e', 'i', 'c']);
+			expect(
+				outcomes.map(function (outcome) {
+					return outcome.status;
+				})
+			).toEqual(['rejected', 'rejected', 'fulfilled', 'rejected', 'fulfilled', 'rejected', 'fulfilled', 'rejected', 'fulfilled']);
+			expect(queue.size).toBe(0);
+		});
+
+		it('queues and aborts many tasks sharing a signal in linear time (previously quadratic: one listener each)', async function () {
+			/**
+			 * Times queuing 30,000 tasks on a paused queue, with or without a shared signal, then aborting them (or clearing the queue).
+			 * @param {boolean} shared - Whether the tasks share a signal
+			 * @returns {Promise<number>} The time in ms
+			 */
+			async function time(shared: boolean): Promise<number> {
+				const queue = createQueue({ concurrency: 1 });
+				const controller = new AbortController();
+				const tasks: Array<Promise<unknown>> = [];
+				const options = shared ? { signal: controller.signal } : {};
+				queue.pause();
+				const start = performance.now();
+				for (let i = 0; i < 30_000; i++) tasks.push(queue.add(jest.fn(), { priority: i % 3, ...options }));
+				if (shared) controller.abort();
+				else queue.clear();
+				const elapsed = performance.now() - start;
+				expect(queue.size).toBe(0);
+				await Promise.allSettled(tasks);
+				return elapsed;
+			}
+			const alone = await time(false);
+			// Quadratic, it took hundreds of times as long.
+			expect(await time(true)).toBeLessThan(alone * 20 + 100);
+		});
+
 		it('rejects at once (without running) for an already-aborted task signal', async function () {
 			const queue = createQueue();
 			const signal = new CountingSignal();
@@ -2630,6 +2702,27 @@ describe('Async helpers (round 11)', function () {
 			await expect(failing()).rejects.toThrow('bad key');
 		});
 
+		it('delete() forwards this to the resolver, like a call (previously called it without this)', async function () {
+			const memo = memoizeAsync(
+				async function (this: { scope: string }, id: number) {
+					return `${this.scope}:${id}`;
+				},
+				{
+					resolver: function (this: { scope: string }, id) {
+						return `${this.scope}/${id}`;
+					}
+				}
+			);
+			const admin = { scope: 'admin', memo };
+			const guest = { scope: 'guest', memo };
+			await admin.memo(1);
+			await guest.memo(1);
+			expect(admin.memo.delete.call(admin, 1)).toBe(true);
+			expect([...(memo.cache as Map<unknown, unknown>).keys()]).toEqual(['guest/1']);
+			expect(memo.delete.call(guest, 1)).toBe(true);
+			expect(memo.cache.has('guest/1')).toBe(false);
+		});
+
 		it('clear() and delete() forget values and calls in flight (a cleared call does not write to the cache)', async function () {
 			const gate = createDeferred<string>();
 			const fn = jest.fn(function (key: string): Promise<string> | string {
@@ -2789,6 +2882,107 @@ describe('Async helpers (hostile signals)', function () {
 		second.resolve('done');
 		await expect(task).resolves.toBe('done');
 		expect(queue.size).toBe(0);
+	});
+
+	it('createKeyedMutex: a request signal aborted after its grant does not unlock a key held again (previously forgot the key)', async function () {
+		const signal = hostile({ removeEventListener: boom });
+		const locks = createKeyedMutex<string>();
+		const releaseFirst = await locks.acquire('k');
+		const waiting = locks.acquire('k', { signal });
+		releaseFirst();
+		(await waiting)();
+		const releaseSecond = await locks.acquire('k');
+		signal.fire();
+		expect(locks.isLocked('k')).toBe(true);
+		expect(locks.tryAcquire('k')).toBeUndefined();
+		releaseSecond();
+		expect(locks.isLocked('k')).toBe(false);
+		const pool = createSemaphore(1);
+		const late = hostile({ removeEventListener: boom });
+		const held = pool.tryAcquire() as () => void;
+		const granted = pool.acquire({ signal: late });
+		held();
+		await expect(granted).resolves.toBeInstanceOf(Function);
+		late.fire();
+		expect(pool.available).toBe(0);
+	});
+
+	it('mapWithConcurrency: rejects when a callback returns a promise that cannot be awaited (previously stayed pending)', async function () {
+		/**
+		 * A promise whose `constructor` or `then` getter throws.
+		 * @param {'constructor' | 'then'} key - The poisoned property
+		 * @returns {Promise<number>} The promise
+		 */
+		function poisoned(key: 'constructor' | 'then'): Promise<number> {
+			const promise = Promise.resolve(1);
+			Object.defineProperty(promise, key, {
+				get: function () {
+					throw new Error(key);
+				}
+			});
+			return promise;
+		}
+		await expect(
+			mapWithConcurrency(
+				[1, 2],
+				function () {
+					return poisoned('constructor');
+				},
+				1
+			)
+		).rejects.toThrow('constructor');
+		const outcome = mapWithConcurrency(
+			['constructor', 'then', 'ok'] as const,
+			function (key) {
+				return key === 'ok' ? 2 : poisoned(key);
+			},
+			{ concurrency: 1, stopOnError: false }
+		);
+		await expect(outcome).rejects.toMatchObject({ errors: [new Error('constructor'), new Error('then')] });
+	});
+
+	it('createSemaphore and createQueue: a signal aborting while its listener is added fails the request without leaking anything', async function () {
+		/**
+		 * A signal that aborts as soon as a listener is added, calling it at once.
+		 * @returns {AbortSignalLike} The signal
+		 */
+		function abortingOnAdd(thenThrow = false): AbortSignalLike {
+			const signal = {
+				aborted: false,
+				reason: 'stop',
+				addEventListener: function (_type: string, listener: () => void) {
+					signal.aborted = true;
+					listener();
+					if (thenThrow) throw new Error('add');
+				},
+				removeEventListener: jest.fn()
+			};
+			return signal;
+		}
+		jest.useFakeTimers();
+		try {
+			const pool = createSemaphore(1);
+			const held = pool.tryAcquire() as () => void;
+			await expect(pool.acquire({ signal: abortingOnAdd(), timeout: 1000 })).rejects.toBe('stop');
+			await expect(pool.acquire({ signal: abortingOnAdd(true), timeout: 1000 })).rejects.toBe('stop');
+			expect(pool.pending).toBe(0);
+			expect(jest.getTimerCount()).toBe(0);
+			const queued = pool.acquire();
+			expect(pool.pending).toBe(1);
+			held();
+			(await queued)();
+			expect(pool.available).toBe(1);
+			const queue = createQueue({ concurrency: 1 });
+			queue.pause();
+			const task = jest.fn();
+			await expect(queue.add(task, { signal: abortingOnAdd() })).rejects.toBe('stop');
+			expect(queue.size).toBe(0);
+			queue.resume();
+			await queue.onIdle();
+			expect(task).not.toHaveBeenCalled();
+		} finally {
+			jest.useRealTimers();
+		}
 	});
 
 	it('settles even when removeEventListener throws', async function () {
@@ -3014,6 +3208,41 @@ describe('createBatcher', function () {
 				return new Array<string>(2);
 			});
 			await expect(holes.loadMany([1, 2])).resolves.toEqual([undefined, undefined]);
+		});
+
+		it('reads holes as undefined, not as values planted on a polluted Object.prototype (previously handed out and cached)', async function () {
+			const proto = Object.prototype as unknown as Record<number, unknown>;
+			proto[1] = 'planted';
+			try {
+				const users = createBatcher(
+					async function (keys: number[]) {
+						const rows = new Array<string>(keys.length);
+						rows[0] = 'ada';
+						return rows;
+					},
+					{ cache: true }
+				);
+				await expect(users.loadMany([1, 2])).resolves.toEqual(['ada', undefined]);
+				const arrayLike = createBatcher(function (keys: number[]) {
+					return { length: keys.length, 0: 'zero' } as ArrayLike<string>;
+				});
+				await expect(arrayLike.loadMany([0, 1])).resolves.toEqual(['zero', undefined]);
+			} finally {
+				delete proto[1];
+			}
+			// Values inherited from another prototype (an array-like class) are read.
+			class Pair {
+				get length(): number {
+					return 2;
+				}
+				get 1(): string {
+					return 'inherited';
+				}
+			}
+			const inherited = createBatcher(function (_keys: number[]) {
+				return new Pair() as unknown as ArrayLike<string>;
+			});
+			await expect(inherited.loadMany([0, 1])).resolves.toEqual([undefined, 'inherited']);
 		});
 
 		it('compares keys with SameValueZero by default', async function () {
@@ -3582,6 +3811,28 @@ describe('createBatcher', function () {
 			await expect(load).rejects.toMatchObject({ name: 'AbortError' });
 			await flush();
 			expect(calls).toEqual([]);
+		});
+
+		it('clears the delay timer of a batch every key left, and opens a new batch for the next key (previously kept the timer)', async function () {
+			jest.useFakeTimers();
+			const { calls, batchLoad } = recorder();
+			const batcher = createBatcher(batchLoad, { delay: 1000, cache: true });
+			const controller = new AbortController();
+			const aborted = batcher.load(1, { signal: controller.signal });
+			controller.abort();
+			await expect(aborted).rejects.toMatchObject({ name: 'AbortError' });
+			expect(jest.getTimerCount()).toBe(0);
+			const primed = batcher.load(2);
+			batcher.prime(2, 'primed');
+			await expect(primed).resolves.toBe('primed');
+			expect(jest.getTimerCount()).toBe(0);
+			const later = batcher.load(3);
+			jest.advanceTimersByTime(999);
+			await flush();
+			expect(calls).toEqual([]);
+			jest.advanceTimersByTime(1);
+			await expect(later).resolves.toBe('value 3');
+			expect(calls).toEqual([[3]]);
 		});
 
 		it('removes an aborted key from the requests in flight of a cache, so it is requested next time', async function () {
@@ -4228,6 +4479,61 @@ describe('Async helpers (locks, events, reduceAsync, minDelay)', function () {
 			expect(jest.getTimerCount()).toBe(0);
 			holder();
 			expect(semaphore.available).toBe(1);
+		});
+
+		it('queues and aborts many requests sharing a signal in linear time (previously quadratic: one listener each)', async function () {
+			/**
+			 * Times queuing 30,000 requests, with or without a shared signal, then aborting them (or timing them out at once).
+			 * @param {boolean} shared - Whether the requests share a signal
+			 * @returns {Promise<number>} The time in ms
+			 */
+			async function time(shared: boolean): Promise<number> {
+				const pool = createSemaphore(1);
+				const held = pool.tryAcquire() as () => void;
+				const controller = new AbortController();
+				const requests: Array<Promise<() => void>> = [];
+				const start = performance.now();
+				for (let i = 0; i < 30_000; i++) requests.push(pool.acquire(shared ? { signal: controller.signal } : {}));
+				if (shared) controller.abort();
+				const elapsed = performance.now() - start;
+				held();
+				if (shared) {
+					expect(pool.pending).toBe(0);
+					await Promise.allSettled(requests);
+				} else {
+					// Every request is granted in turn.
+					for (const request of requests) (await request)();
+				}
+				return elapsed;
+			}
+			const alone = await time(false);
+			expect(await time(true)).toBeLessThan(alone * 20 + 100);
+		});
+
+		it('serves a long queue of waiting requests in linear time (previously quadratic: a Set used as a queue)', async function () {
+			/**
+			 * Times `n` runs through a semaphore of 4 permits, all queued at once.
+			 * @param {number} n - The number of runs
+			 * @returns {Promise<number>} The time in ms
+			 */
+			async function time(n: number): Promise<number> {
+				const pool = createSemaphore(4);
+				const runs: Array<Promise<number>> = [];
+				const start = performance.now();
+				for (let i = 0; i < n; i++) {
+					runs.push(
+						pool.run(function () {
+							return i;
+						})
+					);
+				}
+				await Promise.all(runs);
+				return performance.now() - start;
+			}
+			await time(20_000);
+			const small = await time(20_000);
+			// Eight times the requests: about 8 times as long (64 times, quadratic).
+			expect(await time(160_000)).toBeLessThan(small * 20 + 100);
 		});
 
 		it('works with Infinity permits', async function () {
