@@ -619,9 +619,15 @@ export function formatList(items: Iterable<string> & { readonly charAt?: never }
 	if (typeof items === 'string' || !isIterable(items)) throw new TypeError(`formatList: \`items\` must be an iterable of strings, got ${describe(items)}`);
 
 	const list = Array.from(items);
+	const array = Array.isArray(items);
 
-	for (const item of list) {
-		if (typeof item !== 'string') throw new TypeError(`formatList: every item must be a string, got ${describe(item)}`);
+	for (let index = 0; index < list.length; index++) {
+		const item = list[index];
+
+		// A hole of an array is `undefined` (iterating would read it from a polluted `Array.prototype` or `Object.prototype`).
+		if (typeof item !== 'string' || (array && !Object.hasOwn(items, index))) {
+			throw new TypeError(`formatList: every item must be a string, got ${describe(typeof item === 'string' ? undefined : item)}`);
+		}
 	}
 
 	const type = readOption(options, 'type', 'conjunction');
@@ -704,7 +710,7 @@ export function formatRelativeTime(value: number, unit: Intl.RelativeTimeFormatU
  * @param {number} n - An integer
  * @param {FormatOrdinalOptions} [options={}] - `locale` (default `'en-US'`) and `suffixes`
  * @returns {string} The formatted ordinal
- * @throws {TypeError} when `n` is not a number
+ * @throws {TypeError} when `n` is not a number, or `suffixes` has no string `other`
  * @throws {RangeError} when `n` is not a finite integer, or the locale is invalid
  * @example
  * formatOrdinal(1); // => '1st'
@@ -720,9 +726,18 @@ export function formatOrdinal(n: number, options: FormatOrdinalOptions = {}): st
 	if (!Number.isInteger(n)) throw new RangeError(`formatOrdinal: \`n\` must be an integer, got ${n}`);
 
 	const locale = readOption(options, 'locale');
+	const suffixes = readOption(options, 'suffixes');
+
+	// `other` is the suffix of every category the table does not list: without it, those would print `undefined`.
+	if (suffixes !== undefined && suffixes !== null) {
+		const other: unknown = readOption(suffixes, 'other');
+
+		if (typeof other !== 'string') throw new TypeError(`formatOrdinal: \`suffixes.other\` must be a string, got ${describe(other)}`);
+	}
+
 	const value = n === 0 ? 0 : n;
 	const rules = getFormatter('plural', Intl.PluralRules, locale, { type: 'ordinal' }, ORDINAL_MEMO);
-	const table = readOption(options, 'suffixes') ?? (resolvedLanguage(rules) === 'en' ? ENGLISH_ORDINAL_SUFFIXES : GENERIC_ORDINAL_SUFFIXES);
+	const table = suffixes ?? (resolvedLanguage(rules) === 'en' ? ENGLISH_ORDINAL_SUFFIXES : GENERIC_ORDINAL_SUFFIXES);
 
 	// The suffix tables are read like options: a category missing from one (`one` in `{ other: '.' }`) falls back to `other`, never to a
 	// suffix planted on a polluted `Object.prototype`.

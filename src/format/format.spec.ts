@@ -530,6 +530,25 @@ describe('Format helpers', function () {
 				helpers.formatList(['a', 1] as any);
 			}).toThrow(new TypeError('formatList: every item must be a string, got number'));
 		});
+
+		it('should reject a hole of an array, also when a polluted prototype plants a string there', function () {
+			// eslint-disable-next-line no-sparse-arrays
+			const sparse = ['a', , 'b'] as string[];
+
+			expect(function () {
+				helpers.formatList(sparse);
+			}).toThrow(new TypeError('formatList: every item must be a string, got undefined'));
+			const proto = Object.prototype as unknown as Record<number, unknown>;
+			proto[1] = 'planted';
+			try {
+				expect(function () {
+					helpers.formatList(sparse);
+				}).toThrow(new TypeError('formatList: every item must be a string, got undefined'));
+				expect(helpers.formatList(['a', 'b'])).toBe('a and b');
+			} finally {
+				delete proto[1];
+			}
+		});
 	});
 
 	describe('formatDateTime', function () {
@@ -680,6 +699,34 @@ describe('Format helpers', function () {
 			expect(helpers.formatOrdinal(1, { locale: 'fr-FR', suffixes: french })).toBe('1er');
 			expect(helpers.formatOrdinal(2, { locale: 'fr-FR', suffixes: french })).toBe('2e');
 			expect(helpers.formatOrdinal(2, { suffixes: { other: 'º' } })).toBe('2º');
+		});
+
+		it('should reject suffixes without a string `other`, which would print undefined', function () {
+			const lacking = { one: 'st' } as unknown as helpers.OrdinalSuffixes;
+
+			expect(function () {
+				helpers.formatOrdinal(4, { suffixes: lacking });
+			}).toThrow(new TypeError('formatOrdinal: `suffixes.other` must be a string, got undefined'));
+			// Also when the number's own category is listed: the table is wrong either way.
+			expect(function () {
+				helpers.formatOrdinal(1, { suffixes: lacking });
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.formatOrdinal(1, { suffixes: 'th' as unknown as helpers.OrdinalSuffixes });
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.formatOrdinal(1, { suffixes: { other: 1 } as unknown as helpers.OrdinalSuffixes });
+			}).toThrow('got number');
+			// Planted on a polluted prototype, `other` does not count.
+			const proto = Object.prototype as unknown as Record<string, unknown>;
+			proto.other = 'th';
+			try {
+				expect(function () {
+					helpers.formatOrdinal(4, { suffixes: lacking });
+				}).toThrow(TypeError);
+			} finally {
+				delete proto.other;
+			}
 		});
 
 		it('should treat unsupported locales as en-US', function () {
