@@ -9,7 +9,7 @@ import {
 	type MemoizeCache,
 	type ThrottleOptions
 } from '../functions/index.js';
-import { assertDelay, assertFunction, describe } from '../utils/assert.js';
+import { assertDelay, assertFunction, describe, readOption } from '../utils/assert.js';
 import type { AnyFunction, RandomGenerator } from '../utils/index.js';
 
 /**
@@ -929,4 +929,309 @@ export function timeout(ms: number, message?: string): AsyncMethodDecorator {
 			return withTimeout(result, ms, message);
 		};
 	}) as unknown as AsyncMethodDecorator;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// lazy
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Caches the value a `@lazy` getter computed as a data property of the instance, which then shadows the getter: later reads are plain
+ * property reads. Not done (the caller keeps the value in its `WeakMap` instead) on the object that holds the getter (a class, for a static
+ * getter), on a prototype (the value would be shared by every instance), when the getter runs for a subclass's override through `super`
+ * (the own value would shadow the override), or on non-extensible (frozen, sealed) objects.
+ * @param {object} owner - The object the getter was read from
+ * @param {string | symbol} key - The getter's key
+ * @param {unknown} value - The computed value
+ * @param {UnknownMethod} get - The `@lazy` getter
+ * @returns {boolean} Whether the value was defined on `owner`
+ */
+function cacheOnInstance(owner: object, key: string | symbol, value: unknown, get: UnknownMethod): boolean {
+	if (Object.prototype.hasOwnProperty.call(owner, key) || isPrototypeObject(owner)) return false;
+	// (`resolveDescriptor` finds nothing on a `null` prototype.)
+	if (resolveDescriptor(Object.getPrototypeOf(owner) as object, key)?.get !== get) return false;
+	// Non-enumerable and read-only, like the getter it replaces (no setter: assigning throws in strict mode); configurable, so that deleting
+	// it computes the value again on the next read.
+	return Reflect.defineProperty(owner, key, { value, writable: false, enumerable: false, configurable: true });
+}
+
+/**
+ * Creates the getter of a `@lazy` getter.
+ * @param {UnknownMethod} getter - The original getter
+ * @param {string | symbol | undefined} key - The getter's key, or `undefined` for a private getter (whose value stays in a `WeakMap`)
+ * @returns {UnknownMethod} The caching getter
+ */
+function lazyGetter(getter: UnknownMethod, key: string | symbol | undefined): UnknownMethod {
+	// Values of the objects that cannot cache them as an own property (see `cacheOnInstance`), and of private getters.
+	const values = new WeakMap<object, unknown>();
+
+	return function lazyGet(this: unknown): unknown {
+		// A primitive `this` (only through `Reflect.get` with a primitive receiver) has nowhere to keep a value.
+		if (!isObjectLike(this)) return getter.call(this);
+		const cached = values.get(this);
+		if (cached !== undefined || values.has(this)) return cached;
+		// A throw leaves nothing cached: the next read runs the getter again.
+		const value = getter.call(this);
+		let stored = false;
+		try {
+			stored = key !== undefined && cacheOnInstance(this, key, value, lazyGet);
+		} catch {
+			// A proxy whose traps throw: the value goes to the `WeakMap`.
+		}
+		if (!stored) values.set(this, value);
+		return value;
+	};
+}
+
+/**
+ * Makes the decorated getter compute its value once per instance (per class for static getters), on first read, and return that value on
+ * every later read. Errors are not cached: a getter that throws runs again on the next read. `this` is the object read from, as usual.
+ *
+ * - **Public getters:** the value is stored as a non-enumerable, read-only own property of the instance, which shadows the getter, so
+ *   later reads cost exactly what reading a plain property does (`delete instance.key` makes the next read compute it again). Instances
+ *   that cannot hold it (frozen or sealed ones), and reads through `super` from a subclass's overriding getter, keep the value in a
+ *   `WeakMap` instead (garbage-collected with the instance); so does the object holding the getter itself (a class, for a static
+ *   getter, so each subclass computes its own value) and a prototype read directly. `Object.keys` and `JSON.stringify` are unaffected.
+ * - **Private getters** (`get #key()`, standard decorators): the value is kept in a `WeakMap`.
+ * - A setter of the same name is not supported: legacy decorators reject the pair, and with standard decorators (which cannot see it) the
+ *   cached own property would shadow it.
+ *
+ * Works with TypeScript/Babel legacy decorators and with TC39 standard decorators.
+ * @template T - The getter's value type
+ * @param {object | (() => T)} targetOrValue - Legacy: the prototype (or constructor); standard: the getter
+ * @param {string | symbol | ClassGetterDecoratorContext} keyOrContext - Legacy: the getter name; standard: the decorator context
+ * @param {TypedPropertyDescriptor<T>} [descriptor] - Legacy: the getter descriptor
+ * @returns {TypedPropertyDescriptor<T> | (() => T)} Legacy: the new descriptor; standard: the caching getter
+ * @throws {TypeError} when applied to something other than a getter, or (legacy) to a getter with a setter
+ * @example
+ * ```ts
+ * class Report {
+ *   builds = 0;
+ *   rows = [1, 2, 3];
+ *   @lazy
+ *   get total(): number { this.builds++; return this.rows.reduce(function (sum, row) { return sum + row; }, 0); }
+ * }
+ * const report = new Report();
+ * report.total; // => 6
+ * report.total; // => 6
+ * report.builds; // => 1 // computed once
+ * Object.keys(report); // => ['builds', 'rows'] // the cached value is not enumerable
+ * ```
+ */
+export function lazy<T>(targetOrValue: object, keyOrContext: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>;
+export function lazy<This, T>(targetOrValue: (this: This) => T, keyOrContext: ClassGetterDecoratorContext<This, T>): (this: This) => T;
+/**
+ * Implementation of {@link lazy} (see the first overload for the full documentation).
+ * @param {unknown} targetOrValue - Legacy: the prototype (or constructor); standard: the getter
+ * @param {unknown} keyOrContext - Legacy: the getter name; standard: the decorator context
+ * @param {PropertyDescriptor} [descriptor] - Legacy: the getter descriptor
+ * @returns {unknown} Legacy: the new descriptor; standard: the caching getter
+ * @throws {TypeError} when applied to something other than a getter, or (legacy) to a getter with a setter
+ */
+export function lazy(targetOrValue: unknown, keyOrContext: unknown, descriptor?: PropertyDescriptor): unknown {
+	if (isStandardContext(keyOrContext)) {
+		if (keyOrContext.kind !== 'getter' || typeof targetOrValue !== 'function') throw new TypeError(`@lazy can only decorate getters, not ${kindsOf(keyOrContext.kind)}`);
+		return lazyGetter(targetOrValue as UnknownMethod, keyOrContext.private ? undefined : keyOrContext.name);
+	}
+
+	const key = keyOrContext as string | symbol;
+
+	if (descriptor === undefined || typeof descriptor.get !== 'function') throw new TypeError(`@lazy can only decorate getters (${String(key)} is not a getter)`);
+	if (descriptor.set !== undefined) throw new TypeError(`@lazy cannot decorate ${String(key)}, which has a setter`);
+
+	return { ...descriptor, get: lazyGetter(descriptor.get as UnknownMethod, key) };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// measure
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * What {@link measure} reports for each call of the decorated method.
+ */
+export interface Measurement {
+	/** The method name (or the `name` option). */
+	readonly name: string;
+	/** How long the call took, in milliseconds: until it returned or threw, or, for a method returning a promise, until it settled. */
+	readonly duration: number;
+	/** The arguments of the call (the array the method received, not a copy). */
+	readonly args: readonly unknown[];
+	/** Whether the call threw, or its promise rejected. */
+	readonly failed: boolean;
+	/** What the call threw or rejected with (`undefined` when it did not fail: check `failed`, since `undefined` can be thrown too). */
+	readonly error: unknown;
+}
+
+/**
+ * Options of the {@link measure} decorator factory (`@measure({ ... })`).
+ */
+export interface MeasureOptions {
+	/** The name reported (defaults to the method name). */
+	readonly name?: string;
+	/**
+	 * Receives each {@link Measurement}, with the instance as `this`. Defaults to logging `"<name> method took <ms> ms"` (or
+	 * `"<name> method failed after <ms> ms"`) with `console.debug`. What it throws is ignored: measuring never changes what the method does.
+	 */
+	readonly onMeasure?: (measurement: Measurement) => void;
+	/**
+	 * The clock, in milliseconds. Defaults to `performance.now()` (monotonic, sub-millisecond), or `Date.now()` where it is missing. What
+	 * it throws is ignored too: when the call starts, the duration is then `NaN`; when it ends, that measurement is not reported.
+	 */
+	readonly clock?: () => number;
+}
+
+/**
+ * Reads a monotonic clock in milliseconds: `performance.now()` where available, `Date.now()` otherwise.
+ * @returns {number} The current time
+ */
+function monotonicNow(): number {
+	const clock = (globalThis as { performance?: { now?: () => number } }).performance;
+
+	return typeof clock?.now === 'function' ? clock.now() : Date.now();
+}
+
+/**
+ * The default reporter of {@link measure}: logs the measurement with `console.debug`.
+ * @param {Measurement} measurement - The measurement
+ * @returns {void}
+ */
+function logMeasurement(measurement: Measurement): void {
+	// eslint-disable-next-line no-console
+	console.debug(`${measurement.name} method ${measurement.failed ? 'failed after' : 'took'} ${measurement.duration.toFixed(3)} ms`);
+}
+
+/**
+ * Creates the method wrapper of the {@link measure} decorator.
+ * @param {string | undefined} label - The reported name, or `undefined` for the method name
+ * @param {(measurement: Measurement) => void} onMeasure - The reporter
+ * @param {() => number} clock - The clock
+ * @returns {MethodWrapper} The wrapper
+ */
+function measureWrapper(label: string | undefined, onMeasure: (measurement: Measurement) => void, clock: () => number): MethodWrapper {
+	return function (method: UnknownMethod, methodName: string): UnknownMethod {
+		const name = label ?? methodName;
+
+		/**
+		 * Reports a finished call, ignoring what the clock and the reporter throw.
+		 * @param {unknown} instance - The call's `this`
+		 * @param {number} start - When the call started
+		 * @param {unknown[]} args - The call's arguments
+		 * @param {boolean} failed - Whether the call failed
+		 * @param {unknown} error - What it failed with
+		 * @returns {void}
+		 */
+		function report(instance: unknown, start: number, args: unknown[], failed: boolean, error: unknown): void {
+			try {
+				// Always the same shape (`error` included), so that reporters see one object shape.
+				onMeasure.call(instance, { name, duration: clock() - start, args, failed, error });
+			} catch {
+				// Measuring must not change what the method does.
+			}
+		}
+
+		return function measured(this: unknown, ...args: unknown[]): unknown {
+			// eslint-disable-next-line @typescript-eslint/no-this-alias -- the reporters of a promise need the caller's `this`
+			const self = this;
+			let start = NaN;
+			try {
+				start = clock();
+			} catch {
+				// Measuring must not change what the method does: the duration is `NaN`.
+			}
+			let result: unknown;
+
+			try {
+				result = method.apply(self, args);
+			} catch (error) {
+				report(self, start, args, true, error);
+				throw error;
+			}
+
+			// As for `@log`: a promise is timed until it settles, through a promise chained on it (which is returned), so a rejection nobody
+			// handles still surfaces; other thenables are returned untouched (calling `then` can start their work) and timed as returned.
+			if (isNativePromise(result)) {
+				return result.then(
+					function (value: unknown): unknown {
+						report(self, start, args, false, undefined);
+						return value;
+					},
+					function (error: unknown): never {
+						report(self, start, args, true, error);
+						throw error;
+					}
+				);
+			}
+
+			report(self, start, args, false, undefined);
+
+			return result;
+		};
+	};
+}
+
+/**
+ * Times every call of the decorated method and reports a {@link Measurement} (`{ name, duration, args, failed, error }`) to
+ * `onMeasure` (by default, `"<name> method took 1.234 ms"` is logged with `console.debug`). Synchronous calls are timed until they return
+ * or throw; calls returning a native promise until it settles, and a promise settling the same way is returned (as `@log` does).
+ * Return values are kept, errors rethrown, `this` preserved; what `onMeasure` and `clock` throw is ignored. Durations use
+ * `performance.now()` (or the `clock` option). Arguments are passed to `onMeasure` as they are: it decides what to log.
+ *
+ * Use it bare (`@measure`) or as a factory with {@link MeasureOptions} (`@measure({ name, onMeasure, clock })`).
+ * Works with TypeScript/Babel legacy decorators and with TC39 standard decorators.
+ * @template T - The method type
+ * @param {object | T | MeasureOptions} targetOrValue - Legacy: the prototype (or constructor); standard: the method; factory: the options
+ * @param {string | symbol | ClassMethodDecoratorContext} [keyOrContext] - Legacy: the method name; standard: the decorator context
+ * @param {TypedPropertyDescriptor<T>} [descriptor] - Legacy: the method descriptor
+ * @returns {TypedPropertyDescriptor<T> | T | UniversalMethodDecorator} Legacy: the new descriptor; standard: the wrapped method; factory: the decorator
+ * @throws {TypeError} when applied to something other than a method, or (factory) when `options` is not an object, `name` is not a
+ * string, or `onMeasure` or `clock` is not a function
+ * @example
+ * ```ts
+ * import { sleep } from 'tinkit/async';
+ * const durations: number[] = [];
+ * class Api {
+ *   @measure({ onMeasure: function (measurement) { durations.push(measurement.duration); } })
+ *   async load(id: number): Promise<string> { await sleep(20); return `user ${id}`; }
+ * }
+ * await new Api().load(1); // => 'user 1'
+ * durations.length; // => 1
+ * durations[0] >= 15; // => true // about 20 ms, timed until the promise settled
+ * ```
+ * @example
+ * ```ts
+ * class Parser {
+ *   @measure
+ *   parse(text: string): unknown { return JSON.parse(text); }
+ * }
+ * new Parser().parse('[1]'); // => [1] // and logs "parse method took 0.012 ms" with console.debug
+ * ```
+ */
+export function measure<T extends AnyFunction>(targetOrValue: object, keyOrContext: string | symbol, descriptor: TypedPropertyDescriptor<T>): TypedPropertyDescriptor<T>;
+export function measure<This, T extends AnyFunction>(targetOrValue: T, keyOrContext: MethodContext<This, T>): T;
+export function measure(options?: MeasureOptions): UniversalMethodDecorator;
+/**
+ * Implementation of {@link measure} (see the first overload for the full documentation).
+ * @param {unknown} [targetOrValue] - Legacy: the prototype (or constructor); standard: the method; factory: the options
+ * @param {unknown} [keyOrContext] - Legacy: the method name; standard: the decorator context
+ * @param {unknown} [descriptor] - Legacy: the method descriptor
+ * @returns {unknown} Legacy: the new descriptor; standard: the wrapped method; factory: the decorator
+ * @throws {TypeError} when applied to something other than a method, or when the options are invalid
+ */
+export function measure(targetOrValue?: unknown, keyOrContext?: unknown, descriptor?: unknown): unknown {
+	// Decorators always receive a key or a context: otherwise this is the factory form.
+	if (keyOrContext !== undefined) return decorateMethod('measure', measureWrapper(undefined, logMeasurement, monotonicNow), targetOrValue, keyOrContext, descriptor);
+
+	const options = targetOrValue === undefined ? {} : targetOrValue;
+
+	if (typeof options !== 'object' || options === null) throw new TypeError(`@measure: \`options\` must be an object, got ${describe(options)}`);
+
+	const name = readOption(options as MeasureOptions, 'name');
+	const onMeasure = readOption(options as MeasureOptions, 'onMeasure', logMeasurement);
+	const clock = readOption(options as MeasureOptions, 'clock', monotonicNow);
+
+	if (name !== undefined && typeof name !== 'string') throw new TypeError(`@measure: \`options.name\` must be a string, got ${describe(name)}`);
+	assertFunction('@measure', 'options.onMeasure', onMeasure);
+	assertFunction('@measure', 'options.clock', clock);
+
+	return createMethodDecorator('measure', measureWrapper(name, onMeasure, clock));
 }

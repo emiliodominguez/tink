@@ -3,6 +3,7 @@ import * as vm from 'vm';
 import * as decorators from '.';
 import { sleep } from '../async/index.js';
 import { createLRUCache, type LRUCache } from '../cache/index.js';
+import { constant, noop } from '../functions/index.js';
 
 class Test {
 	@decorators.readonly
@@ -1164,6 +1165,507 @@ describe('Decorators (security)', function () {
 			expect(function () {
 				(decorators.memoize({}) as any)({}, 'getter', { get: function () {} });
 			}).toThrow(new TypeError('@memoize can only decorate methods (getter is not a method)'));
+		});
+	});
+});
+
+/**
+ * A clock that advances by `step` ms on every read, starting at 0.
+ * @param {number} step - The step
+ * @returns {() => number} The clock
+ */
+function steppingClock(step: number): () => number {
+	let time = -step;
+	return function (): number {
+		time += step;
+		return time;
+	};
+}
+
+describe('Decorators (1.4)', function () {
+	describe('lazy', function () {
+		let computed = 0;
+
+		class Lazy {
+			constructor(readonly base: number) {}
+
+			@decorators.lazy
+			get value(): number {
+				computed++;
+				return this.base * 2;
+			}
+
+			@decorators.lazy
+			get nothing(): undefined {
+				computed++;
+				return undefined;
+			}
+
+			@decorators.lazy
+			static get shared(): string {
+				computed++;
+				return `shared by ${(this as unknown as { name: string }).name}`;
+			}
+		}
+
+		beforeEach(function () {
+			computed = 0;
+		});
+
+		it('computes once per instance, on first read, with the instance as this', function () {
+			const first = new Lazy(1);
+			const second = new Lazy(2);
+			expect(computed).toBe(0);
+			expect([first.value, first.value, first.value]).toEqual([2, 2, 2]);
+			expect(computed).toBe(1);
+			expect(second.value).toBe(4);
+			expect(second.value).toBe(4);
+			expect(computed).toBe(2);
+			expect(first.nothing).toBeUndefined();
+			expect(first.nothing).toBeUndefined();
+			expect(computed).toBe(3);
+		});
+
+		it('caches a non-enumerable, read-only own property that deleting resets', function () {
+			const instance = new Lazy(3);
+			expect(instance.value).toBe(6);
+			expect(Object.getOwnPropertyDescriptor(instance, 'value')).toEqual({ value: 6, writable: false, enumerable: false, configurable: true });
+			expect(Object.keys(instance)).toEqual(['base']);
+			expect(JSON.stringify(instance)).toBe('{"base":3}');
+			expect(function () {
+				(instance as { value: number }).value = 1;
+			}).toThrow(TypeError);
+			delete (instance as { value?: number }).value;
+			expect(instance.value).toBe(6);
+			expect(computed).toBe(2);
+		});
+
+		it('does not cache errors', function () {
+			let attempts = 0;
+			class Flaky {
+				@decorators.lazy
+				get value(): string {
+					attempts++;
+					if (attempts < 3) throw new Error(`attempt ${attempts}`);
+					return 'ready';
+				}
+			}
+			const flaky = new Flaky();
+			expect(function () {
+				return flaky.value;
+			}).toThrow('attempt 1');
+			expect(function () {
+				return flaky.value;
+			}).toThrow('attempt 2');
+			expect(flaky.value).toBe('ready');
+			expect(flaky.value).toBe('ready');
+			expect(attempts).toBe(3);
+		});
+
+		it('computes once on frozen instances, keeping the value in a WeakMap', function () {
+			const frozen = Object.freeze(new Lazy(5));
+			expect([frozen.value, frozen.value, frozen.nothing, frozen.nothing]).toEqual([10, 10, undefined, undefined]);
+			expect(computed).toBe(2);
+			expect(Object.hasOwn(frozen, 'value')).toBe(false);
+		});
+
+		it('works through inheritance, and does not let super reads shadow an override', function () {
+			class Child extends Lazy {}
+			const child = new Child(4);
+			expect([child.value, child.value]).toEqual([8, 8]);
+			expect(computed).toBe(1);
+			expect(Object.hasOwn(child, 'value')).toBe(true);
+
+			class Override extends Lazy {
+				override get value(): number {
+					return super.value + 1;
+				}
+			}
+			const override = new Override(1);
+			expect([override.value, override.value, override.value]).toEqual([3, 3, 3]);
+			expect(computed).toBe(2);
+			expect(Object.hasOwn(override, 'value')).toBe(false);
+		});
+
+		it('never caches on a prototype read directly', function () {
+			const prototype = Lazy.prototype as unknown as { base: number; value: number };
+			expect(prototype.value).toBeNaN();
+			expect(prototype.value).toBeNaN();
+			expect(computed).toBe(1);
+			expect(typeof Object.getOwnPropertyDescriptor(Lazy.prototype, 'value')?.get).toBe('function');
+			class Child extends Lazy {}
+			expect((Child.prototype as unknown as { value: number }).value).toBeNaN();
+			expect(Object.hasOwn(Child.prototype, 'value')).toBe(false);
+			expect(new Child(1).value).toBe(2);
+		});
+
+		it('computes static getters once per class, subclasses getting their own value', function () {
+			expect([Lazy.shared, Lazy.shared]).toEqual(['shared by Lazy', 'shared by Lazy']);
+			expect(typeof Object.getOwnPropertyDescriptor(Lazy, 'shared')?.get).toBe('function');
+			class Sub extends Lazy {}
+			expect([Sub.shared, Sub.shared]).toEqual(['shared by Sub', 'shared by Sub']);
+			expect(Lazy.shared).toBe('shared by Lazy');
+			expect(computed).toBe(2);
+		});
+
+		it('keeps the value in a WeakMap when the getter defined the property itself, or the receiver resolves elsewhere', function () {
+			let runs = 0;
+			class SelfDefining {
+				@decorators.lazy
+				get value(): number {
+					runs++;
+					Object.defineProperty(this, 'value', { get: constant(-1), configurable: false });
+					return runs;
+				}
+			}
+			const instance = new SelfDefining();
+			expect(instance.value).toBe(1);
+			expect(instance.value).toBe(-1);
+			const getter = Object.getOwnPropertyDescriptor(Lazy.prototype, 'value')?.get as () => number;
+			const receiver = Object.create(null) as { base: number };
+			receiver.base = 7;
+			expect([getter.call(receiver), getter.call(receiver)]).toEqual([14, 14]);
+			const elsewhere = Object.assign(Object.create({ value: 'other' }), { base: 8 }) as { base: number };
+			expect([Reflect.get(Lazy.prototype, 'value', elsewhere), Reflect.get(Lazy.prototype, 'value', elsewhere)]).toEqual([16, 16]);
+			expect(computed).toBe(2);
+			expect(Object.hasOwn(elsewhere, 'value')).toBe(false);
+		});
+
+		it('computes once for a proxy whose traps throw', function () {
+			const proxy = new Proxy(new Lazy(6), {
+				defineProperty: function (): never {
+					throw new Error('defineProperty');
+				}
+			});
+			expect([proxy.value, proxy.value]).toEqual([12, 12]);
+			expect(computed).toBe(1);
+		});
+
+		it('runs the getter on every read with a primitive receiver', function () {
+			const getter = Object.getOwnPropertyDescriptor(Lazy.prototype, 'value')?.get as () => number;
+			// A number receiver reads `base` from `Number.prototype`: undefined.
+			expect(getter.call(5 as never)).toBeNaN();
+			expect(Reflect.get(Lazy.prototype, 'value', 5)).toBeNaN();
+			expect(computed).toBe(2);
+		});
+
+		it('supports symbol keys and keeps the other descriptor attributes (Babel legacy)', function () {
+			const key = Symbol('lazy');
+			const descriptor = decorators.lazy({}, key, { get: constant(1), enumerable: true, configurable: true });
+			expect(descriptor.enumerable).toBe(true);
+			expect(descriptor.configurable).toBe(true);
+			const target = {};
+			Object.defineProperty(Object.getPrototypeOf(target), key, descriptor);
+			try {
+				expect((target as Record<symbol, number>)[key]).toBe(1);
+				expect(Object.getOwnPropertyDescriptor(target, key)?.value).toBe(1);
+			} finally {
+				delete (Object.prototype as Record<symbol, unknown>)[key];
+			}
+		});
+
+		it('rejects what is not a getter (legacy)', function () {
+			expect(function () {
+				decorators.lazy({}, 'method', { value: noop, writable: true });
+			}).toThrow(new TypeError('@lazy can only decorate getters (method is not a getter)'));
+			expect(function () {
+				decorators.lazy({}, 'field', undefined as never);
+			}).toThrow(new TypeError('@lazy can only decorate getters (field is not a getter)'));
+			expect(function () {
+				decorators.lazy({}, 'pair', { get: constant(1), set: noop });
+			}).toThrow(new TypeError('@lazy cannot decorate pair, which has a setter'));
+		});
+
+		describe('standard decorators', function () {
+			it('caches public getters on the instance', function () {
+				let runs = 0;
+				const getter = decorators.lazy(function (this: { base: number }): number {
+					runs++;
+					return this.base + 1;
+				}, fakeContext('getter', 'next').context);
+				class Host {
+					base = 1;
+				}
+				Object.defineProperty(Host.prototype, 'next', { get: getter, configurable: true });
+				const host = new Host() as Host & { next: number };
+				expect([host.next, host.next]).toEqual([2, 2]);
+				expect(runs).toBe(1);
+				expect(Object.getOwnPropertyDescriptor(host, 'next')?.value).toBe(2);
+			});
+
+			it('keeps the values of private getters in a WeakMap', function () {
+				let runs = 0;
+				const getter = decorators.lazy(
+					function (this: { base: number }): number {
+						runs++;
+						return this.base * 3;
+					},
+					fakeContext('getter', '#secret', { private: true }).context
+				);
+				const host = { base: 2 };
+				expect([getter.call(host), getter.call(host)]).toEqual([6, 6]);
+				expect(getter.call({ base: 1 })).toBe(3);
+				expect(runs).toBe(2);
+				expect(Object.getOwnPropertyNames(host)).toEqual(['base']);
+			});
+
+			it.each(['method', 'setter', 'field', 'accessor', 'class'])('rejects %s contexts', function (kind) {
+				expect(function () {
+					decorators.lazy(noop as never, fakeContext(kind, 'x').context);
+				}).toThrow(new TypeError(`@lazy can only decorate getters, not ${kind === 'class' ? 'classes' : `${kind}s`}`));
+			});
+
+			it('rejects a getter context without a function', function () {
+				expect(function () {
+					decorators.lazy(undefined as never, fakeContext('getter', 'x').context);
+				}).toThrow(new TypeError('@lazy can only decorate getters, not getters'));
+			});
+		});
+	});
+
+	describe('measure', function () {
+		it('reports sync calls, preserving this, arguments and the result', function () {
+			const measurements: Array<[unknown, decorators.Measurement]> = [];
+			class Work {
+				factor = 3;
+
+				@decorators.measure({
+					clock: steppingClock(5),
+					onMeasure: function (this: unknown, measurement: decorators.Measurement): void {
+						measurements.push([this, measurement]);
+					}
+				})
+				scale(n: number, extra?: string): string {
+					return `${n * this.factor}${extra ?? ''}`;
+				}
+			}
+			const work = new Work();
+			expect(work.scale(2, '!')).toBe('6!');
+			expect(measurements).toEqual([[work, { name: 'scale', duration: 5, args: [2, '!'], failed: false, error: undefined }]]);
+			expect(Object.keys(measurements[0][1])).toEqual(['name', 'duration', 'args', 'failed', 'error']);
+		});
+
+		it('reports and rethrows sync errors', function () {
+			const onMeasure = jest.fn();
+			const error = new RangeError('boom');
+			const method = decorators.measure({ onMeasure, clock: steppingClock(2), name: 'custom' })(function (): never {
+				throw error;
+			}, fakeContext('method', 'm').context);
+			expect(function () {
+				method();
+			}).toThrow(error);
+			expect(onMeasure).toHaveBeenCalledWith({ name: 'custom', duration: 2, args: [], failed: true, error });
+			const thrownUndefined = decorators.measure({ onMeasure, clock: steppingClock(1) })(function (): never {
+				throw undefined;
+			}, fakeContext('method', 'u').context);
+			expect(function () {
+				thrownUndefined();
+			}).toThrow();
+			expect(onMeasure).toHaveBeenLastCalledWith({ name: 'u', duration: 1, args: [], failed: true, error: undefined });
+		});
+
+		it('times promises until they settle, returning a promise that settles the same way', async function () {
+			const onMeasure = jest.fn();
+			const clock = jest.fn(steppingClock(10));
+			const decorate = decorators.measure({ onMeasure, clock });
+			const resolving = decorate(function (value: number): Promise<number> {
+				return Promise.resolve(value * 2);
+			}, fakeContext('method', 'resolving').context);
+			const promise = resolving(21);
+			expect(onMeasure).not.toHaveBeenCalled();
+			expect(clock).toHaveBeenCalledTimes(1);
+			await expect(promise).resolves.toBe(42);
+			expect(onMeasure).toHaveBeenCalledWith({ name: 'resolving', duration: 10, args: [21], failed: false, error: undefined });
+			const error = new Error('rejected');
+			const original = Promise.reject(error);
+			const rejecting = decorate(function (): Promise<never> {
+				return original;
+			}, fakeContext('method', 'rejecting').context);
+			const returned = rejecting();
+			expect(returned).not.toBe(original);
+			await expect(returned).rejects.toBe(error);
+			expect(onMeasure).toHaveBeenLastCalledWith({ name: 'rejecting', duration: 10, args: [], failed: true, error });
+			const foreign = decorate(function (): unknown {
+				return vm.runInNewContext('Promise.resolve("foreign")');
+			}, fakeContext('method', 'foreign').context);
+			await expect(foreign()).resolves.toBe('foreign');
+			expect(onMeasure).toHaveBeenLastCalledWith(expect.objectContaining({ name: 'foreign', failed: false }));
+		});
+
+		it('returns other thenables untouched, timed as returned', function () {
+			const onMeasure = jest.fn();
+			const thenable = { then: jest.fn() };
+			const method = decorators.measure({ onMeasure })(function (): unknown {
+				return thenable;
+			}, fakeContext('method', 'lazyQuery').context);
+			expect(method()).toBe(thenable);
+			expect(thenable.then).not.toHaveBeenCalled();
+			expect(onMeasure).toHaveBeenCalledWith(expect.objectContaining({ name: 'lazyQuery', failed: false }));
+		});
+
+		it('ignores what onMeasure throws', async function () {
+			const onMeasure = jest.fn(function (): never {
+				throw new Error('reporter');
+			});
+			const decorate = decorators.measure({ onMeasure });
+			const sync = decorate(constant(1), fakeContext('method', 'sync').context);
+			expect(sync()).toBe(1);
+			const failing = decorate(function (): never {
+				throw new TypeError('own');
+			}, fakeContext('method', 'failing').context);
+			expect(function () {
+				failing();
+			}).toThrow(new TypeError('own'));
+			const async = decorate(function (): Promise<string> {
+				return Promise.resolve('ok');
+			}, fakeContext('method', 'async').context);
+			await expect(async()).resolves.toBe('ok');
+			const rejected = decorate(function (): Promise<never> {
+				return Promise.reject(new RangeError('own'));
+			}, fakeContext('method', 'rejected').context);
+			await expect(rejected()).rejects.toThrow(new RangeError('own'));
+			expect(onMeasure).toHaveBeenCalledTimes(4);
+		});
+
+		it('ignores what the clock throws, reporting a NaN duration (regression)', async function () {
+			const measurements: decorators.Measurement[] = [];
+			let reads = 0;
+			const decorate = decorators.measure({
+				clock: function (): number {
+					reads++;
+					if (reads % 2 === 1) throw new Error('clock');
+					return 5;
+				},
+				onMeasure: function (measurement: decorators.Measurement): void {
+					measurements.push(measurement);
+				}
+			});
+			const received: number[] = [];
+			const sync = decorate(function (n: number): number {
+				received.push(n);
+				return n * 2;
+			}, fakeContext('method', 'sync').context);
+			expect(sync(4)).toBe(8);
+			expect(received).toEqual([4]);
+			const async = decorate(function (): Promise<string> {
+				return Promise.resolve('ok');
+			}, fakeContext('method', 'async').context);
+			await expect(async()).resolves.toBe('ok');
+			expect(
+				measurements.map(function (measurement) {
+					return [measurement.name, measurement.duration, measurement.failed];
+				})
+			).toEqual([
+				['sync', NaN, false],
+				['async', NaN, false]
+			]);
+			// A clock that throws when the call ends: that report is skipped, the result is kept.
+			reads = 1;
+			expect(sync(1)).toBe(2);
+			expect(measurements.length).toBe(2);
+		});
+
+		it('logs with console.debug by default, bare or as a factory', function () {
+			const debug = jest.spyOn(console, 'debug').mockImplementation(function () {});
+			class Parser {
+				@decorators.measure
+				parse(text: string): unknown {
+					return JSON.parse(text);
+				}
+
+				@decorators.measure()
+				fail(): never {
+					throw new Error('x');
+				}
+			}
+			const parser = new Parser();
+			expect(parser.parse('[1]')).toEqual([1]);
+			expect(debug).toHaveBeenCalledTimes(1);
+			expect(debug.mock.calls[0][0]).toMatch(/^parse method took \d+\.\d{3} ms$/);
+			expect(function () {
+				parser.fail();
+			}).toThrow('x');
+			expect(debug.mock.calls[1][0]).toMatch(/^fail method failed after \d+\.\d{3} ms$/);
+		});
+
+		it('formats the default log from the clock', function () {
+			const debug = jest.spyOn(console, 'debug').mockImplementation(function () {});
+			const method = decorators.measure({ clock: steppingClock(1.23456) })(noop, fakeContext('method', 'm').context);
+			method();
+			expect(debug).toHaveBeenCalledWith('m method took 1.235 ms');
+		});
+
+		it('uses performance.now, or Date.now where it is missing', function () {
+			const onMeasure = jest.fn();
+			const now = jest.spyOn(performance, 'now');
+			const method = decorators.measure({ onMeasure })(noop, fakeContext('method', 'm').context);
+			method();
+			expect(now).toHaveBeenCalledTimes(2);
+			const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'performance') as PropertyDescriptor;
+			Object.defineProperty(globalThis, 'performance', { value: undefined, configurable: true, writable: true });
+			const dateNow = jest.spyOn(Date, 'now');
+			try {
+				method();
+				expect(dateNow).toHaveBeenCalledTimes(2);
+			} finally {
+				Object.defineProperty(globalThis, 'performance', descriptor);
+			}
+			expect(onMeasure).toHaveBeenCalledTimes(2);
+			expect(onMeasure.mock.calls[1][0].duration).toBeGreaterThanOrEqual(0);
+		});
+
+		it('ignores options inherited from a polluted Object.prototype', function () {
+			const debug = jest.spyOn(console, 'debug').mockImplementation(function () {});
+			const prototype = Object.prototype as Record<string, unknown>;
+			prototype.onMeasure = 'polluted';
+			prototype.name = 5;
+			try {
+				const method = decorators.measure({})(noop, fakeContext('method', 'm').context);
+				method();
+				expect(debug).toHaveBeenCalledWith(expect.stringMatching(/^m method took/));
+			} finally {
+				delete prototype.onMeasure;
+				delete prototype.name;
+			}
+		});
+
+		it('works on static methods', function () {
+			const onMeasure = jest.fn();
+			class Tool {
+				@decorators.measure({ onMeasure })
+				static run(): string {
+					return (this as unknown as { name: string }).name;
+				}
+			}
+			expect(Tool.run()).toBe('Tool');
+			expect(onMeasure.mock.contexts[0]).toBe(Tool);
+		});
+
+		it('validates its options and rejects what is not a method', function () {
+			expect(function () {
+				decorators.measure(null as never);
+			}).toThrow(new TypeError('@measure: `options` must be an object, got null'));
+			expect(function () {
+				decorators.measure('x' as never);
+			}).toThrow(new TypeError('@measure: `options` must be an object, got string'));
+			expect(function () {
+				decorators.measure({ name: 1 as never });
+			}).toThrow(new TypeError('@measure: `options.name` must be a string, got number'));
+			expect(function () {
+				decorators.measure({ onMeasure: 'log' as never });
+			}).toThrow(new TypeError('@measure: `options.onMeasure` must be a function, got string'));
+			expect(function () {
+				decorators.measure({ clock: 0 as never });
+			}).toThrow(new TypeError('@measure: `options.clock` must be a function, got number'));
+			expect(function () {
+				decorators.measure({}, 'getter', { get: noop } as never);
+			}).toThrow(new TypeError('@measure can only decorate methods (getter is not a method)'));
+			expect(function () {
+				decorators.measure(undefined as never, fakeContext('field', 'x').context);
+			}).toThrow(new TypeError('@measure can only decorate methods, not fields'));
+			expect(function () {
+				decorators.measure({ name: 'custom' })(undefined as never, fakeContext('getter', 'x').context);
+			}).toThrow(new TypeError('@measure can only decorate methods, not getters'));
 		});
 	});
 });
