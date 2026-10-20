@@ -41,6 +41,7 @@ import {
 	type Release
 } from '.';
 import { EventEmitter } from 'node:events';
+import { runInNewContext } from 'node:vm';
 import { createEmitter } from '../emitter/index.js';
 import { createLRUCache } from '../cache/index.js';
 import type { AbortSignalLike } from '../utils/index.js';
@@ -2762,6 +2763,34 @@ describe('Async helpers (hostile signals)', function () {
 		throw new Error('boom');
 	}
 
+	it('Queue.add: a task signal aborted after its start (its listener could not be removed) does not reject the running task', async function () {
+		const signal = hostile({
+			removeEventListener: function () {
+				throw new Error('remove');
+			}
+		});
+		const queue = createQueue({ concurrency: 1 });
+		const first = createDeferred<void>();
+		const second = createDeferred<string>();
+
+		void queue.add(function () {
+			return first.promise;
+		});
+		const task = queue.add(
+			function () {
+				return second.promise;
+			},
+			{ signal }
+		);
+		first.resolve();
+		await sleep(0);
+		expect(queue.pending).toBe(1);
+		signal.fire();
+		second.resolve('done');
+		await expect(task).resolves.toBe('done');
+		expect(queue.size).toBe(0);
+	});
+
 	it('settles even when removeEventListener throws', async function () {
 		const signal = hostile({ removeEventListener: boom });
 		await expect(sleep(1, { signal })).resolves.toBeUndefined();
@@ -3134,7 +3163,7 @@ describe('createBatcher', function () {
 
 	describe('errors', function () {
 		it('rejects only the key whose value is an Error instance (other realms included)', async function () {
-			const foreign = Object.create(null, { [Symbol.toStringTag]: { value: 'Error' } });
+			const foreign: unknown = runInNewContext('new Error("foreign")');
 			const batcher = createBatcher(async function (keys: number[]) {
 				return keys.map(function (key) {
 					return key === 2 ? new RangeError('no 2') : key === 3 ? (foreign as Error) : `ok ${key}`;
@@ -6651,6 +6680,205 @@ describe('Async helpers (1.4: error checks, circuit breaker, backoff, fromEvent,
 			expect(function () {
 				return watch.elapsed;
 			}).toThrow(new RangeError('createStopwatch: `now()` must be a finite number, got -Infinity'));
+		});
+	});
+});
+
+describe('Async helpers (options inherited from a polluted Object.prototype)', function () {
+	const prototype = Object.prototype as Record<string, unknown>;
+	const pollutedSignal = { aborted: true, reason: new Error('polluted'), addEventListener: noop, removeEventListener: noop };
+	const poisonedCache = {
+		get: function () {
+			return 'poisoned';
+		},
+		has: yes,
+		set: noop,
+		delete: yes,
+		clear: noop
+	};
+
+	/** Does nothing. */
+	function noop(): void {
+		return undefined;
+	}
+
+	/** Always `true`. */
+	function yes(): boolean {
+		return true;
+	}
+
+	/** Always `false`. */
+	function no(): boolean {
+		return false;
+	}
+
+	/** The same key for every argument. */
+	function same(): string {
+		return 'same';
+	}
+
+	/**
+	 * Runs `fn` while `Object.prototype[key]` is `value`.
+	 */
+	async function polluted<T>(key: string, value: unknown, fn: () => Promise<T>): Promise<T> {
+		Object.defineProperty(Object.prototype, key, { value, configurable: true, writable: true });
+		try {
+			return await fn();
+		} finally {
+			delete prototype[key];
+		}
+	}
+
+	it('sleep and pollUntil ignore an inherited signal, interval or timeout', async function () {
+		await polluted('signal', pollutedSignal, function () {
+			return expect(sleep(0, {})).resolves.toBeUndefined();
+		});
+		await polluted('timeout', 0, function () {
+			let calls = 0;
+			return expect(
+				pollUntil(
+					function () {
+						return ++calls === 3;
+					},
+					{ interval: 1 }
+				)
+			).resolves.toBe(true);
+		});
+		await polluted('interval', 'x', function () {
+			return expect(
+				pollUntil(function () {
+					return 1;
+				}, {})
+			).resolves.toBe(1);
+		});
+	});
+
+	it('retry ignores inherited options', async function () {
+		for (const [key, value] of [
+			['retries', 0],
+			['shouldRetry', no],
+			['signal', pollutedSignal],
+			['delay', -1],
+			['onRetry', 'x']
+		] as const) {
+			let attempts = 0;
+			await polluted(key, value, function () {
+				return expect(
+					retry(function () {
+						if (++attempts < 2) throw new Error('flaky');
+						return attempts;
+					}, {})
+				).resolves.toBe(2);
+			});
+		}
+	});
+
+	it('the *WithConcurrency helpers ignore inherited options', async function () {
+		function mapper(n: number): number {
+			if (n === 1) throw new Error('one');
+			return n;
+		}
+		await polluted('stopOnError', false, function () {
+			return expect(mapWithConcurrency([1, 2], mapper, {})).rejects.toThrow('one');
+		});
+		await polluted('concurrency', 0.5, function () {
+			return expect(filterWithConcurrency([1, 2], Boolean, {})).resolves.toEqual([1, 2]);
+		});
+		await polluted('signal', pollutedSignal, function () {
+			return expect(mapSettledWithConcurrency([2], mapper, {})).resolves.toEqual([{ status: 'fulfilled', value: 2 }]);
+		});
+		// A number (or nothing) is still the concurrency.
+		await polluted('concurrency', 0.5, function () {
+			return expect(mapWithConcurrency([2, 3], mapper, 1)).resolves.toEqual([2, 3]);
+		});
+		await expect(mapWithConcurrency([2], mapper, null as never)).rejects.toThrow(TypeError);
+	});
+
+	it('createLimiter, createQueue, Queue.add and createRateLimiter ignore inherited options', async function () {
+		await polluted('maxPending', 0, async function () {
+			const limit = createLimiter(1, {});
+			const first = limit(sleep, 1);
+			await expect(limit(sleep, 1)).resolves.toBeUndefined();
+			await first;
+		});
+		await polluted('concurrency', 0, function () {
+			return expect(
+				createQueue({}).add(function () {
+					return 1;
+				})
+			).resolves.toBe(1);
+		});
+		await polluted('signal', pollutedSignal, async function () {
+			const queue = createQueue({});
+			await expect(
+				queue.add(function () {
+					return 2;
+				}, {})
+			).resolves.toBe(2);
+			await expect(
+				createRateLimiter({ limit: 1, interval: 10 }).schedule(function () {
+					return 3;
+				})
+			).resolves.toBe(3);
+		});
+		await polluted('priority', 'high', function () {
+			return expect(
+				createQueue({}).add(function () {
+					return 4;
+				}, {})
+			).resolves.toBe(4);
+		});
+		await polluted('limit', 5, async function () {
+			expect(function () {
+				createRateLimiter({ interval: 10 } as never);
+			}).toThrow(new TypeError('createRateLimiter: `limit` must be an integer >= 1, got undefined'));
+		});
+	});
+
+	it('memoizeAsync ignores an inherited cache, resolver or ttl', async function () {
+		await polluted('cache', poisonedCache, async function () {
+			const memoized = memoizeAsync(async function (n: number) {
+				return n;
+			}, {});
+			await expect(memoized(1)).resolves.toBe(1);
+			expect(memoized.cache).toBeInstanceOf(Map);
+		});
+		await polluted('resolver', same, async function () {
+			const memoized = memoizeAsync(async function (n: number) {
+				return n;
+			}, {});
+			await expect(Promise.all([memoized(1), memoized(2)])).resolves.toEqual([1, 2]);
+		});
+		await polluted('ttl', -1, async function () {
+			expect(
+				memoizeAsync(async function () {
+					return 1;
+				}, {}).cache
+			).toBeInstanceOf(Map);
+		});
+	});
+
+	it('createBatcher and its load options ignore inherited options', async function () {
+		async function load(keys: number[]): Promise<number[]> {
+			return keys;
+		}
+		await polluted('cache', poisonedCache, function () {
+			return expect(createBatcher(load, {}).load(1)).resolves.toBe(1);
+		});
+		await polluted('key', same, function () {
+			const batcher = createBatcher(load, {});
+			return expect(Promise.all([batcher.load(1), batcher.load(2)])).resolves.toEqual([1, 2]);
+		});
+		await polluted('maxBatchSize', 0, function () {
+			return expect(createBatcher(load, {}).loadMany([1, 2])).resolves.toEqual([1, 2]);
+		});
+		await polluted('delay', -1, function () {
+			return expect(createBatcher(load, {}).load(3)).resolves.toBe(3);
+		});
+		await polluted('signal', pollutedSignal, async function () {
+			const batcher = createBatcher(load);
+			await expect(batcher.load(4, {})).resolves.toBe(4);
+			await expect(batcher.loadMany([5], {})).resolves.toEqual([5]);
 		});
 	});
 });

@@ -160,7 +160,7 @@ export function sleep(ms: number, options: SleepOptions = {}): Promise<void> {
 	return new Promise<void>(function (resolve, reject) {
 		assertDelay('sleep', 'ms', ms);
 
-		const { signal } = options;
+		const signal = readOption(options, 'signal');
 
 		assertOptionalSignal('sleep', 'signal', signal);
 
@@ -253,7 +253,15 @@ export function withTimeout<T>(promise: PromiseLike<T> | T, ms: number, message?
  * calls; // => 3
  */
 export async function retry<T>(fn: (attempt: number) => PromiseLike<T> | T, options: RetryOptions = {}, random: RandomGenerator = Math.random): Promise<T> {
-	const { retries = 3, delay = 0, factor = 2, maxDelay = Infinity, jitter = false, shouldRetry, onRetry, signal } = options;
+	// Every option is read as an own property (or a getter): a value inherited from a polluted `Object.prototype` is ignored.
+	const retries = readOption(options, 'retries', 3);
+	const delay = readOption(options, 'delay', 0);
+	const factor = readOption(options, 'factor', 2);
+	const maxDelay = readOption(options, 'maxDelay', Infinity);
+	const jitter = readOption(options, 'jitter', false);
+	const shouldRetry = readOption(options, 'shouldRetry');
+	const onRetry = readOption(options, 'onRetry');
+	const signal = readOption(options, 'signal');
 
 	assertFunction('retry', 'fn', fn);
 	assertInteger('retry', 'retries', retries, 0, true);
@@ -339,7 +347,14 @@ function runConcurrently(
 
 	// Argument errors (also from reading the options), an aborted signal and (on the fast path) synchronous throws become rejections.
 	try {
-		({ concurrency = Infinity, signal, stopOnError = true } = typeof options === 'object' && options !== null ? options : { concurrency: options });
+		if (typeof options === 'object' && options !== null) {
+			concurrency = readOption(options, 'concurrency', Infinity);
+			signal = readOption(options, 'signal');
+			stopOnError = readOption(options, 'stopOnError', true);
+		} else {
+			concurrency = options === undefined ? Infinity : options;
+			stopOnError = true;
+		}
 		assertInteger(caller, 'concurrency', concurrency, 1, true);
 		assertFunction(caller, name, callback);
 		assertOptionalSignal(caller, 'signal', signal);
@@ -711,7 +726,8 @@ interface LimiterTask {
 export function createLimiter(concurrency: number, options: LimiterOptions = {}): Limiter {
 	assertInteger('createLimiter', 'concurrency', concurrency, 1, true);
 
-	const { rejectOnClear = false, maxPending = Infinity } = options;
+	const rejectOnClear = readOption(options, 'rejectOnClear', false);
+	const maxPending = readOption(options, 'maxPending', Infinity);
 	assertInteger('createLimiter', 'maxPending', maxPending, 0, true);
 	// The waiting tasks form a linked FIFO queue (O(1) enqueue and dequeue, no array to compact).
 	let first: LimiterTask | undefined;
@@ -945,7 +961,8 @@ function wake(waiters: Array<() => void>): Array<() => void> {
  * queue.size; // => 0
  */
 export function createQueue<S extends AbortSignalLike = never>(options: QueueOptions<S> = {}): Queue<S> {
-	const { concurrency = Infinity, signal: queueSignal } = options;
+	const concurrency = readOption(options, 'concurrency', Infinity);
+	const queueSignal = readOption(options, 'signal');
 
 	assertInteger('createQueue', 'concurrency', concurrency, 1, true);
 	assertOptionalSignal('createQueue', 'signal', queueSignal);
@@ -1002,7 +1019,8 @@ export function createQueue<S extends AbortSignalLike = never>(options: QueueOpt
 			addOptions: O = {} as O
 		): Promise<T> {
 			return new Promise<T>(function (resolve, reject) {
-				const { priority = 0, signal } = addOptions;
+				const priority = readOption(addOptions, 'priority', 0);
+				const signal = readOption(addOptions, 'signal');
 
 				assertFunction('Queue.add', 'task', task);
 				assertNumber('Queue.add', 'priority', priority, priority === priority, 'a number');
@@ -1041,7 +1059,8 @@ export function createQueue<S extends AbortSignalLike = never>(options: QueueOpt
 				 * @returns {void}
 				 */
 				function onAbort(): void {
-					waiting.delete(entry);
+					// Only a waiting task: a signal whose `removeEventListener` throws still calls this once the task has started.
+					if (!waiting.delete(entry)) return;
 					reject(abortReason(signal as AbortSignalLike));
 					notify();
 				}
@@ -1164,7 +1183,9 @@ interface RateLimitedCall {
 export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
 	if (typeof options !== 'object' || options === null) throw new TypeError(`createRateLimiter: \`options\` must be an object, got ${describe(options)}`);
 
-	const { limit, interval: period, signal } = options;
+	const limit = readOption(options, 'limit') as number;
+	const period = readOption(options, 'interval') as number;
+	const signal = readOption(options, 'signal');
 
 	assertInteger('createRateLimiter', 'limit', limit, 1);
 	assertDelay('createRateLimiter', 'interval', period);
@@ -1783,7 +1804,9 @@ export interface PollOptions {
  */
 export function pollUntil<T>(check: () => T | PromiseLike<T>, options: PollOptions = {}): Promise<Truthy<Awaited<T>>> {
 	return new Promise<Truthy<Awaited<T>>>(function (resolve, reject) {
-		const { interval: period = 100, timeout = Infinity, signal } = options;
+		const period = readOption(options, 'interval', 100);
+		const timeout = readOption(options, 'timeout', Infinity);
+		const signal = readOption(options, 'signal');
 
 		assertFunction('pollUntil', 'check', check);
 		assertDelay('pollUntil', 'interval', period);
@@ -2086,13 +2109,15 @@ export interface MemoizedAsync<F extends AnyFunction> {
  * await flaky(); // => 'ok' // the rejection was not cached
  */
 export function memoizeAsync<F extends AnyFunction>(fn: F, options: MemoizeAsyncOptions<F> = {}): MemoizedAsync<F> {
-	const { resolver = defaultMemoizeKey, ttl } = options;
+	const resolver = readOption(options, 'resolver', defaultMemoizeKey);
+	const ttl = readOption(options, 'ttl');
+	const cacheOption = readOption(options, 'cache');
 
 	assertFunction('memoizeAsync', 'fn', fn);
 	assertFunction('memoizeAsync', 'resolver', resolver);
 	if (ttl !== undefined) assertNumber('memoizeAsync', 'ttl', ttl, ttl > 0, 'a number > 0 or Infinity');
 
-	const cache = (options.cache ?? (ttl === undefined ? new Map() : createLRUCache({ max: Infinity, ttl }))) as MemoizeCache<unknown, unknown>;
+	const cache = (cacheOption ?? (ttl === undefined ? new Map() : createLRUCache({ max: Infinity, ttl }))) as MemoizeCache<unknown, unknown>;
 	const setOptions = ttl === undefined ? undefined : { ttl };
 	const inflight = new Map<unknown, Promise<unknown>>();
 	const call = fn as unknown as (this: unknown, ...args: unknown[]) => unknown;
@@ -2413,7 +2438,7 @@ function signalOption(caller: string, options: unknown): AbortSignalLike | null 
 	if (options === undefined) return undefined;
 	if (typeof options !== 'object' || options === null) throw new TypeError(`${caller}: \`options\` must be an object, got ${describe(options)}`);
 
-	const { signal } = options as BatcherLoadOptions;
+	const signal = readOption(options as BatcherLoadOptions, 'signal');
 
 	assertOptionalSignal(caller, 'signal', signal);
 
@@ -2470,7 +2495,10 @@ function signalOption(caller: string, options: unknown): AbortSignalLike | null 
 export function createBatcher<K, V>(batchLoad: BatchLoadFunction<K, V>, options: BatcherOptions<K, V> = {}): Batcher<K, V> {
 	if (typeof options !== 'object' || options === null) throw new TypeError(`createBatcher: \`options\` must be an object, got ${describe(options)}`);
 
-	const { delay, maxBatchSize = Infinity, key: keyOf, cache: cacheOption = false } = options;
+	const delay = readOption(options, 'delay');
+	const maxBatchSize = readOption(options, 'maxBatchSize', Infinity);
+	const keyOf = readOption(options, 'key');
+	const cacheOption = readOption(options, 'cache', false);
 
 	assertFunction('createBatcher', 'batchLoad', batchLoad);
 	if (delay !== undefined) assertDelay('createBatcher', 'delay', delay);
