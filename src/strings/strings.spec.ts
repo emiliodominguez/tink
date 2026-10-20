@@ -2102,6 +2102,18 @@ describe('String helpers under prototype pollution', function () {
 			for (const key of ['suffix', 'separator', 'lowercase', 'replacements', 'indent', 'includeEmptyLines', 'replacement', 'maxLength']) delete polluted[key];
 		}
 	});
+
+	it('dedent inserts undefined for a missing value, not a polluted Object.prototype index (regression)', function () {
+		const polluted = Object.prototype as Record<string, unknown>;
+		polluted[0] = '<EVIL>';
+		try {
+			const strings = Object.assign(['a', 'b', 'c'], { raw: ['a', 'b', 'c'] }) as unknown as TemplateStringsArray;
+			expect(helpers.dedent(strings, 1)).toBe('a1bundefinedc');
+			expect(helpers.dedent(strings)).toBe('aundefinedbundefinedc');
+		} finally {
+			delete polluted[0];
+		}
+	});
 });
 
 describe('truncate with options', function () {

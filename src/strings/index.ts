@@ -1437,7 +1437,8 @@ export function dedent(input: string | TemplateStringsArray, ...values: unknown[
 	const parts = dedentParts(literals);
 	let result = parts[0];
 
-	for (let index = 1; index < parts.length; index++) result += String(values[index - 1]) + parts[index];
+	// A missing value (a direct call with too few) is `undefined`, never a polluted `Object.prototype[index]` read through the hole.
+	for (let index = 1; index < parts.length; index++) result += String(index <= values.length ? values[index - 1] : undefined) + parts[index];
 
 	return result;
 }
