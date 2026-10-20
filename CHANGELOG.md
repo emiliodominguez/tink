@@ -1,10 +1,10 @@
 # Changelog
 
-## 1.3.0 (unreleased)
+## 1.3.0
 
-About 90 helpers that other libraries (lodash, es-toolkit, radash, remeda, ramda, date-fns, culori, validator.js, ufo, the p-\* family,
-async-mutex, nanostores, fuse.js, type-fest, Kendo and Syncfusion data utilities) offer and tink lacked, each with property tests and
-100% coverage:
+About 140 new helpers, each with property tests and 100% coverage: about 90 that other libraries (lodash, es-toolkit, radash, remeda,
+ramda, date-fns, culori, validator.js, ufo, the p-\* family, async-mutex, nanostores, fuse.js, type-fest, Kendo and Syncfusion data
+utilities) offer and tink lacked, and 47 math helpers checked against independent references:
 
 - **`errors` (new module):** `toError` turns anything thrown (strings, `null`, symbols, objects with throwing getters, revoked proxies) into an `Error` with the original as `cause`, passing errors of any realm through; `getErrorMessage` and `isErrorLike` never throw. `serializeError` gives a JSON-safe object (`name`, `message`, `stack`, `code`, `cause`, `AggregateError` `errors`, own properties), cycle-safe, never throwing, and at most 1000 levels deep so that deeply nested input cannot overflow the stack; `deserializeError` rebuilds only built-in error classes, chosen by name, never calls another constructor, is prototype-safe, and never copies a key the error inherits (`toString`, `valueOf`…), so hostile data cannot break `String(error)`. Name, message, stack and the cause chain survive a JSON round trip.
 - **Types (`tinkit/utils` and the package root):** 33 type-fest style utilities written from scratch: `PartialDeep`, `RequiredDeep`, `WritableDeep` (through arrays, tuples, `Map` and `Set`), `Writable`, `SetOptional`, `SetRequired`, `SetNonNullable`, `Except`, `RequireAtLeastOne`, `RequireExactlyOne`, `RequireAllOrNone`, `MergeExclusive`, `DistributedOmit`/`DistributedPick` (discriminated unions stay intact), stackable `Tagged`/`UnwrapTagged`, `IsEqual`/`IsAny`/`IsNever`/`IsUnknown`, `Jsonify` (honours `toJSON`, `Date` → `string`, drops `undefined`/function keys), `LiteralUnion`, `ValueOf`, `KeysOfUnion`, `NonEmptyArray` (what `isNonEmptyArray` narrows to), `Promisable`, `Arrayable`, `UnknownRecord`, `EmptyObject`, `IterableElement`, `AsyncReturnType`, `ConditionalKeys`, `ConditionalPick`. They are now listed in the API reference.
