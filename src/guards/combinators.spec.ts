@@ -1668,4 +1668,32 @@ describe('guards (pass 6 regressions)', function () {
 		(tree.c as Tree[])[0].a = 'x';
 		expect(explain(isTree, tree)).toEqual([{ message: 'Invalid value (got string)', path: ['c', 0, 'a'] }]);
 	});
+
+	it('a lazy guard explained when recording its verdict overflows leaves the check depth right', function () {
+		// Invalid at the root only: its child passes, and recording that verdict throws.
+		const tree: Tree = { a: 'x', c: [{ a: 1 }] };
+		const set = Map.prototype.set;
+
+		// Throws once, as a stack overflow does when the explanation of a lazy guard records its verdict near the stack limit.
+		Map.prototype.set = function (this: Map<unknown, unknown>, key: unknown, value: unknown): Map<unknown, unknown> {
+			if (value === true) {
+				Map.prototype.set = set;
+				throw new RangeError('Maximum call stack size exceeded');
+			}
+			return set.call(this, key, value);
+		};
+		try {
+			expect(function (): unknown {
+				return explain(isTree, tree);
+			}).toThrow(RangeError);
+		} finally {
+			Map.prototype.set = set;
+		}
+		// A depth left above 0 would keep what this check finds for the next one.
+		tree.a = 1;
+		expect(isTree(tree)).toBe(true);
+		(tree.c as Tree[])[0].a = 'x';
+		expect(isTree(tree)).toBe(false);
+		expect(explain(isTree, tree)).toEqual([{ message: 'Invalid value (got string)', path: ['c', 0, 'a'] }]);
+	});
 });

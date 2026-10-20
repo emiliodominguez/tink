@@ -2819,13 +2819,15 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 				}
 				throw error;
 			} finally {
+				// The depth first: near the stack limit the calls below can overflow, and a depth left above 0 would keep every memo (and
+				// its stale verdicts and outputs) for every later check and parse.
+				scope.depth--;
 				// The verdict is kept for the other paths to the same object: a value sharing objects (each held twice by the next) is then
 				// explained in linear time, with one issue per extra path, instead of once per path (exponential in the depth). A
 				// failure that reported nothing (a guard that is not deterministic), or threw, is explained again when met again.
 				if (issues.length > before) reported.set(value, { path: path.slice(), run: explainRun, root: explainRoot } as LazyReport);
 				else if (passed) reported.set(value, true);
 				else reported.delete(value);
-				scope.depth--;
 			}
 		}
 	);
