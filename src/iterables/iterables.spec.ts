@@ -3094,6 +3094,19 @@ describe('parseSSE', function () {
 		expect(await events('data:x\n\n')).toEqual([{ event: 'message', data: 'x', id: '' }]);
 	});
 
+	it('ignores a retry too large to be an exact number of milliseconds (regression: hundreds of digits gave Infinity)', async function () {
+		const seen: number[] = [];
+		function onRetry(ms: number): void {
+			seen.push(ms);
+		}
+		const huge = `retry: 1000\nretry: ${'9'.repeat(400)}\nretry: 9007199254740993\ndata:x\n\n`;
+		expect(await events(huge, { onRetry })).toEqual([{ event: 'message', data: 'x', id: '', retry: 1000 }]);
+		expect(await events(`retry: ${'0'.repeat(400)}9007199254740991\ndata:x\n\n`, { onRetry })).toEqual([
+			{ event: 'message', data: 'x', id: '', retry: Number.MAX_SAFE_INTEGER }
+		]);
+		expect(seen).toEqual([1000, Number.MAX_SAFE_INTEGER]);
+	});
+
 	it('format-bom: one leading byte order mark is dropped, a second one makes the first line a field of its own', async function () {
 		expect(datas(await events('\uFEFFdata:1\n\n\uFEFFdata:2\n\ndata:3\n\n'))).toEqual(['1', '3']);
 		expect(datas(await events('\uFEFF\uFEFFdata:1\n\ndata:2\n\ndata:3\n\n'))).toEqual(['2', '3']);
@@ -4663,5 +4676,94 @@ describe('async combinators: hostile promises, large read-aheads and a polluted 
 		} finally {
 			delete proto[0];
 		}
+	});
+	it('mergeAsync closes a source whose return() gives a native promise with an own then, as await does (regression: it hung or rejected)', async function () {
+		for (const then of [
+			function (): never {
+				throw new Error('own then');
+			},
+			function (): void {
+				// Never calls back.
+			}
+		]) {
+			const source: AsyncIterable<number> = {
+				[Symbol.asyncIterator]() {
+					return {
+						next: async function () {
+							return { done: false, value: 1 };
+						},
+						return() {
+							return Object.assign(Promise.resolve({ done: true, value: undefined }), { then });
+						}
+					} as AsyncIterator<number>;
+				}
+			};
+			const merged = helpers.mergeAsync(source);
+			await expect(merged.next()).resolves.toEqual({ done: false, value: 1 });
+			const closed = (merged.return as (value?: unknown) => Promise<IteratorResult<unknown>>)(undefined);
+			const outcome = await Promise.race([
+				closed,
+				new Promise(function (resolve) {
+					setTimeout(resolve, 1000, 'hung');
+				})
+			]);
+			expect(outcome).toEqual({ done: true, value: undefined });
+		}
+	});
+
+	it('accepts a function as an iterator result, reading its value only when not done, as for await does (regression: a TypeError)', async function () {
+		/** An async iterable of `'f'` whose results are functions; the `value` of the last one throws. */
+		function functionResults(): AsyncIterable<string> {
+			return {
+				[Symbol.asyncIterator]() {
+					let pull = 0;
+					return {
+						next: async function () {
+							return Object.defineProperties(function () {}, {
+								done: { value: pull++ > 0 },
+								value: {
+									get(): string {
+										if (pull > 1) throw new Error('value of a done result');
+										return 'f';
+									}
+								}
+							});
+						}
+					} as unknown as AsyncIterator<string>;
+				}
+			};
+		}
+		const awaited: string[] = [];
+		for await (const value of functionResults()) awaited.push(value);
+		expect(awaited).toEqual(['f']);
+		expect(await helpers.toArrayAsync(helpers.mapConcurrent(functionResults(), String, 2))).toEqual(['f']);
+		expect(await helpers.toArrayAsync(helpers.mergeAsync(functionResults()))).toEqual(['f']);
+		expect(await helpers.toArrayAsync(helpers.bufferTime(functionResults(), 1000))).toEqual([['f']]);
+		expect(await helpers.streamToArray(functionResults())).toEqual(['f']);
+		expect(await helpers.toArrayAsync(helpers.readLines(functionResults()))).toEqual(['f']);
+	});
+
+	it('mergeAsync stays linear with tens of thousands of sources (regression: quadratic shift)', async function () {
+		const sources = Array.from({ length: 60_000 }, function (_, index) {
+			return [index, index + 100_000];
+		});
+		const start = Date.now();
+		const values = await helpers.toArrayAsync(helpers.mergeAsync(...sources));
+		expect(Date.now() - start).toBeLessThan(3000);
+		expect(values).toHaveLength(120_000);
+		expect(values.slice(0, 2)).toEqual([0, 1]);
+	});
+
+	it('interleave stays linear with a hundred thousand iterables (regression: quadratic splice)', function () {
+		const sources = Array.from({ length: 100_000 }, function (_, index) {
+			return [index, index + 100_000];
+		});
+		const start = Date.now();
+		const items = helpers.toArray(helpers.interleave(...sources, [1, 2, 3]));
+		expect(Date.now() - start).toBeLessThan(1500);
+		expect(items).toHaveLength(200_003);
+		expect(items.slice(0, 3)).toEqual([0, 1, 2]);
+		expect(items.slice(99_999, 100_002)).toEqual([99_999, 1, 100_000]);
+		expect(items.slice(-3)).toEqual([199_999, 2, 3]);
 	});
 });

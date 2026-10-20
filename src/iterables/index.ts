@@ -553,7 +553,7 @@ function closeIterators(iterators: ReadonlyArray<Iterator<unknown>>, skip: numbe
 }
 
 /**
- * Checks the result of an iterator's `next()` as `for...of` does: it must be an object (functions included).
+ * Checks the result of an iterator's `next()` as `for...of` and `for await` do: it must be an object (functions included).
  * @param {string} caller - Name of the public function, used in the error message
  * @param {unknown} result - The result
  * @returns {IteratorResult<unknown>} The result
@@ -1254,8 +1254,7 @@ async function* mappedConcurrently(
 
 				// The result is read like `for await` reads it: a non-object, or a `done` / `value` getter that throws, is the source failing.
 				try {
-					if (typeof step !== 'object' || step === null) throw new TypeError(`mapConcurrent: iterator result ${describe(step)} is not an object`);
-					done = step.done;
+					done = stepOf('mapConcurrent', step).done;
 					if (!done) item = step.value;
 				} catch (error) {
 					failSource(error);
@@ -1531,8 +1530,12 @@ export function toArrayAsync<T>(iterable: AwaitableIterable<T>): Promise<T[]> {
  * @returns {Generator<ZippedValues<T>[number], void, undefined>} A generator of the items, in round-robin order
  */
 function* interleaved<T extends Array<Iterable<unknown>>>(iterables: T): Generator<ZippedValues<T>[number], void, undefined> {
-	// The iterators still running: an exhausted one is removed, so that it is skipped and never closed.
+	// The iterators still running, in order: those advanced in this round and still running are moved to the front (`kept` of them), and
+	// those from `index` on are still to be advanced in it. An exhausted one is dropped, so that it is skipped and never closed; dropping
+	// them as the round goes (rather than one `splice` each) keeps thousands of iterables linear.
 	const iterators: Array<Iterator<unknown>> = [];
+	let index = 0;
+	let kept = 0;
 	// Index of the iterator being advanced: when it throws, it must not be closed.
 	let current = -1;
 	let threw = false;
@@ -1543,16 +1546,23 @@ function* interleaved<T extends Array<Iterable<unknown>>>(iterables: T): Generat
 			if (typeof iterator !== 'object' || iterator === null) throw new TypeError(`interleave: an iterator must be an object, got ${describe(iterator)}`);
 			iterators.push(iterator as Iterator<unknown>);
 		}
-		let index = 0;
-		while (iterators.length > 0) {
-			if (index >= iterators.length) index = 0;
+		for (;;) {
+			if (index === iterators.length) {
+				// The round is over: the iterators that ended in it are dropped (setting `length` costs, even to the same value).
+				if (kept !== index) iterators.length = kept;
+				index = 0;
+				kept = 0;
+				if (iterators.length === 0) return;
+			}
 			current = index;
 			const result = stepOf('interleave', iterators[index].next());
 			if (result.done) {
-				iterators.splice(index, 1);
+				index++;
 			} else {
 				const value = result.value;
 				current = -1;
+				if (kept !== index) iterators[kept] = iterators[index];
+				kept++;
 				index++;
 				yield value as ZippedValues<T>[number];
 			}
@@ -1561,7 +1571,10 @@ function* interleaved<T extends Array<Iterable<unknown>>>(iterables: T): Generat
 		threw = true;
 		throw error;
 	} finally {
-		closeIterators(iterators, current, threw);
+		// Those still running: the ones kept in this round, then the ones not advanced yet (the one being advanced, if any, comes first).
+		iterators.copyWithin(kept, index);
+		iterators.length -= index - kept;
+		closeIterators(iterators, current === -1 ? -1 : kept, threw);
 	}
 }
 
@@ -1703,7 +1716,10 @@ interface Arrival {
 async function* merged(sources: ReadonlyArray<AwaitableIterable<unknown>>): AsyncGenerator<unknown, void, undefined> {
 	const iterators: Array<AsyncIterator<unknown>> = [];
 	const states: number[] = [];
-	const arrivals: Arrival[] = [];
+	// Delivered results not yet handed out, from `arrivals[head]` (at most one per source): taken by moving `head` and compacted once half
+	// of it is taken, as in `mapConcurrent` (`shift()` made thousands of sources quadratic).
+	const arrivals: Array<Arrival | undefined> = [];
+	let head = 0;
 	// Sources not finished: a failed one still counts, its error being among the arrivals, thrown before the end is noticed.
 	let running = 0;
 	let wakeUp: () => void = ignore;
@@ -1756,8 +1772,7 @@ async function* merged(sources: ReadonlyArray<AwaitableIterable<unknown>>): Asyn
 
 				// Read like `for await` reads it: a non-object, or a `done` / `value` getter that throws, is the source failing.
 				try {
-					if (typeof result !== 'object' || result === null) throw new TypeError(`mergeAsync: iterator result ${describe(result)} is not an object`);
-					done = result.done;
+					done = stepOf('mergeAsync', result).done;
 					if (!done) value = result.value;
 				} catch (error) {
 					arrive(index, false, error);
@@ -1789,9 +1804,15 @@ async function* merged(sources: ReadonlyArray<AwaitableIterable<unknown>>): Asyn
 		}
 		for (let index = 0; index < iterators.length; index++) pull(index);
 		for (;;) {
-			const arrival = arrivals.shift();
+			// An own slot only: past the end, `arrivals[head]` would read a polluted `Object.prototype[0]`.
+			const arrival = head < arrivals.length ? arrivals[head] : undefined;
 
 			if (arrival !== undefined) {
+				arrivals[head++] = undefined;
+				if (head * 2 >= arrivals.length) {
+					arrivals.splice(0, head);
+					head = 0;
+				}
 				if (!arrival.ok) throw arrival.value;
 				states[arrival.index] = HANDED_OUT;
 				yield arrival.value;
@@ -1831,11 +1852,13 @@ async function closeSources(iterators: ReadonlyArray<AsyncIterator<unknown>>, st
 		if (state === PULLING) {
 			closeLater(iterators[index]);
 		} else if (state !== FINISHED) {
-			try {
-				closing.push(Promise.resolve(iterators[index].return?.()));
-			} catch (error) {
-				closing.push(Promise.reject(error));
-			}
+			// Followed as `await` would (a native promise's own `then`, which could throw or never call back, is ignored); a `return()` that
+			// throws rejects it.
+			closing.push(
+				new Promise(function (resolve, reject) {
+					whenSettled(iterators[index].return?.(), resolve, reject);
+				})
+			);
 		}
 	}
 	// `allSettled`: every close is waited for, and no rejection is left unhandled.
@@ -1979,8 +2002,7 @@ async function* batchedByTime(
 				let value: unknown;
 
 				try {
-					if (typeof result !== 'object' || result === null) throw new TypeError(`bufferTime: iterator result ${describe(result)} is not an object`);
-					done = result.done;
+					done = stepOf('bufferTime', result).done;
 					if (!done) value = result.value;
 				} catch (error) {
 					failSource(error);
@@ -2302,10 +2324,10 @@ function chunkReader(caller: string, source: unknown, whole: boolean, signal: Ab
 				const step = signal === undefined ? await pull : await interruptible(pull);
 				// Aborted while the chunk was arriving: it is dropped (the source is already cancelled).
 				check();
-				if (typeof step !== 'object' || step === null)
+				// Read like `for await` reads it: an object (functions too), whose `value` is read only when it is not `done`.
+				if (typeof step !== 'object' ? typeof step !== 'function' : step === null)
 					throw new TypeError(`${caller}: the source returned a read result that is not an object, got ${describe(step)}`);
-				const { done, value } = step as IteratorResult<unknown>;
-				if (!done) return value;
+				if (!(step as IteratorResult<unknown>).done) return (step as IteratorResult<unknown>).value;
 				settled = true;
 				return END;
 			} catch (error) {
@@ -2704,8 +2726,12 @@ function interpretLine(state: SseState, line: string): ServerSentEvent | undefin
 	} else if (field === 'id') {
 		if (!value.includes('\0')) state.id = value;
 	} else if (field === 'retry' && RETRY_VALUE.test(value)) {
-		state.retry = Number(value);
-		state.onRetry?.(state.retry);
+		const retry = Number(value);
+		// An integer too large to be exact (`Infinity` for hundreds of digits) is no usable delay: it is ignored.
+		if (Number.isSafeInteger(retry)) {
+			state.retry = retry;
+			state.onRetry?.(retry);
+		}
 	}
 	return undefined;
 }
@@ -2771,7 +2797,8 @@ async function* sseEvents(
  * - A line starting with `:` is a comment. Otherwise the field name is what precedes the first `:` (the whole line when there is none)
  *   and the value what follows it, minus one leading space. Field names are case-sensitive; unknown fields are ignored.
  * - `data` values are joined with `\n`; `event` sets the type (`'message'` by default); `id` sets the last event ID, which persists
- *   across events, unless its value contains U+0000; `retry` sets the reconnection time when its value is made of ASCII digits only.
+ *   across events, unless its value contains U+0000; `retry` sets the reconnection time when its value is made of ASCII digits only
+ *   (and is at most `Number.MAX_SAFE_INTEGER`).
  * - A blank line dispatches the event, unless no `data` field was seen since the last one (then nothing is yielded, as in browsers).
  *   An event not followed by a blank line when the stream ends is discarded.
  * - Each event is `{ event, data, id }`, plus `retry` once the stream has set one (see {@link ServerSentEvent}).
