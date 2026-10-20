@@ -52,4 +52,6 @@ The 1.4.0 additions were mutated on their own lines (a full run of all 38,000 mu
 | [`search`](./search.md)         | `tokenize`                                                                                                          | 96.40% |
 | [`validate`](./validate.md)     | semver ranges and increments                                                                                        | 96.30% |
 
+After 1.4.0, `cache` and `store` were mutated again as whole modules (2,233 mutants): `cache` scores 97.54% (32 equivalent mutants, plus 2 that only Stryker's per-test coverage misses) and `store` 96.89% (31 equivalent mutants).
+
 The date module's list includes 3 mutants that survive only because Stryker runs in UTC. The DST tests kill them under `TZ=America/New_York`.
