@@ -2257,3 +2257,321 @@ describe('Statistics helpers (property-based)', function () {
 		});
 	});
 });
+
+/**
+ * The position of a double in the order of the doubles, `0` and `-0` both at `0` (adjacent doubles are `1` apart).
+ * @param {number} value - A number that is not NaN
+ * @returns {bigint} Its position
+ */
+function orderOf(value: number): bigint {
+	const bits = new BigInt64Array(new Float64Array([value]).buffer)[0];
+	return bits < 0n ? -(bits + (1n << 63n)) : bits;
+}
+
+/**
+ * The exact value of a finite double as a fraction of BigInts.
+ * @param {number} value - A finite number
+ * @returns {[bigint, bigint]} `[numerator, denominator]`, the denominator a power of two
+ */
+function exactFraction(value: number): [bigint, bigint] {
+	let mantissa = value;
+	let exponent = 0n;
+	for (; !Number.isInteger(mantissa); exponent++) mantissa *= 2;
+	return [BigInt(mantissa), 1n << exponent];
+}
+
+/**
+ * Rounds the shortest decimal representation of a number to `decimals` places, ties to even, in exact BigInt arithmetic: a reference for
+ * `roundHalfEven` written independently of it.
+ * @param {number} value - A finite number
+ * @param {number} decimals - The decimal places to keep, `>= 0`
+ * @returns {number} The rounded number
+ */
+function referenceHalfEven(value: number, decimals: number): number {
+	const [mantissa, exponent = '0'] = String(Math.abs(value)).split('e');
+	const [whole, fraction = ''] = mantissa.split('.');
+	// |value| = digits * 10 ** power.
+	const digits = BigInt(whole + fraction);
+	const power = Number(exponent) - fraction.length;
+	const shift = power + decimals;
+	let rounded: bigint;
+	if (shift >= 0) {
+		rounded = digits * 10n ** BigInt(shift);
+	} else {
+		const divisor = 10n ** BigInt(-shift);
+		const quotient = digits / divisor;
+		const twice = 2n * (digits % divisor);
+		rounded = twice > divisor || (twice === divisor && quotient % 2n === 1n) ? quotient + 1n : quotient;
+	}
+	const result = Number(`${rounded}e-${decimals}`);
+	return 1 / value < 0 ? -result : result;
+}
+
+describe('Rounding and floating-point helpers (property-based)', function () {
+	const decimals = fc.integer({ min: 0, max: 6 });
+	// Values with up to 8 decimals, half of them ties (a last digit of 5).
+	const decimalValue = fc.tuple(fc.integer({ min: -1e9, max: 1e9 }), fc.integer({ min: 0, max: 8 }), fc.boolean()).map(function ([digits, places, tie]) {
+		return Number(`${digits}${tie ? '5' : ''}e-${places + (tie ? 1 : 0)}`);
+	});
+
+	describe('roundHalfEven', function () {
+		it('should equal an exact decimal reference', function () {
+			fc.assert(
+				fc.property(fc.oneof(decimalValue, finiteDouble), decimals, function (value, places) {
+					expect(helpers.roundHalfEven(value, places)).toBe(referenceHalfEven(value, places));
+				})
+			);
+		});
+
+		it('should only differ from round on ties, by going to the even neighbour', function () {
+			fc.assert(
+				fc.property(fc.oneof(decimalValue, finiteDouble), decimals, function (value, places) {
+					const even = helpers.roundHalfEven(value, places);
+					const away = helpers.round(value, places);
+					if (even !== away) {
+						expect(helpers.decimalPlaces(value)).toBe(places + 1);
+						expect(String(value).endsWith('5')).toBe(true);
+						expect(Math.abs(even)).toBeLessThan(Math.abs(away));
+						expect(BigInt(helpers.round(Math.abs(even) * 10 ** places)) % 2n).toBe(0n);
+					}
+				})
+			);
+		});
+
+		it('should be idempotent and odd-symmetric', function () {
+			fc.assert(
+				fc.property(fc.oneof(decimalValue, finiteDouble), fc.integer({ min: -3, max: 6 }), function (value, places) {
+					const rounded = helpers.roundHalfEven(value, places);
+					expect(helpers.roundHalfEven(rounded, places)).toBe(rounded);
+					expect(helpers.roundHalfEven(-value, places)).toBe(-rounded);
+				})
+			);
+		});
+	});
+
+	describe('trunc', function () {
+		it('should be floor for positive numbers and ceil for negative ones, never moving away from zero', function () {
+			fc.assert(
+				fc.property(fc.oneof(decimalValue, finiteDouble), fc.integer({ min: -3, max: 6 }), function (value, places) {
+					const truncated = helpers.trunc(value, places);
+					expect(truncated).toBe(1 / value < 0 ? helpers.ceil(value, places) : helpers.floor(value, places));
+					expect(Math.abs(truncated)).toBeLessThanOrEqual(Math.abs(value));
+					expect(truncated === 0 || Math.sign(truncated) === Math.sign(value)).toBe(true);
+					expect(helpers.trunc(-value, places)).toBe(-truncated);
+					expect(helpers.trunc(truncated, places)).toBe(truncated);
+				})
+			);
+		});
+	});
+
+	describe('nextAfter and ulp', function () {
+		const anyDouble = fc.double({ noNaN: true });
+
+		it('should step to the adjacent double towards `to`', function () {
+			fc.assert(
+				fc.property(anyDouble, anyDouble, function (from, to) {
+					const next = helpers.nextAfter(from, to);
+					if (from === to) {
+						expect(Object.is(next, to)).toBe(true);
+					} else {
+						expect(orderOf(next) - orderOf(from)).toBe(to > from ? 1n : -1n);
+						expect(next > from).toBe(to > from);
+					}
+				})
+			);
+		});
+
+		it('should step back to where it started', function () {
+			fc.assert(
+				fc.property(anyDouble, function (value) {
+					fc.pre(value !== 0 && Math.abs(value) < Infinity);
+					expect(helpers.nextAfter(helpers.nextAfter(value, Infinity), -Infinity)).toBe(value);
+					expect(helpers.nextAfter(helpers.nextAfter(value, -Infinity), Infinity)).toBe(value);
+				})
+			);
+		});
+
+		it('should give the gap to the next larger double, a power of two', function () {
+			fc.assert(
+				fc.property(anyDouble, function (value) {
+					const magnitude = Math.abs(value);
+					fc.pre(magnitude < Number.MAX_VALUE);
+					const gap = helpers.ulp(value);
+					expect(gap).toBe(helpers.nextAfter(magnitude, Infinity) - magnitude);
+					expect(Number.isInteger(Math.log2(gap))).toBe(true);
+					expect(gap).toBeLessThanOrEqual(Math.max(magnitude * Number.EPSILON, Number.MIN_VALUE));
+				})
+			);
+		});
+	});
+
+	describe('decimalPlaces', function () {
+		it('should give the digits that the shortest representation needs', function () {
+			fc.assert(
+				fc.property(fc.double({ noNaN: true, noDefaultInfinity: true }), function (value) {
+					const places = helpers.decimalPlaces(value);
+					expect(Number.isInteger(places) && places >= 0).toBe(true);
+					// `toFixed` writes the same number with that many places, and with one place fewer it is a different number.
+					if (places <= 100) {
+						expect(Number(value.toFixed(places)) === value).toBe(true);
+						if (places > 0) expect(Number(value.toFixed(places - 1)) === value).toBe(false);
+					}
+				})
+			);
+		});
+	});
+
+	describe('toFraction', function () {
+		it('should give back fractions with small denominators exactly, in lowest terms', function () {
+			fc.assert(
+				fc.property(fc.integer({ min: -100_000, max: 100_000 }), fc.integer({ min: 1, max: 1000 }), function (numerator, denominator) {
+					const divisor = helpers.gcd(numerator, denominator);
+					expect(helpers.toFraction(numerator / denominator)).toEqual([numerator / divisor + 0, denominator / divisor]);
+				})
+			);
+		});
+
+		it('should be in lowest terms, within the limit, and odd-symmetric', function () {
+			fc.assert(
+				fc.property(fc.double({ min: -1e6, max: 1e6, noNaN: true }), fc.integer({ min: 1, max: 1e9 }), function (value, limit) {
+					const [numerator, denominator] = helpers.toFraction(value, limit);
+					expect(denominator >= 1 && denominator <= limit).toBe(true);
+					expect(helpers.gcd(numerator, denominator)).toBe(1);
+					expect(helpers.toFraction(-value, limit)).toEqual([-numerator + 0, denominator]);
+				})
+			);
+		});
+
+		it('should be at least as close as any fraction within the limit (brute force)', function () {
+			fc.assert(
+				fc.property(fc.double({ min: -50, max: 50, noNaN: true }), fc.integer({ min: 1, max: 60 }), function (value, limit) {
+					const [numerator, denominator] = helpers.toFraction(value, limit);
+					const [n, d] = exactFraction(value);
+					// |value - p / q| as the fraction |n * q - p * d| / (d * q), compared by cross-multiplication.
+					function distance(p: bigint, q: bigint): [bigint, bigint] {
+						const difference = n * q - p * d;
+						return [difference < 0n ? -difference : difference, d * q];
+					}
+					const [best, bestDenominator] = distance(BigInt(numerator), BigInt(denominator));
+					for (let q = 1n; q <= BigInt(limit); q++) {
+						// The two fractions with denominator `q` around the value.
+						const floor = (n * q) / d - (n < 0n && (n * q) % d !== 0n ? 1n : 0n);
+						for (const p of [floor, floor + 1n]) {
+							const [other, otherDenominator] = distance(p, q);
+							expect(best * otherDenominator <= other * bestDenominator).toBe(true);
+						}
+					}
+				})
+			);
+		});
+	});
+
+	describe('percentageChange', function () {
+		const value = fc.double({ min: -1e5, max: 1e5, noNaN: true });
+
+		it('should have the sign of the difference, and be 0 without change', function () {
+			fc.assert(
+				fc.property(value, value, function (from, to) {
+					fc.pre(from !== 0);
+					expect(Math.sign(helpers.percentageChange(from, to)) || 0).toBe(Math.sign(to - from) || 0);
+					expect(helpers.percentageChange(from, from)).toBe(0);
+				})
+			);
+		});
+
+		it('should not depend on the scale, even where the difference overflows', function () {
+			fc.assert(
+				fc.property(value, value, fc.integer({ min: -1000, max: 1000 }), function (from, to, exponent) {
+					fc.pre(Math.abs(from) >= 1e-3);
+					const scale = 2 ** exponent;
+					fc.pre(Number.isFinite(from * scale) && Number.isFinite(to * scale) && Math.abs(from * scale) >= 2 ** -1000);
+					fc.pre(Math.abs(to * scale) >= 2 ** -1000 || to === 0);
+					expect(helpers.percentageChange(from * scale, to * scale)).toBe(helpers.percentageChange(from, to));
+				})
+			);
+		});
+	});
+
+	describe('findRoot', function () {
+		// Functions whose computed sign is exactly the sign of `x - t` (the difference of two different doubles is never rounded to 0, and
+		// nothing underflows to 0 after it): their only sign change is at `t`.
+		const shapes: ReadonlyArray<(x: number, t: number) => number> = [
+			function (x, t) {
+				return x - t;
+			},
+			function (x, t) {
+				return (x - t) * 2 ** 1000;
+			},
+			function (x, t) {
+				return Math.atan(x - t);
+			},
+			function (x, t) {
+				return Math.cbrt(x - t) * 1e300;
+			},
+			function (x, t) {
+				return x < t ? -1 : 1;
+			},
+			function (x, t) {
+				return x < t ? -Infinity : (x - t) * 1e300;
+			}
+		];
+		const finite = fc.oneof(fc.double({ noNaN: true, noDefaultInfinity: true }), fc.double({ min: -100, max: 100, noNaN: true }));
+
+		it('should find the sign change within the tolerance', function () {
+			fc.assert(
+				fc.property(
+					fc.tuple(finite, finite, finite),
+					fc.nat({ max: shapes.length - 1 }),
+					fc.oneof(fc.constant(0), fc.double({ min: 0, max: 1e3, noNaN: true })),
+					function (points, shape, tolerance) {
+						const [lower, t, upper] = [...points].sort(function (a, b) {
+							return a - b;
+						});
+						fc.pre(lower < t && t < upper);
+						let calls = 0;
+						const root = helpers.findRoot(
+							function (x) {
+								calls++;
+								return shapes[shape](x, t);
+							},
+							lower,
+							upper,
+							{ tolerance }
+						);
+						expect(root >= lower && root <= upper).toBe(true);
+						expect(Math.abs(root - t)).toBeLessThanOrEqual(tolerance + 4 * Number.EPSILON * Math.max(Math.abs(root), Math.abs(t)) + 2 * Number.MIN_VALUE);
+						expect(calls).toBeLessThanOrEqual(300);
+					}
+				)
+			);
+		});
+
+		it('should find a root of a polynomial bracketing a sign change, as precisely as doubles allow', function () {
+			fc.assert(
+				fc.property(fc.array(fc.double({ min: -10, max: 10, noNaN: true }), { minLength: 2, maxLength: 6 }), finite, finite, function (coefficients, a, b) {
+					function polynomial(x: number): number {
+						let result = 0;
+						for (const coefficient of coefficients) result = result * x + coefficient;
+						return result;
+					}
+					const lower = helpers.clamp(Math.min(a, b), -1e3, 1e3);
+					const upper = helpers.clamp(Math.max(a, b), -1e3, 1e3);
+					fc.pre(Math.sign(polynomial(lower)) * Math.sign(polynomial(upper)) < 0);
+					const root = helpers.findRoot(polynomial, lower, upper);
+					expect(root >= lower && root <= upper).toBe(true);
+					// The polynomial (as computed) is zero at the root or changes sign within 4 epsilons of it: some double that close has the
+					// other sign.
+					const sign = Math.sign(polynomial(root));
+					const reach = 4 * Number.EPSILON * Math.abs(root) + Number.MIN_VALUE;
+					let found = sign === 0;
+					for (const direction of [-Infinity, Infinity]) {
+						for (let x = helpers.nextAfter(root, direction); !found && Math.abs(x - root) <= reach; x = helpers.nextAfter(x, direction)) {
+							found = Math.sign(polynomial(x)) !== sign;
+						}
+					}
+					expect(found).toBe(true);
+				})
+			);
+		});
+	});
+});

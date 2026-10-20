@@ -3909,3 +3909,584 @@ describe('Statistics helpers', function () {
 		});
 	});
 });
+
+describe('roundHalfEven', function () {
+	it('should round ties to the even neighbour', function () {
+		expect(helpers.roundHalfEven(0.5)).toBe(0);
+		expect(helpers.roundHalfEven(1.5)).toBe(2);
+		expect(helpers.roundHalfEven(2.5)).toBe(2);
+		expect(helpers.roundHalfEven(3.5)).toBe(4);
+		expect(helpers.roundHalfEven(-1.5)).toBe(-2);
+		expect(helpers.roundHalfEven(-2.5)).toBe(-2);
+		expect(Object.is(helpers.roundHalfEven(-0.5), -0)).toBe(true);
+	});
+
+	it('should round decimal ties as written', function () {
+		expect(helpers.roundHalfEven(0.125, 2)).toBe(0.12);
+		expect(helpers.roundHalfEven(0.135, 2)).toBe(0.14);
+		expect(helpers.roundHalfEven(2.675, 2)).toBe(2.68);
+		expect(helpers.roundHalfEven(1.005, 2)).toBe(1);
+		expect(helpers.roundHalfEven(1.015, 2)).toBe(1.02);
+		expect(helpers.roundHalfEven(1.025, 2)).toBe(1.02);
+		expect(helpers.roundHalfEven(-1.025, 2)).toBe(-1.02);
+		expect(helpers.roundHalfEven(2.5e-7, 7)).toBe(2e-7);
+		expect(helpers.roundHalfEven(3.5e-7, 7)).toBe(4e-7);
+	});
+
+	it('should agree with round away from ties', function () {
+		expect(helpers.roundHalfEven(1.2351, 2)).toBe(1.24);
+		expect(helpers.roundHalfEven(-1.2349, 2)).toBe(-1.23);
+		expect(helpers.roundHalfEven(1.250001, 1)).toBe(1.3);
+		expect(helpers.roundHalfEven(2.6)).toBe(3);
+		expect(Object.is(helpers.roundHalfEven(-0.4), -0)).toBe(true);
+	});
+
+	it('should round to tens, hundreds, etc. with negative decimals', function () {
+		expect(helpers.roundHalfEven(250, -2)).toBe(200);
+		expect(helpers.roundHalfEven(350, -2)).toBe(400);
+		expect(helpers.roundHalfEven(150, -2)).toBe(200);
+		expect(helpers.roundHalfEven(251, -2)).toBe(300);
+		expect(helpers.roundHalfEven(50, -2)).toBe(0);
+		expect(Object.is(helpers.roundHalfEven(-50, -2), -0)).toBe(true);
+		expect(helpers.roundHalfEven(5, -1)).toBe(0);
+		expect(helpers.roundHalfEven(15, -1)).toBe(20);
+		expect(helpers.roundHalfEven(0.05, -1)).toBe(0);
+		expect(helpers.roundHalfEven(2.5e22, -22)).toBe(2e22);
+		expect(helpers.roundHalfEven(3.5e22, -22)).toBe(4e22);
+	});
+
+	it('should return numbers that need no rounding, and non-finite numbers, as they are', function () {
+		expect(helpers.roundHalfEven(1.25, 2)).toBe(1.25);
+		expect(helpers.roundHalfEven(2 ** 53 + 2)).toBe(2 ** 53 + 2);
+		expect(helpers.roundHalfEven(1e300, 3)).toBe(1e300);
+		expect(helpers.roundHalfEven(NaN, 2)).toBeNaN();
+		expect(helpers.roundHalfEven(Infinity, 2)).toBe(Infinity);
+		expect(helpers.roundHalfEven(-Infinity)).toBe(-Infinity);
+		expect(Object.is(helpers.roundHalfEven(-0, 2), -0)).toBe(true);
+	});
+
+	it('should convert the input with unary +', function () {
+		expect(helpers.roundHalfEven('2.5' as never)).toBe(2);
+		expect(helpers.roundHalfEven('0.125' as never, 2)).toBe(0.12);
+	});
+
+	it('should give every half from -1000.5 to 1000.5 to its even neighbour', function () {
+		for (let n = -1001; n <= 1000; n++) {
+			const value = n + 0.5;
+			const even = Math.floor(value) % 2 === 0 ? Math.floor(value) : Math.ceil(value);
+			// A zero result keeps the sign of the value.
+			expect(helpers.roundHalfEven(value)).toBe(even === 0 && value < 0 ? -0 : even);
+		}
+	});
+
+	it('should throw on invalid decimals', function () {
+		expect(function () {
+			helpers.roundHalfEven(1, 1.5);
+		}).toThrow(new RangeError('roundHalfEven: `decimals` must be an integer, got 1.5'));
+		expect(function () {
+			helpers.roundHalfEven(1, '2' as never);
+		}).toThrow(new TypeError('roundHalfEven: `decimals` must be an integer, got string'));
+	});
+});
+
+describe('trunc', function () {
+	it('should be Math.trunc without decimals', function () {
+		expect(helpers.trunc(3.99)).toBe(3);
+		expect(helpers.trunc(-3.99)).toBe(-3);
+		expect(Object.is(helpers.trunc(-0.5), -0)).toBe(true);
+		expect(helpers.trunc(NaN)).toBeNaN();
+	});
+
+	it('should drop the digits after the given decimal places, as written', function () {
+		expect(helpers.trunc(1.239, 2)).toBe(1.23);
+		expect(helpers.trunc(-1.239, 2)).toBe(-1.23);
+		expect(helpers.trunc(4.35, 2)).toBe(4.35);
+		expect(helpers.trunc(-4.35, 2)).toBe(-4.35);
+		expect(helpers.trunc(0.29, 2)).toBe(0.29);
+		expect(helpers.trunc(-0.29, 2)).toBe(-0.29);
+		expect(helpers.trunc(1.0000000000000002, 15)).toBe(1);
+		expect(helpers.trunc(-1.0000000000000002, 15)).toBe(-1);
+	});
+
+	it('should truncate to tens, hundreds, etc. with negative decimals', function () {
+		expect(helpers.trunc(4567, -2)).toBe(4500);
+		expect(helpers.trunc(-4567, -2)).toBe(-4500);
+		expect(helpers.trunc(99, -2)).toBe(0);
+		expect(Object.is(helpers.trunc(-99, -2), -0)).toBe(true);
+	});
+
+	it('should keep the sign of a zero result and return non-finite numbers as they are', function () {
+		expect(Object.is(helpers.trunc(-0.001, 2), -0)).toBe(true);
+		expect(Object.is(helpers.trunc(-0, 2), -0)).toBe(true);
+		expect(Object.is(helpers.trunc(0.001, 2), 0)).toBe(true);
+		expect(helpers.trunc(Infinity, 2)).toBe(Infinity);
+		expect(helpers.trunc(-Infinity, 1)).toBe(-Infinity);
+		expect(helpers.trunc(NaN, 2)).toBeNaN();
+	});
+
+	it('should throw on invalid decimals', function () {
+		expect(function () {
+			helpers.trunc(1, 0.5);
+		}).toThrow(new RangeError('trunc: `decimals` must be an integer, got 0.5'));
+		expect(function () {
+			helpers.trunc(1, '1' as never);
+		}).toThrow(new TypeError('trunc: `decimals` must be an integer, got string'));
+	});
+});
+
+describe('nextAfter', function () {
+	const MIN = Number.MIN_VALUE;
+
+	it('should step to the adjacent double', function () {
+		expect(helpers.nextAfter(1, 2)).toBe(1 + Number.EPSILON);
+		expect(helpers.nextAfter(1, Infinity)).toBe(1 + Number.EPSILON);
+		expect(helpers.nextAfter(1, 0)).toBe(1 - Number.EPSILON / 2);
+		expect(helpers.nextAfter(-1, -2)).toBe(-1 - Number.EPSILON);
+		expect(helpers.nextAfter(-1, 0)).toBe(-1 + Number.EPSILON / 2);
+		expect(helpers.nextAfter(2 ** -1022, 0)).toBe(2 ** -1022 - MIN);
+		expect(helpers.nextAfter(2 ** -1022 - MIN, 1)).toBe(2 ** -1022);
+	});
+
+	it('should step through zero', function () {
+		expect(helpers.nextAfter(0, 1)).toBe(MIN);
+		expect(helpers.nextAfter(-0, 1)).toBe(MIN);
+		expect(helpers.nextAfter(0, -1)).toBe(-MIN);
+		expect(Object.is(helpers.nextAfter(MIN, 0), 0)).toBe(true);
+		expect(Object.is(helpers.nextAfter(-MIN, 0), -0)).toBe(true);
+		expect(Object.is(helpers.nextAfter(MIN, -1), 0)).toBe(true);
+	});
+
+	it('should return `to` when `from` equals it', function () {
+		expect(Object.is(helpers.nextAfter(0, -0), -0)).toBe(true);
+		expect(Object.is(helpers.nextAfter(-0, 0), 0)).toBe(true);
+		expect(helpers.nextAfter(1, 1)).toBe(1);
+		expect(helpers.nextAfter(Infinity, Infinity)).toBe(Infinity);
+	});
+
+	it('should step between the largest doubles and the infinities', function () {
+		expect(helpers.nextAfter(MAX, Infinity)).toBe(Infinity);
+		expect(helpers.nextAfter(-MAX, -Infinity)).toBe(-Infinity);
+		expect(helpers.nextAfter(Infinity, 0)).toBe(MAX);
+		expect(helpers.nextAfter(-Infinity, 0)).toBe(-MAX);
+		expect(helpers.nextAfter(MAX, 0)).toBe(MAX - 2 ** 971);
+	});
+
+	it('should propagate NaN', function () {
+		expect(helpers.nextAfter(NaN, 1)).toBeNaN();
+		expect(helpers.nextAfter(1, NaN)).toBeNaN();
+		expect(helpers.nextAfter(NaN, NaN)).toBeNaN();
+	});
+});
+
+describe('ulp', function () {
+	it('should give the spacing of the doubles at the magnitude of the number', function () {
+		expect(helpers.ulp(1)).toBe(Number.EPSILON);
+		expect(helpers.ulp(-1)).toBe(Number.EPSILON);
+		expect(helpers.ulp(1.5)).toBe(Number.EPSILON);
+		expect(helpers.ulp(2)).toBe(2 * Number.EPSILON);
+		expect(helpers.ulp(0.1)).toBe(2 ** -56);
+		expect(helpers.ulp(2 ** 53)).toBe(2);
+		expect(helpers.ulp(1e16)).toBe(2);
+	});
+
+	it('should give the smallest subnormal at zero and among the subnormals', function () {
+		expect(helpers.ulp(0)).toBe(Number.MIN_VALUE);
+		expect(helpers.ulp(-0)).toBe(Number.MIN_VALUE);
+		expect(helpers.ulp(Number.MIN_VALUE)).toBe(Number.MIN_VALUE);
+		expect(helpers.ulp(2 ** -1022)).toBe(Number.MIN_VALUE);
+	});
+
+	it('should give the gap below the largest double, and Infinity or NaN for non-finite numbers', function () {
+		expect(helpers.ulp(MAX)).toBe(2 ** 971);
+		expect(helpers.ulp(-MAX)).toBe(2 ** 971);
+		expect(helpers.ulp(Infinity)).toBe(Infinity);
+		expect(helpers.ulp(-Infinity)).toBe(Infinity);
+		expect(helpers.ulp(NaN)).toBeNaN();
+	});
+});
+
+describe('decimalPlaces', function () {
+	it('should count the digits after the decimal point of the shortest representation', function () {
+		expect(helpers.decimalPlaces(1.25)).toBe(2);
+		expect(helpers.decimalPlaces(-1.5)).toBe(1);
+		expect(helpers.decimalPlaces(0.1 + 0.2)).toBe(17);
+		expect(helpers.decimalPlaces(0.1)).toBe(1);
+	});
+
+	it('should give 0 for integers, also in exponential form', function () {
+		expect(helpers.decimalPlaces(100)).toBe(0);
+		expect(helpers.decimalPlaces(0)).toBe(0);
+		expect(helpers.decimalPlaces(-0)).toBe(0);
+		expect(helpers.decimalPlaces(1e21)).toBe(0);
+		expect(helpers.decimalPlaces(1.5e22)).toBe(0);
+		expect(helpers.decimalPlaces(MAX)).toBe(0);
+	});
+
+	it('should expand the exponential form of small numbers', function () {
+		expect(helpers.decimalPlaces(1e-7)).toBe(7);
+		expect(helpers.decimalPlaces(1.5e-7)).toBe(8);
+		expect(helpers.decimalPlaces(Number.MIN_VALUE)).toBe(324);
+	});
+
+	it('should give NaN for non-finite numbers and convert with unary +', function () {
+		expect(helpers.decimalPlaces(NaN)).toBeNaN();
+		expect(helpers.decimalPlaces(Infinity)).toBeNaN();
+		expect(helpers.decimalPlaces(-Infinity)).toBeNaN();
+		expect(helpers.decimalPlaces('1.50' as never)).toBe(1);
+	});
+});
+
+describe('toFraction', function () {
+	it('should give exact fractions with small denominators', function () {
+		expect(helpers.toFraction(0.75)).toEqual([3, 4]);
+		expect(helpers.toFraction(-1.25)).toEqual([-5, 4]);
+		expect(helpers.toFraction(0.5)).toEqual([1, 2]);
+		expect(helpers.toFraction(2 ** -19)).toEqual([1, 2 ** 19]);
+	});
+
+	it('should give decimals as written', function () {
+		expect(helpers.toFraction(0.1)).toEqual([1, 10]);
+		expect(helpers.toFraction(0.1 + 0.2)).toEqual([3, 10]);
+		expect(helpers.toFraction(1 / 3)).toEqual([1, 3]);
+		expect(helpers.toFraction(-2 / 3)).toEqual([-2, 3]);
+		expect(helpers.toFraction(123456.789, 1000)).toEqual([123456789, 1000]);
+	});
+
+	it('should find the best approximation within the denominator limit, like Python', function () {
+		expect(helpers.toFraction(Math.PI)).toEqual([3126535, 995207]);
+		expect(helpers.toFraction(Math.PI, 1000)).toEqual([355, 113]);
+		expect(helpers.toFraction(-Math.PI, 100)).toEqual([-311, 99]);
+		expect(helpers.toFraction(Math.E, 1000)).toEqual([1457, 536]);
+		expect(helpers.toFraction(0.333, 10)).toEqual([1, 3]);
+		expect(helpers.toFraction(0.3, 7)).toEqual([2, 7]);
+		expect(helpers.toFraction(2 / 3, 2)).toEqual([1, 2]);
+	});
+
+	it('should keep the convergent on a tie', function () {
+		expect(helpers.toFraction(0.5, 1)).toEqual([0, 1]);
+		expect(helpers.toFraction(1.5, 1)).toEqual([1, 1]);
+		expect(helpers.toFraction(2.5, 1)).toEqual([2, 1]);
+		expect(helpers.toFraction(1.25, 2)).toEqual([1, 1]);
+		expect(helpers.toFraction(0.75, 2)).toEqual([1, 1]);
+		// Symmetric: only the numerator changes sign.
+		expect(helpers.toFraction(-1.5, 1)).toEqual([-1, 1]);
+	});
+
+	it('should handle zeros, integers and numbers too small for the limit', function () {
+		expect(helpers.toFraction(0)).toEqual([0, 1]);
+		expect(Object.is(helpers.toFraction(-0)[0], 0)).toBe(true);
+		expect(helpers.toFraction(5)).toEqual([5, 1]);
+		expect(helpers.toFraction(-7, 1)).toEqual([-7, 1]);
+		expect(helpers.toFraction(1e300)).toEqual([1e300, 1]);
+		expect(helpers.toFraction(1e-10)).toEqual([0, 1]);
+		expect(Object.is(helpers.toFraction(-1e-10)[0], 0)).toBe(true);
+		expect(helpers.toFraction(Number.MIN_VALUE)).toEqual([0, 1]);
+		expect(helpers.toFraction(Number.MIN_VALUE, Number.MAX_SAFE_INTEGER)).toEqual([0, 1]);
+	});
+
+	it('should accept the largest safe denominator', function () {
+		expect(helpers.toFraction(0.1, Number.MAX_SAFE_INTEGER)).toEqual([1, 10]);
+		expect(helpers.toFraction(2 ** -52, Number.MAX_SAFE_INTEGER)).toEqual([1, 2 ** 52]);
+		expect(helpers.toFraction(1 + 2 ** -52, Number.MAX_SAFE_INTEGER)).toEqual([2 ** 52 + 1, 2 ** 52]);
+	});
+
+	it('should throw on invalid arguments', function () {
+		expect(function () {
+			helpers.toFraction(Infinity);
+		}).toThrow(new RangeError('toFraction: `value` must be a finite number, got Infinity'));
+		expect(function () {
+			helpers.toFraction(NaN);
+		}).toThrow(new RangeError('toFraction: `value` must be a finite number, got NaN'));
+		expect(function () {
+			helpers.toFraction('1' as never);
+		}).toThrow(new TypeError('toFraction: `value` must be a finite number, got string'));
+		expect(function () {
+			helpers.toFraction(1, 0);
+		}).toThrow(new RangeError('toFraction: `maxDenominator` must be a safe integer >= 1, got 0'));
+		expect(function () {
+			helpers.toFraction(1, 1.5);
+		}).toThrow(new RangeError('toFraction: `maxDenominator` must be a safe integer >= 1, got 1.5'));
+		expect(function () {
+			helpers.toFraction(1, 2 ** 53);
+		}).toThrow(new RangeError(`toFraction: \`maxDenominator\` must be a safe integer >= 1, got ${2 ** 53}`));
+		expect(function () {
+			helpers.toFraction(1, Infinity);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.toFraction(1, '10' as never);
+		}).toThrow(new TypeError('toFraction: `maxDenominator` must be a safe integer >= 1, got string'));
+	});
+});
+
+describe('percentageChange', function () {
+	it('should give the change relative to the magnitude of the original value', function () {
+		expect(helpers.percentageChange(50, 75)).toBe(50);
+		expect(helpers.percentageChange(80, 60)).toBe(-25);
+		expect(helpers.percentageChange(-50, -25)).toBe(50);
+		expect(helpers.percentageChange(-50, -75)).toBe(-50);
+		expect(helpers.percentageChange(10, 10)).toBe(0);
+		expect(helpers.percentageChange(-10, 10)).toBe(200);
+	});
+
+	it('should round once', function () {
+		expect(helpers.percentageChange(3, 4)).toBe(100 / 3);
+		expect(helpers.percentageChange(0.1, 0.3)).toBe(((0.3 - 0.1) * 100) / 0.1);
+	});
+
+	it('should give NaN when the original value is 0', function () {
+		expect(helpers.percentageChange(0, 10)).toBeNaN();
+		expect(helpers.percentageChange(-0, 10)).toBeNaN();
+		expect(helpers.percentageChange(0, 0)).toBeNaN();
+	});
+
+	it('should not overflow when the change is finite', function () {
+		expect(helpers.percentageChange(2 ** 1020, 1.5 * 2 ** 1020)).toBe(50);
+		// The correctly rounded change between these two doubles (whose difference is slightly below 5e306).
+		expect(helpers.percentageChange(1e307, 1.5e307)).toBe(49.99999999999999);
+		expect(helpers.percentageChange(-MAX, MAX)).toBe(200);
+		expect(helpers.percentageChange(MAX, -MAX)).toBe(-200);
+		expect(helpers.percentageChange(Number.MIN_VALUE, 2 * Number.MIN_VALUE)).toBe(100);
+		expect(helpers.percentageChange(1e-300, 1e10)).toBe(Infinity);
+	});
+
+	it('should propagate non-finite values', function () {
+		expect(helpers.percentageChange(Infinity, 1)).toBeNaN();
+		expect(helpers.percentageChange(-Infinity, Infinity)).toBeNaN();
+		expect(helpers.percentageChange(1, Infinity)).toBe(Infinity);
+		expect(helpers.percentageChange(1, -Infinity)).toBe(-Infinity);
+		expect(helpers.percentageChange(NaN, 1)).toBeNaN();
+		expect(helpers.percentageChange(1, NaN)).toBeNaN();
+	});
+});
+
+describe('findRoot', function () {
+	function square(x: number) {
+		return x * x - 2;
+	}
+
+	it('should find roots to full precision', function () {
+		expect([Math.SQRT2, helpers.nextAfter(Math.SQRT2, 0)]).toContain(helpers.findRoot(square, 0, 2));
+		expect(helpers.findRoot(Math.cos, 0, 3)).toBe(Math.PI / 2);
+		expect(Math.abs(helpers.findRoot(Math.sin, 3, 4) - Math.PI)).toBeLessThanOrEqual(4 * Number.EPSILON * Math.PI);
+		const exponential = helpers.findRoot(
+			function (x) {
+				return Math.exp(x) - 1e300;
+			},
+			0,
+			1000
+		);
+		expect(Math.abs(exponential - 300 * Math.LN10)).toBeLessThan(1e-12);
+	});
+
+	it('should accept the bounds in either order', function () {
+		expect([Math.SQRT2, helpers.nextAfter(Math.SQRT2, 0)]).toContain(helpers.findRoot(square, 2, 0));
+		expect(helpers.findRoot(Math.cos, 3, 0)).toBe(Math.PI / 2);
+	});
+
+	it('should return a bound where the function is 0', function () {
+		function shifted(x: number) {
+			return x - 3;
+		}
+		expect(helpers.findRoot(shifted, 3, 10)).toBe(3);
+		expect(helpers.findRoot(shifted, 0, 3)).toBe(3);
+		expect(helpers.findRoot(shifted, 3, 3)).toBe(3);
+	});
+
+	it('should stop within the tolerance', function () {
+		let calls = 0;
+		const root = helpers.findRoot(
+			function (x) {
+				calls++;
+				return x ** 3 - x - 1;
+			},
+			1,
+			2,
+			{ tolerance: 0.1 }
+		);
+		expect(Math.abs(root - 1.324717957244746)).toBeLessThanOrEqual(0.1);
+		expect(calls).toBeLessThan(6);
+		const coarse = helpers.findRoot(square, 0, 2, { tolerance: 1e6 });
+		expect(coarse === 0 || coarse === 2).toBe(true);
+	});
+
+	it('should find a sign change of a discontinuous function', function () {
+		const pole = helpers.findRoot(
+			function (x) {
+				return 1 / (x - 1);
+			},
+			0,
+			3
+		);
+		expect(Math.abs(pole - 1)).toBeLessThanOrEqual(4 * Number.EPSILON);
+		const step = helpers.findRoot(
+			function (x) {
+				return x < 0.3 ? -1 : 1;
+			},
+			-MAX,
+			MAX
+		);
+		expect(Math.abs(step - 0.3)).toBeLessThanOrEqual(4 * Number.EPSILON * 0.3);
+		const infinite = helpers.findRoot(
+			function (x) {
+				return x < 1 ? -Infinity : Infinity;
+			},
+			0,
+			3
+		);
+		expect(Math.abs(infinite - 1)).toBeLessThanOrEqual(4 * Number.EPSILON);
+	});
+
+	it('should narrow the widest brackets down to roots next to zero in few steps', function () {
+		let calls = 0;
+		function counted(f: (x: number) => number) {
+			return function (x: number) {
+				calls++;
+				return f(x);
+			};
+		}
+		const sign = helpers.findRoot(
+			counted(function (x) {
+				return x < 0 ? -1 : 1;
+			}),
+			-MAX,
+			MAX
+		);
+		expect([-Number.MIN_VALUE, 0]).toContain(sign);
+		expect(calls).toBeLessThan(150);
+		calls = 0;
+		const tiny = helpers.findRoot(
+			counted(function (x) {
+				return x < 1e-300 ? -1 : 1;
+			}),
+			MAX,
+			-MAX
+		);
+		expect(Math.abs(tiny - 1e-300)).toBeLessThanOrEqual(4 * Number.EPSILON * 1e-300);
+		expect(calls).toBeLessThan(150);
+		expect(helpers.findRoot(Math.atan, -MAX, MAX)).toBe(0);
+		expect(
+			helpers.findRoot(
+				function (x) {
+					return Math.atan(x) - 1e-320;
+				},
+				-MAX,
+				MAX
+			)
+		).toBe(1e-320);
+		const cube = helpers.findRoot(
+			function (x) {
+				return x * x * x;
+			},
+			-1,
+			2
+		);
+		expect(Math.abs(cube)).toBeLessThan(1e-100);
+	});
+
+	it('should converge on a root of high multiplicity', function () {
+		const root = helpers.findRoot(
+			function (x) {
+				return (x - 1) ** 21;
+			},
+			-5,
+			1e10
+		);
+		expect(Math.abs(root - 1)).toBeLessThan(1e-12);
+	});
+
+	it('should throw when the root is not found within maxIterations', function () {
+		expect(function () {
+			helpers.findRoot(Math.cos, 0, 3, { maxIterations: 2 });
+		}).toThrow(new RangeError('findRoot: no root found within 2 iterations'));
+	});
+
+	it('should throw when the function has the same sign at both bounds', function () {
+		expect(function () {
+			helpers.findRoot(
+				function (x) {
+					return x * x + 1;
+				},
+				-1,
+				1
+			);
+		}).toThrow(new RangeError('findRoot: `fn` must have opposite signs at `lower` and `upper`, got 2 and 2'));
+		expect(function () {
+			helpers.findRoot(
+				function () {
+					return -Infinity;
+				},
+				-1,
+				1
+			);
+		}).toThrow(RangeError);
+	});
+
+	it('should throw when the function returns NaN or something other than a number', function () {
+		expect(function () {
+			helpers.findRoot(
+				function () {
+					return '1' as never;
+				},
+				0,
+				1
+			);
+		}).toThrow(new TypeError('findRoot: `fn` must return a number, got string for 0'));
+		expect(function () {
+			helpers.findRoot(
+				function (x) {
+					return x === 1 ? NaN : -1;
+				},
+				0,
+				1
+			);
+		}).toThrow(new RangeError('findRoot: `fn` must not return NaN, got NaN for 1'));
+		expect(function () {
+			helpers.findRoot(
+				function (x) {
+					return x === 0 || x === 1 ? x - 0.5 : NaN;
+				},
+				0,
+				1
+			);
+		}).toThrow(new RangeError('findRoot: `fn` must not return NaN, got NaN for 0.5'));
+	});
+
+	it('should throw on invalid arguments', function () {
+		expect(function () {
+			helpers.findRoot('x' as never, 0, 1);
+		}).toThrow(new TypeError('findRoot: `fn` must be a function, got string'));
+		expect(function () {
+			helpers.findRoot(square, NaN, 1);
+		}).toThrow(new RangeError('findRoot: `lower` must be a finite number, got NaN'));
+		expect(function () {
+			helpers.findRoot(square, 0, Infinity);
+		}).toThrow(new RangeError('findRoot: `upper` must be a finite number, got Infinity'));
+		expect(function () {
+			helpers.findRoot(square, 0, '2' as never);
+		}).toThrow(new TypeError('findRoot: `upper` must be a finite number, got string'));
+		expect(function () {
+			helpers.findRoot(square, 0, 2, { tolerance: -1 });
+		}).toThrow(new RangeError('findRoot: `tolerance` must be a finite number >= 0, got -1'));
+		expect(function () {
+			helpers.findRoot(square, 0, 2, { tolerance: Infinity });
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.findRoot(square, 0, 2, { maxIterations: 0 });
+		}).toThrow(new RangeError('findRoot: `maxIterations` must be an integer >= 1, got 0'));
+		expect(function () {
+			helpers.findRoot(square, 0, 2, { maxIterations: 1.5 });
+		}).toThrow(RangeError);
+	});
+
+	it('should ignore options inherited from a polluted prototype', function () {
+		const prototype = Object.prototype as Record<string, unknown>;
+		prototype.tolerance = 1e6;
+		prototype.maxIterations = 1;
+		try {
+			expect(helpers.findRoot(Math.cos, 0, 3, {})).toBe(Math.PI / 2);
+		} finally {
+			delete prototype.tolerance;
+			delete prototype.maxIterations;
+		}
+	});
+});

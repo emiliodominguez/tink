@@ -1,4 +1,4 @@
-import { assertInteger, assertNumber, describe, draw, readOption, show } from '../utils/assert.js';
+import { assertFunction, assertInteger, assertNumber, describe, draw, readOption, show } from '../utils/assert.js';
 import type { RandomGenerator } from '../utils/index.js';
 
 /**
@@ -155,7 +155,7 @@ export function round(input: number, decimals = 0): number {
 	const scaled = number * scale;
 	if (Math.abs(scaled - Math.floor(scaled) - 0.5) > Math.abs(scaled) * 2 ** -46) return Math.round(scaled) / scale;
 	// Non-finite input, or the number already has at most `decimals` fractional digits: rounding is the identity.
-	if (!Number.isFinite(number) || decimalPlaces(number) <= decimals) return number;
+	if (!Number.isFinite(number) || signedDecimalPlaces(number) <= decimals) return number;
 	// `1 / -0` is `-Infinity`.
 	const negative = 1 / number < 0;
 	const rounded = roundDecimalString(Math.abs(number), decimals);
@@ -163,16 +163,17 @@ export function round(input: number, decimals = 0): number {
 }
 
 /**
- * Rounds a positive finite number half up on its shortest decimal representation (the digits `String` shows), to `decimals` places.
- * The digits are rounded as text and converted once: shifting them into a double first would lose the first dropped digit for
- * values of `2 ** 51` and more once shifted (`3.0000000000000004` to 15 places would round up).
+ * Rounds a positive finite number half up (or half to even) on its shortest decimal representation (the digits `String` shows), to
+ * `decimals` places. The digits are rounded as text and converted once: shifting them into a double first would lose the first dropped
+ * digit for values of `2 ** 51` and more once shifted (`3.0000000000000004` to 15 places would round up).
  * @param {number} value - A positive finite number with more than `decimals` decimal places
  * @param {number} decimals - The integer number of decimal places to keep (may be negative)
+ * @param {boolean} [halfEven=false] - Whether an exact tie goes to the even neighbour instead of up
  * @returns {number} The double nearest to the rounded decimal
  * @example
  * roundDecimalString(3.0000000000000004, 15); // => 3
  */
-function roundDecimalString(value: number, decimals: number): number {
+function roundDecimalString(value: number, decimals: number, halfEven = false): number {
 	const [mantissa, exponent = '0'] = String(value).split('e');
 	const point = mantissa.indexOf('.');
 	const digits = point === -1 ? mantissa : mantissa.slice(0, point) + mantissa.slice(point + 1);
@@ -181,7 +182,11 @@ function roundDecimalString(value: number, decimals: number): number {
 	const keep = integerDigits + decimals;
 	// Every kept digit is beyond the ones of the value, and the first dropped one is a leading zero: it rounds to zero.
 	if (keep < 0) return 0;
-	const kept = BigInt(digits.slice(0, keep) || '0') + (digits.charCodeAt(keep) >= 53 ? 1n : 0n);
+	let up = digits.charCodeAt(keep) >= 53;
+	// An exact tie (a `5` followed by nothing but zeros) goes up only from an odd last kept digit (char codes have the parity of their
+	// digits; with no kept digit, `NaN & 1` is `0`: the kept part is `0`, which is even).
+	if (halfEven && digits.charCodeAt(keep) === 53 && !/[1-9]/.test(digits.slice(keep + 1))) up = (digits.charCodeAt(keep - 1) & 1) === 1;
+	const kept = BigInt(digits.slice(0, keep) || '0') + (up ? 1n : 0n);
 	return Number(`${kept}e${-decimals}`);
 }
 
@@ -1285,11 +1290,11 @@ function interpolateSorted(low: number, high: number, t: number): number {
  * @param {number} value - A finite number
  * @returns {number} The number of digits after the decimal point (`0` for integers written in full, negative for `1e21` and above)
  * @example
- * decimalPlaces(0.25); // => 2
- * decimalPlaces(1e-7); // => 7
- * decimalPlaces(1.5e22); // => -21
+ * signedDecimalPlaces(0.25); // => 2
+ * signedDecimalPlaces(1e-7); // => 7
+ * signedDecimalPlaces(1.5e22); // => -21
  */
-function decimalPlaces(value: number): number {
+function signedDecimalPlaces(value: number): number {
 	const [mantissa, exponent = '0'] = String(value).split('e');
 	return (mantissa.split('.')[1] ?? '').length - Number(exponent);
 }
@@ -1830,8 +1835,8 @@ export function roundToStep(value: number, step: number): number {
 	// Work on the magnitude and restore the sign at the end, exactly like `round` (ties away from zero, `-0` preserved).
 	const negative = 1 / value < 0;
 	const magnitude = Math.abs(value);
-	const stepDecimals = Math.max(0, decimalPlaces(step));
-	const shift = Math.max(decimalPlaces(magnitude), stepDecimals);
+	const stepDecimals = Math.max(0, signedDecimalPlaces(step));
+	const shift = Math.max(signedDecimalPlaces(magnitude), stepDecimals);
 	const scaledValue = shiftDecimal(magnitude, shift);
 	const scaledStep = shiftDecimal(step, shift);
 	// Dividing the decimal-shifted integers avoids binary-fraction artefacts such as 0.35 / 0.1 === 3.4999999999999996. A shift that
@@ -1862,7 +1867,7 @@ export function roundToStep(value: number, step: number): number {
  * The exact integer `value * 10 ** shift`, read from the decimal representation of `value` (`shift` is at least its number of
  * decimal places).
  * @param {number} value - A non-negative finite number
- * @param {number} shift - The power of ten, at least `decimalPlaces(value)`
+ * @param {number} shift - The power of ten, at least `signedDecimalPlaces(value)`
  * @returns {bigint} The shifted value
  * @example
  * scaledInteger(1.25, 3); // => 1250n
@@ -3566,4 +3571,410 @@ export function summarize(numbers: ReadonlyArray<number>): Summary {
 		variance: variance(values),
 		standardDeviation: standardDeviation(values)
 	};
+}
+
+/**
+ * Rounds a number to a given number of decimal places with ties to even (banker's rounding, the rounding of IEEE 754 arithmetic, of
+ * Python's `round` and of `Intl.NumberFormat` with `roundingMode: 'halfEven'`), so that rounding many values does not drift upwards on
+ * average: `2.5` and `1.5` both round to `2`. Like {@link round}, it works on the decimal representation, so values round as written:
+ * `roundHalfEven(2.675, 2) === 2.68` and `roundHalfEven(0.125, 2) === 0.12` are ties (Python gives `2.67` for the first, from the binary
+ * value of `2.675`, slightly below the tie).
+ *
+ * Away from ties it gives the same result as {@link round}. Negative `decimals` round to tens, hundreds, etc. The sign of a zero result is
+ * kept (`roundHalfEven(-0.5)` is `-0`), and non-finite input (`NaN`, `±Infinity`) is returned as-is.
+ * @param {number} input - The number to round (converted with unary `+`)
+ * @param {number} [decimals=0] - The number of decimal places to keep (integer, may be negative)
+ * @returns {number} The rounded number
+ * @throws {RangeError} when `decimals` is not an integer
+ * @throws {TypeError} when `decimals` is not a number
+ * @example
+ * roundHalfEven(2.5); // => 2
+ * roundHalfEven(3.5); // => 4
+ * roundHalfEven(-2.5); // => -2
+ * roundHalfEven(0.125, 2); // => 0.12
+ * roundHalfEven(2.675, 2); // => 2.68 // as written: the double is 2.67499999999999982236431605997495353221893310546875
+ * roundHalfEven(1.2351, 2); // => 1.24 // not a tie
+ * roundHalfEven(250, -2); // => 200
+ */
+export function roundHalfEven(input: number, decimals = 0): number {
+	assertNumber('roundHalfEven', 'decimals', decimals, Number.isInteger(decimals), 'an integer');
+	const number = +input;
+	// The fast path of `round`: away from a tie, `Math.round` agrees with every rounding to nearest.
+	const scale = POWERS_OF_TEN[decimals];
+	const scaled = number * scale;
+	if (Math.abs(scaled - Math.floor(scaled) - 0.5) > Math.abs(scaled) * 2 ** -46) return Math.round(scaled) / scale;
+	if (!Number.isFinite(number) || signedDecimalPlaces(number) <= decimals) return number;
+	const negative = 1 / number < 0;
+	const rounded = roundDecimalString(Math.abs(number), decimals, true);
+	return negative ? -rounded : rounded;
+}
+
+/**
+ * Rounds a number towards zero to a given number of decimal places, dropping the digits after them: {@link floor} for positive numbers
+ * and {@link ceil} for negative ones. Like them, it works on the decimal representation, so values are truncated as written:
+ * `trunc(4.35, 2) === 4.35` (the naive `Math.trunc(4.35 * 100) / 100` gives `4.34`). Negative `decimals` truncate to tens, hundreds, etc.
+ * Without `decimals` it is exactly `Math.trunc`. The sign of a zero result is kept, and non-finite input is returned as-is.
+ * @param {number} number - The number to truncate
+ * @param {number} [decimals=0] - The number of decimal places to keep (integer, may be negative)
+ * @returns {number} The multiple of `10 ** -decimals` nearest to the number between zero and the number
+ * @throws {RangeError} when `decimals` is not an integer
+ * @throws {TypeError} when `decimals` is not a number
+ * @example
+ * trunc(3.99); // => 3
+ * trunc(1.239, 2); // => 1.23
+ * trunc(-1.239, 2); // => -1.23
+ * trunc(4.35, 2); // => 4.35
+ * trunc(-4567, -2); // => -4500
+ */
+export function trunc(number: number, decimals = 0): number {
+	// `1 / -0` is `-Infinity`: `-0` takes the negative side, like the negative numbers, where `ceil` moves towards zero.
+	return decimals === 0 ? Math.trunc(number) : roundDirected('trunc', 1 / +number < 0 ? Math.ceil : Math.floor, number, decimals);
+}
+
+/**
+ * Returns the next representable double after `from` in the direction of `to`, with the semantics of C's `nextafter` and Python's
+ * `math.nextafter`: `to` itself when the two are equal (so `nextAfter(0, -0)` is `-0`), `NaN` when either is `NaN`, the smallest
+ * subnormal of the sign of `to` after a zero, and `±Infinity` after `±Number.MAX_VALUE` (and `±Number.MAX_VALUE` after `±Infinity`).
+ * Use it to step over a boundary exactly (the largest value below a limit), or to widen a range by the smallest possible amount.
+ * @param {number} from - The starting number
+ * @param {number} to - The direction to step in
+ * @returns {number} The double adjacent to `from` towards `to`
+ * @example
+ * nextAfter(1, 2); // => 1.0000000000000002
+ * nextAfter(1, 0); // => 0.9999999999999999
+ * nextAfter(0, -1); // => -5e-324
+ * nextAfter(Number.MAX_VALUE, Infinity); // => Infinity
+ * nextAfter(1, 1); // => 1
+ */
+export function nextAfter(from: number, to: number): number {
+	if (from === to || to !== to) return to;
+	if (from !== from) return from;
+	if (from === 0) return to > 0 ? Number.MIN_VALUE : -Number.MIN_VALUE;
+	const double = new Float64Array([from]);
+	// Doubles of one sign are ordered like their bit patterns (see `nextDown`): the magnitude goes up when stepping away from zero.
+	new BigInt64Array(double.buffer)[0] += to > from === from > 0 ? 1n : -1n;
+	return double[0];
+}
+
+/**
+ * Returns the unit in the last place of a number: the gap between `|x|` and the next larger double (the spacing of the doubles at that
+ * magnitude), with the semantics of Python's `math.ulp`. `ulp(1)` is `Number.EPSILON`; it is `Number.MIN_VALUE` for `0` and the
+ * subnormals, and for `Number.MAX_VALUE` (which has no larger double) the gap below it. `±Infinity` gives `Infinity`, `NaN` gives `NaN`.
+ * Useful for tolerances that scale with the numbers compared, such as "within 4 ulps".
+ * @param {number} x - The number
+ * @returns {number} The spacing of the doubles at `|x|` (always `>= 0`)
+ * @example
+ * ulp(1); // => Number.EPSILON
+ * ulp(-1); // => 2.220446049250313e-16
+ * ulp(1e16); // => 2
+ * ulp(0); // => 5e-324
+ */
+export function ulp(x: number): number {
+	const magnitude = Math.abs(x);
+	if (magnitude === Infinity || magnitude !== magnitude) return magnitude;
+	const next = nextAfter(magnitude, Infinity);
+	// Neighbouring doubles subtract exactly.
+	return next === Infinity ? magnitude - nextAfter(magnitude, 0) : next - magnitude;
+}
+
+/**
+ * Counts the decimal places of a number: the digits after the decimal point in its shortest decimal representation (the one `String`
+ * writes, without the noise of the binary value), such as the precision of a step or of user input. Integers have `0`, including those
+ * that `String` writes in exponential form (`1e21` and above), and the exponential form of small numbers is expanded (`1e-7` has `7`).
+ * `NaN` and `±Infinity` have no decimal places: they give `NaN`.
+ * @param {number} value - The number (converted with unary `+`)
+ * @returns {number} The number of decimal places, an integer from `0` to `1074`, or `NaN` when `value` is not finite
+ * @example
+ * decimalPlaces(1.25); // => 2
+ * decimalPlaces(0.1 + 0.2); // => 17 // 0.30000000000000004
+ * decimalPlaces(100); // => 0
+ * decimalPlaces(1e-7); // => 7
+ * decimalPlaces(Infinity); // => NaN
+ */
+export function decimalPlaces(value: number): number {
+	const number = +value;
+	if (!Number.isFinite(number)) return NaN;
+	return Math.max(0, signedDecimalPlaces(number));
+}
+
+/**
+ * Finds the fraction closest to a number among those with a denominator up to `maxDenominator`: its best rational approximation, by
+ * continued fractions, with the semantics of Python's `Fraction(value).limit_denominator(maxDenominator)`. The number is read as the exact
+ * value of its double, so a value that is exactly a fraction with a small enough denominator gives that fraction (`0.75` is `[3, 4]`), and
+ * decimals that doubles cannot hold exactly come back as written (`0.1` is `[1, 10]`) as long as `maxDenominator` stays well below the
+ * precision of the double (the default, `1_000_000`, does for values up to about a thousand).
+ *
+ * The fraction is in lowest terms, its denominator is positive and its numerator carries the sign (`toFraction(-x)` is `toFraction(x)`
+ * with the numerator negated); `±0` gives `[0, 1]` and an integer `[value, 1]`. The arithmetic is exact (BigInt), and so are both parts.
+ * @param {number} value - The finite number to approximate
+ * @param {number} [maxDenominator=1_000_000] - The largest denominator allowed, a safe integer `>= 1`
+ * @returns {[number, number]} `[numerator, denominator]`
+ * @throws {RangeError} when `value` is not finite, or `maxDenominator` is not a safe integer `>= 1`
+ * @throws {TypeError} when `value` or `maxDenominator` is not a number
+ * @example
+ * toFraction(0.75); // => [3, 4]
+ * toFraction(0.1); // => [1, 10]
+ * toFraction(1 / 3); // => [1, 3]
+ * toFraction(-1.25); // => [-5, 4]
+ * toFraction(Math.PI, 1000); // => [355, 113]
+ * toFraction(0.333, 10); // => [1, 3]
+ * toFraction(Infinity); // throws RangeError
+ */
+export function toFraction(value: number, maxDenominator = 1_000_000): [number, number] {
+	assertNumber('toFraction', 'value', value, Number.isFinite(value), 'a finite number');
+	assertNumber('toFraction', 'maxDenominator', maxDenominator, Number.isSafeInteger(maxDenominator) && maxDenominator >= 1, 'a safe integer >= 1');
+	// The exact value of the double, `mantissa / 2 ** exponent`, in lowest terms (doubling is exact, and stops as soon as the mantissa is
+	// an integer, which is then odd unless the value already was an integer).
+	let mantissa = Math.abs(value);
+	let exponent = 0;
+	for (; !Number.isInteger(mantissa); exponent++) mantissa *= 2;
+	const numerator = BigInt(mantissa);
+	const denominator = 1n << BigInt(exponent);
+	const limit = BigInt(maxDenominator);
+	let fraction = [numerator, denominator];
+	if (denominator > limit) {
+		// The convergents `p1 / q1` of the continued fraction, up to the last one whose denominator fits (Python's algorithm).
+		let p0 = 0n;
+		let q0 = 1n;
+		let p1 = 1n;
+		let q1 = 0n;
+		let n = numerator;
+		let d = denominator;
+		for (;;) {
+			const a = n / d;
+			const q2 = q0 + a * q1;
+			if (q2 > limit) break;
+			[p0, q0, p1, q1] = [p1, q1, p0 + a * p1, q2];
+			[n, d] = [d, n - a * d];
+		}
+		// The best approximation is that convergent or the semiconvergent with the largest denominator that fits, whichever is closer:
+		// they are `1 / (q1 * (q0 + k * q1))` apart, and the convergent is `d / (q1 * denominator)` away from the value (a tie keeps the
+		// convergent).
+		const k = (limit - q0) / q1;
+		fraction = 2n * d * (q0 + k * q1) <= denominator ? [p1, q1] : [p0 + k * p1, q0 + k * q1];
+	}
+	// `BigInt` has no negative zero, so `-0` gives `0`.
+	return [Number(value < 0 ? -fraction[0] : fraction[0]), Number(fraction[1])];
+}
+
+/**
+ * Computes the relative change from one value to another, as a percentage of the first: `(to - from) / |from| * 100`. Dividing by the
+ * magnitude keeps the sign meaningful for negative values (going from `-50` to `-25` is an increase of `50`). When `from` is `0` the
+ * change is undefined and `NaN` is returned (rather than `±Infinity`), like {@link percentage}. The result is the correctly rounded
+ * quotient of `100` times the difference, and it does not overflow when the difference (or `100` times it) does but the change does not.
+ * @param {number} from - The original value
+ * @param {number} to - The new value
+ * @returns {number} The change in percent (negative for a decrease), or `NaN` when `from` is `0`
+ * @example
+ * percentageChange(50, 75); // => 50
+ * percentageChange(80, 60); // => -25
+ * percentageChange(-50, -25); // => 50
+ * percentageChange(3, 4); // => 33.333333333333336
+ * percentageChange(0, 10); // => NaN
+ */
+export function percentageChange(from: number, to: number): number {
+	if (from === 0) return NaN;
+	const magnitude = Math.abs(from);
+	const difference = to - from;
+	if (Number.isFinite(difference)) {
+		const hundredfold = difference * 100;
+		// `100` times the difference, then divided: dividing first would round twice for the ratio alone (`3` to `4` would be
+		// `33.33333333333333`, not the nearest double to 100 / 3).
+		if (Number.isFinite(hundredfold)) return hundredfold / magnitude;
+	}
+	// The difference, or `100` times it, overflowed although both values are finite: work on the values divided by 256 (exactly, for values
+	// that large; a tiny `from` makes the change overflow anyway). A non-finite value makes the change `NaN` or infinite.
+	return Number.isFinite(from) && Number.isFinite(to) ? ((to / 256 - from / 256) * 100) / (magnitude / 256) : difference / magnitude;
+}
+
+/**
+ * Options accepted by {@link findRoot}.
+ */
+export interface FindRootOptions {
+	/**
+	 * The absolute tolerance on the root, a finite number `>= 0`: the search stops once the root is bracketed within `tolerance` (plus
+	 * `4 * Number.EPSILON` times the root, the precision of doubles). `0` finds the root as precisely as doubles allow.
+	 * @default 0
+	 */
+	tolerance?: number;
+	/**
+	 * The largest number of iterations (one call of `fn` each), a positive integer. The default is far more than any search takes: smooth
+	 * functions need 5 to 15 at full precision, and bisection bounds every search to about 260.
+	 * @default 1000
+	 */
+	maxIterations?: number;
+}
+
+/**
+ * The position of a double in the order of the doubles: its bit pattern read as an integer with the sign of the double, so that adjacent
+ * doubles are `1` apart (`-0` and `0` are both `0`). Halving the difference of two positions halves the number of doubles between them:
+ * on a bracket within one binade that is the arithmetic midpoint, across binades it is closer to a geometric mean, so bisecting by
+ * positions reaches adjacent doubles in at most 64 steps whatever the bracket (halving `[0, 1]` arithmetically takes 1075 to reach `0`).
+ * @param {number} value - A finite number
+ * @returns {bigint} Its position
+ * @example
+ * doubleAtPosition((doublePosition(1) + doublePosition(4)) >> 1n); // => 2
+ */
+function doublePosition(value: number): bigint {
+	const pattern = new BigInt64Array(new Float64Array([value]).buffer)[0];
+	// A negative double's pattern, as a signed integer, is `-2 ** 63` plus its magnitude's: map it to minus its magnitude's.
+	return pattern < 0n ? -(pattern + (1n << 63n)) : pattern;
+}
+
+/**
+ * The double at a position of {@link doublePosition}.
+ * @param {bigint} at - A position, between those of two finite doubles
+ * @returns {number} The double
+ */
+function doubleAtPosition(at: bigint): number {
+	const double = new Float64Array(1);
+	new BigInt64Array(double.buffer)[0] = at < 0n ? -at : at;
+	return at < 0n ? -double[0] : double[0];
+}
+
+/** How many iterations of {@link findRoot} may leave the number of doubles in the bracket above half before it is bisected by position. */
+const STALLED_ITERATIONS = 3;
+
+/**
+ * Calls the function of {@link findRoot} and checks its result.
+ * @param {(x: number) => number} fn - The function
+ * @param {number} x - The argument
+ * @returns {number} `fn(x)`
+ * @throws {TypeError} when `fn` returns something other than a number
+ * @throws {RangeError} when `fn` returns `NaN`
+ */
+function evaluateRoot(fn: (x: number) => number, x: number): number {
+	const value: unknown = fn(x);
+	if (typeof value !== 'number') throw new TypeError(`findRoot: \`fn\` must return a number, got ${describe(value)} for ${x}`);
+	if (value !== value) throw new RangeError(`findRoot: \`fn\` must not return NaN, got NaN for ${x}`);
+	return value;
+}
+
+/**
+ * Finds a root of a continuous function (an `x` with `fn(x) === 0`) between two bounds where it has opposite signs, by Brent's method
+ * (as in scipy's `brentq` and netlib's `zeroin`): inverse quadratic interpolation and secant steps, which converge superlinearly on
+ * smooth functions, safeguarded by bisection, so that the bracket keeps shrinking whatever the function (for a discontinuous one, it
+ * finds a point where the sign changes). When the bracket stops halving, it is bisected in the order of the doubles rather than on the
+ * number line, so that whatever the function and the bracket (even `[-Number.MAX_VALUE, Number.MAX_VALUE]` around a root next to `0`), the
+ * search takes at most about 260 iterations. Use it to invert a function that has no inverse formula: an interest rate from payments, a
+ * time from a position on an easing curve, a parameter that hits a target value.
+ *
+ * The result `x` lies in the bracket, and `fn` changes sign (or is `0`) within `tolerance + 4 · Number.EPSILON · |x|` of it (or between it
+ * and an adjacent double): with the default tolerance, a few units in the last place from the root. A bound where `fn` is exactly `0` is
+ * returned as is. Each iteration calls `fn` once; smooth functions typically take 5 to 15. Infinite values of `fn` are fine, `NaN` is not.
+ * @param {(x: number) => number} fn - A function with opposite signs at `lower` and `upper` (continuous, for a root rather than a sign change)
+ * @param {number} lower - One end of the bracket, a finite number
+ * @param {number} upper - The other end, a finite number (the bounds can be given in either order)
+ * @param {FindRootOptions} [options={}] - `tolerance` (default `0`: full precision) and `maxIterations` (default `1000`)
+ * @returns {number} The root
+ * @throws {TypeError} when `fn` is not a function or returns something other than a number, or a bound or option is not a number
+ * @throws {RangeError} when a bound is not finite, `fn` has the same sign at both bounds or returns `NaN`, an option is out of range, or
+ * no root is found within `maxIterations` iterations
+ * @example
+ * findRoot(function (x) { return x * x - 2; }, 0, 2); // => 1.414213562373095 // √2, to the last digit (Math.SQRT2 is the next double)
+ * findRoot(Math.cos, 0, 3); // => Math.PI / 2
+ * const root = findRoot(function (x) { return x ** 3 - x - 1; }, 1, 2, { tolerance: 1e-6 });
+ * Math.abs(root - 1.324717957244746) < 1e-6; // => true
+ * findRoot(function (x) { return x - 3; }, 3, 10); // => 3
+ * findRoot(function (x) { return x * x + 1; }, -1, 1); // throws RangeError
+ */
+export function findRoot(fn: (x: number) => number, lower: number, upper: number, options: FindRootOptions = {}): number {
+	assertFunction('findRoot', 'fn', fn);
+	assertNumber('findRoot', 'lower', lower, Number.isFinite(lower), 'a finite number');
+	assertNumber('findRoot', 'upper', upper, Number.isFinite(upper), 'a finite number');
+	const tolerance = readOption(options, 'tolerance', 0);
+	const maxIterations = readOption(options, 'maxIterations', 1000);
+	assertNumber('findRoot', 'tolerance', tolerance, tolerance >= 0 && tolerance < Infinity, 'a finite number >= 0');
+	assertInteger('findRoot', 'maxIterations', maxIterations, 1);
+	let a = lower;
+	let b = upper;
+	let fa = evaluateRoot(fn, a);
+	if (fa === 0) return a;
+	let fb = evaluateRoot(fn, b);
+	if (fb === 0) return b;
+	if (fa > 0 === fb > 0) throw new RangeError(`findRoot: \`fn\` must have opposite signs at \`lower\` and \`upper\`, got ${fa} and ${fb}`);
+	// Brent's `zeroin`: `b` is the best estimate, `c` the other end of the bracket (`fn` changes sign between `b` and `c`), `a` the
+	// previous `b`; `d` is the last step and `e` the one before, against which interpolation steps must make progress.
+	let c = a;
+	let fc = fa;
+	let d = b - a;
+	let e = d;
+	// The number of doubles in the bracket when it last halved, and the iterations since then (see below).
+	let checkpoint = doublePosition(a) - doublePosition(b);
+	if (checkpoint < 0n) checkpoint = -checkpoint;
+	let stalled = 0;
+	for (let iteration = 0; iteration < maxIterations; iteration++) {
+		if (fb > 0 === fc > 0) {
+			c = a;
+			fc = fa;
+			d = b - a;
+			e = d;
+		}
+		if (Math.abs(fc) < Math.abs(fb)) {
+			a = b;
+			b = c;
+			c = a;
+			fa = fb;
+			fb = fc;
+			fc = fa;
+		}
+		// At least the smallest subnormal, so that a step always moves `b`, even next to a root at `0`.
+		const step = Math.max(2 * Number.EPSILON * Math.abs(b) + tolerance / 2, Number.MIN_VALUE);
+		const width = c - b;
+		// Done once the bracket is within the tolerance (or `b` and `c` are adjacent doubles). The difference of two subnormals is exact,
+		// their half may not be: the test is on the width. Halved first when the width overflows (a bracket wider than `Number.MAX_VALUE`).
+		if (Math.abs(width) <= Math.max(4 * Number.EPSILON * Math.abs(b) + tolerance, Number.MIN_VALUE) || fb === 0) return b;
+		const middle = Number.isFinite(width) ? width / 2 : c / 2 - b / 2;
+		const from = doublePosition(b);
+		const to = doublePosition(c);
+		const span = from < to ? to - from : from - to;
+		if (span <= checkpoint / 2n) {
+			checkpoint = span;
+			stalled = 0;
+		} else {
+			stalled++;
+		}
+		let interpolated = false;
+		// Brent's rule makes interpolation steps shrink, but not the bracket: steps towards a root next to `0`, or creeping up on a root
+		// of high multiplicity, can each halve while the bracket keeps nearly all its doubles (over a thousand halvings, from `1` to
+		// the subnormals). After 3 iterations without halving the number of doubles in the bracket, it is bisected by position.
+		if (stalled < STALLED_ITERATIONS && Math.abs(e) >= step && Math.abs(fa) > Math.abs(fb)) {
+			// Interpolate: a secant step through `a` and `b`, or an inverse quadratic one through `a`, `b` and `c`. (A difference or a
+			// ratio that overflows makes `p` infinite or `NaN`, which fails the test below: the step is then a bisection.)
+			const s = fb / fa;
+			let p: number;
+			let q: number;
+			if (a === c) {
+				p = 2 * middle * s;
+				q = 1 - s;
+			} else {
+				const r = fb / fc;
+				q = fa / fc;
+				p = s * (2 * middle * q * (q - r) - (b - a) * (r - 1));
+				q = (q - 1) * (r - 1) * (s - 1);
+			}
+			if (p > 0) q = -q;
+			else p = -p;
+			// The step must stay well inside the bracket and shrink faster than bisection would over two steps; otherwise bisect.
+			if (2 * p < Math.min(3 * middle * q - Math.abs(step * q), Math.abs(e * q))) {
+				e = d;
+				d = p / q;
+				interpolated = true;
+			}
+		}
+		const previous = b;
+		if (interpolated) {
+			b += Math.abs(d) > step ? d : middle > 0 ? step : -step;
+		} else {
+			// Bisect: on the number line (which finds a root in the middle of a bracket at once), or by position once stalled. The new point
+			// is set directly: adding a step to `b` could round a midpoint next to `0` to `0` itself.
+			b = stalled < STALLED_ITERATIONS ? b + middle : doubleAtPosition((from + to) >> 1n);
+			d = b - previous;
+			e = d;
+		}
+		a = previous;
+		fa = fb;
+		fb = evaluateRoot(fn, b);
+	}
+	throw new RangeError(`findRoot: no root found within ${maxIterations} iterations`);
 }
