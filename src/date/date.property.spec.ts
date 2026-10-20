@@ -573,6 +573,27 @@ describe('Date helpers (properties)', function () {
 			);
 		});
 
+		it('parseDuration reads a decimal amount exactly when it is a whole number of milliseconds', function () {
+			// The unit, the decimal places that keep its milliseconds whole, and the milliseconds per unit of the last place.
+			const units: Array<[helpers.DurationUnit, number, number]> = [
+				['d', 5, 864],
+				['h', 5, 36],
+				['m', 4, 6],
+				['s', 3, 1],
+				['ms', 0, 1]
+			];
+
+			fc.assert(
+				fc.property(fc.constantFrom(...units), fc.integer({ min: 0, max: 1e13 }), fc.boolean(), function ([unit, places, factor], scaled, negative) {
+					// `scaled` units of the last decimal place, written as a decimal (`'1.00100'` for 100100 with 5 places).
+					const digits = String(scaled).padStart(places + 1, '0');
+					const amount = places === 0 ? digits : `${digits.slice(0, -places)}.${digits.slice(-places)}`;
+
+					expect(helpers.parseDuration(`${negative ? '-' : ''}${amount}${unit}`)).toBe((negative ? -1 : 1) * scaled * factor + 0);
+				})
+			);
+		});
+
 		it('formatDuration with restricted units / largest truncates toward zero by less than the dropped part', function () {
 			const unitsArb = fc.subarray(['d', 'h', 'm', 's', 'ms'] as helpers.DurationUnit[], { minLength: 1 });
 

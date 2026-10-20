@@ -267,6 +267,12 @@ const INCLUSIVITIES: ReadonlyArray<string> = ['[]', '()', '[)', '(]'];
 const DURATION_UNIT_MS: Readonly<Record<DurationUnit, number>> = { d: MS_PER_DAY, h: MS_PER_HOUR, m: MS_PER_MINUTE, s: MS_PER_SECOND, ms: 1 };
 
 /**
+ * For each duration unit, the power of ten by which {@link parseDuration} shifts the decimal point of an amount (the rest of the unit's
+ * size is an integer factor: 864 × 10⁵ ms in a day, 36 × 10⁵ in an hour, 6 × 10⁴ in a minute, 10³ in a second).
+ */
+const DURATION_UNIT_EXPONENTS: Readonly<Record<DurationUnit, number>> = { d: 5, h: 5, m: 4, s: 3, ms: 0 };
+
+/**
  * Every duration unit, largest first (also the default `units` of {@link formatDuration}).
  */
 const DURATION_UNITS: ReadonlyArray<DurationUnit> = ['d', 'h', 'm', 's', 'ms'];
@@ -457,9 +463,7 @@ const FORMATTERS: Readonly<Record<string, Formatter>> = {
  * toValidDate(0).toISOString(); // => '1970-01-01T00:00:00.000Z'
  */
 function toValidDate(input: DateInput): Date {
-	if (!isDate(input) && typeof input !== 'number') {
-		throw new TypeError('Expected a Date or a timestamp number');
-	}
+	if (typeof input !== 'number' && !isDate(input)) throw new TypeError('Expected a Date or a timestamp number');
 
 	// The constructor reads the internal time value of a Date, also from another realm or with an overridden `getTime`.
 	const date = new Date(input);
@@ -479,7 +483,20 @@ function toValidDate(input: DateInput): Date {
  * timeOf(new Date(5)); // => 5
  */
 function timeOf(input: DateInput): number {
-	return toValidDate(input).getTime();
+	// A timestamp gets the `TimeClip` of the `Date` constructor (truncated, `-0` as `0`), without allocating a `Date`.
+	if (typeof input === 'number') {
+		if (!(Math.abs(input) <= MAX_TIME)) throw new RangeError('Invalid date');
+
+		return Math.trunc(input) + 0;
+	}
+	if (!isDate(input)) throw new TypeError('Expected a Date or a timestamp number');
+
+	// The internal time value of a Date, also from another realm or with an overridden `getTime`.
+	const time = Date.prototype.getTime.call(input);
+
+	if (Number.isNaN(time)) throw new RangeError('Invalid date');
+
+	return time;
 }
 
 /**
@@ -2070,9 +2087,7 @@ export function getRelativeTime(date: DateInput, baseDate: DateInput = new Date(
 export function eachDayOfInterval(start: DateInput, end: DateInput, options: EachDayOfIntervalOptions = {}): Date[] {
 	assertOptions('eachDayOfInterval', options);
 
-	const { step = 1 } = options;
-
-	return eachUnit('eachDayOfInterval', start, end, 4, step, 0, Infinity);
+	return eachUnit('eachDayOfInterval', start, end, 4, readOption(options, 'step', 1), 0, Infinity);
 }
 
 /**
@@ -2391,7 +2406,8 @@ export function formatDuration(ms: number, options: FormatDurationOptions = {}):
 	assertNumber('formatDuration', 'ms', ms, Number.isFinite(ms), 'a finite number');
 
 	assertOptions('formatDuration', options);
-	const { units = DURATION_UNITS, largest = Infinity } = options;
+	const units = readOption(options, 'units', DURATION_UNITS);
+	const largest = readOption(options, 'largest', Infinity);
 
 	if (!Array.isArray(units)) throw new TypeError(`formatDuration: \`units\` must be an array of duration units, got ${describe(units)}`);
 	if (units.length === 0) throw new RangeError('formatDuration: `units` must not be empty');
@@ -2435,7 +2451,8 @@ export function formatDuration(ms: number, options: FormatDurationOptions = {}):
  * Parses a duration string made of `<number><unit>` tokens (units `d`, `h`, `m`, `s`, `ms`, lowercase; whitespace
  * between and inside tokens is optional; decimals such as `'1.5h'` or `'.5s'` are allowed) into milliseconds, e.g.
  * `'1h 30m'` → `5_400_000`. Tokens may appear in any order and repeated units are summed. A single leading `'-'`
- * negates the whole duration. It is the inverse of {@link formatDuration}'s output.
+ * negates the whole duration. It is the inverse of {@link formatDuration}'s output. Decimals are read as written, not through a
+ * binary fraction: `'1.001s'` is 1001 ms and `'1.1d'` is 95 040 000 ms (multiplying `1.001` by 1000 gives `1000.9999999999999`).
  * @param {string} value - The duration string
  * @returns {number} The duration in milliseconds (may be fractional, e.g. `'0.5ms'`)
  * @throws {TypeError} when `value` is not a string or is not a valid duration (empty, a bare number, an unknown unit…)
@@ -2444,6 +2461,7 @@ export function formatDuration(ms: number, options: FormatDurationOptions = {}):
  * parseDuration('1h 30m'); // => 5_400_000
  * parseDuration('1d 2h 3m 4s 5ms'); // => 93_784_005
  * parseDuration('1.5s'); // => 1_500
+ * parseDuration('1.001s'); // => 1_001
  * parseDuration('-2m'); // => -120_000
  * parseDuration('10'); // throws TypeError (missing unit)
  */
@@ -2453,9 +2471,18 @@ export function parseDuration(value: string): number {
 		throw new TypeError(`parseDuration: \`value\` must be a valid duration, got ${JSON.stringify(value.length > 50 ? `${value.slice(0, 50)}…` : value)}`);
 
 	let total = 0;
+	let match: RegExpExecArray | null;
 
-	for (const [, amount, unit] of value.matchAll(DURATION_TOKEN_REGEX)) {
-		total += Number(amount) * DURATION_UNIT_MS[unit as DurationUnit];
+	// An `exec` loop rather than `matchAll`, which allocates an iterator and copies the regex.
+	DURATION_TOKEN_REGEX.lastIndex = 0;
+	while ((match = DURATION_TOKEN_REGEX.exec(value)) !== null) {
+		const amount = match[1];
+		const size = DURATION_UNIT_MS[match[2] as DurationUnit];
+		const exponent = DURATION_UNIT_EXPONENTS[match[2] as DurationUnit];
+
+		// A decimal point is moved in the text, so the amount is read as written: `Number('1.001e3')` is 1001, whereas `1.001 * 1000` is
+		// `1000.9999999999999` (exact whenever the milliseconds are whole, the rest of the unit being an integer factor).
+		total += amount.includes('.') ? Number(`${amount}e${exponent}`) * (size / 10 ** exponent) : Number(amount) * size;
 	}
 
 	if (!Number.isFinite(total)) throw new RangeError('parseDuration: the duration is too large to be represented');
@@ -2661,7 +2688,7 @@ export function toISOStringLocal(date: DateInput, options: ToISOStringLocalOptio
 	const offset = Math.round(offsetMs / MS_PER_MINUTE);
 	const minutes = Math.abs(offset);
 	const suffix = offset === 0 ? 'Z' : `${offset < 0 ? '-' : '+'}${pad(Math.floor(minutes / 60), 2)}:${pad(minutes % 60, 2)}`;
-	const withMilliseconds = options.milliseconds !== false;
+	const withMilliseconds = readOption(options, 'milliseconds') !== false;
 
 	// An offset with seconds cannot be written: show the instant at the rounded offset instead of the wall clock.
 	if (offsetMs !== offset * MS_PER_MINUTE) {

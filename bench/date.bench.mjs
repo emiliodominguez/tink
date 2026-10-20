@@ -5,9 +5,11 @@ import {
 	addDuration,
 	addMonths,
 	addYears,
+	compareAsc,
 	diffInBusinessDays,
 	diffInCalendarMonths,
 	diffInDays,
+	diffInHours,
 	diffInMonths,
 	diffInWeeks,
 	diffInYears,
@@ -25,12 +27,14 @@ import {
 	getZonedParts,
 	intervalsOverlap,
 	intervalToDuration,
+	isBefore,
 	isCronMatch,
 	isSameDay,
 	isSameQuarter,
 	isSameWeek,
 	isTomorrow,
 	isValidDate,
+	minDate,
 	nextCronDate,
 	nextWeekday,
 	parseCron,
@@ -305,6 +309,46 @@ export default [
 			return dateFns.isSameDay(date, other) ? 1 : 0;
 		}
 	),
+	dateCase(
+		'isBefore (100 pairs)',
+		function (date, _, other) {
+			return isBefore(date, other) ? 1 : 0;
+		},
+		function (date, _, other) {
+			return dateFns.isBefore(date, other) ? 1 : 0;
+		}
+	),
+	dateCase(
+		'diffInHours (100 pairs)',
+		function (date, _, other) {
+			return diffInHours(date, other);
+		},
+		function (date, _, other) {
+			return dateFns.differenceInHours(date, other);
+		}
+	),
+	{
+		name: 'sort(compareAsc) (100 dates)',
+		fn: function () {
+			return dates.slice().sort(compareAsc).length;
+		},
+		competitors: {
+			'date-fns': function () {
+				return dates.slice().sort(dateFns.compareAsc).length;
+			}
+		}
+	},
+	{
+		name: 'minDate (100 dates)',
+		fn: function () {
+			return minDate(dates).getTime();
+		},
+		competitors: {
+			'date-fns min': function () {
+				return dateFns.min(dates).getTime();
+			}
+		}
+	},
 	dateCase(
 		'getISOWeek (100)',
 		function (date) {

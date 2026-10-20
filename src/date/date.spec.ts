@@ -1453,6 +1453,17 @@ describe('Date helpers', function () {
 			expect(helpers.parseDuration('0.125m 1.5s')).toBe(9_000);
 		});
 
+		it('reads decimal amounts as written, not through a binary fraction', function () {
+			// Multiplying the parsed number by the unit gives 1000.9999999999999, 95040000.00000001 and 864.0000000000001.
+			expect(helpers.parseDuration('1.001s')).toBe(1_001);
+			expect(helpers.parseDuration('1.1d')).toBe(95_040_000);
+			expect(helpers.parseDuration('0.07s')).toBe(70);
+			expect(helpers.parseDuration('-1.001s 0.3h')).toBe(-1_081_001);
+			expect(helpers.parseDuration('0.0001m')).toBe(6);
+			expect(helpers.parseDuration('0.00001d')).toBe(864);
+			expect(helpers.parseDuration('0.25ms')).toBe(0.25);
+		});
+
 		it('does not coerce non-strings, even those whose string form is valid', function () {
 			expect(function () {
 				helpers.parseDuration({
@@ -3307,6 +3318,21 @@ describe('Date helpers under prototype pollution', function () {
 		});
 		polluted('days', 5, function () {
 			expect(helpers.addDuration(0, {}).getTime()).toBe(0);
+		});
+	});
+
+	it('eachDayOfInterval, formatDuration and toISOStringLocal ignore inherited options', function () {
+		polluted('step', 3, function () {
+			expect(helpers.eachDayOfInterval(new Date(2024, 0, 1), new Date(2024, 0, 10))).toHaveLength(10);
+		});
+		polluted('largest', 1, function () {
+			expect(helpers.formatDuration(93_784_005)).toBe('1d 2h 3m 4s 5ms');
+		});
+		polluted('units', ['h'], function () {
+			expect(helpers.formatDuration(93_784_005)).toBe('1d 2h 3m 4s 5ms');
+		});
+		polluted('milliseconds', false, function () {
+			expect(helpers.toISOStringLocal(new Date(2024, 0, 1, 1, 2, 3, 4))).toMatch(/^2024-01-01T01:02:03\.004/);
 		});
 	});
 
