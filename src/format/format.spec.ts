@@ -746,6 +746,34 @@ describe('Format helpers (hostile inputs)', function () {
 		expect(helpers.formatNumber(1.25, { minimumIntegerDigits: 1 })).toBe('1.25');
 	});
 
+	it('ignores the locale, display, decimals, list type and style, and suffixes inherited from a polluted Object.prototype', function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		const planted = { locale: 'de-DE', display: 'long', decimals: 5, type: 'disjunction', style: 'narrow', suffixes: { other: '<b>' }, one: '<i>' };
+		Object.assign(proto, planted);
+		try {
+			expect(helpers.formatNumber(1234.5)).toBe('1,234.5');
+			expect(helpers.formatNumber(1234.5, {})).toBe('1,234.5');
+			expect(helpers.formatCurrency(1, 'USD')).toBe('$1.00');
+			expect(helpers.formatPercent(0.5)).toBe('50%');
+			expect(helpers.formatCompact(1234)).toBe('1.2K');
+			expect(helpers.formatUnit(5, 'meter')).toBe('5 m');
+			expect(helpers.formatList(['a', 'b', 'c'])).toBe('a, b, and c');
+			expect(helpers.formatDateTime(0, { dateStyle: 'medium' })).toBe('Jan 1, 1970');
+			expect(helpers.formatRelativeTime(1, 'day')).toBe('in 1 day');
+			expect(helpers.pluralRule(1)).toBe('one');
+			expect(helpers.formatOrdinal(3)).toBe('3rd');
+			// A category missing from a suffix table falls back to its `other` suffix, not to a planted one.
+			expect(helpers.formatOrdinal(1, { locale: 'fr-FR' })).toBe('1.');
+			expect(helpers.formatOrdinal(1, { locale: 'fr-FR', suffixes: { other: 'e' } })).toBe('1e');
+			expect(helpers.formatOrdinal(1, { locale: 'fr-FR', suffixes: { one: 'er', other: 'e' } })).toBe('1er');
+			// Own options still apply.
+			expect(helpers.formatNumber(1234.5, { locale: 'de-DE' })).toBe('1.234,5');
+			expect(helpers.formatCurrency(1, 'USD', { display: 'code' })).toBe('USD 1.00');
+		} finally {
+			for (const key of Object.keys(planted)) delete proto[key];
+		}
+	});
+
 	it('formats the time value of a Date whose getTime is overridden', function () {
 		class Lying extends Date {
 			override getTime(): number {

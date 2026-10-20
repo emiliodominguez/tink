@@ -10,6 +10,8 @@
  *   `RangeError` raised by `Intl`.
  * - **Deterministic default time zone.** {@link formatDateTime} formats in `'UTC'` unless you pass `timeZone` (the `date` module, in
  *   contrast, works in local time).
+ * - **Own options.** An option inherited from a polluted `Object.prototype` (`locale`, `display`, `suffixes`, an `Intl` option…) is
+ *   ignored, so that it cannot change what every call formats.
  * - **Cached formatters.** Constructing an `Intl` formatter is far more expensive than calling `format` on it, so formatters are cached
  *   per `(kind, locales, options)` in a small least-recently-used cache (50 entries) shared by the whole module. Formatters are
  *   immutable, so a cached one always produces exactly what a freshly constructed one would. (Options whose value is an object, and
@@ -461,9 +463,9 @@ function assertString(name: string, label: string, value: unknown): asserts valu
  */
 export function formatNumber(value: number | bigint, options: FormatNumberOptions = {}): string {
 	assertNumeric('formatNumber', value);
-	const { locale, ...rest } = options;
+	const { locale: _locale, ...rest } = options;
 
-	return getFormatter('number', Intl.NumberFormat, locale, rest, NUMBER_MEMO).format(value);
+	return getFormatter('number', Intl.NumberFormat, readOption(options, 'locale'), rest, NUMBER_MEMO).format(value);
 }
 
 /**
@@ -490,9 +492,15 @@ export function formatNumber(value: number | bigint, options: FormatNumberOption
 export function formatCurrency(value: number | bigint, currency: string, options: FormatCurrencyOptions = {}): string {
 	assertNumeric('formatCurrency', value);
 	assertString('formatCurrency', 'currency', currency);
-	const { locale, display = 'symbol', ...rest } = options;
+	const { locale: _locale, display: _display, ...rest } = options;
 
-	return getFormatter('number', Intl.NumberFormat, locale, { ...rest, style: 'currency', currency, currencyDisplay: display }, CURRENCY_MEMO).format(value);
+	return getFormatter(
+		'number',
+		Intl.NumberFormat,
+		readOption(options, 'locale'),
+		{ ...rest, style: 'currency', currency, currencyDisplay: readOption(options, 'display', 'symbol') },
+		CURRENCY_MEMO
+	).format(value);
 }
 
 /**
@@ -512,7 +520,8 @@ export function formatCurrency(value: number | bigint, currency: string, options
  */
 export function formatPercent(value: number, options: FormatPercentOptions = {}): string {
 	assertFiniteNumber('formatPercent', value);
-	const { locale, decimals, ...rest } = options;
+	const { locale: _locale, decimals: _decimals, ...rest } = options;
+	const decimals = readOption(options, 'decimals');
 
 	if (decimals !== undefined) {
 		if (typeof decimals !== 'number') throw new TypeError(`formatPercent: \`decimals\` must be a number, got ${describe(decimals)}`);
@@ -524,7 +533,7 @@ export function formatPercent(value: number, options: FormatPercentOptions = {})
 		rest.maximumFractionDigits = decimals;
 	}
 
-	return getFormatter('number', Intl.NumberFormat, locale, { ...rest, style: 'percent' }, PERCENT_MEMO).format(value);
+	return getFormatter('number', Intl.NumberFormat, readOption(options, 'locale'), { ...rest, style: 'percent' }, PERCENT_MEMO).format(value);
 }
 
 /**
@@ -544,9 +553,10 @@ export function formatPercent(value: number, options: FormatPercentOptions = {})
  */
 export function formatCompact(value: number | bigint, options: FormatCompactOptions = {}): string {
 	assertNumeric('formatCompact', value);
-	const { locale, display = 'short', ...rest } = options;
+	const { locale: _locale, display: _display, ...rest } = options;
+	const compactDisplay = readOption(options, 'display', 'short');
 
-	return getFormatter('number', Intl.NumberFormat, locale, { ...rest, notation: 'compact', compactDisplay: display }, COMPACT_MEMO).format(value);
+	return getFormatter('number', Intl.NumberFormat, readOption(options, 'locale'), { ...rest, notation: 'compact', compactDisplay }, COMPACT_MEMO).format(value);
 }
 
 /**
@@ -569,9 +579,10 @@ export function formatCompact(value: number | bigint, options: FormatCompactOpti
 export function formatUnit(value: number | bigint, unit: string, options: FormatUnitOptions = {}): string {
 	assertNumeric('formatUnit', value);
 	assertString('formatUnit', 'unit', unit);
-	const { locale, display = 'short', ...rest } = options;
+	const { locale: _locale, display: _display, ...rest } = options;
+	const unitDisplay = readOption(options, 'display', 'short');
 
-	return getFormatter('number', Intl.NumberFormat, locale, { ...rest, style: 'unit', unit, unitDisplay: display }, UNIT_MEMO).format(value);
+	return getFormatter('number', Intl.NumberFormat, readOption(options, 'locale'), { ...rest, style: 'unit', unit, unitDisplay }, UNIT_MEMO).format(value);
 }
 
 /**
@@ -599,9 +610,10 @@ export function formatList(items: Iterable<string> & { readonly charAt?: never }
 		if (typeof item !== 'string') throw new TypeError(`formatList: every item must be a string, got ${describe(item)}`);
 	}
 
-	const { locale, type = 'conjunction', style = 'long' } = options;
+	const type = readOption(options, 'type', 'conjunction');
+	const style = readOption(options, 'style', 'long');
 
-	return getFormatter('list', Intl.ListFormat, locale, { type, style }, LIST_MEMO).format(list);
+	return getFormatter('list', Intl.ListFormat, readOption(options, 'locale'), { type, style }, LIST_MEMO).format(list);
 }
 
 /**
@@ -633,12 +645,12 @@ export function formatDateTime(date: DateInput, options: FormatDateTimeOptions =
 	// The range of `Date` (8.64e15 ms on each side of the epoch), checked without constructing one; `NaN` fails the comparison.
 	if (!(Math.abs(time) <= 8.64e15)) throw new RangeError('formatDateTime: `date` must be a valid date, got Invalid Date');
 
-	const { locale, ...rest } = options;
+	const { locale: _locale, ...rest } = options;
 
 	// An own `timeZone` only (an inherited one is ignored, like every other inherited option).
 	if (!Object.hasOwn(rest, 'timeZone') || rest.timeZone === undefined) rest.timeZone = 'UTC';
 
-	return getFormatter('date', Intl.DateTimeFormat, locale, rest, DATE_MEMO).format(time);
+	return getFormatter('date', Intl.DateTimeFormat, readOption(options, 'locale'), rest, DATE_MEMO).format(time);
 }
 
 /**
@@ -662,9 +674,9 @@ export function formatDateTime(date: DateInput, options: FormatDateTimeOptions =
 export function formatRelativeTime(value: number, unit: Intl.RelativeTimeFormatUnit, options: FormatRelativeTimeOptions = {}): string {
 	assertFiniteNumber('formatRelativeTime', value);
 	assertString('formatRelativeTime', 'unit', unit);
-	const { locale, ...rest } = options;
+	const { locale: _locale, ...rest } = options;
 
-	return getFormatter('relative', Intl.RelativeTimeFormat, locale, rest, RELATIVE_MEMO).format(value, unit);
+	return getFormatter('relative', Intl.RelativeTimeFormat, readOption(options, 'locale'), rest, RELATIVE_MEMO).format(value, unit);
 }
 
 /**
@@ -693,12 +705,14 @@ export function formatOrdinal(n: number, options: FormatOrdinalOptions = {}): st
 	assertFiniteNumber('formatOrdinal', n, 'n');
 	if (!Number.isInteger(n)) throw new RangeError(`formatOrdinal: \`n\` must be an integer, got ${n}`);
 
-	const { locale, suffixes } = options;
+	const locale = readOption(options, 'locale');
 	const value = n === 0 ? 0 : n;
 	const rules = getFormatter('plural', Intl.PluralRules, locale, { type: 'ordinal' }, ORDINAL_MEMO);
-	const table = suffixes ?? (resolvedLanguage(rules) === 'en' ? ENGLISH_ORDINAL_SUFFIXES : GENERIC_ORDINAL_SUFFIXES);
+	const table = readOption(options, 'suffixes') ?? (resolvedLanguage(rules) === 'en' ? ENGLISH_ORDINAL_SUFFIXES : GENERIC_ORDINAL_SUFFIXES);
 
-	return `${formatNumber(value, { locale })}${table[rules.select(pluralSubject(value))] ?? table.other}`;
+	// The suffix tables are read like options: a category missing from one (`one` in `{ other: '.' }`) falls back to `other`, never to a
+	// suffix planted on a polluted `Object.prototype`.
+	return `${formatNumber(value, { locale })}${readOption(table, rules.select(pluralSubject(value))) ?? readOption(table, 'other')}`;
 }
 
 /**
@@ -737,9 +751,9 @@ function pluralSubject(value: number): number {
  */
 export function pluralRule(count: number, options: PluralRuleOptions = {}): Intl.LDMLPluralRule {
 	assertFiniteNumber('pluralRule', count, 'count');
-	const { locale, ...rest } = options;
+	const { locale: _locale, ...rest } = options;
 
-	return getFormatter('plural', Intl.PluralRules, locale, rest, PLURAL_MEMO).select(pluralSubject(count));
+	return getFormatter('plural', Intl.PluralRules, readOption(options, 'locale'), rest, PLURAL_MEMO).select(pluralSubject(count));
 }
 
 /** The kinds of {@link Affix}, as bits (each kind may appear once around a number): a sign. */
