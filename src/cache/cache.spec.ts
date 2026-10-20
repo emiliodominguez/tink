@@ -153,6 +153,45 @@ describe('createLRUCache', function () {
 				delete proto.updateAgeOnGet;
 			}
 		});
+
+		it('rejects a non-boolean updateAgeOnGet', function () {
+			for (const updateAgeOnGet of ['false', 1, null]) {
+				expect(function () {
+					createLRUCache({ max: 1, updateAgeOnGet: updateAgeOnGet as never });
+				}).toThrow(new TypeError(`createLRUCache: \`updateAgeOnGet\` must be a boolean, got ${updateAgeOnGet === null ? 'null' : typeof updateAgeOnGet}`));
+			}
+		});
+
+		it('builds the shared getters when Object.prototype holds a value, writable or set', function () {
+			const proto = Object.prototype as Record<string, unknown>;
+			const planted = jest.fn();
+			let fresh: typeof import('./index.js') | undefined;
+			// A fresh copy of the module, whose prototypes are created on first use (loaded before the pollution, which the loader
+			// itself would not survive).
+			jest.isolateModules(function () {
+				fresh = jest.requireActual<typeof import('./index.js')>('./index');
+			});
+			const module = fresh as typeof import('./index.js');
+			proto.value = 1;
+			proto.writable = true;
+			proto.set = planted;
+			try {
+				const cache = module.createLRUCache<string, number>({ max: 2 });
+				cache.set('a', 1);
+				expect([cache.size, cache.totalSize]).toEqual([1, 1]);
+				for (const structure of [cache, module.createDeque(), module.createRingBuffer(1), module.createBiMap(), module.createMultiMap()]) {
+					expect(function () {
+						(structure as { size: number }).size = 5;
+					}).toThrow(TypeError);
+					expect(structure.size).not.toBe(5);
+				}
+				expect(planted).not.toHaveBeenCalled();
+			} finally {
+				delete proto.value;
+				delete proto.writable;
+				delete proto.set;
+			}
+		});
 	});
 
 	describe('basic operations', function () {
@@ -614,8 +653,9 @@ describe('createLRUCache', function () {
 	});
 
 	describe('clock reads', function () {
-		it('rejects a clock returning NaN, a string or a bigint, without changing the cache', function () {
-			for (const bad of [NaN, '1000', 5n]) {
+		it('rejects a clock returning NaN, ±Infinity, a string or a bigint, without changing the cache', function () {
+			// An infinite time would store entries that never expire (Infinity + ttl) or have expired from the start (-Infinity + ttl).
+			for (const bad of [NaN, Infinity, -Infinity, '1000', 5n]) {
 				const evicted: unknown[] = [];
 				let time: unknown = 0;
 				const cache = createLRUCache<string, string>({
@@ -631,9 +671,7 @@ describe('createLRUCache', function () {
 				time = bad;
 				expect(function () {
 					cache.set('a', 'new', { ttl: 1000 });
-				}).toThrow(
-					new TypeError(`createLRUCache: \`now()\` must return a number, got ${typeof bad === 'string' ? 'string' : typeof bad === 'bigint' ? 'bigint' : 'NaN'}`)
-				);
+				}).toThrow(new TypeError(`createLRUCache: \`now()\` must return a finite number, got ${typeof bad === 'number' ? bad : typeof bad}`));
 				expect(function () {
 					cache.get('a');
 				}).toThrow(TypeError);
@@ -788,6 +826,32 @@ describe('LRUCache size budget and remaining TTL', function () {
 		// Growing or shrinking an entry: 0.01 - 0.1 rounds, the total must not.
 		mixed.set('d', 0.1).set('d', 0.01);
 		expect(mixed.totalSize).toBe(0.01);
+	});
+
+	it('enforces maxSize and keeps the total right when the sizes add up beyond Number.MAX_VALUE', function () {
+		const { events, onEvict } = recorder<string, number>();
+		function identity(size: number): number {
+			return size;
+		}
+		// 2e308 does not fit Number.MAX_VALUE: 'a' goes, and 'b', which fits on its own, stays.
+		const cache = createLRUCache<string, number>({ max: Infinity, maxSize: Number.MAX_VALUE, sizeOf: identity, onEvict });
+		cache.set('a', 1e308).set('b', 1e308);
+		expect([[...cache], cache.totalSize, events]).toEqual([[['b', 1e308]], 1e308, [['a', 1e308, 'capacity']]]);
+		cache.set('c', 5);
+		expect(cache.totalSize).toBe(1e308 + 5);
+		cache.set('b', 1);
+		expect([cache.size, cache.totalSize]).toEqual([2, 6]);
+
+		// Without a bound, the total is Infinity while the sizes add up beyond Number.MAX_VALUE, and comes back after.
+		const unbounded = createLRUCache<string, number>({ max: Infinity, sizeOf: identity });
+		unbounded.set('a', 1e308).set('b', 1e308).set('c', 1e308).set('d', 2);
+		expect([unbounded.size, unbounded.totalSize]).toEqual([4, Infinity]);
+		unbounded.delete('a');
+		expect(unbounded.totalSize).toBe(Infinity);
+		unbounded.set('b', 3);
+		expect(unbounded.totalSize).toBe(1e308 + 5);
+		unbounded.delete('c');
+		expect(unbounded.totalSize).toBe(5);
 	});
 
 	it('reports every eviction even when onEvict throws', function () {
@@ -1235,6 +1299,28 @@ describe('LRUCache.getOrSet', function () {
 		expect(cache.getOrSet('k', factory)).toBe(2);
 		clock.advance(100);
 		expect(cache.peek('k')).toBeUndefined();
+	});
+
+	it('reads the TTL option once', function () {
+		const clock = fakeClock();
+		const cache = createLRUCache<string, number>({ max: 2, now: clock.now });
+		let reads = 0;
+		// A getter returning a valid TTL, then an invalid one: the validated TTL is the one used.
+		const options = {
+			get ttl(): number {
+				return ++reads === 1 ? 10 : 0;
+			}
+		};
+		expect(
+			cache.getOrSet(
+				'k',
+				function () {
+					return 1;
+				},
+				options
+			)
+		).toBe(1);
+		expect([reads, cache.getRemainingTTL('k')]).toEqual([1, 10]);
 	});
 
 	it('stores nothing when the factory throws, and validates before calling it', function () {
@@ -2004,6 +2090,12 @@ describe('createMultiMap', function () {
 			expect(map.add('a', 1)).toBe(true);
 		} finally {
 			delete proto.unique;
+		}
+		// A truthy non-boolean (a 'false' read from a configuration file) does not turn `unique` on.
+		for (const unique of ['false', 1, null]) {
+			expect(function () {
+				createMultiMap(null, { unique: unique as never });
+			}).toThrow(new TypeError(`createMultiMap: \`options.unique\` must be a boolean, got ${unique === null ? 'null' : typeof unique}`));
 		}
 		const map = createMultiMap();
 		expect(inheritedGetter(map, 'size')).toBe(inheritedGetter(createDeque(), 'size'));

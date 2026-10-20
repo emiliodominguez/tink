@@ -37,12 +37,12 @@ export interface LRUCacheOptions<K, V> {
 	/**
 	 * Clock used for expiry, in milliseconds. Defaults to `Date.now`. Inject a fake clock for deterministic tests. Expiry instants are
 	 * absolute (`setTime + ttl`), so a clock that jumps backwards extends the lifetime of the entries stored before the jump. It must
-	 * return a number other than `NaN` (or the operation reading it throws a `TypeError`, changing nothing) and must not use the cache.
+	 * return a finite number (or the operation reading it throws a `TypeError`, changing nothing) and must not use the cache.
 	 */
 	now?: () => number;
 	/** Called after an entry has been removed (the cache is already in its new state, so the callback may use it). */
 	onEvict?: (key: K, value: V, reason: LRUEvictionReason) => void;
-	/** When `true`, a successful `get` restarts the entry's TTL (sliding expiry). `peek`/`has` never do. Defaults to `false`. */
+	/** When `true`, a successful `get` restarts the entry's TTL (sliding expiry). `peek`/`has` never do. A boolean; defaults to `false`. */
 	updateAgeOnGet?: boolean;
 }
 
@@ -67,8 +67,9 @@ export interface LRUCache<K, V> extends Iterable<[K, V]> {
 	 */
 	readonly size: number;
 	/**
-	 * Total size of the stored entries, as measured by `sizeOf` (the number of entries without it). Never exceeds `maxSize`. It is the
-	 * sum of the current sizes rounded once, so fractional sizes do not drift as entries come and go (an emptied cache totals `0`).
+	 * Total size of the stored entries, as measured by `sizeOf` (the number of entries without it). Never exceeds `maxSize`. It is kept
+	 * as a compensated sum (about twice the precision of a plain running total), so fractional sizes do not drift as entries come and
+	 * go (an emptied cache totals `0`); `Infinity` while the sizes add up beyond `Number.MAX_VALUE`.
 	 */
 	readonly totalSize: number;
 	/** Returns the value of a live entry and marks it most-recently used (restarting its TTL with `updateAgeOnGet`); `undefined` otherwise. */
@@ -149,7 +150,9 @@ function getSize(this: { [SIZE](): number }): number {
  */
 function withGetters(getters: Record<string, () => unknown>): object {
 	const prototype = {};
-	for (const name of Object.keys(getters)) Object.defineProperty(prototype, name, { get: getters[name], configurable: true });
+	// Descriptors without a prototype: a `value`, `writable` or `set` planted on `Object.prototype` would make `defineProperty` throw (an
+	// accessor with a value), or install a setter.
+	for (const name of Object.keys(getters)) Object.defineProperty(prototype, name, { __proto__: null, get: getters[name], configurable: true } as PropertyDescriptor);
 	return prototype;
 }
 
@@ -248,7 +251,8 @@ function assertTTL(caller: string, ttl: number): void {
  * @param {LRUCacheOptions<K, V>} options - `max` (required), and optional `maxSize`, `sizeOf`, `ttl`, `now`, `onEvict`, `updateAgeOnGet`
  * @returns {LRUCache<K, V>} A new, empty cache
  * @throws {TypeError} when `options` is not an object, `now`/`onEvict`/`sizeOf` is provided but not a function, `max`/`maxSize`/`ttl`
- * is not a number, (from `getOrSet`) `factory` is not a function, or (from `set`/`getOrSet`) `sizeOf` does not return a number
+ * is not a number, `updateAgeOnGet` is not a boolean, (from `getOrSet`) `factory` is not a function, or (from `set`/`getOrSet`)
+ * `sizeOf` does not return a number
  * @throws {RangeError} when `max` is not an integer `>= 1` (or `Infinity`), `maxSize` is not a number `> 0`, `ttl` (here, in `set` or in
  * `getOrSet`) is not a number `> 0`, or (from `set`/`getOrSet`) `sizeOf` returns a negative, infinite or `NaN` size
  * @throws {AggregateError} from `clear`/`prune` when several `onEvict` calls threw
@@ -305,6 +309,8 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	const now = readOption(options, 'now', Date.now);
 	const onEvict = readOption(options, 'onEvict');
 	const updateAgeOnGet = readOption(options, 'updateAgeOnGet', false);
+	// Checked: a truthy string such as 'false' (from a configuration file) must not turn sliding expiry on.
+	if (typeof updateAgeOnGet !== 'boolean') throw new TypeError(`createLRUCache: \`updateAgeOnGet\` must be a boolean, got ${describe(updateAgeOnGet)}`);
 
 	assertInteger('createLRUCache', 'max', max, 1, true);
 	assertNumber('createLRUCache', 'maxSize', maxSize, maxSize > 0, 'a number > 0 or Infinity');
@@ -335,14 +341,17 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	}
 
 	/**
-	 * Reads the clock and checks the result: a `NaN`, string or bigint time would make expiry instants that every check reads differently.
+	 * Reads the clock and checks the result: a `NaN`, string or bigint time would make expiry instants that every check reads differently,
+	 * and an infinite one entries that never expire (`Infinity + ttl`) or are expired from the start (`-Infinity + ttl`).
 	 * @returns {number} The current time
-	 * @throws {TypeError} when `now()` does not return a number other than `NaN`
+	 * @throws {TypeError} when `now()` does not return a finite number
 	 */
 	function readNow(): number {
 		const time = now();
 
-		if (typeof time !== 'number' || time !== time) throw new TypeError(`createLRUCache: \`now()\` must return a number, got ${time !== time ? 'NaN' : describe(time)}`);
+		// `time - time` is `0` for finite numbers only (`NaN` for `NaN` and ±Infinity).
+		if (typeof time !== 'number' || time - time !== 0)
+			throw new TypeError(`createLRUCache: \`now()\` must return a finite number, got ${typeof time === 'number' ? time : describe(time)}`);
 
 		return time;
 	}
@@ -418,6 +427,22 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	}
 
 	/**
+	 * Recomputes the total from the entries once it has gone past `Number.MAX_VALUE` (sizes near it: `Infinity - size` stays `Infinity`,
+	 * and the residue becomes `NaN`), so that it comes back as soon as the sizes fit again; it stays `Infinity` until then. Called where
+	 * the total is read, never on the way to a decision that does not depend on it.
+	 * @returns {void}
+	 */
+	function recount(): void {
+		if (total + residue < Infinity) return;
+		total = residue = 0;
+		for (let entry = oldest; entry !== undefined; entry = entry.newer) account(entry.size);
+		if (!(total + residue < Infinity)) {
+			total = Infinity;
+			residue = 0;
+		}
+	}
+
+	/**
 	 * Removes an entry from the map and the list.
 	 * @param {Entry<K, V>} entry - The entry
 	 * @returns {void}
@@ -435,7 +460,11 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	 * @returns {boolean} `true` when least-recently-used entries must go
 	 */
 	function overflows(): boolean {
-		return store.size > max || total + residue > maxSize;
+		if (store.size > max) return true;
+		if (total + residue <= maxSize) return false;
+		// Over `maxSize`, or beyond `Number.MAX_VALUE` (`NaN` included): recounted first, only then.
+		recount();
+		return total + residue > maxSize;
 	}
 
 	/**
@@ -566,13 +595,14 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 			getOrSet(key: K, factory: (key: K) => V, setOptions?: LRUCacheSetOptions): V {
 				assertFunction('LRUCache.getOrSet', 'factory', factory);
 				// Validated before `factory` runs, so that its result is never computed for nothing.
-				readTTL('LRUCache.getOrSet', setOptions);
+				const ttl = readTTL('LRUCache.getOrSet', setOptions);
 
 				const entry = touch(key);
 				if (entry !== undefined) return entry.value;
 
 				const value = factory(key);
-				cache.set(key, value, setOptions);
+				// With the TTL read above: the options are read once (a getter could return another TTL the second time).
+				cache.set(key, value, setOptions == null ? setOptions : { ttl });
 
 				return value;
 			},
@@ -708,6 +738,7 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 		}
 	);
 	(cache as unknown as Record<symbol, unknown>)[TOTAL_SIZE] = function (): number {
+		recount();
 		return total + residue;
 	};
 
@@ -1745,7 +1776,7 @@ function pairOf<K, V>(key: K, value: V): [K, V] {
  * @param {Iterable<readonly [K, V]> | null} [entries] - Initial `[key, value]` pairs, added in order
  * @param {MultiMapOptions} [options={}] - `unique` (default `false`)
  * @returns {MultiMap<K, V>} A new multimap
- * @throws {TypeError} when `entries` is neither iterable nor `null`/`undefined`
+ * @throws {TypeError} when `entries` is neither iterable nor `null`/`undefined`, or `unique` is not a boolean
  * @example
  * const tags = createMultiMap<string, string>();
  * tags.add('post-1', 'js');
@@ -1766,6 +1797,7 @@ function pairOf<K, V>(key: K, value: V): [K, V] {
 export function createMultiMap<K, V>(entries?: Iterable<readonly [K, V]> | null, options: MultiMapOptions = {}): MultiMap<K, V> {
 	const pairs = readEntries('createMultiMap', entries);
 	const unique = readOption(options, 'unique', false);
+	if (typeof unique !== 'boolean') throw new TypeError(`createMultiMap: \`options.unique\` must be a boolean, got ${describe(unique)}`);
 	// A list of values per key, or a set with `unique`. Keys without values are never stored.
 	const groups = new Map<K, V[] | Set<V>>();
 	let total = 0;
