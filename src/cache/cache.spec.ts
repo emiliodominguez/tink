@@ -854,6 +854,21 @@ describe('LRUCache size budget and remaining TTL', function () {
 		expect(unbounded.totalSize).toBe(5);
 	});
 
+	it('evicts in linear time while the sizes add up beyond Number.MAX_VALUE', function () {
+		function identity(size: number): number {
+			return size;
+		}
+		// The 40,000 small entries are older than the big one, so they all go before it does, while the total stays beyond
+		// Number.MAX_VALUE: recounting the total at each eviction took seconds (O(n²)).
+		const cache = createLRUCache<number, number>({ max: Infinity, maxSize: Number.MAX_VALUE, sizeOf: identity });
+		for (let i = 0; i < 40_000; i++) cache.set(i, 1);
+		cache.set(-1, Number.MAX_VALUE * 0.6);
+		const start = performance.now();
+		cache.set(-2, Number.MAX_VALUE * 0.6);
+		expect(performance.now() - start).toBeLessThan(1500);
+		expect([[...cache.keys()], cache.totalSize]).toEqual([[-2], Number.MAX_VALUE * 0.6]);
+	});
+
 	it('reports every eviction even when onEvict throws', function () {
 		const seen: string[] = [];
 		const cache = textCache(4, function (key) {

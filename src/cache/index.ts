@@ -325,9 +325,11 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	let oldest: Entry<K, V> | undefined;
 	// The sum of the entries' sizes, kept as a rounded sum plus the rounding errors of the additions that made it (`total + residue`):
 	// with sizes that are not integers (0.1, 0.2...), plain additions and subtractions drift, so that an emptied cache would total
-	// 5.6e-17 and a value that fits on its own would be evicted on arrival.
+	// 5.6e-17 and a value that fits on its own would be evicted on arrival. Sizes are added multiplied by `scale`: `1`, or `2 ** -64`
+	// while they add up beyond `Number.MAX_VALUE` (see `account`).
 	let total = 0;
 	let residue = 0;
+	let scale = 1;
 	// Whether any entry may ever expire (set by the first `set` with a finite TTL). Until then every `expiresAt` is `Infinity`, so the
 	// clock (`Date.now` costs more than a `Map` lookup) is not read at all.
 	let timed = false;
@@ -415,31 +417,24 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	}
 
 	/**
-	 * Adds a size to the total, keeping the exact rounding error of the addition (Knuth's TwoSum) in `residue`.
+	 * Adds a size to the total (scaled), keeping the exact rounding error of the addition (Knuth's TwoSum) in `residue`. A total that
+	 * would go past `Number.MAX_VALUE` (sizes near it) is first scaled down by `2 ** -64`, exactly (a power of two): any realistic number
+	 * of sizes then adds up to a finite total, which comes back down as entries leave (an infinite one would stay `Infinity`, and its
+	 * residue `NaN`, as `Infinity - size` is `Infinity`).
 	 * @param {number} size - The size to add (negative to subtract)
 	 * @returns {void}
 	 */
 	function account(size: number): void {
+		if (total + size * scale === Infinity) {
+			total *= 2 ** -64;
+			residue *= 2 ** -64;
+			scale = 2 ** -64;
+		}
+		size *= scale;
 		const sum = total + size;
 		const added = sum - total;
 		residue += total - (sum - added) + (size - added);
 		total = sum;
-	}
-
-	/**
-	 * Recomputes the total from the entries once it has gone past `Number.MAX_VALUE` (sizes near it: `Infinity - size` stays `Infinity`,
-	 * and the residue becomes `NaN`), so that it comes back as soon as the sizes fit again; it stays `Infinity` until then. Called where
-	 * the total is read, never on the way to a decision that does not depend on it.
-	 * @returns {void}
-	 */
-	function recount(): void {
-		if (total + residue < Infinity) return;
-		total = residue = 0;
-		for (let entry = oldest; entry !== undefined; entry = entry.newer) account(entry.size);
-		if (!(total + residue < Infinity)) {
-			total = Infinity;
-			residue = 0;
-		}
 	}
 
 	/**
@@ -451,8 +446,13 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 		store.delete(entry.key);
 		unlink(entry);
 		account(-entry.size);
-		// An empty cache totals exactly 0, whatever rounding the residue itself went through.
-		if (store.size === 0) total = residue = 0;
+		// An empty cache totals exactly 0, whatever rounding the residue itself went through. Sizes back within `Number.MAX_VALUE` are
+		// summed again unscaled (once per return: the residue would otherwise keep the rounding errors of the huge sizes that left).
+		if (store.size === 0 || (scale !== 1 && total + residue <= Number.MAX_VALUE * scale)) {
+			total = residue = 0;
+			scale = 1;
+			for (let rest = oldest; rest !== undefined; rest = rest.newer) account(rest.size);
+		}
 	}
 
 	/**
@@ -460,11 +460,7 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	 * @returns {boolean} `true` when least-recently-used entries must go
 	 */
 	function overflows(): boolean {
-		if (store.size > max) return true;
-		if (total + residue <= maxSize) return false;
-		// Over `maxSize`, or beyond `Number.MAX_VALUE` (`NaN` included): recounted first, only then.
-		recount();
-		return total + residue > maxSize;
+		return store.size > max || total + residue > maxSize * scale;
 	}
 
 	/**
@@ -697,6 +693,7 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 				newest = undefined;
 				oldest = undefined;
 				total = residue = 0;
+				scale = 1;
 
 				notifyAll(removed);
 			},
@@ -738,8 +735,8 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 		}
 	);
 	(cache as unknown as Record<symbol, unknown>)[TOTAL_SIZE] = function (): number {
-		recount();
-		return total + residue;
+		// `Infinity` while the sizes add up beyond `Number.MAX_VALUE`.
+		return (total + residue) / scale;
 	};
 
 	return cache;
