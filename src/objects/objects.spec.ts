@@ -4985,3 +4985,119 @@ describe('Objects helpers (1.6 audit regressions)', function () {
 		expect(helpers.isEmpty(defaultRules)).toBe(true);
 	});
 });
+
+describe('Objects helpers (1.6 audit, pass 2: polluted prototypes)', function () {
+	/**
+	 * Runs `body` while `Object.prototype` holds `values` (as a vulnerable deep merge of JSON would plant them), then removes them.
+	 * @param {Record<string, unknown>} values - The keys and values to plant
+	 * @param {() => void} body - The checks
+	 * @returns {void}
+	 */
+	function withPollution(values: Record<string, unknown>, body: () => void): void {
+		const prototype = Object.prototype as Record<string, unknown>;
+		for (const key of Object.keys(values)) {
+			Object.defineProperty(prototype, key, { __proto__: null, value: values[key], writable: true, configurable: true, enumerable: true } as PropertyDescriptor);
+		}
+		try {
+			body();
+		} finally {
+			for (const key of Object.keys(values)) delete prototype[key];
+		}
+	}
+
+	it('isEqual matches the object keys of maps and the object members of sets whatever Object.prototype holds at an index', function () {
+		/**
+		 * @returns {Set<object>} A set of two records
+		 */
+		function set(): Set<object> {
+			return new Set([{ id: 1 }, { id: 2 }]);
+		}
+		/**
+		 * @returns {Map<object, string>} A map keyed by two records
+		 */
+		function map(): Map<object, string> {
+			return new Map([
+				[{ k: 1 }, 'x'],
+				[{ k: 2 }, 'y']
+			]);
+		}
+		withPollution({ 0: true, 1: 1 }, function () {
+			expect(helpers.isEqual(set(), set())).toBe(true);
+			expect(helpers.isEqual(map(), map())).toBe(true);
+			expect(helpers.isEqual({ tags: set() }, { tags: set() })).toBe(true);
+			expect(
+				helpers.isEqualWith(set(), set(), function () {
+					return undefined;
+				})
+			).toBe(true);
+			// A member is still matched once only.
+			expect(helpers.isEqual(new Set([{ a: 1 }, { a: 1 }]), new Set([{ a: 1 }, { b: 1 }]))).toBe(false);
+		});
+	});
+
+	it('the comparisons ignore settings planted on Object.prototype', function () {
+		withPollution({ customizer: true, json: true, absentUndefined: true, proven: 1, settled: 1, equals: 1, compared: 'x', assumed: 'x' }, function () {
+			expect(helpers.isEqual({ a: [1, { b: 2 }] }, { a: [1, { b: 2 }] })).toBe(true);
+			expect(helpers.isEqual(Object.create(null), {})).toBe(false);
+			expect(helpers.isEqual({ a: undefined }, {})).toBe(false);
+			expect(helpers.isMatch({ a: { b: 1, c: 2 } }, { a: { b: 1 } })).toBe(true);
+			expect(helpers.isMatch({ a: new Date(0) }, { a: new Date(0) })).toBe(true);
+			expect(helpers.createPatch({ a: 1, b: [1, 2] }, { a: 2, b: [0, 1, 2] })).toEqual([
+				{ op: 'replace', path: '/a', value: 2 },
+				{ op: 'add', path: '/b/0', value: 0 }
+			]);
+			expect(helpers.applyPatch({ a: { b: 1 } }, [{ op: 'test', path: '/a', value: { b: 1 } }])).toEqual({ a: { b: 1 } });
+			// A large shared subtree goes through the remembered pairs.
+			const node = {
+				list: Array.from({ length: 100 }, function (_, index) {
+					return { index };
+				})
+			};
+			expect(helpers.isEqual({ l: node, r: node }, helpers.deepClone({ l: node, r: node }))).toBe(true);
+			expect(helpers.isMatch({ l: node, r: node }, helpers.deepClone({ l: node, r: node }))).toBe(true);
+		});
+	});
+
+	it('the merge helpers ignore a `created` planted on Object.prototype', function () {
+		withPollution({ created: true }, function () {
+			expect(helpers.deepMerge({ a: { b: 1 } }, { a: { c: 2 } })).toEqual({ a: { b: 1, c: 2 } });
+			expect(helpers.defaultsDeep({ a: {} }, { a: { x: 1 } })).toEqual({ a: { x: 1 } });
+			expect(helpers.deepMergeWith({ arrays: 'concat' }, { a: { l: [1] } }, { a: { l: [2] } })).toEqual({ a: { l: [1, 2] } });
+			expect(helpers.defaultsWith({ deep: true }, { a: {} }, { a: { x: 1 } })).toEqual({ a: { x: 1 } });
+		});
+	});
+
+	it('defines properties whatever `get` or `set` Object.prototype holds', function () {
+		for (const key of ['get', 'set']) {
+			withPollution({ [key]: true }, function () {
+				expect(helpers.pick({ toString: 1, a: 2 }, ['toString', 'a'])).toEqual({ toString: 1, a: 2 });
+				expect(helpers.omit(JSON.parse('{"__proto__": 1, "a": 2}'), ['a'])).toEqual(JSON.parse('{"__proto__": 1}'));
+				expect(helpers.flattenObject({ a: { b: 1 } })).toEqual({ 'a.b': 1 });
+				expect(helpers.unflattenObject({ 'a.b': 1 })).toEqual({ a: { b: 1 } });
+				expect(helpers.setPath({}, 'a.b', 1)).toEqual({ a: { b: 1 } });
+				expect(helpers.mapValues({ valueOf: 1 }, String)).toEqual({ valueOf: '1' });
+				expect(helpers.applyPatch({ a: [1, 2] }, [{ op: 'add', path: '/a/0', value: 0 }])).toEqual({ a: [0, 1, 2] });
+				const copy = helpers.deepClone(new TypeError('boom', { cause: 1 }));
+				expect(copy.message).toBe('boom');
+				expect(copy.cause).toBe(1);
+			});
+		}
+	});
+
+	it('isMatch reads the own items of an array, never a hole through a polluted prototype', function () {
+		withPollution({ 1: 'x' }, function () {
+			// eslint-disable-next-line no-sparse-arrays
+			expect(helpers.isMatch({ list: [1, , 3] }, { list: [1, undefined, 3] })).toBe(true);
+			// eslint-disable-next-line no-sparse-arrays
+			expect(helpers.isMatch({ list: [1, , 3] }, { list: [1, 'x', 3] })).toBe(false);
+		});
+	});
+
+	it('evolve defines a transformed key that the copy lacks, never running the __proto__ setter', function () {
+		const value = Object.defineProperty({ a: 1 }, '__proto__', { value: { role: 'user' }, enumerable: false, writable: true, configurable: true });
+		const result = helpers.evolve(value, JSON.parse('{"__proto__": {}}') as Record<string, never>) as Record<string, unknown>;
+		expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+		expect(result.role).toBeUndefined();
+		expect(Object.getOwnPropertyDescriptor(result, '__proto__')?.value).toEqual({ role: 'user' });
+	});
+});

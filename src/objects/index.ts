@@ -227,7 +227,24 @@ function appendSymbols(object: object, keys: PropertyKey[]): PropertyKey[] {
  * @returns {void}
  */
 function defineOwn(object: object, key: PropertyKey, value: unknown): void {
-	Object.defineProperty(object, key, { value, writable: true, enumerable: true, configurable: true });
+	defineDescriptor(object, key, { value, writable: true, enumerable: true, configurable: true });
+}
+
+/**
+ * `Object.defineProperty`, whatever a polluted `Object.prototype` holds: a data descriptor that inherits a `get` or `set` (an accessor
+ * with a value, which `Object.defineProperty` rejects with a `TypeError`) is given again without a prototype. Only the retry pays for
+ * that: a descriptor without a prototype is slower to read. Every attribute of a descriptor given here is its own, so none is inherited.
+ * @param {object} object - The object to write to
+ * @param {PropertyKey} key - The property key
+ * @param {PropertyDescriptor} descriptor - The descriptor, with all its attributes
+ * @returns {void}
+ */
+function defineDescriptor(object: object, key: PropertyKey, descriptor: PropertyDescriptor): void {
+	try {
+		Object.defineProperty(object, key, descriptor);
+	} catch {
+		Object.defineProperty(object, key, Object.setPrototypeOf(descriptor, null) as PropertyDescriptor);
+	}
 }
 
 /**
@@ -1385,10 +1402,10 @@ function copyWith(value: unknown, seen?: Map<object, unknown>): unknown {
 			if ('value' in descriptor) descriptor.value = copyChild(descriptor.value, seen);
 			// V8 defines `stack` as an own accessor reading an internal slot of the original, which the copy lacks: copy its value.
 			else if (key === 'stack') {
-				Object.defineProperty(copy, key, { value: (value as Error).stack, writable: true, configurable: true, enumerable: descriptor.enumerable === true });
+				defineDescriptor(copy, key, { value: (value as Error).stack, writable: true, configurable: true, enumerable: descriptor.enumerable === true });
 				continue;
 			}
-			Object.defineProperty(copy, key, descriptor);
+			defineDescriptor(copy, key, descriptor);
 		} else defineValue(copy, key, copyChild((value as Properties)[key], seen));
 	}
 	return copy;
@@ -1533,9 +1550,10 @@ interface MergeSettings {
 	/**
 	 * With a customizer, the plain objects created by the current merge, the only ones merged into in place (set by {@link mergeAll}).
 	 * Without one, every plain object of the result is created by the merge (incoming plain objects are always merged into a new
-	 * object, never stored as they are), so none needs to be recorded.
+	 * object, never stored as they are), so none needs to be recorded. Always an own property, `undefined` or not: a missing one would be
+	 * read from a polluted `Object.prototype`.
 	 */
-	created?: WeakSet<object>;
+	created: WeakSet<object> | undefined;
 }
 
 /**
@@ -1676,11 +1694,11 @@ function mergeSettings(caller: string, options: unknown, fill: boolean): MergeSe
 	}
 	if (missing !== 'undefined' && missing !== 'nullish') throw new RangeError(`${caller}: \`missing\` must be 'undefined' or 'nullish', got ${JSON.stringify(missing)}`);
 	if (customizer !== undefined) assertFunction(caller, 'customizer', customizer);
-	return { caller, deep: !fill || deep === true, fill, nullish: missing === 'nullish', arrays, customizer };
+	return { caller, deep: !fill || deep === true, fill, nullish: missing === 'nullish', arrays, customizer, created: undefined };
 }
 
 /** Settings of {@link deepMerge}. */
-const DEEP_MERGE: MergeSettings = { caller: 'deepMerge', deep: true, fill: false, nullish: false, arrays: 'replace', customizer: undefined };
+const DEEP_MERGE: MergeSettings = { caller: 'deepMerge', deep: true, fill: false, nullish: false, arrays: 'replace', customizer: undefined, created: undefined };
 
 /**
  * Deeply merges plain objects into a NEW object, left to right (later sources win). Inputs are never mutated.
@@ -1751,10 +1769,10 @@ export function deepMergeWith<O extends DeepMergeOptions, T extends object, S ex
 }
 
 /** Settings of {@link defaults}. */
-const DEFAULTS: MergeSettings = { caller: 'defaults', deep: false, fill: true, nullish: false, arrays: 'replace', customizer: undefined };
+const DEFAULTS: MergeSettings = { caller: 'defaults', deep: false, fill: true, nullish: false, arrays: 'replace', customizer: undefined, created: undefined };
 
 /** Settings of {@link defaultsDeep}. */
-const DEFAULTS_DEEP: MergeSettings = { caller: 'defaultsDeep', deep: true, fill: true, nullish: false, arrays: 'replace', customizer: undefined };
+const DEFAULTS_DEEP: MergeSettings = { caller: 'defaultsDeep', deep: true, fill: true, nullish: false, arrays: 'replace', customizer: undefined, created: undefined };
 
 /**
  * Fills the MISSING keys of a copy of `target` from `sources`: a key keeps the first value that is not `undefined`, looking at the
@@ -1868,25 +1886,41 @@ export interface EqualityContext {
 export type EqualityCustomizer = (a: unknown, b: unknown, context: EqualityContext) => boolean | undefined;
 
 /**
- * Pairs of objects currently being compared by {@link isEqual} (used to detect cycles), with the key under which each pair was
- * reached; {@link isEqualWith} attaches its customizer (and the matching `equals` function) to it.
+ * The state of one comparison of {@link isEqual}, {@link isEqualWith} or {@link isMatch}. Every field is set by
+ * {@link comparisonStack}: a missing one would be read from a polluted `Object.prototype` (a planted `customizer` made every comparison
+ * throw, a planted `absentUndefined` ignored `undefined` members, a planted `json` equated `null`-prototype and plain objects).
  */
-type ComparisonStack = Array<[object, object, unknown?]> & {
-	customizer?: EqualityCustomizer;
-	equals?: (a: unknown, b: unknown) => boolean;
+interface ComparisonStack {
+	/** Pairs of objects currently being compared (used to detect cycles), with the key under which each pair was reached. */
+	readonly pairs: Array<[object, object, unknown?]>;
+	/** The customizer of {@link isEqualWith}. */
+	readonly customizer: EqualityCustomizer | undefined;
+	/** The `equals` function given to the customizer. */
+	equals: ((a: unknown, b: unknown) => boolean) | undefined;
 	/** The number of object pairs compared so far (see `proven`). */
-	compared?: number;
+	compared: number;
 	/** How many times a pair under comparison was assumed equal (a cycle): results reached meanwhile only hold under that assumption. */
-	assumed?: number;
+	assumed: number;
 	/** Pairs with a large subtree proven equal without assumptions: a subtree shared by several paths is then compared once. */
-	proven?: WeakMap<object, object>;
+	proven: WeakMap<object, object> | undefined;
 	/** For {@link isMatch}: the results of pairs with a large subtree, settled without assumptions. */
-	settled?: WeakMap<object, WeakMap<object, boolean>>;
+	settled: WeakMap<object, WeakMap<object, boolean>> | undefined;
 	/** For the `test` operation of {@link applyPatch}: plain objects compare their members whatever their prototype (`null` or not). */
-	json?: boolean;
+	readonly json: boolean;
 	/** For {@link applyPatch} and {@link createPatch}: a member of a plain object whose value is `undefined` counts as absent (as in JSON). */
-	absentUndefined?: boolean;
-};
+	readonly absentUndefined: boolean;
+}
+
+/**
+ * A new, empty {@link ComparisonStack}.
+ * @param {EqualityCustomizer} [customizer] - The customizer of {@link isEqualWith}
+ * @param {boolean} [json=false] - See {@link ComparisonStack.json}
+ * @param {boolean} [absentUndefined=false] - See {@link ComparisonStack.absentUndefined}
+ * @returns {ComparisonStack} The state
+ */
+function comparisonStack(customizer?: EqualityCustomizer, json = false, absentUndefined = false): ComparisonStack {
+	return { pairs: [], customizer, equals: undefined, compared: 0, assumed: 0, proven: undefined, settled: undefined, json, absentUndefined };
+}
 
 /** How many nested object pairs an equal pair must have needed for {@link isEqual} to remember it (small subtrees are cheaper to redo). */
 const PROVEN_SUBTREE = 64;
@@ -1903,7 +1937,6 @@ function mapsEqual(a: Map<unknown, unknown>, b: Map<unknown, unknown>, stack: Co
 	if (a.size !== b.size) return false;
 	// Collected when first needed: maps keyed by primitives (the usual ones) never need it.
 	let objectEntriesB: Array<[unknown, unknown]> | undefined;
-	const matched: boolean[] = [];
 
 	for (const [keyA, valueA] of a) {
 		if (!isObject(keyA)) {
@@ -1913,11 +1946,13 @@ function mapsEqual(a: Map<unknown, unknown>, b: Map<unknown, unknown>, stack: Co
 		objectEntriesB ??= Array.from(b).filter(function ([key]) {
 			return isObject(key);
 		});
-		const index = objectEntriesB.findIndex(function ([keyB, valueB], candidate) {
-			return !matched[candidate] && equalWith(keyA, keyB, stack) && equalWith(valueA, valueB, stack, keyA);
+		const index = objectEntriesB.findIndex(function ([keyB, valueB]) {
+			return equalWith(keyA, keyB, stack) && equalWith(valueA, valueB, stack, keyA);
 		});
 		if (index === -1) return false;
-		matched[index] = true;
+		// A matched entry is no candidate for the next keys. (Removed rather than flagged in a list of flags: a flag never set would be
+		// read from a polluted `Object.prototype`, such as a planted `0`, and turn its candidate down.)
+		objectEntriesB.splice(index, 1);
 	}
 	return true;
 }
@@ -1934,7 +1969,6 @@ function setsEqual(a: Set<unknown>, b: Set<unknown>, stack: ComparisonStack): bo
 	if (a.size !== b.size) return false;
 	// Collected when first needed: sets of primitives (the usual ones) never need it.
 	let objectMembersB: unknown[] | undefined;
-	const matched: boolean[] = [];
 
 	for (const memberA of a) {
 		if (!isObject(memberA)) {
@@ -1942,11 +1976,12 @@ function setsEqual(a: Set<unknown>, b: Set<unknown>, stack: ComparisonStack): bo
 			continue;
 		}
 		objectMembersB ??= Array.from(b).filter(isObject);
-		const index = objectMembersB.findIndex(function (memberB, candidate) {
-			return !matched[candidate] && equalWith(memberA, memberB, stack);
+		const index = objectMembersB.findIndex(function (memberB) {
+			return equalWith(memberA, memberB, stack);
 		});
 		if (index === -1) return false;
-		matched[index] = true;
+		// A matched member is no candidate for the next ones (see `mapsEqual`).
+		objectMembersB.splice(index, 1);
 	}
 	return true;
 }
@@ -2089,7 +2124,7 @@ function isJsonObject(value: object): boolean {
  * @returns {boolean} Whether the pair is on the stack
  */
 function isComparing(stack: ComparisonStack, a: unknown, b: unknown): boolean {
-	for (const [left, right] of stack) {
+	for (const [left, right] of stack.pairs) {
 		if (left === a && right === b) return true;
 	}
 	return false;
@@ -2108,20 +2143,20 @@ function equalWith(a: unknown, b: unknown, stack: ComparisonStack, key?: unknown
 	if (sameValueZero(a, b)) return true;
 	if (!isObject(a) || !isObject(b) || !(sameKind(a, b) || (stack.json === true && isJsonObject(a) && isJsonObject(b)))) return false;
 	if (isComparing(stack, a, b)) {
-		stack.assumed = (stack.assumed ?? 0) + 1;
+		stack.assumed++;
 		return true;
 	}
 	if (stack.proven?.get(a) === b) return true;
 
-	const assumed = stack.assumed ?? 0;
-	const compared = (stack.compared = (stack.compared ?? 0) + 1);
+	const assumed = stack.assumed;
+	const compared = ++stack.compared;
 
-	stack.push([a, b]);
+	stack.pairs.push([a, b]);
 	const result = objectsEqual(a, b, stack);
-	stack.pop();
+	stack.pairs.pop();
 	// A value reached through several paths (`{ l: node, r: node }` at every level) would otherwise be compared once per path: an
 	// exponential number of times. An equality that assumed no pair equal holds anywhere, so the pairs with large subtrees are remembered.
-	if (result && (stack.compared as number) - compared > PROVEN_SUBTREE && (stack.assumed ?? 0) === assumed) (stack.proven ??= new WeakMap()).set(a, b);
+	if (result && stack.compared - compared > PROVEN_SUBTREE && stack.assumed === assumed) (stack.proven ??= new WeakMap()).set(a, b);
 	return result;
 }
 
@@ -2140,16 +2175,17 @@ function customEqual(a: unknown, b: unknown, stack: ComparisonStack, key: unknow
 	const objects = isObject(a) && isObject(b);
 	if (objects && isComparing(stack, a, b)) return true;
 
-	const depth = stack.length;
+	const pairs = stack.pairs;
+	const depth = pairs.length;
 	const path: unknown[] = [];
-	for (let index = 1; index < depth; index++) path.push(stack[index][2]);
+	for (let index = 1; index < depth; index++) path.push(pairs[index][2]);
 	if (depth > 0) path.push(key);
-	const parent = stack[depth - 1] as [object, object] | undefined;
+	const parent = pairs[depth - 1] as [object, object] | undefined;
 
-	if (objects) stack.push([a, b, key]);
+	if (objects) pairs.push([a, b, key]);
 	let result: unknown = customizer(a, b, { key, path, parentA: parent?.[0], parentB: parent?.[1], equals: stack.equals as (a: unknown, b: unknown) => boolean });
 	if (result === undefined) result = sameValueZero(a, b) || (objects && sameKind(a, b) && objectsEqual(a, b, stack));
-	if (objects) stack.pop();
+	if (objects) pairs.pop();
 	return Boolean(result);
 }
 
@@ -2179,7 +2215,8 @@ function customEqual(a: unknown, b: unknown, stack: ComparisonStack, key: unknow
  * isEqual([1], { 0: 1 }); // => false
  */
 export function isEqual(a: unknown, b: unknown): boolean {
-	return equalWith(a, b, []);
+	// Primitives are settled without a stack.
+	return sameValueZero(a, b) || (isObject(a) && isObject(b) && equalWith(a, b, comparisonStack()));
 }
 
 /**
@@ -2203,8 +2240,7 @@ export function isEqual(a: unknown, b: unknown): boolean {
  */
 export function isEqualWith(a: unknown, b: unknown, customizer: EqualityCustomizer): boolean {
 	assertFunction('isEqualWith', 'customizer', customizer);
-	const stack: ComparisonStack = [];
-	stack.customizer = customizer;
+	const stack = comparisonStack(customizer);
 	stack.equals = function (x: unknown, y: unknown): boolean {
 		return equalWith(x, y, stack);
 	};
@@ -2233,18 +2269,18 @@ export interface IsMatchOptions {
 function matchWith(value: unknown, pattern: unknown, subset: boolean, stack: ComparisonStack): boolean {
 	if (sameValueZero(value, pattern)) return true;
 	const plain = isPlainObject(pattern);
-	if (!plain && !Array.isArray(pattern)) return isObject(pattern) && equalWith(value, pattern, []);
+	if (!plain && !Array.isArray(pattern)) return isObject(pattern) && equalWith(value, pattern, comparisonStack());
 	if (!(isObject(value) || isFunction(value)) || (!plain && !Array.isArray(value))) return false;
 	if (isComparing(stack, value, pattern)) {
-		stack.assumed = (stack.assumed ?? 0) + 1;
+		stack.assumed++;
 		return true;
 	}
 	const settled = stack.settled?.get(value)?.get(pattern);
 	if (settled !== undefined) return settled;
 
-	const assumed = stack.assumed ?? 0;
-	const compared = (stack.compared = (stack.compared ?? 0) + 1);
-	stack.push([value, pattern]);
+	const assumed = stack.assumed;
+	const compared = ++stack.compared;
+	stack.pairs.push([value, pattern]);
 	let result: boolean;
 	if (plain) {
 		result = ownEnumerableKeys(pattern).every(function (key) {
@@ -2263,13 +2299,14 @@ function matchWith(value: unknown, pattern: unknown, subset: boolean, stack: Com
 				})
 			: items.length === (pattern as unknown[]).length &&
 				(pattern as unknown[]).every(function (expected, index) {
-					return matchWith(items[index], expected, subset, stack);
+					// Own items only: a hole must not read a value from a polluted `Array.prototype` or `Object.prototype`.
+					return matchWith(hasOwn(items, index) ? items[index] : undefined, expected, subset, stack);
 				});
 	}
-	stack.pop();
+	stack.pairs.pop();
 	// A pair reached through several paths would otherwise be matched once per path: an exponential number of times. A mismatch holds
 	// anywhere (assuming the pairs on the stack match only made matching easier), a match only when it assumed nothing.
-	if ((stack.compared as number) - compared > PROVEN_SUBTREE && (!result || (stack.assumed ?? 0) === assumed)) {
+	if (stack.compared - compared > PROVEN_SUBTREE && (!result || stack.assumed === assumed)) {
 		const settledPairs = (stack.settled ??= new WeakMap());
 		let pairs = settledPairs.get(value);
 		if (pairs === undefined) settledPairs.set(value, (pairs = new WeakMap()));
@@ -2303,7 +2340,7 @@ function matchWith(value: unknown, pattern: unknown, subset: boolean, stack: Com
 export function isMatch(value: unknown, pattern: unknown, options: IsMatchOptions = {}): boolean {
 	const arrays = readOption(options, 'arrays') ?? 'exact';
 	if (arrays !== 'exact' && arrays !== 'subset') throw new RangeError(`isMatch: \`arrays\` must be 'exact' or 'subset', got ${JSON.stringify(arrays)}`);
-	return matchWith(value, pattern, arrays === 'subset', []);
+	return matchWith(value, pattern, arrays === 'subset', comparisonStack());
 }
 
 /**
@@ -3165,9 +3202,7 @@ function treeHash(value: unknown, state: PatchWalk): number {
  * @returns {boolean} Whether they are equal
  */
 function patchEqual(a: unknown, b: unknown): boolean {
-	const stack: ComparisonStack = [];
-	stack.absentUndefined = true;
-	return equalWith(a, b, stack);
+	return equalWith(a, b, comparisonStack(undefined, false, true));
 }
 
 /**
@@ -3572,10 +3607,7 @@ function ownField(operation: object, field: string): unknown {
  * @returns {boolean} Whether they are equal
  */
 function jsonEqual(a: unknown, b: unknown): boolean {
-	const stack: ComparisonStack = [];
-	stack.json = true;
-	stack.absentUndefined = true;
-	return equalWith(a, b, stack);
+	return equalWith(a, b, comparisonStack(undefined, true, true));
 }
 
 /**
@@ -3923,9 +3955,10 @@ function evolveWith(value: object, transforms: object, ancestors: object[]): obj
 		// Only OWN keys of the value are transformed: transforms never create keys.
 		if (!hasOwn(value, key)) continue;
 		const current = (value as Properties)[key];
-		// `key` is an own data property of the copy, so plain assignment updates it (an own `'__proto__'` key included).
-		if (!nested) result[key] = (transform as (value: unknown) => unknown)(current);
-		else if (isContainer(current)) result[key] = evolveWith(current, transform, ancestors);
+		// Defined, not assigned: a non-enumerable key of the value is missing from the copy, and assigning it could run an inherited setter
+		// (`'__proto__'` would replace the copy's prototype).
+		if (!nested) defineValue(result, key, (transform as (value: unknown) => unknown)(current));
+		else if (isContainer(current)) defineValue(result, key, evolveWith(current, transform, ancestors));
 	}
 	ancestors.pop();
 	return result;
