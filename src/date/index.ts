@@ -823,8 +823,11 @@ function businessCalendar(caller: string, options: BusinessDayOptions | undefine
 		weekend = 0;
 		// An index loop, unlike `forEach`, also visits the holes of a sparse array.
 		for (let i = 0; i < weekendDays.length; i++) {
-			assertWeekday(caller, weekendDays[i], `weekend[${i}]`);
-			weekend |= 1 << weekendDays[i];
+			// Read once: the day that is validated is the day that is used, even behind a getter.
+			const weekday: unknown = weekendDays[i];
+
+			assertWeekday(caller, weekday as number, `weekend[${i}]`);
+			weekend |= 1 << (weekday as number);
 		}
 		if (weekend === 0b1111111) throw new RangeError(`${caller}: \`weekend\` must leave at least one business day in the week`);
 	}
@@ -949,13 +952,43 @@ function diffInCompleteUnits(later: DateInput, earlier: DateInput, unitMonths: n
 	if (end.getTime() < start.getTime()) return 0 - diffInCompleteUnits(start, end, unitMonths, unitDays);
 
 	// The calendar difference counts one unit too many when the time of day or a clamped day is not reached yet, and two when the
-	// day reached that way was skipped (Kiritimati's 1994-12-31): the clock shows the next day, which can be after `end`.
-	let units = Math.floor(unitMonths === 0 ? diffInDays(end, start) / unitDays : calendarMonthDiff(end, start) / unitMonths);
+	// day reached that way was skipped (Kiritimati's 1994-12-31): the clock shows the next day, which can be after `end`. It is even
+	// negative when the clocks were set back across midnight between the two (`end` on October 31st, after `start` on November 1st):
+	// counting starts from 0 then.
+	let units = Math.max(0, Math.floor(unitMonths === 0 ? diffInDays(end, start) / unitDays : calendarMonthDiff(end, start) / unitMonths));
 
 	// A trial shift past the representable range (an invalid date) overshoots too. Zero units never do.
-	while (!(shiftCalendarUnchecked(new Date(start), units * unitMonths, units * unitDays).getTime() <= end.getTime())) units -= 1;
+	if (!(shiftCalendarUnchecked(new Date(start), units * unitMonths, units * unitDays).getTime() <= end.getTime())) {
+		do units -= 1;
+		while (!(shiftCalendarUnchecked(new Date(start), units * unitMonths, units * unitDays).getTime() <= end.getTime()));
+
+		return units;
+	}
+
+	// And one too few when `end` is in a day that came back after the clocks were set back across midnight (St. John's, 2009-11-01 at
+	// 00:01, back to 23:01 on October 31st): the first minute of November 1st came before that second October 31st 23:30. (After a
+	// decrement, the next unit is known to overshoot.)
+	if (mayHaveComeBack(end)) {
+		while (shiftCalendarUnchecked(new Date(start), (units + 1) * unitMonths, (units + 1) * unitDays).getTime() <= end.getTime()) units += 1;
+	}
 
 	return units;
+}
+
+/**
+ * Whether an instant on a later LOCAL calendar day than `date` can come before it on the timeline: only when the clock was set back across
+ * the midnight that ends `date`'s day, by more than `date` is from that midnight, less than a day before `date` (St. John's at 00:01 until
+ * 2011; Alaska by 24 hours in 1867). With the changes of UTC offset more than two days apart, as in the time zone database, the offset
+ * two days earlier is then larger. (`getTimezoneOffset()` truncates the seconds of local mean time offsets, which can hide a change of
+ * less than 2 minutes: within 2 minutes of the midnight, the answer is always `true`.)
+ * @param {Date} date - A valid date
+ * @returns {boolean} `false` when no such instant exists
+ * @example
+ * mayHaveComeBack(new Date(2024, 0, 15, 12)); // => false // outside St. John's in 2009 and the like
+ */
+function mayHaveComeBack(date: Date): boolean {
+	// Minutes WEST of UTC: a larger value is a smaller offset.
+	return new Date(date.getTime() - 2 * MS_PER_DAY).getTimezoneOffset() < date.getTimezoneOffset() || (date.getHours() === 23 && date.getMinutes() >= 58);
 }
 
 /**
@@ -2453,7 +2486,8 @@ export function formatDuration(ms: number, options: FormatDurationOptions = {}):
  * between and inside tokens is optional; decimals such as `'1.5h'` or `'.5s'` are allowed) into milliseconds, e.g.
  * `'1h 30m'` → `5_400_000`. Tokens may appear in any order and repeated units are summed. A single leading `'-'`
  * negates the whole duration. It is the inverse of {@link formatDuration}'s output. Decimals are read as written, not through a
- * binary fraction: `'1.001s'` is 1001 ms and `'1.1d'` is 95 040 000 ms (multiplying `1.001` by 1000 gives `1000.9999999999999`).
+ * binary fraction: `'1.001s'` is 1001 ms and `'1.1d'` is 95 040 000 ms (multiplying `1.001` by 1000 gives `1000.9999999999999`), and
+ * a token of up to 13 significant digits gives the double nearest to its exact value (`'12.345678h'` is `44_444_440.8`).
  * @param {string} value - The duration string
  * @returns {number} The duration in milliseconds (may be fractional, e.g. `'0.5ms'`)
  * @throws {TypeError} when `value` is not a string or is not a valid duration (empty, a bare number, an unknown unit…)
@@ -2481,9 +2515,19 @@ export function parseDuration(value: string): number {
 		const size = DURATION_UNIT_MS[match[2] as DurationUnit];
 		const exponent = DURATION_UNIT_EXPONENTS[match[2] as DurationUnit];
 
-		// A decimal point is moved in the text, so the amount is read as written: `Number('1.001e3')` is 1001, whereas `1.001 * 1000` is
-		// `1000.9999999999999` (exact whenever the milliseconds are whole, the rest of the unit being an integer factor).
-		total += amount.includes('.') ? Number(`${amount}e${exponent}`) * (size / 10 ** exponent) : Number(amount) * size;
+		const point = amount.indexOf('.');
+
+		if (point < 0) total += Number(amount) * size;
+		else {
+			// The amount is read as written, not through a binary fraction (`1.001 * 1000` is `1000.9999999999999`): its digits times the
+			// rest of the unit (an integer factor) are exact while they are a safe integer, and the decimal point is then moved in the
+			// text, so the result is rounded once. Beyond (over 13 significant digits), the point is moved before multiplying, which is
+			// still exact whenever the milliseconds are whole.
+			const factor = size / 10 ** exponent;
+			const digits = Number(amount.slice(0, point) + amount.slice(point + 1)) * factor;
+
+			total += digits <= Number.MAX_SAFE_INTEGER ? Number(`${digits}e${exponent - (amount.length - point - 1)}`) : Number(`${amount}e${exponent}`) * factor;
+		}
 	}
 
 	if (!Number.isFinite(total)) throw new RangeError('parseDuration: the duration is too large to be represented');
@@ -2614,15 +2658,24 @@ export function intervalToDuration(start: DateInput, end: DateInput): IntervalDu
 	const to = toValidDate(end);
 	const target = to.getTime();
 	const sign = target < from.getTime() ? -1 : 1;
+	// Not against the direction of travel, which happens when the clocks were set back across midnight in between (see `diffInCompleteUnits`).
 	let months = calendarMonthDiff(to, from);
+
+	if (sign * months < 0) months = 0;
 	// Trial shifts may land past the representable range (an invalid date): that counts as too far.
 	let reached = shiftCalendarUnchecked(new Date(from), months, 0);
 
 	// One month too far (the day or the time of day is not reached yet) in the direction of travel, or two when the day reached was
-	// skipped (Kiritimati's 1994-12-31) and the clock shows the next one. Zero months never are.
-	while (!(sign * (reached.getTime() - target) <= 0)) {
-		months -= sign;
-		reached = shiftCalendarUnchecked(new Date(from), months, 0);
+	// skipped (Kiritimati's 1994-12-31) and the clock shows the next one. Zero months never are. Or one too few when `to` is in a day that
+	// came back after the clocks were set back across midnight (see `diffInCompleteUnits`); after a decrement, the next month is known to
+	// overshoot. (Not backwards: a shift lands on the first occurrence of a repeated time, before the clocks went back.)
+	if (!(sign * (reached.getTime() - target) <= 0)) {
+		do {
+			months -= sign;
+			reached = shiftCalendarUnchecked(new Date(from), months, 0);
+		} while (!(sign * (reached.getTime() - target) <= 0));
+	} else if (sign > 0 && mayHaveComeBack(to)) {
+		while (shiftCalendarUnchecked(new Date(from), months + 1, 0).getTime() <= target) months += 1;
 	}
 
 	// Counted from the calendar day that the months lead to (clamped to the end of the month), not from the day that the clock shows
@@ -2637,11 +2690,18 @@ export function intervalToDuration(start: DateInput, end: DateInput): IntervalDu
 
 	reached = shiftCalendarUnchecked(new Date(from), months, days);
 
-	// Likewise one day too far (the time of day is not reached yet).
-
-	while (!(sign * (reached.getTime() - target) <= 0)) {
-		days -= sign;
-		reached = shiftCalendarUnchecked(new Date(from), months, days);
+	// Likewise one day too far (the time of day is not reached yet), or too few (a day that came back).
+	if (!(sign * (reached.getTime() - target) <= 0)) {
+		do {
+			days -= sign;
+			reached = shiftCalendarUnchecked(new Date(from), months, days);
+		} while (!(sign * (reached.getTime() - target) <= 0));
+	} else if (sign > 0 && mayHaveComeBack(to)) {
+		for (let further = shiftCalendarUnchecked(new Date(from), months, days + 1); further.getTime() <= target;) {
+			days += 1;
+			reached = further;
+			further = shiftCalendarUnchecked(new Date(from), months, days + 1);
+		}
 	}
 
 	const rest = target - reached.getTime();
@@ -3399,20 +3459,21 @@ export function parseDate(value: string, pattern: string): Date | undefined {
 
 		// AM/PM: anything else is rejected when the result is formatted again.
 		if (token === 'A' || token === 'a') {
-			fields.A = value[position] === 'P' || value[position] === 'p' ? 1 : 0;
+			fields.A = value.charAt(position) === 'P' || value.charAt(position) === 'p' ? 1 : 0;
 			position += 2;
 			continue;
 		}
 
 		// A formatter is always followed by a literal text, empty when another token follows directly (empty `[]` literals too).
 		let after = i + 1;
-		while (parts[after] === '') after++;
-		const next = parts[after];
+		// (Own elements only: past the end, a polluted `Object.prototype` would answer.)
+		while (after < parts.length && parts[after] === '') after++;
+		const next = after < parts.length ? parts[after] : undefined;
 		const followedByNumber = typeof next === 'function' && next !== FORMATTERS.A && next !== FORMATTERS.a;
 		const maxDigits = token.length === 1 ? 2 : token === 'YYYY' && !followedByNumber ? Infinity : token.length;
 		const start = position;
 
-		if (token === 'YYYY' && value[position] === '-') position++;
+		if (token === 'YYYY' && value.charAt(position) === '-') position++;
 
 		const digitsStart = position;
 
@@ -3634,7 +3695,7 @@ function zoneClock(timeZone: string): ZoneClock {
 function resolveTimeZone(caller: string, timeZone: string): ResolvedZone {
 	if (typeof timeZone !== 'string') throw new TypeError(`${caller}: \`timeZone\` must be a string, got ${describe(timeZone)}`);
 
-	if (timeZone[0] === '+' || timeZone[0] === '-') {
+	if (timeZone.startsWith('+') || timeZone.startsWith('-')) {
 		const match = OFFSET_ZONE_REGEX.exec(timeZone);
 
 		// `+ 0` turns the `-0` of `'-00:00'` into `0`.
@@ -4372,7 +4433,7 @@ function compileCron(caller: string, expression: string): Int32Array {
 	const source = expression.trim();
 	let text = source;
 
-	if (text[0] === '@') {
+	if (text.startsWith('@')) {
 		const index = CRON_MACROS.indexOf(text.toLowerCase());
 
 		// (The expansions never start with `@`, so a match is always a name.)

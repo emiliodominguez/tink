@@ -594,6 +594,27 @@ describe('Date helpers (properties)', function () {
 			);
 		});
 
+		it('parseDuration gives the double nearest to the exact value of a token of up to 13 significant digits', function () {
+			const sizes: Record<helpers.DurationUnit, bigint> = { d: 86_400_000n, h: 3_600_000n, m: 60_000n, s: 1000n, ms: 1n };
+
+			fc.assert(
+				fc.property(
+					fc.constantFrom<helpers.DurationUnit>('d', 'h', 'm', 's', 'ms'),
+					fc.integer({ min: 0, max: 99_999_999 }),
+					fc.integer({ min: 0, max: 99_999 }),
+					fc.integer({ min: 1, max: 5 }),
+					function (unit, whole, fraction, places) {
+						const decimals = String(fraction % 10 ** places).padStart(places, '0');
+						// The exact milliseconds, as a decimal string (`Number` rounds it once, to the nearest double). At most 13 digits times 864.
+						const scaled = (BigInt(`${whole}${decimals}`) * sizes[unit]).toString().padStart(places + 1, '0');
+						const exact = Number(`${scaled.slice(0, -places)}.${scaled.slice(-places)}`);
+
+						expect(helpers.parseDuration(`${whole}.${decimals}${unit}`)).toBe(exact);
+					}
+				)
+			);
+		});
+
 		it('formatDuration with restricted units / largest truncates toward zero by less than the dropped part', function () {
 			const unitsArb = fc.subarray(['d', 'h', 'm', 's', 'ms'] as helpers.DurationUnit[], { minLength: 1 });
 
@@ -737,6 +758,69 @@ describe('Date helpers (properties)', function () {
 					);
 				})
 			);
+		});
+
+		it("the complete units are maximal where a day came back after the clocks were set back across midnight (St. John's)", function () {
+			const realProcess = new (util.inspect.constructor as FunctionConstructor)('return process')() as { env: Record<string, string | undefined> };
+			const previous = realProcess.env.TZ;
+			// 2006-2010: the clocks went back at 00:01 (NDT) to 23:01 (NST) on the first Sunday of November. Starts in the first minute of
+			// a day, ends within two hours of a change, so that a unit can end on the next day before `end`.
+			const changes = [
+				Date.UTC(2006, 9, 29, 2, 31),
+				Date.UTC(2007, 10, 4, 2, 31),
+				Date.UTC(2008, 10, 2, 2, 31),
+				Date.UTC(2009, 10, 1, 2, 31),
+				Date.UTC(2010, 10, 7, 2, 31)
+			];
+
+			realProcess.env.TZ = 'America/St_Johns';
+			try {
+				fc.assert(
+					fc.property(
+						fc.constantFrom(...changes),
+						fc.integer({ min: -2 * 3_600_000, max: 2 * 3_600_000 }),
+						// Days back from `end`, or months back from the day after `end` (so that a unit can end on November 1st).
+						fc.oneof(
+							fc.integer({ min: 0, max: 800 }),
+							fc.integer({ min: 0, max: 30 }).map(function (months) {
+								return -1 - months;
+							})
+						),
+						fc.integer({ min: 0, max: 59_999 }),
+						fc.boolean(),
+						function (change, shift, back, intoDay, swap) {
+							const end = new Date(change + shift);
+							const day = back >= 0 ? helpers.addDays(end, -back) : helpers.addMonths(helpers.addDays(end, 1), back + 1);
+							const start = new Date(day.getFullYear(), day.getMonth(), day.getDate(), 0, 0, 0, intoDay);
+							const [later, earlier] = swap ? [start, end] : [end, start];
+							const [from, to, sign] = later.getTime() >= earlier.getTime() ? [earlier, later, 1] : [later, earlier, -1];
+							const units: Array<[number, (date: Date, n: number) => Date]> = [
+								[helpers.diffInWeeks(later, earlier), helpers.addWeeks],
+								[helpers.diffInMonths(later, earlier), helpers.addMonths],
+								[helpers.diffInYears(later, earlier), helpers.addYears]
+							];
+
+							for (const [count, add] of units) {
+								expect(add(from, sign * count).getTime()).toBeLessThanOrEqual(to.getTime());
+								expect(add(from, sign * count + 1).getTime()).toBeGreaterThan(to.getTime());
+							}
+
+							const duration = helpers.intervalToDuration(start, end);
+							const months = duration.years * 12 + duration.months;
+
+							expect(helpers.addDuration(start, duration).getTime()).toBe(end.getTime());
+							for (const value of Object.values(duration)) expect(Math.sign(value) * (end.getTime() < start.getTime() ? -1 : 1)).toBeGreaterThanOrEqual(0);
+							if (end.getTime() >= start.getTime()) {
+								expect(helpers.addMonths(start, months + 1).getTime()).toBeGreaterThan(end.getTime());
+								expect(helpers.addDuration(start, { months, days: duration.days + 1 }).getTime()).toBeGreaterThan(end.getTime());
+							}
+						}
+					)
+				);
+			} finally {
+				if (previous === undefined) delete realProcess.env.TZ;
+				else realProcess.env.TZ = previous;
+			}
 		});
 
 		it('startOf/endOf hour and minute bracket the date on wall-clock boundaries', function () {

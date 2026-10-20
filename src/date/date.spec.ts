@@ -1464,6 +1464,14 @@ describe('Date helpers', function () {
 			expect(helpers.parseDuration('0.25ms')).toBe(0.25);
 		});
 
+		it('gives the double nearest to a decimal amount of up to 13 significant digits, also when it has a fraction of a millisecond', function () {
+			// Moving the point first (`Number('12.345678e5') * 36`) rounds twice: 44444440.800000004.
+			expect(helpers.parseDuration('12.345678h')).toBe(44_444_440.8);
+			expect(helpers.parseDuration('-12.345678h')).toBe(-44_444_440.8);
+			// Beyond, the point is moved before multiplying.
+			expect(helpers.parseDuration('123456789012345.5d')).toBe(Number('123456789012345.5e5') * 864);
+		});
+
 		it('does not coerce non-strings, even those whose string form is valid', function () {
 			expect(function () {
 				helpers.parseDuration({
@@ -2335,6 +2343,45 @@ describe('Date helpers', function () {
 				// Kiritimati skipped December 31st, 1994 (UTC-10 to UTC+14).
 				expect(helpers.endOfYear(new Date(1994, 5, 1, 12)).getTime()).toBe(helpers.endOfMonth(new Date(1994, 11, 15, 12)).getTime());
 				expect(helpers.toISOStringLocal(helpers.endOfYear(new Date(1994, 5, 1, 12)))).toBe('1994-12-30T23:59:59.999-10:00');
+			});
+		});
+
+		it('count the complete units that end in a day that came back after the clocks were set back across midnight', function () {
+			withTimeZone('America/St_Johns', function () {
+				// 2009-11-01 00:01 NDT became 2009-10-31 23:01 NST: the first minute of November came before the second 23:31 of October 31st.
+				const end = new Date('2009-11-01T03:01:00.000Z');
+				expect(helpers.toISOStringLocal(end)).toBe('2009-10-31T23:31:00.000-03:30');
+				expect(helpers.addWeeks(new Date(2009, 9, 25, 0, 0, 30), 1).getTime()).toBeLessThan(end.getTime());
+				expect(helpers.diffInWeeks(end, new Date(2009, 9, 25, 0, 0, 30))).toBe(1);
+				expect(helpers.diffInMonths(end, new Date(2009, 9, 1, 0, 0, 30))).toBe(1);
+				expect(helpers.diffInYears(end, new Date(2008, 10, 1, 0, 0, 30))).toBe(1);
+				expect(helpers.diffInWeeks(new Date(2009, 9, 25, 0, 0, 30), end)).toBe(-1);
+				expect(helpers.intervalToDuration(new Date(2008, 10, 1, 0, 0, 30), end)).toEqual({
+					years: 1,
+					months: 0,
+					days: 0,
+					hours: 0,
+					minutes: 30,
+					seconds: 30,
+					milliseconds: 0
+				});
+				expect(helpers.intervalToDuration(new Date(2009, 9, 25, 0, 0, 30), end)).toMatchObject({ months: 0, days: 7, hours: 0, minutes: 30 });
+				// Backwards, to the first minute of November: 30 minutes and 30 seconds earlier.
+				const first = new Date(2009, 10, 1, 0, 0, 30);
+				expect(helpers.intervalToDuration(end, first)).toEqual({ years: 0, months: 0, days: 0, hours: 0, minutes: -30, seconds: -30, milliseconds: 0 });
+				// The later date is 30 minutes earlier on the timeline, though in the next month: no complete unit either way.
+				expect(helpers.diffInMonths(first, end)).toBe(0);
+				expect(helpers.diffInWeeks(first, end)).toBe(0);
+				expect(helpers.diffInMonths(end, first)).toBe(0);
+				// In the last 2 minutes of a day, the check is made whatever the offsets (they hide changes shorter than that).
+				expect(helpers.diffInWeeks(new Date(2009, 6, 8, 23, 59), new Date(2009, 6, 1, 23, 59, 30))).toBe(0);
+			});
+			withTimeZone('America/Sitka', function () {
+				// 1867-10-19 15:30 (+14:58:47) became 1867-10-18 15:30 (-09:01:13) when Alaska was sold: October 18th came back for a day.
+				const end = new Date(Date.UTC(1867, 9, 19, 2, 31, 13));
+				const start = new Date(1867, 9, 12, 10);
+				expect(helpers.diffInWeeks(end, start)).toBe(1);
+				expect(helpers.intervalToDuration(start, end)).toMatchObject({ months: 0, days: 7, hours: 7, minutes: 30 });
 			});
 		});
 
@@ -3688,6 +3735,16 @@ describe('Date helpers (scheduling round)', function () {
 			expect(helpers.isBusinessDay(new Date(2024, 11, 27, 1), { holidays: christmas })).toBe(true);
 			expect(helpers.isBusinessDay(new Date(2024, 11, 24, 23, 59), { holidays: christmas })).toBe(true);
 			expect(helpers.isBusinessDay(new Date(2024, 11, 24), {})).toBe(true);
+			// A weekend day behind a getter is read once: the day that is validated is the one that is used.
+			let reads = 0;
+			const shifty = [] as helpers.WeekdayIndex[];
+			Object.defineProperty(shifty, 0, {
+				get: function () {
+					return reads++ === 0 ? 0 : 3;
+				},
+				enumerable: true
+			});
+			expect(helpers.isBusinessDay(new Date(2024, 4, 15), { weekend: shifty })).toBe(true);
 			expect(function () {
 				helpers.isBusinessDay(INVALID);
 			}).toThrow(new RangeError('Invalid date'));
@@ -4753,6 +4810,24 @@ describe('Cron', function () {
 			} finally {
 				delete (Object.prototype as Record<string, unknown>)[key];
 			}
+		}
+	});
+
+	it('does not read the first character of an empty expression or time zone from a polluted Object.prototype', function () {
+		(Object.prototype as Record<string, unknown>)[0] = '@';
+		try {
+			// `''[0]` is looked up on the prototypes: it read as a macro.
+			expect(function () {
+				helpers.parseCron('  ');
+			}).toThrow('must have 5 fields');
+		} finally {
+			delete (Object.prototype as Record<string, unknown>)[0];
+		}
+		(Object.prototype as Record<string, unknown>)[0] = '+';
+		try {
+			expect(helpers.isValidTimeZone('')).toBe(false);
+		} finally {
+			delete (Object.prototype as Record<string, unknown>)[0];
 		}
 	});
 
