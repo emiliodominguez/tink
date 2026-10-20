@@ -1,4 +1,4 @@
-import { extendedGcd, findRoot, integerSqrt, linspace, niceDomain, primeFactors, summarize, ticks, toFraction } from 'tinkit/math';
+import { allocate, extendedGcd, findRoot, integerSqrt, linspace, niceDomain, primeFactors, summarize, ticks, toFraction } from 'tinkit/math';
 import type { ExtendedGcd, FindRootOptions, LinspaceOptions, Summary } from 'tinkit/math';
 
 const root: number = integerSqrt(17);
@@ -7,6 +7,11 @@ const bigRoot: bigint = integerSqrt(10n ** 40n);
 const notBig: bigint = integerSqrt(17);
 declare const either: number | bigint;
 const eitherRoot: number | bigint = integerSqrt(either);
+const eitherShares: number[] | bigint[] = allocate(either, [1, 2n]);
+const numberShares: number[] = allocate(100, [1, 1]);
+const bigShares: bigint[] = allocate(100n, [1, 1]);
+// @ts-expect-error a number or bigint total may give bigint shares
+const notNumbers: number[] = allocate(either, [1]);
 const bezout: ExtendedGcd = extendedGcd(240, 46);
 // @ts-expect-error the coefficients are read-only
 bezout.x = 0;
@@ -24,4 +29,4 @@ const summary: Summary = summarize([1, 2, 3]);
 const spread: number = summary.q3 - summary.q1;
 // @ts-expect-error unknown field
 void summary.mode;
-void [root, bigRoot, notBig, eitherRoot, numerator, denominator, low, high, found, spaced, tickValues, factors, spread];
+void [root, bigRoot, notBig, eitherRoot, eitherShares, numberShares, bigShares, notNumbers, numerator, denominator, low, high, found, spaced, tickValues, factors, spread];

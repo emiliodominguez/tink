@@ -1176,6 +1176,22 @@ describe('Math helpers', function () {
 			expect(helpers.weightedAverage([10, 20], [1e300, 3e300])).toBe(17.5);
 		});
 
+		it('should not turn a mean next to Number.MAX_VALUE into NaN', function () {
+			const largest = Number.MAX_VALUE;
+			// The quotient of the scaled sums rounded up to Infinity, and the Newton step made it NaN.
+			expect(helpers.weightedAverage([largest, largest, largest], [0.1, 0.3, 0.7])).toBe(largest);
+			expect(helpers.weightedAverage([largest, largest, largest, largest, largest], [0.1, 0.6, 0.4, 0.9, 0.3])).toBe(largest);
+			for (const weights of [
+				[0.1, 0.2],
+				[0.3, 0.3, 0.3],
+				[0.7, 0.9, 0.1, 0.5],
+				[1, 3, 7]
+			]) {
+				expect(helpers.weightedAverage(new Array(weights.length).fill(largest), weights)).toBe(largest);
+				expect(helpers.weightedAverage(new Array(weights.length).fill(-largest), weights)).toBe(-largest);
+			}
+		});
+
 		it('should return NaN when the total weight is 0', function () {
 			expect(helpers.weightedAverage([10, 20], [0, 0])).toBeNaN();
 			expect(helpers.weightedAverage([], [])).toBeNaN();
@@ -1261,6 +1277,22 @@ describe('Math helpers', function () {
 			}
 		});
 
+		it('should read exponents of any length, in linear time', function () {
+			expect(helpers.parseBytes(`1e${'0'.repeat(40)}3 B`)).toBe(1000);
+			expect(helpers.parseBytes(`0e${'9'.repeat(40)} YB`)).toBe(0);
+			expect(helpers.parseBytes(`5e-${'9'.repeat(40)} kB`)).toBe(0);
+			expect(helpers.parseBytes(`${'1'.repeat(30)}e-${'0'.repeat(20)}29 kB`)).toBe(Number(`${'1'.repeat(30)}e-26`));
+			// Parsing the exponent as a BigInt took over a second for 4 million digits.
+			const digits = '9'.repeat(4_000_000);
+			const start = performance.now();
+			expect(helpers.parseBytes(`0e${digits} B`)).toBe(0);
+			expect(helpers.parseBytes(`1e-${digits} B`)).toBe(0);
+			expect(function () {
+				helpers.parseBytes(`1e${digits} B`);
+			}).toThrow(RangeError);
+			expect(performance.now() - start).toBeLessThan(500);
+		});
+
 		it('should reject garbage instead of half-parsing it', function () {
 			const rejected = [
 				'1 Mb',
@@ -1300,6 +1332,9 @@ describe('Math helpers', function () {
 			expect(function () {
 				helpers.parseBytes(1024 as any);
 			}).toThrow(new TypeError('parseBytes: `value` must be a string, got number'));
+			expect(function () {
+				helpers.parseBytes(`1e${'1'.repeat(30)} B`);
+			}).toThrow(RangeError);
 			expect(function () {
 				helpers.parseBytes('1 kB', { base: 1000.5 as any });
 			}).toThrow(new RangeError('parseBytes: `base` must be 1000 or 1024, got 1000.5'));
@@ -1461,6 +1496,21 @@ describe('Math helpers', function () {
 			expect(helpers.nthRoot(-32, 5)).toBe(-2);
 			expect(helpers.nthRoot(-7, 1)).toBe(-7);
 			expect(helpers.nthRoot(-2, 7) ** 7).toBeCloseTo(-2, 12);
+		});
+
+		it('should always return a number, converting the value with unary +', function () {
+			// 1.6.0 (unreleased) returned the value itself for `n = 1`, zeros, infinities and NaN: a string, `null` or `undefined`.
+			expect(helpers.nthRoot('8' as never, 1)).toBe(8);
+			expect(helpers.nthRoot('0' as never, 5)).toBe(0);
+			expect(helpers.nthRoot('Infinity' as never, 7)).toBe(Infinity);
+			expect(helpers.nthRoot(null as never, 5)).toBe(0);
+			expect(helpers.nthRoot('abc' as never, 5)).toBeNaN();
+			expect(helpers.nthRoot(undefined as never, 4)).toBeNaN();
+			expect(helpers.nthRoot('-32' as never, 5)).toBe(-2);
+			expect(helpers.nthRoot('16' as never, 4)).toBe(2);
+			expect(function () {
+				helpers.nthRoot(8n as never, 5);
+			}).toThrow(TypeError);
 		});
 
 		it('should return NaN for even roots of negative numbers', function () {
@@ -2521,6 +2571,51 @@ describe('histogram', function () {
 });
 
 describe('Math helpers under prototype pollution', function () {
+	it('do not read a planted NaN tolerance as an option', function () {
+		const polluted = Object.prototype as Record<string, unknown>;
+		polluted.relative = NaN;
+		polluted.absolute = NaN;
+		try {
+			// A planted NaN was not recognised as inherited (`NaN !== NaN`) and every call with options threw.
+			expect(helpers.approximatelyEqual(1, 1 + 1e-12, {})).toBe(true);
+			expect(helpers.approximatelyEqual(1, 2, {})).toBe(false);
+		} finally {
+			delete polluted.relative;
+			delete polluted.absolute;
+		}
+	});
+
+	it('never read missing array indices, which fall through to Object.prototype', function () {
+		const polluted = Object.prototype as Record<string, unknown>;
+		Object.assign(polluted, { '-1': 5, 0: 3, 1: 'abc', 23: 1, 25: 1 });
+		try {
+			// The largest value of an empty sorted copy was read at index -1.
+			expect(helpers.median([])).toBeNaN();
+			expect(helpers.quantile([], 0.5)).toBeNaN();
+			expect(helpers.percentile([], 50)).toBeNaN();
+			expect(helpers.interquartileRange([])).toBeNaN();
+			expect(helpers.medianAbsoluteDeviation([])).toBeNaN();
+			expect(helpers.trimmedMean([], 0.1)).toBeNaN();
+			expect(helpers.summarize([]).median).toBeNaN();
+			// The power of ten of `decimals` outside 0..22 was read from the table.
+			expect(helpers.ceil(1.21, 23)).toBe(1.21);
+			expect(helpers.round(1.4, 25)).toBe(1.4);
+			expect(helpers.round(1234, -1)).toBe(1230);
+			expect(helpers.floor(1234, -1)).toBe(1230);
+			expect(helpers.trunc(1234, -1)).toBe(1230);
+			expect(helpers.roundHalfEven(1234, -1)).toBe(1230);
+			// The fraction of a number without a decimal point was read at index 1 of its split.
+			expect(helpers.decimalPlaces(100)).toBe(0);
+			expect(helpers.roundToStep(7, 5)).toBe(5);
+			// The tick before the first one was read at index -1.
+			expect(helpers.ticks(0, 1, 5)).toEqual([0, 0.2, 0.4, 0.6, 0.8, 1]);
+			polluted['-1'] = Infinity;
+			expect(helpers.ticks(5, 10, 3)).toEqual([6, 8, 10]);
+		} finally {
+			for (const key of ['-1', '0', '1', '23', '25']) delete polluted[key];
+		}
+	});
+
 	it('read their options as own properties only', function () {
 		const clean = helpers.histogram([1, 2, 3, 4]);
 		const polluted = Object.prototype as Record<string, unknown>;

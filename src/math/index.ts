@@ -154,7 +154,7 @@ export function round(input: number, decimals = 0): number {
 	// Away from ties, `Math.round` (ties towards +Infinity) agrees with rounding half away from zero, signs and `-0` included.
 	// Near ties, for huge values (the margin exceeds `0.5` beyond `2 ** 45`), for non-finite numbers and for `decimals` outside
 	// `0..22` (no exact power of ten: the product is `NaN`, which fails the margin test), the decimal strings are edited instead.
-	const scale = POWERS_OF_TEN[decimals];
+	const scale = powerOfTen(decimals);
 	const scaled = number * scale;
 	if (Math.abs(scaled - Math.floor(scaled) - 0.5) > Math.abs(scaled) * 2 ** -46) return Math.round(scaled) / scale;
 	// Non-finite input, or the number already has at most `decimals` fractional digits: rounding is the identity.
@@ -190,6 +190,16 @@ function roundDecimalString(value: number, decimals: number): number {
 
 /** `10 ** k` for `k` in `0..22`, the powers of ten that are exactly representable as doubles. */
 const POWERS_OF_TEN: ReadonlyArray<number> = [1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22];
+
+/**
+ * The exact power of ten `10 ** decimals` for `decimals` in `0..22`, `NaN` otherwise. Indices outside the table are not read from it: they
+ * would fall through to `Object.prototype`, where a polluted `'-1'` or `'23'` key would be taken for a power of ten.
+ * @param {number} decimals - An integer
+ * @returns {number} The power of ten, or `NaN`
+ */
+function powerOfTen(decimals: number): number {
+	return decimals >= 0 && decimals <= 22 ? POWERS_OF_TEN[decimals] : NaN;
+}
 
 /**
  * Calculates the arithmetic mean of an array of numbers (using the compensated {@link sum}, so numeric strings count as numbers).
@@ -422,7 +432,7 @@ function roundDirected(caller: string, method: (value: number) => number, input:
 	const number = +input;
 	// Fast path (see `round`): unless the scaled product lies within a safety margin of an integer, it rounds to the same integer `k` as
 	// the decimal-shifted value, and `k / 10 ** decimals` is the double nearest to `k e-decimals`.
-	const scale = POWERS_OF_TEN[decimals];
+	const scale = powerOfTen(decimals);
 	const scaled = number * scale;
 	if (Math.abs(scaled - Math.round(scaled)) > Math.abs(scaled) * 2 ** -46) return method(scaled) / scale;
 	if (!Number.isFinite(number)) return number;
@@ -744,8 +754,9 @@ export function median(numbers: ReadonlyArray<number>): number {
  */
 function sortedMedian(sorted: ArrayLike<number>): number {
 	const length = sorted.length;
-	// The largest value is missing (empty input) or NaN (sorted last): the median is undefined.
-	if (!(sorted[length - 1] <= Infinity)) return NaN;
+	// No values (index `-1` is not read: it would fall through to `Object.prototype`), or the largest is NaN (sorted last): the median is
+	// undefined.
+	if (length === 0 || !(sorted[length - 1] <= Infinity)) return NaN;
 	const middle = length >> 1;
 	if (length % 2 === 1) return sorted[middle];
 	const low = sorted[middle - 1];
@@ -1326,7 +1337,9 @@ function interpolateSorted(low: number, high: number, t: number): number {
  */
 function signedDecimalPlaces(value: number): number {
 	const [mantissa, exponent = '0'] = String(value).split('e');
-	return (mantissa.split('.')[1] ?? '').length - Number(exponent);
+	// Not `mantissa.split('.')[1]`: without a point, index 1 is missing and would be read from a polluted `Object.prototype`.
+	const point = mantissa.indexOf('.');
+	return (point === -1 ? 0 : mantissa.length - point - 1) - Number(exponent);
 }
 
 /**
@@ -1359,8 +1372,8 @@ export function quantile(numbers: ReadonlyArray<number>, q: number): number {
  */
 function sortedQuantile(sorted: ArrayLike<number>, q: number): number {
 	const length = sorted.length;
-	// The largest value is missing (empty input) or NaN (sorted last): the quantile is undefined.
-	if (!(sorted[length - 1] <= Infinity)) return NaN;
+	// No values (index `-1` is not read, see `sortedMedian`), or the largest is NaN (sorted last): the quantile is undefined.
+	if (length === 0 || !(sorted[length - 1] <= Infinity)) return NaN;
 	const position = (length - 1) * q;
 	const lowerIndex = Math.floor(position);
 	// At q = 1 the factor is 0, so the (missing) value after the maximum is never used.
@@ -1470,9 +1483,12 @@ export function cumulativeSum(numbers: Iterable<number>): number[] {
 export function approximatelyEqual(a: number, b: number, options?: ApproximatelyEqualOptions): boolean {
 	// Often called in loops: read inline (see `readOption`), and not at all without options.
 	let relative = options === undefined ? undefined : options.relative;
-	if (relative === undefined || (relative === (Object.prototype as ApproximatelyEqualOptions).relative && !Object.hasOwn(options as object, 'relative'))) relative = 1e-9;
+	// `Object.is`, not `===`, as in `readOption`: a planted `NaN` is recognised too.
+	if (relative === undefined || (Object.is(relative, (Object.prototype as ApproximatelyEqualOptions).relative) && !Object.hasOwn(options as object, 'relative')))
+		relative = 1e-9;
 	let absolute = options === undefined ? undefined : options.absolute;
-	if (absolute === undefined || (absolute === (Object.prototype as ApproximatelyEqualOptions).absolute && !Object.hasOwn(options as object, 'absolute'))) absolute = 0;
+	if (absolute === undefined || (Object.is(absolute, (Object.prototype as ApproximatelyEqualOptions).absolute) && !Object.hasOwn(options as object, 'absolute')))
+		absolute = 0;
 	assertNumber('approximatelyEqual', 'relative', relative, relative >= 0, 'a number >= 0');
 	assertNumber('approximatelyEqual', 'absolute', absolute, absolute >= 0, 'a number >= 0');
 	if (a === b) return true;
@@ -1487,6 +1503,8 @@ export function approximatelyEqual(a: number, b: number, options?: Approximately
  * corrected by one Newton step, so `weightedAverage([1, 2], [1, 3])` is exactly `1.75` (dividing the weights by the largest one gave
  * `1.7500000000000002`). The exceptions are an exact tie between two doubles that terms below `2 ** -100` of the mean tip one way, products
  * below the normal doubles, and weights below about `2 ** -1022` times the largest one, which are rounded (an ulp at most, for the first).
+ * The sums are compensated, not exact: when products of opposite signs cancel, the error is bounded as for {@link dot}, by about an ulp
+ * plus `n² · 2 ** -106` times `Σ(|value| × weight) / Σ(weight)` for `n` values.
  * Weights are rescaled by a power of two first (exactly), so only their ratios matter and very large or tiny (subnormal) weights neither
  * overflow nor underflow, and the result does not overflow when the mean is finite.
  * Values and weights are converted with unary `+` (numeric strings count as numbers). An infinite or `NaN` value makes the result
@@ -1652,6 +1670,13 @@ export function allocate(total: number, ratios: ReadonlyArray<number | bigint>):
  * allocate(5n, [1, 1]); // => [3n, 2n]
  */
 export function allocate(total: bigint, ratios: ReadonlyArray<number | bigint>): bigint[];
+/**
+ * {@link allocate} for a total that may be either a number or a bigint: the shares have the type of `total`.
+ * @param {number | bigint} total - The amount to split: a safe integer, or a bigint
+ * @param {ReadonlyArray<number | bigint>} ratios - One finite, non-negative weight per share, not all zero
+ * @returns {number[] | bigint[]} The shares, of the same type as `total`
+ */
+export function allocate(total: number | bigint, ratios: ReadonlyArray<number | bigint>): number[] | bigint[];
 /**
  * Splits an integer amount in proportion to some ratios without losing or creating a unit (see the overloads).
  * @param {number | bigint} total - The amount to split: a safe integer, or a bigint
@@ -1831,9 +1856,11 @@ export function parseBytes(value: string, options: ParseBytesOptions = {}): numb
 		// `-1` for an unknown unit; the IEC symbols are the only ones with three letters.
 		const power = Math.max(SI_BYTE_UNITS.indexOf(unit), IEC_BYTE_UNITS.indexOf(unit));
 		const decimal = base === 1000 && unit.length < 3;
-		// SI multiples go into the decimal exponent, so the text is converted to a double only once.
-		// (`BigInt` writes the exponent in full: a number of 1e21 or more would print as `1e+21`.)
-		if (power >= 0) bytes = Number(`${match[1]}e${BigInt(match[2] ?? 0) + BigInt(decimal ? 3 * power : 0)}`) * (decimal ? 1 : Math.pow(1024, power));
+		// SI multiples go into the decimal exponent, so the text is converted to a double only once. The exponent is clamped to `±1e15`, which
+		// changes nothing (beyond it, any number of digits that fits in a string is `0` or beyond the doubles), and keeps it an exact integer
+		// that prints in full (from 1e21 it would print as `1e+21`); parsing millions of its digits as a `BigInt` took seconds.
+		const exponent = Math.min(Math.max(Number(match[2] ?? 0), -1e15), 1e15) + (decimal ? 3 * power : 0);
+		if (power >= 0) bytes = Number(`${match[1]}e${exponent}`) * (decimal ? 1 : Math.pow(1024, power));
 	}
 	if (!Number.isFinite(bytes)) {
 		const shown = value.length > 50 ? `${value.slice(0, 50)}…` : value;
@@ -3461,8 +3488,8 @@ export function trimmedMean(numbers: ReadonlyArray<number>, proportion: number):
 	assertNumber('trimmedMean', 'proportion', proportion, proportion >= 0 && proportion < 0.5, 'a number in [0, 0.5)');
 	const sorted = sortedCopy(numbers);
 	const length = sorted.length;
-	// The largest value is missing (empty input) or NaN (sorted last).
-	if (!(sorted[length - 1] <= Infinity)) return NaN;
+	// No values (index `-1` is not read, see `sortedMedian`), or the largest is NaN (sorted last).
+	if (length === 0 || !(sorted[length - 1] <= Infinity)) return NaN;
 	const cut = Math.floor(length * proportion);
 	const kept: number[] = [];
 	for (let i = cut; i < length - cut; i++) kept.push(sorted[i]);
@@ -3712,7 +3739,7 @@ export function roundHalfEven(input: number, decimals = 0): number {
 	assertNumber('roundHalfEven', 'decimals', decimals, Number.isInteger(decimals), 'an integer');
 	const number = +input;
 	// The fast path of `round`: away from a tie, `Math.round` agrees with every rounding to nearest.
-	const scale = POWERS_OF_TEN[decimals];
+	const scale = powerOfTen(decimals);
 	const scaled = number * scale;
 	if (Math.abs(scaled - Math.floor(scaled) - 0.5) > Math.abs(scaled) * 2 ** -46) return Math.round(scaled) / scale;
 	if (!Number.isFinite(number) || signedDecimalPlaces(number) <= decimals) return number;
@@ -4534,11 +4561,12 @@ export function ticks(start: number, stop: number, count = 10): number[] {
 	const [first, last, increment] = tickSpec(low, high, count);
 	const result: number[] = [];
 	// Counted with `k`: beyond `2 ** 53` (a step finer than the precision of the domain) `first + k` can stop growing. Such ticks are not
-	// distinct, and are only kept when they are inside the domain and above the previous one.
+	// distinct, and are only kept when they are inside the domain and above the previous one (the first one has none: `result[-1]` would be
+	// read from `Object.prototype`).
 	for (let k = 0; k <= last - first; k++) {
 		const index = first + k;
 		const tick = increment < 0 ? index / -increment : index * increment;
-		if (tick >= low && tick <= high && !(tick <= result[result.length - 1])) result.push(tick);
+		if (tick >= low && tick <= high && !(result.length > 0 && tick <= result[result.length - 1])) result.push(tick);
 	}
 	return reverse ? result.reverse() : result;
 }
