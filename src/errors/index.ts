@@ -697,7 +697,8 @@ function readErrors(value: object): unknown[] {
 	const items: unknown[] = [];
 	try {
 		const errors = hasOwn.call(value, 'errors') ? (value as { errors: unknown }).errors : undefined;
-		if (Array.isArray(errors)) for (let index = 0; index < errors.length; index++) items.push(errors[index]);
+		// A hole reads as `undefined`, not as a polluted `Object.prototype[index]`.
+		if (Array.isArray(errors)) for (let index = 0; index < errors.length; index++) items.push(hasOwn.call(errors, index) ? errors[index] : undefined);
 	} catch {
 		// A revoked proxy, or a throwing getter or trap: the items read so far are kept.
 	}
@@ -804,7 +805,9 @@ function headerOf(value: unknown): string {
  */
 function pushFrames(lines: string[], stack: string, header: string, indent: string): void {
 	let frames = stack;
-	if (stack.startsWith(header)) frames = stack.slice(header.length);
+	// The header must be the whole first line: after `error.message = 'Request'`, a stack written as `Error: Request failed` starts with the
+	// new header too, and ` failed` would be printed as a frame.
+	if (stack.startsWith(header) && (stack.length === header.length || stack.charCodeAt(header.length) === 10)) frames = stack.slice(header.length);
 	else {
 		// A header written before the message or name changed: V8's frames start at the first `at` line (`[ \t]`, not `\s`, keeps the
 		// search linear). Other engines (Firefox, Safari) write frames only.

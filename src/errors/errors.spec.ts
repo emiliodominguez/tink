@@ -1128,6 +1128,20 @@ describe('errors (1.4)', function () {
 			}
 		});
 
+		it('reads a hole of an errors array as undefined, not as a polluted Object.prototype[index] (regression)', function () {
+			const prototype = Object.prototype as Record<number, unknown>;
+			const errors: unknown[] = [];
+			errors[1] = new Error('b');
+			const holey = { name: 'AggregateError', message: 'g', errors };
+			prototype[0] = new Error('planted');
+			try {
+				expect(getErrorChain(holey, { aggregate: true })).toEqual([holey, undefined, errors[1]]);
+				expect(formatError(holey, { stack: false })).toBe('AggregateError: g\n  [1/2] undefined\n  [2/2] Error: b');
+			} finally {
+				delete prototype[0];
+			}
+		});
+
 		it('follows the causes of objects only, not of functions', function () {
 			const fn = Object.assign(function () {}, { cause: new Error('never followed') });
 			expect(getErrorChain(fn)).toEqual([fn]);
@@ -1274,6 +1288,21 @@ describe('errors (1.4)', function () {
 			expect(formatError(firefox)).toBe('Error: x\n    run@file.js:1:1');
 			const noStack = { name: 'Plain', message: 'no stack' };
 			expect(formatError(noStack)).toBe('Plain: no stack');
+		});
+
+		it('drops a stale V8 header that the current header is a prefix of (regression: its end was printed as a frame)', function () {
+			const shortened = new Error('Request');
+			shortened.stack = 'Error: Request failed\n    at a (file.js:1:1)';
+			expect(formatError(shortened)).toBe('Error: Request\n    at a (file.js:1:1)');
+			const emptied = new TypeError('');
+			emptied.stack = 'TypeError: boom\n    at a (file.js:1:1)';
+			expect(formatError(emptied)).toBe('TypeError\n    at a (file.js:1:1)');
+			const nameless = Object.assign(new Error(''), { name: '' });
+			nameless.stack = 'Error\n    at a (file.js:1:1)';
+			expect(formatError(nameless)).toBe('\n    at a (file.js:1:1)');
+			const headerOnly = new Error('x');
+			headerOnly.stack = 'Error: x';
+			expect(formatError(headerOnly)).toBe('Error: x');
 		});
 
 		it('stays linear on hostile stacks', function () {
