@@ -2604,6 +2604,15 @@ let explainRun: object | undefined;
 let explainRoot: object | undefined;
 
 /**
+ * Whether the outermost check (or {@link explain} call) that ended last may have left the memos of the lazy guards filled: it sets this
+ * before calling `release` in its `finally` and clears it after, so a stack overflow that this call meets again (when the check ran near
+ * the stack limit) leaves it set, and the next outermost check releases them before it starts. Its verdicts would otherwise answer that
+ * check for the same objects (a `PENDING` reading as a cycle), however they changed since. Tested before calling `release`, which costs
+ * more than many checks.
+ */
+let unreleased = false;
+
+/**
  * Returns the table of a lazy guard's results for `value` while a discriminated union checks it (`discriminated.object === value`; the
  * lazy guard uses its plain table otherwise): one table per set of discriminant keys, created on first use, since an exact shape accepts
  * those keys on `value` there and nowhere else. Only the innermost run of entries for `value` counts: deeper ones belong to an ancestor
@@ -2714,6 +2723,11 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 			const guard = resolve();
 
 			if (typeof value !== 'object' || value === null) return guard(value);
+			// The outermost check starts from empty memos (see `unreleased`).
+			if (unreleased && scope.depth === 0) {
+				release();
+				unreleased = false;
+			}
 
 			// Inline test of the usual case: not inside a discriminated union's check of this object (see `tableOf`). A cycle met in another
 			// discriminant context than the one it started in is caught one turn later, in the same context: the result is `false` either way.
@@ -2752,7 +2766,11 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 				throw error;
 			} finally {
 				if (--scope.checks === 0) scope.checkRoot = undefined;
-				if (--scope.depth === 0) release();
+				if (--scope.depth === 0) {
+					unreleased = true;
+					release();
+					unreleased = false;
+				}
 			}
 		},
 		function explainLazy(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
@@ -3012,7 +3030,12 @@ export function explain(guard: Guard<unknown>, value: unknown): SchemaIssue[] {
 	const previousRun = explainRun;
 	const previousRoot = explainRoot;
 
-	// The memos of the lazy guards (see `utils/memo.ts`) live until the end, so explaining reuses what checking found.
+	// The memos of the lazy guards (see `utils/memo.ts`) live until the end, so explaining reuses what checking found; the outermost call
+	// starts from empty ones (see `unreleased`).
+	if (unreleased && scope.depth === 0) {
+		release();
+		unreleased = false;
+	}
 	explainRun = {};
 	if (previousRun === undefined) explainRoot = scope.checks === 0 ? explainRun : (scope.checkRoot ??= {});
 	scope.depth++;
@@ -3031,7 +3054,11 @@ export function explain(guard: Guard<unknown>, value: unknown): SchemaIssue[] {
 	} finally {
 		explainRun = previousRun;
 		explainRoot = previousRoot;
-		if (--scope.depth === 0) release();
+		if (--scope.depth === 0) {
+			unreleased = true;
+			release();
+			unreleased = false;
+		}
 	}
 
 	return issues;

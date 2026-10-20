@@ -1622,3 +1622,50 @@ describe('guards (pass 5 regressions)', function () {
 		}).toThrow(new TypeError('isIntegerInRange: `max` must be a number >= min (0), got object'));
 	});
 });
+
+describe('guards (pass 6 regressions)', function () {
+	/**
+	 * Runs `action` while `Map.prototype.clear` throws, as a stack overflow does when the outermost check calls `release` in its `finally`
+	 * near the stack limit: the memos of the lazy guards are then left with what that check found.
+	 * @param {() => unknown} action - The check
+	 * @returns {void}
+	 */
+	function withoutRelease(action: () => unknown): void {
+		const clear = Map.prototype.clear;
+
+		Map.prototype.clear = function (): void {
+			throw new RangeError('Maximum call stack size exceeded');
+		};
+		try {
+			expect(action).toThrow(RangeError);
+		} finally {
+			Map.prototype.clear = clear;
+		}
+	}
+
+	type Tree = { a: unknown; c?: Tree[] };
+	const isTree: Guard<Tree> = isLazy(function (): Guard<Tree> {
+		return isShape({ a: isFiniteNumber, c: isOptional(isArrayOf(isTree)) });
+	});
+
+	it('an outermost check does not read the verdicts of a check that could not release its memos', function () {
+		const tree: Tree = { a: 1, c: [{ a: 1 }] };
+
+		withoutRelease(function (): boolean {
+			return isTree(tree);
+		});
+		(tree.c as Tree[])[0].a = 'x';
+		expect(isTree(tree)).toBe(false);
+		expect(explain(isTree, tree)).toEqual([{ message: 'Invalid value (got string)', path: ['c', 0, 'a'] }]);
+	});
+
+	it('an outermost explain does not read the verdicts of an explain that could not release its memos', function () {
+		const tree: Tree = { a: 1, c: [{ a: 1 }] };
+
+		withoutRelease(function (): unknown {
+			return explain(isTree, tree);
+		});
+		(tree.c as Tree[])[0].a = 'x';
+		expect(explain(isTree, tree)).toEqual([{ message: 'Invalid value (got string)', path: ['c', 0, 'a'] }]);
+	});
+});
