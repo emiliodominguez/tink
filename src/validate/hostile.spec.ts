@@ -20,6 +20,7 @@ import {
 	blankAsUndefined,
 	chain,
 	discriminatedUnion,
+	incrementSemver,
 	lazy,
 	nullable,
 	optional,
@@ -372,5 +373,36 @@ describe('outputs and arrays under hardened or foreign prototypes', function () 
 		const foreign = vm.runInNewContext('Array.prototype[0] = "evil"; [, "b"]') as unknown[];
 		expect(safeParse(arrayOf(optional(isString)), foreign)).toEqual([undefined, [undefined, 'b']]);
 		expect(safeParse(tuple(optional(isString), isString), foreign)).toEqual([undefined, [undefined, 'b']]);
+	});
+
+	it('defines inherited keys when Object.prototype holds a get or a set', function () {
+		const getter = polluted(Object.prototype, 'get', String, function () {
+			return [
+				safeParse(recordOf(asInteger), JSON.parse('{"constructor":"1","toString":2}')),
+				safeParse({ get: asInteger }, { get: '3' }),
+				safeParse(discriminatedUnion('constructor', { a: { set: asInteger } }), { constructor: 'a', set: '4' })
+			];
+		});
+		const setter = polluted(Object.prototype, 'set', String, function () {
+			return safeParse(recordOf(asInteger), { constructor: 5 });
+		});
+
+		expect(getter).toEqual([
+			[undefined, { constructor: 1, toString: 2 }],
+			[undefined, { get: 3 }],
+			[undefined, { constructor: 'a', set: 4 }]
+		]);
+		expect(setter).toEqual([undefined, { constructor: 5 }]);
+	});
+});
+
+describe('semver under prototype pollution', function () {
+	it('should not read pre-release identifiers past the end from Object.prototype', function () {
+		// `beta` bumps to `beta.0`, which is shorter than the wanted `beta.0` plus a counter: index 2 is past its end.
+		const result = polluted(Object.prototype, 2, 7, function () {
+			return incrementSemver('1.2.4-beta', 'prerelease', { identifier: 'beta.0' });
+		});
+
+		expect(result).toBe('1.2.4-beta.0.0');
 	});
 });

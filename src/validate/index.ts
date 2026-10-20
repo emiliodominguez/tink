@@ -1636,8 +1636,9 @@ function bumpPrerelease(prerelease: (string | number)[], identifier: string | un
 	if (identifier === undefined) return prerelease;
 
 	const wanted = identifier.split('.');
-	// `Number` as node-semver's `isNaN`: past the end, or an identifier such as `beta`, is not a number (but `1e5` is).
-	let continues = !Number.isNaN(Number(prerelease[wanted.length]));
+	// `Number` as node-semver's `isNaN`: past the end, or an identifier such as `beta`, is not a number (but `1e5` is). Past the end is
+	// not read: a hole would be looked up on a polluted `Object.prototype`.
+	let continues = wanted.length < prerelease.length && !Number.isNaN(Number(prerelease[wanted.length]));
 	for (let i = 0; continues && i < wanted.length; i++) continues = String(prerelease[i]) === wanted[i];
 	return continues ? prerelease : base === false ? [identifier] : [identifier, counter];
 }
@@ -2146,6 +2147,18 @@ export function parseJson(text: string, guardOrOptions?: Guard<unknown> | ParseJ
 const FAIL = Symbol.for('tinkit.parse.fail');
 
 /**
+ * The issue list of the outermost report running (see {@link report}), `undefined` between parses: the list of the parse the caller
+ * sees, as opposed to the lists of parses nested in a guard, a `check` predicate or a transform (see {@link lazy}).
+ */
+let rootIssues: SchemaIssue[] | undefined;
+
+/** Where a {@link lazy} parser reported an invalid object: its first issue, at `index` in the list it went to. */
+interface LazyReport {
+	readonly index: number;
+	readonly first: SchemaIssue;
+}
+
+/**
  * Parses `value` without reporting anything: returns the output, or {@link FAIL} at the first problem. Valid values (the common case)
  * only take this path; invalid ones are parsed again by the schema's {@link Run}, which builds the issues and their paths.
  */
@@ -2505,15 +2518,27 @@ function standardNode(schema: StandardSchemaLike): Node {
 /**
  * Sets `output[key]` as an own property. A key the output inherits is defined rather than assigned: `__proto__` would replace the
  * prototype, an inherited setter (a polluted prototype) would run, and an inherited read-only property (a frozen `Object.prototype`
- * keeps `toString` read-only) would make the assignment throw.
+ * keeps `toString` read-only) would make the assignment throw. A descriptor that inherits a `get` or `set` from a polluted
+ * `Object.prototype` (an accessor with a value, which `Object.defineProperty` rejects) is given again without a prototype.
  * @param {Record<string, unknown>} output - The object being built
  * @param {string} key - The key
  * @param {unknown} value - The value
  * @returns {void}
  */
 function assign(output: Record<string, unknown>, key: string, value: unknown): void {
-	if (key in output) Object.defineProperty(output, key, { value, enumerable: true, writable: true, configurable: true });
-	else output[key] = value;
+	if (!(key in output)) {
+		output[key] = value;
+
+		return;
+	}
+
+	const descriptor: PropertyDescriptor = { value, enumerable: true, writable: true, configurable: true };
+
+	try {
+		Object.defineProperty(output, key, descriptor);
+	} catch {
+		Object.defineProperty(output, key, Object.setPrototypeOf(descriptor, null) as PropertyDescriptor);
+	}
 }
 
 /**
@@ -2743,7 +2768,7 @@ function execute(fast: Fast, run: Run, value: unknown, issues: SchemaIssue[]): u
  * @returns {unknown} The output (meaningless when issues were added)
  */
 function report(run: Run, value: unknown, issues: SchemaIssue[]): unknown {
-	scope.depth++;
+	if (scope.depth++ === 0) rootIssues = issues;
 	try {
 		return run(value, [], issues);
 	} catch (error) {
@@ -2754,7 +2779,10 @@ function report(run: Run, value: unknown, issues: SchemaIssue[]): unknown {
 
 		return undefined;
 	} finally {
-		if (--scope.depth === 0) release();
+		if (--scope.depth === 0) {
+			rootIssues = undefined;
+			release();
+		}
 	}
 }
 
@@ -3830,9 +3858,12 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 	let resolved: Node | undefined;
 	let resolving = false;
 	// The output for each object parsed by this parser during the current parse (see `utils/memo.ts`), and the objects reported during
-	// it: `PENDING` while being reported (meeting one again means a cycle), then the list its issues went to, so that an object reached
-	// again by another path of the same report is not reported again (once per path would be exponential in the depth of the objects a
-	// value shares). A parse nested in a guard or a transform reports to a list of its own, which the report around it does not hold.
+	// it: `PENDING` while being reported (meeting one again means a cycle), then where its issues went (a `LazyReport`), so that an object
+	// reached again by another path is not reported again (once per path would be exponential in the depth of the objects a value
+	// shares). The report the caller sees (`rootIssues`) always holds the issues its pointers refer to: an object reported only by a parse
+	// nested in a guard, a check or a transform, whose list it does not hold, or whose issues it dropped since (a missing property sums
+	// its issues up as `Missing required property`), is reported again there. A nested parse gets the pointer for an object reported
+	// anywhere, so that a guard parsing with this very parser, at every level of a value, stays linear too.
 	const memo = new Map<object, unknown>();
 	const reported = new Map<object, unknown>();
 	// The values being scored: a union that reaches this parser again on the same value (`lazy(() => union(a, nullable(self)))`) would
@@ -3918,7 +3949,8 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 
 			const state = reported.get(value);
 
-			if (state === PENDING || state === issues) {
+			// In the caller's report, an object whose issues are not there (any longer) is reported in full; see `reported` above.
+			if (state !== undefined && (state === PENDING || issues !== rootIssues || issues[(state as LazyReport).index] === (state as LazyReport).first)) {
 				issues.push({ message: state === PENDING ? 'Circular reference' : 'Invalid value (same object as reported at another path)', path: path.slice() });
 
 				return undefined;
@@ -3930,7 +3962,7 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 			let failed = false;
 
 			// A parser of another copy of tinkit may report through this one: the scope keeps `reported` until this call returns.
-			scope.depth++;
+			if (scope.depth++ === 0) rootIssues = issues;
 			try {
 				// The fast parse of this very value just failed: parsing it again first would double the cost at every level.
 				const output = node.run(value, path, issues);
@@ -3956,9 +3988,12 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 				}
 				throw error;
 			} finally {
-				if (failed) reported.set(value, issues);
+				if (failed) reported.set(value, { index: before, first: issues[before] });
 				else reported.delete(value);
-				if (--scope.depth === 0) release();
+				if (--scope.depth === 0) {
+					rootIssues = undefined;
+					release();
+				}
 			}
 		},
 		guard: undefined,

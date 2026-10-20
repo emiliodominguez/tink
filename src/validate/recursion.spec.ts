@@ -619,6 +619,66 @@ describe('recursive unions told apart deep inside', function () {
 		expect(issuesOf({ first: nestedCheck, second: item }, { first: {}, second: shared })).toEqual([{ message: 'nested', path: ['first'] }, idIssue]);
 	});
 
+	it('should report in linear time when a guard parses with the lazy parser at every level', function () {
+		type Chain = { id: number; child?: Chain };
+		let guardCalls = 0;
+		const chained: Parser<Chain> = lazy(function () {
+			return { id: asInteger, child: optional(isChained) };
+		});
+
+		/**
+		 * Accepts what `chained` parses, with a parse of its own at every level (each reports to a list of its own).
+		 * @param {unknown} value - The value
+		 * @returns {boolean} Whether `chained` accepts it
+		 */
+		function isChained(value: unknown): value is Chain {
+			guardCalls++;
+
+			return safeParse(chained, value)[0] === undefined;
+		}
+
+		let value: unknown = { id: 'x' };
+
+		for (let level = 0; level < 24; level++) value = { id: level, child: value };
+		// Each nested parse used to report the levels below it again, into its own list: 2^24 parses, hours.
+		expect(issuesOf(chained, value)).toEqual([{ message: 'Invalid value (got object)', path: ['child'] }]);
+		expect(guardCalls).toBeLessThan(500);
+	});
+
+	it('should report in full an object whose issues the report dropped for a missing property', function () {
+		const item = lazy(function () {
+			return { id: asInteger };
+		});
+		const shared = { id: 'x' };
+
+		/**
+		 * Accepts `undefined` only.
+		 * @param {unknown} value - The value
+		 * @returns {boolean} Whether it is `undefined`
+		 */
+		function isUndefined(value: unknown): value is undefined {
+			return value === undefined;
+		}
+
+		// A missing `a` becomes `shared`, whose issues are then summed up as `Missing required property`: `b` must not point at them.
+		const missingToShared = chain(
+			transform(isUndefined, function (): object {
+				return shared;
+			}),
+			item
+		);
+
+		expect(issuesOf({ a: missingToShared, b: item }, { b: shared })).toEqual([
+			{ message: 'Missing required property', path: ['a'] },
+			{ message: 'Expected an integer or an integer string (got string)', path: ['b', 'id'] }
+		]);
+		expect(issuesOf({ a: missingToShared, b: arrayOf(item) }, { b: [shared, shared] })).toEqual([
+			{ message: 'Missing required property', path: ['a'] },
+			{ message: 'Expected an integer or an integer string (got string)', path: ['b', 0, 'id'] },
+			{ message: 'Invalid value (same object as reported at another path)', path: ['b', 1] }
+		]);
+	});
+
 	it('should report again an object held twice whose first report found nothing', function () {
 		let lateCalls = 0;
 		/**
