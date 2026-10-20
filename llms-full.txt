@@ -383,7 +383,7 @@ Import: `import { … } from 'tinkit/math';`
 - `product(numbers: ReadonlyArray<number>): number` — Multiplies all numbers of an array together.
 - `median(numbers: ReadonlyArray<number>): number` — Finds the median of an array of numbers (the mean of the two middle values for even lengths).
 - `mode(numbers: ReadonlyArray<number>): number[]` — Finds the most frequent value(s) of an array of numbers.
-- `variance(numbers: ReadonlyArray<number>, options: VarianceOptions = {}): number` — Computes the variance of an array of numbers using Welford's numerically stable online algorithm.
+- `variance(numbers: ReadonlyArray<number>, options: VarianceOptions = {}): number` — Computes the variance of an array of numbers in two passes: the compensated mean (see `average`), then the squared deviations from it, corrected for the rounding of the mean (Chan, Golub and LeVeque's corrected two-pass algorithm, as in `covariance`).
 - `standardDeviation(numbers: ReadonlyArray<number>, options: VarianceOptions = {}): number` — Computes the standard deviation (square root of `variance`) of an array of numbers.
 - `covariance(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>, options: VarianceOptions = {}): number` — Computes the covariance of two paired samples: how they vary together, `Σ(x - x̄)(y - ȳ) / n`.
 - `correlation(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): number` — Computes the Pearson correlation coefficient of two paired samples: their covariance divided by the product of their standard deviations, from `-1` (perfectly opposite linear relation) through `0` (no linear relation) to `1` (perfectly linear).

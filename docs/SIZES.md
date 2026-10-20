@@ -585,27 +585,27 @@ Whole module: **2.9 kB**
 
 ## math
 
-Whole module: **13.2 kB**
+Whole module: **13.4 kB**
 
 | Export                     | min + gzip |
 | -------------------------- | ---------: |
 | `abs`                      |       71 B |
 | `allocate`                 |      632 B |
-| `angleDifference`          |      452 B |
+| `angleDifference`          |      418 B |
 | `approximatelyEqual`       |      386 B |
 | `average`                  |      270 B |
 | `binomial`                 |      430 B |
 | `ceil`                     |      528 B |
 | `clamp`                    |      273 B |
 | `correlation`              |      643 B |
-| `cosineSimilarity`         |      499 B |
+| `cosineSimilarity`         |      498 B |
 | `covariance`               |      727 B |
 | `cumulativeSum`            |      161 B |
 | `damp`                     |      444 B |
 | `decimalPlaces`            |      168 B |
-| `distance`                 |      582 B |
+| `distance`                 |      581 B |
 | `divisors`                 |      865 B |
-| `dot`                      |      535 B |
+| `dot`                      |      742 B |
 | `exponentialMovingAverage` |      338 B |
 | `extendedGcd`              |      372 B |
 | `extent`                   |      176 B |
@@ -620,7 +620,7 @@ Whole module: **13.2 kB**
 | `inRange`                  |       89 B |
 | `integerSqrt`              |      371 B |
 | `interquartileRange`       |      347 B |
-| `inverseLerp`              |      135 B |
+| `inverseLerp`              |      141 B |
 | `isEven`                   |       91 B |
 | `isOdd`                    |      100 B |
 | `isPerfectSquare`          |      170 B |
@@ -629,11 +629,11 @@ Whole module: **13.2 kB**
 | `kurtosis`                 |      660 B |
 | `lcm`                      |      296 B |
 | `lerp`                     |      115 B |
-| `lerpAngle`                |      458 B |
+| `lerpAngle`                |      423 B |
 | `linearRegression`         |      792 B |
 | `linspace`                 |      489 B |
 | `log`                      |      165 B |
-| `mapRange`                 |      189 B |
+| `mapRange`                 |      196 B |
 | `max`                      |      133 B |
 | `median`                   |      286 B |
 | `medianAbsoluteDeviation`  |      334 B |
@@ -647,7 +647,7 @@ Whole module: **13.2 kB**
 | `nextPowerOfTwo`           |      308 B |
 | `nextPrime`                |      584 B |
 | `niceDomain`               |      759 B |
-| `norm`                     |      404 B |
+| `norm`                     |      403 B |
 | `normalize`                |      400 B |
 | `nthRoot`                  |      363 B |
 | `ordinal`                  |      315 B |
@@ -655,7 +655,7 @@ Whole module: **13.2 kB**
 | `percentage`               |       86 B |
 | `percentageChange`         |      174 B |
 | `percentile`               |      494 B |
-| `pingPong`                 |      313 B |
+| `pingPong`                 |      272 B |
 | `pow`                      |       72 B |
 | `previousPrime`            |      591 B |
 | `primeFactors`             |      802 B |
@@ -671,16 +671,16 @@ Whole module: **13.2 kB**
 | `roundHalfEven`            |      628 B |
 | `roundToStep`              |      793 B |
 | `skewness`                 |      659 B |
-| `smootherstep`             |      364 B |
-| `smoothstep`               |      353 B |
+| `smootherstep`             |      371 B |
+| `smoothstep`               |      362 B |
 | `softmax`                  |      350 B |
 | `spearmanCorrelation`      |      787 B |
 | `sqrt`                     |       71 B |
-| `standardDeviation`        |      379 B |
-| `standardize`              |      654 B |
+| `standardDeviation`        |      477 B |
+| `standardize`              |      682 B |
 | `sum`                      |      174 B |
 | `sumPrecise`               |      931 B |
-| `summarize`                |      914 B |
+| `summarize`                |      933 B |
 | `ticks`                    |      692 B |
 | `toDegrees`                |       79 B |
 | `toFraction`               |      475 B |
@@ -689,7 +689,7 @@ Whole module: **13.2 kB**
 | `trimmedMean`              |      591 B |
 | `trunc`                    |      546 B |
 | `ulp`                      |      232 B |
-| `variance`                 |      325 B |
+| `variance`                 |      463 B |
 | `weightedAverage`          |      499 B |
 | `wrap`                     |      370 B |
 | `zScore`                   |      220 B |
