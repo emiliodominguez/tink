@@ -2527,7 +2527,7 @@ function factorize(caller: string, n: number): number[] {
  * Factors a positive integer into primes: the primes whose product is `n`, each repeated as many times as it divides `n`, in ascending
  * order (`[]` for `1`). Factors below about 1000 are found by trial division; what remains is split by a deterministic Miller–Rabin test
  * (see {@link isPrime}) and Pollard's rho method, so every safe integer, even a product of two primes near `2 ** 26.5` (the hardest case),
- * is factored in a few milliseconds at most, where trial division up to `√n` would take seconds.
+ * is factored in tens of milliseconds at most (about one millisecond typically), where trial division up to `√n` would take seconds.
  * @param {number} n - A safe integer `>= 1`
  * @returns {number[]} The prime factors of `n`, with multiplicity, ascending
  * @throws {RangeError} when `n` is not a safe integer `>= 1`
@@ -2614,8 +2614,8 @@ const LARGEST_SAFE_PRIME = 9007199254740881;
 
 /**
  * Finds the smallest prime greater than `n` (`nextPrime(7)` is `11`; `n` need not be an integer, and every `n < 2` gives `2`). Candidates
- * are tested with {@link isPrime}, whose cost is bounded, and gaps between primes below `2 ** 53` are at most a few hundred numbers, so the
- * search is fast for any `n`. There is no safe-integer prime after `9007199254740881`, so larger `n` are rejected.
+ * are tested with {@link isPrime}, whose cost is bounded, and gaps between primes below `2 ** 53` are at most 1132 numbers (after `1693182318746371`),
+ * so the search takes milliseconds at most for any `n`. There is no safe-integer prime after `9007199254740881`, so larger `n` are rejected.
  * @param {number} n - The number to start after, less than `9007199254740881` (the largest prime below `2 ** 53`)
  * @returns {number} The smallest prime `p > n`
  * @throws {RangeError} when `n` is `NaN` or not less than `9007199254740881`
@@ -2757,8 +2757,8 @@ function bezout(a: number, b: number): ExtendedGcd {
 
 /**
  * Computes the greatest common divisor of two integers together with Bézout coefficients: integers `x` and `y` such that
- * `a * x + b * y === gcd(a, b)`, as found by the extended Euclidean algorithm (the smallest ones: `|x| <= |b / gcd|` and
- * `|y| <= |a / gcd|`). They solve linear Diophantine equations and give modular inverses (see {@link modInverse}). Every intermediate
+ * `a * x + b * y === gcd(a, b)`, as found by the extended Euclidean algorithm (the smallest ones: when neither `a` nor `b` is
+ * `0`, `|x| <= |b / gcd|` and `|y| <= |a / gcd|`). They solve linear Diophantine equations and give modular inverses (see {@link modInverse}). Every intermediate
  * value is a safe integer, so the result is exact. `extendedGcd(0, 0)` is `{ gcd: 0, x: 0, y: 0 }`.
  * @param {number} a - A safe integer
  * @param {number} b - A safe integer
@@ -2907,7 +2907,8 @@ export function integerSqrt(n: number | bigint): number | bigint {
 	// `Math.sqrt` is correctly rounded: it never rounds below the integer root (an exact double), but can round up to `r + 1` when `n` is
 	// just below `(r + 1) ** 2`. Such squares are below `2 ** 53`, so the product is exact.
 	const root = Math.floor(Math.sqrt(n));
-	return root * root > n ? root - 1 : root;
+	// `+ 0` turns the root of `-0` into `0`.
+	return (root * root > n ? root - 1 : root) + 0;
 }
 
 /**

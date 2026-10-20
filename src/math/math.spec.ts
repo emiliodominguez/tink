@@ -3319,6 +3319,15 @@ describe('integerSqrt', function () {
 		expect(helpers.integerSqrt(9007199254740991)).toBe(94906265);
 	});
 
+	it('gives +0 for -0 (regression: the sign of zero leaked through Math.sqrt)', function () {
+		expect(Object.is(helpers.integerSqrt(-0), 0)).toBe(true);
+	});
+
+	it('bounds the Bézout coefficients only when both inputs are non-zero, as documented', function () {
+		expect(helpers.extendedGcd(5, 0)).toEqual({ gcd: 5, x: 1, y: 0 });
+		expect(helpers.extendedGcd(0, -5)).toEqual({ gcd: 5, x: 0, y: -1 });
+	});
+
 	it('is exact where Math.sqrt rounds up', function () {
 		expect(Math.floor(Math.sqrt(94906265 ** 2 - 1))).toBe(94906265);
 		expect(helpers.integerSqrt(94906265 ** 2 - 1)).toBe(94906264);
