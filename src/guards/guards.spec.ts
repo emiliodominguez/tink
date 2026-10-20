@@ -854,6 +854,16 @@ describe('guards', function () {
 			expect(guards.isTypedArray(vm.runInNewContext('new Uint16Array(2)'))).toBe(true);
 		});
 
+		it('isTypedArray accepts a Float16Array (ES2025), which getType names', function () {
+			// Node 24+ has it; the other realm is a fresh V8 context, which always has it there.
+			const array: unknown = vm.runInNewContext('typeof Float16Array === "function" ? new Float16Array(2) : new Float32Array(2)');
+
+			expect(guards.isTypedArray(array)).toBe(true);
+			expect(guards.getType(array)).toMatch(/^float(16|32)array$/);
+			const Float16 = (globalThis as { Float16Array?: new (length: number) => unknown }).Float16Array;
+			if (Float16 !== undefined) expect(guards.isTypedArray(new Float16(1))).toBe(true);
+		});
+
 		it('isTypedArray rejects DataView, buffers, arrays, fakes and primitives', function () {
 			expect(guards.isTypedArray(new DataView(new ArrayBuffer(1)))).toBe(false);
 			expect(guards.isTypedArray(new ArrayBuffer(1))).toBe(false);

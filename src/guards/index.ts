@@ -1,4 +1,4 @@
-import { assertFunction, assertNumber, describe as typeName } from '../utils/assert.js';
+import { assertFunction, assertNumber, readOption, describe as typeName } from '../utils/assert.js';
 import type { AnyFunction, NonEmptyArray, Primitive, UnionToIntersection } from '../utils/index.js';
 import { generate } from '../utils/jit.js';
 import { hold, isTooDeep, PENDING, release, scope } from '../utils/memo.js';
@@ -610,9 +610,16 @@ export function isSafeInteger(value: unknown): value is number {
 }
 
 /**
- * Any built-in typed array (the eleven `TypedArray` constructors of ES2022). `DataView` is not a typed array.
+ * A `Float16Array` (ES2025) when the `lib` of the compilation declares it, `never` otherwise.
+ */
+type Float16ArrayType = typeof globalThis extends { Float16Array: { prototype: infer F } } ? F : never;
+
+/**
+ * Any built-in typed array: the eleven `TypedArray` constructors of ES2022, and `Float16Array` (ES2025) when the `lib` of the compilation
+ * declares it. `DataView` is not a typed array.
  */
 export type TypedArray =
+	| Float16ArrayType
 	| Int8Array
 	| Uint8Array
 	| Uint8ClampedArray
@@ -639,6 +646,7 @@ const TYPED_ARRAY_NAMES: ReadonlySet<unknown> = new Set([
 	'Uint16Array',
 	'Int32Array',
 	'Uint32Array',
+	'Float16Array',
 	'Float32Array',
 	'Float64Array',
 	'BigInt64Array',
@@ -756,8 +764,15 @@ export function isNonEmptyArray(value: unknown): value is [unknown, ...unknown[]
 }
 
 /**
+ * The values that name the property key `K`: the key itself and, for a number or the canonical string of one, its other form (`0` and
+ * `'0'` name the same property, and either may have been passed to {@link isKeyOf}).
+ * @template K - A property key
+ */
+type KeyForms<K> = K extends number ? K | `${K}` : K extends `${infer N extends number}` ? K | N : K;
+
+/**
  * Checks whether `key` is an OWN property key of `object` (string, number or symbol; enumerable or not), narrowing
- * `key` to `keyof T`. Inherited keys such as `'toString'` or `'__proto__'` are rejected, which makes it safe to use
+ * `key` to `keyof T` (with its other form for a numeric key: `isKeyOf({ 0: 'a' }, key)` narrows `key` to `0 | '0'`). Inherited keys such as `'toString'` or `'__proto__'` are rejected, which makes it safe to use
  * before indexing with untrusted keys. Like every type predicate, the `false` branch removes the keys of `T` from the type of `key`,
  * although optional keys that are absent and inherited ones (class methods) also return `false`: test `typeof key` there instead.
  * @template T - The object type
@@ -771,7 +786,7 @@ export function isNonEmptyArray(value: unknown): value is [unknown, ...unknown[]
  * isKeyOf(colors, 'toString'); // => false // inherited
  * isKeyOf(colors, 42); // => false
  */
-export function isKeyOf<T extends object>(object: T, key: unknown): key is T extends unknown ? keyof T : never {
+export function isKeyOf<T extends object>(object: T, key: unknown): key is T extends unknown ? KeyForms<keyof T> : never {
 	if (object === null || object === undefined) throw new TypeError(`isKeyOf: \`object\` must not be null or undefined, got ${object}`);
 	if (typeof key !== 'string' && typeof key !== 'number' && typeof key !== 'symbol') return false;
 
@@ -794,8 +809,11 @@ export function isKeyOf<T extends object>(object: T, key: unknown): key is T ext
 export function isOneOf<const T extends ReadonlyArray<unknown>>(values: T): (value: unknown) => value is T[number] {
 	if (!Array.isArray(values)) throw new TypeError(`isOneOf: \`values\` must be an array, got ${typeName(values)}`);
 
-	const allowed = new Set<unknown>(values);
 	const count = values.length;
+	const allowed = new Set<unknown>();
+
+	// A hole allows `undefined`, not an element planted on a polluted `Array.prototype` or `Object.prototype` (which iterating would read).
+	for (let index = 0; index < count; index++) allowed.add(hasOwn.call(values, index) ? values[index] : undefined);
 
 	return explainable(
 		function isOneOfValues(value: unknown): value is T[number] {
@@ -935,8 +953,8 @@ export function isRecordOf<T>(guard: Guard<T>): (value: unknown) => value is Rec
 }
 
 /**
- * Checks whether a value is one of the eleven built-in typed arrays (`Uint8Array`, `Float64Array`, `BigInt64Array`…),
- * including subclasses and instances from other realms. `DataView`, `ArrayBuffer` and plain arrays are not typed arrays.
+ * Checks whether a value is one of the built-in typed arrays (`Uint8Array`, `Float64Array`, `BigInt64Array`…, and `Float16Array` where
+ * the runtime has it), including subclasses and instances from other realms. `DataView`, `ArrayBuffer` and plain arrays are not typed arrays.
  * @param {unknown} value - The value to check
  * @returns {boolean} Whether the value is a typed array
  * @example
@@ -2240,8 +2258,11 @@ export function isDiscriminatedUnion<const K extends string, const V extends Sha
 	const lookup = new Map<unknown, Guard<unknown>>();
 
 	for (const tag of tags) {
-		assertFunction('isDiscriminatedUnion', `variants.${tag}`, variants[tag]);
-		lookup.set(tag, variants[tag]);
+		// Read once: a getter could return a function when checked, then something else.
+		const variant: unknown = variants[tag];
+
+		assertFunction('isDiscriminatedUnion', `variants.${tag}`, variant);
+		lookup.set(tag, variant as Guard<unknown>);
 	}
 
 	const quoted = tags.map(function (tag: string): string {
@@ -2483,19 +2504,24 @@ function samePath(a: ReadonlyArray<PropertyKey>, b: ReadonlyArray<PropertyKey>):
 }
 
 /**
- * Where {@link isLazy} explained an object that failed: the path it reported it at, and the {@link explain} call that did (`run`).
+ * Where {@link isLazy} explained an object that failed: the path it reported it at, the {@link explain} call that did (`run`), and the
+ * outermost `explain` call around that one (`root`).
  */
 interface LazyReport {
 	readonly path: PropertyKey[];
 	readonly run: object;
+	readonly root: object;
 }
 
 /**
- * The {@link explain} call running right now (a fresh object per call, `undefined` outside one). An object that {@link isLazy} reported
- * during another call (a guard or predicate calling `explain` itself, or the validate module explaining several guards in one parse) is
- * reported again in full: that call's issues may have been dropped.
+ * The {@link explain} call running right now (a fresh object per call, `undefined` outside one), and the outermost one running
+ * (`explainRoot`, whose report is the one its caller sees). The root report gives an object that {@link isLazy} reported during another
+ * call (a guard or predicate calling `explain` itself, whose issues may have been dropped, or another root call, as the validate module
+ * makes several in one parse) in full; a nested call gives a pointer issue for any object already reported during the same root call, so
+ * that a guard explaining at each level of a recursive value cannot make the report exponential.
  */
 let explainRun: object | undefined;
+let explainRoot: object | undefined;
 
 /**
  * Returns the table of a lazy guard's results for `value` while a discriminated union checks it (`discriminated.object === value`; the
@@ -2659,9 +2685,10 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 
 				return false;
 			}
-			// Reported by this `explain` call (whose issues all reach its result): one pointer issue, or none when met again at the same
-			// path (the members of an intersection), where its issues are already. Reported by another call, it is explained again.
-			if (state !== undefined && (state as LazyReport).run === explainRun) {
+			// Reported by this `explain` call (whose issues all reach its result), or, in a nested call, during the same root call: one
+			// pointer issue, or none when met again at the same path (the members of an intersection), where its issues are already. In the
+			// root call, an object reported by another call is explained again in full (see `explainRoot`).
+			if (state !== undefined && (explainRun === explainRoot ? (state as LazyReport).run === explainRun : (state as LazyReport).root === explainRoot)) {
 				if (!samePath((state as LazyReport).path, path)) issues.push({ message: 'Invalid value (same object as reported at another path)', path: path.slice() });
 
 				return false;
@@ -2689,7 +2716,7 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 				// The verdict is kept for the other paths to the same object: a value sharing objects (each held twice by the next) is then
 				// explained in linear time, with one issue per extra path, instead of once per path (exponential in the depth). A
 				// failure that reported nothing (a guard that is not deterministic), or threw, is explained again when met again.
-				if (issues.length > before) reported.set(value, { path: path.slice(), run: explainRun } as LazyReport);
+				if (issues.length > before) reported.set(value, { path: path.slice(), run: explainRun, root: explainRoot } as LazyReport);
 				else if (passed) reported.set(value, true);
 				else reported.delete(value);
 				scope.depth--;
@@ -2799,8 +2826,11 @@ function compilePattern(pattern: unknown, ancestors: unknown[]): Guard<unknown> 
 	if (array)
 		for (let index = 0; index < (pattern as unknown[]).length; index++) guards.push(compilePattern(hasOwn.call(source, index) ? source[index] : undefined, ancestors));
 	for (const key of keys) {
-		guards.push(compilePattern(source[key], ancestors));
-		required.push(typeof source[key] !== 'function');
+		// Read once: a getter could return a guard, then a literal.
+		const value = source[key];
+
+		guards.push(compilePattern(value, ancestors));
+		required.push(typeof value !== 'function');
 	}
 	ancestors.pop();
 
@@ -2829,9 +2859,11 @@ export function explain(guard: Guard<unknown>, value: unknown): SchemaIssue[] {
 
 	const issues: SchemaIssue[] = [];
 	const previousRun = explainRun;
+	const previousRoot = explainRoot;
 
 	// The memos of the lazy guards (see `utils/memo.ts`) live until the end, so explaining reuses what checking found.
 	explainRun = {};
+	if (previousRun === undefined) explainRoot = explainRun;
 	scope.depth++;
 	try {
 		// Guards never consult the explainers, so valid values take the fast path and allocate nothing beyond the result.
@@ -2847,6 +2879,7 @@ export function explain(guard: Guard<unknown>, value: unknown): SchemaIssue[] {
 		issues.push({ message: 'Value is nested too deeply', path: [] });
 	} finally {
 		explainRun = previousRun;
+		explainRoot = previousRoot;
 		if (--scope.depth === 0) release();
 	}
 
@@ -2896,7 +2929,8 @@ export function issuesByPath(issues: ReadonlyArray<StandardSchemaIssue>): Record
 	const grouped: Record<string, string[]> = Object.create(null);
 
 	for (const issue of issues) {
-		const key = (issue.path ?? [])
+		// An own `path` only: a root issue of another library may have none, and must not take one planted on `Object.prototype`.
+		const key = (readOption(issue, 'path') ?? [])
 			.map(function (segment: PropertyKey | { readonly key: PropertyKey }): string {
 				return String(typeof segment === 'object' && segment !== null ? segment.key : segment);
 			})
@@ -2975,8 +3009,9 @@ function hasHiddenToJSON(value: object): boolean {
 	return typeof (value as { toJSON?: unknown }).toJSON === 'function' && (Array.isArray(value) || !Object.prototype.propertyIsEnumerable.call(value, 'toJSON'));
 }
 
-/** Marks, on the stack of {@link walkJson}, the end of a container's children. */
+/** Marks, on the stack of {@link walkJson}, the end of a container's children: a container it records, and one it does not. */
 const EXIT = {};
+const LEAF_EXIT = {};
 
 /**
  * Checks that `root` is a JSON value without recursion (so arbitrarily deep values cannot overflow the stack), rejecting cycles.
@@ -2990,7 +3025,11 @@ function walkJson(root: unknown, path: PropertyKey[] | undefined, issues: Schema
 	// Pairs of (key, value), and (container, EXIT) once a container's children are pushed. The root pair is the only one popped from
 	// an otherwise empty stack, and the root's EXIT pair is popped last.
 	const stack: unknown[] = [undefined, root];
-	const ancestors = new Set<unknown>();
+	// Each container holding containers, once met: the number of issues before its walk while it is walked (meeting it again then means a
+	// cycle), then whether it passed. Such a container held in several places is walked once, so a value sharing containers (each held
+	// twice by the next, as YAML aliases build) is checked in linear time instead of once per path, exponential in its depth. Containers of
+	// primitives only (most of them) are not recorded: they cannot be part of a cycle, and are walked once per container holding them.
+	const walked = new Map<unknown, number | boolean>();
 	let passed = true;
 
 	while (stack.length > 0) {
@@ -2999,27 +3038,48 @@ function walkJson(root: unknown, path: PropertyKey[] | undefined, issues: Schema
 		const isRoot = stack.length === 0;
 		let message: string;
 
-		if (value === EXIT) {
-			ancestors.delete(key);
+		if (value === EXIT || value === LEAF_EXIT) {
+			if (value === EXIT) walked.set(key, issues === undefined || issues.length === walked.get(key));
 			if (path !== undefined && !isRoot) path.pop();
 			continue;
 		}
 		if (typeof value === 'object' && value !== null) {
-			if (ancestors.has(value)) {
+			const state = walked.get(value);
+
+			if (state === true) continue;
+			if (state === false) {
+				message = 'Invalid value (same object as reported at another path)';
+			} else if (state !== undefined) {
 				message = 'Circular reference';
 			} else if ((Array.isArray(value) || isPlainObject(value)) && !hasHiddenToJSON(value)) {
-				ancestors.add(value);
+				const exit = stack.length + 1;
+				let nested = false;
+
 				if (path !== undefined && !isRoot) path.push(key);
-				stack.push(value, EXIT);
+				stack.push(value, LEAF_EXIT);
 				if (Array.isArray(value)) {
 					// Holes read as `undefined` (also under a polluted `Array.prototype`), which is rejected: `JSON.stringify` writes them as `null`.
 					const polluted = isArrayPrototypePolluted();
 
-					for (let index = value.length - 1; index >= 0; index--) stack.push(index, polluted && !hasOwn.call(value, index) ? undefined : value[index]);
+					for (let index = value.length - 1; index >= 0; index--) {
+						const child = polluted && !hasOwn.call(value, index) ? undefined : value[index];
+
+						if (typeof child === 'object' && child !== null) nested = true;
+						stack.push(index, child);
+					}
 				} else {
 					const keys = Object.keys(value);
 
-					for (let index = keys.length - 1; index >= 0; index--) stack.push(keys[index], value[keys[index]]);
+					for (let index = keys.length - 1; index >= 0; index--) {
+						const child = value[keys[index]];
+
+						if (typeof child === 'object' && child !== null) nested = true;
+						stack.push(keys[index], child);
+					}
+				}
+				if (nested) {
+					walked.set(value, issues === undefined ? 0 : issues.length);
+					stack[exit] = EXIT;
 				}
 				continue;
 			} else {
@@ -3062,7 +3122,9 @@ function explainJson(guard: Guard<unknown>, value: unknown, path: PropertyKey[],
  * `undefined`, functions, symbols and bigints (dropped, or throwing), sparse arrays (holes become `null`), dates, maps, class instances
  * and other non-plain objects (including those with a `toJSON` method), and circular references (which make `JSON.stringify` throw).
  * Symbol keys are ignored, as `JSON.stringify` does. The walk is iterative, so arbitrarily deep values cannot overflow the stack, and
- * {@link explain} reports the path of every offending value.
+ * {@link explain} reports the path of every offending value. A container held in several places is walked once, so the cost is linear in
+ * the size of the value even when it shares containers (YAML aliases), where `JSON.stringify` is exponential; {@link explain} reports
+ * an invalid one at its first path and gives one `Invalid value (same object as reported at another path)` issue at each other path.
  * @param {unknown} value - The value to check
  * @returns {boolean} Whether the value is a JsonValue
  * @example

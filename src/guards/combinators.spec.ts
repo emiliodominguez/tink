@@ -24,6 +24,7 @@ import {
 	isNonNegativeNumber,
 	isNumberInRange,
 	isOneOf,
+	isNullable,
 	isOptional,
 	isPositiveInteger,
 	isPositiveNumber,
@@ -31,6 +32,7 @@ import {
 	isShape,
 	isString,
 	isTruthy,
+	isTuple,
 	isUnion,
 	refine,
 	withMessage,
@@ -494,6 +496,49 @@ describe('isLazy', function () {
 		]);
 	});
 
+	it('should stay linear when a guard explains with the same lazy guard at each level of a recursive value', function () {
+		type Node = { id: number; a?: Node; b?: Node; c?: Node };
+		let calls = 0;
+		/**
+		 * A guard explaining with `isNode` itself, used at every level.
+		 * @param {unknown} value - The value to check
+		 * @returns {boolean} Whether `isNode` reports nothing
+		 */
+		function isExplained(value: unknown): value is Node {
+			calls++;
+
+			return explain(isNode, value).length === 0;
+		}
+		const isNode: Guard<Node> = isLazy(function () {
+			return isShape({ id: isInteger, a: isOptional(isNode), b: isOptional(isNode), c: isOptional(isExplained) });
+		});
+		// Each level holds the next one three times: a tree of 3^20 nodes, whose leaf has an invalid id.
+		let shared: Record<string, unknown> = { id: 'x' };
+		for (let depth = 0; depth < 20; depth++) shared = { id: depth, a: shared, b: shared, c: shared };
+
+		const issues = explain(isNode, shared);
+
+		expect(calls).toBeLessThanOrEqual(2 * 20);
+		expect(issues[0]).toEqual({ message: 'Invalid value (got string)', path: [...Array<string>(20).fill('a'), 'id'] });
+		expect(issues).toHaveLength(2 * 20 + 1);
+
+		// A chain explained at every level, through `refine`: each object is reported once per root call, not once per level.
+		calls = 0;
+		const isLink: Guard<{ id: number; child?: unknown }> = isLazy(function () {
+			return refine(isShape({ id: isInteger, child: isOptional(isPlainObject) }), function (value) {
+				calls++;
+
+				return value.child === undefined || explain(isLink, value.child).length === 0;
+			});
+		});
+		let chain: Record<string, unknown> = { id: 'x' };
+		for (let depth = 0; depth < 200; depth++) chain = { id: depth, child: chain };
+
+		// The predicate fails at the root, as its nested explain of the child fails.
+		expect(explain(isLink, chain)).toEqual([{ message: 'Invalid value (got object)', path: [] }]);
+		expect(calls).toBeLessThanOrEqual(2 * 200);
+	});
+
 	it('should report in full an object that another explain call reported (nested explains, or several in one check)', function () {
 		const isItem = isLazy(function () {
 			return isShape({ id: isInteger });
@@ -652,6 +697,23 @@ describe('isLazy', function () {
 
 describe('isMatching', function () {
 	const isAdminEvent = isMatching({ type: 'login', user: { role: 'admin', id: isInteger } });
+
+	it('should read each value of the pattern once', function () {
+		let reads = 0;
+		const pattern = {
+			get id(): unknown {
+				reads++;
+
+				return reads === 1 ? isOptional(isInteger) : 1;
+			}
+		};
+		const isIdentified = isMatching(pattern);
+
+		expect(reads).toBe(1);
+		// The guard read is optional, so a missing `id` passes (the second read would have made it a required literal).
+		expect(isIdentified({})).toBe(true);
+		expect(isIdentified({ id: 2 })).toBe(true);
+	});
 
 	it('should read a hole of an array pattern as undefined, not as an element planted on a polluted prototype', function () {
 		const proto = Object.prototype as unknown as Record<number, unknown>;
@@ -886,6 +948,39 @@ describe('isJsonValue / isJsonObject / isJsonArray', function () {
 		expect(explain(isJsonValue, { a: shared, b: [shared, shared] })).toEqual([]);
 	});
 
+	it('should walk a container held in several places once (linear in the size of a value sharing containers)', function () {
+		let reads = 0;
+		const leaf = {
+			get n(): number {
+				reads++;
+
+				return 1;
+			}
+		};
+		// Each level holds the next one twice: 2^20 paths to the leaf (YAML aliases build such values).
+		let value: unknown = [leaf];
+		for (let depth = 0; depth < 20; depth++) value = { a: value, b: [value] };
+
+		expect(isJsonValue(value)).toBe(true);
+		expect(reads).toBe(1);
+		expect(explain(isJsonValue, value)).toEqual([]);
+
+		// An invalid shared container is reported at its first path, with one pointer issue at each other path.
+		const bad = { x: NaN, y: [1] };
+		let invalid: unknown = bad;
+		for (let depth = 0; depth < 20; depth++) invalid = [invalid, invalid];
+
+		expect(isJsonValue(invalid)).toBe(false);
+		const issues = explain(isJsonValue, invalid);
+
+		expect(issues[0]).toEqual({ message: 'Expected a finite number (got NaN)', path: [...Array<number>(20).fill(0), 'x'] });
+		expect(issues.slice(1)).toEqual(
+			Array.from({ length: 20 }, function (_, index: number) {
+				return { message: 'Invalid value (same object as reported at another path)', path: [...Array<number>(19 - index).fill(0), 1] };
+			})
+		);
+	});
+
 	it('should handle very deep values without overflowing the stack', function () {
 		let deep: unknown = 1;
 
@@ -1002,6 +1097,106 @@ describe('guards (regressions)', function () {
 });
 
 describe('guards (pass 3 regressions)', function () {
+	it('reports the closest member of a union through every wrapper', function () {
+		const isA = isShape({ kind: isLiteral('a'), n: isInteger });
+		const close = { kind: 'a', n: 1.5 };
+		const wrappers = [
+			isOptional(isA),
+			isNullable(isA),
+			withMessage(isA, 'Not an A'),
+			refine(isA, function () {
+				return true;
+			}),
+			isIntersection(isA, isShape({ x: isOptional(isString) })),
+			isDiscriminatedUnion('kind', { a: isShape({ n: isInteger }) }),
+			isLazy(function () {
+				return isA;
+			}),
+			isUnion(isA, isString)
+		];
+
+		for (const wrapper of wrappers) {
+			const issues = explain(isUnion(isString, wrapper), close);
+
+			expect(issues).toEqual(wrapper === wrappers[2] ? [{ message: 'Not an A', path: [] }] : [{ message: 'Invalid value (got number)', path: ['n'] }]);
+		}
+		// A refinement whose base guard passes is as close as can be; a discriminated union without its tag is further than its variants.
+		const isPositive = refine(isA, function (value: { n: number }): boolean {
+			return value.n > 0;
+		});
+		expect(explain(isUnion(isShape({ kind: isLiteral('b') }), isPositive), { kind: 'a', n: -1 })).toEqual([{ message: 'Invalid value (got object)', path: [] }]);
+		const isTagged = isDiscriminatedUnion('kind', { a: isShape({ n: isInteger }) });
+		expect(explain(isUnion(isTagged, isShape({ n: isString })), { n: 1 })).toEqual([{ message: 'Invalid value (got number)', path: ['n'] }]);
+		expect(explain(isUnion(isTagged, isShape({ n: isString })), 1)).toEqual([{ message: 'Expected an object (got number)', path: [] }]);
+		// A union reaching its own lazy guard again on the same value while scoring it.
+		const isSelf: Guard<unknown> = isLazy(function () {
+			return isUnion(isString, isNullable(isSelf));
+		});
+		expect(explain(isUnion(isFiniteNumber, isSelf), {})).toEqual([{ message: 'Invalid value (got object)', path: [] }]);
+	});
+
+	it('reads the holes of checked arrays as undefined under a polluted Array.prototype', function () {
+		const proto = Array.prototype as unknown as Record<number, unknown>;
+		proto[1] = 1;
+		try {
+			// eslint-disable-next-line no-sparse-arrays
+			const sparse = [1, , 1];
+
+			expect(isArrayOf(isInteger)(sparse)).toBe(false);
+			expect(explain(isArrayOf(isInteger), sparse)).toEqual([{ message: 'Invalid value (got undefined)', path: [1] }]);
+			expect(isTuple(isInteger, isInteger, isInteger)(sparse)).toBe(false);
+			expect(explain(isTuple(isInteger, isInteger, isInteger), sparse)).toEqual([{ message: 'Invalid value (got undefined)', path: [1] }]);
+			expect(isArrayOf(isInteger)([1, 2])).toBe(true);
+			expect(isTuple(isInteger)([1])).toBe(true);
+		} finally {
+			delete proto[1];
+		}
+	});
+
+	it('checks exact shapes with symbol keys key by key, and scores shapes on their primitive properties', function () {
+		const tag = Symbol('tag');
+		const isTagged = isShape({ [tag]: isInteger, name: isString }, { exact: true });
+
+		expect(isTagged({ [tag]: 1, name: 'a' })).toBe(true);
+		expect(isTagged({ [tag]: 1, name: 'a', extra: 1 })).toBe(false);
+		expect(isTagged('a')).toBe(false);
+		expect(isTagged([])).toBe(false);
+		// The nested object is not scored: the closest member is the one whose primitive properties match.
+		const isUser = isShape({ id: isInteger, profile: isShape({ name: isString }) });
+		const isGroup = isShape({ id: isString, profile: isShape({ name: isString }) });
+		expect(explain(isUnion(isGroup, isUser), { id: 1, profile: { name: 2 } })).toEqual([{ message: 'Invalid value (got number)', path: ['profile', 'name'] }]);
+	});
+
+	it('rethrows what a guard throws while lazy guards explain', function () {
+		let calls = 0;
+		const isFlaky: Guard<unknown> = isLazy(function () {
+			return function (value: unknown): value is never {
+				if (++calls > 1) throw new Error('flaky');
+
+				return value === undefined;
+			};
+		});
+		const isOuter = isLazy(function () {
+			return isShape({ a: isFlaky });
+		});
+
+		expect(function () {
+			explain(isOuter, { a: {} });
+		}).toThrow('flaky');
+	});
+
+	it('explains a value nested too deeply as one issue', function () {
+		type Chain = { next?: Chain };
+		const isChain: Guard<Chain> = isLazy(function () {
+			return isShape({ next: isOptional(isChain) });
+		});
+		let chain: Chain = { next: 1 as never };
+		for (let depth = 0; depth < 100_000; depth++) chain = { next: chain };
+
+		expect(isChain(chain)).toBe(false);
+		expect(explain(isChain, chain)).toEqual([{ message: 'Value is nested too deeply', path: [] }]);
+	});
+
 	it('accepts the discriminants of nested discriminated unions on the same object', function () {
 		const inner = isDiscriminatedUnion('sub', { x: isShape({ n: isFiniteNumber }, { exact: true }) });
 		const outer = isDiscriminatedUnion('type', { a: inner });
@@ -1034,6 +1229,21 @@ describe('guards (pass 3 regressions)', function () {
 		}
 	});
 
+	it('reads a hole of the isOneOf list as undefined, not as an element planted on a polluted prototype', function () {
+		const proto = Object.prototype as unknown as Record<number, unknown>;
+		proto[1] = 'planted';
+		try {
+			// eslint-disable-next-line no-sparse-arrays
+			const isAllowed = isOneOf(['a', , 'b']);
+
+			expect(isAllowed('planted')).toBe(false);
+			expect(isAllowed(undefined)).toBe(true);
+			expect(isAllowed('b')).toBe(true);
+		} finally {
+			delete proto[1];
+		}
+	});
+
 	it('reports the number of values isOneOf was created with', function () {
 		const list = ['a', 'b'];
 		const isListed = isOneOf(list);
@@ -1047,6 +1257,22 @@ describe('guards (pass 3 regressions)', function () {
 		if (isKeyOf(object, key)) {
 			const narrowed: Equal<typeof key, 'a' | 'b'> = true;
 			expect(narrowed).toBe(true);
+		}
+		// A numeric key names the property in both forms, and either may be what passed.
+		const numbered = { 0: 'a', '1': 'b', name: 'c' };
+		for (const candidate of [0, '0', 1, '1', 'name'] as unknown[]) {
+			if (isKeyOf(numbered, candidate)) {
+				const narrowed: Equal<typeof candidate, 0 | '0' | 1 | '1' | 'name'> = true;
+				expect(narrowed).toBe(true);
+			} else {
+				throw new Error(`isKeyOf rejected ${String(candidate)}`);
+			}
+		}
+		const indexes = ['x'];
+		const index: unknown = '0';
+		if (isKeyOf(indexes, index)) {
+			const asString: Equal<Extract<typeof index, `${number}`>, `${number}`> = true;
+			expect(asString).toBe(true);
 		}
 		const list = [1] as string[] | number[];
 		if (isNonEmptyArray(list)) {

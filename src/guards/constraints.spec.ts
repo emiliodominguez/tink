@@ -15,6 +15,17 @@ import {
 } from '.';
 
 describe('issuesByPath', function () {
+	it('should not take the path of an issue without one from a polluted Object.prototype', function () {
+		const proto = Object.prototype as unknown as Record<string, unknown>;
+		proto.path = ['planted'];
+		try {
+			expect(issuesByPath([{ message: 'Invalid form' }, { message: 'Too short', path: ['name'] }])).toEqual({ '': ['Invalid form'], name: ['Too short'] });
+			expect(issuesByPath([{ message: 'Odd', path: [null as never, { key: 'a' }, 0] }])).toEqual({ 'null.a.0': ['Odd'] });
+		} finally {
+			delete proto.path;
+		}
+	});
+
 	it('should group messages by dotted path, in order', function () {
 		const isSignup = isShape({ email: isString, age: isIntegerInRange(13, 130), tags: isArrayOf(isString) });
 
@@ -210,6 +221,21 @@ describe('isStringMatching', function () {
 });
 
 describe('isDiscriminatedUnion', function () {
+	it('should read each variant once (a getter cannot pass the check, then hand over something else)', function () {
+		let reads = 0;
+		const variants = {
+			get a(): (value: unknown) => value is object {
+				reads++;
+
+				return reads === 1 ? isShape({}) : (1 as never);
+			}
+		};
+		const isTagged = isDiscriminatedUnion('type', variants);
+
+		expect(reads).toBe(1);
+		expect(isTagged({ type: 'a' })).toBe(true);
+	});
+
 	const isFigure = isDiscriminatedUnion('type', {
 		circle: isShape({ radius: isFiniteNumber }),
 		square: isShape({ side: isFiniteNumber })
