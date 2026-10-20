@@ -30,6 +30,7 @@ import {
 	parse,
 	recordOf,
 	safeParse,
+	toParser,
 	transform,
 	union,
 	withDefault,
@@ -716,6 +717,69 @@ describe('recursive unions told apart deep inside', function () {
 
 		for (let level = 0; level < 16; level++) shared = { id: level, kids: [shared, shared] };
 		expect(issuesOf(tree, shared)).toHaveLength(17);
+	});
+
+	it('should stay linear when an adapter over the parser is the recursion of a schema', function () {
+		let adapterCalls = 0;
+		const node: Parser<unknown> = lazy(function () {
+			return { id: asInteger, l: nullable(adapter), r: nullable(adapter) };
+		});
+		const adapter: Schema = {
+			'~standard': {
+				version: 1,
+				vendor: 'adapter',
+				validate: function validate(value: unknown) {
+					adapterCalls++;
+
+					return node['~standard'].validate(value);
+				}
+			}
+		};
+		/**
+		 * Builds `depth` levels above an invalid leaf, each holding the level below as `l`, and as `r` too when `shared`.
+		 * @param {number} depth - The depth
+		 * @param {boolean} shared - Whether each level holds the one below twice
+		 * @returns {unknown} The value
+		 */
+		function build(depth: number, shared: boolean): unknown {
+			let value: unknown = { id: 'x', l: null, r: null };
+
+			for (let level = 0; level < depth; level++) value = { id: level, l: value, r: shared ? value : null };
+
+			return value;
+		}
+
+		// Every fast parse through the adapter reported the levels below it: 2 * depth ** 2 adapterCalls (a chain of 1,600 levels took 51 s).
+		expect(issuesOf(node, build(200, false))).toEqual([{ message: 'Expected an integer or an integer string (got string)', path: [...Array(200).fill('l'), 'id'] }]);
+		expect(adapterCalls).toBeLessThan(200 * 10);
+		// Each path through the adapter was reported in full: 2 ** depth issues (25 levels ran out of memory).
+		adapterCalls = 0;
+		expect(issuesOf(node, build(16, true))).toHaveLength(17);
+		expect(adapterCalls).toBeLessThan(16 * 10);
+	});
+
+	it('should report in full after a foreign validator threw during a fast parse', function () {
+		let throws = true;
+		const inner = toParser({ id: asInteger });
+		const adapter: Schema = {
+			'~standard': {
+				version: 1,
+				vendor: 'adapter',
+				validate: function validate(value: unknown) {
+					if (throws) throw new Error('adapter');
+
+					return inner['~standard'].validate(value);
+				}
+			}
+		};
+
+		expect(function () {
+			safeParse(adapter, {});
+		}).toThrow('adapter');
+		throws = false;
+		// The next parse is not the adapter's fast parse, which would only need to know that the value is invalid.
+		expect(inner['~standard'].validate({ id: 'x' })).toEqual({ issues: [{ message: 'Expected an integer or an integer string (got string)', path: ['id'] }] });
+		expect(issuesOf(adapter, {})).toEqual([{ message: 'Missing required property', path: ['id'] }]);
 	});
 
 	it('should report again an object held twice whose first report found nothing', function () {

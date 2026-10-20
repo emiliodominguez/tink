@@ -15,9 +15,11 @@ import {
 } from '../guards/index.js';
 import {
 	arrayOf,
+	asArray,
 	asBoolean,
 	asDate,
 	asInteger,
+	asList,
 	asNumber,
 	chain,
 	isUrl,
@@ -665,6 +667,71 @@ describe('arrayOf', function () {
 	it('should parse holes as undefined', function () {
 		// oxlint-disable-next-line no-sparse-arrays
 		expect(parse(arrayOf(optional(asInteger)), [1, , 3])).toEqual([1, undefined, 3]);
+		expect(parse(arrayOf(optional(asInteger)), Array(16))).toEqual(Array(16).fill(undefined));
+		expect(issuesOf(arrayOf(asInteger), Array(16))).toHaveLength(16);
+	});
+
+	it('should reject more than 65,536 holes in a row without walking them', function () {
+		const message = 'Expected at most 65536 holes in a row';
+		let reads = 0;
+
+		/**
+		 * Wraps a sparse array of length `2 ** 32 - 1`, counting (and capping) the reads of its elements.
+		 * @param {number[]} indexes - The indexes holding an element
+		 * @returns {unknown[]} The array
+		 */
+		function sparse(...indexes: number[]): unknown[] {
+			const target: unknown[] = [];
+
+			target.length = 2 ** 32 - 1;
+			for (const index of indexes) target[index] = '1';
+
+			return new Proxy(target, {
+				get(array: unknown[], key: PropertyKey): unknown {
+					if (key !== 'length' && ++reads > 300_000) throw new Error('walked the holes');
+
+					return Reflect.get(array, key);
+				},
+				getOwnPropertyDescriptor(array: unknown[], key: PropertyKey): PropertyDescriptor | undefined {
+					if (++reads > 300_000) throw new Error('walked the holes');
+
+					return Reflect.getOwnPropertyDescriptor(array, key);
+				}
+			});
+		}
+
+		for (const schema of [arrayOf(optional(asInteger)), asArray(optional(asInteger)), asList(optional(asInteger))]) {
+			reads = 0;
+			expect(issuesOf(schema, sparse(0, 2 ** 31))).toEqual([{ message, path: [1] }]);
+			reads = 0;
+			expect(issuesOf({ a: schema }, { a: sparse(4) })).toEqual([{ message, path: ['a', 5] }]);
+		}
+		reads = 0;
+		expect(issuesOf(arrayOf(asInteger), sparse(0, 1, 3))).toEqual([
+			{ message: 'Expected an integer or an integer string (got undefined)', path: [2] },
+			{ message, path: [4] }
+		]);
+		// The last 65,536 elements may be holes, each checked once (not once per hole before it).
+		const tail = ['1'];
+
+		let checks = 0;
+
+		tail.length = 65537;
+		expect(
+			parse(
+				arrayOf(optional(asInteger)),
+				new Proxy(tail, {
+					getOwnPropertyDescriptor(array: unknown[], key: PropertyKey): PropertyDescriptor | undefined {
+						checks++;
+
+						return Reflect.getOwnPropertyDescriptor(array, key);
+					}
+				})
+			)
+		).toEqual([1, ...Array(65536).fill(undefined)]);
+		expect(checks).toBeLessThan(4 * 65537);
+		tail.length = 65538;
+		expect(issuesOf(arrayOf(optional(asInteger)), tail)).toEqual([{ message, path: [1] }]);
 	});
 
 	it('should report every invalid element with its index', function () {

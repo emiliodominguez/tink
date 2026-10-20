@@ -396,6 +396,56 @@ describe('outputs and arrays under hardened or foreign prototypes', function () 
 	});
 });
 
+describe('compiled schemas under prototype pollution', function () {
+	it('should ignore an Object.prototype holding the names of optional hooks', function () {
+		/**
+		 * Compiles and runs parses that read the optional hooks of nodes (`missing`, `handlesMissing`, `score`).
+		 * @returns {unknown[]} The results
+		 */
+		function run(): unknown[] {
+			return [
+				safeParse({ a: asInteger, b: optional(isString) }, { a: '1', b: 'x' }),
+				issuesOf({ a: asInteger, b: optional(isString) }, { b: 1 }),
+				issuesOf(union({ a: asInteger, c: isString }, { b: isString }), { b: 1 }),
+				issuesOf(union(asInteger, { b: isString }), 'x'),
+				issuesOf(arrayOf(withDefault(asInteger, 0)), [undefined, 'x'])
+			];
+		}
+		const expected = run();
+
+		expect(expected).toEqual([
+			[undefined, { a: 1, b: 'x' }],
+			[
+				{ message: 'Missing required property', path: ['a'] },
+				{ message: 'Invalid value (got number)', path: ['b'] }
+			],
+			[{ message: 'Invalid value (got number)', path: ['b'] }],
+			[{ message: 'Expected an integer or an integer string (got string)', path: [] }],
+			[{ message: 'Expected an integer or an integer string (got string)', path: [1] }]
+		]);
+		// Compiled while polluted: a node without the hook read the planted value, and every parse threw a `TypeError`.
+		for (const key of ['missing', 'handlesMissing', 'score']) expect(polluted(Object.prototype, key, 'planted', run)).toEqual(expected);
+	});
+
+	it('should not read the issues of a Standard Schema result from Object.prototype', function () {
+		const foreign: Schema = {
+			'~standard': {
+				version: 1,
+				vendor: 'foreign',
+				validate: function validate(value: unknown) {
+					return typeof value === 'number' ? { value: value * 2 } : { issues: [{ message: 'Not a number' }] };
+				}
+			}
+		};
+		// The planted string was iterated as the issues of every success: valid values failed, one issue per character.
+		const results = polluted(Object.prototype, 'issues', 'planted', function () {
+			return [safeParse({ a: foreign }, { a: 2 }), issuesOf({ a: foreign }, { a: 'x' })];
+		});
+
+		expect(results).toEqual([[undefined, { a: 4 }], [{ message: 'Not a number', path: ['a'] }]]);
+	});
+});
+
 describe('semver under prototype pollution', function () {
 	it('should not read pre-release identifiers past the end from Object.prototype', function () {
 		// `beta` bumps to `beta.0`, which is shorter than the wanted `beta.0` plus a counter: index 2 is past its end.

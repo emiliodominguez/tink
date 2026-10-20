@@ -2154,16 +2154,31 @@ const FAIL = Symbol.for('tinkit.parse.fail');
 let rootIssues: SchemaIssue[] | undefined;
 
 /**
- * Set while a foreign Standard Schema validator reports (see {@link standardNode}), until a parse starts (see {@link execute}): a
- * parser of this module handed over as a plain Standard Schema reports there to a list whose issues the report around it takes, so
- * that list must hold the issues its pointers refer to, like the report the caller sees.
+ * What a foreign Standard Schema validator is called for (see {@link standardNode}), until a parse starts (see {@link execute}), so that
+ * a parser of this module handed over as a plain Standard Schema knows: `1` while it reports, to a list whose issues the report around
+ * it takes (that list must hold the issues its pointers refer to, like the report the caller sees), `2` during a fast parse, which
+ * only needs to know whether the value is valid (an invalid one gets one generic issue instead of a report, which would be redone at
+ * every level of a recursive schema), `0` otherwise.
  */
-let surfaced = false;
+let surfaced = 0;
 
-/** Where a {@link lazy} parser reported an invalid object: its first issue, at `index` in the list it went to. */
+/**
+ * The issue lists of the reports that surfaced reports (see {@link surfaced}) run in: their issues reach the caller's report, like those
+ * of the surfaced reports, so a pointer given there may refer to them.
+ */
+const outers = new Set<SchemaIssue[] | undefined>();
+
+/**
+ * `true` for the issue list of a surfaced report, and for each of its issues, where the report around it put the copy (see
+ * {@link standardNode}): a {@link lazy} parser that reported an object there follows its first issue to the copy.
+ */
+const moved = new WeakMap<object, LazyReport | true>();
+
+/** Where a {@link lazy} parser reported an invalid object: its first issue, at `index` in `list`. */
 interface LazyReport {
 	readonly index: number;
 	readonly first: SchemaIssue;
+	readonly list: SchemaIssue[];
 }
 
 /**
@@ -2220,7 +2235,7 @@ function always(): boolean {
  * @returns {boolean} Whether it handles missing values
  */
 function handlesMissing(node: Node): boolean {
-	return node.handlesMissing !== undefined && node.handlesMissing();
+	return typeof node.handlesMissing === 'function' && node.handlesMissing();
 }
 
 /**
@@ -2240,7 +2255,7 @@ function isAbsent(node: Node, value: unknown): boolean {
  * @returns {boolean} `true` when the schema flags it
  */
 function flags(node: Node, value: unknown): boolean {
-	return node.missing !== undefined && node.missing(value);
+	return typeof node.missing === 'function' && node.missing(value);
 }
 
 /**
@@ -2250,7 +2265,7 @@ function flags(node: Node, value: unknown): boolean {
  * @returns {number} The score, lower being closer
  */
 function scoreOf(node: Node, value: unknown): number {
-	return node.score === undefined ? 1 : node.score(value);
+	return typeof node.score === 'function' ? node.score(value) : 1;
 }
 
 /**
@@ -2262,7 +2277,7 @@ function scoreOf(node: Node, value: unknown): number {
  * @returns {boolean} Whether the property is present
  */
 function isPresent(child: Node, value: object, key: string, raw: unknown): boolean {
-	return hasOwn.call(value, key) && (child.missing === undefined || !child.missing(raw));
+	return hasOwn.call(value, key) && !flags(child, raw);
 }
 
 /** A parser created by this module. */
@@ -2520,29 +2535,44 @@ function standardNode(schema: StandardSchemaLike): Node {
 
 	return {
 		fast: function fastStandard(value: unknown): unknown {
-			const result = callValidator(value);
+			let result: StandardSchemaResult<unknown>;
 
-			// As the Standard Schema spec says, any falsy `issues` (not only `undefined`) means success.
-			return result.issues ? FAIL : result.value;
+			// Reset even when the validator throws: the next parse would take the flag, and give its caller no report.
+			surfaced = 2;
+			try {
+				result = callValidator(value);
+			} finally {
+				surfaced = 0;
+			}
+
+			// As the Standard Schema spec says, any falsy `issues` (not only `undefined`) means success; a success result has no `issues`
+			// of its own, so a polluted `Object.prototype.issues` is not read (it would fail every valid value).
+			return readOption(result, 'issues') ? FAIL : (result as { readonly value: unknown }).value;
 		},
 		run: function runStandard(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
 			// Its issues join this report: a parser of this module reporting through it must not point at issues it does not hold (a
-			// validator that throws leaves the flag set, which only makes the next parse report in full).
-			surfaced = true;
+			// validator that throws leaves the flag set, which only changes how the next parse reports).
+			surfaced = 1;
 
 			const result = callValidator(value);
-			const found = result.issues;
+			const found = readOption(result, 'issues');
 
-			surfaced = false;
+			surfaced = 0;
 
-			if (!found) return result.value;
+			if (!found) return (result as { readonly value: unknown }).value;
 			if (found.length === 0) issues.push({ message: `Invalid value (got ${describe(value)})`, path: path.slice() });
+
+			// The issues of a parser of this module, given back as they are: their copies take their place (see `moved`).
+			const own = moved.get(found) === true;
+
 			for (const issue of found as ReadonlyArray<{ readonly message: string; readonly path?: ReadonlyArray<PropertyKey | { readonly key: PropertyKey }> }>) {
 				const segments = (issue.path ?? []).map(function (segment: PropertyKey | { readonly key: PropertyKey }): PropertyKey {
 					return typeof segment === 'object' ? segment.key : segment;
 				});
+				const copy = { message: issue.message, path: [...path, ...segments] };
 
-				issues.push({ message: issue.message, path: [...path, ...segments] });
+				if (own) moved.set(issue, { index: issues.length, first: copy, list: issues });
+				issues.push(copy);
 			}
 
 			return undefined;
@@ -2678,18 +2708,22 @@ function generateObject(keys: ReadonlyArray<string>, children: ReadonlyArray<Nod
 	const literals = keys.map(function (key: string): string {
 		return JSON.stringify(key);
 	});
+	// A node without the hook reads it from `Object.prototype`, which pollution may give a value that is not one (see `flags`).
+	const hooks = children.map(function (child: Node): Node['missing'] {
+		return typeof child.missing === 'function' ? child.missing : undefined;
+	});
 	const lines = children.map(function (child: Node, index: number): string {
 		const key = literals[index];
-		const store = `if (r !== undefined || H.call(v, ${key})${child.missing === undefined ? '' : ` && !m${index}(i)`}) o[${key}] = r;`;
+		const store = `if (r !== undefined || H.call(v, ${key})${hooks[index] === undefined ? '' : ` && !m${index}(i)`}) o[${key}] = r;`;
 
 		if (child.guard !== undefined) return `r = v[${key}]; if (!c${index}(r)) return F; ${store}`;
-		if (child.missing !== undefined) return `i = v[${key}]; r = c${index}(i); if (r === F) return F; ${store}`;
+		if (hooks[index] !== undefined) return `i = v[${key}]; r = c${index}(i); if (r === F) return F; ${store}`;
 
 		return `r = c${index}(v[${key}]); if (r === F) return F; ${store}`;
 	});
 	const source = [
-		...children.map(function (child: Node, index: number): string {
-			return `const c${index} = C[${index}]${child.missing === undefined ? '' : `, m${index} = M[${index}]`};`;
+		...hooks.map(function (hook: Node['missing'], index: number): string {
+			return `const c${index} = C[${index}]${hook === undefined ? '' : `, m${index} = M[${index}]`};`;
 		}),
 		'return function fastObject(v) {',
 		"if (typeof v !== 'object' || v === null || A(v)) return F;",
@@ -2716,9 +2750,7 @@ function generateObject(keys: ReadonlyArray<string>, children: ReadonlyArray<Nod
 		children.map(function (child: Node): AnyFunction {
 			return child.guard ?? child.fast;
 		}),
-		children.map(function (child: Node): unknown {
-			return child.missing;
-		})
+		hooks
 	]) as Fast | undefined;
 }
 
@@ -2790,13 +2822,17 @@ function rerun(node: Node, value: unknown, path: PropertyKey[], issues: SchemaIs
 function execute(fast: Fast, run: Run, value: unknown, issues: SchemaIssue[]): unknown {
 	// The fast parse needs no scope of its own: each outermost lazy parser keeps its memo (see `utils/memo.ts`) for its own call, and
 	// fails a value too deep to parse. Read first: a parse nested in the fast parse must not take the flag.
-	const root = surfaced;
+	const mode = surfaced;
 
-	surfaced = false;
+	surfaced = 0;
 
 	const output = fast(value);
 
-	return output === FAIL ? report(run, value, issues, root) : output;
+	if (output !== FAIL) return output;
+	if (mode !== 2) return report(run, value, issues, mode === 1);
+	issues.push({ message: 'Invalid value', path: [] });
+
+	return undefined;
 }
 
 /**
@@ -2812,6 +2848,10 @@ function report(run: Run, value: unknown, issues: SchemaIssue[], root: boolean):
 	const outer = rootIssues;
 
 	if (scope.depth++ === 0 || root) rootIssues = issues;
+	if (root) {
+		moved.set(issues, true);
+		outers.add(outer);
+	}
 	try {
 		return run(value, [], issues);
 	} catch (error) {
@@ -2822,6 +2862,7 @@ function report(run: Run, value: unknown, issues: SchemaIssue[], root: boolean):
 
 		return undefined;
 	} finally {
+		if (root) outers.delete(outer);
 		rootIssues = outer;
 		if (--scope.depth === 0) release();
 	}
@@ -3215,8 +3256,10 @@ export function withError<S extends Schema>(schema: S, message: string | ((value
 
 /**
  * Creates a parser for arrays whose elements are parsed with `schema`, returning a new array of the outputs (`z.array()`). Every
- * index from `0` to `length - 1` is parsed, so holes are parsed as `undefined`. For elements that only need checking, the guards
- * module's `isArrayOf` works too (and returns the array itself).
+ * index from `0` to `length - 1` is parsed, so holes are parsed as `undefined`; more than 65,536 holes in a row (only a sparse array
+ * has them) fail with `Expected at most 65536 holes in a row` at the first, since parsing them would cost the array's length rather
+ * than what it holds (4 billion checks for `length = 2 ** 32 - 1`). The same goes for {@link asArray} and {@link asList}. For
+ * elements that only need checking, the guards module's `isArrayOf` works too (and returns the array itself).
  * @template S - The element schema
  * @param {S} schema - The schema of each element
  * @returns {Parser<SchemaOutput<S>[]>} The parser
@@ -3224,6 +3267,10 @@ export function withError<S extends Schema>(schema: S, message: string | ((value
  * @example
  * parse(arrayOf(asInteger), ['1', '2', 3]); // => [1, 2, 3]
  * safeParse(arrayOf(asInteger), ['1', 'x'])[0]?.issues; // => [{ message: 'Expected an integer or an integer string (got string)', path: [1] }]
+ * safeParse(arrayOf(optional(asInteger)), Array(20))[0]?.issues; // => undefined
+ * const sparse = ['1'];
+ * sparse.length = 2 ** 32 - 1;
+ * safeParse(arrayOf(optional(asInteger)), sparse)[0]?.issues; // => [{ message: 'Expected at most 65536 holes in a row', path: [1] }]
  */
 export function arrayOf<S extends Schema>(schema: S): Parser<SchemaOutput<S>[]> {
 	const node = compile('arrayOf', 'schema', schema, []);
@@ -3252,10 +3299,13 @@ function parseElements(node: Node, elements: ReadonlyArray<unknown>): unknown {
 	const { guard, fast } = node;
 	const output: unknown[] = [];
 	const direct = readsHolesAsUndefined(elements);
+	// The index from which a hole may start a long run (see `holesEnd`).
+	let checked = 0;
 
 	for (let index = 0; index < elements.length; index++) {
 		let element = direct || hasOwn.call(elements, index) ? elements[index] : undefined;
 
+		if (element === undefined && index >= checked && (checked = holesEnd(elements, index)) < 0) return FAIL;
 		if (guard !== undefined) {
 			if (!guard(element)) return FAIL;
 		} else if ((element = fast(element)) === FAIL) {
@@ -3278,14 +3328,41 @@ function parseElements(node: Node, elements: ReadonlyArray<unknown>): unknown {
 function reportElements(node: Node, elements: ReadonlyArray<unknown>, path: PropertyKey[], issues: SchemaIssue[]): unknown[] {
 	const output: unknown[] = [];
 	const direct = readsHolesAsUndefined(elements);
+	// The index from which a hole may start a long run (see `holesEnd`).
+	let checked = 0;
 
 	for (let index = 0; index < elements.length; index++) {
+		const element = direct || hasOwn.call(elements, index) ? elements[index] : undefined;
+
+		if (element === undefined && index >= checked && (checked = holesEnd(elements, index)) < 0) {
+			// The elements after the run are not reported: finding the next one would cost a walk of the holes.
+			issues.push({ message: `Expected at most ${MAX_HOLES} holes in a row`, path: [...path, index] });
+			break;
+		}
 		path.push(index);
-		output.push(rerun(node, direct || hasOwn.call(elements, index) ? elements[index] : undefined, path, issues));
+		output.push(rerun(node, element, path, issues));
 		path.pop();
 	}
 
 	return output;
+}
+
+/** The most holes in a row that {@link arrayOf}, {@link asArray} and {@link asList} parse (see {@link holesEnd}). */
+const MAX_HOLES = 65536;
+
+/**
+ * Where a run of holes from `index` ends, unless it holds more than {@link MAX_HOLES} holes, which {@link arrayOf}, {@link asArray} and
+ * {@link asList} reject: only a sparse array has one, and parsing it would cost its length rather than what it holds (`[]` with
+ * `length = 2 ** 32 - 1` would take 4 billion checks, and give as many issues: an out-of-memory abort). The parsers check again only
+ * past the end returned, so that each index is checked once.
+ * @param {ReadonlyArray<unknown>} elements - The array
+ * @param {number} index - An index whose element reads `undefined`
+ * @returns {number} The index after the first own element from `index` (or after the end), or `-1` for too long a run
+ */
+function holesEnd(elements: ReadonlyArray<unknown>, index: number): number {
+	for (let at = index; at <= index + MAX_HOLES; at++) if (at >= elements.length || hasOwn.call(elements, at)) return at + 1;
+
+	return -1;
 }
 
 /**
@@ -3992,10 +4069,15 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 
 			if (typeof value !== 'object' || value === null) return node.run(value, path, issues);
 
-			const state = reported.get(value);
+			let state = reported.get(value) as LazyReport | undefined;
 
+			// Reported by a surfaced report: its first issue is now where the report around it copied it.
+			for (let copy; state !== undefined && state !== PENDING && (copy = moved.get(state.first)) !== undefined;) reported.set(value, (state = copy as LazyReport));
 			// In the caller's report, an object whose issues are not there (any longer) is reported in full; see `reported` above.
-			if (state !== undefined && (state === PENDING || issues !== rootIssues || issues[(state as LazyReport).index] === (state as LazyReport).first)) {
+			if (
+				state !== undefined &&
+				(state === PENDING || issues !== rootIssues || (state.list[state.index] === state.first && (state.list === issues || outers.has(state.list))))
+			) {
 				issues.push({ message: state === PENDING ? 'Circular reference' : 'Invalid value (same object as reported at another path)', path: path.slice() });
 
 				return undefined;
@@ -4034,7 +4116,7 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 				}
 				throw error;
 			} finally {
-				if (failed) reported.set(value, { index: before, first: issues[before] });
+				if (failed) reported.set(value, { index: before, first: issues[before], list: issues });
 				else reported.delete(value);
 				if (--scope.checks === 0) scope.checkRoot = undefined;
 				if (--scope.depth === 0) {
