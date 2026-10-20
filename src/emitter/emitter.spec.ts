@@ -545,6 +545,23 @@ describe('createEmitter', function () {
 			]);
 		});
 
+		it('passes undefined for an event emitted without payload, not a value planted on Object.prototype', function () {
+			const events = createEmitter<TestEvents>();
+			const proto = Object.prototype as Record<string, unknown>;
+			const calls: unknown[][] = [];
+
+			events.on('*', function (event, payload) {
+				calls.push([event, payload]);
+			});
+			proto[0] = 'planted';
+			try {
+				events.emit('ready');
+			} finally {
+				delete proto[0];
+			}
+			expect(calls).toEqual([['ready', undefined]]);
+		});
+
 		it('supports once and off for wildcard handlers', function () {
 			const events = createEmitter<TestEvents>();
 			const once = jest.fn();

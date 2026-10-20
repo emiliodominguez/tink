@@ -319,7 +319,8 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 			if (listeners === undefined && wildcards === undefined) return;
 
 			const withPayload = args.length > 0;
-			const payload = args[0];
+			// Not read without one: `args[0]` would then be looked up on a polluted `Object.prototype` (and handed to wildcard handlers).
+			const payload = withPayload ? args[0] : undefined;
 			// Both snapshots (the list lengths) are taken before any listener runs.
 			const length = listeners === undefined ? 0 : listeners.list.length;
 			const wildcardLength = wildcards === undefined ? 0 : wildcards.list.length;
