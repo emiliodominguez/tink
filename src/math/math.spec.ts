@@ -4400,6 +4400,31 @@ describe('findRoot', function () {
 		}).toThrow(new RangeError('findRoot: no root found within 2 iterations'));
 	});
 
+	it('should use the result of the last allowed call of fn (regression: one iteration was lost)', function () {
+		expect(
+			helpers.findRoot(
+				function (x) {
+					return x - 1;
+				},
+				0,
+				2,
+				{ maxIterations: 1 }
+			)
+		).toBe(1);
+		// Exactly the calls the search needs inside the loop are enough; one fewer is not.
+		let calls = 0;
+		function counted(x: number): number {
+			calls++;
+			return x * x - 2;
+		}
+		const root = helpers.findRoot(counted, 0, 2);
+		const needed = calls - 2;
+		expect(helpers.findRoot(counted, 0, 2, { maxIterations: needed })).toBe(root);
+		expect(function () {
+			helpers.findRoot(counted, 0, 2, { maxIterations: needed - 1 });
+		}).toThrow(new RangeError(`findRoot: no root found within ${needed - 1} iterations`));
+	});
+
 	it('should throw when the function has the same sign at both bounds', function () {
 		expect(function () {
 			helpers.findRoot(

@@ -3683,7 +3683,7 @@ export function ulp(x: number): number {
  * that `String` writes in exponential form (`1e21` and above), and the exponential form of small numbers is expanded (`1e-7` has `7`).
  * `NaN` and `±Infinity` have no decimal places: they give `NaN`.
  * @param {number} value - The number (converted with unary `+`)
- * @returns {number} The number of decimal places, an integer from `0` to `1074`, or `NaN` when `value` is not finite
+ * @returns {number} The number of decimal places, an integer from `0` to `324` (for `5e-324`), or `NaN` when `value` is not finite
  * @example
  * decimalPlaces(1.25); // => 2
  * decimalPlaces(0.1 + 0.2); // => 17 // 0.30000000000000004
@@ -3705,7 +3705,9 @@ export function decimalPlaces(value: number): number {
  * precision of the double (the default, `1_000_000`, does for values up to about a thousand).
  *
  * The fraction is in lowest terms, its denominator is positive and its numerator carries the sign (`toFraction(-x)` is `toFraction(x)`
- * with the numerator negated); `±0` gives `[0, 1]` and an integer `[value, 1]`. The arithmetic is exact (BigInt), and so are both parts.
+ * with the numerator negated); `±0` gives `[0, 1]` and an integer `[value, 1]`. Being symmetric, it differs from Python on the rare exact
+ * ties of negative values, which Python breaks downwards: `toFraction(-1.5, 1)` is `[-1, 1]` (the candidate nearer zero), where
+ * `Fraction(-1.5).limit_denominator(1)` is `-2`. The arithmetic is exact (BigInt), and so are both parts.
  * @param {number} value - The finite number to approximate
  * @param {number} [maxDenominator=1_000_000] - The largest denominator allowed, a safe integer `>= 1`
  * @returns {[number, number]} `[numerator, denominator]`
@@ -3760,8 +3762,10 @@ export function toFraction(value: number, maxDenominator = 1_000_000): [number, 
 /**
  * Computes the relative change from one value to another, as a percentage of the first: `(to - from) / |from| * 100`. Dividing by the
  * magnitude keeps the sign meaningful for negative values (going from `-50` to `-25` is an increase of `50`). When `from` is `0` the
- * change is undefined and `NaN` is returned (rather than `±Infinity`), like {@link percentage}. The result is the correctly rounded
- * quotient of `100` times the difference, and it does not overflow when the difference (or `100` times it) does but the change does not.
+ * change is undefined and `NaN` is returned (rather than `±Infinity`), like {@link percentage}. The difference is multiplied by `100`
+ * before it is divided, so that a change that is a simple ratio comes out as the double nearest to it (`3` to `4` is `100 / 3`); in
+ * general the result is within a couple of units in the last place of the exact change. It does not overflow when the difference (or
+ * `100` times it) does but the change does not.
  * @param {number} from - The original value
  * @param {number} to - The new value
  * @returns {number} The change in percent (negative for a decrease), or `NaN` when `from` is `0`
@@ -3903,7 +3907,7 @@ export function findRoot(fn: (x: number) => number, lower: number, upper: number
 	let checkpoint = doublePosition(a) - doublePosition(b);
 	if (checkpoint < 0n) checkpoint = -checkpoint;
 	let stalled = 0;
-	for (let iteration = 0; iteration < maxIterations; iteration++) {
+	for (let iteration = 0; ; iteration++) {
 		if (fb > 0 === fc > 0) {
 			c = a;
 			fc = fa;
@@ -3924,6 +3928,8 @@ export function findRoot(fn: (x: number) => number, lower: number, upper: number
 		// Done once the bracket is within the tolerance (or `b` and `c` are adjacent doubles). The difference of two subnormals is exact,
 		// their half may not be: the test is on the width. Halved first when the width overflows (a bracket wider than `Number.MAX_VALUE`).
 		if (Math.abs(width) <= Math.max(4 * Number.EPSILON * Math.abs(b) + tolerance, Number.MIN_VALUE) || fb === 0) return b;
+		// Checked after the test above, so that the result of the last allowed call of `fn` is still used.
+		if (iteration === maxIterations) throw new RangeError(`findRoot: no root found within ${maxIterations} iterations`);
 		const middle = Number.isFinite(width) ? width / 2 : c / 2 - b / 2;
 		const from = doublePosition(b);
 		const to = doublePosition(c);
@@ -3976,5 +3982,4 @@ export function findRoot(fn: (x: number) => number, lower: number, upper: number
 		fa = fb;
 		fb = evaluateRoot(fn, b);
 	}
-	throw new RangeError(`findRoot: no root found within ${maxIterations} iterations`);
 }
