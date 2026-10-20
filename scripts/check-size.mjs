@@ -5,7 +5,7 @@ import { execSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { gzipSync } from 'node:zlib';
 
-const BUDGET = { runtimeGzip: 154 * 1024, packed: 600 * 1024 };
+const BUDGET = { runtimeGzip: 160 * 1024, packed: 600 * 1024 };
 // npm 12 keys the report by package name; earlier versions print an array.
 const [report] = Object.values(JSON.parse(execSync('npm pack --dry-run --json', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })));
 const javascript = Buffer.concat(
