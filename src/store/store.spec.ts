@@ -3620,7 +3620,7 @@ describe('persistStore', function () {
 				expect(store.getState()).toEqual({ theme: 'dark', size: 1 });
 				// The startup hydration notified once (a merged copy), the event once more.
 				expect(seen).toEqual(['light', 'dark']);
-				expect(storage.calls).toEqual([]);
+				expect(storage.calls).toEqual(['get prefs']);
 				// Other keys and other storages are ignored.
 				dispatch({ key: 'other', newValue: '{"state":{"theme":"x"},"version":0}', storageArea: storage });
 				dispatch({ key: 'prefs', newValue: '{"state":{"theme":"y"},"version":0}', storageArea: memoryStorage() });
@@ -3690,8 +3690,9 @@ describe('persistStore', function () {
 				storage.data.set('n', '{"state":5,"version":0}');
 				dispatch({ key: 'n', newValue: '{"state":5,"version":0}', storageArea: storage });
 				expect(store.getState()).toBe(50);
-				expect(storage.calls).toEqual(['get n']);
+				expect(storage.calls).toEqual(['get n', 'get n']);
 				expect(storage.data.get('n')).toBe('{"state":5,"version":0}');
+				storage.data.set('n', '{"state":500,"version":1}');
 				dispatch({ key: 'n', newValue: '{"state":500,"version":1}', storageArea: storage });
 				expect(store.getState()).toBe(100);
 				expect(storage.data.get('n')).toBe('{"state":100,"version":1}');
@@ -3719,8 +3720,40 @@ describe('persistStore', function () {
 				storage.data.set('k', text);
 				dispatch({ key: 'k', newValue: text, storageArea: storage });
 				expect(store.getState()).toBe(before);
-				expect(storage.calls).toEqual(['get k']);
+				expect(storage.calls).toEqual(['get k', 'get k']);
 				expect(storage.data.get('k')).toBe(text);
+			});
+		});
+
+		it('hydrates what the storage holds when a late event arrives, so that two tabs writing at once converge', function () {
+			withEvents(function (dispatch) {
+				const storage = memoryStorage();
+				const store = createStore(0);
+				persistStore(store, { key: 'n', storage, sync: true });
+				// Another tab wrote 1, then this tab wrote 2 before the event of that write arrived: the other tab takes 2 from the
+				// event of this write, so this tab must keep 2 (the storage holds it), not take 1 from the late event.
+				storage.data.set('n', '{"state":1,"version":0}');
+				store.setState(2);
+				dispatch({ key: 'n', newValue: '{"state":1,"version":0}', storageArea: storage });
+				expect(store.getState()).toBe(2);
+				expect(storage.data.get('n')).toBe('{"state":2,"version":0}');
+			});
+		});
+
+		it('writes back a reaction that returns to the state before the event', function () {
+			withEvents(function (dispatch) {
+				const storage = memoryStorage();
+				const defaults = { theme: 'light' };
+				const store = createStore(defaults);
+				// A validation listener: an unknown theme resets the store, to the very state it held before the event.
+				store.subscribe(function () {
+					if (store.getState().theme !== 'light' && store.getState().theme !== 'dark') store.reset();
+				});
+				persistStore(store, { key: 'k', storage, sync: true });
+				storage.data.set('k', '{"state":{"theme":"neon"},"version":0}');
+				dispatch({ key: 'k', newValue: '{"state":{"theme":"neon"},"version":0}', storageArea: storage });
+				expect(store.getState()).toBe(defaults);
+				expect(storage.data.get('k')).toBe('{"state":{"theme":"light"},"version":0}');
 			});
 		});
 
@@ -3744,7 +3777,7 @@ describe('persistStore', function () {
 				expect(onError).toHaveBeenCalledWith(expect.any(SyntaxError));
 				expect(store.getState()).toBe(0);
 				// The bad data is not overwritten in reaction.
-				expect(storage.calls).toEqual(['get n']);
+				expect(storage.calls).toEqual(['get n', 'get n']);
 				stop();
 				stop();
 				expect(count()).toBe(0);

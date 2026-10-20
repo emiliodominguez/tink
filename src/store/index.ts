@@ -1599,9 +1599,9 @@ export interface PersistOptions<S, P = S> {
 	 */
 	debounce?: number;
 	/**
-	 * When `true`, follows the changes other tabs (or windows) make to the key: on each `storage` event for it, the new text is
-	 * hydrated into the store as at startup (deserialized, migrated and merged into the current state), without being written back (not
-	 * even once migrated: the other tab may run another version).
+	 * When `true`, follows the changes other tabs (or windows) make to the key: on each `storage` event for it, the text the storage
+	 * holds then (the latest, even when the event is late) is hydrated into the store as at startup (deserialized, migrated and merged
+	 * into the current state), without being written back (not even once migrated: the other tab may run another version).
 	 * Only native storages (`localStorage`, `sessionStorage`) fire these events, and only in browsers; elsewhere the option does nothing.
 	 * Removing the key in another tab leaves the state as it is. The store must notify synchronously (as this module's stores do), so
 	 * that hydrating does not echo the state back to the other tabs.
@@ -1777,9 +1777,11 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 	let stored: string | null = null;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let active = true;
-	// Whether a `storage` event is being hydrated (the store's notification then writes nothing), and the state it set.
+	// Whether a `storage` event is being hydrated (the store's notification then writes nothing), the state it set, and whether the
+	// store notified meanwhile (it took that state).
 	let syncing = false;
 	let synced: S;
+	let notified: boolean;
 
 	/**
 	 * Reports an error to `onError`, if any.
@@ -1843,25 +1845,25 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 	 * @returns {void}
 	 */
 	function onStorage(event: unknown): void {
-		const { key: changed, newValue, storageArea } = event as { key?: unknown; newValue?: unknown; storageArea?: unknown };
+		const { key: changed, storageArea } = event as { key?: unknown; storageArea?: unknown };
 		// `key` is `null` when another tab cleared the whole storage.
 		if (storageArea !== storage || (changed !== key && changed !== null)) return;
 		// The storage no longer holds what this tab wrote (`hydrate` records what it holds now, when it is a string).
 		stored = null;
-		const before = getState.call(store);
 		syncing = true;
+		notified = false;
 		let set: boolean;
 		try {
-			set = hydrate(function (): unknown {
-				return newValue;
-			});
+			// What the storage holds now, rather than the event's `newValue`: events arrive late, and the text of an event older than a
+			// write of this tab would replace this tab's state with a stale one (while the other tab takes this tab's).
+			set = hydrate(readStorage);
 		} finally {
 			syncing = false;
 		}
-		// What this tab's listeners changed in reaction is a change of its own, written as usual; a state the store did not take (its
-		// `equals` deemed it equal to the current one) is not, or two tabs whose states only differ in key order would echo each other.
-		const after = getState.call(store);
-		if (set && !Object.is(after, synced) && !Object.is(after, before)) onChange();
+		// What this tab's listeners changed in reaction is a change of its own, written as usual (even back to the state before the
+		// event); a state the store did not take (its `equals` deemed it equal to the current one: no notification) is not, or two tabs
+		// whose states only differ in key order would echo each other.
+		if (set && notified && !Object.is(getState.call(store), synced)) onChange();
 	}
 
 	/**
@@ -1902,7 +1904,10 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 	 * @returns {void}
 	 */
 	function onChange(): void {
-		if (syncing) return;
+		if (syncing) {
+			notified = true;
+			return;
+		}
 		if (debounce === 0) write();
 		else if (timer === undefined) timer = setTimeout(write, debounce);
 	}

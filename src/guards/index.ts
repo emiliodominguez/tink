@@ -2385,7 +2385,9 @@ export function isIntersection<const G extends ReadonlyArray<Guard<unknown>>>(..
 				return true;
 			},
 			function explainIntersection(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): boolean {
-				const seen = new Set<string>();
+				// The issues kept, by message and path as text: two paths can give the same text (symbols of the same description, or a key
+				// holding `\0`), so the paths are then compared.
+				const seen = new Map<string, SchemaIssue[]>();
 				let passed = true;
 
 				for (let index = 0; index < members.length; index++) {
@@ -2395,9 +2397,14 @@ export function isIntersection<const G extends ReadonlyArray<Guard<unknown>>>(..
 					passed = false;
 					for (const issue of found) {
 						const id = `${issue.path.map(String).join('\0')}\u0001${issue.message}`;
+						const same = seen.get(id) ?? [];
 
-						if (!seen.has(id)) {
-							seen.add(id);
+						if (
+							!same.some(function (other: SchemaIssue): boolean {
+								return samePath(other.path, issue.path);
+							})
+						) {
+							seen.set(id, same).get(id)?.push(issue);
 							issues.push(issue);
 						}
 					}
@@ -2518,10 +2525,15 @@ interface LazyReport {
  * (`explainRoot`, whose report is the one its caller sees). The root report gives an object that {@link isLazy} reported during another
  * call (a guard or predicate calling `explain` itself, whose issues may have been dropped, or another root call, as the validate module
  * makes several in one parse) in full; a nested call gives a pointer issue for any object already reported during the same root call, so
- * that a guard explaining at each level of a recursive value cannot make the report exponential.
+ * that a guard explaining at each level of a recursive value cannot make the report exponential. A call made while a lazy guard checks
+ * a value outside `explain` (`lazyChecks` of them running) is nested too, in the check (`checkRoot`, shared by the calls made during the
+ * outermost check): a guard or predicate there explaining each level once the levels below were checked (and explained) would otherwise
+ * report them all again at each level.
  */
 let explainRun: object | undefined;
 let explainRoot: object | undefined;
+let lazyChecks = 0;
+let checkRoot: object | undefined;
 
 /**
  * Returns the table of a lazy guard's results for `value` while a discriminated union checks it (`discriminated.object === value`; the
@@ -2579,9 +2591,12 @@ function isPending(value: object, plain: Map<object, unknown>, contextual: Map<s
  * by each lazy guard, which keeps a recursive {@link isUnion} linear in the size of the value however its members differ, and a value
  * nested so deeply that checking it would overflow the stack is rejected (explained as `Value is nested too deeply`). {@link explain}
  * reports an invalid object the value holds in several places at the first place only, the others getting one `Invalid value (same
- * object as reported at another path)` issue, so that a value sharing objects cannot make the report (or its cost) grow exponentially
- * (each `explain` call reports it in full: a guard may call `explain` itself). Inside an {@link isDiscriminatedUnion}, where an exact shape
- * accepts the discriminant, an object is checked apart from its uses elsewhere.
+ * object as reported at another path)` issue, so that a value sharing objects cannot make the report (or its cost) grow exponentially.
+ * The outermost `explain` call reports in full an object that an `explain` call made inside it (by a guard or a predicate) reported
+ * first. Such an inner call, or one made by a guard or a predicate while a lazy guard checks a value (also through {@link ensure} or a
+ * parse of the validate module), gives the pointer issue for an object already reported during the outermost check or `explain`, so that
+ * explaining at each level of a recursive value stays linear: its report tells whether the value passes, not always why. Inside an
+ * {@link isDiscriminatedUnion}, where an exact shape accepts the discriminant, an object is checked apart from its uses elsewhere.
  * @template T - The guarded type
  * @param {() => Guard<T>} getter - Returns the guard (called once, on the first check)
  * @returns {(value: unknown) => boolean} A guard narrowing to `T`
@@ -2648,6 +2663,7 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 			const cycles = scope.cycles;
 
 			scope.depth++;
+			lazyChecks++;
 			try {
 				const passed = guard(value);
 
@@ -2667,6 +2683,7 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 				memo.delete(value);
 				throw error;
 			} finally {
+				if (--lazyChecks === 0) checkRoot = undefined;
 				if (--scope.depth === 0) release();
 			}
 		},
@@ -2686,10 +2703,13 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 				return false;
 			}
 			// Reported by this `explain` call (whose issues all reach its result), or, in a nested call, during the same root call: one
-			// pointer issue, or none when met again at the same path (the members of an intersection), where its issues are already. In the
-			// root call, an object reported by another call is explained again in full (see `explainRoot`).
+			// pointer issue, or none when this call meets it again at the same path (the members of an intersection), where its issues are
+			// already (the path of another call's report is another value's). In the root call, an object reported by another call is
+			// explained again in full (see `explainRoot`).
 			if (state !== undefined && (explainRun === explainRoot ? (state as LazyReport).run === explainRun : (state as LazyReport).root === explainRoot)) {
-				if (!samePath((state as LazyReport).path, path)) issues.push({ message: 'Invalid value (same object as reported at another path)', path: path.slice() });
+				if ((state as LazyReport).run !== explainRun || !samePath((state as LazyReport).path, path)) {
+					issues.push({ message: 'Invalid value (same object as reported at another path)', path: path.slice() });
+				}
 
 				return false;
 			}
@@ -2863,7 +2883,7 @@ export function explain(guard: Guard<unknown>, value: unknown): SchemaIssue[] {
 
 	// The memos of the lazy guards (see `utils/memo.ts`) live until the end, so explaining reuses what checking found.
 	explainRun = {};
-	if (previousRun === undefined) explainRoot = explainRun;
+	if (previousRun === undefined) explainRoot = lazyChecks === 0 ? explainRun : (checkRoot ??= {});
 	scope.depth++;
 	try {
 		// Guards never consult the explainers, so valid values take the fast path and allocate nothing beyond the result.
@@ -3027,8 +3047,9 @@ function walkJson(root: unknown, path: PropertyKey[] | undefined, issues: Schema
 	const stack: unknown[] = [undefined, root];
 	// Each container holding containers, once met: the number of issues before its walk while it is walked (meeting it again then means a
 	// cycle), then whether it passed. Such a container held in several places is walked once, so a value sharing containers (each held
-	// twice by the next, as YAML aliases build) is checked in linear time instead of once per path, exponential in its depth. Containers of
-	// primitives only (most of them) are not recorded: they cannot be part of a cycle, and are walked once per container holding them.
+	// twice by the next, as YAML aliases build) is checked in linear time instead of once per path, exponential in its depth. Small
+	// containers of primitives only (most of them) are not recorded: they cannot be part of a cycle, and walking one again costs no more
+	// than the reference to it did; a large one is recorded, or a list holding it many times would walk it once per place (quadratic).
 	const walked = new Map<unknown, number | boolean>();
 	let passed = true;
 
@@ -3077,7 +3098,8 @@ function walkJson(root: unknown, path: PropertyKey[] | undefined, issues: Schema
 						stack.push(keys[index], child);
 					}
 				}
-				if (nested) {
+				// More than 15 children: a large container.
+				if (nested || stack.length > exit + 31) {
 					walked.set(value, issues === undefined ? 0 : issues.length);
 					stack[exit] = EXIT;
 				}
@@ -3124,7 +3146,8 @@ function explainJson(guard: Guard<unknown>, value: unknown, path: PropertyKey[],
  * Symbol keys are ignored, as `JSON.stringify` does. The walk is iterative, so arbitrarily deep values cannot overflow the stack, and
  * {@link explain} reports the path of every offending value. A container held in several places is walked once, so the cost is linear in
  * the size of the value even when it shares containers (YAML aliases), where `JSON.stringify` is exponential; {@link explain} reports
- * an invalid one at its first path and gives one `Invalid value (same object as reported at another path)` issue at each other path.
+ * an invalid one at its first path and gives one `Invalid value (same object as reported at another path)` issue at each other path
+ * (a container of fewer than 16 primitives is cheap enough to be checked, and reported, again at each path).
  * @param {unknown} value - The value to check
  * @returns {boolean} Whether the value is a JsonValue
  * @example
