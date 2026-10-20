@@ -6,19 +6,10 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import ts from 'typescript';
 
-// Calls every major bundler (esbuild, Rollup, webpack + terser) treats as side-effect free.
-const PURE_CALLEES = new Set([
-	'Symbol',
-	'Symbol.for',
-	'Map',
-	'Set',
-	'WeakMap',
-	'WeakSet',
-	'RegExp',
-	'Object.getOwnPropertyDescriptor',
-	'Object.getPrototypeOf',
-	'Object.freeze'
-]);
+// Calls allowed at the top level. Bundlers drop unused `Symbol`, `Map`, `Set`, `WeakMap` and `WeakSet` calls; esbuild keeps the
+// `Object.*` ones, which are deliberate (they capture built-ins before any user code can replace them) and cost a few bytes. `RegExp`
+// is not allowed: esbuild keeps every `RegExp(...)` and `new RegExp(...)` (they can throw), so module-level patterns are literals.
+const PURE_CALLEES = new Set(['Symbol', 'Symbol.for', 'Map', 'Set', 'WeakMap', 'WeakSet', 'Object.getOwnPropertyDescriptor', 'Object.getPrototypeOf', 'Object.freeze']);
 
 const violations = [];
 

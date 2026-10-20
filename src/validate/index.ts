@@ -151,10 +151,12 @@ const HEX_COLOR_PATTERN = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
 /** CSS hex colour without an alpha channel. */
 const OPAQUE_HEX_COLOR_PATTERN = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
 
-/** The official semver.org 2.0.0 regular expression (numbered groups: major, minor, patch, pre-release, build). */
-const SEMVER_PATTERN = new RegExp(
-	String.raw`^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$`
-);
+/**
+ * The official semver.org 2.0.0 regular expression (numbered groups: major, minor, patch, pre-release, build). A literal, not
+ * `new RegExp(...)`: bundlers keep a module-level constructor call, even in bundles that never read a version.
+ */
+const SEMVER_PATTERN =
+	/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
 
 /** A string of ASCII digits. */
 const DIGITS_PATTERN = /^[0-9]+$/;

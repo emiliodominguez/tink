@@ -179,26 +179,20 @@ export interface MeetsContrastOptions {
 }
 
 /**
- * One argument of a CSS colour function: a CSS `<number>` and an optional `%` or angle unit (both captured).
- * Built into the two function patterns below, so a colour function is matched by a single regular expression.
+ * Legacy syntax `name(a, b, c[, d])`: the function name, then a number and a unit per argument. An argument is a CSS `<number>` and an
+ * optional `%` or angle unit (both captured), and the white space around it is CSS white space (CSS Syntax 3: space, tab and line
+ * feed, carriage return or form feed, not JavaScript's `\s`). A literal, not `new RegExp(...)`: bundlers keep a module-level
+ * constructor call, even in bundles that never parse a colour.
  */
-const COMPONENT = String.raw`([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(%|deg|grad|rad|turn)?`;
+const LEGACY_FUNCTION_PATTERN =
+	/^(rgba?|hsla?)\([ \t\n\r\f]*([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(%|deg|grad|rad|turn)?[ \t\n\r\f]*,[ \t\n\r\f]*([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(%|deg|grad|rad|turn)?[ \t\n\r\f]*,[ \t\n\r\f]*([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(%|deg|grad|rad|turn)?(?:[ \t\n\r\f]*,[ \t\n\r\f]*([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(%|deg|grad|rad|turn)?)?[ \t\n\r\f]*\)$/i;
 
-/** CSS white space (CSS Syntax 3): space, tab and line feed, carriage return or form feed — not JavaScript's `\s` (no-break space, U+2028...). */
-const SPACE = String.raw`[ \t\n\r\f]`;
-
-/** Legacy syntax `name(a, b, c[, d])`: the function name, then a number and a unit per argument. */
-const LEGACY_FUNCTION_PATTERN = new RegExp(
-	String.raw`^(rgba?|hsla?)\(${SPACE}*${COMPONENT}${SPACE}*,${SPACE}*${COMPONENT}${SPACE}*,${SPACE}*${COMPONENT}(?:${SPACE}*,${SPACE}*${COMPONENT})?${SPACE}*\)$`,
-	'i'
-);
-
-/** Modern syntax `name(a b c[ / d])`, where any argument may be `none`: the function name, then a number, a unit and `none` per argument. */
-const MODERN_COMPONENT = `(?:${COMPONENT}|(none))`;
-const MODERN_FUNCTION_PATTERN = new RegExp(
-	String.raw`^(rgba?|hsla?|oklab|oklch)\(${SPACE}*${MODERN_COMPONENT}${SPACE}+${MODERN_COMPONENT}${SPACE}+${MODERN_COMPONENT}(?:${SPACE}*\/${SPACE}*${MODERN_COMPONENT})?${SPACE}*\)$`,
-	'i'
-);
+/**
+ * Modern syntax `name(a b c[ / d])`, where any argument may be `none`: the function name, then a number, a unit and `none` per argument
+ * (arguments and white space as in {@link LEGACY_FUNCTION_PATTERN}).
+ */
+const MODERN_FUNCTION_PATTERN =
+	/^(rgba?|hsla?|oklab|oklch)\([ \t\n\r\f]*(?:([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(%|deg|grad|rad|turn)?|(none))[ \t\n\r\f]+(?:([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(%|deg|grad|rad|turn)?|(none))[ \t\n\r\f]+(?:([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(%|deg|grad|rad|turn)?|(none))(?:[ \t\n\r\f]*\/[ \t\n\r\f]*(?:([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(%|deg|grad|rad|turn)?|(none)))?[ \t\n\r\f]*\)$/i;
 
 /** How many of each CSS angle unit make a full turn (`''` is a unitless hue, which means degrees). */
 const UNITS_PER_TURN: Readonly<Record<string, number>> = { '': 360, deg: 360, grad: 400, rad: 2 * Math.PI, turn: 1 };
@@ -697,7 +691,7 @@ function quote(text: string): string {
 }
 
 /**
- * Tells whether a UTF-16 code unit is CSS white space (see {@link SPACE}).
+ * Tells whether a UTF-16 code unit is CSS white space (space, tab, line feed, carriage return, form feed).
  * @param {number} code - The code unit
  * @returns {boolean} `true` for space, tab, line feed, form feed and carriage return
  * @example
@@ -709,7 +703,7 @@ function isSpace(code: number): boolean {
 }
 
 /**
- * Strips CSS white space (see {@link SPACE}) from both ends of a string: `String.prototype.trim` also strips no-break spaces, line
+ * Strips CSS white space (space, tab, line feed, carriage return, form feed) from both ends of a string: `String.prototype.trim` also strips no-break spaces, line
  * separators, BOMs...
  * @param {string} input - The string
  * @returns {string} The string without leading and trailing CSS white space

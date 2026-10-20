@@ -333,9 +333,10 @@ const TOKEN_REGEX = /YYYY|YY|SSS|MM|M|DD|D|HH|H|hh|h|mm|m|ss|s|A|a/g;
 
 /**
  * {@link TOKEN_REGEX} plus a `[...]` group capturing literal text. Only run on text that ends with `]` (see
- * {@link compilePattern}): there, every `[` has a closing `]` and each match consumes all it scans, so tokenizing is linear.
+ * {@link compilePattern}): there, every `[` has a closing `]` and each match consumes all it scans, so tokenizing is linear. A literal,
+ * not built from `TOKEN_REGEX.source`: bundlers keep a module-level `new RegExp(...)`, even in bundles that never format a date.
  */
-const FORMAT_TOKEN_REGEX = new RegExp(`\\[([^\\]]*)]|${TOKEN_REGEX.source}`, 'g');
+const FORMAT_TOKEN_REGEX = /\[([^\]]*)]|YYYY|YY|SSS|MM|M|DD|D|HH|H|hh|h|mm|m|ss|s|A|a/g;
 
 /**
  * The tokens of {@link formatInTimeZone}: {@link TOKEN_REGEX}'s plus the UTC offset tokens `ZZ` and `Z` (literals, unlike
