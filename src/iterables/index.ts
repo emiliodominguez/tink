@@ -1853,10 +1853,16 @@ async function closeSources(iterators: ReadonlyArray<AsyncIterator<unknown>>, st
 			closeLater(iterators[index]);
 		} else if (state !== FINISHED) {
 			// Followed as `await` would (a native promise's own `then`, which could throw or never call back, is ignored); a `return()` that
-			// throws rejects it.
+			// throws rejects it. The result is not resolved again: a `then` it gained since (a getter) would be followed.
 			closing.push(
-				new Promise(function (resolve, reject) {
-					whenSettled(iterators[index].return?.(), resolve, reject);
+				new Promise<void>(function (resolve, reject) {
+					whenSettled(
+						iterators[index].return?.(),
+						function () {
+							resolve();
+						},
+						reject
+					);
 				})
 			);
 		}

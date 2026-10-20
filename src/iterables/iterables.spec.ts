@@ -4710,6 +4710,39 @@ describe('async combinators: hostile promises, large read-aheads and a polluted 
 			expect(outcome).toEqual({ done: true, value: undefined });
 		}
 	});
+	it('mergeAsync reads the then of a return() result once, as await does (regression: it hung when a getter gave a then later)', async function () {
+		let reads = 0;
+		const result = Object.defineProperty({ done: true }, 'then', {
+			get(): unknown {
+				reads++;
+				// A `then` that never calls back, from the second read on.
+				return reads === 1 ? undefined : function (): void {};
+			}
+		});
+		const source: AsyncIterable<number> = {
+			[Symbol.asyncIterator]() {
+				return {
+					next: async function () {
+						return { done: false, value: 1 };
+					},
+					return() {
+						return result;
+					}
+				} as unknown as AsyncIterator<number>;
+			}
+		};
+		const merged = helpers.mergeAsync(source);
+		await expect(merged.next()).resolves.toEqual({ done: false, value: 1 });
+		const closed = (merged.return as (value?: unknown) => Promise<IteratorResult<unknown>>)(undefined);
+		const outcome = await Promise.race([
+			closed,
+			new Promise(function (resolve) {
+				setTimeout(resolve, 1000, 'hung');
+			})
+		]);
+		expect(outcome).toEqual({ done: true, value: undefined });
+		expect(reads).toBe(1);
+	});
 
 	it('accepts a function as an iterator result, reading its value only when not done, as for await does (regression: a TypeError)', async function () {
 		/** An async iterable of `'f'` whose results are functions; the `value` of the last one throws. */
