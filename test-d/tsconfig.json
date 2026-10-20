@@ -20,6 +20,18 @@
 		"store-color.ts",
 		"strings-math.ts",
 		"url-objects.ts",
-		"utils.ts"
+		"utils.ts",
+		"async-1.4.ts",
+		"cache-1.4.ts",
+		"color-1.4.ts",
+		"date-1.4.ts",
+		"decorators-1.4.ts",
+		"encoding-1.4.ts",
+		"errors-1.4.ts",
+		"functions-1.4.ts",
+		"iterables-1.4.ts",
+		"path-1.4.ts",
+		"search-1.4.ts",
+		"validate-1.4.ts"
 	]
 }

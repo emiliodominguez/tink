@@ -11,31 +11,56 @@ const MODULES = [
 	['strings', 'Unicode-aware transformations, case conversion, escaping, templating, natural sorting, terminal text width, ANSI/HTML stripping and safe file names.'],
 	['url', 'Typed route patterns (match and build), query-string building and parsing, URL joining, normalization and cookies.'],
 	[
+		'path',
+		'POSIX path helpers (normalize, join, resolve, relative, parse/format, basename/dirname/extname) for every runtime, byte for byte like node:path, in linear time.'
+	],
+	[
 		'math',
 		'Precise arithmetic and rounding (exact sums, half-even rounding, lossless allocation, fractions), statistics, regression, histograms, number theory (factorization, modular arithmetic), interpolation, axis ticks, vectors, root finding and random numbers.'
 	],
-	['functions', 'Function composition, currying, memoization and rate limiting.'],
-	['async', 'Promise utilities: retries, timeouts, polling, limiters, semaphores and mutexes, request batching, event waiting, keyed Promise.all and async debounce.'],
-	['color', 'Hex/RGB/HSL/HSV and OKLab/OKLCH conversion with CSS gamut mapping, perceptual mixing and scales, opt-in named colours and WCAG contrast checks.'],
-	['search', 'Fuzzy matching and ranking with highlight ranges and optional accent folding, for command palettes and filter-as-you-type UIs.'],
+	['functions', 'Function composition, currying, memoization, rate limiting, pattern matching, Result tuples (ok/err/unwrap) and when/unless/cond.'],
+	[
+		'async',
+		'Promise utilities: retries and backoff, timeouts, polling, limiters, semaphores and mutexes, circuit breakers, request batching, event waiting and async event iteration, drift-free intervals, stopwatches, keyed Promise.all and async debounce.'
+	],
+	[
+		'color',
+		'Hex/RGB/HSL/HSV, OKLab/OKLCH and CIELAB conversion with CSS gamut mapping, perceptual mixing and scales, colour difference (deltaE, CIEDE2000), stable colours from strings, colour-blindness simulation, opt-in named colours and WCAG contrast checks.'
+	],
+	[
+		'search',
+		'Fuzzy matching and ranking with highlight ranges and optional accent folding, for command palettes and filter-as-you-type UIs, plus a BM25 full-text index and a Unicode tokenizer.'
+	],
 	['easing', 'Animation easing curves, CSS-accurate cubic-bezier() and steps(), and an analytic spring.'],
 	[
 		'encoding',
-		'Buffer-free base64/base64url, base32, hex and UTF-8 conversions with strict decoding, RFC 4180 CSV, JWT decoding, constant-time comparison and a synchronous SHA-256.'
+		'Buffer-free base64/base64url, base32, hex and UTF-8 conversions with strict decoding, RFC 4180 CSV, JWT decoding and HS256 signing/verification, constant-time comparison, a synchronous SHA-256 and HMAC-SHA256, and CRC-32.'
 	],
-	['errors', 'Never-throwing error normalization (toError, getErrorMessage) and cycle-safe error serialization that round-trips through JSON.'],
+	[
+		'errors',
+		'Never-throwing error normalization (toError, getErrorMessage), cycle-safe error serialization that round-trips through JSON, typed error classes (defineError), cause chains and readable reports.'
+	],
 	['format', 'Deterministic, cached Intl formatting (numbers, currency, percent, compact, units, lists, dates, ordinals) and strict locale-aware number parsing.'],
 	[
 		'validate',
-		'Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates, zod-like parsing with coercion, defaults and transforms, and typed environment variables.'
+		'Linear-time string validators (email, URL, UUID, IP, semver, ISO dates, Luhn, base64, ...) as type predicates, zod-like parsing with coercion, defaults and transforms, typed environment variables, and node-semver-exact ranges.'
 	],
-	['date', 'DST-safe, non-mutating date arithmetic, formatting and parsing, IANA time zones, calendar grids, interval sets and business days with holidays.'],
-	['iterables', 'Lazy, generator-based pipelines over any (async) iterable, with exact pull counts and early-exit cleanup.'],
-	['cache', 'O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock (plugs into memoize), a ring-buffer deque and a priority queue.'],
+	[
+		'date',
+		'DST-safe, non-mutating date arithmetic, formatting and parsing, IANA time zones, calendar grids, interval sets, business days with holidays and cron schedules.'
+	],
+	[
+		'iterables',
+		'Lazy, generator-based pipelines over any (async) iterable, with exact pull counts and early-exit cleanup, plus stream readers (lines, Server-Sent Events, NDJSON) and async merging and batching.'
+	],
+	[
+		'cache',
+		'O(1) LRU cache with optional TTL, eviction callbacks and an injectable clock (plugs into memoize), a ring-buffer deque, a ring buffer, a priority queue, a radix trie, a Bloom filter, and bidirectional, multi-value and default maps.'
+	],
 	['emitter', 'Typed event emitter with wildcard listeners, waitFor and error isolation.'],
 	['store', 'Tiny state store compatible with React useSyncExternalStore, with derived and computed stores, persistence, typed state machines and undo/redo.'],
 	['random', 'Seeded deterministic PRNG plus cryptographically secure ids, UUIDs (v4, v7), ULIDs and bytes.'],
-	['decorators', 'Class decorators for TypeScript (legacy and TC39 standard) and Babel.']
+	['decorators', 'Class decorators for TypeScript (legacy and TC39 standard) and Babel, including lazy getters and method timing.']
 ];
 
 /**
@@ -205,7 +230,7 @@ const llms = `# tink (tinkit)
 
 > Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities (${MODULES.length} modules, ${[...EXPORTS.values()].reduce(function (total, rows) {
 	return total + rows.length;
-}, 0)} exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, encoding, error serialization, fuzzy search, caches, emitters and stores. Property-tested and mutation-tested.
+}, 0)} exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, encoding, error serialization, fuzzy and full-text search, caches, emitters, stores, POSIX paths, cron and semver. Property-tested and mutation-tested.
 
 ${PRINCIPLES}
 

@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 
-const INSTANTIATION_BUDGET = 66_000;
+const INSTANTIATION_BUDGET = 80_000;
 // The native TypeScript 7 compiler (`typescript` itself is the TypeScript 6 API package, for the tools that need one).
 const tsc = join(dirname(createRequire(import.meta.url).resolve('@typescript/native/package.json')), 'bin', 'tsc');
 let output;
