@@ -22,6 +22,7 @@ import {
 	asInteger,
 	blankAsUndefined,
 	chain,
+	check,
 	discriminatedUnion,
 	lazy,
 	nullable,
@@ -587,6 +588,35 @@ describe('recursive unions told apart deep inside', function () {
 			{ message: 'Expected an integer or an integer string (got string)', path: [0, 'id'] },
 			{ message: 'Invalid value (same object as reported at another path)', path: [2] }
 		]);
+	});
+
+	it('should report an object again when a parse nested in a guard or a check reported it first', function () {
+		const item = lazy(function () {
+			return { id: asInteger };
+		});
+		const shared = { id: 'x' };
+		const idIssue = { message: 'Expected an integer or an integer string (got string)', path: ['second', 'id'] };
+
+		/**
+		 * Accepts what `item` parses, with a parse of its own: its issues are not part of the report around it.
+		 * @param {unknown} value - The value
+		 * @returns {boolean} Whether `item` accepts it
+		 */
+		function isItem(value: unknown): value is object {
+			return safeParse(item, value)[0] === undefined;
+		}
+
+		expect(issuesOf({ first: isItem, second: item }, { first: shared, second: shared })).toEqual([{ message: 'Invalid value (got object)', path: ['first'] }, idIssue]);
+
+		const nestedCheck = check(
+			isObject,
+			function (): boolean {
+				return safeParse(item, shared)[0] === undefined;
+			},
+			'nested'
+		);
+
+		expect(issuesOf({ first: nestedCheck, second: item }, { first: {}, second: shared })).toEqual([{ message: 'nested', path: ['first'] }, idIssue]);
 	});
 
 	it('should report again an object held twice whose first report found nothing', function () {

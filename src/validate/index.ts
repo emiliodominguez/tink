@@ -3830,8 +3830,9 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 	let resolved: Node | undefined;
 	let resolving = false;
 	// The output for each object parsed by this parser during the current parse (see `utils/memo.ts`), and the objects reported during
-	// it: `PENDING` while being reported (meeting one again means a cycle), then `FAIL` when it had issues, so that an object reached
-	// again by another path is not reported again (once per path would be exponential in the depth of the objects a value shares).
+	// it: `PENDING` while being reported (meeting one again means a cycle), then the list its issues went to, so that an object reached
+	// again by another path of the same report is not reported again (once per path would be exponential in the depth of the objects a
+	// value shares). A parse nested in a guard or a transform reports to a list of its own, which the report around it does not hold.
 	const memo = new Map<object, unknown>();
 	const reported = new Map<object, unknown>();
 	// The values being scored: a union that reaches this parser again on the same value (`lazy(() => union(a, nullable(self)))`) would
@@ -3917,7 +3918,7 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 
 			const state = reported.get(value);
 
-			if (state !== undefined) {
+			if (state === PENDING || state === issues) {
 				issues.push({ message: state === PENDING ? 'Circular reference' : 'Invalid value (same object as reported at another path)', path: path.slice() });
 
 				return undefined;
@@ -3955,7 +3956,7 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 				}
 				throw error;
 			} finally {
-				if (failed) reported.set(value, FAIL);
+				if (failed) reported.set(value, issues);
 				else reported.delete(value);
 				if (--scope.depth === 0) release();
 			}
