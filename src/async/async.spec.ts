@@ -5043,6 +5043,26 @@ describe('Async helpers (locks, events, reduceAsync, minDelay)', function () {
 			await expect(waitForEvent(emitter, 'x', null as any)).rejects.toThrow(TypeError);
 			expect(emitter.eventNames()).toEqual([]);
 		});
+
+		it('rejects a hole in rejectOn, whatever a polluted Object.prototype holds at its index', async function () {
+			const emitter = new EventEmitter();
+			const proto = Object.prototype as Record<string, unknown>;
+			// eslint-disable-next-line no-sparse-arrays
+			const rejectOn = ['error', , 'close'] as string[];
+			const error = new TypeError('waitForEvent: `rejectOn[1]` must be a string or a symbol, got undefined');
+
+			await expect(waitForEvent(emitter, 'x', { rejectOn })).rejects.toThrow(error);
+			proto[1] = 'end';
+			try {
+				await expect(waitForEvent(emitter, 'x', { rejectOn })).rejects.toThrow(error);
+				expect(function () {
+					fromEvent(emitter, 'x', { rejectOn });
+				}).toThrow(new TypeError('fromEvent: `rejectOn[1]` must be a string or a symbol, got undefined'));
+			} finally {
+				delete proto[1];
+			}
+			expect(emitter.eventNames()).toEqual([]);
+		});
 	});
 
 	describe('reduceAsync', function () {
@@ -6344,6 +6364,30 @@ describe('Async helpers (1.4: error checks, circuit breaker, backoff, fromEvent,
 			await expect(unread.next()).resolves.toEqual({ value: undefined, done: true });
 		});
 
+		it('serves many pending reads in linear time (previously quadratic: an Array#shift queue)', async function () {
+			/**
+			 * Times `n` events, each handed to one of `n` reads made beforehand.
+			 * @param {number} n - The number of reads
+			 * @returns {Promise<number>} The time in ms
+			 */
+			async function time(n: number): Promise<number> {
+				const emitter = new EventEmitter();
+				const iterator = fromEvent<number>(emitter, 'n');
+				const reads: Array<Promise<IteratorResult<number>>> = [];
+				for (let i = 0; i < n; i++) reads.push(iterator.next());
+				const start = performance.now();
+				for (let i = 0; i < n; i++) emitter.emit('n', i);
+				const elapsed = performance.now() - start;
+				expect((await reads[n - 1]).value).toBe(n - 1);
+				await iterator.return?.();
+				return elapsed;
+			}
+			await time(10_000);
+			const small = await time(10_000);
+			// Eight times the reads: about 8 times as long (64 times, quadratic: 100,000 reads took 8 s).
+			expect(await time(80_000)).toBeLessThan(small * 20 + 200);
+		});
+
 		it('fails with a rejectOn event after the buffered events, removing every listener at once', async function () {
 			const emitter = new EventEmitter();
 			const iterator = fromEvent<string>(emitter, 'data', { rejectOn: ['error', 'close'] });
@@ -7427,6 +7471,34 @@ describe('Async helpers (one listener per shared signal, promises with their own
 		interval(tick, 10, { signal: abortingOnAdd(), immediate: true });
 		expect(tick).not.toHaveBeenCalled();
 		expect(jest.getTimerCount()).toBe(0);
+	});
+
+	it('createQueue and createRateLimiter reject a call queued as their signal aborts while its listener is added (previously queued, then run)', async function () {
+		jest.useFakeTimers();
+		const queue = createQueue({ concurrency: 1, signal: abortingOnAdd() });
+		const gate = createDeferred<void>();
+		const running = queue.add(function () {
+			return gate.promise;
+		});
+		const task = jest.fn();
+		const dropped = queue.add(task);
+		expect(await stateOf(dropped)).toBe('rejected');
+		await expect(dropped).rejects.toBe('stop');
+		expect(queue.size).toBe(0);
+		gate.resolve();
+		await running;
+		await flush();
+		expect(task).not.toHaveBeenCalled();
+		const limiter = createRateLimiter({ limit: 1, interval: 50, signal: abortingOnAdd() });
+		await expect(limiter.schedule(jest.fn().mockReturnValue(1))).resolves.toBe(1);
+		const call = jest.fn();
+		const rejected = limiter.schedule(call);
+		expect(await stateOf(rejected)).toBe('rejected');
+		await expect(rejected).rejects.toBe('stop');
+		expect(limiter.pendingCount).toBe(0);
+		expect(jest.getTimerCount()).toBe(0);
+		jest.advanceTimersByTime(100);
+		expect(call).not.toHaveBeenCalled();
 	});
 
 	it('follow a promise with its own throwing then like await does (previously leaked a slot or a permit, threw, or hung)', async function () {

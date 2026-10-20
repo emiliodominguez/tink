@@ -1167,6 +1167,8 @@ export function createQueue<S extends AbortSignalLike = never>(options: QueueOpt
 						throw error;
 					}
 					waiting.push(entry);
+					// A queue signal that aborted as its listener was added (and ran it before this task was queued) drops this task too.
+					if (queueSignal?.aborted) drop(abortReason(queueSignal));
 				}
 			});
 		},
@@ -1404,8 +1406,10 @@ export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
 			else (last as RateLimitedCall).next = call;
 			last = call;
 			pending++;
-			// A call scheduled from a starting call is picked up by the running drain loop.
-			if (timer === undefined && !draining) drain();
+			// A signal that aborted as its listener was added (and ran it before this call was queued) rejects this call too. A call
+			// scheduled from a starting call is picked up by the running drain loop.
+			if (signal?.aborted) drop(abortReason(signal));
+			else if (timer === undefined && !draining) drain();
 		});
 	}
 
@@ -3349,9 +3353,10 @@ function listenerMethods(caller: string, target: unknown, type: unknown): [AnyFu
  */
 function assertRejectOn(caller: string, rejectOn: unknown): asserts rejectOn is ReadonlyArray<string | symbol> {
 	if (!Array.isArray(rejectOn)) throw new TypeError(`${caller}: \`rejectOn\` must be an array, got ${describe(rejectOn)}`);
-	rejectOn.forEach(function (rejectType: unknown, index) {
-		assertEventType(caller, `rejectOn[${index}]`, rejectType);
-	});
+	// Every index, a hole as `undefined` (`forEach` skips holes, and reads one filled by a polluted `Object.prototype`).
+	for (let index = 0; index < rejectOn.length; index++) {
+		assertEventType(caller, `rejectOn[${index}]`, Object.hasOwn(rejectOn, index) ? rejectOn[index] : undefined);
+	}
 }
 
 /**
@@ -4355,7 +4360,7 @@ export interface FromEventOptions<T> {
 }
 
 /**
- * An event buffered by {@link fromEvent}.
+ * An event buffered by {@link fromEvent}, or a read waiting for one (its deferred).
  */
 interface QueuedEvent {
 	readonly value: unknown;
@@ -4453,8 +4458,9 @@ export function fromEvent(target: EventTargetLike | EventEmitterLike, type: stri
 	let first: QueuedEvent | undefined;
 	let last: QueuedEvent | undefined;
 	let buffered = 0;
-	// The reads waiting for an event.
-	const reads: Array<Deferred<IteratorResult<unknown>>> = [];
+	// The reads waiting for an event (their deferreds), as a linked FIFO queue too: an `Array#shift` queue made n pending reads cost O(n²).
+	let firstRead: QueuedEvent | undefined;
+	let lastRead: QueuedEvent | undefined;
 	// Whether the listeners are gone (no event is accepted any more), and the error the iteration fails with once the buffer is read.
 	let closed = false;
 	let failure: { error: unknown } | undefined;
@@ -4476,11 +4482,16 @@ export function fromEvent(target: EventTargetLike | EventEmitterLike, type: stri
 	 * @returns {{ error: unknown } | undefined} `error` when no read was waiting for it (it is then thrown by the next read)
 	 */
 	function endReads(error: { error: unknown } | undefined): { error: unknown } | undefined {
-		for (const read of reads.splice(0)) {
+		let read = firstRead;
+
+		firstRead = lastRead = undefined;
+		for (; read !== undefined; read = read.next) {
+			const { resolve, reject } = read.value as Deferred<IteratorResult<unknown>>;
+
 			if (error === undefined) {
-				read.resolve({ value: undefined, done: true });
+				resolve({ value: undefined, done: true });
 			} else {
-				read.reject(error.error);
+				reject(error.error);
 				error = undefined;
 			}
 		}
@@ -4548,10 +4559,13 @@ export function fromEvent(target: EventTargetLike | EventEmitterLike, type: stri
 			return;
 		}
 
-		const read = reads.shift();
+		const read = firstRead;
 
 		if (read !== undefined) {
-			read.resolve({ value: event, done: false });
+			firstRead = read.next;
+			// Not to keep the read (and its event) alive through `lastRead`.
+			if (firstRead === undefined) lastRead = undefined;
+			(read.value as Deferred<IteratorResult<unknown>>).resolve({ value: event, done: false });
 		} else if (buffered < bufferSize || overflow === 'drop-oldest') {
 			const node: QueuedEvent = { value: event, next: undefined };
 
@@ -4577,8 +4591,11 @@ export function fromEvent(target: EventTargetLike | EventEmitterLike, type: stri
 			if (closed) return Promise.resolve({ value: undefined, done: true });
 
 			const read = createDeferred<IteratorResult<unknown>>();
+			const node: QueuedEvent = { value: read, next: undefined };
 
-			reads.push(read);
+			if (firstRead === undefined) firstRead = node;
+			else (lastRead as QueuedEvent).next = node;
+			lastRead = node;
 			return read.promise;
 		},
 		return(): Promise<IteratorResult<unknown>> {
