@@ -4269,6 +4269,7 @@ describe('percentageChange', function () {
 });
 
 describe('findRoot', function () {
+	/** `x² - 2`, whose positive root is `√2`. */
 	function square(x: number) {
 		return x * x - 2;
 	}
@@ -4293,6 +4294,7 @@ describe('findRoot', function () {
 	});
 
 	it('should return a bound where the function is 0', function () {
+		/** `x - 3`, whose root is `3`. */
 		function shifted(x: number) {
 			return x - 3;
 		}
@@ -4347,6 +4349,7 @@ describe('findRoot', function () {
 
 	it('should narrow the widest brackets down to roots next to zero in few steps', function () {
 		let calls = 0;
+		/** Wraps `f` so that its calls are counted in `calls`. */
 		function counted(f: (x: number) => number) {
 			return function (x: number) {
 				calls++;
@@ -4422,6 +4425,7 @@ describe('findRoot', function () {
 		).toBe(1);
 		// Exactly the calls the search needs inside the loop are enough; one fewer is not.
 		let calls = 0;
+		/** `x² - 2`, counting its calls in `calls`. */
 		function counted(x: number): number {
 			calls++;
 			return x * x - 2;

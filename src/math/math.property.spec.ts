@@ -2063,6 +2063,7 @@ describe('New math helpers (property-based)', function () {
 			const e10 = Math.sqrt(50);
 			const e5 = Math.sqrt(10);
 			const e2 = Math.sqrt(2);
+			/** d3's `tickSpec`: the first and last tick indices and the step (negative: its inverse). */
 			function tickSpec(low: number, high: number, n: number): [number, number, number] {
 				const step = (high - low) / Math.max(0, n);
 				const power = Math.floor(Math.log10(step));
@@ -2183,10 +2184,12 @@ describe('New math helpers (property-based)', function () {
 	});
 
 	describe('dot, norm, distance and cosineSimilarity', function () {
+		/** The first element of a pair. */
 		function first(pair: [number, number]): number {
 			return pair[0];
 		}
 
+		/** The second element of a pair. */
 		function second(pair: [number, number]): number {
 			return pair[1];
 		}
@@ -2893,7 +2896,7 @@ describe('Rounding and floating-point helpers (property-based)', function () {
 				fc.property(fc.double({ min: -50, max: 50, noNaN: true }), fc.integer({ min: 1, max: 60 }), function (value, limit) {
 					const [numerator, denominator] = helpers.toFraction(value, limit);
 					const [n, d] = exactFraction(value);
-					// |value - p / q| as the fraction |n * q - p * d| / (d * q), compared by cross-multiplication.
+					/** `|value - p / q|` as the fraction `|n * q - p * d| / (d * q)`, compared by cross-multiplication. */
 					function distance(p: bigint, q: bigint): [bigint, bigint] {
 						const difference = n * q - p * d;
 						return [difference < 0n ? -difference : difference, d * q];
@@ -2995,6 +2998,7 @@ describe('Rounding and floating-point helpers (property-based)', function () {
 		it('should find a root of a polynomial bracketing a sign change, as precisely as doubles allow', function () {
 			fc.assert(
 				fc.property(fc.array(fc.double({ min: -10, max: 10, noNaN: true }), { minLength: 2, maxLength: 6 }), finite, finite, function (coefficients, a, b) {
+					/** The polynomial with these coefficients (highest degree first), by Horner's rule. */
 					function polynomial(x: number): number {
 						let result = 0;
 						for (const coefficient of coefficients) result = result * x + coefficient;
@@ -3038,6 +3042,7 @@ function bigAbs(value: bigint): bigint {
 
 /** Whether `result` is a nearest double to the exact value `exact * 2 ** -scaleBits` (no neighbour is closer). */
 function isNearest(result: number, exact: bigint, scaleBits: bigint): boolean {
+	/** The distance from a candidate double to the exact value, in units of `2 ** -scaleBits`. */
 	function error(candidate: number): bigint {
 		return bigAbs((exactScaled(candidate) << (scaleBits - 1074n)) - exact);
 	}

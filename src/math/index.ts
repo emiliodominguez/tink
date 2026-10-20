@@ -2703,11 +2703,12 @@ export function binomial(n: number, k: number): number {
 	if (i > steps) return result;
 	// `C(base + i, i)` grows with `i` and is at least `2 ** i`, so the exact computation reaches `2 ** 1024` within about 1024 steps.
 	let exact = BigInt(result);
+	// A bigint of at least `2 ** 1024` converts to `Infinity`. (Computed here, once per call: a module-level bigint power is kept by
+	// bundlers, which cannot tell that it has no side effects, in every import of the module.)
+	const overflow = 1n << 1024n;
 	for (; i <= steps; i++) {
 		exact = (exact * BigInt(base + i)) / BigInt(i);
-		// A bigint of at least `2 ** 1024` converts to `Infinity`. (Computed here: a module-level bigint power is kept by bundlers, which
-		// cannot tell that it has no side effects, in every import of the module.)
-		if (exact >= 1n << 1024n) return Infinity;
+		if (exact >= overflow) return Infinity;
 	}
 	return Number(exact);
 }
@@ -2887,6 +2888,12 @@ export function integerSqrt(n: number): number;
  * integerSqrt(2n ** 64n + 1n); // => 2n ** 32n
  */
 export function integerSqrt(n: bigint): bigint;
+/**
+ * {@link integerSqrt} for a value that may be either a number or a bigint: the root has the type of `n`.
+ * @param {number | bigint} n - A safe integer `>= 0` or a bigint `>= 0n`
+ * @returns {number | bigint} `⌊√n⌋`, of the same type as `n`
+ */
+export function integerSqrt(n: number | bigint): number | bigint;
 /**
  * Computes the integer square root of a non-negative integer, a number or a bigint (see the overloads).
  * @param {number | bigint} n - A safe integer `>= 0` or a bigint `>= 0n`
@@ -3160,9 +3167,10 @@ export function harmonicMean(numbers: ReadonlyArray<number>): number {
 }
 
 /**
- * The rounding error of a product: `a * b - fl(a * b)`, exactly, by Dekker's algorithm (each factor split into two halves of 26 bits, whose
- * partial products are exact). The factors must stay below `2 ** 996` in magnitude, so that splitting them does not overflow, and their
- * product must not underflow.
+ * The rounding error of a product: `a * b - fl(a * b)`, exactly, by Dekker's algorithm (each factor split into two halves of 26 bits by
+ * Veltkamp's constant `2 ** 27 + 1`, whose partial products are exact). The factors must stay below `2 ** 996` in magnitude, so that
+ * splitting them does not overflow, and their product must not underflow. Shared by {@link harmonicMean}, the vector products and
+ * {@link normalizedDot}.
  * @param {number} a - A factor
  * @param {number} b - The other factor
  * @returns {number} The exact error of the rounded product `a * b`
@@ -3571,6 +3579,8 @@ export function summarize(numbers: ReadonlyArray<number>): Summary {
 	const sorted = sortedCopy(values);
 	// `NaN` sorts last.
 	const nan = count > 0 && sorted[count - 1] !== sorted[count - 1];
+	// The sum of squares is computed once for both spread fields, with the same arithmetic as `variance` and `standardDeviation`.
+	const [squares, scale] = count === 0 ? [NaN, 1] : centredSquares(values);
 	return {
 		count,
 		min: nan ? NaN : count === 0 ? Infinity : sorted[0],
@@ -3580,8 +3590,8 @@ export function summarize(numbers: ReadonlyArray<number>): Summary {
 		median: sortedMedian(sorted),
 		q1: sortedQuantile(sorted, 0.25),
 		q3: sortedQuantile(sorted, 0.75),
-		variance: variance(values),
-		standardDeviation: standardDeviation(values)
+		variance: squares / count / scale / scale,
+		standardDeviation: Math.sqrt(squares / count) / scale
 	};
 }
 
@@ -4506,9 +4516,6 @@ export function niceDomain(start: number, stop: number, count = 10): [number, nu
 	return reverse ? [high, low] : [low, high];
 }
 
-/** Veltkamp's splitting constant, `2 ** 27 + 1`: `x * SPLITTER` cuts a double into two halves of at most 26 bits, whose products are exact. */
-const SPLITTER = 134217729;
-
 /**
  * Converts the elements of a vector once with unary `+` (the conversion of the aggregates of this module), into a typed array.
  * @param {ReadonlyArray<number>} numbers - The vector
@@ -4552,14 +4559,8 @@ function dot2(xs: Float64Array, scaleX: number, ys: Float64Array, scaleY: number
 		const x = xs[i] * scaleX;
 		const y = ys[i] * scaleY;
 		const productHigh = x * y;
-		let split = SPLITTER * x;
-		const xHigh = split - (split - x);
-		const xLow = x - xHigh;
-		split = SPLITTER * y;
-		const yHigh = split - (split - y);
-		const yLow = y - yHigh;
 		// `productHigh + productLow` is exactly `x * y` (unless it underflows).
-		const productLow = xLow * yLow - (productHigh - xHigh * yHigh - xLow * yHigh - xHigh * yLow);
+		const productLow = productError(x, y);
 		// `sumHigh + sumLow` is exactly `high + productHigh`.
 		const sumHigh = high + productHigh;
 		const virtual = sumHigh - high;
