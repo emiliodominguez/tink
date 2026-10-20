@@ -1499,6 +1499,21 @@ describe('Color scales, names, adjustments and HSV', function () {
 				helpers.colorSteps([], 3);
 			}).toThrow(new RangeError('colorSteps: `stops` must hold at least one colour, got an empty array'));
 		});
+
+		it('rejects more colours than an array can hold before any work (regression)', function () {
+			// Regression: 2 ** 32 colours were made one by one until the process ran out of memory.
+			const stops = new Proxy(['#000', '#fff'], {
+				get() {
+					throw new Error('the stops must not be read');
+				}
+			});
+			for (const count of [2 ** 32, Number.MAX_SAFE_INTEGER]) {
+				expect(function () {
+					helpers.colorSteps(stops, count);
+				}).toThrow(new RangeError(`colorSteps: the result would contain ${count} colours, more than an array can hold`));
+			}
+			expect(helpers.colorSteps(['#000'], 2 ** 16)).toHaveLength(2 ** 16);
+		});
 	});
 
 	describe('isCssColor', function () {

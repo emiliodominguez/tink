@@ -1513,7 +1513,8 @@ export function colorScale(stops: readonly ColorInput[], options: ColorScaleOpti
  * @returns {Rgba[]} The colours, from the start of the domain to its end
  * @throws {TypeError} when `stops` or `domain` is not an array, a stop is invalid (see {@link toRgba}), or `count` or a position is not
  * a number
- * @throws {RangeError} when `count` is not an integer `>= 0`, or as {@link colorScale}
+ * @throws {RangeError} when `count` is not an integer `>= 0` or is above `2 ** 32 - 1` (the array limit, far more than a heap can hold:
+ * bound untrusted counts), or as {@link colorScale}
  * @example
  * colorSteps(['#000000', '#ffffff'], 3); // => [{ r: 0, g: 0, b: 0, a: 1 }, { r: 128, g: 128, b: 128, a: 1 }, { r: 255, g: 255, b: 255, a: 1 }]
  * colorSteps(['#000000', '#ffffff'], 3, { space: 'oklab' }).map(function (c) { return toHex(c); }); // => ['#000000', '#636363', '#ffffff']
@@ -1522,6 +1523,8 @@ export function colorScale(stops: readonly ColorInput[], options: ColorScaleOpti
  */
 export function colorSteps(stops: readonly ColorInput[], count: number, options: ColorScaleOptions = {}): Rgba[] {
 	assertInteger('colorSteps', 'count', count);
+	// Thrown at once, rather than once the colours made so far have run the process out of memory.
+	if (count > 2 ** 32 - 1) throw new RangeError(`colorSteps: the result would contain ${count} colours, more than an array can hold`);
 	const [at, start, end] = scaleOf('colorSteps', stops, options);
 	const colors: Rgba[] = [];
 	for (let i = 0; i < count; i++) colors.push(at(lerp(start, end, count > 1 ? i / (count - 1) : 0)));
