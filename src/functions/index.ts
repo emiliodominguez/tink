@@ -40,6 +40,9 @@ const KEY_VISIT_BUDGET = 65536;
 /** See {@link KEY_VISIT_BUDGET} (2^24 characters). */
 const KEY_LENGTH_BUDGET = 16777216;
 
+/** From this index on, {@link serializeKey} writes each run of holes of an array at once (see {@link ownIndexes}). */
+const SPARSE_KEY_SCAN = 65536;
+
 /** Thrown by {@link serializeKey} when a key expanded in full exceeds its budget (see {@link KEY_VISIT_BUDGET}). */
 const OVER_BUDGET: object = {};
 
@@ -559,6 +562,7 @@ export type Memoized<F extends AnyFunction, C extends MemoizeCache<unknown, unkn
  * @param {...unknown} args - The call arguments
  * @returns {unknown} The cache key
  * @throws {TypeError} when the arguments contain a circular structure of plain objects or arrays
+ * @throws {RangeError} when the key would be longer than the engine's maximum string length (such as an array of `2 ** 32 - 1` holes)
  * @example
  * defaultMemoizeKey(1); // => 1
  * defaultMemoizeKey('a', 2); // => '["a",2]'
@@ -650,6 +654,36 @@ function serializeArguments(args: unknown[]): string {
 }
 
 /**
+ * The indexes of the own elements of an array, in ascending order and followed by `Infinity`, without walking its holes (see
+ * {@link serializeKey}).
+ * @param {unknown[]} array - The array
+ * @returns {number[]} Its own indexes, then `Infinity`
+ */
+function ownIndexes(array: unknown[]): number[] {
+	const indexes: number[] = [];
+
+	for (const key of Object.keys(array)) {
+		const index = Number(key) >>> 0;
+
+		if (String(index) === key) indexes.push(index);
+	}
+	// Already in order, except from a proxy listing them otherwise.
+	indexes.sort(ascending).push(Infinity);
+
+	return indexes;
+}
+
+/**
+ * Compares two numbers, for an ascending sort.
+ * @param {number} a - A number
+ * @param {number} b - Another number
+ * @returns {number} Negative when `a` comes first
+ */
+function ascending(a: number, b: number): number {
+	return a - b;
+}
+
+/**
  * Escapes a string that looks like a key marker (see {@link defaultMemoizeKey}).
  * @param {string} value - A string argument or nested string
  * @returns {string} The string to serialise
@@ -733,9 +767,24 @@ function serializeKey(value: unknown, state: KeyState): string {
 				// A hole reads `undefined`, even when a polluted prototype defines its index (the key would otherwise merge with the array
 				// holding that value).
 				const direct = !isArrayPrototypePolluted();
+				// The own indexes of a long array with a hole, and the position of the next one to reach.
+				let indexes: number[] | undefined;
+				let next = 0;
 
 				for (let i = 0; i < value.length; i++) {
-					key += (i === 0 ? '' : ',') + serializeKey(elementOf(value, i, direct), state);
+					const element = elementOf(value, i, direct);
+
+					if (element !== undefined || i < SPARSE_KEY_SCAN || hasOwn.call(value, i)) key += (i === 0 ? '' : ',') + serializeKey(element, state);
+					else {
+						// A run of holes is written at once: one at a time, those of a sparse array (a length of `2 ** 32 - 1` for a few elements,
+						// after `array[index] = value`) took seconds and gigabytes of memory, aborting the process, before the key reached the
+						// engine's maximum string length (where `repeat` throws a `RangeError` at once).
+						indexes ??= ownIndexes(value);
+						while (indexes[next] <= i) next++;
+						const end = Math.min(indexes[next], value.length);
+						key += ',"undefined"'.repeat(end - i);
+						i = end - 1;
+					}
 					if (key.length > limit) throw OVER_BUDGET;
 				}
 				key = `[${key}]`;

@@ -4685,6 +4685,42 @@ describe('Functions helpers (pass 3 regressions)', function () {
 			}
 		});
 
+		it('should write the holes of a long sparse array in runs (regression: one at a time, 2 ** 32 - 1 of them aborted the process)', function () {
+			const sparse: unknown[] = [];
+			sparse[2 ** 20] = 1;
+			sparse[2 ** 20 - 3] = undefined;
+			// Ignored, like on any array.
+			Object.assign(sparse, { label: 'x' });
+			let reads = 0;
+			const counted = new Proxy(sparse, {
+				get(target, key, receiver): unknown {
+					if (key !== 'length') reads++;
+					return Reflect.get(target, key, receiver) as unknown;
+				}
+			});
+			const expected = `[[${'"undefined",'.repeat(2 ** 20)}1]]`;
+			expect(helpers.defaultMemoizeKey(counted)).toBe(expected);
+			// The first 65,536 elements one by one, then only the own ones (previously every index: over a million reads).
+			expect(reads).toBeLessThan(70000);
+			expect(helpers.defaultMemoizeKey(sparse)).toBe(expected);
+			// Holes still read `undefined` with a polluted prototype.
+			const prototype = Object.prototype as Record<number, unknown>;
+			prototype[2 ** 19] = 'planted';
+			try {
+				expect(helpers.defaultMemoizeKey(sparse)).toBe(expected);
+			} finally {
+				delete prototype[2 ** 19];
+			}
+			// A key longer than strings can be throws at once (previously after seconds and gigabytes of memory, or out of memory).
+			const huge: unknown[] = [];
+			huge[2 ** 32 - 2] = 1;
+			const start = Date.now();
+			expect(function () {
+				helpers.memoize(helpers.identity)(huge);
+			}).toThrow(RangeError);
+			expect(Date.now() - start).toBeLessThan(2000);
+		});
+
 		it('should still throw on circular structures, and leave a key computed by a getter meanwhile intact', function () {
 			const cyclic: Record<string, unknown> = {};
 			cyclic.self = cyclic;
