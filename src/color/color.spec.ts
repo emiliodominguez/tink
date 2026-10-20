@@ -1549,6 +1549,32 @@ describe('Color scales, names, adjustments and HSV', function () {
 			expect(helpers.parseNamedColor('TRANSPARENT')).toEqual({ r: 0, g: 0, b: 0, a: 0 });
 		});
 
+		it('keeps the table whole when building it throws, as a stack overflow does deep in a recursion (regression)', function () {
+			// Regression: the table was published empty, then filled, so a throw while filling it made every later lookup miss.
+			let fresh: typeof import('./index.js') | undefined;
+			jest.isolateModules(function () {
+				fresh = jest.requireActual<typeof import('./index.js')>('./index');
+			});
+			const module = fresh as typeof import('./index.js');
+			const original = globalThis.parseInt;
+			let calls = 0;
+			globalThis.parseInt = function (text: string, radix?: number): number {
+				if (++calls === 3) throw new RangeError('Maximum call stack size exceeded');
+				return original(text, radix);
+			};
+			try {
+				expect(function () {
+					module.parseNamedColor('red');
+				}).toThrow(RangeError);
+			} finally {
+				globalThis.parseInt = original;
+			}
+			expect(module.parseNamedColor('aliceblue')).toEqual({ r: 240, g: 248, b: 255, a: 1 });
+			expect(module.parseNamedColor('yellowgreen')).toEqual({ r: 154, g: 205, b: 50, a: 1 });
+			expect(module.toColorName('#9acd32')).toBe('yellowgreen');
+			expect(module.toColorName('#9acd33', { nearest: true })).toBe('yellowgreen');
+		});
+
 		it('returns a new object each time', function () {
 			const a = helpers.parseNamedColor('red') as helpers.Rgba;
 			a.r = 0;
