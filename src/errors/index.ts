@@ -257,13 +257,19 @@ export function serializeError(value: unknown, options: SerializeErrorOptions = 
 	const stack = readOption(options, 'stack') !== false;
 	const source = isSource(value) ? value : undefined;
 	const view = source === undefined ? { name: 'Error', message: getErrorMessage(value) } : errorView(source, stack);
+	// Every field is own: a polluted `Object.prototype.converted` (or `values`, `count`…) would otherwise be read as the state of the walk.
 	return toJsonMembers(view, {
 		replacer: undefined,
 		keys: undefined,
 		stack,
 		maxDepth: Math.min(maxDepth, MAX_JSON_DEPTH),
 		ancestors: source === undefined ? [] : [source],
-		onPath: new Set(source === undefined ? [] : [source])
+		onPath: new Set(source === undefined ? [] : [source]),
+		converted: undefined,
+		dependent: false,
+		count: 0,
+		values: 0,
+		shared: false
 	}) as SerializedError;
 }
 
@@ -1024,16 +1030,17 @@ export function formatError(error: unknown, options: FormatErrorOptions = {}): s
 	const printed = new Set<object>();
 	const onPath = new Set<object>();
 	const arrays = new Set<object>();
-	// Depth-first, with an explicit stack of entries to print (pushed in reverse order); `exit` entries take an object off the path once
-	// everything below it has been printed.
-	const todo: Array<{ value: unknown; depth: number; label: string } | { exit: object }> = [{ value: error, depth: 0, label: '' }];
+	// Depth-first, with an explicit stack of entries to print (pushed in reverse order); exit entries (depth -1) take an object off the path
+	// once everything below it has been printed. Told apart by their depth, not by an `exit` key: `'exit' in entry` would read a polluted
+	// `Object.prototype.exit`, and print nothing.
+	const todo: Array<{ value: unknown; depth: number; label: string }> = [{ value: error, depth: 0, label: '' }];
 	while (todo.length !== 0) {
-		const entry = todo.pop() as { value: unknown; depth: number; label: string } | { exit: object };
-		if ('exit' in entry) {
-			onPath.delete(entry.exit);
+		const entry = todo.pop() as { value: unknown; depth: number; label: string };
+		const { value, depth } = entry;
+		if (depth < 0) {
+			onPath.delete(value as object);
 			continue;
 		}
-		const { value, depth } = entry;
 		const indent = indentOf(depth);
 		const label = `${markerOf(depth)}${entry.label}`;
 		const isObject = typeof value === 'object' && value !== null;
@@ -1063,7 +1070,7 @@ export function formatError(error: unknown, options: FormatErrorOptions = {}): s
 			continue;
 		}
 		onPath.add(value);
-		todo.push({ exit: value });
+		todo.push({ value, depth: -1, label: '' });
 		if (cause !== undefined) todo.push({ value: cause, depth: depth + 1, label: 'Caused by: ' });
 		for (let index = errors.length - 1; index >= 0; index--) {
 			todo.push({ value: errors[index], depth: depth + 1, label: `[${indices[index] + 1}/${length}] ` });

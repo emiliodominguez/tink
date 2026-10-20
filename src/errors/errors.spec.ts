@@ -1611,6 +1611,39 @@ describe('errors under a polluted Object.prototype', function () {
 		});
 	});
 
+	it('serializes the same and converts a shared leaf once when Object.prototype holds the names of the walk state (regression)', function () {
+		const error = Object.assign(new Error('x', { cause: new Error('c', { cause: { deep: [1, { a: 2 }] } }) }), { data: { list: [1, 2, 3] } });
+		const expected = serializeError(error, { stack: false });
+		let reads = 0;
+		const leaf = new Proxy(new Array(100).fill(0), {
+			get(target, key, receiver): unknown {
+				reads++;
+				return Reflect.get(target, key, receiver) as unknown;
+			}
+		});
+		const paths: Record<string, unknown> = {};
+		for (let index = 0; index < 50; index++) paths[`k${index}`] = leaf;
+		const shared = Object.assign(new Error('y'), { o: paths });
+		polluted({ converted: {}, values: 'P', count: 'P', dependent: true, shared: 'P' }, function () {
+			expect(serializeError(error, { stack: false })).toEqual(expected);
+			const serialized = serializeError(shared, { stack: false }) as unknown as { o: Record<string, unknown> };
+			expect(serialized.o.k49).toEqual(new Array(100).fill(0));
+		});
+		// Converted once (its 100 items, plus a few reads per path such as `toJSON`), not once per path (over 5,000).
+		expect(reads).toBeLessThan(1000);
+	});
+
+	it('formats the whole report when Object.prototype holds exit (regression: it printed nothing)', function () {
+		const loop = new Error('loop');
+		loop.cause = loop;
+		const error = new AggregateError([new Error('a'), loop], 'group', { cause: new Error('cause') });
+		const expected = formatError(error, { stack: false });
+		polluted({ exit: { planted: true } }, function () {
+			expect(formatError(error, { stack: false })).toBe(expected);
+		});
+		expect(expected.split('\n')).toEqual(['AggregateError: group', '  [1/2] Error: a', '  [2/2] Error: loop', '    Caused by: [Circular]', '  Caused by: Error: cause']);
+	});
+
 	it('gives defineError classes and errors the same property attributes', function () {
 		polluted({ writable: true, enumerable: true, configurable: true }, function () {
 			const NotFound = defineError('NotFoundError', { code: 'E_NOT_FOUND' });
