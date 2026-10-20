@@ -3458,3 +3458,454 @@ function bigModPow(base: bigint, exponent: bigint, modulus: bigint): bigint {
 	}
 	return result;
 }
+
+describe('Statistics helpers', function () {
+	describe('geometricMean', function () {
+		it('should compute the n-th root of the product, exactly for exact powers', function () {
+			expect(helpers.geometricMean([2, 8])).toBe(4);
+			expect(helpers.geometricMean([1, 3, 9])).toBe(3);
+			expect(helpers.geometricMean([4, 16, 64])).toBe(16);
+			expect(helpers.geometricMean([3, 12])).toBe(6);
+			expect(helpers.geometricMean([7])).toBe(7);
+			expect(helpers.geometricMean([0.5, 0.125])).toBe(0.25);
+			// Python's statistics.geometric_mean([1.1, 1.2, 0.9]).
+			expect(helpers.geometricMean([1.1, 1.2, 0.9])).toBe(1.059104500597819);
+			expect(helpers.geometricMean([2, 3])).toBe(Math.sqrt(6));
+			expect(helpers.geometricMean([81, 1, 1, 1])).toBe(3);
+			expect(helpers.geometricMean([2.25, 1])).toBe(1.5);
+			expect(helpers.geometricMean([3 ** 10, 1, 1, 1, 1, 1, 1, 1, 1, 1])).toBe(3);
+			expect(helpers.geometricMean(new Array(30).fill(2))).toBe(2);
+			expect(helpers.geometricMean(new Array(30).fill(3))).toBeCloseTo(3, 14);
+		});
+
+		it('should neither overflow nor underflow', function () {
+			expect(helpers.geometricMean([1e300, 1e300])).toBe(1e300);
+			expect(helpers.geometricMean(new Array(1000).fill(1e300)) / 1e300).toBeCloseTo(1, 15);
+			expect(helpers.geometricMean(new Array(1000).fill(1e-300)) / 1e-300).toBeCloseTo(1, 15);
+			expect(helpers.geometricMean([MAX, MAX, MAX])).toBe(MAX);
+			expect(helpers.geometricMean([5e-324, 5e-324])).toBe(5e-324);
+			expect(helpers.geometricMean([5e-324, 1])).toBe(Math.sqrt(5e-324));
+			expect(helpers.geometricMean([1e-300, 1e300])).toBeCloseTo(1, 14);
+			expect(helpers.geometricMean([2 ** -1000, 2 ** 1000, 2 ** -600, 2 ** 600])).toBe(1);
+		});
+
+		it('should root a large leftover power of two on its own', function () {
+			// 1001 values: the leftover power of two exceeds 2 ** 500.
+			const values = new Array(1001).fill(2);
+			values[0] = 2 ** 520;
+			const exact = 2 ** ((1000 + 520) / 1001);
+			expect(helpers.geometricMean(values) / exact).toBeCloseTo(1, 14);
+		});
+
+		it('should handle zeros, infinities, negatives and NaN', function () {
+			expect(helpers.geometricMean([4, 0])).toBe(0);
+			expect(Object.is(helpers.geometricMean([4, -0]), 0)).toBe(true);
+			expect(helpers.geometricMean([4, Infinity])).toBe(Infinity);
+			expect(helpers.geometricMean([0, Infinity])).toBeNaN();
+			expect(helpers.geometricMean([-1, 1])).toBeNaN();
+			expect(helpers.geometricMean([0, -1])).toBeNaN();
+			expect(helpers.geometricMean([-Infinity, 1])).toBeNaN();
+			expect(helpers.geometricMean([1, NaN])).toBeNaN();
+			expect(helpers.geometricMean([])).toBeNaN();
+		});
+
+		it('should convert numeric strings', function () {
+			expect(helpers.geometricMean(['2', '8'] as never)).toBe(4);
+		});
+	});
+
+	describe('harmonicMean', function () {
+		it('should compute n / Σ(1 / x) accurately', function () {
+			expect(helpers.harmonicMean([40, 60])).toBe(48);
+			expect(helpers.harmonicMean([1, 4, 4])).toBe(2);
+			expect(helpers.harmonicMean([1, 2, 3])).toBe(18 / 11);
+			expect(helpers.harmonicMean([5])).toBe(5);
+			expect(helpers.harmonicMean([3, 3, 3])).toBe(3);
+			expect(helpers.harmonicMean(['40', '60'] as never)).toBe(48);
+		});
+
+		it('should not overflow the reciprocals of tiny values, nor lose the huge ones', function () {
+			expect(helpers.harmonicMean([5e-324, 5e-324])).toBe(5e-324);
+			expect(helpers.harmonicMean([5e-324, 1e308])).toBe(1e-323);
+			expect(helpers.harmonicMean([MAX, MAX])).toBe(MAX);
+			expect(helpers.harmonicMean([1e-300, 1e-300, 1e-300])).toBe(1e-300);
+		});
+
+		it('should handle zeros, infinities, negatives and NaN', function () {
+			expect(helpers.harmonicMean([2, 0])).toBe(0);
+			expect(Object.is(helpers.harmonicMean([2, -0]), 0)).toBe(true);
+			expect(helpers.harmonicMean([1, Infinity])).toBe(2);
+			expect(helpers.harmonicMean([Infinity, Infinity])).toBe(Infinity);
+			expect(helpers.harmonicMean([-1, 1])).toBeNaN();
+			expect(helpers.harmonicMean([1, NaN])).toBeNaN();
+			expect(helpers.harmonicMean([])).toBeNaN();
+		});
+	});
+
+	describe('rootMeanSquare', function () {
+		it('should compute √(Σx² / n)', function () {
+			expect(helpers.rootMeanSquare([3, 4])).toBe(3.5355339059327378);
+			expect(helpers.rootMeanSquare([-2, 2])).toBe(2);
+			expect(helpers.rootMeanSquare([1, 2, 3, 4, 5, 6, 7])).toBe(Math.sqrt(20));
+			expect(helpers.rootMeanSquare([0, 0])).toBe(0);
+			expect(helpers.rootMeanSquare(['3', '4'] as never)).toBe(3.5355339059327378);
+		});
+
+		it('should neither overflow nor underflow', function () {
+			expect(helpers.rootMeanSquare([1e200, 1e200])).toBe(1e200);
+			expect(helpers.rootMeanSquare([MAX, -MAX])).toBe(MAX);
+			expect(helpers.rootMeanSquare([5e-324, 5e-324])).toBe(5e-324);
+			expect(helpers.rootMeanSquare([1e-200, -1e-200])).toBe(1e-200);
+		});
+
+		it('should propagate non-finite values', function () {
+			expect(helpers.rootMeanSquare([])).toBeNaN();
+			expect(helpers.rootMeanSquare([1, NaN])).toBeNaN();
+			expect(helpers.rootMeanSquare([1, -Infinity])).toBe(Infinity);
+			expect(helpers.rootMeanSquare([Infinity, NaN])).toBeNaN();
+		});
+	});
+
+	describe('skewness', function () {
+		const excel = [3, 4, 5, 2, 3, 4, 5, 6, 4, 7];
+
+		it('should compute the population skewness (scipy skew)', function () {
+			// Exact value: 1.01823376490862838...
+			expect(helpers.skewness([1, 2, 3, 10])).toBe(1.0182337649086284);
+			expect(helpers.skewness([1, 2, 3])).toBe(0);
+			expect(helpers.skewness([1, 2])).toBe(0);
+			expect(helpers.skewness([10, 3, 2, 1])).toBe(-helpers.skewness([-10, -3, -2, -1]));
+		});
+
+		it('should compute the adjusted sample skewness (Excel SKEW, pandas skew)', function () {
+			// Excel's documentation gives SKEW(3,4,5,2,3,4,5,6,4,7) = 0.359543; exactly 0.359543071406797142...
+			expect(helpers.skewness(excel, { sample: true })).toBeCloseTo(0.35954307140679714, 15);
+			expect(helpers.skewness([1, 2, 3], { sample: true })).toBe(0);
+			expect(helpers.skewness([1, 2], { sample: true })).toBeNaN();
+		});
+
+		it('should be accurate far from zero and at any magnitude', function () {
+			for (const offset of [1e6, 1e9, 1e12]) {
+				expect(
+					helpers.skewness(
+						[1, 2, 3, 10].map(function (value) {
+							return value + offset;
+						})
+					)
+				).toBe(1.0182337649086284);
+			}
+			expect(helpers.skewness([1e300, 2e300, 3e300, 10e300])).toBe(1.0182337649086284);
+			expect(helpers.skewness([1e-300, 2e-300, 3e-300, 10e-300])).toBeCloseTo(1.0182337649086284, 15);
+		});
+
+		it('should be NaN when undefined', function () {
+			expect(helpers.skewness([])).toBeNaN();
+			expect(helpers.skewness([5])).toBeNaN();
+			expect(helpers.skewness([0.1, 0.1, 0.1])).toBeNaN();
+			expect(helpers.skewness([1, 2, NaN])).toBeNaN();
+			expect(helpers.skewness([1, 2, Infinity])).toBeNaN();
+		});
+	});
+
+	describe('kurtosis', function () {
+		const excel = [3, 4, 5, 2, 3, 4, 5, 6, 4, 7];
+
+		it('should compute the population excess kurtosis (scipy kurtosis)', function () {
+			expect(helpers.kurtosis([1, 2, 3, 4])).toBe(-1.36);
+			expect(helpers.kurtosis([1, 2])).toBe(-2);
+			// 22/7 - ... : exactly 3.142857142857142857...
+			expect(helpers.kurtosis([0, 0, 0, 0, 0, 0, 0, 10])).toBeCloseTo(3.142857142857143, 14);
+		});
+
+		it('should compute the adjusted sample excess kurtosis (Excel KURT, pandas kurt)', function () {
+			// Excel's documentation gives KURT(3,4,5,2,3,4,5,6,4,7) = -0.151799637; exactly -0.151799637208414219...
+			expect(helpers.kurtosis(excel, { sample: true })).toBeCloseTo(-0.15179963720841422, 14);
+			expect(helpers.kurtosis([1, 2, 3], { sample: true })).toBeNaN();
+			expect(helpers.kurtosis([1, 2, 3, 4], { sample: true })).toBeCloseTo(-1.2, 14);
+		});
+
+		it('should be accurate far from zero and at any magnitude', function () {
+			for (const offset of [0, 1e6, 1e9, 1e12]) {
+				expect(
+					helpers.kurtosis(
+						[1, 2, 3, 10].map(function (value) {
+							return value + offset;
+						})
+					)
+				).toBeCloseTo(-0.7696, 14);
+			}
+			expect(helpers.kurtosis([5e-324, 1e-323, 1.5e-323, 5e-323])).toBeCloseTo(-0.7696, 14);
+			expect(helpers.kurtosis([1e308, 2e307, 3e307, -1e308])).toBeCloseTo(helpers.kurtosis([10, 2, 3, -10]), 14);
+		});
+
+		it('should be NaN when undefined', function () {
+			expect(helpers.kurtosis([])).toBeNaN();
+			expect(helpers.kurtosis([0.1, 0.1, 0.1, 0.1])).toBeNaN();
+			expect(helpers.kurtosis([1, 2, NaN, 4])).toBeNaN();
+			expect(helpers.kurtosis([1, 2, -Infinity, 4])).toBeNaN();
+		});
+	});
+
+	describe('medianAbsoluteDeviation', function () {
+		it('should compute median(|x - median(x)|)', function () {
+			expect(helpers.medianAbsoluteDeviation([1, 1, 2, 2, 4, 6, 9])).toBe(1);
+			expect(helpers.medianAbsoluteDeviation([1, 2, 3, 4, 1000])).toBe(1);
+			expect(helpers.medianAbsoluteDeviation([1, 2, 3, 4])).toBe(1);
+			expect(helpers.medianAbsoluteDeviation([5, 5, 5])).toBe(0);
+			expect(helpers.medianAbsoluteDeviation(['1', '2', '3'] as never)).toBe(1);
+		});
+
+		it('should not mutate the input', function () {
+			const input = [3, 1, 2];
+			helpers.medianAbsoluteDeviation(input);
+			expect(input).toEqual([3, 1, 2]);
+		});
+
+		it('should handle empty input, NaN and infinities', function () {
+			expect(helpers.medianAbsoluteDeviation([])).toBeNaN();
+			expect(helpers.medianAbsoluteDeviation([1, NaN, 3])).toBeNaN();
+			expect(helpers.medianAbsoluteDeviation([1, Infinity, 2])).toBe(1);
+			expect(helpers.medianAbsoluteDeviation([Infinity, Infinity, 1])).toBeNaN();
+		});
+	});
+
+	describe('trimmedMean', function () {
+		it('should cut floor(n · proportion) values off each end (scipy trim_mean)', function () {
+			expect(helpers.trimmedMean([1, 2, 3, 4, 100], 0.2)).toBe(3);
+			expect(helpers.trimmedMean([1, 2, 3, 4, 100], 0.1)).toBe(22);
+			expect(helpers.trimmedMean([1, 2, 3, 4, 100], 0)).toBe(22);
+			expect(helpers.trimmedMean([100, 4, 3, 2, 1, -100], 0.25)).toBe(2.5);
+			expect(helpers.trimmedMean([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.1)).toBe(5.5);
+			expect(helpers.trimmedMean([7], 0.49)).toBe(7);
+			expect(helpers.trimmedMean(['1', '2', '3'] as never, 0)).toBe(2);
+		});
+
+		it('should cut infinities off, and be NaN for empty input or NaN', function () {
+			expect(helpers.trimmedMean([Infinity, 1, 2, 3, -Infinity], 0.2)).toBe(2);
+			expect(helpers.trimmedMean([Infinity, 1, 2], 0)).toBe(Infinity);
+			expect(helpers.trimmedMean([], 0.1)).toBeNaN();
+			expect(helpers.trimmedMean([1, NaN, 3, 4, 5], 0.2)).toBeNaN();
+		});
+
+		it('should validate the proportion', function () {
+			expect(function () {
+				helpers.trimmedMean([1, 2], 0.5);
+			}).toThrow(new RangeError('trimmedMean: `proportion` must be a number in [0, 0.5), got 0.5'));
+			expect(function () {
+				helpers.trimmedMean([1, 2], -0.1);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.trimmedMean([1, 2], NaN);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.trimmedMean([1, 2], '0.1' as never);
+			}).toThrow(new TypeError('trimmedMean: `proportion` must be a number in [0, 0.5), got string'));
+		});
+	});
+
+	describe('ranks', function () {
+		it('should rank in ascending order, ties sharing their average rank (scipy rankdata)', function () {
+			expect(helpers.ranks([10, 30, 20])).toEqual([1, 3, 2]);
+			expect(helpers.ranks([10, 20, 20, 30])).toEqual([1, 2.5, 2.5, 4]);
+			expect(helpers.ranks([0, 2, 3, 2])).toEqual([1, 2.5, 4, 2.5]);
+			expect(helpers.ranks([7, 7, 7])).toEqual([2, 2, 2]);
+			expect(helpers.ranks([])).toEqual([]);
+			expect(helpers.ranks(['b', '1', '10', '2'] as never)).toEqual([NaN, 1, 3, 2]);
+		});
+
+		it('should give NaN a NaN rank and rank infinities and zeros', function () {
+			expect(helpers.ranks([3, NaN, 1])).toEqual([2, NaN, 1]);
+			expect(helpers.ranks([0, -0, Infinity, -Infinity, NaN, 2, 2, 2])).toEqual([2.5, 2.5, 7, 1, NaN, 5, 5, 5]);
+			expect(helpers.ranks([NaN, NaN])).toEqual([NaN, NaN]);
+		});
+	});
+
+	describe('spearmanCorrelation', function () {
+		it('should measure monotonic relations', function () {
+			expect(helpers.spearmanCorrelation([1, 2, 3, 4], [1, 4, 9, 16])).toBe(1);
+			expect(helpers.spearmanCorrelation([1, 2, 3, 4], [1, 8, 27, 1000])).toBe(1);
+			expect(helpers.spearmanCorrelation([1, 2, 3], [3, 2, 1])).toBe(-1);
+			// scipy.stats.spearmanr([1, 2, 3, 4, 5], [5, 6, 7, 8, 7]) = 0.8207826816681233.
+			expect(helpers.spearmanCorrelation([1, 2, 3, 4, 5], [5, 6, 7, 8, 7])).toBeCloseTo(0.8207826816681233, 15);
+			expect(helpers.spearmanCorrelation([1, Infinity, 3], [1, 3, 2])).toBe(1);
+		});
+
+		it('should be NaN when undefined', function () {
+			expect(helpers.spearmanCorrelation([], [])).toBeNaN();
+			expect(helpers.spearmanCorrelation([1], [1])).toBeNaN();
+			expect(helpers.spearmanCorrelation([1, 2, 3], [5, 5, 5])).toBeNaN();
+			expect(helpers.spearmanCorrelation([1, NaN, 3], [1, 2, 3])).toBeNaN();
+		});
+
+		it('should throw on different lengths', function () {
+			expect(function () {
+				helpers.spearmanCorrelation([1, 2], [1]);
+			}).toThrow(new RangeError('spearmanCorrelation: `xs` and `ys` must have the same length, got 2 and 1'));
+		});
+	});
+
+	describe('standardize', function () {
+		it('should compute population z-scores by default', function () {
+			expect(helpers.standardize([2, 4, 4, 4, 5, 5, 7, 9])).toEqual([-1.5, -0.5, -0.5, -0.5, 0, 0, 1, 2]);
+			expect(helpers.standardize([1e308, -1e308])).toEqual([1, -1]);
+			expect(helpers.standardize(['1', '3'] as never)).toEqual([-1, 1]);
+		});
+
+		it('should compute sample z-scores with { sample: true }', function () {
+			expect(helpers.standardize([1, 2, 3], { sample: true })).toEqual([-1, 0, 1]);
+			expect(helpers.standardize([1], { sample: true })).toEqual([NaN]);
+		});
+
+		it('should give zeros for constant data and NaN when undefined', function () {
+			expect(helpers.standardize([5, 5])).toEqual([0, 0]);
+			expect(helpers.standardize([0.1, 0.1, 0.1])).toEqual([0, 0, 0]);
+			expect(helpers.standardize([])).toEqual([]);
+			expect(helpers.standardize([1, NaN])).toEqual([NaN, NaN]);
+			expect(helpers.standardize([1, Infinity])).toEqual([NaN, NaN]);
+		});
+	});
+
+	describe('softmax', function () {
+		it('should give weights that add up to 1, in the order of the scores', function () {
+			// Correctly rounded: [0.09003057317038046, 0.24472847105479764, 0.6652409557748219].
+			const weights = helpers.softmax([1, 2, 3]);
+			expect(weights[0]).toBe(0.09003057317038046);
+			expect(weights[1]).toBe(0.24472847105479764);
+			expect(weights[2]).toBeCloseTo(0.6652409557748219, 15);
+			expect(helpers.softmax([0, 0, 0, 0])).toEqual([0.25, 0.25, 0.25, 0.25]);
+			expect(helpers.softmax([5])).toEqual([1]);
+			expect(helpers.softmax(['0', '0'] as never)).toEqual([0.5, 0.5]);
+		});
+
+		it('should not overflow', function () {
+			expect(helpers.softmax([1000, 1000])).toEqual([0.5, 0.5]);
+			expect(helpers.softmax([-1e308, 1e308])).toEqual([0, 1]);
+			expect(helpers.softmax([-1000, -1000])).toEqual([0.5, 0.5]);
+		});
+
+		it('should handle infinities and NaN', function () {
+			expect(helpers.softmax([0, -Infinity])).toEqual([1, 0]);
+			expect(helpers.softmax([Infinity, 1, Infinity])).toEqual([0.5, 0, 0.5]);
+			expect(helpers.softmax([-Infinity, -Infinity])).toEqual([NaN, NaN]);
+			expect(helpers.softmax([NaN, 1])).toEqual([NaN, NaN]);
+			expect(helpers.softmax([NaN, Infinity])).toEqual([NaN, NaN]);
+			expect(helpers.softmax([])).toEqual([]);
+		});
+	});
+
+	describe('exponentialMovingAverage', function () {
+		it('should follow pandas ewm(alpha, adjust=False)', function () {
+			expect(helpers.exponentialMovingAverage([1, 2, 3, 4, 5], 0.5)).toEqual([1, 1.5, 2.25, 3.125, 4.0625]);
+			expect(helpers.exponentialMovingAverage([1, 2, 3], 1)).toEqual([1, 2, 3]);
+			expect(helpers.exponentialMovingAverage([10, 20], 0.25)).toEqual([10, 12.5]);
+			expect(helpers.exponentialMovingAverage([], 0.5)).toEqual([]);
+			expect(helpers.exponentialMovingAverage(['1', '2'] as never, 0.5)).toEqual([1, 1.5]);
+		});
+
+		it('should skip NaN values (ignore_na=True)', function () {
+			expect(helpers.exponentialMovingAverage([NaN, 10, NaN, 20], 0.5)).toEqual([NaN, 10, 10, 15]);
+			expect(helpers.exponentialMovingAverage([NaN, NaN], 0.5)).toEqual([NaN, NaN]);
+		});
+
+		it('should keep infinities, and NaN once both were seen', function () {
+			expect(helpers.exponentialMovingAverage([1, Infinity, 2, -Infinity, 3], 0.5)).toEqual([1, Infinity, Infinity, NaN, NaN]);
+		});
+
+		it('should stay within the range of the values', function () {
+			expect(helpers.exponentialMovingAverage([MAX, MAX, MAX], 0.3)).toEqual([MAX, MAX, MAX]);
+		});
+
+		it('should validate alpha', function () {
+			expect(function () {
+				helpers.exponentialMovingAverage([1], 0);
+			}).toThrow(new RangeError('exponentialMovingAverage: `alpha` must be a number in (0, 1], got 0'));
+			expect(function () {
+				helpers.exponentialMovingAverage([1], 1.5);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.exponentialMovingAverage([1], NaN);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.exponentialMovingAverage([1], '0.5' as never);
+			}).toThrow(new TypeError('exponentialMovingAverage: `alpha` must be a number in (0, 1], got string'));
+		});
+	});
+
+	describe('summarize', function () {
+		it('should compute every statistic at once', function () {
+			expect(helpers.summarize([2, 4, 4, 4, 5, 5, 7, 9])).toEqual({
+				count: 8,
+				min: 2,
+				max: 9,
+				sum: 40,
+				mean: 5,
+				median: 4.5,
+				q1: 4,
+				q3: 5.5,
+				variance: 4,
+				standardDeviation: 2
+			});
+			expect(helpers.summarize(['3', '1', '2'] as never)).toEqual({
+				count: 3,
+				min: 1,
+				max: 3,
+				sum: 6,
+				mean: 2,
+				median: 2,
+				q1: 1.5,
+				q3: 2.5,
+				variance: 2 / 3,
+				standardDeviation: Math.sqrt(2 / 3)
+			});
+		});
+
+		it('should match the individual helpers, zeros and overflow included', function () {
+			for (const values of [
+				[0, -0],
+				[-0, -0],
+				[0.1, 0.2, 0.3],
+				[MAX, MAX, -MAX],
+				[1, Infinity],
+				[-Infinity, Infinity]
+			]) {
+				const summary = helpers.summarize(values);
+				expect(summary.min).toBe(helpers.min(values));
+				expect(summary.max).toBe(helpers.max(values));
+				expect(summary.sum).toBe(helpers.sum(values));
+				expect(summary.mean).toBe(helpers.average(values));
+				expect(summary.median).toBe(helpers.median(values));
+				expect(summary.q1).toBe(helpers.quantile(values, 0.25));
+				expect(summary.q3).toBe(helpers.quantile(values, 0.75));
+				expect(summary.variance).toBe(helpers.variance(values));
+				expect(summary.standardDeviation).toBe(helpers.standardDeviation(values));
+			}
+		});
+
+		it('should describe empty input and NaN', function () {
+			expect(helpers.summarize([])).toEqual({
+				count: 0,
+				min: Infinity,
+				max: -Infinity,
+				sum: 0,
+				mean: NaN,
+				median: NaN,
+				q1: NaN,
+				q3: NaN,
+				variance: NaN,
+				standardDeviation: NaN
+			});
+			expect(helpers.summarize([1, NaN])).toEqual({
+				count: 2,
+				min: NaN,
+				max: NaN,
+				sum: NaN,
+				mean: NaN,
+				median: NaN,
+				q1: NaN,
+				q3: NaN,
+				variance: NaN,
+				standardDeviation: NaN
+			});
+		});
+	});
+});

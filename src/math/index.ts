@@ -722,7 +722,15 @@ export function product(numbers: ReadonlyArray<number>): number {
  * median([]); // => NaN
  */
 export function median(numbers: ReadonlyArray<number>): number {
-	const sorted = sortedCopy(numbers);
+	return sortedMedian(sortedCopy(numbers));
+}
+
+/**
+ * The median of numbers sorted by {@link sortedCopy} (see {@link median}).
+ * @param {ArrayLike<number>} sorted - The sorted numbers
+ * @returns {number} The median, or `NaN` if there are no numbers or one is `NaN`
+ */
+function sortedMedian(sorted: ArrayLike<number>): number {
 	const length = sorted.length;
 	// The largest value is missing (empty input) or NaN (sorted last): the median is undefined.
 	if (!(sorted[length - 1] <= Infinity)) return NaN;
@@ -2970,4 +2978,592 @@ export function nextPowerOfTwo(n: number): number {
 	if (n === Infinity) return n;
 	const power = floorPowerOfTwo(n);
 	return power === n ? n : power * 2;
+}
+
+/**
+ * Multiplies a number by `2 ** exponent` in two steps, so that the power of two itself never overflows or underflows (`2 ** 1074` is
+ * `Infinity`): exact whenever the result is a normal double.
+ * @param {number} value - The number to scale
+ * @param {number} exponent - An integer between `-2098` and `2098`
+ * @returns {number} `value * 2 ** exponent`
+ * @example
+ * scaleByPowerOfTwo(5e-324, 1074); // => 1
+ */
+function scaleByPowerOfTwo(value: number, exponent: number): number {
+	const half = Math.trunc(exponent / 2);
+	return value * 2 ** half * 2 ** (exponent - half);
+}
+
+/**
+ * Computes the geometric mean of an array of numbers, the `n`-th root of their product: the average of growth rates, ratios and other
+ * multiplicative quantities (Python's `statistics.geometric_mean`, scipy's `gmean`, Excel's `GEOMEAN`). The product is accumulated with
+ * its power of two kept apart, so that it neither overflows nor underflows whatever the number of values (`geometricMean([1e300, 1e300])`
+ * is `1e300`, where the product is `Infinity`), and its root is taken once, so the result is accurate to a few units in the last place
+ * (exact for exact powers: `geometricMean([2, 8])` is `4`, where `exp(mean(log))` gives `4.000000000000001`).
+ *
+ * Values are converted once with unary `+`. The geometric mean is only defined for non-negative values: a negative value or `NaN` gives
+ * `NaN`; otherwise a zero gives `0`, and an `Infinity` gives `Infinity` (`NaN` with a zero).
+ * @param {ReadonlyArray<number>} numbers - The non-negative numbers
+ * @returns {number} The geometric mean, or `NaN` for an empty array
+ * @example
+ * geometricMean([2, 8]); // => 4
+ * geometricMean([1, 3, 9]); // => 3
+ * geometricMean([1e300, 1e300]); // => 1e300
+ * geometricMean([4, 0]); // => 0
+ * geometricMean([-1, 1]); // => NaN
+ */
+export function geometricMean(numbers: ReadonlyArray<number>): number {
+	const count = numbers.length;
+	if (count === 0) return NaN;
+	// The product is `scaledProduct * 2 ** exponent`, with `scaledProduct` kept in `[2 ** -500, 2 ** 500]` (every value is brought into that
+	// range too, by exact powers of two), so that multiplying two of them can neither overflow nor underflow.
+	let scaledProduct = 1;
+	let exponent = 0;
+	let zero = false;
+	let infinite = false;
+	for (let i = 0; i < count; i++) {
+		let value = +numbers[i];
+		// Negative or `NaN`.
+		if (!(value >= 0)) return NaN;
+		if (value === 0) zero = true;
+		else if (value === Infinity) infinite = true;
+		else {
+			if (value > 2 ** 500) {
+				value *= 2 ** -600;
+				exponent += 600;
+			} else if (value < 2 ** -500) {
+				value *= 2 ** 600;
+				exponent -= 600;
+			}
+			scaledProduct *= value;
+			if (scaledProduct > 2 ** 500) {
+				scaledProduct *= 2 ** -500;
+				exponent += 500;
+			} else if (scaledProduct < 2 ** -500) {
+				scaledProduct *= 2 ** 500;
+				exponent -= 500;
+			}
+		}
+	}
+	if (zero) return infinite ? NaN : 0;
+	if (infinite) return Infinity;
+	// The product as `mantissa * 2 ** exponent`, with the mantissa in `[1, 2)`.
+	let shift = Math.floor(Math.log2(scaledProduct));
+	let mantissa = scaledProduct * 2 ** -shift;
+	// `Math.log2` is exact on powers of two and monotonic, so it can only round up to one (for a product just below it).
+	if (mantissa < 1) {
+		mantissa *= 2;
+		shift--;
+	}
+	exponent += shift;
+	// `(mantissa * 2 ** exponent) ** (1 / count)` is `(mantissa * 2 ** rest) ** (1 / count) * 2 ** quotient`: a single root, of a number in
+	// `[1, 2 ** count)`, which is snapped to an exact root when there is one. Past `2 ** 500` the power of two is rooted on its own.
+	const quotient = Math.floor(exponent / count);
+	const rest = exponent - quotient * count;
+	if (rest > 500) return scaleByPowerOfTwo(nthRoot(mantissa, count) * 2 ** (rest / count), quotient);
+	const radicand = mantissa * 2 ** rest;
+	return scaleByPowerOfTwo(exactRoot(nthRoot(radicand, count), radicand, count), quotient);
+}
+
+/**
+ * Snaps an approximate `n`-th root to the exact one when the radicand is the `n`-th power of a double: an exact root `r` of a double has at
+ * most `floor(53 / n)` significant bits (its `n`-th power has at most 53), so the approximation rounded to that many bits is `r` if `r`
+ * exists, which its exact `n`-th power (computed by `n - 1` exact multiplications) confirms (`geometricMean([81, 1, 1, 1])` is then exactly
+ * `3`, and `geometricMean([2.25, 1])` exactly `1.5`).
+ * @param {number} root - The approximate root, at least `1`
+ * @param {number} radicand - The radicand, at least `1`
+ * @param {number} n - The degree of the root, a positive integer
+ * @returns {number} The exact root if there is one, else `root`
+ * @example
+ * exactRoot(1.4999999999999998, 5.0625, 4); // => 1.5
+ */
+function exactRoot(root: number, radicand: number, n: number): number {
+	// Beyond 26, an exact root has a single significant bit: in `[1, 2)` that is `1`, the root of `1`, which `nthRoot` gives exactly.
+	if (n > 26) return root;
+	const unit = 2 ** (Math.floor(Math.log2(root)) + 1 - Math.floor(53 / n));
+	const candidate = Math.round(root / unit) * unit;
+	let power = candidate;
+	for (let i = 1; i < n; i++) power *= candidate;
+	return power === radicand ? candidate : root;
+}
+
+/**
+ * Computes the harmonic mean of an array of numbers, `n / Σ(1 / x)`: the average of rates, such as speeds over equal distances or
+ * price-earnings ratios (Python's `statistics.harmonic_mean`, scipy's `hmean`, Excel's `HARMEAN`). The reciprocals are taken of values
+ * scaled by a power of two (exactly), so that tiny values do not overflow them, and added up with the compensated {@link sum}.
+ *
+ * Values are converted once with unary `+`. The harmonic mean is only defined for non-negative values: a negative value or `NaN` gives
+ * `NaN`; otherwise a zero gives `0`, and `Infinity` values count for nothing (only `Infinity`s give `Infinity`).
+ * @param {ReadonlyArray<number>} numbers - The non-negative numbers
+ * @returns {number} The harmonic mean, or `NaN` for an empty array
+ * @example
+ * harmonicMean([40, 60]); // => 48 // the average speed of a round trip at 40 and 60 km/h
+ * harmonicMean([1, 4, 4]); // => 2
+ * harmonicMean([5e-324, 5e-324]); // => 5e-324 // 1 / 5e-324 is Infinity
+ * harmonicMean([2, 0]); // => 0
+ * harmonicMean([-1, 1]); // => NaN
+ */
+export function harmonicMean(numbers: ReadonlyArray<number>): number {
+	const count = numbers.length;
+	if (count === 0) return NaN;
+	const values: number[] = [];
+	let smallest = Infinity;
+	for (let i = 0; i < count; i++) {
+		const value = +numbers[i];
+		// Negative or `NaN`.
+		if (!(value >= 0)) return NaN;
+		values.push(value);
+		smallest = Math.min(smallest, value);
+	}
+	if (smallest === 0) return 0;
+	if (smallest === Infinity) return Infinity;
+	// Scaled so that the smallest value is close to `1`: no reciprocal exceeds `2`, and those that underflow are negligible next to it.
+	const exponent = -Math.floor(Math.log2(smallest));
+	// The sum of the reciprocals in double-double precision: each reciprocal and its rounding error go through a Neumaier sum, whose total
+	// and compensation are then renormalized into `high + low`.
+	let total = 0;
+	let compensation = 0;
+	/**
+	 * Adds a term to the Neumaier sum.
+	 * @param {number} term - The term
+	 * @returns {void}
+	 */
+	function add(term: number): void {
+		const next = total + term;
+		compensation += Math.abs(total) >= Math.abs(term) ? total - next + term : term - next + total;
+		total = next;
+	}
+	for (const value of values) {
+		const scaled = scaleByPowerOfTwo(value, exponent);
+		const reciprocal = 1 / scaled;
+		add(reciprocal);
+		// Splitting multiplies by `2 ** 27 + 1`, which would overflow for the largest doubles; the reciprocals of values beyond `2 ** 900`
+		// count for nothing next to the others (at least `1 / 2`) anyway.
+		if (scaled <= 2 ** 900) add((1 - reciprocal * scaled - productError(reciprocal, scaled)) / scaled);
+	}
+	const high = total + compensation;
+	const low = compensation - (high - total);
+	// `count / (high + low)`: the quotient by `high`, corrected by one Newton step on the exact residual `count - quotient * (high + low)`
+	// (`count - quotient * high` is exact, the product being within an ulp of `count`), so that a repeated value gives back that value.
+	const quotient = count / high;
+	const residual = count - quotient * high - productError(quotient, high) - quotient * low;
+	return scaleByPowerOfTwo(quotient + residual / high, -exponent);
+}
+
+/**
+ * The rounding error of a product: `a * b - fl(a * b)`, exactly, by Dekker's algorithm (each factor split into two halves of 26 bits, whose
+ * partial products are exact). The factors must stay below `2 ** 996` in magnitude, so that splitting them does not overflow, and their
+ * product must not underflow.
+ * @param {number} a - A factor
+ * @param {number} b - The other factor
+ * @returns {number} The exact error of the rounded product `a * b`
+ * @example
+ * productError(1 / 3, 3); // => -5.551115123125783e-17
+ */
+function productError(a: number, b: number): number {
+	const rounded = a * b;
+	const aSplit = 134217729 * a;
+	const aHigh = aSplit - (aSplit - a);
+	const aLow = a - aHigh;
+	const bSplit = 134217729 * b;
+	const bHigh = bSplit - (bSplit - b);
+	const bLow = b - bHigh;
+	return aHigh * bHigh - rounded + aHigh * bLow + aLow * bHigh + aLow * bLow;
+}
+
+/**
+ * Computes the root mean square (quadratic mean) of an array of numbers, `√(Σx² / n)`: the magnitude of a signal or of errors (the RMSE of
+ * residuals). Like `Math.hypot`, the values are scaled by a power of two first (exactly), so that their squares neither overflow nor
+ * underflow (`rootMeanSquare([1e200, 1e200])` is `1e200`, not `Infinity`); the squares are added up with the compensated {@link sum}.
+ * Values are converted once with unary `+`.
+ * @param {ReadonlyArray<number>} numbers - The numbers
+ * @returns {number} The root mean square: `NaN` for an empty array or if a value is `NaN`, else `Infinity` if a value is infinite
+ * @example
+ * rootMeanSquare([3, 4]); // => 3.5355339059327378
+ * rootMeanSquare([-2, 2]); // => 2
+ * rootMeanSquare([1e200, 1e200]); // => 1e200
+ * rootMeanSquare([]); // => NaN
+ */
+export function rootMeanSquare(numbers: ReadonlyArray<number>): number {
+	const count = numbers.length;
+	if (count === 0) return NaN;
+	const [values, scale] = scaledSample(numbers);
+	const squares = values.map(function (value) {
+		return value * value;
+	});
+	return Math.sqrt(scaledSum(squares, count)) / scale;
+}
+
+/**
+ * The central moments of a sample that {@link skewness} and {@link kurtosis} derive their results from, of the sample scaled by
+ * {@link scaledSample} (the ratios they compute do not depend on the scale).
+ */
+interface CentralMoments {
+	/** The number of values. */
+	count: number;
+	/** Whether every value is the same (the shape statistics are then undefined). */
+	constant: boolean;
+	/** The second central moment `Σ(x - x̄)² / n`. */
+	m2: number;
+	/** The third central moment `Σ(x - x̄)³ / n`. */
+	m3: number;
+	/** The fourth central moment `Σ(x - x̄)⁴ / n`. */
+	m4: number;
+}
+
+/**
+ * Computes the second, third and fourth central moments of a sample in two passes (the compensated mean, then the powers of the
+ * deviations from it), on the values scaled by a power of two (so that the fourth powers neither overflow nor underflow). The deviations
+ * from the rounded mean add up to `n` times its rounding error instead of `0`: as in {@link pairedMoments}, the sums are re-centred on the
+ * mean of the deviations (by the binomial expansion), which matters for data far from zero. Values are converted with unary `+`.
+ * @param {ReadonlyArray<number>} numbers - The sample
+ * @returns {CentralMoments} The count, whether the sample is constant, and the moments (`NaN` if a value is not finite)
+ */
+function centralMoments(numbers: ReadonlyArray<number>): CentralMoments {
+	const [values] = scaledSample(numbers);
+	const count = values.length;
+	const mean = average(values);
+	let constant = true;
+	let s1 = 0;
+	let s2 = 0;
+	let s3 = 0;
+	let s4 = 0;
+	for (let i = 0; i < count; i++) {
+		if (values[i] !== values[0]) constant = false;
+		const deviation = values[i] - mean;
+		const square = deviation * deviation;
+		s1 += deviation;
+		s2 += square;
+		s3 += square * deviation;
+		s4 += square * square;
+	}
+	// `Σ(d - c)^k` for the mean `c` of the deviations, expanded (with `Σd = n·c`).
+	const c = s1 / count;
+	return {
+		count,
+		constant,
+		m2: (s2 - c * s1) / count,
+		m3: (s3 - 3 * c * s2 + 2 * count * c ** 3) / count,
+		m4: (s4 - 4 * c * s3 + 6 * c * c * s2 - 3 * count * c ** 4) / count
+	};
+}
+
+/**
+ * Computes the skewness of an array of numbers, the asymmetry of their distribution: positive when the tail on the right (large values) is
+ * longer, negative when the left one is, `0` for symmetric data. By default the population (biased) skewness `g1 = m3 / m2^1.5` is
+ * returned, like scipy's `skew`; pass `{ sample: true }` for the adjusted Fisher–Pearson sample skewness
+ * `G1 = g1 · √(n(n - 1)) / (n - 2)` of Excel's `SKEW` and pandas' `skew`. The moments are computed in two passes from the compensated
+ * mean, on values scaled by a power of two, so the result is accurate for data far from zero and for any magnitude.
+ * Values are converted once with unary `+`.
+ * @param {ReadonlyArray<number>} numbers - The numbers
+ * @param {VarianceOptions} [options={}] - `sample`: compute the adjusted sample skewness instead of the population one
+ * @returns {number} The skewness; `NaN` for an empty array, for a sample skewness of fewer than 3 values, when every value is the same
+ * (the skewness is undefined), or if a value is not finite
+ * @example
+ * skewness([1, 2, 3, 10]); // => 1.0182337649086284
+ * skewness([3, 4, 5, 2, 3, 4, 5, 6, 4, 7], { sample: true }); // => 0.359543071406797 // Excel's SKEW
+ * skewness([1, 2, 3]); // => 0
+ * skewness([5, 5, 5]); // => NaN
+ */
+export function skewness(numbers: ReadonlyArray<number>, options: VarianceOptions = {}): number {
+	const sample = readOption(options, 'sample') === true;
+	const { count, constant, m2, m3 } = centralMoments(numbers);
+	if (constant || (sample && count < 3)) return NaN;
+	const population = m3 / (m2 * Math.sqrt(m2));
+	return sample ? (population * Math.sqrt(count * (count - 1))) / (count - 2) : population;
+}
+
+/**
+ * Computes the excess kurtosis of an array of numbers, how heavy the tails of their distribution are compared to a normal distribution
+ * (whose excess kurtosis is `0`): positive for heavy tails and outliers, negative for light tails (a uniform distribution has `-1.2`).
+ * By default the population (biased) excess kurtosis `g2 = m4 / m2² - 3` is returned, like scipy's `kurtosis`; pass `{ sample: true }` for
+ * the adjusted sample excess kurtosis `G2 = ((n + 1) g2 + 6) (n - 1) / ((n - 2)(n - 3))` of Excel's `KURT` and pandas' `kurt`. Add `3` to
+ * the population value for Pearson's (non-excess) kurtosis. The moments are computed like those of {@link skewness}.
+ * Values are converted once with unary `+`.
+ * @param {ReadonlyArray<number>} numbers - The numbers
+ * @param {VarianceOptions} [options={}] - `sample`: compute the adjusted sample excess kurtosis instead of the population one
+ * @returns {number} The excess kurtosis; `NaN` for an empty array, for a sample kurtosis of fewer than 4 values, when every value is the
+ * same (the kurtosis is undefined), or if a value is not finite
+ * @example
+ * kurtosis([1, 2, 3, 4]); // => -1.36
+ * kurtosis([3, 4, 5, 2, 3, 4, 5, 6, 4, 7], { sample: true }); // => -0.15179963720841477 // Excel's KURT
+ * kurtosis([5, 5, 5, 5]); // => NaN
+ */
+export function kurtosis(numbers: ReadonlyArray<number>, options: VarianceOptions = {}): number {
+	const sample = readOption(options, 'sample') === true;
+	const { count, constant, m2, m4 } = centralMoments(numbers);
+	if (constant || (sample && count < 4)) return NaN;
+	const population = m4 / (m2 * m2) - 3;
+	return sample ? (((count + 1) * population + 6) * (count - 1)) / ((count - 2) * (count - 3)) : population;
+}
+
+/**
+ * Computes the median absolute deviation of an array of numbers, `median(|x - median(x)|)`: a measure of spread that, unlike the standard
+ * deviation, outliers barely move (scipy's `median_abs_deviation` with its default `scale = 1`). Multiply it by `1.4826` to estimate the
+ * standard deviation of normally distributed data (scipy's `scale='normal'`), e.g. to flag values more than three such deviations from the
+ * median as outliers. The input is not mutated; values are converted once with unary `+`.
+ * @param {ReadonlyArray<number>} numbers - The numbers
+ * @returns {number} The median absolute deviation; `NaN` for an empty array, if a value is `NaN`, or when the median is infinite
+ * @example
+ * medianAbsoluteDeviation([1, 1, 2, 2, 4, 6, 9]); // => 1
+ * medianAbsoluteDeviation([1, 2, 3, 4, 1000]); // => 1 // the standard deviation is about 399
+ * medianAbsoluteDeviation([]); // => NaN
+ */
+export function medianAbsoluteDeviation(numbers: ReadonlyArray<number>): number {
+	const sorted = sortedCopy(numbers);
+	const center = sortedMedian(sorted);
+	return median(
+		Array.from(sorted, function (value) {
+			return Math.abs(value - center);
+		})
+	);
+}
+
+/**
+ * Computes the trimmed (truncated) mean of an array of numbers: the mean of what remains once the `floor(n · proportion)` smallest and as
+ * many largest values are cut off, a mean that outliers do not move (scipy's `trim_mean`). `proportion = 0` gives the plain
+ * {@link average}, and a proportion close to `0.5` tends to the median. The input is not mutated; values are converted once with unary `+`.
+ * @param {ReadonlyArray<number>} numbers - The numbers
+ * @param {number} proportion - The share cut off at each end, in `[0, 0.5)`
+ * @returns {number} The trimmed mean, or `NaN` for an empty array or if a value is `NaN`
+ * @throws {RangeError} when `proportion` is not in `[0, 0.5)` (including `NaN`)
+ * @throws {TypeError} when `proportion` is not a number
+ * @example
+ * trimmedMean([1, 2, 3, 4, 100], 0.2); // => 3 // 1 and 100 are cut off
+ * trimmedMean([1, 2, 3, 4, 100], 0); // => 22
+ * trimmedMean([], 0.1); // => NaN
+ * trimmedMean([1, 2], 0.5); // throws RangeError
+ */
+export function trimmedMean(numbers: ReadonlyArray<number>, proportion: number): number {
+	assertNumber('trimmedMean', 'proportion', proportion, proportion >= 0 && proportion < 0.5, 'a number in [0, 0.5)');
+	const sorted = sortedCopy(numbers);
+	const length = sorted.length;
+	// The largest value is missing (empty input) or NaN (sorted last).
+	if (!(sorted[length - 1] <= Infinity)) return NaN;
+	const cut = Math.floor(length * proportion);
+	const kept: number[] = [];
+	for (let i = cut; i < length - cut; i++) kept.push(sorted[i]);
+	return average(kept);
+}
+
+/**
+ * Ranks numbers in ascending order: the smallest gets `1`, the next `2`, and so on, equal values sharing the average of the ranks they
+ * span (fractional ranking: `[10, 20, 20, 30]` ranks `[1, 2.5, 2.5, 4]`), like scipy's `rankdata`, pandas' `rank()` and Excel's `RANK.AVG`
+ * in ascending order. The ranks are given in the order of the input. Like pandas' default, a `NaN` gets a `NaN` rank and the other values
+ * are ranked among themselves; `0` and `-0` are equal, and infinities rank first or last. Values are converted once with unary `+`.
+ * @param {ReadonlyArray<number>} numbers - The numbers to rank
+ * @returns {number[]} One rank per number, from `1` to the count of numbers that are not `NaN`
+ * @example
+ * ranks([10, 30, 20]); // => [1, 3, 2]
+ * ranks([10, 20, 20, 30]); // => [1, 2.5, 2.5, 4]
+ * ranks([3, NaN, 1]); // => [2, NaN, 1]
+ */
+export function ranks(numbers: ReadonlyArray<number>): number[] {
+	const values = Array.from(numbers, function (value) {
+		return +value;
+	});
+	const result = new Array<number>(values.length).fill(NaN);
+	const order: number[] = [];
+	for (let i = 0; i < values.length; i++) {
+		if (values[i] === values[i]) order.push(i);
+	}
+	order.sort(function (a, b) {
+		return values[a] < values[b] ? -1 : values[a] > values[b] ? 1 : 0;
+	});
+	// Each run of equal values, at sorted positions `start` to `end - 1`, gets the mean of the ranks `start + 1` to `end`.
+	for (let start = 0; start < order.length;) {
+		let end = start + 1;
+		while (end < order.length && values[order[end]] === values[order[start]]) end++;
+		for (let i = start; i < end; i++) result[order[i]] = (start + 1 + end) / 2;
+		start = end;
+	}
+	return result;
+}
+
+/**
+ * Computes Spearman's rank correlation coefficient of two paired samples: the Pearson {@link correlation} of their {@link ranks}, from `-1`
+ * to `1`. Where the Pearson coefficient measures how linear the relation is, Spearman's measures how monotonic it is (`1` whenever `ys`
+ * grows with `xs`, however non-linearly), and outliers count only by their rank (scipy's `spearmanr`, pandas' `corr(method='spearman')`).
+ * Ties get average ranks; infinities are ranked like any other value. Values are converted once with unary `+`.
+ * @param {ReadonlyArray<number>} xs - The first sample
+ * @param {ReadonlyArray<number>} ys - The second sample, one value per value of `xs`
+ * @returns {number} The coefficient, in `[-1, 1]`; `NaN` for fewer than 2 pairs, when either sample is constant, or if a value is `NaN`
+ * @throws {RangeError} when `xs` and `ys` have different lengths
+ * @example
+ * spearmanCorrelation([1, 2, 3, 4], [1, 4, 9, 16]); // => 1
+ * spearmanCorrelation([1, 2, 3, 4], [1, 8, 27, 1000]); // => 1 // their Pearson correlation is about 0.8
+ * spearmanCorrelation([1, 2, 3], [3, 2, 1]); // => -1
+ * spearmanCorrelation([1, 2, 3, 4, 5], [5, 6, 7, 8, 7]); // => 0.8207826816681233
+ * spearmanCorrelation([1, 2], [1]); // throws RangeError
+ */
+export function spearmanCorrelation(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): number {
+	// The ranks have the lengths of the samples, which `pairedMoments` checks.
+	const moments = pairedMoments('spearmanCorrelation', ranks(xs), ranks(ys));
+	const root = Math.sqrt(determination(moments));
+	return moments.sxy < 0 ? -root : root;
+}
+
+/**
+ * Standardizes numbers into z-scores: how many standard deviations each one lies from their mean, `(x - mean) / standardDeviation`, so
+ * that the result has a mean of `0` and a standard deviation of `1` (scikit-learn's `StandardScaler`, scipy's `zscore`). The population
+ * standard deviation is used by default; pass `{ sample: true }` for the sample one. When every value is the same, every score is `0`, as
+ * in scikit-learn. The computation runs on values scaled by a power of two (exactly), so that no difference overflows.
+ * Values are converted once with unary `+`.
+ * @param {ReadonlyArray<number>} numbers - The numbers
+ * @param {VarianceOptions} [options={}] - `sample`: divide by the sample standard deviation instead of the population one
+ * @returns {number[]} One z-score per number; every score is `NaN` when the standard deviation is undefined (a value that is not finite,
+ * or a single value with `{ sample: true }`)
+ * @example
+ * standardize([2, 4, 4, 4, 5, 5, 7, 9]); // => [-1.5, -0.5, -0.5, -0.5, 0, 0, 1, 2]
+ * standardize([1, 2, 3], { sample: true }); // => [-1, 0, 1]
+ * standardize([5, 5]); // => [0, 0]
+ */
+export function standardize(numbers: ReadonlyArray<number>, options: VarianceOptions = {}): number[] {
+	const [values] = scaledSample(numbers);
+	const mean = average(values);
+	const deviation = standardDeviation(values, options);
+	return values.map(function (value) {
+		return deviation === 0 ? 0 : (value - mean) / deviation;
+	});
+}
+
+/**
+ * Computes the softmax of some numbers (scores, logits): `exp(x) / Σ exp(x)` for each one, positive weights that add up to `1` and keep
+ * the order of the scores. The largest score is subtracted first, which changes nothing mathematically but keeps `exp` from overflowing
+ * (`softmax([1000, 1000])` is `[0.5, 0.5]`, where the naive formula gives `NaN`); the exponentials are added up with the compensated
+ * {@link sum}. A `-Infinity` score gets a weight of `0` (a masked choice); `Infinity` scores share the whole weight equally.
+ * Values are converted once with unary `+`.
+ * @param {ReadonlyArray<number>} numbers - The scores
+ * @returns {number[]} One weight per score, in `[0, 1]`; all `NaN` if a score is `NaN` or every score is `-Infinity`
+ * @example
+ * softmax([1, 2, 3]); // => [0.09003057317038046, 0.24472847105479764, 0.6652409557748218]
+ * softmax([1000, 1000]); // => [0.5, 0.5]
+ * softmax([0, -Infinity]); // => [1, 0]
+ * softmax([]); // => []
+ */
+export function softmax(numbers: ReadonlyArray<number>): number[] {
+	const values = Array.from(numbers, function (value) {
+		return +value;
+	});
+	const largest = max(values);
+	if (largest === Infinity) {
+		const infinities = values.filter(function (value) {
+			return value === Infinity;
+		}).length;
+		return values.map(function (value) {
+			return value === Infinity ? 1 / infinities : 0;
+		});
+	}
+	// `NaN` (a `NaN` score), or `-Infinity` (every score is, or there are none: then the map is empty).
+	if (!(largest > -Infinity)) {
+		return values.map(function () {
+			return NaN;
+		});
+	}
+	const exponentials = values.map(function (value) {
+		return Math.exp(value - largest);
+	});
+	// At least `1`: the largest score contributes `exp(0)`.
+	const total = sum(exponentials);
+	return exponentials.map(function (exponential) {
+		return exponential / total;
+	});
+}
+
+/**
+ * Computes the exponential moving average of a series: each average is `alpha · value + (1 - alpha) · previous average`, starting from the
+ * first value, so recent values weigh more and the weight of older ones decays geometrically. These are the results of pandas'
+ * `ewm(alpha=alpha, adjust=False, ignore_na=True).mean()`; for a smoothing over `span` periods (as trading indicators define their EMA), pass
+ * `alpha = 2 / (span + 1)`, and for a half-life of `h` periods, `alpha = 1 - 0.5 ** (1 / h)`. Each step is a {@link lerp}, so `alpha = 1`
+ * gives the values themselves.
+ *
+ * A `NaN` value is skipped: its position repeats the previous average (`NaN` before the first number), and the average goes on from there,
+ * instead of every later average being `NaN`. An infinite value makes every later average infinite (`NaN` once both infinities were seen).
+ * Values are converted once with unary `+`.
+ * @param {ReadonlyArray<number>} values - The series
+ * @param {number} alpha - The smoothing factor, in `(0, 1]`: the weight of the newest value
+ * @returns {number[]} One average per value
+ * @throws {RangeError} when `alpha` is not in `(0, 1]` (including `NaN`)
+ * @throws {TypeError} when `alpha` is not a number
+ * @example
+ * exponentialMovingAverage([1, 2, 3, 4, 5], 0.5); // => [1, 1.5, 2.25, 3.125, 4.0625]
+ * exponentialMovingAverage([NaN, 10, NaN, 20], 0.5); // => [NaN, 10, 10, 15]
+ * exponentialMovingAverage([1, 2, 3], 2 / (3 + 1)); // => [1, 1.5, 2.25] // a 3-period EMA
+ * exponentialMovingAverage([1, 2], 0); // throws RangeError
+ */
+export function exponentialMovingAverage(values: ReadonlyArray<number>, alpha: number): number[] {
+	assertNumber('exponentialMovingAverage', 'alpha', alpha, alpha > 0 && alpha <= 1, 'a number in (0, 1]');
+	const result: number[] = [];
+	let current = NaN;
+	let started = false;
+	for (const item of values) {
+		const value = +item;
+		if (value === value) {
+			current = started ? lerp(current, value, alpha) : value;
+			started = true;
+		}
+		result.push(current);
+	}
+	return result;
+}
+
+/**
+ * The descriptive statistics of a sample, as computed by {@link summarize}.
+ */
+export interface Summary {
+	/** The number of values. */
+	readonly count: number;
+	/** The smallest value, as {@link min} gives it (`Infinity` for no values). */
+	readonly min: number;
+	/** The largest value, as {@link max} gives it (`-Infinity` for no values). */
+	readonly max: number;
+	/** The compensated {@link sum} (`0` for no values). */
+	readonly sum: number;
+	/** The arithmetic mean, as {@link average} gives it. */
+	readonly mean: number;
+	/** The {@link median}. */
+	readonly median: number;
+	/** The first quartile, `quantile(numbers, 0.25)`. */
+	readonly q1: number;
+	/** The third quartile, `quantile(numbers, 0.75)`. */
+	readonly q3: number;
+	/** The population {@link variance}. */
+	readonly variance: number;
+	/** The population {@link standardDeviation}. */
+	readonly standardDeviation: number;
+}
+
+/**
+ * Computes the usual descriptive statistics of a sample at once (the count, extremes, sum, mean, median, quartiles, and population
+ * variance and standard deviation), as pandas' `describe()` or a box plot needs them. Every field is exactly what the function of the
+ * same name gives (`summary.q1` is `quantile(numbers, 0.25)`, `summary.mean` is `average(numbers)`...), but the values are converted and
+ * sorted only once. For the sample variance, call {@link variance} with `{ sample: true }`.
+ * Values are converted once with unary `+`. With no values, the count and the sum are `0`, `min` and `max` are `Infinity` and `-Infinity`
+ * (like `Math.min()` and `Math.max()`), and every other field is `NaN`; a `NaN` value makes every field but `count` `NaN`.
+ * @param {ReadonlyArray<number>} numbers - The numbers
+ * @returns {Summary} `{ count, min, max, sum, mean, median, q1, q3, variance, standardDeviation }`
+ * @example
+ * summarize([2, 4, 4, 4, 5, 5, 7, 9]); // => { count: 8, min: 2, max: 9, sum: 40, mean: 5, median: 4.5, q1: 4, q3: 5.5, variance: 4, standardDeviation: 2 }
+ * summarize([]).count; // => 0
+ */
+export function summarize(numbers: ReadonlyArray<number>): Summary {
+	const values = Array.from(numbers, function (value) {
+		return +value;
+	});
+	const count = values.length;
+	const sorted = sortedCopy(values);
+	// `NaN` sorts last.
+	const nan = count > 0 && sorted[count - 1] !== sorted[count - 1];
+	return {
+		count,
+		min: nan ? NaN : count === 0 ? Infinity : sorted[0],
+		max: nan ? NaN : count === 0 ? -Infinity : sorted[count - 1],
+		sum: sum(values),
+		mean: average(values),
+		median: sortedMedian(sorted),
+		q1: sortedQuantile(sorted, 0.25),
+		q3: sortedQuantile(sorted, 0.75),
+		variance: variance(values),
+		standardDeviation: standardDeviation(values)
+	};
 }

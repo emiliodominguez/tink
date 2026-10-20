@@ -1874,3 +1874,386 @@ describe('New math helpers (property-based)', function () {
 		});
 	});
 });
+
+describe('Statistics helpers (property-based)', function () {
+	const positive = fc.double({ min: 1e-3, max: 1e6, noNaN: true });
+	const positiveArray = fc.array(positive, { minLength: 1, maxLength: 40 });
+	const anyNumber = fc.oneof(fc.double(), fc.constantFrom(0, -0, NaN, Infinity, -Infinity));
+	const nonConstantInts = fc.array(fc.integer({ min: -1000, max: 1000 }), { minLength: 4, maxLength: 40 }).filter(function (numbers) {
+		return numbers.some(function (value) {
+			return value !== numbers[0];
+		});
+	});
+
+	/**
+	 * Whether `a <= b`, up to a relative tolerance for rounding.
+	 * @param {number} a - The smaller value
+	 * @param {number} b - The larger value
+	 * @returns {boolean} `a <= b * (1 + 1e-12)`
+	 */
+	function atMost(a: number, b: number): boolean {
+		return a <= b * (1 + 1e-12);
+	}
+
+	describe('harmonicMean, geometricMean, average and rootMeanSquare', function () {
+		it('should be ordered HM <= GM <= AM <= RMS, within the range of the values', function () {
+			fc.assert(
+				fc.property(positiveArray, function (numbers) {
+					const hm = helpers.harmonicMean(numbers);
+					const gm = helpers.geometricMean(numbers);
+					const am = helpers.average(numbers);
+					const rms = helpers.rootMeanSquare(numbers);
+					expect(atMost(hm, gm) && atMost(gm, am) && atMost(am, rms)).toBe(true);
+					expect(atMost(helpers.min(numbers), hm) && atMost(rms, helpers.max(numbers))).toBe(true);
+				})
+			);
+		});
+
+		it('should give back a repeated value (exactly for the harmonic mean)', function () {
+			fc.assert(
+				fc.property(fc.double({ min: 5e-324, max: Number.MAX_VALUE, noNaN: true }), fc.integer({ min: 1, max: 20 }), function (value, count) {
+					const numbers = new Array<number>(count).fill(value);
+					expect(helpers.harmonicMean(numbers)).toBe(value);
+					expect(helpers.geometricMean(numbers) / value).toBeCloseTo(1, 13);
+					expect(helpers.rootMeanSquare(numbers) / value).toBeCloseTo(1, 14);
+				})
+			);
+		});
+	});
+
+	describe('geometricMean', function () {
+		it('should be exact for powers of two whose exponents average to an integer', function () {
+			fc.assert(
+				fc.property(fc.array(fc.integer({ min: -300, max: 300 }), { maxLength: 7 }), fc.integer({ min: -300, max: 300 }), function (exponents, mean) {
+					const last = mean * (exponents.length + 1) - helpers.sum(exponents);
+					fc.pre(last >= -1074 && last <= 1023);
+					const numbers = exponents.concat(last).map(function (exponent) {
+						return 2 ** exponent;
+					});
+					expect(helpers.geometricMean(numbers)).toBe(2 ** mean);
+				})
+			);
+		});
+
+		it('should equal exp(mean(log x)) up to rounding', function () {
+			fc.assert(
+				fc.property(positiveArray, function (numbers) {
+					const reference = Math.exp(
+						helpers.average(
+							numbers.map(function (value) {
+								return Math.log(value);
+							})
+						)
+					);
+					expect(helpers.geometricMean(numbers) / reference).toBeCloseTo(1, 12);
+				})
+			);
+		});
+	});
+
+	describe('rootMeanSquare', function () {
+		it('should equal the naive formula and ignore signs', function () {
+			fc.assert(
+				fc.property(finiteArray, function (numbers) {
+					const naive = Math.sqrt(
+						helpers.average(
+							numbers.map(function (value) {
+								return value * value;
+							})
+						)
+					);
+					const rms = helpers.rootMeanSquare(numbers);
+					// The naive squares of the tiniest values underflow.
+					expect(Math.abs(rms - naive)).toBeLessThanOrEqual(naive * 1e-14 + 1e-150);
+					expect(
+						helpers.rootMeanSquare(
+							numbers.map(function (value) {
+								return -value;
+							})
+						)
+					).toBe(rms);
+				})
+			);
+		});
+	});
+
+	describe('skewness and kurtosis', function () {
+		it('should flip the sign of the skewness under negation and keep the kurtosis', function () {
+			fc.assert(
+				fc.property(fc.array(finiteDouble, { minLength: 4, maxLength: 40 }), fc.boolean(), function (numbers, sample) {
+					const negated = numbers.map(function (value) {
+						return -value;
+					});
+					expect(helpers.skewness(negated, { sample }) + 0).toBe(-helpers.skewness(numbers, { sample }) + 0);
+					expect(Object.is(helpers.kurtosis(negated, { sample }), helpers.kurtosis(numbers, { sample }))).toBe(true);
+				})
+			);
+		});
+
+		it('should not change when every value is scaled by a power of two', function () {
+			// Away from the subnormals, where scaling would round.
+			const moderate = fc.oneof(fc.constant(0), fc.double({ min: 1e-6, max: 1e6, noNaN: true }), fc.double({ min: -1e6, max: -1e-6, noNaN: true }));
+			fc.assert(
+				fc.property(fc.array(moderate, { minLength: 4, maxLength: 40 }), fc.integer({ min: -900, max: 900 }), function (numbers, exponent) {
+					const scaled = numbers.map(function (value) {
+						return value * 2 ** exponent;
+					});
+					expect(Object.is(helpers.skewness(scaled), helpers.skewness(numbers))).toBe(true);
+					expect(Object.is(helpers.kurtosis(scaled), helpers.kurtosis(numbers))).toBe(true);
+				})
+			);
+		});
+
+		it('should be invariant under positive affine maps (the skewness changes sign with a negative factor)', function () {
+			fc.assert(
+				fc.property(
+					nonConstantInts,
+					fc.integer({ min: -100, max: 100 }).filter(function (factor) {
+						return factor !== 0;
+					}),
+					fc.integer({ min: -1e6, max: 1e6 }),
+					function (numbers, factor, shift) {
+						const mapped = numbers.map(function (value) {
+							return factor * value + shift;
+						});
+						expect(helpers.skewness(mapped)).toBeCloseTo(Math.sign(factor) * helpers.skewness(numbers), 9);
+						expect(helpers.kurtosis(mapped)).toBeCloseTo(helpers.kurtosis(numbers), 9);
+						expect(helpers.kurtosis(mapped, { sample: true })).toBeCloseTo(helpers.kurtosis(numbers, { sample: true }), 9);
+					}
+				)
+			);
+		});
+
+		it('should match the textbook formulas, and the kurtosis be at least -2', function () {
+			fc.assert(
+				fc.property(nonConstantInts, function (numbers) {
+					const n = numbers.length;
+					const mean = helpers.average(numbers);
+					/**
+					 * The `k`-th central moment, naively.
+					 * @param {number} k - The order
+					 * @returns {number} `Σ(x - mean)^k / n`
+					 */
+					function moment(k: number): number {
+						return (
+							helpers.sum(
+								numbers.map(function (value) {
+									return (value - mean) ** k;
+								})
+							) / n
+						);
+					}
+					const g1 = moment(3) / moment(2) ** 1.5;
+					const g2 = moment(4) / moment(2) ** 2 - 3;
+					expect(helpers.skewness(numbers)).toBeCloseTo(g1, 9);
+					expect(helpers.skewness(numbers, { sample: true })).toBeCloseTo((g1 * Math.sqrt(n * (n - 1))) / (n - 2), 9);
+					expect(helpers.kurtosis(numbers)).toBeCloseTo(g2, 9);
+					expect(helpers.kurtosis(numbers)).toBeGreaterThanOrEqual(-2 - 1e-12);
+				})
+			);
+		});
+	});
+
+	describe('ranks', function () {
+		it('should equal the naive fractional ranking, adding up to n(n + 1) / 2', function () {
+			const element = fc.oneof(fc.integer({ min: -5, max: 5 }), fc.constantFrom(0, -0, NaN, Infinity, -Infinity));
+			fc.assert(
+				fc.property(fc.array(element, { maxLength: 40 }), function (numbers) {
+					const result = helpers.ranks(numbers);
+					const ranked = numbers.filter(function (value) {
+						return value === value;
+					});
+					numbers.forEach(function (value, index) {
+						if (value !== value) {
+							expect(result[index]).toBeNaN();
+							return;
+						}
+						const below = ranked.filter(function (other) {
+							return other < value;
+						}).length;
+						const equal = ranked.filter(function (other) {
+							return other === value;
+						}).length;
+						expect(result[index]).toBe(below + (equal + 1) / 2);
+					});
+					const total = helpers.sum(
+						result.filter(function (rank) {
+							return rank === rank;
+						})
+					);
+					expect(total).toBe((ranked.length * (ranked.length + 1)) / 2);
+				})
+			);
+		});
+	});
+
+	describe('spearmanCorrelation', function () {
+		it('should not change under strictly increasing maps, and be in [-1, 1]', function () {
+			fc.assert(
+				fc.property(
+					fc.array(fc.tuple(fc.integer({ min: -1000, max: 1000 }), fc.integer({ min: -1000, max: 1000 })), { minLength: 2, maxLength: 30 }),
+					function (pairs) {
+						const xs = pairs.map(function (pair) {
+							return pair[0];
+						});
+						const ys = pairs.map(function (pair) {
+							return pair[1];
+						});
+						const cubes = xs.map(function (value) {
+							return value * value * value;
+						});
+						const rho = helpers.spearmanCorrelation(xs, ys);
+						expect(Object.is(helpers.spearmanCorrelation(cubes, ys), rho)).toBe(true);
+						expect(Object.is(rho, helpers.correlation(helpers.ranks(xs), helpers.ranks(ys)))).toBe(true);
+						if (rho === rho) expect(Math.abs(rho)).toBeLessThanOrEqual(1);
+					}
+				)
+			);
+		});
+	});
+
+	describe('standardize', function () {
+		it('should give scores with mean 0 and standard deviation 1', function () {
+			fc.assert(
+				fc.property(fc.array(fc.double({ noNaN: true, noDefaultInfinity: true }), { minLength: 2, maxLength: 40 }), fc.boolean(), function (numbers, sample) {
+					fc.pre(
+						numbers.some(function (value) {
+							return value !== numbers[0];
+						})
+					);
+					const scores = helpers.standardize(numbers, { sample });
+					expect(Math.abs(helpers.average(scores))).toBeLessThan(1e-9);
+					expect(helpers.standardDeviation(scores, { sample })).toBeCloseTo(1, 9);
+				})
+			);
+		});
+
+		it('should preserve the order of the values', function () {
+			fc.assert(
+				fc.property(finiteArray, function (numbers) {
+					const scores = helpers.standardize(numbers);
+					for (let i = 1; i < numbers.length; i++) {
+						if (numbers[i - 1] < numbers[i]) expect(scores[i - 1]).toBeLessThanOrEqual(scores[i]);
+					}
+				})
+			);
+		});
+	});
+
+	describe('softmax', function () {
+		it('should give weights in [0, 1] that add up to 1, in the order of the scores', function () {
+			fc.assert(
+				fc.property(fc.array(fc.double({ min: -1e6, max: 1e6, noNaN: true }), { minLength: 1, maxLength: 40 }), function (numbers) {
+					const weights = helpers.softmax(numbers);
+					expect(helpers.sum(weights)).toBeCloseTo(1, 12);
+					for (let i = 0; i < numbers.length; i++) {
+						expect(weights[i] >= 0 && weights[i] <= 1).toBe(true);
+						if (i > 0 && numbers[i - 1] < numbers[i]) expect(weights[i - 1]).toBeLessThanOrEqual(weights[i]);
+					}
+				})
+			);
+		});
+
+		it('should be invariant under shifts', function () {
+			fc.assert(
+				fc.property(fc.array(fc.integer({ min: -1000, max: 1000 }), { maxLength: 40 }), fc.integer({ min: -1e6, max: 1e6 }), function (numbers, shift) {
+					const shifted = numbers.map(function (value) {
+						return value + shift;
+					});
+					expect(helpers.softmax(shifted)).toEqual(helpers.softmax(numbers));
+				})
+			);
+		});
+	});
+
+	describe('exponentialMovingAverage', function () {
+		it('should follow the recurrence α·x + (1 - α)·previous', function () {
+			fc.assert(
+				fc.property(finiteArray, fc.double({ min: 0, max: 1, minExcluded: true, noNaN: true }), function (numbers, alpha) {
+					const result = helpers.exponentialMovingAverage(numbers, alpha);
+					let previous = numbers[0];
+					expect(result[0]).toBe(previous);
+					for (let i = 1; i < numbers.length; i++) {
+						previous = alpha * numbers[i] + (1 - alpha) * previous;
+						expect(Math.abs(result[i] - previous)).toBeLessThanOrEqual(1e-6);
+					}
+				})
+			);
+		});
+
+		it('should skip NaN values, as if they were not there', function () {
+			fc.assert(
+				fc.property(
+					fc.array(fc.oneof(finiteDouble, fc.constant(NaN)), { maxLength: 40 }),
+					fc.double({ min: 0, max: 1, minExcluded: true, noNaN: true }),
+					function (numbers, alpha) {
+						const result = helpers.exponentialMovingAverage(numbers, alpha);
+						const present = numbers.filter(function (value) {
+							return value === value;
+						});
+						const compact = helpers.exponentialMovingAverage(present, alpha);
+						let seen = -1;
+						numbers.forEach(function (value, index) {
+							if (value === value) seen++;
+							if (seen < 0) expect(result[index]).toBeNaN();
+							else expect(result[index]).toBe(compact[seen]);
+						});
+					}
+				)
+			);
+		});
+	});
+
+	describe('summarize', function () {
+		it('should equal the individual helpers on any input', function () {
+			fc.assert(
+				fc.property(fc.array(anyNumber, { maxLength: 40 }), function (numbers) {
+					const summary = helpers.summarize(numbers);
+					expect(summary.count).toBe(numbers.length);
+					expect(Object.is(summary.min, helpers.min(numbers))).toBe(true);
+					expect(Object.is(summary.max, helpers.max(numbers))).toBe(true);
+					expect(Object.is(summary.sum, helpers.sum(numbers))).toBe(true);
+					expect(Object.is(summary.mean, helpers.average(numbers))).toBe(true);
+					expect(Object.is(summary.median, helpers.median(numbers))).toBe(true);
+					expect(Object.is(summary.q1, helpers.quantile(numbers, 0.25))).toBe(true);
+					expect(Object.is(summary.q3, helpers.quantile(numbers, 0.75))).toBe(true);
+					expect(Object.is(summary.variance, helpers.variance(numbers))).toBe(true);
+					expect(Object.is(summary.standardDeviation, helpers.standardDeviation(numbers))).toBe(true);
+				})
+			);
+		});
+	});
+
+	describe('trimmedMean', function () {
+		it('should equal the average of the naively trimmed sorted values', function () {
+			fc.assert(
+				fc.property(intArray, fc.double({ min: 0, max: 0.5, maxExcluded: true, noNaN: true }), function (numbers, proportion) {
+					const sorted = numbers.slice().sort(function (a, b) {
+						return a - b;
+					});
+					const cut = Math.floor(numbers.length * proportion);
+					expect(helpers.trimmedMean(numbers, proportion)).toBe(helpers.average(sorted.slice(cut, numbers.length - cut)));
+					expect(helpers.trimmedMean(numbers, 0)).toBe(helpers.average(numbers));
+				})
+			);
+		});
+	});
+
+	describe('medianAbsoluteDeviation', function () {
+		it('should not change under shifts and negation', function () {
+			fc.assert(
+				fc.property(intArray, fc.integer({ min: -1e6, max: 1e6 }), function (numbers, shift) {
+					const mad = helpers.medianAbsoluteDeviation(numbers);
+					const shifted = numbers.map(function (value) {
+						return value + shift;
+					});
+					const negated = numbers.map(function (value) {
+						return -value;
+					});
+					expect(helpers.medianAbsoluteDeviation(shifted)).toBe(mad);
+					expect(helpers.medianAbsoluteDeviation(negated)).toBe(mad);
+				})
+			);
+		});
+	});
+});
