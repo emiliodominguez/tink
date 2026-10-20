@@ -1295,3 +1295,29 @@ describe('Format helpers (pass 5 regressions)', function () {
 		expect(helpers.parseNumber('1 234,5', { locale: 'fr-CA' })).toBe(1234.5);
 	});
 });
+
+describe('Format helpers (pass 6 regressions)', function () {
+	it('does not memoize a formatter with the option count of the previous call when counting its options throws', function () {
+		expect(helpers.formatNumber(1, {})).toBe('1');
+		expect(helpers.pluralRule(1, {})).toBe('one');
+		Object.defineProperty(Object.prototype, 'planted', {
+			configurable: true,
+			enumerable: true,
+			get(): never {
+				throw new Error('planted getter');
+			}
+		});
+		try {
+			expect(function () {
+				helpers.formatNumber(1, { minimumFractionDigits: 2 });
+			}).toThrow('planted getter');
+			expect(function () {
+				helpers.pluralRule(1, { minimumFractionDigits: 1 });
+			}).toThrow('planted getter');
+		} finally {
+			delete (Object.prototype as Record<string, unknown>).planted;
+		}
+		expect(helpers.formatNumber(1, {})).toBe('1');
+		expect(helpers.pluralRule(1, {})).toBe('one');
+	});
+});

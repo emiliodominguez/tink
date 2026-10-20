@@ -383,10 +383,14 @@ function getFormatter<T, O>(kind: string, Formatter: new (locales: string[], opt
 	}
 
 	if (typeof locale !== 'object') {
+		// Counted before the memo changes: `for…in` reads the keys planted on `Object.prototype`, and a getter there that throws would
+		// otherwise leave this formatter memoized with the previous call's count (`formatNumber(1, {})` then printing `'1.00'`).
+		const size = countDefined(options as object);
+
 		memo.formatter = formatter;
 		memo.locale = locale;
 		memo.options = options as object;
-		memo.size = countDefined(options as object);
+		memo.size = size;
 	}
 
 	return formatter;
