@@ -748,6 +748,142 @@ describe('createEmitter', function () {
 			expect(events.listenerCount('x')).toBe(1);
 		});
 
+		describe('after a stack overflow (simulated by a throwing Map or Array method)', function () {
+			/**
+			 * Makes `Map.prototype[method]` throw a stack-overflow `RangeError` for `key` during `run`.
+			 * @param {'get' | 'set'} method - The method
+			 * @param {unknown} key - The key it throws for
+			 * @param {() => void} run - Runs with the method patched
+			 * @returns {void}
+			 */
+			function overflowOn(method: 'get' | 'set', key: unknown, run: () => void): void {
+				const original = Map.prototype[method] as (this: Map<unknown, unknown>, ...args: unknown[]) => unknown;
+
+				Object.defineProperty(Map.prototype, method, {
+					configurable: true,
+					writable: true,
+					value: function (this: Map<unknown, unknown>, ...args: unknown[]) {
+						if (args[0] === key) throw new RangeError('Maximum call stack size exceeded');
+						return original.apply(this, args);
+					}
+				});
+				try {
+					run();
+				} finally {
+					Object.defineProperty(Map.prototype, method, { configurable: true, writable: true, value: original });
+				}
+			}
+
+			it('keeps a handler removable by off when indexing it overflows (regression: off missed it and it stayed registered)', function () {
+				const events = createEmitter<{ x: number }>();
+				const handler = jest.fn();
+
+				events.on('x', jest.fn());
+				// Indexes the listeners of 'x'.
+				events.off('x', function () {});
+				overflowOn('set', handler, function () {
+					expect(function () {
+						events.on('x', handler);
+					}).toThrow(RangeError);
+				});
+				expect(events.off('x', handler)).toBe(true);
+				events.emit('x', 1);
+				expect(handler).not.toHaveBeenCalled();
+				expect(events.listenerCount('x')).toBe(1);
+			});
+
+			it('builds the index again after an off that overflowed while building it (regression: off missed every listener)', function () {
+				const events = createEmitter<{ x: number }>();
+				const a = jest.fn();
+				const b = jest.fn();
+
+				events.on('x', a);
+				events.on('x', b);
+				overflowOn('set', a, function () {
+					expect(function () {
+						events.off('x', b);
+					}).toThrow(RangeError);
+				});
+				expect(events.off('x', b)).toBe(true);
+				expect(events.off('x', a)).toBe(true);
+				events.emit('x', 1);
+				expect(a).not.toHaveBeenCalled();
+				expect(b).not.toHaveBeenCalled();
+				expect(events.listenerCount()).toBe(0);
+			});
+
+			it('leaves a registration active when its removal overflows (regression: removed, never counted, listenerCount 1 too high)', function () {
+				const events = createEmitter<{ x: number }>();
+				const handler = jest.fn();
+
+				events.on('x', jest.fn());
+				const stop = events.on('x', handler);
+				events.off('x', function () {});
+				overflowOn('get', handler, function () {
+					expect(stop).toThrow(RangeError);
+				});
+				expect(events.listenerCount('x')).toBe(2);
+				stop();
+				expect(events.listenerCount('x')).toBe(1);
+				events.emit('x', 1);
+				expect(handler).not.toHaveBeenCalled();
+			});
+
+			it('compacts the wildcard list again after an emit whose compaction overflowed (regression: it never was)', async function () {
+				const events = createEmitter<{ x: number }>();
+				const refs: Array<WeakRef<{ id: number }>> = [];
+
+				events.once('x', function () {});
+				events.on('x', function () {});
+				events.on('*', function () {});
+				// The first compaction after the emit pops the removed `once` registration: it throws instead.
+				const pop = Array.prototype.pop;
+				Array.prototype.pop = function () {
+					Array.prototype.pop = pop;
+					throw new RangeError('Maximum call stack size exceeded');
+				};
+				try {
+					expect(function () {
+						events.emit('x', 1);
+					}).toThrow(RangeError);
+				} finally {
+					Array.prototype.pop = pop;
+				}
+				// Wildcard registrations added and removed: compacted away (with their handlers) unless the list counts an emit forever.
+				(function () {
+					for (let id = 0; id < 4; id++) {
+						const value = { id };
+
+						refs.push(new WeakRef(value));
+						events.on('*', function () {
+							return value;
+						})();
+					}
+				})();
+				await collectGarbage();
+				expect(
+					refs.filter(function (ref) {
+						return ref.deref() !== undefined;
+					})
+				).toHaveLength(0);
+				expect(events.listenerCount()).toBe(2);
+			});
+		});
+
+		it('clears an event whose list holds removed registrations not yet compacted', function () {
+			const events = createEmitter<{ x: number }>();
+			const handler = jest.fn();
+
+			const stop = events.on('x', handler);
+			events.on('x', handler);
+			events.on('x', handler);
+			stop();
+			events.clear('x');
+			events.emit('x', 1);
+			expect(handler).not.toHaveBeenCalled();
+			expect(events.listenerCount()).toBe(0);
+		});
+
 		it('removes a handler during an emit, which then skips it', function () {
 			const events = createEmitter<{ x: void }>();
 			const calls: string[] = [];

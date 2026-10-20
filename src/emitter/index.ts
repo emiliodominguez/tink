@@ -119,32 +119,18 @@ interface Listeners {
 	/** Number of `emit` calls iterating `list`: it is only compacted while none is. */
 	emitting: number;
 	/**
-	 * Built by the first `off` (only it needs one, and most emitters never call it): the active registration of each handler, so that
+	 * Built by the first `off` (only it needs one, and most emitters never call it): one active registration of each handler, so that
 	 * `off` costs O(1) rather than a scan of the list (n `off` calls on n listeners took O(n²): 30,000 took 13 s). A handler registered
-	 * again while active is not indexed a second time but counted in `duplicates`, and `off` scans the list while any is active. Set to
+	 * again while active is not indexed a second time, and `off` scans the list while the index holds fewer entries than there are active
+	 * registrations. That count is derived, not kept: a stack overflow between two updates cannot make `off` miss a registration. Set to
 	 * `undefined` rather than left out, so that a value planted on a polluted `Object.prototype` is not taken for it.
 	 */
 	index: Map<unknown, Registration> | undefined;
-	/** Number of active registrations missing from `index` (always `0` without one). */
-	duplicates: number;
 }
 
 /**
- * Indexes an active registration by its handler (see {@link Listeners.index}), if the event has an index.
- * @param {Listeners} listeners - The registrations of an event
- * @param {Registration} registration - One of them, active
- * @returns {void}
- */
-function track(listeners: Listeners, registration: Registration): void {
-	const index = listeners.index;
-
-	if (index === undefined) return;
-	if (index.has(registration.handler)) listeners.duplicates++;
-	else index.set(registration.handler, registration);
-}
-
-/**
- * Marks a registration inactive, and drops it from the index of its event.
+ * Marks a registration inactive and counts it removed, after dropping it from the index of its event: the only step that can throw (on
+ * a stack overflow) comes before any change, so the registration is either removed everywhere or still active everywhere.
  * @param {Listeners} listeners - The registrations of an event
  * @param {Registration} registration - One of them, active
  * @returns {void}
@@ -152,10 +138,9 @@ function track(listeners: Listeners, registration: Registration): void {
 function deactivate(listeners: Listeners, registration: Registration): void {
 	const index = listeners.index;
 
+	if (index?.get(registration.handler) === registration) index.delete(registration.handler);
 	registration.active = false;
-	if (index === undefined) return;
-	if (index.get(registration.handler) === registration) index.delete(registration.handler);
-	else listeners.duplicates--;
+	listeners.removed++;
 }
 
 /**
@@ -227,10 +212,13 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 		const registration: Registration = { handler: handler as (...args: unknown[]) => unknown, once, active: true };
 		let listeners = registry.get(event);
 
-		if (listeners === undefined) registry.set(event, (listeners = { list: [registration], removed: 0, emitting: 0, index: undefined, duplicates: 0 }));
+		if (listeners === undefined) registry.set(event, (listeners = { list: [registration], removed: 0, emitting: 0, index: undefined }));
 		else {
+			const index = listeners.index;
+
+			// Listed before it is indexed: a stack overflow in between leaves it unindexed, which `off` notices (see `Listeners.index`).
 			listeners.list.push(registration);
-			track(listeners, registration);
+			if (index !== undefined && !index.has(handler)) index.set(handler, registration);
 		}
 
 		const owner = listeners;
@@ -238,20 +226,18 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 		return function (): void {
 			if (!registration.active) return;
 			deactivate(owner, registration);
-			release(event, owner, 1);
+			release(event, owner);
 		};
 	}
 
 	/**
-	 * Accounts for registrations of `event` just marked inactive: forgets the event once it has no active registration left, and
-	 * compacts its list.
+	 * Follows the removal of registrations of `event` (see {@link deactivate}): forgets the event once it has no active registration
+	 * left, and compacts its list.
 	 * @param {PropertyKey} event - The event name
 	 * @param {Listeners} listeners - Its registrations (those of the registry: an inactive registration is never released again)
-	 * @param {number} count - Number of registrations just marked inactive
 	 * @returns {void}
 	 */
-	function release(event: PropertyKey, listeners: Listeners, count: number): void {
-		listeners.removed += count;
+	function release(event: PropertyKey, listeners: Listeners): void {
 		// An emit iterating the list keeps it (and empties it when it ends): only the registry forgets it.
 		if (listeners.removed === listeners.list.length) registry.delete(event);
 		// Also once forgotten: the unsubscribe functions still hold the list, which must not keep the removed handlers alive.
@@ -288,7 +274,7 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 			if (!registration.active) continue;
 			if (registration.once) {
 				deactivate(listeners, registration);
-				release(wildcard ? WILDCARD : event, listeners, 1);
+				release(wildcard ? WILDCARD : event, listeners);
 			}
 
 			// Called as a plain function: `this` is `undefined`, not the registration (which a listener could otherwise reactivate).
@@ -341,21 +327,23 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 			let index = listeners.index;
 
 			if (index === undefined) {
-				index = listeners.index = new Map();
-				for (const registration of listeners.list) if (registration.active) track(listeners, registration);
+				// Stored once complete: a build cut short by a stack overflow leaves no index rather than a partial one.
+				index = new Map();
+				for (const registration of listeners.list) if (registration.active && !index.has(registration.handler)) index.set(registration.handler, registration);
+				listeners.index = index;
 			}
 
 			let count = 0;
 
-			// The indexed registration alone, unless a handler is registered more than once.
-			for (const registration of listeners.duplicates === 0 ? [index.get(handler)] : listeners.list) {
+			// The indexed registration alone, unless some active registration is not indexed (its handler is registered more than once).
+			for (const registration of index.size === listeners.list.length - listeners.removed ? [index.get(handler)] : listeners.list) {
 				if (registration?.active && registration.handler === handler) {
 					deactivate(listeners, registration);
 					count++;
 				}
 			}
 			if (count === 0) return false;
-			release(event, listeners, count);
+			release(event, listeners);
 
 			return true;
 		},
@@ -379,13 +367,15 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 			if (listeners !== undefined) listeners.emitting++;
 			if (wildcards !== undefined) wildcards.emitting++;
 			// The counters always come back down, even when a stack overflow escapes from `run`: a raised counter would keep the list from
-			// ever being compacted.
+			// ever being compacted. Both before compacting, which can overflow the stack too.
 			try {
 				if (listeners !== undefined) errors = run(event, listeners, length, false, withPayload, payload, errors);
 				if (wildcards !== undefined) errors = run(event, wildcards, wildcardLength, true, withPayload, payload, errors);
 			} finally {
-				if (listeners !== undefined && --listeners.emitting === 0) compact(listeners);
-				if (wildcards !== undefined && --wildcards.emitting === 0) compact(wildcards);
+				if (listeners !== undefined) listeners.emitting--;
+				if (wildcards !== undefined) wildcards.emitting--;
+				if (listeners !== undefined) compact(listeners);
+				if (wildcards !== undefined) compact(wildcards);
 			}
 
 			if (errors === undefined) return;
@@ -396,13 +386,16 @@ export function createEmitter<Events extends EventMap>(): Emitter<Events> {
 		clear(event?: PropertyKey): void {
 			for (const listeners of event === undefined ? registry.values() : [registry.get(event)]) {
 				if (listeners === undefined) continue;
-				// Inactive, they are skipped by an emit iterating the list, and their unsubscribe functions do nothing.
-				for (const registration of listeners.list) registration.active = false;
 				listeners.index = undefined;
-				listeners.duplicates = 0;
+				// Inactive, they are skipped by an emit iterating the list, and their unsubscribe functions do nothing. Counted one by one:
+				// a loop cut short by a stack overflow leaves the others registered, and the counts right.
+				for (const registration of listeners.list) {
+					if (!registration.active) continue;
+					registration.active = false;
+					listeners.removed++;
+				}
 				// Emptied (now, or when the emits iterating it end): the unsubscribe functions still hold the list, which must not keep the
 				// removed handlers alive.
-				listeners.removed = listeners.list.length;
 				compact(listeners);
 			}
 			if (event === undefined) registry.clear();
