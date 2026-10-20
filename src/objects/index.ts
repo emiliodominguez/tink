@@ -1155,10 +1155,10 @@ export type OmitAtPath<T, P extends string> =
  * @returns {object} The copy
  */
 function copyContainer(container: object): object {
+	if (Array.isArray(container)) return clone(container);
 	const prototype = Object.getPrototypeOf(container);
-	if (prototype === Object.prototype && !Array.isArray(container)) return { ...container };
-	// Arrays, `null`-prototype objects, and the plain objects of another realm (whose prototype `clone` keeps).
-	return prototype === null ? copyBare(container) : clone(container);
+	// The plain objects of another realm keep their prototype, as with `clone`.
+	return prototype === Object.prototype ? { ...container } : prototype === null ? copyBare(container) : clone(container);
 }
 
 /**
@@ -1625,8 +1625,12 @@ interface MergeSettings {
  * @returns {unknown[]} A new array
  */
 function combineArrays(earlier: ReadonlyArray<unknown>, later: ReadonlyArray<unknown>, union: boolean): unknown[] {
-	// Called on a fresh plain array, `concat` never consults the species of a user's array subclass.
-	const combined: unknown[] = [].concat(earlier as never, later as never);
+	// Own items only: `concat` and the iteration of an array read a hole from a polluted `Array.prototype` or `Object.prototype`. A hole
+	// stays one (`'concat'`), or is an `undefined` member (`'union'`).
+	const combined: unknown[] = new Array(earlier.length + later.length);
+	if (union) combined.fill(undefined);
+	for (const index of presentIndexes(earlier)) combined[index] = earlier[index];
+	for (const index of presentIndexes(later)) combined[earlier.length + index] = later[index];
 	return union ? Array.from(new Set(combined)) : combined;
 }
 
@@ -2353,17 +2357,22 @@ function matchWith(value: unknown, pattern: unknown, subset: boolean, stack: Com
 		});
 	} else {
 		const items = value as unknown[];
-		result = subset
-			? (pattern as unknown[]).every(function (expected) {
-					return presentIndexes(items).some(function (index: number) {
-						return matchWith(items[index], expected, subset, stack);
-					});
-				})
-			: items.length === (pattern as unknown[]).length &&
-				(pattern as unknown[]).every(function (expected, index) {
-					// Own items only: a hole must not read a value from a polluted `Array.prototype` or `Object.prototype`.
-					return matchWith(hasOwn(items, index) ? items[index] : undefined, expected, subset, stack);
+		const expected = pattern as unknown[];
+		// Own items only, of both arrays: a hole must not read a value from a polluted `Array.prototype` or `Object.prototype` (`every`
+		// visits the indexes the prototype has). A hole of the pattern matches anything.
+		if (subset) {
+			const present = presentIndexes(items);
+			result = presentIndexes(expected).every(function (index: number) {
+				return present.some(function (item: number) {
+					return matchWith(items[item], expected[index], subset, stack);
 				});
+			});
+		} else {
+			result = items.length === expected.length;
+			for (let index = 0; result && index < expected.length; index++) {
+				if (hasOwn(expected, index)) result = matchWith(hasOwn(items, index) ? items[index] : undefined, expected[index], subset, stack);
+			}
+		}
 	}
 	stack.pairs.pop();
 	// A pair reached through several paths would otherwise be matched once per path: an exponential number of times. A mismatch holds
@@ -4393,17 +4402,28 @@ export function toKebabCaseKeys<T>(value: T): KebabCaseKeys<T> {
 // Serialization and hashing
 // ---------------------------------------------------------------------------------------------------------------------
 
+/** The state of one {@link stableStringify} call. */
+interface EncodeState {
+	/** Objects on the current path (cycle detection). */
+	readonly ancestors: object[];
+	/** The encodings longer than `REMEMBERED_TEXT` made so far, by object. */
+	done: Map<object, string> | undefined;
+}
+
+/** How long an object's encoding must be for {@link encodeValue} to remember it. */
+const REMEMBERED_TEXT = 512;
+
 /**
  * Encodes the members of an object's own enumerable STRING keys, sorted by UTF-16 code units, as `"key":value` pairs.
  * @param {object} object - The object to encode
- * @param {object[]} ancestors - Objects on the current path (cycle detection)
+ * @param {EncodeState} state - The state of the call
  * @returns {string} The `{...}` encoding
  */
-function encodeMembers(object: object, ancestors: object[]): string {
+function encodeMembers(object: object, state: EncodeState): string {
 	const keys = Object.keys(object).sort();
 	let text = '{';
 	for (let index = 0; index < keys.length; index++) {
-		text += (index === 0 ? '' : ',') + JSON.stringify(keys[index]) + ':' + encodeValue((object as Properties)[keys[index]], ancestors);
+		text += (index === 0 ? '' : ',') + JSON.stringify(keys[index]) + ':' + encodeValue((object as Properties)[keys[index]], state);
 	}
 	return text + '}';
 }
@@ -4414,16 +4434,16 @@ const JOIN_CHUNK = 4096;
 /**
  * Encodes the items of an array-like value (holes of a genuine array are encoded as nothing, like in an array literal).
  * @param {ArrayLike<unknown>} items - The items
- * @param {object[]} ancestors - Objects on the current path (cycle detection)
+ * @param {EncodeState} state - The state of the call
  * @returns {string} The `[...]` encoding
  */
-function encodeItems(items: ArrayLike<unknown>, ancestors: object[]): string {
-	if (items.length > JOIN_CHUNK) return encodeLongItems(items, ancestors);
+function encodeItems(items: ArrayLike<unknown>, state: EncodeState): string {
+	if (items.length > JOIN_CHUNK) return encodeLongItems(items, state);
 	let text = '[';
 	for (let index = 0; index < items.length; index++) {
 		if (index > 0) text += ',';
 		// Own elements only: a hole must not read a value from a polluted `Array.prototype`.
-		if (hasOwn(items, index)) text += encodeValue(items[index], ancestors);
+		if (hasOwn(items, index)) text += encodeValue(items[index], state);
 	}
 	// As in array literals, a trailing hole needs one more comma: otherwise `new Array(1)` would encode like `[]`.
 	if (items.length > 0 && !hasOwn(items, items.length - 1)) text += ',';
@@ -4435,10 +4455,10 @@ function encodeItems(items: ArrayLike<unknown>, ancestors: object[]): string {
  * each took some 70 bytes of memory, so that tens of millions of items (a large typed array) exhausted the memory and aborted the
  * process before the text reached the engine's maximum string length (where a `RangeError`, which can be caught, is thrown).
  * @param {ArrayLike<unknown>} items - The items
- * @param {object[]} ancestors - Objects on the current path (cycle detection)
+ * @param {EncodeState} state - The state of the call
  * @returns {string} The `[...]` encoding
  */
-function encodeLongItems(items: ArrayLike<unknown>, ancestors: object[]): string {
+function encodeLongItems(items: ArrayLike<unknown>, state: EncodeState): string {
 	const length = items.length;
 	const chunks: string[] = [];
 	let chunk: string[] = [];
@@ -4446,9 +4466,9 @@ function encodeLongItems(items: ArrayLike<unknown>, ancestors: object[]): string
 		if (!hasOwn(items, index)) {
 			// A hole (only arrays have some): the array may be sparse, the rest is encoded from its own elements.
 			if (chunk.length > 0) chunks.push(chunk.join(','));
-			return `[${chunks.join(',')}${index > 0 ? ',' : ''}${encodeSparseItems(items as ReadonlyArray<unknown>, index, ancestors)}`;
+			return `[${chunks.join(',')}${index > 0 ? ',' : ''}${encodeSparseItems(items as ReadonlyArray<unknown>, index, state)}`;
 		}
-		chunk.push(encodeValue(items[index], ancestors));
+		chunk.push(encodeValue(items[index], state));
 		if (chunk.length === JOIN_CHUNK) {
 			chunks.push(chunk.join(','));
 			chunk = [];
@@ -4465,10 +4485,10 @@ function encodeLongItems(items: ArrayLike<unknown>, ancestors: object[]): string
  * string length, which now throws a `RangeError` at once.
  * @param {ReadonlyArray<unknown>} items - The array
  * @param {number} hole - The index of its first hole, after the comma that precedes it
- * @param {object[]} ancestors - Objects on the current path (cycle detection)
+ * @param {EncodeState} state - The state of the call
  * @returns {string} The encoding of the items from `hole` on, and the closing `]`
  */
-function encodeSparseItems(items: ReadonlyArray<unknown>, hole: number, ancestors: object[]): string {
+function encodeSparseItems(items: ReadonlyArray<unknown>, hole: number, state: EncodeState): string {
 	// Each part is the commas before an item, then the item; they are joined a chunk at a time too.
 	const chunks: string[] = [];
 	let chunk: string[] = [];
@@ -4476,7 +4496,7 @@ function encodeSparseItems(items: ReadonlyArray<unknown>, hole: number, ancestor
 	let commas = hole;
 	for (const index of presentIndexes(items)) {
 		if (index < hole) continue;
-		chunk.push(','.repeat(index - commas) + encodeValue(items[index], ancestors));
+		chunk.push(','.repeat(index - commas) + encodeValue(items[index], state));
 		commas = index;
 		if (chunk.length === JOIN_CHUNK) {
 			chunks.push(chunk.join(''));
@@ -4491,43 +4511,44 @@ function encodeSparseItems(items: ReadonlyArray<unknown>, hole: number, ancestor
 /**
  * Encodes a list of values in a canonical order (the sorted encodings), for `Set` members and `Map` entries.
  * @param {Iterable<unknown>} values - The values
- * @param {object[]} ancestors - Objects on the current path (cycle detection)
+ * @param {EncodeState} state - The state of the call
  * @returns {string} The `[...]` encoding
  */
-function encodeUnordered(values: Iterable<unknown>, ancestors: object[]): string {
+function encodeUnordered(values: Iterable<unknown>, state: EncodeState): string {
 	const encoded: string[] = [];
-	for (const value of values) encoded.push(encodeValue(value, ancestors));
+	for (const value of values) encoded.push(encodeValue(value, state));
 	return '[' + encoded.sort().join(',') + ']';
 }
 
 /**
  * Encodes an object that is not a plain object or an array (see {@link stableStringify}).
  * @param {object} value - The object
- * @param {object[]} ancestors - Objects on the current path (cycle detection)
+ * @param {EncodeState} state - The state of the call
  * @returns {string} The encoding
  * @throws {TypeError} for a `WeakMap`, a `WeakSet` or a promise
  */
-function encodeSpecial(value: object, ancestors: object[]): string {
+function encodeSpecial(value: object, state: EncodeState): string {
 	if (isUncloneable(value)) throw new TypeError(`stableStringify: cannot serialize a ${getTag(value).slice(8, -1)}`);
-	if (isDate(value)) return `Date(${encodeValue(value.getTime(), ancestors)})`;
+	if (isDate(value)) return `Date(${encodeValue(value.getTime(), state)})`;
 	if (isRegExp(value)) return `RegExp(${JSON.stringify(String(value))})`;
-	if (isMap(value)) return `Map(${encodeUnordered(value, ancestors)})`;
-	if (isSet(value)) return `Set(${encodeUnordered(value, ancestors)})`;
+	if (isMap(value)) return `Map(${encodeUnordered(value, state)})`;
+	if (isSet(value)) return `Set(${encodeUnordered(value, state)})`;
 	if (isBinary(value)) {
 		if (!ArrayBuffer.isView(value)) return `${getTag(value).slice(8, -1)}([${typedJoin.call(bytesOf(value), ',')}])`;
 		const name = typedArrayTag.call(value) as string | undefined;
 		// A typed array encodes its elements (numbers or bigints), a `DataView` its bytes (none when detached, like an empty one).
 		if (name === undefined) return `DataView([${typedJoin.call(bytesOf(value as DataView), ',')}])`;
-		// The built-in `join` writes integers as `encodeValue` does, faster and in less memory; not `-0` (`'0'`) nor bigints (no `n`).
-		if (!name.startsWith('Float') && !name.startsWith('Big')) return `${name}([${typedJoin.call(value, ',')}])`;
-		return `${name}(${encodeItems(value as unknown as ArrayLike<unknown>, ancestors)})`;
+		// The built-in `join` writes integers as `encodeValue` does, faster and in less memory; not `-0` (`'0'`) nor bigints (no `n`). It
+		// throws for a view of a detached buffer, or out of the bounds of a shrunk one: such a view has no items.
+		if (!name.startsWith('Float') && !name.startsWith('Big')) return `${name}([${(value as Uint8Array).length > 0 ? typedJoin.call(value, ',') : ''}])`;
+		return `${name}(${encodeItems(value as unknown as ArrayLike<unknown>, state)})`;
 	}
 	const [isBoxed, primitive] = unbox(value);
-	if (isBoxed) return `${getTag(value).slice(8, -1)}(${encodeValue(primitive, ancestors)})`;
+	if (isBoxed) return `${getTag(value).slice(8, -1)}(${encodeValue(primitive, state)})`;
 	const constructor = (Object.getPrototypeOf(value) as { constructor?: unknown } | null)?.constructor;
 	const name = typeof constructor === 'function' && constructor.name !== '' ? constructor.name : '?';
 	// A name that is not an identifier (a computed class name such as `'1,"z":'`) is quoted: written as is, it could read as other data.
-	return (name === '?' || IDENTIFIER.test(name) ? name : JSON.stringify(name)) + encodeMembers(value, ancestors);
+	return (name === '?' || IDENTIFIER.test(name) ? name : JSON.stringify(name)) + encodeMembers(value, state);
 }
 
 /** A JavaScript identifier (ASCII or not): how class names are written in {@link stableStringify}'s output. */
@@ -4536,11 +4557,11 @@ const IDENTIFIER = /^[\p{ID_Start}$_][\p{ID_Continue}$\u200c\u200d]*$/u;
 /**
  * Recursive worker of {@link stableStringify}.
  * @param {unknown} value - The value to encode
- * @param {object[]} ancestors - Objects on the current path (cycle detection)
+ * @param {EncodeState} state - The state of the call
  * @returns {string} The encoding
  * @throws {TypeError} for functions, symbols, `WeakMap`s, `WeakSet`s, promises and circular references
  */
-function encodeValue(value: unknown, ancestors: object[]): string {
+function encodeValue(value: unknown, state: EncodeState): string {
 	switch (typeof value) {
 		case 'string':
 			return JSON.stringify(value);
@@ -4558,10 +4579,17 @@ function encodeValue(value: unknown, ancestors: object[]): string {
 		default:
 			throw new TypeError(`stableStringify: cannot serialize a ${typeof value}`);
 	}
+	const { ancestors } = state;
 	if (ancestors.includes(value)) throw new TypeError('stableStringify: cannot serialize a circular structure');
+	const known = state.done?.get(value);
+	if (known !== undefined) return known;
 	ancestors.push(value);
-	const text = isPlainRecord(value) ? encodeMembers(value, ancestors) : Array.isArray(value) ? encodeItems(value, ancestors) : encodeSpecial(value, ancestors);
+	const text = isPlainRecord(value) ? encodeMembers(value, state) : Array.isArray(value) ? encodeItems(value, state) : encodeSpecial(value, state);
 	ancestors.pop();
+	// A value shared by several paths (`{ l: node, r: node }` at every level) would otherwise be encoded once per path: in exponential
+	// time, and in memory that ran out (aborting the process) before the text reached the engine's maximum string length. Long encodings
+	// are remembered: the text then shares them, and one too long throws a `RangeError` at once. (A short one costs little to redo.)
+	if (text.length > REMEMBERED_TEXT) (state.done ??= new Map()).set(value, text);
 	return text;
 }
 
@@ -4581,7 +4609,10 @@ function encodeValue(value: unknown, ancestors: object[]): string {
  * - Functions, symbols, `WeakMap`s, `WeakSet`s, promises (any object with a `then` method) and circular references throw a
  *   `TypeError` (shared references are fine).
  *
- * Getters are invoked; `toJSON` methods are NOT. Distinct classes sharing a name encode alike.
+ * Getters are invoked; `toJSON` methods are NOT. Distinct classes sharing a name encode alike. A value reached through several paths
+ * (shared references) is written at each, but encoded once when its encoding is long (its getters then run once): a shared part costs
+ * its encoding once, although the text can be exponentially longer than the value (`{ l: node, r: node }` at every level), up to the
+ * maximum string length.
  * @param {unknown} value - The value to serialize
  * @returns {string} The deterministic encoding
  * @throws {TypeError} when the value contains a function, a symbol, a `WeakMap`, a `WeakSet`, a promise or a circular reference
@@ -4595,7 +4626,7 @@ function encodeValue(value: unknown, ancestors: object[]): string {
  * stableStringify({ when: new Date(0), bytes: new Uint8Array([1, 2]) }); // => '{"bytes":Uint8Array([1,2]),"when":Date(0)}'
  */
 export function stableStringify(value: unknown): string {
-	return encodeValue(value, []);
+	return encodeValue(value, { ancestors: [], done: undefined });
 }
 
 /**

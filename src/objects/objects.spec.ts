@@ -5370,3 +5370,121 @@ describe('Objects helpers (1.6 audit, pass 3)', function () {
 		expect(helpers.stableStringify(new Float32Array([-0, NaN, Infinity]))).toBe('Float32Array([-0,NaN,Infinity])');
 	});
 });
+
+describe('Objects helpers (1.6 audit, pass 4)', function () {
+	/**
+	 * Runs `body` while `Object.prototype` holds `values` (as a vulnerable deep merge of JSON would plant them), then removes them.
+	 * @param {Record<string, unknown>} values - The keys and values to plant
+	 * @param {() => void} body - The checks
+	 * @returns {void}
+	 */
+	function withPollution(values: Record<string, unknown>, body: () => void): void {
+		const prototype = Object.prototype as Record<string, unknown>;
+		for (const key of Object.keys(values)) {
+			Object.defineProperty(prototype, key, { __proto__: null, value: values[key], writable: true, configurable: true, enumerable: true } as PropertyDescriptor);
+		}
+		try {
+			body();
+		} finally {
+			for (const key of Object.keys(values)) delete prototype[key];
+		}
+	}
+
+	it('stableStringify and hash encode an integer typed array without items left as an empty one (they threw)', function () {
+		const typed = new Int32Array(4);
+		(typed.buffer as unknown as { transfer: () => ArrayBuffer }).transfer();
+		expect(helpers.stableStringify(typed)).toBe('Int32Array([])');
+		expect(helpers.hash({ a: typed })).toBe(helpers.hash({ a: new Int32Array(0) }));
+		// A view out of the bounds of a resizable buffer that shrank.
+		const ResizableBuffer = ArrayBuffer as unknown as new (length: number, options: { maxByteLength: number }) => ArrayBuffer & { resize(length: number): void };
+		const buffer = new ResizableBuffer(8, { maxByteLength: 16 });
+		const view = new Uint8Array(buffer, 4, 4);
+		buffer.resize(2);
+		expect(helpers.stableStringify(view)).toBe('Uint8Array([])');
+		expect(helpers.stableStringify(new Uint8Array(buffer))).toBe('Uint8Array([0,0])');
+	});
+
+	it('stableStringify encodes a value shared by several paths once (a DAG of 26 levels exhausted the memory)', function () {
+		let reads = 0;
+		const shared = {
+			get payload(): string {
+				reads++;
+				return 'x'.repeat(600);
+			}
+		};
+		const encoded = `{"payload":"${'x'.repeat(600)}"}`;
+		expect(
+			helpers.stableStringify(
+				Array.from({ length: 100 }, function () {
+					return shared;
+				})
+			)
+		).toBe(`[${new Array(100).fill(encoded).join(',')}]`);
+		expect(reads).toBe(1);
+		// Short encodings are redone (cheaply); the result is that of the same tree without sharing.
+		/**
+		 * @param {number} depth - The number of levels
+		 * @param {boolean} share - Whether both branches of a level are the same object
+		 * @returns {object} A binary tree (a DAG with `share`)
+		 */
+		function levels(depth: number, share: boolean): object {
+			if (depth === 0) return { leaf: [1, 'a'] };
+			const left = levels(depth - 1, share);
+			return { l: left, r: share ? left : levels(depth - 1, share) };
+		}
+		expect(helpers.stableStringify(levels(12, true))).toBe(helpers.stableStringify(levels(12, false)));
+		expect(helpers.hash(levels(12, true))).toBe(helpers.hash(levels(12, false)));
+		// Too long for any string (2 ** 40 leaves): a `RangeError` at once.
+		expect(function () {
+			helpers.hash(levels(40, true));
+		}).toThrow(RangeError);
+	});
+
+	it('the copies of the path helpers keep an array without a prototype an array', function () {
+		const items = Object.setPrototypeOf([1, 2], null) as number[];
+		for (const copy of [
+			helpers.updatePath({ items }, 'items.0', 9).items,
+			helpers.evolve(items, {
+				0: function (n: number) {
+					return n + 1;
+				}
+			} as never),
+			helpers.applyPatch({ items }, [{ op: 'replace', path: '/items/0', value: 9 }]).items
+		]) {
+			expect(Array.isArray(copy)).toBe(true);
+			expect(Object.getPrototypeOf(copy)).toBe(null);
+			expect(copy.length).toBe(2);
+		}
+	});
+
+	it('isMatch skips the holes of an array pattern whatever Object.prototype holds at their index', function () {
+		withPollution({ 1: { planted: true } }, function () {
+			// eslint-disable-next-line no-sparse-arrays
+			const pattern = [1, , 3];
+			expect(helpers.isMatch([1, 2, 3], pattern)).toBe(true);
+			expect(helpers.isMatch({ list: [1, 'x', 3] }, { list: pattern })).toBe(true);
+			expect(helpers.isMatch([3, 1], pattern, { arrays: 'subset' })).toBe(true);
+			expect(helpers.isMatch([1, 2, 4], pattern)).toBe(false);
+		});
+	});
+
+	it('deepMergeWith and defaultsWith combine arrays with holes from their own items only', function () {
+		withPollution({ 1: 'planted', 3: 'planted' }, function () {
+			// eslint-disable-next-line no-sparse-arrays
+			const earlier = [1, , 3];
+			// eslint-disable-next-line no-sparse-arrays
+			const later = [, 'x'];
+			const concat = helpers.deepMergeWith({ arrays: 'concat' }, { a: earlier }, { a: later }).a as unknown[];
+			expect(concat.length).toBe(5);
+			expect(
+				[0, 1, 2, 3, 4].map(function (index) {
+					return Object.prototype.hasOwnProperty.call(concat, index);
+				})
+			).toEqual([true, false, true, false, true]);
+			expect([concat[0], concat[2], concat[4]]).toEqual([1, 3, 'x']);
+			const union = helpers.defaultsWith({ arrays: 'union' }, { a: earlier }, { a: later }).a as unknown[];
+			expect(Object.keys(union).length).toBe(4);
+			expect([union[0], union[1], union[2], union[3]]).toEqual([1, undefined, 3, 'x']);
+		});
+	});
+});
