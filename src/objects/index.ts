@@ -799,6 +799,8 @@ export function isEmpty<T>(value: T): boolean {
 	if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return true;
 	if (Array.isArray(value)) return value.length === 0;
 	if (!isBareRecord(value) && (isMap(value) || isSet(value))) return value.size === 0;
+	// The items of a typed array are its keys, which `for...in` would list all first: tens of millions for a large buffer, out of memory.
+	if (ArrayBuffer.isView(value) && hasOwn(value, 0)) return false;
 	// `for...in` lists the own enumerable string keys first, so the first own key found (if any) settles it without collecting all the keys.
 	for (const key in value) if (hasOwn(value, key)) return false;
 	for (const symbol of Object.getOwnPropertySymbols(value)) if (Object.prototype.propertyIsEnumerable.call(value, symbol)) return false;
@@ -1626,12 +1628,25 @@ interface MergeSettings {
  */
 function combineArrays(earlier: ReadonlyArray<unknown>, later: ReadonlyArray<unknown>, union: boolean): unknown[] {
 	// Own items only: `concat` and the iteration of an array read a hole from a polluted `Array.prototype` or `Object.prototype`. A hole
-	// stays one (`'concat'`), or is an `undefined` member (`'union'`).
+	// stays one (`'concat'`), or is an `undefined` member (`'union'`), where the first hole is: the holes of a sparse array of length
+	// 2 ** 31 are not visited one by one.
+	if (union) {
+		const members = new Set<unknown>();
+		for (const items of [earlier, later]) {
+			let next = 0;
+			for (const index of presentIndexes(items)) {
+				if (index > next) members.add(undefined);
+				members.add(items[index]);
+				next = index + 1;
+			}
+			if (next < items.length) members.add(undefined);
+		}
+		return Array.from(members);
+	}
 	const combined: unknown[] = new Array(earlier.length + later.length);
-	if (union) combined.fill(undefined);
 	for (const index of presentIndexes(earlier)) combined[index] = earlier[index];
 	for (const index of presentIndexes(later)) combined[earlier.length + index] = later[index];
-	return union ? Array.from(new Set(combined)) : combined;
+	return combined;
 }
 
 /**
@@ -2001,8 +2016,9 @@ const PROVEN_SUBTREE = 64;
  */
 function mapsEqual(a: Map<unknown, unknown>, b: Map<unknown, unknown>, stack: ComparisonStack): boolean {
 	if (a.size !== b.size) return false;
-	// Collected when first needed: maps keyed by primitives (the usual ones) never need it.
+	// Collected when first needed: maps keyed by primitives (the usual ones) never need it. The candidates left are those from `first` on.
 	let objectEntriesB: Array<[unknown, unknown]> | undefined;
+	let first = 0;
 
 	for (const [keyA, valueA] of a) {
 		if (!isObject(keyA)) {
@@ -2012,13 +2028,14 @@ function mapsEqual(a: Map<unknown, unknown>, b: Map<unknown, unknown>, stack: Co
 		objectEntriesB ??= Array.from(b).filter(function ([key]) {
 			return isObject(key);
 		});
-		const index = objectEntriesB.findIndex(function ([keyB, valueB]) {
-			return equalWith(keyA, keyB, stack) && equalWith(valueA, valueB, stack, keyA);
-		});
-		if (index === -1) return false;
+		let index = first;
+		while (index < objectEntriesB.length && !(equalWith(keyA, objectEntriesB[index][0], stack) && equalWith(valueA, objectEntriesB[index][1], stack, keyA))) index++;
+		if (index === objectEntriesB.length) return false;
 		// A matched entry is no candidate for the next keys. (Removed rather than flagged in a list of flags: a flag never set would be
-		// read from a polluted `Object.prototype`, such as a planted `0`, and turn its candidate down.)
-		objectEntriesB.splice(index, 1);
+		// read from a polluted `Object.prototype`, such as a planted `0`, and turn its candidate down.) The first one is skipped instead
+		// of spliced out: maps in the same order would otherwise move every candidate at each key, in quadratic time.
+		if (index === first) first++;
+		else objectEntriesB.splice(index, 1);
 	}
 	return true;
 }
@@ -2033,8 +2050,9 @@ function mapsEqual(a: Map<unknown, unknown>, b: Map<unknown, unknown>, stack: Co
  */
 function setsEqual(a: Set<unknown>, b: Set<unknown>, stack: ComparisonStack): boolean {
 	if (a.size !== b.size) return false;
-	// Collected when first needed: sets of primitives (the usual ones) never need it.
+	// Collected when first needed: sets of primitives (the usual ones) never need it. The candidates left are those from `first` on.
 	let objectMembersB: unknown[] | undefined;
+	let first = 0;
 
 	for (const memberA of a) {
 		if (!isObject(memberA)) {
@@ -2042,12 +2060,12 @@ function setsEqual(a: Set<unknown>, b: Set<unknown>, stack: ComparisonStack): bo
 			continue;
 		}
 		objectMembersB ??= Array.from(b).filter(isObject);
-		const index = objectMembersB.findIndex(function (memberB) {
-			return equalWith(memberA, memberB, stack);
-		});
-		if (index === -1) return false;
+		let index = first;
+		while (index < objectMembersB.length && !equalWith(memberA, objectMembersB[index], stack)) index++;
+		if (index === objectMembersB.length) return false;
 		// A matched member is no candidate for the next ones (see `mapsEqual`).
-		objectMembersB.splice(index, 1);
+		if (index === first) first++;
+		else objectMembersB.splice(index, 1);
 	}
 	return true;
 }
@@ -2319,7 +2337,8 @@ export function isEqualWith(a: unknown, b: unknown, customizer: EqualityCustomiz
 export interface IsMatchOptions {
 	/**
 	 * How an array of the pattern matches: `'exact'` (default: an array of the same length whose items match one by one) or
-	 * `'subset'` (an array in which every item of the pattern matches some item, in any order, like lodash `isMatch`).
+	 * `'subset'` (an array in which every item of the pattern matches some item, in any order, like lodash `isMatch`: each item of the
+	 * pattern is tried against the items until one matches, up to `n × m` matches for arrays of `n` and `m` items).
 	 */
 	arrays?: 'exact' | 'subset';
 }
@@ -2368,10 +2387,12 @@ function matchWith(value: unknown, pattern: unknown, subset: boolean, stack: Com
 				});
 			});
 		} else {
-			result = items.length === expected.length;
-			for (let index = 0; result && index < expected.length; index++) {
-				if (hasOwn(expected, index)) result = matchWith(hasOwn(items, index) ? items[index] : undefined, expected[index], subset, stack);
-			}
+			// The items of the pattern, not its length: a sparse pattern of length 2 ** 32 - 1 may hold one.
+			result =
+				items.length === expected.length &&
+				presentIndexes(expected).every(function (index: number) {
+					return matchWith(hasOwn(items, index) ? items[index] : undefined, expected[index], subset, stack);
+				});
 		}
 	}
 	stack.pairs.pop();
@@ -3159,8 +3180,9 @@ export type JsonPatchOperation =
 
 /**
  * Error thrown by {@link applyPatch} when a well-formed operation cannot be applied to the document: a location that does not exist,
- * an array index out of bounds, a value that cannot be walked into, a failed `test`, a `move` into its own child, or a `remove` of the
- * whole document. A malformed operation throws a `TypeError` or a `RangeError` instead.
+ * an array index out of bounds, a value that cannot be walked into, a failed `test`, a `move` into its own child, a `remove` of the
+ * whole document, or an array with holes too long to fill (longer than 2 ** 27). A malformed operation throws a `TypeError` or a
+ * `RangeError` instead.
  * @example
  * try {
  *   applyPatch({ a: 1 }, [{ op: 'test', path: '/a', value: 2 }]);
@@ -3583,11 +3605,21 @@ function ownContainer(state: PatchState, value: unknown, segments: ReadonlyArray
 	if (!isContainer(value)) patchFailure(state, `${pointerTo(segments, count)} is not an object or an array`);
 	if (state.owned.has(value)) return value;
 	const copy = copyContainer(value);
-	// Holes become `undefined` (JSON has none): shifting items over a hole would read it through `Array.prototype`, maybe polluted.
-	if (Array.isArray(copy)) for (let index = 0; index < copy.length; index++) if (!hasOwn(copy, index)) defineOwn(copy, index, undefined);
+	if (Array.isArray(copy)) {
+		// Holes become `undefined` (JSON has none): shifting items over a hole would read it through `Array.prototype`, maybe polluted.
+		// Filling those of a sparse array of length 2 ** 32 - 1 would run out of memory: it is refused at once.
+		if (copy.length > MAX_FILLED_LENGTH && Object.keys(copy).length < copy.length) {
+			patchFailure(state, `${pointerTo(segments, count)} has too many holes to fill (length ${copy.length})`);
+		}
+		// Assigned where no prototype has the index: defining every one took 2 µs a hole (20 s for 10 million).
+		for (let index = 0; index < copy.length; index++) if (!hasOwn(copy, index)) defineValue(copy, index, undefined);
+	}
 	state.owned.add(copy);
 	return copy;
 }
+
+/** The longest array with holes that {@link applyPatch} fills (one item per index: 2 ** 27 of them take a gigabyte). */
+const MAX_FILLED_LENGTH = 2 ** 27;
 
 /**
  * Returns the parent of the location at a (non-empty) path, made modifiable: the containers on the way are copied (once per call), so
@@ -3704,7 +3736,8 @@ function jsonEqual(a: unknown, b: unknown): boolean {
  *   names (defined, never assigned), and never reach a prototype.
  * - Values are inserted as given (not copied): a later operation writing inside one copies it first, as it does the document's parts.
  *   `copy` shares the copied value between both locations the same way. In an array an operation modifies, holes become `undefined`
- *   (JSON has no holes, and they would otherwise be read through `Array.prototype`).
+ *   (JSON has no holes, and they would otherwise be read through `Array.prototype`): such an array longer than 2 ** 27 (a sparse one
+ *   of length 2 ** 32 - 1) throws a {@link JsonPatchError}.
  * @template T - The document type (the patch is assumed to keep it)
  * @param {T} document - The document
  * @param {ReadonlyArray<JsonPatchOperation>} operations - The patch
@@ -4697,6 +4730,8 @@ interface JsonLayout {
 	readonly keys: ReadonlyArray<string> | undefined;
 	/** Whether the keys of objects are sorted. */
 	readonly sort: boolean;
+	/** The texts longer than `REMEMBERED_TEXT` written so far, by node of the tree. */
+	readonly texts: Map<object, string>;
 }
 
 /**
@@ -4710,6 +4745,10 @@ interface JsonLayout {
  */
 function writeJson(value: JsonValue, indent: string, layout: JsonLayout): string {
 	if (typeof value !== 'object' || value === null) return typeof value === 'string' ? JSON.stringify(value) : String(value);
+	// The converter shares the tree of an object it meets at the same depth through several paths, so a node always has the same
+	// indentation: written once (when long), as in `stableStringify`, it costs its text once, and too long a text throws at once.
+	const known = layout.texts.get(value);
+	if (known !== undefined) return known;
 	const isArray = Array.isArray(value);
 	const gap = layout.gap;
 	const inner = indent + gap;
@@ -4724,7 +4763,9 @@ function writeJson(value: JsonValue, indent: string, layout: JsonLayout): string
 		}
 	}
 	if (text === '') return isArray ? '[]' : '{}';
-	return (isArray ? '[' : '{') + text + (gap === '' ? '' : '\n' + indent) + (isArray ? ']' : '}');
+	text = (isArray ? '[' : '{') + text + (gap === '' ? '' : '\n' + indent) + (isArray ? ']' : '}');
+	if (text.length > REMEMBERED_TEXT) layout.texts.set(value, text);
+	return text;
 }
 
 /**
@@ -4744,7 +4785,10 @@ function writeJson(value: JsonValue, indent: string, layout: JsonLayout): string
  *
  * Only own properties are read: an array hole is `null` even when `Array.prototype` has an element there, and a key of a `replacer` list
  * that an object only inherits is left out; a `toJSON` method inherited from a polluted `Object.prototype` is ignored. Boxed primitives are written as their primitive. The cost is linear in the size of the
- * value; an array costs its `length`, holes included.
+ * value and of the text; an array costs its `length`, holes included (one too long for any text, such as a sparse array of length
+ * 2 ** 32 - 1, is written `"[Throws: Invalid string length]"`). An object held in several places at the same depth may be converted
+ * only once there (its getters and `toJSON` then run once, not at each place), unless a replacer function is given or it holds a
+ * circular reference, a cut or a throw.
  *
  * The `errors` module is not imported for this: both modules share a private converter, which `serializeError` also uses.
  * @param {unknown} value - The value to serialize
@@ -4795,7 +4839,9 @@ export function safeStringify(value: unknown, options: SafeStringifyOptions = {}
 		try {
 			// The tree holds plain objects and arrays only: `JSON.stringify` writes it faster, unless a `toJSON` was planted on their
 			// prototypes or the keys must be written in another order than the tree's.
-			return keys === undefined && !sort && !('toJSON' in Array.prototype) ? JSON.stringify(tree, undefined, gap) : writeJson(tree, '', { gap, keys, sort });
+			return keys === undefined && !sort && !('toJSON' in Array.prototype)
+				? JSON.stringify(tree, undefined, gap)
+				: writeJson(tree, '', { gap, keys, sort, texts: new Map() });
 		} catch (error) {
 			// Called with little stack left, writing a deep tree can overflow it: the value is walked again, half as deep. Any other failure
 			// (a text longer than the engine's maximum string length) is thrown, as documented.

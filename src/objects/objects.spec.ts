@@ -5523,3 +5523,230 @@ describe('Objects helpers (1.6 audit, pass 4)', function () {
 		});
 	});
 });
+
+describe('Objects helpers (1.6 audit, pass 5: hostile sizes)', function () {
+	/**
+	 * A sparse array of length 2 ** 32 - 1 holding `items` at their indexes.
+	 * @param {Record<number, unknown>} items - The items, by index
+	 * @returns {unknown[]} The array
+	 */
+	function sparse(items: Record<number, unknown>): unknown[] {
+		const array: unknown[] = [];
+		array.length = 2 ** 32 - 1;
+		for (const key of Object.keys(items)) array[Number(key)] = items[Number(key)];
+		return array;
+	}
+
+	it('isMatch matches a sparse array pattern by its items, not by every index up to its length (2 ** 32 - 1 of them hung)', function () {
+		let lookups = 0;
+		const pattern = new Proxy(sparse({ 3: 'x', 4_000_000_000: { id: 1 } }), {
+			getOwnPropertyDescriptor(target, key) {
+				if (++lookups > 1000) throw new Error('every index looked up');
+				return Reflect.getOwnPropertyDescriptor(target, key);
+			}
+		});
+		expect(helpers.isMatch(sparse({ 3: 'x', 4_000_000_000: { id: 1, name: 'Ada' } }), pattern)).toBe(true);
+		expect(helpers.isMatch(sparse({ 3: 'x', 4_000_000_000: { id: 2 } }), pattern)).toBe(false);
+		expect(helpers.isMatch(sparse({ 3: 'x' }), pattern)).toBe(false);
+		expect(lookups).toBeLessThan(1000);
+	});
+
+	it('applyPatch refuses at once an array with holes too long to fill (a sparse one of length 2 ** 32 - 1 hung, then ran out of memory)', function () {
+		const defineProperty = Object.defineProperty;
+		const define = jest.spyOn(Object, 'defineProperty').mockImplementation(function (object, key, descriptor) {
+			if (define.mock.calls.length > 1000) throw new Error('every hole defined');
+			return defineProperty(object, key, descriptor);
+		});
+		try {
+			for (const operation of [
+				{ op: 'replace', path: '/list/0', value: 1 },
+				{ op: 'add', path: '/list/-', value: 1 },
+				{ op: 'remove', path: '/list/7' }
+			] as const) {
+				expect(function () {
+					helpers.applyPatch({ list: sparse({ 7: 'a' }) }, [operation]);
+				}).toThrow(
+					new helpers.JsonPatchError(
+						'applyPatch: `operations[0]` (' +
+							operation.op +
+							' "' +
+							operation.path +
+							'") cannot be applied: "/list" has too many holes to fill (length 4294967295)',
+						0,
+						operation
+					)
+				);
+			}
+			expect(function () {
+				helpers.applyPatch(sparse({}), [{ op: 'add', path: '/x', value: 1 }]);
+			}).toThrow('"" has too many holes to fill');
+			// Not one hole was defined before the refusal.
+			expect(define).not.toHaveBeenCalled();
+		} finally {
+			define.mockRestore();
+		}
+		// Holes still become `undefined`, without running a setter a prototype has at their index.
+		let calls = 0;
+		Object.defineProperty(Array.prototype, 1, {
+			configurable: true,
+			get() {
+				return 'inherited';
+			},
+			set() {
+				calls++;
+			}
+		});
+		let patched: unknown[];
+		let hole: PropertyDescriptor | undefined;
+		try {
+			// eslint-disable-next-line no-sparse-arrays
+			patched = helpers.applyPatch({ list: [0, , , 3] }, [{ op: 'replace', path: '/list/0', value: 9 }]).list;
+			hole = Object.getOwnPropertyDescriptor(patched, 1);
+		} finally {
+			// Removed before the checks: the matchers read the holes of their own arrays.
+			delete (Array.prototype as unknown as Record<number, unknown>)[1];
+		}
+		expect(hole).toEqual({ value: undefined, writable: true, enumerable: true, configurable: true });
+		expect(patched).toEqual([9, undefined, undefined, 3]);
+		expect(Object.keys(patched)).toEqual(['0', '1', '2', '3']);
+		expect(calls).toBe(0);
+	});
+
+	it('deepMergeWith and defaultsWith unite arrays by their items, not by every index (a sparse one of length 2 ** 31 hung)', function () {
+		const add = Set.prototype.add;
+		const members = jest.spyOn(Set.prototype, 'add').mockImplementation(function (this: Set<unknown>, value: unknown) {
+			if (members.mock.calls.length > 1000) throw new Error('every index added');
+			return add.call(this, value);
+		});
+		const results: unknown[] = [];
+		try {
+			for (const length of [100_000, 2 ** 31]) {
+				const holey: unknown[] = [];
+				holey.length = length;
+				holey[3] = 'x';
+				holey[7] = 'y';
+				results.push(helpers.deepMergeWith({ arrays: 'union' }, { a: holey }, { a: ['y', 'z'] }).a);
+				results.push(helpers.defaultsWith({ deep: true, arrays: 'union' }, { a: ['z'] }, { a: holey }).a);
+			}
+		} finally {
+			members.mockRestore();
+		}
+		// A hole is an `undefined` member, where the first hole is.
+		expect(results).toEqual([
+			[undefined, 'x', 'y', 'z'],
+			['z', undefined, 'x', 'y'],
+			[undefined, 'x', 'y', 'z'],
+			['z', undefined, 'x', 'y']
+		]);
+		// eslint-disable-next-line no-sparse-arrays
+		expect(helpers.deepMergeWith({ arrays: 'union' }, { a: [1, , 2, 1] }, { a: [3, undefined, , 2] }).a).toEqual([1, undefined, 2, 3]);
+		expect(helpers.deepMergeWith({ arrays: 'union' }, { a: [1, 2] }, { a: new Array(2) }).a).toEqual([1, 2, undefined]);
+	});
+
+	it('isEmpty answers for a typed array without listing its items (those of a large buffer ran out of memory)', function () {
+		let listings = 0;
+		const counting = new Proxy(Uint8Array.prototype, {
+			ownKeys(target) {
+				listings++;
+				return Reflect.ownKeys(target);
+			}
+		});
+		const view = Object.setPrototypeOf(new Uint8Array(4), counting) as Uint8Array;
+		expect(helpers.isEmpty(view)).toBe(false);
+		expect(listings).toBe(0);
+		expect(helpers.isEmpty(new Float64Array(0))).toBe(true);
+		expect(helpers.isEmpty(Object.assign(new Uint8Array(0), { extra: 1 }))).toBe(false);
+		expect(helpers.isEmpty(new DataView(new ArrayBuffer(8)))).toBe(true);
+	});
+
+	it('isEqual matches the object keys and members of maps and sets in the same order without moving the other candidates', function () {
+		const splice = jest.spyOn(Array.prototype, 'splice');
+		try {
+			/**
+			 * @returns {object[]} 2,000 distinct records
+			 */
+			function records(): object[] {
+				return Array.from({ length: 2000 }, function (_, id) {
+					return { id };
+				});
+			}
+			const keys = records();
+			expect(helpers.isEqual(new Set(records()), new Set(records()))).toBe(true);
+			expect(
+				helpers.isEqual(
+					new Map(
+						records().map(function (key, index) {
+							return [key, index];
+						})
+					),
+					new Map(
+						keys.map(function (key, index) {
+							return [key, index];
+						})
+					)
+				)
+			).toBe(true);
+			expect(splice).not.toHaveBeenCalled();
+			// Another order still matches (and the candidates left are still all tried).
+			expect(helpers.isEqual(new Set(records()), new Set(records().reverse()))).toBe(true);
+			expect(helpers.isEqual(new Set([{ id: 1 }, { id: 2 }, { id: 3 }]), new Set([{ id: 1 }, { id: 3 }, { id: 4 }]))).toBe(false);
+			expect(
+				helpers.isEqual(
+					new Map([
+						[{ id: 1 }, 'a'],
+						[{ id: 2 }, 'b']
+					]),
+					new Map([
+						[{ id: 2 }, 'b'],
+						[{ id: 1 }, 'a']
+					])
+				)
+			).toBe(true);
+			expect(
+				helpers.isEqual(
+					new Map([
+						[{ id: 1 }, 'a'],
+						[{ id: 2 }, 'b']
+					]),
+					new Map([
+						[{ id: 2 }, 'b'],
+						[{ id: 1 }, 'b']
+					])
+				)
+			).toBe(false);
+		} finally {
+			splice.mockRestore();
+		}
+	});
+
+	it('safeStringify writes a node shared by several paths once with sortKeys or a key list (40 levels of sharing ran out of memory)', function () {
+		/**
+		 * Builds levels of objects each holding the previous one twice.
+		 * @param {number} depth - The number of levels
+		 * @param {boolean} share - Whether each level holds the same object twice (or two equal copies)
+		 * @returns {object} The top level
+		 */
+		function levels(depth: number, share: boolean): object {
+			if (depth === 0) return { b: 'x'.repeat(40), a: [1, null] };
+			const left = levels(depth - 1, share);
+			return { r: left, l: share ? left : levels(depth - 1, share) };
+		}
+		const quote = jest.spyOn(JSON, 'stringify');
+		try {
+			for (const options of [{ sortKeys: true }, { replacer: ['l', 'r', 'a', 'b'] }, { sortKeys: true, space: '\t' }]) {
+				const text = helpers.safeStringify(levels(12, true), options);
+				expect(quote.mock.calls.length).toBeLessThan(500);
+				quote.mockClear();
+				expect(text).toBe(helpers.safeStringify(levels(12, false), options));
+				quote.mockClear();
+			}
+			// Too long for any string (2 ** 40 leaves): the RangeError `JSON.stringify` throws, at once.
+			expect(function () {
+				helpers.safeStringify(levels(40, true), { sortKeys: true });
+			}).toThrow(RangeError);
+			expect(quote.mock.calls.length).toBeLessThan(500);
+		} finally {
+			quote.mockRestore();
+		}
+	});
+});
