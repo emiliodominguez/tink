@@ -1,7 +1,8 @@
 /**
  * Helpers for whatever a `catch` block receives: normalizing it to an `Error` ({@link toError}), reading a message from it
- * ({@link getErrorMessage}), and moving errors across JSON boundaries (workers, logs, HTTP responses) with {@link serializeError} and
- * {@link deserializeError}.
+ * ({@link getErrorMessage}), walking and printing its causes ({@link getErrorChain}, {@link formatError}), and moving errors across JSON
+ * boundaries (workers, logs, HTTP responses) with {@link serializeError} and {@link deserializeError}. {@link defineError} creates typed
+ * error classes with a code, default fields and a guard that works across bundles and realms.
  *
  * Conventions shared by every function in this module:
  * - **Never throws on the value.** Anything can be thrown in JavaScript: strings, `null`, symbols, bigints, objects whose getters or
@@ -74,6 +75,12 @@ export interface DeserializeErrorOptions {
 	 * An integer >= 0 or `Infinity` (the default).
 	 */
 	maxDepth?: number;
+	/**
+	 * Error classes to rebuild by name, an opt-in for your own classes (such as those of {@link defineError}): an error whose `name` is an
+	 * own key of this object is built as usual and then given that class's `prototype`, so `instanceof` and the class's methods and
+	 * getters work. The class's constructor is never called (its own fields, such as a {@link defineError} `code`, come from the data).
+	 */
+	classes?: Readonly<Record<string, abstract new (...args: never[]) => Error>>;
 }
 
 /** `Object.prototype.hasOwnProperty`. */
@@ -201,6 +208,16 @@ export function toError(value: unknown): Error {
 }
 
 /**
+ * Whether a value is serialized and formatted as an error: an `Error` (of any realm), or any object with a string `message`.
+ * @param {unknown} value - The value
+ * @returns {boolean} `true` for errors and error-like objects
+ */
+function isSource(value: unknown): value is object {
+	// `readText` returns `undefined` for `null` (whose read throws).
+	return isAnyError(value) || (typeof value === 'object' && readText(value as object, 'message') !== undefined);
+}
+
+/**
  * Converts an error into a plain, JSON-safe object (`JSON.stringify` never throws on it, and `JSON.parse` gives back an equal object):
  * - `name`, `message` and `stack` (own or inherited), then the own `code` (even non-enumerable), `cause` and `errors` (of an
  *   `AggregateError`), then the other own enumerable string keys; values are converted as `JSON.stringify` would (`toJSON` is honoured,
@@ -231,7 +248,7 @@ export function toError(value: unknown): Error {
 export function serializeError(value: unknown, options: SerializeErrorOptions = {}): SerializedError {
 	const maxDepth = readDepth('serializeError', options);
 	const stack = readOption(options, 'stack') !== false;
-	const source = isAnyError(value) || (typeof value === 'object' && value !== null && readText(value, 'message') !== undefined) ? (value as object) : undefined;
+	const source = isSource(value) ? value : undefined;
 	const view = source === undefined ? { name: 'Error', message: getErrorMessage(value) } : errorView(source, stack);
 	return toJsonMembers(view, {
 		replacer: undefined,
@@ -255,13 +272,28 @@ function defineHidden(error: Error, key: string, value: unknown): void {
 }
 
 /**
+ * Reads the `name` of a rebuilt error without throwing: a class given to {@link deserializeError} may define a throwing getter (or
+ * have a hostile proxy as its prototype).
+ * @param {Error} error - The error
+ * @returns {unknown} Its name, or `undefined` when reading it throws
+ */
+function readName(error: Error): unknown {
+	try {
+		return error.name;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Recursive worker of {@link deserializeError}.
  * @param {unknown} data - The serialized error
  * @param {number} depth - Levels of `cause` and `errors` left to rebuild
  * @param {Map<object, Error>} built - The error rebuilt from each data object so far (cycles and shared references)
+ * @param {ReadonlyMap<unknown, object>} classes - The prototype to give the errors of each name (the `classes` option)
  * @returns {Error} The error
  */
-function rebuild(data: unknown, depth: number, built: Map<object, Error>): Error {
+function rebuild(data: unknown, depth: number, built: Map<object, Error>, classes: ReadonlyMap<unknown, object>): Error {
 	if (isAnyError(data)) return data;
 	if (typeof data !== 'object' || data === null) return new Error(getErrorMessage(data));
 	const done = built.get(data);
@@ -270,8 +302,11 @@ function rebuild(data: unknown, depth: number, built: Map<object, Error>): Error
 	const message = readText(data, 'message') ?? '';
 	const Constructor = BUILT_IN_ERRORS.get(name) ?? Error;
 	const error = name === 'AggregateError' ? new AggregateError([], message) : new Constructor(message);
+	const prototype = classes.get(name);
+	// The built-in error keeps its internal slot (so `isError` and `Error.isError` still recognise it): only its prototype changes.
+	if (prototype !== undefined) Object.setPrototypeOf(error, prototype);
 	built.set(data, error);
-	if (name !== undefined && name !== error.name) defineHidden(error, 'name', name);
+	if (name !== undefined && name !== readName(error)) defineHidden(error, 'name', name);
 	const stack = readText(data, 'stack');
 	if (stack !== undefined) defineHidden(error, 'stack', stack);
 	/**
@@ -280,7 +315,7 @@ function rebuild(data: unknown, depth: number, built: Map<object, Error>): Error
 	 * @returns {unknown} The nested value, rebuilt when it is error-like
 	 */
 	function nestedValue(nested: unknown): unknown {
-		return depth === 0 || !isErrorLike(nested) ? nested : rebuild(nested, depth - 1, built);
+		return depth === 0 || !isErrorLike(nested) ? nested : rebuild(nested, depth - 1, built, classes);
 	}
 	try {
 		if (hasOwn.call(data, 'cause')) defineHidden(error, 'cause', nestedValue((data as { cause: unknown }).cause));
@@ -301,7 +336,8 @@ function rebuild(data: unknown, depth: number, built: Map<object, Error>): Error
  * Rebuilds an `Error` from the output of {@link serializeError} (after any number of `JSON.stringify`/`JSON.parse` round trips):
  * - The class is chosen by `name` among the built-in errors (`Error`, `EvalError`, `RangeError`, `ReferenceError`, `SyntaxError`,
  *   `TypeError`, `URIError`, `AggregateError`); any other name gives an `Error` with that `name`. No other constructor is ever called,
- *   so untrusted data cannot instantiate arbitrary classes.
+ *   so untrusted data cannot instantiate arbitrary classes. Your own classes are opt-in: with `classes: { NotFoundError: NotFound }`, an
+ *   error named `NotFoundError` is built that way and then given `NotFound.prototype` (its constructor is still not called).
  * - `message`, `stack` (when present; otherwise the stack is where `deserializeError` was called), `cause` and `errors` are restored as
  *   the non-enumerable properties the constructors create; an error-like `cause` or item of `errors` is rebuilt recursively (up to
  *   `maxDepth` levels), anything else is kept as data. Shared and circular references between them are preserved.
@@ -313,9 +349,9 @@ function rebuild(data: unknown, depth: number, built: Map<object, Error>): Error
  * An `Error` is returned as it is; any other value that is not an object gives an `Error` with {@link getErrorMessage}'s message. Never
  * throws for any `data`.
  * @param {unknown} data - The serialized error
- * @param {DeserializeErrorOptions} [options={}] - `maxDepth` (default `Infinity`)
+ * @param {DeserializeErrorOptions} [options={}] - `maxDepth` (default `Infinity`) and `classes` (none by default)
  * @returns {Error} The rebuilt error
- * @throws {TypeError} when `maxDepth` is not a number
+ * @throws {TypeError} when `maxDepth` is not a number, `classes` is not an object, or one of its values is not a class
  * @throws {RangeError} when `maxDepth` is not an integer >= 0 or `Infinity`
  * @example
  * const error = deserializeError(JSON.parse('{"name":"TypeError","message":"Bad input","code":"E_INPUT"}'));
@@ -325,7 +361,558 @@ function rebuild(data: unknown, depth: number, built: Map<object, Error>): Error
  * deserializeError({ name: 'AbortError', message: 'Aborted' }).name; // => 'AbortError'
  * const copy = deserializeError(JSON.parse(JSON.stringify(serializeError(new Error('Outer', { cause: new RangeError('Inner') })))));
  * copy.cause instanceof RangeError; // => true
+ * @example
+ * const NotFound = defineError('NotFoundError', { code: 'E_NOT_FOUND' });
+ * const data = JSON.parse(JSON.stringify(serializeError(new NotFound('No user 42'))));
+ * deserializeError(data) instanceof NotFound; // => false // built-in classes only, by default
+ * const rebuilt = deserializeError(data, { classes: { NotFoundError: NotFound } });
+ * rebuilt instanceof NotFound; // => true
+ * NotFound.is(rebuilt) && rebuilt.code; // => 'E_NOT_FOUND'
  */
 export function deserializeError(data: unknown, options: DeserializeErrorOptions = {}): Error {
-	return rebuild(data, readDepth('deserializeError', options), new Map());
+	return rebuild(data, readDepth('deserializeError', options), new Map(), readClasses(readOption(options, 'classes')));
+}
+
+/**
+ * Validates the `classes` option of {@link deserializeError} and indexes the prototypes of its own entries by name (read once, here).
+ * @param {unknown} classes - The option
+ * @returns {ReadonlyMap<unknown, object>} The prototype of each class, by name
+ * @throws {TypeError} when `classes` is not an object, or one of its values is not a class with an object `prototype`
+ */
+function readClasses(classes: unknown): ReadonlyMap<unknown, object> {
+	const prototypes = new Map<unknown, object>();
+	if (classes === undefined) return prototypes;
+	if (typeof classes !== 'object' || classes === null) throw new TypeError(`deserializeError: \`classes\` must be an object, got ${describe(classes)}`);
+	for (const name of Object.keys(classes)) {
+		const Class = (classes as Record<string, unknown>)[name];
+		let prototype: unknown;
+		try {
+			if (typeof Class === 'function') prototype = (Class as { prototype?: unknown }).prototype;
+		} catch {
+			// A proxy whose `get` trap throws: no usable prototype.
+		}
+		if (typeof prototype !== 'object' || prototype === null)
+			throw new TypeError(
+				`deserializeError: \`classes.${name}\` must be a class, got ${typeof Class === 'function' ? 'a function without prototype' : describe(Class)}`
+			);
+		prototypes.set(name, prototype);
+	}
+	return prototypes;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// defineError
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * The options of {@link defineError}: an optional `code`, and default values for any other fields its errors carry.
+ */
+export interface DefineErrorOptions {
+	/** The code of every error of the class (Node style, such as `'E_NOT_FOUND'`), typed as its literal. It cannot be changed per error. */
+	readonly code?: string;
+	/** The default value of another field of the errors (overridable per error). */
+	readonly [field: string]: unknown;
+}
+
+/**
+ * The type of a field of {@link defineError}'s errors: the type of the default as it would be inferred without `const`, since each error
+ * may override it. Literal types are widened to their primitive (`404` gives `number`), and arrays and objects are widened deeply
+ * (`['a']` gives `string[]`, `{ max: 3 }` gives `{ max: number }`); functions are kept as they are.
+ * @template T - The type of the default value
+ */
+export type WidenField<T> = T extends string
+	? string
+	: T extends number
+		? number
+		: T extends boolean
+			? boolean
+			: T extends bigint
+				? bigint
+				: T extends readonly unknown[]
+					? WidenField<T[number]>[]
+					: T extends (...args: never[]) => unknown
+						? T
+						: T extends object
+							? { -readonly [K in keyof T]: WidenField<T[K]> }
+							: T;
+
+/**
+ * An error created by a {@link defineError} class: an `Error` with the class's literal `name`, its literal `code`, and its other fields.
+ * @template N - The error name
+ * @template M - The options the class was defined with
+ */
+export type DefinedError<N extends string, M extends DefineErrorOptions = Record<never, never>> = Error & { name: N } & {
+	-readonly [K in keyof M]: K extends 'code' ? M[K] : WidenField<M[K]>;
+};
+
+/**
+ * The second argument of a {@link defineError} constructor: the standard `cause`, and a value for any field the class defines (except
+ * `code`); a field left out or `undefined` keeps the class's default.
+ * @template M - The options the class was defined with
+ */
+export type DefinedErrorInit<M extends DefineErrorOptions = Record<never, never>> = { cause?: unknown } & { [K in Exclude<keyof M, 'code'>]?: WidenField<M[K]> };
+
+/**
+ * A class created by {@link defineError}. Extend it with `class X extends NotFound {}` like any error class.
+ * @template N - The error name
+ * @template M - The options the class was defined with
+ */
+export type DefinedErrorClass<N extends string, M extends DefineErrorOptions = Record<never, never>> = {
+	/**
+	 * Creates an error.
+	 * @param {string} [message] - The message
+	 * @param {DefinedErrorInit<M>} [init] - `cause`, and the values of the class's fields
+	 */
+	new (message?: string, init?: DefinedErrorInit<M>): DefinedError<N, M>;
+	/** The prototype of the errors. */
+	readonly prototype: DefinedError<N, M>;
+	/** The error name (also the `name` of the class). */
+	readonly name: N;
+	/**
+	 * Whether `value` is an error of this class, from this bundle or from another copy of the class defined with the same name (another
+	 * bundle, realm or version of tinkit): recognised by a brand that `Symbol.for` shares between them, not by `instanceof`. Never
+	 * throws. Called on a subclass (`Sub.is(value)`), it is `value instanceof Sub` instead.
+	 * @param {unknown} value - Any value
+	 * @returns {boolean} `true` for an error of this class or of a subclass
+	 */
+	is(value: unknown): value is DefinedError<N, M>;
+} & { readonly [K in keyof M]: M[K] };
+
+/** Field names {@link defineError} rejects besides those its classes and errors already have (`name`, `message`, `toString`…). */
+const RESERVED_FIELDS: ReadonlySet<string> = new Set(['stack', 'cause', 'errors', 'is']);
+
+/** Whether `Error.captureStackTrace` is needed to leave constructor frames out of stacks (computed on first use, by {@link capturesStack}). */
+let captureNeeded: boolean | undefined;
+
+/**
+ * Whether the constructors of {@link defineError} must call `Error.captureStackTrace` to leave their own frames out of `stack`. V8 (Node,
+ * Deno, Chrome) already leaves out the frames of the constructors up to `new.target`, so a second capture would only double the cost of
+ * creating an error: this is checked by comparing the stacks of a plain and a derived error created at the same place, once the answer is
+ * conclusive (different stacks, or equal ones with more than one line; not while `Error.stackTraceLimit` is 0 or the stack cannot be read,
+ * when the class is created without the capture and the next {@link defineError} call probes again).
+ * @returns {boolean} `true` when `Error.captureStackTrace` exists and is needed
+ */
+function capturesStack(): boolean {
+	if (captureNeeded === undefined) {
+		/** A derived error class with a constructor of its own, like those of {@link defineError}. */
+		class StackProbe extends Error {
+			/** Calls `super`, like the constructors of {@link defineError}. */
+			// eslint-disable-next-line no-useless-constructor -- an explicit constructor, like those of `defineError`, is what is probed
+			constructor() {
+				super();
+			}
+		}
+		const stacks: unknown[] = [];
+		try {
+			for (const Probe of [Error, StackProbe]) stacks.push(new Probe().stack);
+		} catch {
+			// A throwing `Error.prepareStackTrace`: inconclusive, so no second capture for now (it would call it again).
+		}
+		const differ = stacks[0] !== stacks[1];
+		if (!differ && !(typeof stacks[0] === 'string' && stacks[0].includes('\n'))) return false;
+		captureNeeded = differ && typeof (Error as { captureStackTrace?: unknown }).captureStackTrace === 'function';
+	}
+	return captureNeeded;
+}
+
+/**
+ * Creates a typed error class: `const NotFound = defineError('NotFoundError', { code: 'E_NOT_FOUND', status: 404 })`, then
+ * `throw new NotFound('No user 42', { cause, status: 410 })`.
+ * - **Name:** `name` is on the prototype (so `String(error)` and the stack read `NotFoundError: …`) and is the class's `name` too.
+ *   `instanceof` works, subclasses (`class Gone extends NotFound {}`) too, and the stack leaves out the constructors' frames (V8 does it
+ *   natively; elsewhere `Error.captureStackTrace` is used when it exists).
+ * - **Fields:** `code` and every other option become own enumerable properties of each error (`code` is fixed; the others take the value
+ *   given to the constructor, or the default when it is left out or `undefined`). The defaults are also read-only static properties of
+ *   the class (`NotFound.code`), typed as literals. Defaults are shared, not copied: give an object or array field a fresh value per error.
+ *   `cause` is read only when it is an own property of the second argument; anything but an object there is ignored, as `Error` does.
+ * - **Guard:** `NotFound.is(value)` recognises its errors across bundles and realms (by a brand that `Symbol.for` shares, and the name).
+ * - **Serialization:** {@link serializeError} keeps `name`, `message`, `code`, the fields and the cause; {@link deserializeError} rebuilds
+ *   an `Error` with all of them, or a real `NotFound` when you opt in with `classes: { NotFoundError: NotFound }`.
+ *
+ * Reserved field names (they would break errors or the class) throw a `RangeError`: `name`, `message`, `stack`, `cause`, `errors`, `is`,
+ * `prototype`, `length`, and anything else errors or classes already have (`toString`, `constructor`, `captureStackTrace`…).
+ * @template N - The error name
+ * @template M - The options
+ * @param {N} name - The error name (non-empty), conventionally ending in `Error`
+ * @param {M} [options={}] - `code` (a string), and the default values of other fields (own enumerable string keys)
+ * @returns {DefinedErrorClass<N, M>} The class
+ * @throws {TypeError} when `name` is not a string, `options` is not an object, or `code` is not a string
+ * @throws {RangeError} when `name` is empty or a field name is reserved
+ * @example
+ * const NotFound = defineError('NotFoundError', { code: 'E_NOT_FOUND', status: 404 });
+ * const error = new NotFound('No user 42', { cause: 'db miss' });
+ * error instanceof NotFound && error instanceof Error; // => true
+ * [error.name, error.code, error.status, error.cause]; // => ['NotFoundError', 'E_NOT_FOUND', 404, 'db miss']
+ * new NotFound('Gone', { status: 410 }).status; // => 410
+ * String(error); // => 'NotFoundError: No user 42'
+ * [NotFound.name, NotFound.code, NotFound.status]; // => ['NotFoundError', 'E_NOT_FOUND', 404]
+ * NotFound.is(error); // => true
+ * NotFound.is(new Error('x')); // => false
+ * @example
+ * const HttpError = defineError('HttpError', { status: 500, url: undefined as string | undefined });
+ * class GatewayTimeout extends HttpError {
+ *   retryable(): boolean { return true; }
+ * }
+ * const timeout = new GatewayTimeout('Timed out', { status: 504, url: '/api' });
+ * timeout instanceof HttpError && timeout.retryable(); // => true
+ * [timeout.name, timeout.status, timeout.url]; // => ['HttpError', 504, '/api']
+ * serializeError(timeout, { stack: false }); // => { name: 'HttpError', message: 'Timed out', status: 504, url: '/api' }
+ */
+export function defineError<const N extends string, const M extends DefineErrorOptions = Record<never, never>>(name: N, options?: M): DefinedErrorClass<N, M>;
+/**
+ * Implementation of {@link defineError} (see the first overload for the full documentation).
+ * @param {string} name - The error name
+ * @param {DefineErrorOptions} [options={}] - `code`, and the default values of other fields
+ * @returns {DefinedErrorClass<string>} The class
+ * @throws {TypeError} when `name` is not a string, `options` is not an object, or `code` is not a string
+ * @throws {RangeError} when `name` is empty or a field name is reserved
+ */
+export function defineError(name: string, options: DefineErrorOptions = {}): DefinedErrorClass<string> {
+	if (typeof name !== 'string') throw new TypeError(`defineError: \`name\` must be a non-empty string, got ${describe(name)}`);
+	if (name === '') throw new RangeError('defineError: `name` must be a non-empty string, got an empty string');
+	if (typeof options !== 'object' || options === null) throw new TypeError(`defineError: \`options\` must be an object, got ${describe(options)}`);
+	const keys = Object.keys(options);
+	const defaults = keys.map(function (key: string): unknown {
+		return options[key];
+	});
+	const code = keys.indexOf('code');
+	if (code !== -1 && typeof defaults[code] !== 'string') throw new TypeError(`defineError: \`options.code\` must be a string, got ${describe(defaults[code])}`);
+	const brand = Symbol.for('tinkit.defineError');
+	const capture = capturesStack();
+
+	/** The class. */
+	class DefinedError extends Error {
+		/**
+		 * Creates an error of the class.
+		 * @param {string} [message] - The message
+		 * @param {Record<string, unknown>} [init] - `cause`, and the values of the fields
+		 */
+		constructor(message?: string, init?: Readonly<Record<string, unknown>>) {
+			const given = typeof init === 'object' && init !== null ? init : undefined;
+			super(message, given !== undefined && hasOwn.call(given, 'cause') ? { cause: given.cause } : undefined);
+			for (let index = 0; index < keys.length; index++) {
+				const value = index === code || given === undefined || !hasOwn.call(given, keys[index]) ? undefined : given[keys[index]];
+				Object.defineProperty(this, keys[index], { value: value === undefined ? defaults[index] : value, writable: true, enumerable: true, configurable: true });
+			}
+			if (capture) (Error as unknown as { captureStackTrace(target: object, constructor: unknown): void }).captureStackTrace(this, new.target);
+		}
+	}
+
+	for (const key of keys) {
+		if (RESERVED_FIELDS.has(key) || key in DefinedError || key in DefinedError.prototype) throw new RangeError(`defineError: \`options.${key}\` is a reserved field name`);
+	}
+	/**
+	 * Recognises the errors of the class (see {@link DefinedErrorClass}).
+	 * @param {unknown} value - Any value
+	 * @returns {boolean} Whether it is an error of the class
+	 */
+	function is(this: unknown, value: unknown): boolean {
+		try {
+			if (typeof this === 'function' && this !== DefinedError) return value instanceof this;
+			return isAnyError(value) && (value as unknown as Record<symbol, unknown>)[brand] === name;
+		} catch {
+			// A revoked proxy, or a throwing `Symbol.hasInstance` or getter.
+			return false;
+		}
+	}
+	Object.defineProperty(DefinedError, 'name', { value: name, configurable: true });
+	Object.defineProperty(DefinedError, 'is', { value: is, writable: true, configurable: true });
+	for (let index = 0; index < keys.length; index++) Object.defineProperty(DefinedError, keys[index], { value: defaults[index], enumerable: true });
+	Object.defineProperty(DefinedError.prototype, 'name', { value: name, writable: true, configurable: true });
+	Object.defineProperty(DefinedError.prototype, brand, { value: name });
+	return DefinedError as unknown as DefinedErrorClass<string>;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// getErrorChain / formatError
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Options of {@link getErrorChain}.
+ */
+export interface ErrorChainOptions {
+	/** Whether the `errors` of an `AggregateError` (any own `errors` array) are walked too, depth-first (default `false`). */
+	aggregate?: boolean;
+	/**
+	 * How many levels below the error are walked (the error itself is at depth 0). An integer >= 0 or `Infinity` (the default); values
+	 * above 1000 are clamped to 1000, the cap {@link serializeError} applies too.
+	 */
+	maxDepth?: number;
+}
+
+/**
+ * Options of {@link formatError}.
+ */
+export interface FormatErrorOptions {
+	/** Whether stack frames are printed (default `true`). */
+	stack?: boolean;
+	/**
+	 * How many levels of causes and aggregated errors are printed (the error itself is at depth 0): deeper ones are replaced by a
+	 * `[Truncated]` line. An integer >= 0 or `Infinity` (the default); values above 1000 are clamped to 1000.
+	 */
+	maxDepth?: number;
+}
+
+/**
+ * Reads the own `cause` of a value without throwing.
+ * @param {object} value - An error or error-like object
+ * @returns {unknown} The cause, or `undefined` when there is none (or it cannot be read)
+ */
+function readCause(value: object): unknown {
+	let cause: unknown;
+	try {
+		if (hasOwn.call(value, 'cause')) cause = (value as { cause: unknown }).cause;
+	} catch {
+		// A revoked proxy, or a throwing getter or trap: no cause.
+	}
+	return cause;
+}
+
+/**
+ * Reads the items of the own `errors` array of a value (an `AggregateError`, or its serialized form) without throwing.
+ * @param {object} value - An error or error-like object
+ * @returns {unknown[]} A copy of the items (those read before a read threw), empty when there is no `errors` array
+ */
+function readErrors(value: object): unknown[] {
+	const items: unknown[] = [];
+	try {
+		const errors = hasOwn.call(value, 'errors') ? (value as { errors: unknown }).errors : undefined;
+		if (Array.isArray(errors)) for (let index = 0; index < errors.length; index++) items.push(errors[index]);
+	} catch {
+		// A revoked proxy, or a throwing getter or trap: the items read so far are kept.
+	}
+	return items;
+}
+
+/**
+ * Lists an error and its causes: `[error, error.cause, error.cause.cause, …]`, following own `cause` properties of objects (errors,
+ * error-like objects, serialized errors). The chain ends at a value that is not an object, an object without an own `cause` (or with an
+ * `undefined` one), or `maxDepth` levels down; a value that is not an error, such as a string cause, is included as it is.
+ * - With `aggregate: true`, the own `errors` array of an `AggregateError` (or of any object) is walked too, depth-first in pre-order:
+ *   each value, then each of its `errors` with everything below it, then its `cause` with everything below it.
+ * - Cycle-safe: an object met again (a circular or shared reference) is not listed again, so the result is at most as long as the number
+ *   of distinct objects reached plus their primitive causes. Iterative (no recursion), O(n), and never throws on the value: getters,
+ *   proxies and revoked proxies that throw end that branch.
+ * @param {unknown} error - The error (or anything caught)
+ * @param {ErrorChainOptions} [options={}] - `aggregate` (default `false`) and `maxDepth` (default `Infinity`, clamped to 1000)
+ * @returns {unknown[]} The error, then its causes (and aggregated errors), outermost first
+ * @throws {TypeError} when `maxDepth` is not a number
+ * @throws {RangeError} when `maxDepth` is not an integer >= 0 or `Infinity`
+ * @example
+ * const root = new Error('ECONNREFUSED');
+ * const error = new Error('Request failed', { cause: new TypeError('fetch failed', { cause: root }) });
+ * function message(value: unknown): string { return getErrorMessage(value); }
+ * getErrorChain(error).map(message); // => ['Request failed', 'fetch failed', 'ECONNREFUSED']
+ * getErrorChain(error).at(-1) === root; // => true
+ * getErrorChain(new Error('x', { cause: 'disk full' }))[1]; // => 'disk full'
+ * const group = new AggregateError([new Error('a', { cause: new Error('a1') }), new Error('b')], 'all', { cause: new Error('c') });
+ * getErrorChain(group, { aggregate: true }).map(message); // => ['all', 'a', 'a1', 'b', 'c']
+ * const loop = new Error('loop');
+ * loop.cause = loop;
+ * getErrorChain(loop).length; // => 1
+ */
+export function getErrorChain(error: unknown, options: ErrorChainOptions = {}): unknown[] {
+	const maxDepth = Math.min(readDepth('getErrorChain', options), MAX_JSON_DEPTH);
+	const aggregate = readOption(options, 'aggregate') === true;
+	const chain: unknown[] = [];
+	if (!aggregate) {
+		// A single chain: no stack needed, and a linear scan of the (short) chain finds cycles faster than a `Set`, until it grows.
+		chain.push(error);
+		let seen: Set<unknown> | undefined;
+		for (let value = error, depth = 0; depth < maxDepth; depth++) {
+			// Only objects have causes (`readCause` gives none for `null`, whose read throws). A primitive cause ends the chain on the next step,
+			// so checking it for a cycle too is harmless: the chain holds objects only before it.
+			const cause = typeof value === 'object' ? readCause(value as object) : undefined;
+			if (cause === undefined) break;
+			if (seen === undefined && chain.length > 16) seen = new Set(chain);
+			if (seen === undefined ? chain.includes(cause) : seen.has(cause)) break;
+			seen?.add(cause);
+			chain.push(cause);
+			value = cause;
+		}
+		return chain;
+	}
+	const seen = new Set<object>();
+	// Depth-first, with an explicit stack of the values to visit and their depths (pushed in reverse order of visit).
+	const values: unknown[] = [error];
+	const depths: number[] = [0];
+	while (values.length !== 0) {
+		const value = values.pop();
+		const depth = depths.pop() as number;
+		if (typeof value !== 'object' || value === null) {
+			chain.push(value);
+			continue;
+		}
+		if (seen.has(value)) continue;
+		seen.add(value);
+		chain.push(value);
+		if (depth === maxDepth) continue;
+		const cause = readCause(value);
+		if (cause !== undefined) {
+			values.push(cause);
+			depths.push(depth + 1);
+		}
+		const errors = readErrors(value);
+		for (let index = errors.length - 1; index >= 0; index--) {
+			values.push(errors[index]);
+			depths.push(depth + 1);
+		}
+	}
+	return chain;
+}
+
+/**
+ * The first line of a printed error: `Name: message` as `Error.prototype.toString` writes it (`Name` alone when the message is empty, the
+ * message alone when the name is), or {@link getErrorMessage}'s description of a value that is not error-like.
+ * @param {unknown} value - The error (or anything caught)
+ * @returns {string} The header
+ */
+function headerOf(value: unknown): string {
+	if (!isSource(value)) return getErrorMessage(value);
+	const name = readText(value, 'name') ?? 'Error';
+	const message = readText(value, 'message') ?? '';
+	return name === '' ? message : message === '' ? name : `${name}: ${message}`;
+}
+
+/**
+ * Appends the frames of a stack trace, without the header that V8 writes before them (whether or not it is still the current header).
+ * @param {string[]} lines - The output lines
+ * @param {string} stack - The stack trace
+ * @param {string} header - The error's current header
+ * @param {string} indent - The indentation of the frames
+ * @returns {void}
+ */
+function pushFrames(lines: string[], stack: string, header: string, indent: string): void {
+	let frames = stack;
+	if (stack.startsWith(header)) frames = stack.slice(header.length);
+	else {
+		// A header written before the message or name changed: V8's frames start at the first `at` line (`[ \t]`, not `\s`, keeps the
+		// search linear). Other engines (Firefox, Safari) write frames only.
+		const first = stack.search(/\n[ \t]+at /);
+		if (first !== -1) frames = stack.slice(first);
+	}
+	for (const line of frames.split('\n')) {
+		const frame = line.trim();
+		if (frame !== '') lines.push(`${indent}${frame}`);
+	}
+}
+
+/**
+ * Formats an error as a human-readable, multi-line report: `Name: message`, its stack frames, then its aggregated `errors` (labelled
+ * `[1/2]`, `[2/2]`…) and its `cause` (`Caused by: …`), each nested two spaces deeper, recursively:
+ *
+ * ```text
+ * AggregateError: 2 tasks failed
+ *     at main (app.js:9:11)
+ *   [1/2] TypeError: Bad input
+ *       at parse (app.js:3:9)
+ *     Caused by: SyntaxError: Unexpected token
+ *   [2/2] Error: Timed out
+ *   Caused by: Error: Pool closed
+ * ```
+ *
+ * - The frames come from `stack`, without the header V8 writes before them, trimmed and indented four spaces below their error's line;
+ *   `stack: false` leaves them out (e.g. for a user-facing message). A cause that is not error-like is printed as {@link getErrorMessage}
+ *   describes it (`Caused by: disk full`), and so is a thrown value that is not an error.
+ * - The indentation stops growing 10 levels down (20 spaces): deeper lines keep it and start with a `[depth N]` marker instead
+ *   (`[depth 11] Caused by: …`), so that the report grows linearly with the chain (no `d²` spaces for a chain `d` levels deep).
+ * - Never throws, and prints each object once: a circular reference prints `[Circular]`, an error met again in another branch prints
+ *   its header followed by `[Seen above]` (without its frames, causes and errors), and the causes and errors deeper than `maxDepth` are
+ *   replaced by one `[Truncated]` line. Iterative (no recursion), and linear in the size of what it prints.
+ * @param {unknown} error - The error (or anything caught)
+ * @param {FormatErrorOptions} [options={}] - `stack` (default `true`) and `maxDepth` (default `Infinity`, clamped to 1000)
+ * @returns {string} The report (lines separated by `\n`, no trailing newline)
+ * @throws {TypeError} when `maxDepth` is not a number
+ * @throws {RangeError} when `maxDepth` is not an integer >= 0 or `Infinity`
+ * @example
+ * const error = new Error('Request failed', { cause: new TypeError('fetch failed', { cause: 'ECONNREFUSED' }) });
+ * formatError(error, { stack: false }); // => 'Error: Request failed\n  Caused by: TypeError: fetch failed\n    Caused by: ECONNREFUSED'
+ * formatError(error, { stack: false, maxDepth: 1 }); // => 'Error: Request failed\n  Caused by: TypeError: fetch failed\n    [Truncated]'
+ * const group = new AggregateError([new RangeError('Too big'), 'offline'], '2 failed');
+ * formatError(group, { stack: false }); // => 'AggregateError: 2 failed\n  [1/2] RangeError: Too big\n  [2/2] offline'
+ * const loop = new Error('Loop');
+ * loop.cause = loop;
+ * formatError(loop, { stack: false }); // => 'Error: Loop\n  Caused by: [Circular]'
+ * formatError(new Error('Disk full')).split('\n')[1].startsWith('    at '); // => true
+ * @example
+ * let deep: unknown = 'root cause';
+ * for (let level = 12; level > 0; level--) deep = new Error(`level ${level}`, { cause: deep });
+ * const lines = formatError(deep, { stack: false }).split('\n');
+ * lines[10]; // => '                    Caused by: Error: level 11'
+ * lines[11]; // => '                    [depth 11] Caused by: Error: level 12'
+ * lines[12]; // => '                    [depth 12] Caused by: root cause'
+ */
+export function formatError(error: unknown, options: FormatErrorOptions = {}): string {
+	const maxDepth = Math.min(readDepth('formatError', options), MAX_JSON_DEPTH);
+	const withStack = readOption(options, 'stack') !== false;
+	const lines: string[] = [];
+	const printed = new Set<object>();
+	const onPath = new Set<object>();
+	// Depth-first, with an explicit stack of entries to print (pushed in reverse order); `exit` entries take an object off the path once
+	// everything below it has been printed.
+	const todo: Array<{ value: unknown; depth: number; label: string } | { exit: object }> = [{ value: error, depth: 0, label: '' }];
+	while (todo.length !== 0) {
+		const entry = todo.pop() as { value: unknown; depth: number; label: string } | { exit: object };
+		if ('exit' in entry) {
+			onPath.delete(entry.exit);
+			continue;
+		}
+		const { value, depth } = entry;
+		const indent = indentOf(depth);
+		const label = `${markerOf(depth)}${entry.label}`;
+		const isObject = typeof value === 'object' && value !== null;
+		if (isObject && onPath.has(value)) {
+			lines.push(`${indent}${label}[Circular]`);
+			continue;
+		}
+		const header = headerOf(value);
+		const line = `${indent}${label}${header.replaceAll('\n', `\n${indent}`)}`;
+		if (!isObject) {
+			lines.push(line);
+			continue;
+		}
+		if (printed.has(value)) {
+			lines.push(`${line} [Seen above]`);
+			continue;
+		}
+		printed.add(value);
+		lines.push(line);
+		const stack = withStack ? readText(value, 'stack') : undefined;
+		if (stack !== undefined) pushFrames(lines, stack, header, `${indent}    `);
+		const cause = readCause(value);
+		const errors = readErrors(value);
+		if (cause === undefined && errors.length === 0) continue;
+		if (depth === maxDepth) {
+			lines.push(`${indentOf(depth + 1)}${markerOf(depth + 1)}[Truncated]`);
+			continue;
+		}
+		onPath.add(value);
+		todo.push({ exit: value });
+		if (cause !== undefined) todo.push({ value: cause, depth: depth + 1, label: 'Caused by: ' });
+		for (let index = errors.length - 1; index >= 0; index--) {
+			todo.push({ value: errors[index], depth: depth + 1, label: `[${index + 1}/${errors.length}] ` });
+		}
+	}
+	return lines.join('\n');
+}
+
+/** How many levels down {@link formatError} indents its lines further; deeper lines get a `[depth N]` marker instead. */
+const MAX_INDENT_DEPTH = 10;
+
+/**
+ * The indentation of a line of {@link formatError}: two spaces per level, up to {@link MAX_INDENT_DEPTH} levels.
+ * @param {number} depth - The level (0 for the error itself)
+ * @returns {string} The spaces
+ */
+function indentOf(depth: number): string {
+	return '  '.repeat(Math.min(depth, MAX_INDENT_DEPTH));
+}
+
+/**
+ * The marker of a line of {@link formatError} deeper than its indentation shows.
+ * @param {number} depth - The level (0 for the error itself)
+ * @returns {string} `'[depth N] '` below {@link MAX_INDENT_DEPTH} levels, `''` otherwise
+ */
+function markerOf(depth: number): string {
+	return depth > MAX_INDENT_DEPTH ? `[depth ${depth}] ` : '';
 }

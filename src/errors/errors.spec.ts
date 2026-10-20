@@ -1,8 +1,9 @@
+import * as util from 'util';
 import * as vm from 'vm';
 import { AbortError, TimeoutError } from '../async/index.js';
 import { AssertionError, ValidationError } from '../guards/index.js';
 import { JsonPatchError } from '../objects/index.js';
-import { deserializeError, getErrorMessage, isErrorLike, serializeError, toError } from '.';
+import { defineError, deserializeError, formatError, getErrorChain, getErrorMessage, isErrorLike, serializeError, toError } from '.';
 
 /** A revoked proxy: every operation on it throws. */
 function revoked(): object {
@@ -530,6 +531,7 @@ describe('errors', function () {
 			expect(error.code).toBe('E');
 			expect(error.status).toBe(404);
 			expect(Object.keys(error)).toEqual(['code', 'status']);
+			expect(Object.getOwnPropertyDescriptor(error, 'code')).toEqual({ value: 'E', writable: true, enumerable: true, configurable: true });
 			expect(Object.getPrototypeOf(error)).toBe(Error.prototype);
 			expect(error.polluted).toBeUndefined();
 			expect(error.constructor).toBe(Error);
@@ -650,3 +652,759 @@ describe('errors', function () {
 		});
 	});
 });
+
+/** A chain of `depth` errors, each the cause of the previous one (built iteratively). */
+function errorChain(depth: number): Error {
+	let current = new Error(String(depth - 1));
+	for (let index = depth - 2; index >= 0; index--) current = new Error(String(index), { cause: current });
+	return current;
+}
+
+/** A proxy of an error whose every trap throws. */
+function hostileProxy(): object {
+	return new Proxy(new Error('hidden'), {
+		get: function (): never {
+			throw new Error('get');
+		},
+		getOwnPropertyDescriptor: function (): never {
+			throw new Error('getOwnPropertyDescriptor');
+		},
+		getPrototypeOf: function (): never {
+			throw new Error('getPrototypeOf');
+		}
+	});
+}
+
+describe('errors (1.4)', function () {
+	describe('defineError', function () {
+		const NotFound = defineError('NotFoundError', { code: 'E_NOT_FOUND', status: 404 });
+
+		it('creates an Error subclass with the name on the prototype and the class', function () {
+			const error = new NotFound('No user 42');
+			expect(error).toBeInstanceOf(NotFound);
+			expect(error).toBeInstanceOf(Error);
+			expect(error.name).toBe('NotFoundError');
+			expect(error.message).toBe('No user 42');
+			expect(String(error)).toBe('NotFoundError: No user 42');
+			expect(Object.prototype.toString.call(error)).toBe('[object Error]');
+			expect(util.types.isNativeError(error)).toBe(true);
+			expect(Object.hasOwn(error, 'name')).toBe(false);
+			expect(Object.getOwnPropertyDescriptor(NotFound.prototype, 'name')).toEqual({ value: 'NotFoundError', writable: true, enumerable: false, configurable: true });
+			expect(NotFound.name).toBe('NotFoundError');
+			expect(NotFound.prototype.constructor).toBe(NotFound);
+			expect(Object.getPrototypeOf(NotFound)).toBe(Error);
+			expect(new NotFound().message).toBe('');
+			expect(Object.hasOwn(new NotFound(), 'message')).toBe(false);
+		});
+
+		it('gives every error its code and fields as own enumerable properties, defaults overridable except the code', function () {
+			const error = new NotFound('x');
+			expect(Object.keys(error)).toEqual(['code', 'status']);
+			expect(Object.getOwnPropertyDescriptor(error, 'code')).toEqual({ value: 'E_NOT_FOUND', writable: true, enumerable: true, configurable: true });
+			expect(error.status).toBe(404);
+			expect(new NotFound('x', { status: 410 }).status).toBe(410);
+			expect(new NotFound('x', { status: undefined }).status).toBe(404);
+			expect(new NotFound('x', { code: 'E_OTHER' } as never).code).toBe('E_NOT_FOUND');
+			expect(Object.keys(new NotFound('x', { other: 1 } as never))).toEqual(['code', 'status']);
+			expect(new NotFound('x', Object.create({ status: 1 })).status).toBe(404);
+			const Plain = defineError('PlainError');
+			expect(Object.keys(new Plain('x'))).toEqual([]);
+			expect(Object.keys(new (defineError('FieldError', { a: 1, b: 'two' }))('x', { b: 'three' }))).toEqual(['a', 'b']);
+		});
+
+		it('defines fields like class fields, over accessors of subclasses', function () {
+			class Shadowed extends NotFound {
+				override get status(): number {
+					return 0;
+				}
+			}
+			expect(new Shadowed('x').status).toBe(404);
+		});
+
+		it('exposes the defaults as read-only statics', function () {
+			expect(Object.keys(NotFound)).toEqual(['code', 'status']);
+			expect(NotFound.code).toBe('E_NOT_FOUND');
+			expect(NotFound.status).toBe(404);
+			expect(Object.getOwnPropertyDescriptor(NotFound, 'code')).toEqual({ value: 'E_NOT_FOUND', writable: false, enumerable: true, configurable: false });
+			expect(Object.getOwnPropertyDescriptor(NotFound, 'is')).toEqual({ value: NotFound.is, writable: true, enumerable: false, configurable: true });
+			expect(Object.getOwnPropertyDescriptor(NotFound, 'name')).toEqual({ value: 'NotFoundError', writable: false, enumerable: false, configurable: true });
+		});
+
+		it('keeps only an own cause, as the Error constructor stores it', function () {
+			const inner = new Error('inner');
+			expect(new NotFound('x', { cause: inner }).cause).toBe(inner);
+			const undefinedCause = new NotFound('x', { cause: undefined });
+			expect(Object.hasOwn(undefinedCause, 'cause')).toBe(true);
+			expect(Object.getOwnPropertyDescriptor(undefinedCause, 'cause')?.enumerable).toBe(false);
+			expect(Object.hasOwn(new NotFound('x', {}), 'cause')).toBe(false);
+			expect(Object.hasOwn(new NotFound('x', Object.create({ cause: inner })), 'cause')).toBe(false);
+			const prototype = Object.prototype as Record<string, unknown>;
+			prototype.cause = 'polluted';
+			prototype.status = 'polluted';
+			try {
+				const error = new NotFound('x', {});
+				expect(Object.hasOwn(error, 'cause')).toBe(false);
+				expect(error.status).toBe(404);
+			} finally {
+				delete prototype.cause;
+				delete prototype.status;
+			}
+		});
+
+		it('ignores a second argument that is not an object, as Error does', function () {
+			for (const init of [null, 5, 'cause', true, Object.assign(function () {}, { cause: 'c', status: 1 })]) {
+				const error = new NotFound('x', init as never);
+				expect(Object.hasOwn(error, 'cause')).toBe(false);
+				expect(error.status).toBe(404);
+			}
+			const Indexed = defineError('IndexedError', { 0: 'default' });
+			expect(new Indexed('x', 'abc' as never)[0]).toBe('default');
+		});
+
+		it('leaves the constructors out of the stack, without capturing it twice on V8', function () {
+			const capture = jest.spyOn(Error, 'captureStackTrace');
+			jest.isolateModules(function () {
+				const isolated = jest.requireActual<typeof import('.')>('.');
+				const Isolated = isolated.defineError('IsolatedError');
+				class Sub extends Isolated {}
+				/** Creates the errors, so that this function is the first frame. */
+				function createErrors(): Error[] {
+					return [new Isolated('a'), new Sub('b')];
+				}
+				const [first, second] = createErrors();
+				expect(first.stack?.split('\n').slice(0, 2)).toEqual(['IsolatedError: a', expect.stringContaining('at createErrors')]);
+				expect(second.stack?.split('\n').slice(0, 2)).toEqual(['IsolatedError: b', expect.stringContaining('at createErrors')]);
+			});
+			expect(capture).not.toHaveBeenCalled();
+		});
+
+		it('captures the stack where the engine keeps constructor frames', function () {
+			const prepare = Error.prepareStackTrace;
+			let calls = 0;
+			// Different stacks for the plain and the derived probe error, as an engine that keeps constructor frames writes.
+			Error.prepareStackTrace = function (error: Error): string {
+				calls++;
+				return `${error.name}: ${calls}`;
+			};
+			const capture = jest.spyOn(Error, 'captureStackTrace');
+			try {
+				jest.isolateModules(function () {
+					const isolated = jest.requireActual<typeof import('.')>('.');
+					const Captured = isolated.defineError('CapturedError');
+					class Sub extends Captured {}
+					const error = new Sub('x');
+					expect(capture).toHaveBeenCalledWith(error, Sub);
+					new Captured('y');
+					expect(capture).toHaveBeenLastCalledWith(expect.any(Captured), Captured);
+					expect(capture).toHaveBeenCalledTimes(2);
+					// The engine is probed once (two stacks), not for every class.
+					const probes = calls;
+					isolated.defineError('OtherError');
+					expect(calls).toBe(probes);
+				});
+			} finally {
+				Error.prepareStackTrace = prepare;
+			}
+		});
+
+		it('probes again when stacks are turned off at the first probe (regression)', function () {
+			const limit = Error.stackTraceLimit;
+			const prepare = Error.prepareStackTrace;
+			const capture = jest.spyOn(Error, 'captureStackTrace');
+			try {
+				jest.isolateModules(function () {
+					const isolated = jest.requireActual<typeof import('.')>('.');
+					Error.stackTraceLimit = 0;
+					const Early = isolated.defineError('EarlyError');
+					Error.stackTraceLimit = limit;
+					new Early('x');
+					expect(capture).not.toHaveBeenCalled();
+					// Now an engine that keeps constructor frames (different stacks for the plain and the derived probe error).
+					let calls = 0;
+					Error.prepareStackTrace = function (error: Error): string {
+						calls++;
+						return `${error.name}: ${calls}`;
+					};
+					const Late = isolated.defineError('LateError');
+					const error = new Late('y');
+					expect(capture).toHaveBeenCalledWith(error, Late);
+				});
+			} finally {
+				Error.stackTraceLimit = limit;
+				Error.prepareStackTrace = prepare;
+			}
+		});
+
+		it('probes once when equal stacks have frames, as V8 writes them', function () {
+			const prepare = Error.prepareStackTrace;
+			let calls = 0;
+			Error.prepareStackTrace = function (error: Error): string {
+				calls++;
+				return `${error.name}\n    at probe (file.js:1:1)`;
+			};
+			try {
+				jest.isolateModules(function () {
+					const isolated = jest.requireActual<typeof import('.')>('.');
+					isolated.defineError('FirstError');
+					expect(calls).toBe(2);
+					isolated.defineError('SecondError');
+					expect(calls).toBe(2);
+				});
+			} finally {
+				Error.prepareStackTrace = prepare;
+			}
+		});
+
+		it('survives a throwing Error.prepareStackTrace', function () {
+			const prepare = Error.prepareStackTrace;
+			Error.prepareStackTrace = function (): never {
+				throw new Error('prepare');
+			};
+			const capture = jest.spyOn(Error, 'captureStackTrace');
+			try {
+				jest.isolateModules(function () {
+					const isolated = jest.requireActual<typeof import('.')>('.');
+					expect(new (isolated.defineError('PreparedError'))('x').message).toBe('x');
+				});
+				expect(capture).not.toHaveBeenCalled();
+			} finally {
+				Error.prepareStackTrace = prepare;
+			}
+		});
+
+		it('does not capture without Error.captureStackTrace', function () {
+			const descriptor = Object.getOwnPropertyDescriptor(Error, 'captureStackTrace') as PropertyDescriptor;
+			const prepare = Error.prepareStackTrace;
+			let calls = 0;
+			Error.prepareStackTrace = function (): string {
+				return String(++calls);
+			};
+			delete (Error as { captureStackTrace?: unknown }).captureStackTrace;
+			try {
+				jest.isolateModules(function () {
+					const isolated = jest.requireActual<typeof import('.')>('.');
+					expect(new (isolated.defineError('NoCaptureError'))('x').message).toBe('x');
+				});
+			} finally {
+				Object.defineProperty(Error, 'captureStackTrace', descriptor);
+				Error.prepareStackTrace = prepare;
+			}
+		});
+
+		it('supports subclasses', function () {
+			class Gone extends NotFound {
+				readonly gone = true;
+				describe(): string {
+					return `${this.name} ${this.status}`;
+				}
+			}
+			const error = new Gone('Gone', { status: 410 });
+			expect(error).toBeInstanceOf(Gone);
+			expect(error).toBeInstanceOf(NotFound);
+			expect(error.describe()).toBe('NotFoundError 410');
+			expect(error.gone).toBe(true);
+			expect(error.code).toBe('E_NOT_FOUND');
+			expect(Gone.code).toBe('E_NOT_FOUND');
+		});
+
+		it('recognises its errors with is(), across copies of the class with the same name and across realms', function () {
+			const error = new NotFound('x');
+			expect(NotFound.is(error)).toBe(true);
+			expect(NotFound.is(new Error('x'))).toBe(false);
+			expect(NotFound.is(Object.assign(new Error('x'), { name: 'NotFoundError' }))).toBe(false);
+			// Another bundle (or version) defining the same error.
+			const Copy = defineError('NotFoundError');
+			expect(Copy.is(error)).toBe(true);
+			expect(NotFound.is(new Copy('x'))).toBe(true);
+			expect(defineError('OtherError').is(error)).toBe(false);
+			const foreign = vm.runInNewContext('Object.defineProperty(new Error("x"), Symbol.for("tinkit.defineError"), { value: "NotFoundError" })');
+			expect(NotFound.is(foreign)).toBe(true);
+			// A brand alone does not make an error.
+			expect(NotFound.is({ [Symbol.for('tinkit.defineError')]: 'NotFoundError' })).toBe(false);
+			for (const value of [null, undefined, 'NotFoundError', 42, NotFound]) expect(NotFound.is(value)).toBe(false);
+			expect(NotFound.is(revoked())).toBe(false);
+			expect(NotFound.is(hostileProxy())).toBe(false);
+			const { is } = NotFound;
+			expect(is(error)).toBe(true);
+			expect([error, new Error('y')].filter(NotFound.is)).toEqual([error]);
+		});
+
+		it('uses instanceof when is() is called on a subclass', function () {
+			class Gone extends NotFound {}
+			expect(Gone.is(new Gone('x'))).toBe(true);
+			expect(Gone.is(new NotFound('x'))).toBe(false);
+			expect(NotFound.is(new Gone('x'))).toBe(true);
+			expect(Gone.is(hostileProxy())).toBe(false);
+			expect(Gone.is(null)).toBe(false);
+		});
+
+		it('serializes and deserializes, rebuilding the class only on opt-in', function () {
+			const original = new NotFound('No user', { cause: new RangeError('inner'), status: 410 });
+			const data = JSON.parse(JSON.stringify(serializeError(original)));
+			expect(data).toEqual({ name: 'NotFoundError', message: 'No user', stack: original.stack, code: 'E_NOT_FOUND', cause: expect.anything(), status: 410 });
+			const plain = deserializeError(data) as Error & Record<string, unknown>;
+			expect(plain).not.toBeInstanceOf(NotFound);
+			expect(NotFound.is(plain)).toBe(false);
+			expect([plain.name, plain.code, plain.status]).toEqual(['NotFoundError', 'E_NOT_FOUND', 410]);
+			const rebuilt = deserializeError(data, { classes: { NotFoundError: NotFound } });
+			expect(rebuilt).toBeInstanceOf(NotFound);
+			expect(util.types.isNativeError(rebuilt)).toBe(true);
+			expect(NotFound.is(rebuilt)).toBe(true);
+			expect(Object.hasOwn(rebuilt, 'name')).toBe(false);
+			expect(rebuilt.cause).toBeInstanceOf(RangeError);
+			expect(rebuilt.stack).toBe(original.stack);
+			expect(serializeError(rebuilt)).toEqual(serializeError(original));
+			expect(Object.keys(rebuilt)).toEqual(Object.keys(original));
+		});
+
+		it('rebuilds nested errors with the classes too, never shadowing what the class defines', function () {
+			class Detailed extends NotFound {
+				get detail(): string {
+					return `detail of ${this.message}`;
+				}
+			}
+			const data = { name: 'Outer', message: 'x', cause: { name: 'NotFoundError', message: 'inner', detail: 'hostile', status: 1 } };
+			const error = deserializeError(data, { classes: { NotFoundError: Detailed, Outer: NotFound } });
+			expect(error).toBeInstanceOf(NotFound);
+			expect(error.name).toBe('Outer');
+			const cause = error.cause as Detailed;
+			expect(cause).toBeInstanceOf(Detailed);
+			expect(cause.detail).toBe('detail of inner');
+			expect(cause.status).toBe(1);
+			expect(deserializeError({ name: 'Error', message: 'x' }, { classes: { NotFoundError: NotFound } })).not.toBeInstanceOf(NotFound);
+			expect(deserializeError({ name: 'TypeError', message: 'x' }, { classes: { TypeError: NotFound } })).toBeInstanceOf(NotFound);
+			const prototype = Object.prototype as Record<string, unknown>;
+			prototype.PollutedError = NotFound;
+			try {
+				expect(deserializeError({ name: 'PollutedError', message: 'x' }, { classes: {} })).not.toBeInstanceOf(NotFound);
+			} finally {
+				delete prototype.PollutedError;
+			}
+		});
+
+		it('validates the classes option', function () {
+			expect(function () {
+				deserializeError({}, { classes: null as never });
+			}).toThrow(new TypeError('deserializeError: `classes` must be an object, got null'));
+			expect(function () {
+				deserializeError({}, { classes: 'x' as never });
+			}).toThrow(new TypeError('deserializeError: `classes` must be an object, got string'));
+			expect(function () {
+				deserializeError({}, { classes: { A: Math.max as never } });
+			}).toThrow(new TypeError('deserializeError: `classes.A` must be a class, got a function without prototype'));
+			expect(function () {
+				deserializeError({}, { classes: { B: 5 as never } });
+			}).toThrow(new TypeError('deserializeError: `classes.B` must be a class, got number'));
+			expect(function () {
+				deserializeError({}, { classes: { C: { prototype: Error.prototype } as never } });
+			}).toThrow(new TypeError('deserializeError: `classes.C` must be a class, got object'));
+			/** A function whose prototype was set to `null`. */
+			function nullPrototype(): void {}
+			nullPrototype.prototype = null;
+			expect(function () {
+				deserializeError({}, { classes: { D: nullPrototype as never } });
+			}).toThrow(new TypeError('deserializeError: `classes.D` must be a class, got a function without prototype'));
+			expect(deserializeError({}, { classes: undefined })).toBeInstanceOf(Error);
+			// A class whose `prototype` cannot be read (regression: the proxy's own error escaped).
+			const unreadable = new Proxy(class extends Error {}, {
+				get: function (): never {
+					throw new Error('get');
+				}
+			});
+			expect(function () {
+				deserializeError({}, { classes: { E: unreadable } });
+			}).toThrow(new TypeError('deserializeError: `classes.E` must be a class, got a function without prototype'));
+		});
+
+		it('never throws on data that picks a hostile class (regression)', function () {
+			class ThrowingName extends Error {
+				override get name(): string {
+					throw new Error('name');
+				}
+			}
+			const named = deserializeError({ name: 'ThrowingName', message: 'x', code: 1 }, { classes: { ThrowingName } }) as ThrowingName & { code?: number };
+			expect(named).toBeInstanceOf(ThrowingName);
+			expect([named.name, named.message, named.code]).toEqual(['ThrowingName', 'x', 1]);
+			/** A class whose prototype is a proxy with throwing traps. */
+			function Hostile(): void {}
+			Hostile.prototype = new Proxy(Object.create(Error.prototype), {
+				get: function (): never {
+					throw new Error('get');
+				},
+				has: function (): never {
+					throw new Error('has');
+				}
+			});
+			const hostile = deserializeError({ name: 'Hostile', message: 'y', code: 2 }, { classes: { Hostile: Hostile as never } });
+			expect(Object.getPrototypeOf(hostile)).toBe(Hostile.prototype);
+			expect(Object.getOwnPropertyDescriptor(hostile, 'name')?.value).toBe('Hostile');
+			expect(Object.getOwnPropertyDescriptor(hostile, 'message')?.value).toBe('y');
+			expect(Object.hasOwn(hostile, 'code')).toBe(false);
+		});
+
+		it('rejects reserved field names', function () {
+			for (const key of [
+				'name',
+				'message',
+				'stack',
+				'cause',
+				'errors',
+				'is',
+				'prototype',
+				'length',
+				'toString',
+				'constructor',
+				'captureStackTrace',
+				'hasOwnProperty',
+				'__proto__',
+				'call'
+			]) {
+				expect(function () {
+					defineError('X', { [key]: 1 });
+				}).toThrow(new RangeError(`defineError: \`options.${key}\` is a reserved field name`));
+			}
+		});
+
+		it('validates its arguments', function () {
+			expect(function () {
+				defineError(1 as never);
+			}).toThrow(new TypeError('defineError: `name` must be a non-empty string, got number'));
+			expect(function () {
+				defineError('');
+			}).toThrow(new RangeError('defineError: `name` must be a non-empty string, got an empty string'));
+			expect(function () {
+				defineError('X', null as never);
+			}).toThrow(new TypeError('defineError: `options` must be an object, got null'));
+			expect(function () {
+				defineError('X', 'code' as never);
+			}).toThrow(new TypeError('defineError: `options` must be an object, got string'));
+			expect(function () {
+				defineError('X', { code: 404 } as never);
+			}).toThrow(new TypeError('defineError: `options.code` must be a string, got number'));
+			expect(defineError('X', undefined).name).toBe('X');
+		});
+	});
+
+	describe('getErrorChain', function () {
+		it('lists the error and its causes, outermost first', function () {
+			const root = new Error('root');
+			const middle = new TypeError('middle', { cause: root });
+			const error = new Error('top', { cause: middle });
+			expect(getErrorChain(error)).toEqual([error, middle, root]);
+			expect(getErrorChain(error)[0]).toBe(error);
+			expect(getErrorChain(root)).toEqual([root]);
+		});
+
+		it('includes a cause that is not an error, and ends there', function () {
+			expect(getErrorChain(new Error('x', { cause: 'disk full' }))[1]).toBe('disk full');
+			expect(getErrorChain(new Error('x', { cause: null })).length).toBe(2);
+			expect(getErrorChain(new Error('x', { cause: 0 }))[1]).toBe(0);
+			const data = { code: 1, cause: { message: 'below' } };
+			expect(getErrorChain(new Error('x', { cause: data }))).toEqual([expect.any(Error), data, data.cause]);
+		});
+
+		it('follows own causes only, ignoring undefined ones', function () {
+			expect(getErrorChain(new Error('x', { cause: undefined })).length).toBe(1);
+			expect(getErrorChain(Object.create({ cause: new Error('inherited') })).length).toBe(1);
+			const prototype = Object.prototype as Record<string, unknown>;
+			prototype.cause = new Error('polluted');
+			try {
+				expect(getErrorChain(new Error('x')).length).toBe(1);
+			} finally {
+				delete prototype.cause;
+			}
+		});
+
+		it('follows the causes of objects only, not of functions', function () {
+			const fn = Object.assign(function () {}, { cause: new Error('never followed') });
+			expect(getErrorChain(fn)).toEqual([fn]);
+			expect(getErrorChain(new Error('x', { cause: fn }))).toEqual([expect.any(Error), fn]);
+			expect(getErrorChain(new AggregateError([fn], 'g'), { aggregate: true })).toEqual([expect.any(AggregateError), fn]);
+		});
+
+		it('accepts anything as the start', function () {
+			expect(getErrorChain('thrown')).toEqual(['thrown']);
+			expect(getErrorChain(undefined)).toEqual([undefined]);
+			const serialized = { name: 'Error', message: 'a', cause: { name: 'Error', message: 'b' } };
+			expect(getErrorChain(serialized)).toEqual([serialized, serialized.cause]);
+		});
+
+		it('walks aggregated errors depth-first only when asked', function () {
+			const a1 = new Error('a1');
+			const a = new Error('a', { cause: a1 });
+			const b = new Error('b');
+			const c = new Error('c');
+			const group = new AggregateError([a, 'raw', b], 'all', { cause: c });
+			expect(getErrorChain(group)).toEqual([group, c]);
+			expect(getErrorChain(group, { aggregate: true })).toEqual([group, a, a1, 'raw', b, c]);
+			expect(getErrorChain(group, { aggregate: false })).toEqual([group, c]);
+			const nested = new AggregateError([group, new AggregateError([b], 'inner')], 'outer');
+			expect(getErrorChain(nested, { aggregate: true }).map(getMessage)).toEqual(['outer', 'all', 'a', 'a1', 'raw', 'b', 'c', 'inner']);
+			const serialized = serializeError(nested, { stack: false });
+			expect(getErrorChain(serialized, { aggregate: true }).map(getMessage)).toEqual(['outer', 'all', 'a', 'a1', 'raw', 'b', 'c', 'inner', 'b']);
+			expect(getErrorChain({ errors: 'not an array' }, { aggregate: true }).length).toBe(1);
+			// Primitives are listed every time they appear.
+			expect(getErrorChain(new AggregateError(['raw', 'raw', null, null], 'g'), { aggregate: true }).slice(1)).toEqual(['raw', 'raw', null, null]);
+		});
+
+		it('is cycle-safe and lists shared errors once', function () {
+			const loop = new Error('loop');
+			loop.cause = loop;
+			expect(getErrorChain(loop)).toEqual([loop]);
+			const a = new Error('a');
+			const b = new Error('b', { cause: a });
+			a.cause = b;
+			expect(getErrorChain(a)).toEqual([a, b]);
+			const shared = new Error('shared');
+			const group = new AggregateError([shared, shared, new Error('c', { cause: shared })], 'g', { cause: shared });
+			expect(getErrorChain(group, { aggregate: true }).length).toBe(3);
+			for (const length of [16, 17, 18, 40]) {
+				const errors = Array.from({ length }, function (_, index) {
+					return new Error(String(index));
+				});
+				errors.forEach(function (item, index) {
+					item.cause = errors[(index + 1) % length];
+				});
+				expect(getErrorChain(errors[0])).toEqual(errors);
+				// A cycle back to the middle of the chain.
+				errors[length - 1].cause = errors[length >> 1];
+				expect(getErrorChain(errors[0])).toEqual(errors);
+				expect(getErrorChain(errors[0], { aggregate: true })).toEqual(errors);
+			}
+		});
+
+		it('limits the depth, at most 1000 levels', function () {
+			const error = errorChain(3);
+			expect(getErrorChain(error, { maxDepth: 0 })).toEqual([error]);
+			expect(getErrorChain(error, { maxDepth: 1 }).length).toBe(2);
+			expect(getErrorChain(error, { maxDepth: 2 }).length).toBe(3);
+			expect(getErrorChain(error, { maxDepth: Infinity }).length).toBe(3);
+			expect(getErrorChain(errorChain(5000)).length).toBe(1001);
+			expect(getErrorChain(errorChain(5000), { maxDepth: 1000 }).length).toBe(1001);
+			expect(getErrorChain(errorChain(5000), { maxDepth: 999 }).length).toBe(1000);
+			const group = new AggregateError([new Error('a', { cause: new Error('a1') })], 'g');
+			expect(getErrorChain(group, { aggregate: true, maxDepth: 1 }).length).toBe(2);
+			expect(getErrorChain(error, { aggregate: true, maxDepth: 1 }).length).toBe(2);
+		});
+
+		it('never throws on hostile objects', function () {
+			const getter = Object.defineProperty(new Error('x'), 'cause', {
+				get: function (): never {
+					throw new Error('cause getter');
+				}
+			});
+			expect(getErrorChain(getter)).toEqual([getter]);
+			const proxy = hostileProxy();
+			const chain = getErrorChain(proxy, { aggregate: true });
+			expect(chain.length).toBe(1);
+			expect(chain[0]).toBe(proxy);
+			const revokedValue = revoked();
+			expect(getErrorChain(new Error('x', { cause: revokedValue }), { aggregate: true })[1]).toBe(revokedValue);
+			const first = new Error('first');
+			const items = new Proxy([first, 'never read'], {
+				get: function (target: unknown[], key: PropertyKey): unknown {
+					if (key === '1') throw new Error('item getter');
+					return Reflect.get(target, key);
+				}
+			});
+			const group = Object.assign(new Error('g'), { errors: items });
+			expect(getErrorChain(group, { aggregate: true })).toEqual([group, first]);
+		});
+
+		it('validates its options', function () {
+			expect(function () {
+				getErrorChain(new Error('x'), { maxDepth: -1 });
+			}).toThrow(new RangeError('getErrorChain: `maxDepth` must be an integer >= 0 or Infinity, got -1'));
+			expect(function () {
+				getErrorChain(new Error('x'), { maxDepth: '1' as never });
+			}).toThrow(new TypeError('getErrorChain: `maxDepth` must be an integer >= 0 or Infinity, got string'));
+		});
+	});
+
+	describe('formatError', function () {
+		it('prints the header like Error.prototype.toString', function () {
+			const options = { stack: false };
+			expect(formatError(new TypeError('Bad input'), options)).toBe('TypeError: Bad input');
+			expect(formatError(new Error(), options)).toBe('Error');
+			expect(formatError(Object.assign(new Error('only message'), { name: '' }), options)).toBe('only message');
+			expect(formatError({ message: 'like' }, options)).toBe('Error: like');
+			expect(formatError({ name: 'Named', message: 'x' }, options)).toBe('Named: x');
+			expect(formatError(Object.assign(new RangeError('x'), { message: 5 }), options)).toBe('RangeError');
+			expect(formatError(Object.assign(new RangeError('x'), { name: 5 }), options)).toBe('Error: x');
+			expect(formatError('Timed out')).toBe('Timed out');
+			expect(formatError(42)).toBe('42');
+			expect(formatError({ code: 1 })).toBe('{"code":1}');
+			expect(formatError(null)).toBe('null');
+			expect(formatError(Object.assign(function named() {}, { message: 'not an error' }))).toBe('[object Function]');
+		});
+
+		it('prints the stack frames under the header, trimmed and indented', function () {
+			const error = new Error('x');
+			error.stack = 'Error: x\n    at a (file.js:1:1)\n\n  at b (file.js:2:2)  ';
+			expect(formatError(error)).toBe('Error: x\n    at a (file.js:1:1)\n    at b (file.js:2:2)');
+			expect(formatError(error, { stack: false })).toBe('Error: x');
+			expect(formatError(error, { stack: true })).toBe('Error: x\n    at a (file.js:1:1)\n    at b (file.js:2:2)');
+			const real = formatError(new RangeError('real')).split('\n');
+			expect(real[0]).toBe('RangeError: real');
+			expect(real[1]).toMatch(/^ {4}at /);
+		});
+
+		it('drops a stale V8 header and keeps frames-only stacks of other engines', function () {
+			const renamed = new Error('old message');
+			renamed.stack = 'Error: old message\n  spanning lines\n    at a (file.js:1:1)';
+			renamed.message = 'new message';
+			expect(formatError(renamed)).toBe('Error: new message\n    at a (file.js:1:1)');
+			const firefox = new Error('x');
+			firefox.stack = 'run@file.js:1:1\n@file.js:2:2\n';
+			expect(formatError(firefox)).toBe('Error: x\n    run@file.js:1:1\n    @file.js:2:2');
+			firefox.stack = 'Error: x\nrun@file.js:1:1';
+			expect(formatError(firefox)).toBe('Error: x\n    run@file.js:1:1');
+			const noStack = { name: 'Plain', message: 'no stack' };
+			expect(formatError(noStack)).toBe('Plain: no stack');
+		});
+
+		it('stays linear on hostile stacks', function () {
+			const error = new Error('x');
+			error.stack = `${'\n'.repeat(200_000)}x`;
+			expect(formatError(error)).toBe('Error: x\n    x');
+		});
+
+		it('indents causes and aggregated errors, recursively', function () {
+			const group = new AggregateError([new TypeError('a', { cause: new SyntaxError('a1') }), new Error('b')], 'all', { cause: new Error('c') });
+			expect(formatError(group, { stack: false })).toBe(
+				['AggregateError: all', '  [1/2] TypeError: a', '    Caused by: SyntaxError: a1', '  [2/2] Error: b', '  Caused by: Error: c'].join('\n')
+			);
+			const error = new Error('top', { cause: 'disk full' });
+			error.stack = 'Error: top\n    at a (file.js:1:1)';
+			const cause = new Error('inner');
+			cause.stack = 'Error: inner\n    at b (file.js:2:2)';
+			expect(formatError(new Error('outer', { cause: Object.assign(cause, { cause: error }) }), { stack: false })).toBe(
+				'Error: outer\n  Caused by: Error: inner\n    Caused by: Error: top\n      Caused by: disk full'
+			);
+			const outer = new Error('outer', { cause });
+			outer.stack = 'Error: outer\n    at c (file.js:3:3)';
+			expect(formatError(outer)).toBe(
+				[
+					'Error: outer',
+					'    at c (file.js:3:3)',
+					'  Caused by: Error: inner',
+					'      at b (file.js:2:2)',
+					'    Caused by: Error: top',
+					'        at a (file.js:1:1)',
+					'      Caused by: disk full'
+				].join('\n')
+			);
+		});
+
+		it('indents the lines of multi-line messages', function () {
+			expect(formatError(new Error('outer', { cause: new Error('line 1\nline 2') }), { stack: false })).toBe('Error: outer\n  Caused by: Error: line 1\n  line 2');
+		});
+
+		it('prints primitives every time they appear', function () {
+			expect(formatError(new AggregateError(['offline', 'offline', null, null], 'g'), { stack: false })).toBe(
+				'AggregateError: g\n  [1/4] offline\n  [2/4] offline\n  [3/4] null\n  [4/4] null'
+			);
+		});
+
+		it('marks cycles and shared errors, printing each error once', function () {
+			const loop = new Error('loop');
+			loop.cause = loop;
+			expect(formatError(loop, { stack: false })).toBe('Error: loop\n  Caused by: [Circular]');
+			const shared = new Error('shared', { cause: new Error('below') });
+			const group = new AggregateError([shared, shared], 'g', { cause: shared });
+			expect(formatError(group, { stack: false })).toBe(
+				[
+					'AggregateError: g',
+					'  [1/2] Error: shared',
+					'    Caused by: Error: below',
+					'  [2/2] Error: shared [Seen above]',
+					'  Caused by: Error: shared [Seen above]'
+				].join('\n')
+			);
+			const a = new Error('a');
+			const b = new Error('b', { cause: a });
+			a.cause = new AggregateError([b], 'between');
+			expect(formatError(a, { stack: false })).toBe('Error: a\n  Caused by: AggregateError: between\n    [1/1] Error: b\n      Caused by: [Circular]');
+		});
+
+		it('truncates below maxDepth, at most 1000 levels', function () {
+			const error = errorChain(3);
+			expect(formatError(error, { stack: false, maxDepth: 0 })).toBe('Error: 0\n  [Truncated]');
+			expect(formatError(error, { stack: false, maxDepth: 2 })).toBe('Error: 0\n  Caused by: Error: 1\n    Caused by: Error: 2');
+			expect(formatError(new AggregateError([new Error('a')], 'g'), { stack: false, maxDepth: 0 })).toBe('AggregateError: g\n  [Truncated]');
+			expect(formatError(new AggregateError([new Error('a', { cause: new Error('b') })], 'g'), { stack: false, maxDepth: 1 })).toBe(
+				'AggregateError: g\n  [1/1] Error: a\n    [Truncated]'
+			);
+			const lines = formatError(errorChain(1500), { stack: false }).split('\n');
+			expect(lines.length).toBe(1002);
+			expect(lines[1000]).toBe(`${'  '.repeat(10)}[depth 1000] Caused by: Error: 1000`);
+			expect(lines[1001]).toBe(`${'  '.repeat(10)}[depth 1001] [Truncated]`);
+			expect(formatError(errorChain(13), { stack: false, maxDepth: 10 }).split('\n').slice(-2)).toEqual([
+				`${'  '.repeat(10)}Caused by: Error: 10`,
+				`${'  '.repeat(10)}[depth 11] [Truncated]`
+			]);
+		});
+
+		it('stops indenting 10 levels down, marking deeper lines with their depth, so the report grows linearly (regression)', function () {
+			const options = { stack: false };
+			const lines = formatError(errorChain(13), options).split('\n');
+			expect(lines.slice(9)).toEqual([
+				`${'  '.repeat(9)}Caused by: Error: 9`,
+				`${'  '.repeat(10)}Caused by: Error: 10`,
+				`${'  '.repeat(10)}[depth 11] Caused by: Error: 11`,
+				`${'  '.repeat(10)}[depth 12] Caused by: Error: 12`
+			]);
+			// Frames, continuation lines, aggregated errors and cycles keep the capped indentation too.
+			const item = new Error('first\nsecond');
+			item.stack = 'Error: first\nsecond';
+			const deepest = new AggregateError([item], 'group');
+			deepest.stack = 'AggregateError: group\n    at a (file.js:1:1)';
+			deepest.cause = deepest;
+			let top: Error = deepest;
+			for (let level = 11; level > 0; level--) {
+				top = new Error(String(level), { cause: top });
+				top.stack = `Error: ${level}`;
+			}
+			expect(formatError(top).split('\n').slice(11)).toEqual([
+				`${'  '.repeat(10)}[depth 11] Caused by: AggregateError: group`,
+				`${'  '.repeat(12)}at a (file.js:1:1)`,
+				`${'  '.repeat(10)}[depth 12] [1/1] Error: first`,
+				`${'  '.repeat(10)}second`,
+				`${'  '.repeat(10)}[depth 12] Caused by: [Circular]`
+			]);
+			// A thousand levels of causes with stacks and multi-line messages: about as many characters per level, not a thousand times more.
+			let error: Error = Object.assign(new Error('root'), { stack: 'Error: root' });
+			for (let level = 0; level < 999; level++) {
+				error = new Error(`level ${level}\nmore`, { cause: error });
+				error.stack = `Error: level ${level}\nmore\n    at f (file.js:1:1)`;
+			}
+			const report = formatError(error);
+			expect(report.split('\n').length).toBe(3 * 999 + 1);
+			expect(report.length).toBeLessThan(1000 * 150);
+		});
+
+		it('never throws on hostile objects', function () {
+			expect(formatError(hostileProxy())).toBe('object');
+			expect(formatError(revoked())).toBe('object');
+			expect(formatError(throwingGetters)).toBe('[object Object]');
+			const error = new Error('x', { cause: revoked() });
+			error.stack = 'Error: x';
+			expect(formatError(error)).toBe('Error: x\n  Caused by: object');
+		});
+
+		it('validates its options', function () {
+			expect(function () {
+				formatError(new Error('x'), { maxDepth: NaN });
+			}).toThrow(new RangeError('formatError: `maxDepth` must be an integer >= 0 or Infinity, got NaN'));
+		});
+	});
+});
+
+/**
+ * Reads the message of an error, or describes another value.
+ * @param {unknown} value - The value
+ * @returns {string} Its message
+ */
+function getMessage(value: unknown): string {
+	return getErrorMessage(value);
+}
