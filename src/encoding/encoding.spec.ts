@@ -425,6 +425,15 @@ describe('encoding', function () {
 			});
 		});
 
+		it('should find lone surrogates without the native isWellFormed too', function () {
+			without(String.prototype, 'isWellFormed', function () {
+				expect(function () {
+					helpers.encodeUtf8('ab\uD800', { fatal: true });
+				}).toThrow(new TypeError('encodeUtf8: `text` must be well-formed UTF-16, got a lone surrogate "\\ud800" at index 2'));
+				expect(Array.from(helpers.encodeUtf8('😀', { fatal: true }))).toEqual([0xf0, 0x9f, 0x98, 0x80]);
+			});
+		});
+
 		it('should create a new encoder when the global TextEncoder changes', function () {
 			const Native = globalThis.TextEncoder;
 			let created = 0;
@@ -1039,6 +1048,11 @@ describe('decodeJwt', function () {
 		expect(({} as Record<string, unknown>).admin).toBeUndefined();
 		// Hidden behind an escape too.
 		expect(helpers.decodeJwt(token('{}', '{"\\u005f_proto__":{"admin":true}}')).payload).toEqual({});
+		expect(helpers.decodeJwt(token('{}', '{"\\u0063onstructor":{"prototype":{"admin":true}},"a":1}')).payload).toEqual({ a: 1 });
+		// A `constructor` key without any `__proto__` text.
+		expect(helpers.decodeJwt(token('{}', '{"constructor":{"prototype":{"admin":true}},"a":1}')).payload).toEqual({ a: 1 });
+		// An escape that spells another key leaves it as it is.
+		expect(helpers.decodeJwt(token('{}', '{"\\u0061":"\\n"}')).payload).toEqual({ a: '\n' });
 	});
 
 	it('should reject tokens that are not three base64url parts', function () {
@@ -1111,6 +1125,17 @@ describe('decodeJwt', function () {
 			expect(helpers.getJwtExpiration(EXPIRING)).toEqual(new Date(1_700_000_000_000));
 			expect(helpers.getJwtExpiration(token('{}', '{"exp":1.5}'))).toEqual(new Date(1500));
 			expect(helpers.getJwtExpiration(ETERNAL)).toBeUndefined();
+		});
+
+		it('should ignore an exp claim inherited from a polluted Object.prototype (regression)', function () {
+			Object.defineProperty(Object.prototype, 'exp', { value: 1, configurable: true, writable: true });
+			try {
+				expect(helpers.getJwtExpiration(ETERNAL)).toBeUndefined();
+				expect(helpers.isJwtExpired(ETERNAL, { now: 1_700_000_000_000 })).toBe(false);
+				expect(helpers.getJwtExpiration(EXPIRING)).toEqual(new Date(1_700_000_000_000));
+			} finally {
+				delete (Object.prototype as Record<string, unknown>).exp;
+			}
 		});
 
 		it('should reject an exp claim that is not a time', function () {
@@ -1500,6 +1525,20 @@ describe('toCsv', function () {
 		expect(function () {
 			helpers.toCsv([{ a: 1 }, { 'b"': [] as never }]);
 		}).toThrow(new TypeError('toCsv: `rows[1]["b\\""]` must be a string, number, bigint, boolean, null or undefined, got object'));
+	});
+
+	it('should write a hole as an empty field, never a value of a polluted Array.prototype (regression)', function () {
+		// oxlint-disable-next-line no-sparse-arrays
+		expect(helpers.toCsv([['a', , 'b'], [,], ['c']])).toBe('a,,b\r\n""\r\nc');
+		expect(helpers.toCsv([new Array(1)])).toBe('""');
+		expect(helpers.parseCsv(helpers.toCsv([new Array(1), ['c']]), { skipEmptyLines: true })).toEqual([[''], ['c']]);
+		Object.defineProperty(Array.prototype, 1, { value: '=HYPERLINK("x")', configurable: true, writable: true });
+		try {
+			// oxlint-disable-next-line no-sparse-arrays
+			expect(helpers.toCsv([['a', , 'b']])).toBe('a,,b');
+		} finally {
+			delete (Array.prototype as unknown as Record<number, unknown>)[1];
+		}
 	});
 
 	it('should reject rows that are not all arrays or all records', function () {
@@ -2114,6 +2153,12 @@ describe('signJwt / verifyJwt', function () {
 				[{ issuer: 1 as never }, new TypeError('verifyJwt: `issuer` must be a string or an array of strings, got number')],
 				[{ audience: [] }, new RangeError('verifyJwt: `audience` must not be an empty array')],
 				[{ audience: null as never }, new TypeError('verifyJwt: `audience` must be a string or an array of strings, got null')],
+				// A hole is not a string: skipping it would accept a token without the claim (regression).
+				// oxlint-disable-next-line no-sparse-arrays
+				[{ audience: [, 'api'] as never }, new TypeError('verifyJwt: `audience` must be a string or an array of strings, got object')],
+				[{ audience: new Array(1) }, new TypeError('verifyJwt: `audience` must be a string or an array of strings, got object')],
+				// oxlint-disable-next-line no-sparse-arrays
+				[{ issuer: ['a', ,] as never }, new TypeError('verifyJwt: `issuer` must be a string or an array of strings, got object')],
 				[{ subject: 1 as never }, new TypeError('verifyJwt: `subject` must be a string, got number')],
 				[{ typ: 1 as never }, new TypeError('verifyJwt: `typ` must be a string, got number')]
 			];

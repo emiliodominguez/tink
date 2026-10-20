@@ -240,6 +240,18 @@ describe('Encoding helpers (property-based)', function () {
 				})
 			);
 		});
+
+		it('should equal node:crypto for views at any offset, over several blocks', function () {
+			fc.assert(
+				fc.property(fc.uint8Array({ minLength: 1, maxLength: 1200 }), fc.nat(), fc.nat(), function (data, at, size) {
+					const start = at % data.length;
+					const view = data.subarray(start, start + (size % (data.length - start + 1)));
+					const expected = createHash('sha256').update(view).digest('hex');
+					expect(helpers.sha256Hex(view)).toBe(expected);
+					expect(helpers.sha256Hex(new DataView(view.buffer, view.byteOffset, view.byteLength))).toBe(expected);
+				})
+			);
+		});
 	});
 
 	describe('timingSafeEqual', function () {

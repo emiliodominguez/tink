@@ -1,6 +1,6 @@
-import { createHmac, timingSafeEqual as nodeTimingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual as nodeTimingSafeEqual } from 'node:crypto';
 import { crc32 as zlibCrc32 } from 'node:zlib';
-import { crc32, hmacSha256, signJwt, verifyJwt } from 'tinkit/encoding';
+import { crc32, decodeJwt, encodeUtf8, hmacSha256, sha256, signJwt, toCsv, verifyJwt } from 'tinkit/encoding';
 
 // Inputs: a short message (a JWT signing input or a webhook body), 1 kB and 64 kB of pseudo-random bytes.
 /**
@@ -23,6 +23,10 @@ const key = bytes(32);
 const secret = 'a-string-secret-at-least-256-bits-long';
 const claims = { sub: 'user-123', role: 'admin', scope: ['read', 'write'] };
 const token = signJwt(claims, secret, { expiresIn: 3600 });
+const records = Array.from({ length: 1000 }, function (_, i) {
+	return { id: i, name: `name ${i}`, email: `u${i}@example.com`, score: i * 1.5, active: i % 2 === 0, note: 'hello, "world"' };
+});
+const text = 'hello world, ünïcödé ✓ '.repeat(40);
 
 /**
  * The textbook CRC-32: eight shift-and-xor steps per byte, no table.
@@ -86,6 +90,19 @@ function nodeVerify() {
 export default [
 	...Object.entries(sizes).map(function ([label, data]) {
 		return {
+			name: `sha256 (${label})`,
+			fn: function () {
+				return sha256(data);
+			},
+			competitors: {
+				'node:crypto createHash': function () {
+					return createHash('sha256').update(data).digest();
+				}
+			}
+		};
+	}),
+	...Object.entries(sizes).map(function ([label, data]) {
+		return {
 			name: `hmacSha256 (${label})`,
 			fn: function () {
 				return hmacSha256(key, data);
@@ -129,5 +146,35 @@ export default [
 			return verifyJwt(token, secret);
 		},
 		competitors: { 'node:crypto by hand': nodeVerify }
+	},
+	{
+		name: 'decodeJwt (3 claims)',
+		fn: function () {
+			return decodeJwt(token);
+		},
+		competitors: {
+			'Buffer + JSON.parse by hand': function () {
+				const [header, payload] = token.split('.');
+				return { header: JSON.parse(Buffer.from(header, 'base64url').toString()), payload: JSON.parse(Buffer.from(payload, 'base64url').toString()) };
+			}
+		}
+	},
+	{
+		name: 'toCsv (1,000 records × 6 columns)',
+		fn: function () {
+			return toCsv(records);
+		}
+	},
+	{
+		name: 'encodeUtf8 (1 kB, fatal)',
+		fn: function () {
+			return encodeUtf8(text, { fatal: true });
+		},
+		competitors: {
+			'TextEncoder after isWellFormed': function () {
+				if (!text.isWellFormed()) throw new TypeError('lone surrogate');
+				return new TextEncoder().encode(text);
+			}
+		}
 	}
 ];
