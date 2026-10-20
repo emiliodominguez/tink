@@ -49,6 +49,8 @@ export interface JsonWalk {
 	count?: number;
 	/** The number of items and members converted so far. */
 	values?: number;
+	/** Whether the JSON of a container converted earlier was used again: the tree then shares it between several places. */
+	shared?: boolean;
 }
 
 /**
@@ -268,7 +270,10 @@ function toJsonObject(value: object, walk: JsonWalk): JsonValue {
 	// The JSON of a container already converted at this depth: a replacer sees the holder and key of each path, so it disables this.
 	const entry = walk.replacer === undefined ? walk.converted?.get(value) : undefined;
 	const known = entry === undefined ? undefined : Array.isArray(entry) ? (entry[0] === depth ? entry[1] : undefined) : entry.get(depth);
-	if (known !== undefined) return known;
+	if (known !== undefined) {
+		walk.shared = true;
+		return known;
+	}
 	const outer = walk.dependent;
 	const before = (walk.count = (walk.count ?? 0) + 1);
 	const values = walk.values ?? 0;

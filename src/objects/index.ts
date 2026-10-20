@@ -4838,8 +4838,9 @@ export function safeStringify(value: unknown, options: SafeStringifyOptions = {}
 		if (tree === undefined) return undefined;
 		try {
 			// The tree holds plain objects and arrays only: `JSON.stringify` writes it faster, unless a `toJSON` was planted on their
-			// prototypes or the keys must be written in another order than the tree's.
-			return keys === undefined && !sort && !('toJSON' in Array.prototype)
+			// prototypes, the keys must be written in another order than the tree's, or the tree shares nodes (a value sharing objects),
+			// which `JSON.stringify` would write once per path: in exponential time before refusing too long a text.
+			return keys === undefined && !sort && walk.shared !== true && !('toJSON' in Array.prototype)
 				? JSON.stringify(tree, undefined, gap)
 				: writeJson(tree, '', { gap, keys, sort, texts: new Map() });
 		} catch (error) {

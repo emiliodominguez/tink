@@ -4519,6 +4519,28 @@ describe('safeStringify', function () {
 		expect(helpers.safeStringify({ a: node, b: { c: node } }, { maxDepth: 1 })).toBe('{"a":{"a":"[Array]"},"b":{"c":"[Object]"}}');
 	});
 
+	it('writes a tree sharing its nodes once per node (regression: once per path, minutes before the RangeError)', function () {
+		let shared: object = { v: 'x'.repeat(100) };
+		for (let level = 0; level < 16; level++) shared = { l: shared, r: shared };
+		const expected = JSON.stringify(shared, undefined, 1);
+		const stringify = jest.spyOn(JSON, 'stringify');
+		try {
+			expect(helpers.safeStringify(shared, { space: 1 })).toBe(expected);
+			// Strings and primitives only: the shared tree itself is not handed to `JSON.stringify`, which would write it once per path.
+			expect(
+				stringify.mock.calls.every(function ([value]) {
+					return typeof value !== 'object' || value === null;
+				})
+			).toBe(true);
+		} finally {
+			stringify.mockRestore();
+		}
+		for (let level = 16; level < 30; level++) shared = { l: shared, r: shared };
+		expect(function () {
+			helpers.safeStringify(shared);
+		}).toThrow(RangeError);
+	});
+
 	it('refuses an array too long for its text at once, instead of running out of memory', function () {
 		const sparse: unknown[] = [];
 		sparse.length = 2 ** 32 - 1;
