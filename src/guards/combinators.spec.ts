@@ -1,4 +1,5 @@
 import * as vm from 'vm';
+import { safeParse } from '../validate/index.js';
 import {
 	explain,
 	ensure,
@@ -31,6 +32,7 @@ import {
 	isSafeInteger,
 	isShape,
 	isString,
+	issuesByPath,
 	isTruthy,
 	isTuple,
 	isUnion,
@@ -301,6 +303,17 @@ describe('isIntersection', function () {
 			{ message: 'Invalid value (got string)', path: [] },
 			{ message: 'custom', path: [] }
 		]);
+		// Paths whose text is the same: two symbols of one description, and a key holding `\0` next to the path it would join to.
+		const first = Symbol('key');
+		const second = Symbol('key');
+		expect(explain(isIntersection(isShape({ [first]: isString }), isShape({ [second]: isString })), { [first]: 1, [second]: 2 })).toEqual([
+			{ message: 'Invalid value (got number)', path: [first] },
+			{ message: 'Invalid value (got number)', path: [second] }
+		]);
+		expect(explain(isIntersection(isShape({ 'a\0b': isString }), isShape({ a: isShape({ b: isString }) })), { 'a\0b': 1, a: { b: 2 } })).toEqual([
+			{ message: 'Invalid value (got number)', path: ['a\0b'] },
+			{ message: 'Invalid value (got number)', path: ['a', 'b'] }
+		]);
 	});
 
 	it('should validate its arguments', function () {
@@ -563,7 +576,8 @@ describe('isLazy', function () {
 		);
 		expect(explain(isProbed, shared)).toEqual([{ message: 'Invalid value (got string)', path: ['id'] }]);
 
-		// Two `explain` calls within one outer check (as the validate module makes): the second reports what the first did.
+		// Two `explain` calls made by a guard while a lazy guard checks a value: nested in that check, as they would be in an `explain`, the
+		// second gives the pointer issue (the validate module's several explains of one parse are outermost calls: see its tests).
 		const reports: unknown[] = [];
 		const isProbe = isLazy(function () {
 			return function (value: unknown): value is object {
@@ -573,7 +587,76 @@ describe('isLazy', function () {
 			};
 		});
 		expect(isProbe(shared)).toBe(true);
-		expect(reports).toEqual([[{ message: 'Invalid value (got string)', path: ['id'] }], [{ message: 'Invalid value (got string)', path: ['id'] }]]);
+		expect(reports).toEqual([
+			[{ message: 'Invalid value (got string)', path: ['id'] }],
+			[{ message: 'Invalid value (same object as reported at another path)', path: [] }]
+		]);
+		// Outside any check, each call is an outermost one.
+		expect([explain(isItem, shared), explain(isItem, shared)]).toEqual([
+			[{ message: 'Invalid value (got string)', path: ['id'] }],
+			[{ message: 'Invalid value (got string)', path: ['id'] }]
+		]);
+	});
+
+	it('should stay linear when a guard parses or explains a level after checking the levels below it (plain checks and parses)', function () {
+		let calls = 0;
+		/**
+		 * The id check, counting its calls.
+		 * @param {unknown} value - The value to check
+		 * @returns {boolean} Whether it is an integer
+		 */
+		function isId(value: unknown): value is number {
+			calls++;
+
+			return Number.isInteger(value);
+		}
+		// `c` is checked first: its parse checks the levels below (the guard runs before the report), then explains them.
+		const isParsed: Guard<unknown> = isLazy(function () {
+			return isShape({
+				c: isOptional(function (value: unknown): value is object {
+					return safeParse(isParsed, value)[0] === undefined;
+				}),
+				id: isId,
+				a: isOptional(isParsed)
+			});
+		});
+		// A union falling back on a member explaining the child the first member rejected.
+		const isLegacy: Guard<unknown> = isLazy(function () {
+			return isUnion(isShape({ id: isId, a: isOptional(isLegacy) }), function (value: unknown): value is object {
+				return isPlainObject(value) && value.a !== undefined && explain(isLegacy, value.a).length === 0;
+			});
+		});
+		/**
+		 * A chain of `length` levels, whose last id is invalid.
+		 * @param {number} length - The number of levels
+		 * @returns {Record<string, unknown>} The chain
+		 */
+		function chainOf(length: number): Record<string, unknown> {
+			let node: Record<string, unknown> = { id: 'x' };
+			for (let id = length; id > 0; id--) node = { id, a: node, c: node };
+
+			return node;
+		}
+		const parses = [isParsed, isLegacy].map(function (guard: Guard<unknown>) {
+			return function (value: unknown): unknown {
+				return safeParse(guard, value);
+			};
+		});
+
+		for (const run of [isParsed, isLegacy, ...parses]) {
+			const counts = [200, 400].map(function (length: number): number {
+				calls = 0;
+				run(chainOf(length));
+
+				return calls;
+			});
+
+			// Linear: the reports explaining each level again made it quadratic (160,000 calls for 400 levels, and seconds).
+			expect(counts[1]).toBeLessThanOrEqual(2.1 * counts[0]);
+		}
+		const chain = chainOf(400);
+		const [error] = safeParse(isParsed, chain);
+		expect(error?.issues[0]).toEqual({ message: 'Invalid value (got object)', path: ['c'] });
 	});
 
 	it('should not reuse a verdict across the discriminated and plain uses of an object by a lazy exact shape', function () {
@@ -981,6 +1064,36 @@ describe('isJsonValue / isJsonObject / isJsonArray', function () {
 		);
 	});
 
+	it('should walk a large container of primitives held in many places once (a list of aliases of one long list)', function () {
+		let reads = 0;
+		const row: Record<string, unknown> = {};
+		for (let index = 0; index < 100; index++) row[`k${index}`] = index;
+		Object.defineProperty(row, 'k0', {
+			enumerable: true,
+			get(): number {
+				reads++;
+
+				return 0;
+			}
+		});
+		const table = Array<unknown>(1000).fill(row);
+
+		expect(isJsonValue(table)).toBe(true);
+		expect(reads).toBe(1);
+
+		// Invalid: 1000 issues once, then one pointer issue per other place (not 1000 issues per place).
+		const bad = Array<number>(1000).fill(NaN);
+		const issues = explain(isJsonArray, Array<unknown>(1000).fill(bad));
+
+		expect(issues).toHaveLength(1000 + 999);
+		expect(issues[1000]).toEqual({ message: 'Invalid value (same object as reported at another path)', path: [1] });
+		// A small one is checked, and reported, again at each place.
+		expect(explain(isJsonValue, [[NaN], [NaN]].fill([NaN]))).toEqual([
+			{ message: 'Expected a finite number (got NaN)', path: [0, 0] },
+			{ message: 'Expected a finite number (got NaN)', path: [1, 0] }
+		]);
+	});
+
 	it('should handle very deep values without overflowing the stack', function () {
 		let deep: unknown = 1;
 
@@ -1278,6 +1391,34 @@ describe('guards (pass 3 regressions)', function () {
 		if (isNonEmptyArray(list)) {
 			const first: string | number = list[0];
 			expect(first).toBe(1);
+		}
+	});
+});
+
+describe('guards (pass 4 regressions)', function () {
+	it('reads the exact option of isShape as an option, not from a polluted Object.prototype', function () {
+		const proto = Object.prototype as unknown as Record<string, unknown>;
+		proto.exact = true;
+		try {
+			expect(isShape({ a: isString }, {})({ a: 'x', b: 1 })).toBe(true);
+			expect(isShape({ a: isString }, { exact: true })({ a: 'x', b: 1 })).toBe(false);
+		} finally {
+			delete proto.exact;
+		}
+	});
+
+	it('reads a hole of the issues given to issuesByPath as undefined, not as an issue planted on a polluted prototype', function () {
+		const proto = Array.prototype as unknown as Record<number, unknown>;
+		const sparse: unknown[] = [];
+		sparse[1] = { message: 'Too short', path: ['name'] };
+		proto[0] = { message: 'planted', path: ['x'] };
+		try {
+			expect(function () {
+				issuesByPath(sparse as never);
+			}).toThrow(TypeError);
+			expect(issuesByPath([{ message: 'Too short', path: ['name'] }])).toEqual({ name: ['Too short'] });
+		} finally {
+			delete proto[0];
 		}
 	});
 });

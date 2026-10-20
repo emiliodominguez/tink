@@ -772,8 +772,8 @@ type KeyForms<K> = K extends number ? K | `${K}` : K extends `${infer N extends 
 
 /**
  * Checks whether `key` is an OWN property key of `object` (string, number or symbol; enumerable or not), narrowing
- * `key` to `keyof T` (with its other form for a numeric key: `isKeyOf({ 0: 'a' }, key)` narrows `key` to `0 | '0'`). Inherited keys such as `'toString'` or `'__proto__'` are rejected, which makes it safe to use
- * before indexing with untrusted keys. Like every type predicate, the `false` branch removes the keys of `T` from the type of `key`,
+ * `key` to `keyof T` (with its other form for a numeric key: `isKeyOf({ 0: 'a' }, key)` narrows `key` to `0 | '0'`). Inherited keys
+ * such as `'toString'` or `'__proto__'` are rejected, which makes it safe to use before indexing with untrusted keys. Like every type predicate, the `false` branch removes the keys of `T` from the type of `key`,
  * although optional keys that are absent and inherited ones (class methods) also return `false`: test `typeof key` there instead.
  * @template T - The object type
  * @param {T} object - The object whose keys are checked
@@ -1644,7 +1644,10 @@ export function isShape<S extends ShapeGuards>(shape: S, options?: IsShapeOption
 		return guard;
 	});
 
-	return shapeGuard(keys, guards, undefined, options?.exact === true ? new Set<PropertyKey>(keys) : undefined) as (value: unknown) => value is ShapeType<S>;
+	// Read as an option: `{}` is not exact under a polluted `Object.prototype.exact`.
+	return shapeGuard(keys, guards, undefined, options != null && readOption(options, 'exact') === true ? new Set<PropertyKey>(keys) : undefined) as (
+		value: unknown
+	) => value is ShapeType<S>;
 }
 
 /**
@@ -2404,7 +2407,8 @@ export function isIntersection<const G extends ReadonlyArray<Guard<unknown>>>(..
 								return samePath(other.path, issue.path);
 							})
 						) {
-							seen.set(id, same).get(id)?.push(issue);
+							seen.set(id, same);
+							same.push(issue);
 							issues.push(issue);
 						}
 					}
@@ -2948,7 +2952,9 @@ export function issuesByPath(issues: ReadonlyArray<StandardSchemaIssue>): Record
 
 	const grouped: Record<string, string[]> = Object.create(null);
 
-	for (const issue of issues) {
+	for (let index = 0; index < issues.length; index++) {
+		// A hole is `undefined` (rejected as such), not an issue planted on a polluted `Array.prototype` or `Object.prototype`.
+		const issue = hasOwn.call(issues, index) ? issues[index] : (undefined as never);
 		// An own `path` only: a root issue of another library may have none, and must not take one planted on `Object.prototype`.
 		const key = (readOption(issue, 'path') ?? [])
 			.map(function (segment: PropertyKey | { readonly key: PropertyKey }): string {
