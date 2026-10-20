@@ -89,8 +89,9 @@ const NO_INSTANCE: object = {};
  * @returns {boolean} `true` for a standard decorator context
  */
 function isStandardContext(value: unknown): value is StandardContext {
-	// Legacy decorators receive a property key (a string or symbol, whose `kind` is undefined) instead.
-	return typeof (value as { kind?: unknown } | null | undefined)?.kind === 'string';
+	// Legacy decorators receive a property key (a string or symbol) instead: never read its `kind`, which a polluted `Object.prototype`
+	// could define.
+	return typeof value === 'object' && value !== null && typeof (value as { kind?: unknown }).kind === 'string';
 }
 
 /**
@@ -454,13 +455,13 @@ export interface MemoizeMethodOptions {
 }
 
 /**
- * Creates the method wrapper of the {@link memoize} decorator.
- * @param {MemoizeMethodOptions} options - The validated options
+ * Creates the method wrapper of the {@link memoize} decorator. The options are passed one by one, already read: destructuring an options
+ * object (even `{}`) would read a value planted on a polluted `Object.prototype`.
+ * @param {MemoizeMethodOptions['resolver']} resolver - The validated `resolver` option, if any
+ * @param {MemoizeMethodOptions['createCache']} createCache - The validated `createCache` option, if any
  * @returns {MethodWrapper} The wrapper
  */
-function memoizeWrapper(options: MemoizeMethodOptions): MethodWrapper {
-	const { resolver, createCache } = options;
-
+function memoizeWrapper(resolver: MemoizeMethodOptions['resolver'], createCache: MemoizeMethodOptions['createCache']): MethodWrapper {
 	return function (method: UnknownMethod): UnknownMethod {
 		return perInstance(function (): UnknownMethod {
 			// The resolver's public type only constrains what callers may pass; it is called with the method's arguments.
@@ -523,7 +524,7 @@ export function memoize(options: MemoizeMethodOptions): UniversalMethodDecorator
  */
 export function memoize(targetOrValue: unknown, keyOrContext?: unknown, descriptor?: unknown): unknown {
 	// Decorators always receive a key or a context: a lone argument is the options of the factory form.
-	if (keyOrContext !== undefined) return decorateMethod('memoize', (wrapMemoizeDefault ??= memoizeWrapper({})), targetOrValue, keyOrContext, descriptor);
+	if (keyOrContext !== undefined) return decorateMethod('memoize', (wrapMemoizeDefault ??= memoizeWrapper(undefined, undefined)), targetOrValue, keyOrContext, descriptor);
 
 	if (typeof targetOrValue !== 'object' || targetOrValue === null) throw new TypeError(`@memoize: \`options\` must be an object, got ${describe(targetOrValue)}`);
 
@@ -534,7 +535,7 @@ export function memoize(targetOrValue: unknown, keyOrContext?: unknown, descript
 	if (resolver !== undefined) assertFunction('@memoize', 'options.resolver', resolver);
 	if (createCache !== undefined) assertFunction('@memoize', 'options.createCache', createCache);
 
-	return createMethodDecorator('memoize', memoizeWrapper({ resolver, createCache }));
+	return createMethodDecorator('memoize', memoizeWrapper(resolver, createCache));
 }
 
 /**
@@ -553,7 +554,9 @@ let wrapMemoizeDefault: MethodWrapper | undefined;
  *   it as a (non-enumerable, writable) own property of that instance. Accessing it through the prototype returns the unbound method,
  *   and `super.method` accesses from an overriding subclass bind without caching (so the override is not shadowed). On non-extensible
  *   (e.g. frozen) instances, a freshly bound method is returned on every access. Read through a `Proxy` (a reactive store), it is
- *   bound to the proxy, which is what the getter receives, and cached on the target through it.
+ *   bound to the proxy, which is what the getter receives, and cached on the target through it. A static method is bound to the class
+ *   it is read from, subclasses at any depth included, each keeping its bound method internally (not as an own property, which its own
+ *   subclasses would inherit).
  * - Standard decorators: an initializer binds the method on each new instance (unless a subclass overrides it); static methods get the
  *   lazy getter above, so a subclass inheriting one binds it to the subclass. Private methods are rejected.
  *   When combining decorators, put `@bound` first (outermost), so that it sees the final method.
@@ -637,9 +640,9 @@ function bindingAccessor(method: UnknownMethod, key: string | symbol, enumerable
 	function get(this: unknown): UnknownMethod {
 		if (!isObjectLike(this) || isPrototypeObject(this)) return method;
 
-		// The object that holds this accessor (a class, for a static method) keeps it: an own copy would be inherited by subclasses,
-		// which must bind the method to themselves.
-		if (Object.getOwnPropertyDescriptor(this, key)?.get === get) {
+		// A class (a static method, read from the class that holds this accessor or from any subclass) and the object that holds this
+		// accessor keep their bound method here: an own copy would be inherited by their subclasses, which must bind the method to themselves.
+		if (typeof this === 'function' || Object.getOwnPropertyDescriptor(this, key)?.get === get) {
 			let ownerBound = owners.get(this);
 			if (ownerBound === undefined) {
 				ownerBound = method.bind(this) as UnknownMethod;
@@ -945,9 +948,9 @@ export function timeout(ms: number, message?: string): AsyncMethodDecorator {
 
 /**
  * Caches the value a `@lazy` getter computed as a data property of the instance, which then shadows the getter: later reads are plain
- * property reads. Not done (the caller keeps the value in its `WeakMap` instead) on the object that holds the getter (a class, for a static
- * getter), on a prototype (the value would be shared by every instance), when the getter runs for a subclass's override through `super`
- * (the own value would shadow the override), or on non-extensible (frozen, sealed) objects.
+ * property reads. Not done (the caller keeps the value in its `WeakMap` instead) on a class (a static getter: its subclasses would inherit
+ * the value), on the object that holds the getter, on a prototype (the value would be shared by every instance), when the getter runs for a
+ * subclass's override through `super` (the own value would shadow the override), or on non-extensible (frozen, sealed) objects.
  * @param {object} owner - The object the getter was read from
  * @param {string | symbol} key - The getter's key
  * @param {unknown} value - The computed value
@@ -955,7 +958,8 @@ export function timeout(ms: number, message?: string): AsyncMethodDecorator {
  * @returns {boolean} Whether the value was defined on `owner`
  */
 function cacheOnInstance(owner: object, key: string | symbol, value: unknown, get: UnknownMethod): boolean {
-	if (Object.prototype.hasOwnProperty.call(owner, key) || isPrototypeObject(owner)) return false;
+	// A class (a static getter): its subclasses inherit its own properties, and must compute their own value.
+	if (typeof owner === 'function' || Object.prototype.hasOwnProperty.call(owner, key) || isPrototypeObject(owner)) return false;
 	// (`resolveDescriptor` finds nothing on a `null` prototype.)
 	if (resolveDescriptor(Object.getPrototypeOf(owner) as object, key)?.get !== get) return false;
 	// Non-enumerable and read-only, like the getter it replaces (no setter: assigning throws in strict mode); configurable, so that deleting
@@ -998,8 +1002,8 @@ function lazyGetter(getter: UnknownMethod, key: string | symbol | undefined): Un
  * - **Public getters:** the value is stored as a non-enumerable, read-only own property of the instance, which shadows the getter, so
  *   later reads cost exactly what reading a plain property does (`delete instance.key` makes the next read compute it again). Instances
  *   that cannot hold it (frozen or sealed ones), and reads through `super` from a subclass's overriding getter, keep the value in a
- *   `WeakMap` instead (garbage-collected with the instance); so does the object holding the getter itself (a class, for a static
- *   getter, so each subclass computes its own value) and a prototype read directly. `Object.keys` and `JSON.stringify` are unaffected.
+ *   `WeakMap` instead (garbage-collected with the instance); so do classes (for a static getter, so that each subclass, at any depth,
+ *   computes its own value) and a prototype read directly. `Object.keys` and `JSON.stringify` are unaffected.
  * - **Private getters** (`get #key()`, standard decorators): the value is kept in a `WeakMap`.
  * - A setter of the same name is not supported: legacy decorators reject the pair, and with standard decorators (which cannot see it) the
  *   cached own property would shadow it.

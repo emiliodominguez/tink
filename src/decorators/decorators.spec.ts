@@ -1065,6 +1065,20 @@ describe('Decorators (round 2)', function () {
 			expect(staticBound()).toBe('LaterEdge');
 		});
 
+		it('should bind an inherited static method to each subclass at any depth (regression: a subclass of a subclass got its parent)', function () {
+			class Middle extends Edge {}
+			class Leaf extends Middle {}
+
+			const { staticBound: middleBound } = Middle;
+			expect(middleBound()).toBe('Middle');
+			expect(Middle.staticBound).toBe(middleBound);
+			expect(Object.hasOwn(Middle, 'staticBound')).toBe(false);
+			// Previously `Middle` kept its bound method as an own property, which `Leaf` inherited: 'Middle'.
+			const { staticBound: leafBound } = Leaf;
+			expect(leafBound()).toBe('Leaf');
+			expect(Leaf.staticBound).toBe(leafBound);
+		});
+
 		it('should bind standard static methods lazily, so subclasses bind them to themselves', function () {
 			const { context, runInitializers } = fakeContext('method', 'who', { static: true });
 			/**
@@ -1227,6 +1241,54 @@ describe('Decorators (security)', function () {
 			}
 		});
 
+		it('should ignore a resolver or cache factory planted on Object.prototype before the first bare @memoize (regression)', function () {
+			const prototype = Object.prototype as Record<string, unknown>;
+			const shared = new Map<unknown, unknown>();
+			prototype.resolver = function (): string {
+				return 'same key';
+			};
+			prototype.createCache = function (): Map<unknown, unknown> {
+				return shared;
+			};
+			try {
+				let fresh!: typeof decorators;
+				// A fresh module: the bare decorator's wrapper is created on its first use, which must not read the planted options.
+				jest.isolateModules(function () {
+					// eslint-disable-next-line @typescript-eslint/no-require-imports -- a fresh copy of the module
+					fresh = require('.') as typeof decorators;
+				});
+				const spy = jest.fn(function (n: number): number {
+					return n * 2;
+				});
+				const wrapped = fresh.memoize(spy, fakeContext('method', 'm').context);
+				const self = {};
+				// Previously both calls hit the planted resolver's single key, in the planted (shared) cache: 2, 2.
+				expect([wrapped.call(self, 1), wrapped.call(self, 2), wrapped.call(self, 1)]).toEqual([2, 4, 2]);
+				expect(spy).toHaveBeenCalledTimes(2);
+				expect(shared.size).toBe(0);
+			} finally {
+				delete prototype.resolver;
+				delete prototype.createCache;
+			}
+		});
+
+		it('should not mistake a legacy property key for a standard context when Object.prototype has a planted kind (regression)', function () {
+			const prototype = Object.prototype as Record<string, unknown>;
+			prototype.kind = 'method';
+			try {
+				const spy = jest.fn(function (n: number): number {
+					return n * 2;
+				});
+				// Previously the key's inherited `kind` made it a standard context: "@memoize can only decorate methods, not methods".
+				const descriptor = decorators.memoize({}, 'm', { value: spy, writable: true, configurable: true });
+				const self = {};
+				expect([(descriptor.value as typeof spy).call(self, 1), (descriptor.value as typeof spy).call(self, 1)]).toEqual([2, 2]);
+				expect(spy).toHaveBeenCalledTimes(1);
+			} finally {
+				delete prototype.kind;
+			}
+		});
+
 		it('should validate the options when the decorator is created', function () {
 			expect(function () {
 				decorators.memoize(null as any);
@@ -1380,6 +1442,16 @@ describe('Decorators (1.4)', function () {
 			class Sub extends Lazy {}
 			expect([Sub.shared, Sub.shared]).toEqual(['shared by Sub', 'shared by Sub']);
 			expect(Lazy.shared).toBe('shared by Lazy');
+			expect(computed).toBe(2);
+		});
+
+		it('computes static getters once per class at any depth of subclassing (regression: a subclass of a subclass inherited its value)', function () {
+			class Sub extends Lazy {}
+			class SubSub extends Sub {}
+			expect([Sub.shared, Sub.shared]).toEqual(['shared by Sub', 'shared by Sub']);
+			// Previously `Sub` kept its value as an own property, which `SubSub` inherited: 'shared by Sub'.
+			expect([SubSub.shared, SubSub.shared]).toEqual(['shared by SubSub', 'shared by SubSub']);
+			expect(Object.hasOwn(Sub, 'shared')).toBe(false);
 			expect(computed).toBe(2);
 		});
 
