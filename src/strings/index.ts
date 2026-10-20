@@ -90,11 +90,17 @@ function isSimpleCode(code: number): boolean {
  * between them, and the other code unit on each side (which a combining mark, `\n` after `\r`, a prepend character or an emoji ZWJ
  * sequence may join). Two consecutive other code units are always separated by a grapheme boundary (no grapheme-break rule joins them or
  * looks back across them), so the text outside these regions is one grapheme per code unit and every region can be segmented on its own.
- * (The class of {@link COMPLEX_TEXT} is spelled out in this and the next pattern, as literals: bundlers keep a module-level
+ * The group is repeated at most 10 000 times: the engine keeps a backtracking entry per repetition, and overflowed its stack on a region
+ * of a few million code units (`'\r\n'` or `'e\u0301'` repeated); the rest of a longer region is found by {@link COMPLEX_REGION_END}.
+ * (The class of {@link COMPLEX_TEXT} is spelled out in these patterns and the next one, as literals: bundlers keep a module-level
  * `new RegExp(...)` call, and everything it uses, in every bundle that imports any helper of the module.)
  */
 const COMPLEX_REGION =
-	/[^\u0300-\u1dff\u200c-\u200d\u2070-\u2fff\u302a-\u3030\u303d\u3099\u309a\u3297\u3299\ua000-\uabff\ud7a4-\uffff\r]?(?:[\u0300-\u1dff\u200c-\u200d\u2070-\u2fff\u302a-\u3030\u303d\u3099\u309a\u3297\u3299\ua000-\uabff\ud7a4-\uffff\r]+[^\u0300-\u1dff\u200c-\u200d\u2070-\u2fff\u302a-\u3030\u303d\u3099\u309a\u3297\u3299\ua000-\uabff\ud7a4-\uffff\r]?)+/g;
+	/[^\u0300-\u1dff\u200c-\u200d\u2070-\u2fff\u302a-\u3030\u303d\u3099\u309a\u3297\u3299\ua000-\uabff\ud7a4-\uffff\r]?(?:[\u0300-\u1dff\u200c-\u200d\u2070-\u2fff\u302a-\u3030\u303d\u3099\u309a\u3297\u3299\ua000-\uabff\ud7a4-\uffff\r]+[^\u0300-\u1dff\u200c-\u200d\u2070-\u2fff\u302a-\u3030\u303d\u3099\u309a\u3297\u3299\ua000-\uabff\ud7a4-\uffff\r]?){1,10000}/g;
+
+/** The end of a region that {@link COMPLEX_REGION} cut short: the first other code unit not followed by a complex one (the region's last code unit). */
+const COMPLEX_REGION_END =
+	/[^\u0300-\u1dff\u200c-\u200d\u2070-\u2fff\u302a-\u3030\u303d\u3099\u309a\u3297\u3299\ua000-\uabff\ud7a4-\uffff\r](?![\u0300-\u1dff\u200c-\u200d\u2070-\u2fff\u302a-\u3030\u303d\u3099\u309a\u3297\u3299\ua000-\uabff\ud7a4-\uffff\r])/g;
 
 /**
  * One grapheme cluster of the common shapes that need no segmenter (a sticky match): an emoji ZWJ sequence of pictographs (each an
@@ -145,9 +151,13 @@ const WIDE_TEXT = /[^\0-\xff]/;
  * @returns {string[]} The graphemes of `string` (only the first ones, at least `limit + 1`, when it has more than `limit`)
  */
 function splitGraphemes(string: string, limit: number = Infinity): string[] {
+	// Only the first `limit + 1` code units are split when they and the next one are graphemes on their own (the whole of a long CJK or
+	// Hangul text was split for its first grapheme).
+	const text = limit + 2 < string.length && isSimpleText(string.slice(0, limit + 2)) ? string.slice(0, limit + 1) : string;
+
 	// One grapheme per code unit (and no surrogate): V8 splits Latin-1 text faster with `split`, and other text (CJK, Cyrillic, curly
 	// quotes...) about 3 times faster with the string iterator.
-	if (isSimpleText(string)) return WIDE_TEXT.test(string) ? [...string] : string.split('');
+	if (isSimpleText(text)) return WIDE_TEXT.test(text) ? [...text] : text.split('');
 
 	const segmenter = getGraphemeSegmenter();
 	const graphemes: string[] = [];
@@ -163,16 +173,24 @@ function splitGraphemes(string: string, limit: number = Infinity): string[] {
 
 		if (match === null || graphemes.length > limit) return graphemes;
 
+		index = COMPLEX_REGION.lastIndex;
+
+		// A region cut short by the bound on the repetitions goes on with a complex code unit.
+		if (COMPLEX_TEXT.test(string.charAt(index))) {
+			COMPLEX_REGION_END.lastIndex = index;
+			COMPLEX_REGION.lastIndex = index = COMPLEX_REGION_END.exec(string) === null ? string.length : COMPLEX_REGION_END.lastIndex;
+		}
+
+		const region = string.slice(end, index);
+
 		if (segmenter === null) {
-			for (const codePoint of match[0]) graphemes.push(codePoint);
-		} else if (!pushEmojiGraphemes(match[0], graphemes)) {
-			for (const data of segmenter.segment(match[0])) {
+			for (const codePoint of region) graphemes.push(codePoint);
+		} else if (!pushEmojiGraphemes(region, graphemes)) {
+			for (const data of segmenter.segment(region)) {
 				if (graphemes.length > limit) break;
 				graphemes.push(data.segment);
 			}
 		}
-
-		index = COMPLEX_REGION.lastIndex;
 	}
 }
 
@@ -1271,8 +1289,8 @@ function editDistance(a: ReadonlyArray<string>, b: ReadonlyArray<string>): numbe
  * Computes the Levenshtein edit distance between two strings: the minimum number of single-character insertions, deletions and substitutions
  * turning `a` into `b`. Characters are Unicode code points, so an astral character (emoji, surrogate pair) counts as one.
  * The common prefix and suffix are skipped and the dynamic-programming table keeps a single row sized after the shorter string,
- * so the extra memory is O(min(n, m)) and the time O(n × m): cap the length of untrusted inputs (two 100 000-character strings take
- * 10¹⁰ steps).
+ * so the time is O(n × m) and the extra memory O(n + m) (both strings are split into arrays of code points, which take tens of bytes
+ * per code point outside Latin-1): cap the length of untrusted inputs (two 100 000-character strings take 10¹⁰ steps).
  * @param {string} a - The first string
  * @param {string} b - The second string
  * @returns {number} The edit distance (a non-negative integer, `0` iff the strings are equal)
@@ -1446,9 +1464,18 @@ export function dedent(input: string | TemplateStringsArray, ...values: unknown[
 
 	if (!Array.isArray(input)) throw new TypeError(`dedent: \`input\` must be a string or a template strings array, got ${describe(input)}`);
 
-	const literals = input.map(function (cooked: string | undefined, index: number): string {
-		return cooked ?? input.raw[index];
-	});
+	const literals: string[] = [];
+	const raw: ReadonlyArray<string> = input.raw;
+
+	// Read by index, so that a hole (or any other non-string) throws at once: `map` visited every index of a sparse array first (minutes
+	// for a length of 2 ** 32 - 1), and the holes it left were then read through a polluted `Object.prototype`.
+	for (let index = 0; index < input.length; index++) {
+		const literal: unknown = (Object.hasOwn(input, index) ? input[index] : undefined) ?? (Object.hasOwn(raw, index) ? raw[index] : undefined);
+
+		if (typeof literal !== 'string') throw new TypeError(`dedent: \`input\` must be a string or a template strings array, got an array holding ${describe(literal)}`);
+		literals.push(literal);
+	}
+
 	const parts = dedentParts(literals);
 	let result = parts[0];
 
@@ -1638,9 +1665,17 @@ export function randomString(length: number, alphabet: string = ALPHANUMERIC, ra
 	if (/\p{Cs}/u.test(alphabet)) throw new RangeError('randomString: `alphabet` must not contain lone surrogates');
 
 	let result = '';
+	const chunk: string[] = [];
 
+	// Joined 1024 characters at a time: appending them one by one made a chain of one string object per character (about 32 bytes
+	// each), so `randomString(1e7)` ran out of a 256 MB heap.
 	for (let index = 0; index < length; index++) {
-		result += characters[Math.floor(draw('randomString', random) * characters.length)];
+		chunk.push(characters[Math.floor(draw('randomString', random) * characters.length)]);
+
+		if (chunk.length === 1024 || index === length - 1) {
+			result += chunk.join('');
+			chunk.length = 0;
+		}
 	}
 
 	return result;

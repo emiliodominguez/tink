@@ -1165,6 +1165,22 @@ describe('String helpers', function () {
 			).toBe('😃😃');
 		});
 
+		it('joins the characters 1024 at a time, not as a chain of one string per character (regression)', function () {
+			// Appending each character kept one string object (about 32 bytes) per character: randomString(1e7) ran out of a 256 MB heap.
+			let draws = 0;
+			function cycle(): number {
+				return (draws++ % 4) / 4;
+			}
+			const join = jest.spyOn(Array.prototype, 'join');
+			try {
+				const value = helpers.randomString(2050, 'abcd', cycle);
+				expect(join).toHaveBeenCalledTimes(3);
+				expect(value).toBe('abcd'.repeat(513).slice(0, 2050));
+			} finally {
+				join.mockRestore();
+			}
+		});
+
 		it('should throw a RangeError for invalid arguments', function () {
 			for (const length of [-1, 1.5, NaN, Infinity]) {
 				expect(function () {
@@ -1352,6 +1368,36 @@ describe('String helpers', function () {
 			expect(helpers.capitalize('\r\nx')).toBe('\r\nx');
 			expect(helpers.uncapitalize('É')).toBe('é');
 			expect(helpers.mask('ab👍🏽cd👍🏽', { visibleEnd: 1 })).toBe('*****👍🏽');
+		});
+
+		it('only splits the start of plain text when only its first graphemes are needed (regression)', function () {
+			const proto = String.prototype as unknown as Record<symbol, () => Iterator<string>>;
+			const iterate = proto[Symbol.iterator];
+			let reads = 0;
+			proto[Symbol.iterator] = function* (this: string) {
+				for (const char of iterate.call(this) as unknown as Iterable<string>) {
+					reads++;
+					yield char;
+				}
+			};
+			try {
+				const korean = '한'.repeat(100_000);
+				expect(helpers.capitalize(korean)).toBe(korean);
+				expect(helpers.padStart(korean, 10)).toBe(korean);
+				expect(helpers.toSafeFilename(korean)).toBe('한'.repeat(85));
+			} finally {
+				proto[Symbol.iterator] = iterate;
+			}
+			// The whole text was split for its first grapheme (100 000 reads per call).
+			expect(reads).toBeLessThan(1000);
+		});
+
+		it('finds a region of millions of code units without overflowing the regular expression stack', function () {
+			// One region (every other code unit is complex), which a single pattern matched by repeating a group: a RangeError
+			// ('Maximum call stack size exceeded') from about 6.7 million code units. `capitalize` only segments its first grapheme.
+			const text = 'é'.repeat(5_000_000);
+			expect(helpers.capitalize(text).slice(0, 4)).toBe('Éé');
+			expect(helpers.capitalize('\r\n'.repeat(4_000_000) + 'x').endsWith('\r\nx')).toBe(true);
 		});
 
 		it('returns ASCII text unchanged from removeDiacritics and slugs it directly', function () {
@@ -2174,6 +2220,39 @@ describe('String helpers under prototype pollution', function () {
 			expect(helpers.dedent(strings)).toBe('aundefinedbundefinedc');
 		} finally {
 			delete polluted[0];
+		}
+	});
+
+	it('dedent rejects a hole in the template strings at once, without visiting the rest of a sparse array (regression)', function () {
+		const polluted = Object.prototype as Record<string, unknown>;
+		const sparse: string[] = ['a'];
+		sparse.length = 1_000_000;
+		let reads = 0;
+		const counted = new Proxy(Object.assign(sparse, { raw: ['a'] }), {
+			has(target, key) {
+				reads++;
+				return Reflect.has(target, key);
+			},
+			getOwnPropertyDescriptor(target, key) {
+				reads++;
+				return Reflect.getOwnPropertyDescriptor(target, key);
+			}
+		}) as unknown as TemplateStringsArray;
+		expect(function () {
+			helpers.dedent(counted);
+		}).toThrow(TypeError);
+		expect(reads).toBeLessThan(10);
+		polluted[1] = '<EVIL>';
+		try {
+			// Holes at index 1 of both arrays, which `Object.prototype[1]` would fill.
+			const holed = Object.assign(['a', 'x', 'b'], { raw: ['a', 'x', 'b'] });
+			delete holed[1];
+			delete holed.raw[1];
+			expect(function () {
+				helpers.dedent(holed as unknown as TemplateStringsArray, 1, 2);
+			}).toThrow('got an array holding undefined');
+		} finally {
+			delete polluted[1];
 		}
 	});
 });
