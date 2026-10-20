@@ -2163,6 +2163,19 @@ describe('Functions helpers (hostile inputs)', function () {
 		expect(function () {
 			helpers.memoize(jest.fn(), { cache: 5 as any });
 		}).toThrow(new TypeError('memoize: `options.cache` must have get, set, has and clear methods, got number'));
+		const methods = { get: helpers.noop, set: helpers.noop, has: helpers.noop, clear: helpers.noop };
+		for (const missing of ['get', 'set', 'has', 'clear']) {
+			const cache = { ...methods, [missing]: 'not a function' };
+			expect(function () {
+				helpers.memoize(jest.fn(), { cache: cache as never });
+			}).toThrow(new TypeError('memoize: `options.cache` must have get, set, has and clear methods, got object'));
+		}
+		// `null` gives the default cache, as `undefined` does.
+		expect(helpers.memoize(helpers.identity, { cache: null as never })(1)).toBe(1);
+		expect(function () {
+			helpers.memoize(jest.fn(), { cache: Object.assign(helpers.noop.bind(null), methods) as never });
+		}).toThrow(new TypeError('memoize: `options.cache` must have get, set, has and clear methods, got function'));
+		expect(typeof helpers.memoize(jest.fn(), { cache: methods as never })).toBe('function');
 	});
 
 	it('debounce still invokes when the clock returns NaN', function () {
@@ -3762,6 +3775,349 @@ describe('matchWith / matcher', function () {
 			});
 			assertType<Equals<typeof partial.exhaustive, NonExhaustiveError<{ a: 'x' | 'y'; b: number }>>>();
 			expect(partial.otherwise(String)).toBe(2);
+		});
+	});
+});
+
+describe('Functions helpers (1.4)', function () {
+	describe('ok / err', function () {
+		it('build the tuples attempt returns', function () {
+			expect(helpers.ok(1)).toEqual([undefined, 1]);
+			expect(helpers.ok(undefined)).toEqual([undefined, undefined]);
+			expect(helpers.ok(1)).toHaveLength(2);
+			const error = new Error('x');
+			expect(helpers.err(error)).toEqual([error, undefined]);
+			expect(helpers.err(error)[0]).toBe(error);
+			expect(helpers.err(null)).toEqual([null, undefined]);
+			expect(helpers.err(0)).toEqual([0, undefined]);
+			expect(helpers.err(error)).toHaveLength(2);
+			expect(helpers.ok(1)).toEqual(helpers.attempt(helpers.constant(1)));
+		});
+
+		it('err rejects an undefined error, which would read as a success', function () {
+			expect(function () {
+				helpers.err(undefined);
+			}).toThrow(new TypeError('err: `error` must not be undefined (an undefined error reads as a success), got undefined'));
+		});
+	});
+
+	describe('isOk / isErr', function () {
+		it('tell successes from failures like attempt does', function () {
+			expect(helpers.isOk(helpers.ok(1))).toBe(true);
+			expect(helpers.isErr(helpers.ok(1))).toBe(false);
+			expect(helpers.isOk(helpers.err('x'))).toBe(false);
+			expect(helpers.isErr(helpers.err('x'))).toBe(true);
+			expect(helpers.isErr(helpers.err(null))).toBe(true);
+			expect(helpers.isOk(helpers.attempt(JSON.parse, '{'))).toBe(false);
+			// `throw undefined` is captured as [undefined, undefined]: a successful `undefined`.
+			const thrownUndefined = helpers.attempt(function (): never {
+				throw undefined;
+			});
+			expect(helpers.isOk(thrownUndefined)).toBe(true);
+			expect(helpers.isErr(thrownUndefined)).toBe(false);
+		});
+
+		it.each([
+			['isOk', helpers.isOk],
+			['isErr', helpers.isErr],
+			['unwrap', helpers.unwrap]
+		] as const)('%s validates the tuple', function (name, check) {
+			expect(function () {
+				check(null as never);
+			}).toThrow(new TypeError(`${name}: \`result\` must be an [error, result] tuple, got null`));
+			expect(function () {
+				check([undefined] as never);
+			}).toThrow(new TypeError(`${name}: \`result\` must be an [error, result] tuple, got an array of length 1`));
+			expect(function () {
+				check([undefined, 1, 2] as never);
+			}).toThrow(new TypeError(`${name}: \`result\` must be an [error, result] tuple, got an array of length 3`));
+			expect(function () {
+				check({ 0: undefined, 1: 1, length: 2 } as never);
+			}).toThrow(new TypeError(`${name}: \`result\` must be an [error, result] tuple, got object`));
+		});
+	});
+
+	describe('mapResult', function () {
+		it('transforms successes and returns failures as they are', function () {
+			const double = jest.fn(function (n: number): number {
+				return n * 2;
+			});
+			expect(helpers.mapResult(helpers.ok(21), double)).toEqual([undefined, 42]);
+			expect(double).toHaveBeenCalledWith(21);
+			const failed = helpers.err(new Error('x'));
+			expect(helpers.mapResult(failed, double)).toBe(failed);
+			expect(double).toHaveBeenCalledTimes(1);
+			const success = helpers.ok(1);
+			expect(helpers.mapResult(success, helpers.identity)).not.toBe(success);
+		});
+
+		it('does not capture what fn throws', function () {
+			expect(function () {
+				helpers.mapResult(helpers.ok(1), function (): never {
+					throw new RangeError('boom');
+				});
+			}).toThrow(new RangeError('boom'));
+		});
+
+		it('validates its arguments', function () {
+			expect(function () {
+				helpers.mapResult(helpers.ok(1), 1 as never);
+			}).toThrow(new TypeError('mapResult: `fn` must be a function, got number'));
+			expect(function () {
+				helpers.mapResult(1 as never, helpers.identity);
+			}).toThrow(new TypeError('mapResult: `result` must be an [error, result] tuple, got number'));
+			expect(function () {
+				helpers.mapResult(helpers.err(1), 1 as never);
+			}).toThrow(new TypeError('mapResult: `fn` must be a function, got number'));
+		});
+	});
+
+	describe('unwrap', function () {
+		it('returns the value or rethrows the very error', function () {
+			expect(helpers.unwrap(helpers.ok('x'))).toBe('x');
+			expect(helpers.unwrap(helpers.ok(undefined))).toBeUndefined();
+			const error = { not: 'an error' };
+			let caught: unknown;
+			try {
+				helpers.unwrap(helpers.err(error));
+			} catch (thrown) {
+				caught = thrown;
+			}
+			expect(caught).toBe(error);
+			expect(function () {
+				helpers.unwrap(helpers.attempt(JSON.parse, '{'));
+			}).toThrow(SyntaxError);
+			expect(function () {
+				helpers.unwrap(helpers.err(null));
+			}).toThrow();
+		});
+	});
+
+	describe('when / unless', function () {
+		it('apply fn only when the predicate passes (when) or fails (unless)', function () {
+			const isNegative = jest.fn(function (n: number): boolean {
+				return n < 0;
+			});
+			const negate = jest.fn(function (n: number): number {
+				return -n;
+			});
+			const abs = helpers.when(isNegative, negate);
+			expect([3, -2, 0].map(abs)).toEqual([3, 2, 0]);
+			expect(isNegative).toHaveBeenCalledTimes(3);
+			expect(negate).toHaveBeenCalledTimes(1);
+			expect(isNegative).toHaveBeenNthCalledWith(1, 3);
+			const keepNegative = helpers.unless(isNegative, helpers.constant(0));
+			expect([3, -2, 0].map(keepNegative)).toEqual([0, -2, 0]);
+		});
+
+		it('pass only the first argument and forward this', function () {
+			const seen: unknown[][] = [];
+			const target = { factor: 3 };
+			const scale = helpers.when(
+				function (this: unknown, ...args: unknown[]): boolean {
+					seen.push([this, ...args]);
+					return true;
+				},
+				function (this: { factor: number }, n: number, ...rest: unknown[]): number {
+					seen.push([this, n, ...rest]);
+					return n * this.factor;
+				}
+			);
+			expect((scale as (this: unknown, ...args: unknown[]) => unknown).call(target, 2, 'extra')).toBe(6);
+			expect(seen).toEqual([
+				[target, 2],
+				[target, 2]
+			]);
+			const kept = helpers.unless(
+				function (this: unknown): boolean {
+					seen.push([this]);
+					return false;
+				},
+				function (this: unknown, value: unknown): unknown[] {
+					return [this, value];
+				}
+			);
+			expect(kept.call(target, 'v')).toEqual([target, 'v']);
+		});
+
+		it('treat the predicate result as truthy or falsy', function () {
+			const tag = helpers.when(helpers.identity, function (value: unknown): string {
+				return `tagged ${String(value)}`;
+			});
+			expect([0, '', null, 1, 'a'].map(tag)).toEqual([0, '', null, 'tagged 1', 'tagged a']);
+			const fill = helpers.unless(helpers.identity, helpers.constant('default'));
+			expect([0, '', null, 1, 'a'].map(fill)).toEqual(['default', 'default', 'default', 1, 'a']);
+		});
+
+		it('narrow with type guards', function () {
+			const trim = helpers.when(isString, function (text: string): string {
+				return text.trim();
+			});
+			const trimmed: string | number = trim(' a ' as string | number);
+			expect(trimmed).toBe('a');
+			const wrap = helpers.unless(isString, function (value: unknown): string {
+				return String(value);
+			});
+			const wrapped: string = wrap(5 as string | number);
+			expect(wrapped).toBe('5');
+		});
+
+		it.each([
+			['when', helpers.when],
+			['unless', helpers.unless]
+		] as const)('%s validates its arguments', function (name, create) {
+			expect(function () {
+				create(1 as never, helpers.identity);
+			}).toThrow(new TypeError(`${name}: \`predicate\` must be a function, got number`));
+			expect(function () {
+				create(helpers.identity, null as never);
+			}).toThrow(new TypeError(`${name}: \`fn\` must be a function, got null`));
+		});
+	});
+
+	describe('cond', function () {
+		it('returns the transform of the first matching pair, or undefined', function () {
+			const calls: string[] = [];
+			const classify = helpers.cond([
+				[
+					function (n: number): boolean {
+						calls.push(`neg ${n}`);
+						return n < 0;
+					},
+					function (n: number): string {
+						return `negative ${n}`;
+					}
+				],
+				[
+					function (n: number): boolean {
+						calls.push(`zero ${n}`);
+						return n === 0;
+					},
+					helpers.constant('zero')
+				],
+				[
+					function (n: number): boolean {
+						calls.push(`even ${n}`);
+						return n % 2 === 0;
+					},
+					helpers.constant('even')
+				]
+			]);
+			expect(classify(-1)).toBe('negative -1');
+			expect(calls).toEqual(['neg -1']);
+			expect(classify(0)).toBe('zero');
+			expect(classify(4)).toBe('even');
+			expect(classify(3)).toBeUndefined();
+			expect(calls).toEqual(['neg -1', 'neg 0', 'zero 0', 'neg 4', 'zero 4', 'even 4', 'neg 3', 'zero 3', 'even 3']);
+			expect(helpers.cond([])(1)).toBeUndefined();
+			expect(helpers.cond([])()).toBeUndefined();
+		});
+
+		it('passes every argument and this to both functions', function () {
+			const target = { name: 'target' };
+			const record: unknown[][] = [];
+			/**
+			 * Records its call and passes.
+			 */
+			function pass(this: unknown, ...args: unknown[]): boolean {
+				record.push(['predicate', this, ...args]);
+				return true;
+			}
+			/**
+			 * Records its call.
+			 */
+			function transform(this: unknown, ...args: unknown[]): string {
+				record.push(['transform', this, ...args]);
+				return 'done';
+			}
+			const both = helpers.cond([[pass, transform]]);
+			expect(both.call(target, 1, 2, 3)).toBe('done');
+			expect(both.call(target)).toBe('done');
+			expect(both.call(target, 'one')).toBe('done');
+			expect(both.call(target, 'a', 'b')).toBe('done');
+			expect(both.call(target, 1, 2, 3, 4)).toBe('done');
+			expect(record).toEqual([
+				['predicate', target, 1, 2, 3],
+				['transform', target, 1, 2, 3],
+				['predicate', target],
+				['transform', target],
+				['predicate', target, 'one'],
+				['transform', target, 'one'],
+				['predicate', target, 'a', 'b'],
+				['transform', target, 'a', 'b'],
+				['predicate', target, 1, 2, 3, 4],
+				['transform', target, 1, 2, 3, 4]
+			]);
+			const later = helpers.cond([
+				[helpers.constant(false), transform],
+				[pass, transform]
+			]);
+			record.length = 0;
+			for (const args of [[], [1], [1, 2], [1, 2, 3], [1, 2, 3, 4]]) expect(later.apply(target, args)).toBe('done');
+			expect(record.length).toBe(10);
+			const none = helpers.cond([[helpers.constant(false), transform]]);
+			expect(none(1, 2)).toBeUndefined();
+			expect(none()).toBeUndefined();
+			const second = helpers.cond([
+				[helpers.constant(false), transform],
+				[
+					function (a: number, b: number): boolean {
+						return a < b;
+					},
+					function (a: number, b: number): number {
+						return b - a;
+					}
+				]
+			]);
+			expect(second(1, 3)).toBe(2);
+			expect((second as (...args: unknown[]) => unknown)(1)).toBeUndefined();
+		});
+
+		it('copies the pairs when created', function () {
+			const pairs: Array<[(n: number) => boolean, (n: number) => string]> = [[helpers.constant(true), helpers.constant('first')]];
+			const pick = helpers.cond(pairs);
+			pairs[0] = [helpers.constant(true), helpers.constant('changed')];
+			pairs.unshift([helpers.constant(true), helpers.constant('added')]);
+			expect(pick(1)).toBe('first');
+		});
+
+		it('reads each function of a pair once, storing the one it validated (regression)', function () {
+			const reads: string[] = [];
+			const pair = [helpers.constant(true), helpers.constant('kept')] as unknown as [() => boolean, () => string];
+			for (const index of [0, 1]) {
+				const valid = pair[index];
+				Object.defineProperty(pair, index, {
+					get: function (): unknown {
+						reads.push(String(index));
+						return reads.filter(function (read) {
+							return read === String(index);
+						}).length === 1
+							? valid
+							: 'not a function';
+					}
+				});
+			}
+			const pick = helpers.cond([pair]);
+			expect(reads).toEqual(['0', '1']);
+			expect(pick()).toBe('kept');
+		});
+
+		it('validates the pairs', function () {
+			expect(function () {
+				helpers.cond(null as never);
+			}).toThrow(new TypeError('cond: `pairs` must be an array, got null'));
+			expect(function () {
+				helpers.cond([helpers.identity] as never);
+			}).toThrow(new TypeError('cond: `pairs[0]` must be a [predicate, transform] pair, got function'));
+			expect(function () {
+				helpers.cond([
+					[helpers.identity, helpers.identity],
+					[1, helpers.identity]
+				] as never);
+			}).toThrow(new TypeError('cond: `pairs[1][0]` must be a function, got number'));
+			expect(function () {
+				helpers.cond([[helpers.identity]] as never);
+			}).toThrow(new TypeError('cond: `pairs[0][1]` must be a function, got undefined'));
 		});
 	});
 });

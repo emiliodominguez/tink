@@ -10,11 +10,17 @@ import {
 	captureAs,
 	compose,
 	composeAsync,
+	cond,
 	cons,
 	curry,
 	debounce,
 	defaultMemoizeKey,
+	err,
 	flip,
+	identity as identityFunction,
+	isErr,
+	isOk,
+	mapResult,
 	match,
 	matcher,
 	matchWith,
@@ -26,7 +32,12 @@ import {
 	partialRight,
 	pipe,
 	pipeAsync,
-	times
+	ok,
+	times,
+	unless,
+	unwrap,
+	when,
+	type Result
 } from '.';
 
 type IntFn = (x: number) => number;
@@ -788,6 +799,121 @@ describe('matchWith / matcher (properties)', function () {
 				// An `undefined` tail means any tail (no array is `undefined`).
 				const isTail = tail === undefined ? _ : reference(tail);
 				expect(cons(build(head), build(tail))(list)).toBe(list.length > 0 && reference(head)(list[0]) && isTail(list.slice(1)));
+			})
+		);
+	});
+});
+
+describe('Result, when / unless / cond (1.4 properties)', function () {
+	/** A function that throws `error` when given, and returns `value` otherwise. */
+	function outcome(error: unknown, value: unknown): () => unknown {
+		return function (): unknown {
+			if (error !== undefined) throw error;
+			return value;
+		};
+	}
+
+	it('ok/err build what attempt returns, isOk/isErr partition it, and unwrap(attempt(f)) behaves like f()', function () {
+		fc.assert(
+			fc.property(fc.option(fc.anything(), { nil: undefined }), fc.anything(), function (error, value) {
+				const result = attempt(outcome(error, value));
+				expect(result).toEqual(error === undefined ? ok(value) : err(error));
+				expect(isOk(result)).toBe(error === undefined);
+				expect(isErr(result)).toBe(!isOk(result));
+				let thrown: unknown;
+				let returned: unknown;
+				try {
+					returned = unwrap(result);
+				} catch (caught) {
+					thrown = caught;
+				}
+				expect(Object.is(thrown, error)).toBe(true);
+				if (error === undefined) expect(Object.is(returned, value)).toBe(true);
+			})
+		);
+	});
+
+	it('mapResult obeys the functor laws', function () {
+		/** Doubles a number. */
+		function twice(n: number): number {
+			return n * 2;
+		}
+		/** Adds one. */
+		function increment(n: number): number {
+			return n + 1;
+		}
+		const results = fc.oneof(
+			fc.integer().map(ok),
+			fc
+				.anything()
+				.filter(function (error) {
+					return error !== undefined;
+				})
+				.map(err)
+		) as fc.Arbitrary<Result<number>>;
+		fc.assert(
+			fc.property(results, function (result) {
+				expect(mapResult(result, identityFunction)).toEqual(result);
+				expect(
+					mapResult(result, function (n: number): number {
+						return increment(twice(n));
+					})
+				).toEqual(mapResult(mapResult(result, twice), increment));
+			})
+		);
+	});
+
+	it('when/unless equal the ternaries they stand for, and partition the inputs', function () {
+		fc.assert(
+			fc.property(fc.array(fc.integer()), fc.integer({ min: 1, max: 5 }), function (values, by) {
+				/** Whether a value is a multiple of `by`. */
+				function divisible(n: number): boolean {
+					return n % by === 0;
+				}
+				/** Negates and shifts a value. */
+				function transform(n: number): string {
+					return `t${-n}`;
+				}
+				const whenMapped = values.map(when(divisible, transform));
+				const unlessMapped = values.map(unless(divisible, transform));
+				values.forEach(function (n, index) {
+					expect(whenMapped[index]).toEqual(divisible(n) ? transform(n) : n);
+					expect(unlessMapped[index]).toEqual(divisible(n) ? n : transform(n));
+					// Exactly one of the two transforms each value.
+					expect(
+						[whenMapped[index], unlessMapped[index]].filter(function (mapped) {
+							return mapped !== n;
+						})
+					).toEqual([transform(n)]);
+				});
+			})
+		);
+	});
+
+	it('cond equals a first-match loop over its pairs, calling predicates up to the first match only', function () {
+		fc.assert(
+			fc.property(fc.array(fc.tuple(fc.integer({ min: 1, max: 7 }), fc.string()), { maxLength: 6 }), fc.integer(), function (spec, input) {
+				const tested: number[] = [];
+				const pairs = spec.map(function ([by, label], index): readonly [(n: number) => boolean, (n: number) => string] {
+					return [
+						function (n: number): boolean {
+							tested.push(index);
+							return n % by === 0;
+						},
+						function (n: number): string {
+							return `${label}:${n}`;
+						}
+					];
+				});
+				const first = spec.findIndex(function ([by]) {
+					return input % by === 0;
+				});
+				expect(cond(pairs)(input)).toBe(first === -1 ? undefined : `${spec[first][1]}:${input}`);
+				expect(tested).toEqual(
+					Array.from({ length: first === -1 ? spec.length : first + 1 }, function (_unused, index) {
+						return index;
+					})
+				);
 			})
 		);
 	});

@@ -5,12 +5,15 @@ import {
 	attempt,
 	before,
 	compose,
+	cond,
 	constant,
 	curry,
 	debounce,
 	defaultMemoizeKey,
 	flip,
 	identity,
+	isOk,
+	mapResult,
 	match,
 	memoize,
 	memoizeLast,
@@ -22,7 +25,8 @@ import {
 	pipe,
 	throttle,
 	times,
-	unary
+	unary,
+	when
 } from 'tinkit/functions';
 import { memoize as memoizeDecorator } from 'tinkit/decorators';
 import * as esToolkit from 'es-toolkit';
@@ -259,6 +263,56 @@ for (const n of keys) {
 onceAdd(1, 2);
 esOnceAdd(1, 2);
 lodashOnceAdd(1, 2);
+
+// when / cond: the ternary and if-chain they stand for are the baselines.
+/**
+ * @param {number} n - A number
+ * @returns {boolean} Whether `n` is negative
+ */
+function isNegative(n) {
+	return n < 0;
+}
+/**
+ * @param {number} n - A number
+ * @returns {number} `-n`
+ */
+function negateNumber(n) {
+	return -n;
+}
+const abs = when(isNegative, negateNumber);
+const remedaAbs = remeda.when(isNegative, negateNumber);
+/**
+ * @param {number} n - A number
+ * @returns {boolean} Whether `n` is zero
+ */
+function isZero(n) {
+	return n === 0;
+}
+const negativeLabel = constant('negative');
+const zeroLabel = constant('zero');
+const positiveLabel = constant('positive');
+const always = constant(true);
+const signPairs = [
+	[isNegative, negativeLabel],
+	[isZero, zeroLabel],
+	[always, positiveLabel]
+];
+const sign = cond(signPairs);
+const lodashSign = lodash.cond(signPairs);
+const esSign = esCompat.cond(signPairs);
+const remedaSign = remeda.conditional([isNegative, negativeLabel], [isZero, zeroLabel], positiveLabel);
+/**
+ * @param {number} n - A number
+ * @returns {string} Its sign, as an if-chain
+ */
+function signChain(n) {
+	if (isNegative(n)) return negativeLabel(n);
+	if (isZero(n)) return zeroLabel(n);
+	return positiveLabel(n);
+}
+const results = signed.map(function (n) {
+	return attempt(Math.sqrt, n);
+});
 
 export default [
 	{
@@ -815,6 +869,61 @@ export default [
 		baseline: function () {
 			let total = 0;
 			for (let i = 0; i < 100; i++) total += areaSwitch(shapes[i]);
+			return total;
+		}
+	},
+	{
+		name: 'when (map 100)',
+		fn: function () {
+			return signed.map(abs);
+		},
+		baseline: function () {
+			return signed.map(function (n) {
+				return isNegative(n) ? negateNumber(n) : n;
+			});
+		},
+		competitors: {
+			remeda: function () {
+				return signed.map(remedaAbs);
+			}
+		}
+	},
+	{
+		name: 'cond (3 pairs, map 100)',
+		fn: function () {
+			return signed.map(sign);
+		},
+		baseline: function () {
+			return signed.map(signChain);
+		},
+		competitors: {
+			'lodash cond': function () {
+				return signed.map(lodashSign);
+			},
+			'es-toolkit/compat cond': function () {
+				return signed.map(esSign);
+			},
+			'remeda conditional': function () {
+				return signed.map(remedaSign);
+			}
+		}
+	},
+	{
+		name: 'isOk + mapResult (100 results)',
+		fn: function () {
+			let total = 0;
+			for (let i = 0; i < 100; i++) {
+				const mapped = mapResult(results[i], negateNumber);
+				if (isOk(mapped)) total += mapped[1];
+			}
+			return total;
+		},
+		baseline: function () {
+			let total = 0;
+			for (let i = 0; i < 100; i++) {
+				const [error, value] = results[i];
+				if (error === undefined) total += negateNumber(value);
+			}
 			return total;
 		}
 	}

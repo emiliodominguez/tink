@@ -654,8 +654,8 @@ export function memoize<F extends AnyFunction, C extends MemoizeCache<unknown, u
 	const methods = cache as unknown as Partial<Record<keyof MemoizeCache<unknown, unknown>, unknown>>;
 
 	if (
+		// (`null` gave the default cache above.)
 		typeof cache !== 'object' ||
-		cache === null ||
 		typeof methods.get !== 'function' ||
 		typeof methods.set !== 'function' ||
 		typeof methods.has !== 'function' ||
@@ -1254,7 +1254,8 @@ type AnyGuarded<P extends readonly unknown[]> = P extends readonly [infer Head, 
 function combinePredicates(caller: string, predicates: ReadonlyArray<UnknownFunction>, all: boolean): UnknownFunction {
 	assertFunctions(caller, predicates, 'predicates');
 
-	const list = predicates.slice();
+	// The rest array of `allPass`/`anyPass`: fresh, and never seen by the caller, so it needs no copy.
+	const list = predicates;
 
 	// Up to three arguments (an `Array.prototype.filter` callback gets three) are passed with `call`, which V8 optimises much better than
 	// `apply` with an argument list.
@@ -1394,6 +1395,293 @@ export function attempt<A extends unknown[], R>(fn: (...args: A) => R, ...args: 
 	} catch (error) {
 		return [error, undefined];
 	}
+}
+
+/**
+ * Throws a `TypeError` unless `result` is a {@link Result} tuple (an array of length 2).
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {unknown} result - The value to validate
+ * @returns {void}
+ * @throws {TypeError} when `result` is not an array of length 2
+ */
+function assertResult(caller: string, result: unknown): asserts result is Result<unknown> {
+	if (!Array.isArray(result) || result.length !== 2) {
+		throw new TypeError(`${caller}: \`result\` must be an [error, result] tuple, got ${Array.isArray(result) ? `an array of length ${result.length}` : describe(result)}`);
+	}
+}
+
+/**
+ * Creates a successful {@link Result}: `[undefined, value]`, the tuple {@link attempt} returns when the call returned `value`.
+ * @template T - The value type
+ * @param {T} value - The value
+ * @returns {[error: undefined, result: T]} The tuple
+ * @example
+ * ok(42); // => [undefined, 42]
+ * isOk(ok('x')); // => true
+ */
+export function ok<T>(value: T): [error: undefined, result: T] {
+	return [undefined, value];
+}
+
+/**
+ * Creates a failed {@link Result}: `[error, undefined]`, the tuple {@link attempt} returns when the call threw `error`. The error must not
+ * be `undefined`, since `[undefined, undefined]` reads as a success (see {@link Result}).
+ * @template E - The error type
+ * @param {E} error - The error
+ * @returns {[error: E, result: undefined]} The tuple
+ * @throws {TypeError} when `error` is `undefined`
+ * @example
+ * const failed = err(new RangeError('Too big'));
+ * failed[0] instanceof RangeError; // => true
+ * isErr(failed); // => true
+ * err(undefined); // throws TypeError
+ */
+export function err<E>(error: E): [error: E, result: undefined] {
+	if (error === undefined) throw new TypeError('err: `error` must not be undefined (an undefined error reads as a success), got undefined');
+	return [error, undefined];
+}
+
+/**
+ * Checks whether a {@link Result} is a success, narrowing it to `[undefined, T]`. A result is a success when its error is `undefined`,
+ * as {@link attempt} produces it, so `throw undefined` (captured as `[undefined, undefined]`) counts as a successful `undefined` result.
+ * @template T - The success value type
+ * @param {Result<T>} result - The result
+ * @returns {boolean} `true` when `result[0]` is `undefined`
+ * @throws {TypeError} when `result` is not an array of length 2
+ * @example
+ * const result: Result<number> = attempt(Math.sqrt, 16);
+ * const value = isOk(result) ? result[1] : 0; // => 4 // typed as number
+ * isOk(attempt(JSON.parse, '{')); // => false
+ */
+export function isOk<T>(result: Result<T>): result is [error: undefined, result: T] {
+	assertResult('isOk', result);
+	return result[0] === undefined;
+}
+
+/**
+ * Checks whether a {@link Result} is a failure, narrowing it to `[error, undefined]`: the negation of {@link isOk} (its error is not
+ * `undefined`).
+ * @template T - The success value type
+ * @param {Result<T>} result - The result
+ * @returns {boolean} `true` when `result[0]` is not `undefined`
+ * @throws {TypeError} when `result` is not an array of length 2
+ * @example
+ * const result = attempt(JSON.parse, '{');
+ * isErr(result) && result[0] instanceof SyntaxError; // => true
+ * isErr(ok(1)); // => false
+ */
+export function isErr<T>(result: Result<T>): result is [error: unknown, result: undefined] {
+	assertResult('isErr', result);
+	return result[0] !== undefined;
+}
+
+/**
+ * Transforms the value of a successful {@link Result} with `fn`; a failed result is returned as it is (the same tuple), without calling
+ * `fn`. An exception thrown by `fn` is not captured: wrap it with {@link attempt} for that.
+ * @template T - The success value type
+ * @template U - The transformed value type
+ * @param {Result<T>} result - The result
+ * @param {(value: T) => U} fn - Transforms the value
+ * @returns {Result<U>} `[undefined, fn(value)]`, or `result` itself when it failed
+ * @throws {TypeError} when `result` is not an array of length 2 or `fn` is not a function
+ * @example
+ * mapResult(ok(2), function (n: number) { return n * 10; }); // => [undefined, 20]
+ * const failed = attempt(JSON.parse, '{');
+ * mapResult(failed, function () { return 'never called'; }) === failed; // => true
+ */
+export function mapResult<T, U>(result: Result<T>, fn: (value: T) => U): Result<U> {
+	assertResult('mapResult', result);
+	assertFunction('mapResult', 'fn', fn);
+	return result[0] === undefined ? [undefined, fn(result[1] as T)] : (result as [error: unknown, result: undefined]);
+}
+
+/**
+ * Returns the value of a successful {@link Result}, or throws its error, as it is (the very value the function given to {@link attempt}
+ * threw, not wrapped), so `unwrap(attempt(fn, ...args))` behaves like `fn(...args)`.
+ * @template T - The success value type
+ * @param {Result<T>} result - The result
+ * @returns {T} The value
+ * @throws {unknown} the result's error, when it failed
+ * @throws {TypeError} when `result` is not an array of length 2
+ * @example
+ * unwrap(attempt(JSON.parse, '[1]')); // => [1]
+ * unwrap(attempt(JSON.parse, '{')); // throws SyntaxError
+ */
+export function unwrap<T>(result: Result<T>): T {
+	assertResult('unwrap', result);
+	if (result[0] !== undefined) throw result[0];
+	return result[1] as T;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// when / unless / cond
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Builds {@link when} (`negated: false`) or {@link unless} (`negated: true`).
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {UnknownFunction} predicate - The predicate
+ * @param {UnknownFunction} fn - The transform
+ * @param {boolean} negated - Whether `fn` runs when the predicate fails
+ * @returns {(value: unknown) => unknown} The conditional function
+ * @throws {TypeError} when `predicate` or `fn` is not a function
+ */
+function conditional(caller: string, predicate: UnknownFunction, fn: UnknownFunction, negated: boolean): (value: unknown) => unknown {
+	assertFunction(caller, 'predicate', predicate);
+	assertFunction(caller, 'fn', fn);
+	return function transformIf(this: unknown, value: unknown): unknown {
+		return !predicate.call(this, value) === negated ? fn.call(this, value) : value;
+	};
+}
+
+/**
+ * Creates a function that applies `fn` to its argument when `predicate` returns a truthy value for it, and returns the argument unchanged
+ * otherwise: `value => predicate(value) ? fn(value) : value` (Ramda's `when`). Only the first argument is passed on; `this` is forwarded.
+ * With a type guard, `fn` receives the narrowed type, and the result type is `fn`'s result or the input minus the guarded type.
+ * @template T - The input type of the predicate
+ * @template S - The type the predicate guards
+ * @template R - The return type of `fn`
+ * @param {(value: T) => value is S} predicate - Decides whether `fn` runs
+ * @param {(value: S) => R} fn - Transforms the values that pass
+ * @returns {<V extends T>(value: V) => R | Exclude<V, S>} The conditional function
+ * @throws {TypeError} when `predicate` or `fn` is not a function
+ * @example
+ * const clampNegative = when(function (n: number) { return n < 0; }, constant(0));
+ * [3, -2, 5].map(clampNegative); // => [3, 0, 5]
+ * function isString(value: unknown): value is string { return typeof value === 'string'; }
+ * const trimStrings = when(isString, function (text) { return text.trim(); });
+ * [' a ', 1, null].map(trimStrings); // => ['a', 1, null]
+ */
+export function when<T, S extends T, R>(predicate: (value: T) => value is S, fn: (value: S) => R): <V extends T>(value: V) => R | Exclude<V, S>;
+export function when<T, R>(predicate: (value: T) => unknown, fn: (value: T) => R): <V extends T>(value: V) => V | R;
+/**
+ * Implementation of {@link when} (see the first overload for the full documentation).
+ * @param {AnyFunction} predicate - Decides whether `fn` runs
+ * @param {AnyFunction} fn - Transforms the values that pass
+ * @returns {(value: unknown) => unknown} The conditional function
+ * @throws {TypeError} when `predicate` or `fn` is not a function
+ */
+export function when(predicate: AnyFunction, fn: AnyFunction): (value: unknown) => unknown {
+	return conditional('when', predicate as UnknownFunction, fn as UnknownFunction, false);
+}
+
+/**
+ * Creates a function that applies `fn` to its argument when `predicate` returns a falsy value for it, and returns the argument unchanged
+ * otherwise: `value => predicate(value) ? value : fn(value)` (Ramda's `unless`). Only the first argument is passed on; `this` is
+ * forwarded. With a type guard, `fn` receives the input minus the guarded type, and the values that pass keep the guarded type.
+ * @template T - The input type of the predicate
+ * @template S - The type the predicate guards
+ * @template R - The return type of `fn`
+ * @param {(value: T) => value is S} predicate - Decides whether the value is kept as it is
+ * @param {(value: Exclude<T, S>) => R} fn - Transforms the values that fail
+ * @returns {<V extends T>(value: V) => (V & S) | R} The conditional function
+ * @throws {TypeError} when `predicate` or `fn` is not a function
+ * @example
+ * const toArray = unless(Array.isArray, function (value: unknown) { return [value]; });
+ * toArray([1, 2]); // => [1, 2]
+ * toArray(3); // => [3]
+ */
+export function unless<T, S extends T, R>(predicate: (value: T) => value is S, fn: (value: Exclude<T, S>) => R): <V extends T>(value: V) => (V & S) | R;
+export function unless<T, R>(predicate: (value: T) => unknown, fn: (value: T) => R): <V extends T>(value: V) => V | R;
+/**
+ * Implementation of {@link unless} (see the first overload for the full documentation).
+ * @param {AnyFunction} predicate - Decides whether the value is kept as it is
+ * @param {AnyFunction} fn - Transforms the values that fail
+ * @returns {(value: unknown) => unknown} The conditional function
+ * @throws {TypeError} when `predicate` or `fn` is not a function
+ */
+export function unless(predicate: AnyFunction, fn: AnyFunction): (value: unknown) => unknown {
+	return conditional('unless', predicate as UnknownFunction, fn as UnknownFunction, true);
+}
+
+/**
+ * A `[predicate, transform]` pair of {@link cond}.
+ * @template A - The argument types
+ * @template R - The transform's result type
+ */
+export type CondPair<A extends unknown[], R> = readonly [predicate: (...args: A) => unknown, transform: (...args: A) => R];
+
+/**
+ * Creates a function that tries each `[predicate, transform]` pair in order and returns `transform(...args)` for the first predicate that
+ * returns a truthy value for the same arguments, or `undefined` when none does (Ramda's `cond`, lodash's `cond`). Later predicates are
+ * not called once one matches. Every argument and `this` are passed to both functions. The pairs are copied (and validated) when the
+ * function is created, so changing the array afterwards has no effect. End with a catch-all pair (`[constant(true), …]`) for a default.
+ * Typed per pair for up to six pairs (the result is the union of the transforms' results, and `undefined`); longer lists, or arrays,
+ * need transforms of one result type.
+ * @template A - The argument types
+ * @template R1 - The result type of the (first) transform
+ * @param {readonly [CondPair<A, R1>]} pairs - The `[predicate, transform]` pairs
+ * @returns {(...args: A) => R1 | undefined} The function
+ * @throws {TypeError} when `pairs` is not an array, or one of its items is not an array of two functions
+ * @example
+ * const sign = cond([
+ *   [function (n: number) { return n < 0; }, function () { return 'negative'; }],
+ *   [function (n: number) { return n === 0; }, function () { return 'zero'; }],
+ *   [constant(true), function (n: number) { return `positive (${n})`; }]
+ * ]);
+ * sign(-5); // => 'negative'
+ * sign(0); // => 'zero'
+ * sign(7); // => 'positive (7)'
+ * const fizz = cond([[function (n: number, by: number) { return n % by === 0; }, function (n: number, by: number) { return n / by; }]]);
+ * fizz(9, 3); // => 3
+ * fizz(10, 3); // => undefined
+ */
+export function cond<A extends unknown[], R1>(pairs: readonly [CondPair<A, R1>]): (...args: A) => R1 | undefined;
+export function cond<A extends unknown[], R1, R2>(pairs: readonly [CondPair<A, R1>, CondPair<A, R2>]): (...args: A) => R1 | R2 | undefined;
+export function cond<A extends unknown[], R1, R2, R3>(pairs: readonly [CondPair<A, R1>, CondPair<A, R2>, CondPair<A, R3>]): (...args: A) => R1 | R2 | R3 | undefined;
+export function cond<A extends unknown[], R1, R2, R3, R4>(
+	pairs: readonly [CondPair<A, R1>, CondPair<A, R2>, CondPair<A, R3>, CondPair<A, R4>]
+): (...args: A) => R1 | R2 | R3 | R4 | undefined;
+export function cond<A extends unknown[], R1, R2, R3, R4, R5>(
+	pairs: readonly [CondPair<A, R1>, CondPair<A, R2>, CondPair<A, R3>, CondPair<A, R4>, CondPair<A, R5>]
+): (...args: A) => R1 | R2 | R3 | R4 | R5 | undefined;
+export function cond<A extends unknown[], R1, R2, R3, R4, R5, R6>(
+	pairs: readonly [CondPair<A, R1>, CondPair<A, R2>, CondPair<A, R3>, CondPair<A, R4>, CondPair<A, R5>, CondPair<A, R6>]
+): (...args: A) => R1 | R2 | R3 | R4 | R5 | R6 | undefined;
+export function cond(pairs: readonly []): (...args: unknown[]) => undefined;
+export function cond<A extends unknown[], R>(pairs: ReadonlyArray<CondPair<A, R>>): (...args: A) => R | undefined;
+/**
+ * Implementation of {@link cond} (see the first overload for the full documentation).
+ * @param {ReadonlyArray<readonly [AnyFunction, AnyFunction]>} pairs - The `[predicate, transform]` pairs
+ * @returns {(...args: unknown[]) => unknown} The function
+ * @throws {TypeError} when `pairs` is not an array, or one of its items is not an array of two functions
+ */
+export function cond(pairs: ReadonlyArray<readonly [AnyFunction, AnyFunction]>): (...args: unknown[]) => unknown {
+	if (!Array.isArray(pairs)) throw new TypeError(`cond: \`pairs\` must be an array, got ${describe(pairs)}`);
+	// Two flat arrays of functions: monomorphic, and immune to later changes of `pairs`.
+	const predicates: UnknownFunction[] = [];
+	const transforms: UnknownFunction[] = [];
+	for (let index = 0; index < pairs.length; index++) {
+		const pair: unknown = pairs[index];
+		if (!Array.isArray(pair)) throw new TypeError(`cond: \`pairs[${index}]\` must be a [predicate, transform] pair, got ${describe(pair)}`);
+		// Each read once: a getter could give another value the second time.
+		const predicate: unknown = pair[0];
+		const transform: unknown = pair[1];
+		assertFunction('cond', `pairs[${index}][0]`, predicate);
+		assertFunction('cond', `pairs[${index}][1]`, transform);
+		predicates.push(predicate as UnknownFunction);
+		transforms.push(transform as UnknownFunction);
+	}
+	const count = predicates.length;
+	// Up to three arguments (an `Array.prototype.map` callback gets three) are passed with `call`, which V8 optimises much better than
+	// `apply` with an argument list.
+	return function condition(this: unknown, a?: unknown, b?: unknown, c?: unknown): unknown {
+		const length = arguments.length;
+		for (let index = 0; index < count; index++) {
+			if (length === 1) {
+				if (predicates[index].call(this, a)) return transforms[index].call(this, a);
+			} else if (length === 3) {
+				if (predicates[index].call(this, a, b, c)) return transforms[index].call(this, a, b, c);
+			} else if (length === 2) {
+				if (predicates[index].call(this, a, b)) return transforms[index].call(this, a, b);
+			} else {
+				// eslint-disable-next-line prefer-rest-params -- see above
+				const args = arguments as unknown as unknown[];
+				if (predicates[index].apply(this, args)) return transforms[index].apply(this, args);
+			}
+		}
+		return undefined;
+	};
 }
 
 /**
@@ -2796,7 +3084,7 @@ class MatchState {
 	 * @returns {MatchState} The state after the case
 	 */
 	with(pattern: unknown, ...functions: unknown[]): MatchState {
-		const when = caseGuard('matchWith', functions);
+		const guard = caseGuard('matchWith', functions);
 
 		// Once a case matched, later patterns are neither tested nor read.
 		if (this.handler !== undefined) return this;
@@ -2815,7 +3103,7 @@ class MatchState {
 
 		const selection = select('matchWith', log);
 
-		return when !== undefined && !callCase(when, selection, this.value) ? this : new MatchState(this.value, caseHandler(functions) as AnyFunction, selection);
+		return guard !== undefined && !callCase(guard, selection, this.value) ? this : new MatchState(this.value, caseHandler(functions) as AnyFunction, selection);
 	}
 
 	/**
@@ -2992,7 +3280,7 @@ class MatcherState {
 	 * @throws {TypeError} when a function is not one, or the pattern is circular or captures both anonymous and named values (or a name twice)
 	 */
 	with(pattern: unknown, ...functions: unknown[]): MatcherState {
-		const when = caseGuard('matcher', functions);
+		const guard = caseGuard('matcher', functions);
 		const log: unknown[] = [];
 		const scanned = new Map<unknown, unknown[] | false>();
 		const helpers = scan('matcher', pattern, log, [], scanned);
@@ -3006,7 +3294,7 @@ class MatcherState {
 				guard: helpers ? undefined : (isMatching(pattern) as (value: unknown) => boolean),
 				pattern: helpers ? prepare(pattern, scanned, new Map()) : undefined,
 				captures: log.length > 0,
-				when,
+				when: guard,
 				handler: caseHandler(functions) as AnyFunction
 			}
 		]);
