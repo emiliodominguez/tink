@@ -1,4 +1,4 @@
-import { assertFunction, assertInteger, assertNumber, readOption, describe as typeName } from '../utils/assert.js';
+import { assertFunction, assertInteger, assertNumber, readOption, show, describe as typeName } from '../utils/assert.js';
 import { DIACRITICS, NON_ASCII, transliterate } from '../utils/latin.js';
 
 /** Points awarded for every matched character. */
@@ -625,4 +625,885 @@ export function highlight(text: string, ranges: Iterable<readonly [number, numbe
 	}
 	if (cursor < length) segments.push({ text: text.slice(cursor), match: false });
 	return segments;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// tokenize
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * A word segmenter, such as `new Intl.Segmenter(locale, { granularity: 'word' })`: splits a text into consecutive segments.
+ */
+export interface WordSegmenter {
+	/** Splits `text` into consecutive segments (concatenated, they give back `text`). */
+	segment(text: string): Iterable<{ segment: string }>;
+}
+
+/**
+ * Options accepted by {@link tokenize}.
+ */
+export interface TokenizeOptions {
+	/**
+	 * When `true`, tokens keep their case.
+	 * @default false
+	 */
+	caseSensitive?: boolean;
+	/**
+	 * When `true`, accents and other diacritics are removed and letters are folded as {@link fuzzyMatch} folds them, without its length cap (`'Crème'` gives `'creme'`).
+	 * See {@link tokenize}.
+	 * @default false
+	 */
+	ignoreDiacritics?: boolean;
+	/**
+	 * Tokens with fewer code points are dropped (an integer `>= 1`).
+	 * @default 1
+	 */
+	minLength?: number;
+	/** Tokens to drop, compared with the final tokens (so give them lower-cased, and folded with `ignoreDiacritics`). */
+	stopWords?: ReadonlySet<string>;
+	/**
+	 * Word segmenter for scripts written without spaces (Chinese, Japanese, Thai, Lao, Khmer, Burmese), typically
+	 * `new Intl.Segmenter(locale, { granularity: 'word' })`: the text is also split at every boundary between its segments.
+	 */
+	segmenter?: WordSegmenter;
+}
+
+/** A word: a letter or digit, then letters, digits and combining marks (which belong to the letter before them), in any script. */
+const WORDS = /[\p{L}\p{N}][\p{L}\p{M}\p{N}]*/gu;
+/** A format character (soft hyphen, zero-width joiners and spaces, bidirectional marks, word joiner, BOM...). */
+const FORMAT = /\p{Cf}/gu;
+
+/**
+ * Replaces a format character before tokenizing: as in Unicode word segmentation (UAX #29), a zero-width space separates words and
+ * the other format characters are ignored (`'co­operate'`, with a soft hyphen, is one word).
+ * @param {string} char - A format character
+ * @returns {string} A space for U+200B ZERO WIDTH SPACE, nothing for the others
+ */
+function unformat(char: string): string {
+	return char === '​' ? ' ' : '';
+}
+
+/**
+ * Counts the code points of a string.
+ * @param {string} text - The string
+ * @returns {number} Its number of code points
+ */
+function codePoints(text: string): number {
+	let count = 0;
+	for (const _char of text) count++;
+	return count;
+}
+
+/**
+ * Unvalidated implementation of {@link tokenize}.
+ * @param {string} text - The text
+ * @param {boolean} caseSensitive - Whether tokens keep their case
+ * @param {boolean} diacritics - Whether diacritics are removed
+ * @param {number} minLength - Smallest number of code points of a token
+ * @param {ReadonlySet<string> | undefined} stopWords - Tokens to drop
+ * @param {WordSegmenter | undefined} segmenter - Additional word boundaries
+ * @returns {string[]} The tokens
+ * @throws {TypeError} when a segment is not a string
+ */
+function words(
+	text: string,
+	caseSensitive: boolean,
+	diacritics: boolean,
+	minLength: number,
+	stopWords: ReadonlySet<string> | undefined,
+	segmenter: WordSegmenter | undefined
+): string[] {
+	// ASCII text has no format characters or diacritics, and is in NFC (the segments of a segmenter are pieces of the text).
+	const nonAscii = NON_ASCII.test(text);
+	let prepared = nonAscii ? text.replace(FORMAT, unformat) : text;
+	if (segmenter !== undefined) {
+		const segments: string[] = [];
+		// The segmenter sees the text in NFC, the form of its dictionaries.
+		for (const { segment } of segmenter.segment(prepared.normalize('NFC'))) {
+			assertString('tokenize', 'segment', segment);
+			segments.push(segment);
+		}
+		prepared = segments.join(' ');
+	}
+	if (diacritics && nonAscii) prepared = transliterate(prepared.normalize('NFKD').replace(DIACRITICS, ''));
+	if (!caseSensitive) prepared = prepared.toLowerCase();
+	// Composed last, so that tokens are always in NFC: folding decomposes the text, and lower-casing can make characters composable
+	// (`'J'` + caron, which has no precomposed form, gives `'ǰ'`).
+	if (nonAscii) prepared = prepared.normalize('NFC');
+	const tokens = (prepared.match(WORDS) ?? []) as string[];
+	if (minLength === 1 && stopWords === undefined) return tokens;
+	let kept = 0;
+	for (const token of tokens) if ((minLength === 1 || codePoints(token) >= minLength) && !stopWords?.has(token)) tokens[kept++] = token;
+	tokens.length = kept;
+	return tokens;
+}
+
+/**
+ * Splits `text` into lower-cased words, for indexing and full-text search (see {@link createSearchIndex}). A word is a letter or digit
+ * of any script followed by letters, digits and combining marks (`\p{L}`, `\p{N}`, and `\p{M}` attached to the letter before it);
+ * everything else separates words: spaces, punctuation, symbols, emoji, and also apostrophes, hyphens and underscores (`"don't"` gives
+ * `'don'` and `'t'`, `'e-mail'` gives `'e'` and `'mail'`). Tokens are extracted in one pass of a single regular expression (after the
+ * normalization and lower-casing passes below), so the cost is linear in the text.
+ *
+ * Before splitting, format characters are ignored as in Unicode word segmentation (UAX #29): a soft hyphen, zero-width joiner or
+ * non-joiner, word joiner, bidirectional mark or BOM inside a word does not split it, and a zero-width space separates words. The text
+ * is lower-cased with `toLowerCase()` (locale-independent: `'I'` gives `'i'` even in Turkish, `'İ'` gives `'i̇'` with a combining
+ * dot, and a word-final capital sigma becomes `'ς'`), unless `caseSensitive`, then normalized to NFC: tokens are always in NFC, so a
+ * precomposed `'é'` and `'e'` + combining accent give the same token, and so do `'ǰ'` and `'J'` + caron.
+ *
+ * With `ignoreDiacritics`, the text is folded before splitting with the rules of {@link fuzzyMatch}'s `ignoreDiacritics` (compatibility
+ * decomposition, combining diacritical marks removed, `ß`, `æ`, `œ`, `ø`, `đ`, `ð`, `ł`, `þ`, `ı` spelled in ASCII), applied to the whole
+ * text, then recomposed (NFC): `'Ｃａｆé'` gives `'cafe'`, `'Straße'` gives `'strasse'`, `'ﬁle'` gives `'file'`, `'İ'` gives `'i'`,
+ * `'①'` gives `'1'`. Unlike {@link fuzzyMatch}, which keeps a code point whose folding is longer than 3 characters to bound its
+ * quadratic cost, every folding is applied (`'ﷺ'` gives the 4 words of its decomposition): the cost stays linear.
+ *
+ * Scripts written without spaces are not segmented by default: a run of Chinese, Japanese or Thai letters is a single token. Pass an
+ * `Intl.Segmenter` with `granularity: 'word'` as `segmenter` to split it into dictionary words as well (much slower: ICU's segmenter
+ * runs on the whole text).
+ * @param {string} text - The text to split
+ * @param {TokenizeOptions} [options={}] - `caseSensitive`, `ignoreDiacritics` (both default `false`), `minLength` (default `1`), `stopWords`, `segmenter`
+ * @returns {string[]} The tokens, in order (with repetitions)
+ * @throws {TypeError} when `text` is not a string, `stopWords` is not a `Set`, `segmenter` has no `segment` method or gives a segment that is not a string
+ * @throws {RangeError} when `minLength` is not an integer `>= 1`
+ * @example
+ * tokenize('Hello, World! Ünïcode-aware: 42 × π'); // => ['hello', 'world', 'ünïcode', 'aware', '42', 'π']
+ * tokenize('Crème brûlée à Zürich', { ignoreDiacritics: true }); // => ['creme', 'brulee', 'a', 'zurich']
+ * tokenize('The cat and a hat', { stopWords: new Set(['the', 'and']), minLength: 2 }); // => ['cat', 'hat']
+ * @example
+ * tokenize('東京都に住む'); // => ['東京都に住む']
+ * tokenize('東京都に住む', { segmenter: new Intl.Segmenter('ja', { granularity: 'word' }) }).length > 1; // => true
+ */
+export function tokenize(text: string, options: TokenizeOptions = {}): string[] {
+	assertString('tokenize', 'text', text);
+	const minLength = readOption(options, 'minLength', 1);
+	assertInteger('tokenize', 'options.minLength', minLength, 1);
+	const stopWords = readOption(options, 'stopWords');
+	if (stopWords !== undefined && typeof (stopWords as Partial<ReadonlySet<string>> | null)?.has !== 'function') {
+		throw new TypeError(`tokenize: \`options.stopWords\` must be a Set, got ${typeName(stopWords)}`);
+	}
+	const segmenter = readOption(options, 'segmenter');
+	if (segmenter !== undefined && typeof (segmenter as Partial<WordSegmenter> | null)?.segment !== 'function') {
+		throw new TypeError(`tokenize: \`options.segmenter\` must be an Intl.Segmenter, got ${typeName(segmenter)}`);
+	}
+	return words(text, readOption(options, 'caseSensitive') === true, readOption(options, 'ignoreDiacritics') === true, minLength, stopWords, segmenter);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// createSearchIndex
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** The id of a document in a {@link SearchIndex}: a string or a number (compared with SameValueZero, so `0` and `-0` are the same id). */
+export type SearchId = string | number;
+
+/**
+ * Options accepted by {@link createSearchIndex}.
+ * @template T - The type of the indexed documents
+ */
+export interface SearchIndexOptions<T> {
+	/**
+	 * The fields to index: their names (each with a boost of `1`), or an object mapping each name to its boost, a finite number `> 0` by
+	 * which the field's BM25 score is multiplied (`{ title: 2, body: 1 }`).
+	 */
+	fields: ReadonlyArray<string> | Readonly<Record<string, number>>;
+	/**
+	 * Name of the property that holds each document's id (a string or a number, unique in the index).
+	 * @default 'id'
+	 */
+	id?: string;
+	/**
+	 * Reads the text of a field: a string, an array of strings (tags, paragraphs), or `null`/`undefined` for none. By default, the
+	 * document's property of that name (its own, or inherited from its class, but never from a polluted `Object.prototype`).
+	 */
+	extract?: (document: T, field: string) => string | ReadonlyArray<string> | null | undefined;
+	/**
+	 * Splits field texts and queries into terms (it must return an array of strings; empty strings are ignored). Wrap {@link tokenize}
+	 * to change its options, e.g. `function (text) { return tokenize(text, { ignoreDiacritics: true }); }`.
+	 * @default tokenize
+	 */
+	tokenize?: (text: string) => ReadonlyArray<string>;
+	/**
+	 * BM25 term-frequency saturation (a finite number `>= 0`; `0` ignores how often a term occurs).
+	 * @default 1.2
+	 */
+	k1?: number;
+	/**
+	 * BM25 length normalization, between `0` (field length ignored) and `1` (term frequencies fully relative to the length).
+	 * @default 0.75
+	 */
+	b?: number;
+}
+
+/**
+ * Options accepted by {@link SearchIndex.search}.
+ * @template T - The type of the indexed documents
+ */
+export interface SearchIndexQueryOptions<T> {
+	/**
+	 * Maximum number of results.
+	 * @default Infinity
+	 */
+	limit?: number;
+	/**
+	 * Prefix matching: `true` lets every query term match the index terms it starts (`'eng'` matches `'engine'`), `'last'` only the last
+	 * one (search as you type).
+	 * @default false
+	 */
+	prefix?: boolean | 'last';
+	/**
+	 * `'or'` returns the documents matching any query term, `'and'` only those matching every one.
+	 * @default 'or'
+	 */
+	combine?: 'or' | 'and';
+	/** Keeps only the matching documents for which it returns a truthy value. It must not modify the index. */
+	filter?: (document: T) => unknown;
+}
+
+/**
+ * One result of {@link SearchIndex.search}.
+ * @template T - The type of the indexed documents
+ */
+export interface SearchIndexResult<T> {
+	/** The document's id. */
+	id: SearchId;
+	/** The document. */
+	item: T;
+	/** Its BM25 score (higher is better; only meaningful relative to the other results of the same index). */
+	score: number;
+	/**
+	 * The index terms of the document that matched the query: for each query term in order, the term itself, or for a prefix the terms it
+	 * starts (in code-unit order), each listed once.
+	 */
+	terms: string[];
+}
+
+/**
+ * An in-memory full-text index ranked with BM25, as returned by {@link createSearchIndex}.
+ * @template T - The type of the indexed documents
+ */
+export interface SearchIndex<T> {
+	/** Number of indexed documents. */
+	readonly size: number;
+	/** Indexes a document; throws a `RangeError` if a document with the same id is already indexed (see `replace`). */
+	add(document: T): void;
+	/** Indexes documents in order (those before an invalid one stay indexed). */
+	addAll(documents: Iterable<T>): void;
+	/** Indexes a document, replacing the one with the same id (which loses its place in the insertion order); returns `true` when it replaced one. */
+	replace(document: T): boolean;
+	/** Removes the document with this id; returns `false` when there is none. */
+	remove(id: SearchId): boolean;
+	/** Whether a document with this id is indexed. */
+	has(id: SearchId): boolean;
+	/** The indexed document with this id, or `undefined`. */
+	get(id: SearchId): T | undefined;
+	/** The documents matching `query`, best first (see {@link createSearchIndex}). */
+	search(query: string, options?: SearchIndexQueryOptions<T>): Array<SearchIndexResult<T>>;
+}
+
+/**
+ * The postings of a term: the documents that contain it and how often, field by field.
+ */
+interface Posting {
+	/** The term. */
+	term: string;
+	/** Slots of the documents containing the term, ascending (those of removed documents stay until the next vacuum). */
+	slots: number[];
+	/** Occurrences of the term in each field of each of these documents: `tfs[entry * fieldCount + field]`. */
+	tfs: number[];
+	/** Number of indexed documents containing the term, per field. */
+	df: number[];
+	/** Number of indexed documents containing the term (in any field). */
+	live: number;
+}
+
+/**
+ * Binary search in an ascending array.
+ * @template V - Numbers or strings (compared with `<`: strings by UTF-16 code units, like `Array.prototype.sort`)
+ * @param {readonly V[]} values - The ascending values
+ * @param {V} value - The value looked for
+ * @returns {number} The index of the first value `>= value` (`values.length` when there is none)
+ */
+function lowerBound<V extends number | string>(values: readonly V[], value: V): number {
+	let low = 0;
+	let high = values.length;
+	while (low < high) {
+		const middle = (low + high) >>> 1;
+		if (values[middle] < value) low = middle + 1;
+		else high = middle;
+	}
+	return low;
+}
+
+/**
+ * Orders the candidates of a search by descending score, then ascending slot (insertion order), keeping the first `limit` with a
+ * bounded heap: O(n log limit) instead of sorting all of them.
+ * @param {number[]} slots - The candidates' slots (distinct)
+ * @param {number[]} scores - Their scores (never `NaN`)
+ * @param {number} limit - Number of candidates to keep (`>= 1`, or `Infinity`)
+ * @returns {number[]} The indexes (into `slots`) of the kept candidates, best first
+ */
+function rank(slots: number[], scores: number[], limit: number): number[] {
+	/**
+	 * Whether candidate `i` ranks before candidate `j` (a strict total order, as slots are distinct; infinite scores tie like equal ones).
+	 * @param {number} i - A candidate
+	 * @param {number} j - Another candidate
+	 * @returns {boolean} Whether `i` comes first
+	 */
+	function before(i: number, j: number): boolean {
+		return scores[i] > scores[j] || (scores[i] === scores[j] && slots[i] < slots[j]);
+	}
+	/**
+	 * Compares two candidates for `Array.prototype.sort`.
+	 * @param {number} i - A candidate
+	 * @param {number} j - Another candidate
+	 * @returns {number} `-1` when `i` comes first, `1` otherwise
+	 */
+	function compare(i: number, j: number): number {
+		return before(i, j) ? -1 : 1;
+	}
+	// The best `limit` candidates seen so far, the worst at the root: no child ranks after its parent.
+	const heap: number[] = [];
+	for (let i = 0; i < slots.length; i++) {
+		let k = heap.length;
+		if (k < limit) {
+			while (k > 0) {
+				const parent = (k - 1) >> 1;
+				if (before(i, heap[parent])) break;
+				heap[k] = heap[parent];
+				k = parent;
+			}
+			heap[k] = i;
+		} else if (before(i, heap[0])) {
+			k = 0;
+			for (;;) {
+				let child = 2 * k + 1;
+				if (child >= limit) break;
+				if (child + 1 < limit && before(heap[child], heap[child + 1])) child++;
+				if (before(heap[child], i)) break;
+				heap[k] = heap[child];
+				k = child;
+			}
+			heap[k] = i;
+		}
+	}
+	return heap.sort(compare);
+}
+
+/**
+ * The terms of a document that matched a query, in the order of their postings in `matched`: found by binary search in the few matched
+ * posting lists, or by going through the document's terms when there are more matched postings than a quarter of those.
+ * @param {Posting[]} list - The postings of the document's terms
+ * @param {number} slot - The document's slot
+ * @param {Map<Posting, number>} matched - The matched postings, numbered in order
+ * @returns {string[]} The matched terms
+ */
+function matchedTerms(list: Posting[], slot: number, matched: Map<Posting, number>): string[] {
+	const found: Posting[] = [];
+	if (4 * matched.size <= list.length) {
+		for (const posting of matched.keys()) if (posting.slots[lowerBound(posting.slots, slot)] === slot) found.push(posting);
+	} else {
+		for (const posting of list) if (matched.has(posting)) found.push(posting);
+		found.sort(function (a, b) {
+			return (matched.get(a) as number) - (matched.get(b) as number);
+		});
+	}
+	const terms: string[] = [];
+	for (const posting of found) terms.push(posting.term);
+	return terms;
+}
+
+/**
+ * Throws a `TypeError` unless a token returned by the tokenizer is a string.
+ * @param {string} caller - Name of the public method, used in the error message
+ * @param {unknown} token - The token
+ * @returns {void}
+ * @throws {TypeError} when `token` is not a string
+ */
+function assertToken(caller: string, token: unknown): asserts token is string {
+	if (typeof token !== 'string') throw new TypeError(`${caller}: \`options.tokenize\` must return an array of strings, got an array containing ${typeName(token)}`);
+}
+
+/**
+ * Creates an in-memory full-text index whose results are ranked with Okapi BM25, over one or more fields of the documents with per-field
+ * boosts. Documents are kept by reference and found by id; their fields are read and tokenized once, when added (changing a document
+ * afterwards does not change the index: `replace` it). `search` tokenizes the query like the fields and returns the matching documents,
+ * best first, with their score and the terms that matched. Each `add`, `replace` and `remove` is atomic: a document, field or term that
+ * fails validation, or an `extract`/`tokenize` that throws, leaves the index as it was.
+ *
+ * Scoring — every field is scored as an index of its own, then the field scores are multiplied by their boosts and added (a simplified
+ * BM25F, as Lucene's multi-field queries do it). For a query term `t`, a document `d` and a field `f`:
+ *
+ * `score(t, d, f) = boost(f) · idf(t, f) · tf · (k1 + 1) / (tf + k1 · (1 − b + b · len / avglen))`, where
+ * - `tf` is the number of occurrences of `t` in field `f` of `d` (if none, the field adds nothing), and `len` the number of terms of that field;
+ * - `idf(t, f) = ln(1 + (N − n + 0.5) / (n + 0.5))`, Lucene's form of the BM25 IDF, which is never negative: `N` is the number of indexed
+ *   documents with at least one term in field `f`, and `n` the number of those containing `t` there;
+ * - `avglen` is the average length of field `f` over those `N` documents (lengths are exact; Lucene rounds them to one byte).
+ *
+ * A document's score is the sum, over the distinct query terms, of `Σ_f score(t, d, f)`. With prefix matching, a query term matches every
+ * index term it starts (the term itself included), and contributes the best of their scores for the document (not their sum, so a short
+ * prefix does not favour documents with many words that share it). Duplicate query terms count once (as a prefix if any occurrence is one).
+ * Results are sorted by descending score, then by insertion order (a replaced document counts as added last), so they are deterministic.
+ * Scores are computed in a form whose denominator never overflows, so absurd boosts or `k1` (near `Number.MAX_VALUE`) can make a score
+ * `Infinity` but never `NaN`.
+ *
+ * Removal is exact: the statistics (`N`, `n`, lengths) are updated at once, so the scores after `remove` or `replace` are those of an
+ * index built without the document (no tombstones that would skew the IDF). The memory of removed documents is reclaimed when they
+ * outnumber the indexed ones, by renumbering the documents in O(total postings), which keeps removals amortized O(terms of the document
+ * · log n).
+ *
+ * Cost: adding a document is O(its terms) (tokenizing aside); a search is O(postings of the matched terms + matches · log limit), plus
+ * O(limit · matched terms · log n) for the `terms` of the results, plus,
+ * for prefixes, O(log V + expansions) on a sorted term list that is merged in O(V) (V terms) at the first prefix search after new terms
+ * were added. Memory is O(postings). There is no fuzzy matching (combine with {@link fuzzySearch} over the terms if needed), and no
+ * phrase or proximity scoring. To persist an index, keep the documents and rebuild it with `addAll`.
+ * @template T - The type of the indexed documents
+ * @param {SearchIndexOptions<T>} options - `fields` (names, or names → boosts), `id` (default `'id'`), `extract`, `tokenize` (default {@link tokenize}), `k1` (default `1.2`), `b` (default `0.75`)
+ * @returns {SearchIndex<T>} A new, empty index
+ * @throws {TypeError} when `options` is not an object, `fields` is neither an array of strings nor an object, `id` is not a string,
+ * `extract`/`tokenize` are not functions, or `k1`, `b` or a boost is not a number
+ * @throws {RangeError} when `fields` is empty or repeats a field, a boost is not a finite number `> 0`, `k1` is not a finite number `>= 0`, or `b` is not in `[0, 1]`
+ * @example
+ * const index = createSearchIndex<{ id: number; title: string; body: string }>({ fields: { title: 2, body: 1 } });
+ * index.addAll([
+ * 	{ id: 1, title: 'Moby Dick', body: 'The whale hunts the ship. A white whale.' },
+ * 	{ id: 2, title: 'The Old Man and the Sea', body: 'An old fisherman, a marlin and sharks.' },
+ * 	{ id: 3, title: 'Whale Songs', body: 'How humpback whales sing.' }
+ * ]);
+ * index.search('whale').map(function (r) { return r.id; }); // => [3, 1]
+ * index.search('whale').map(function (r) { return r.terms; }); // => [['whale'], ['whale']]
+ * index.search('old sharks', { combine: 'and' }).map(function (r) { return r.item.title; }); // => ['The Old Man and the Sea']
+ * index.search('hum', { prefix: 'last' }).map(function (r) { return r.terms; }); // => [['humpback']]
+ * index.remove(3); // => true
+ * index.search('whale').map(function (r) { return r.id; }); // => [1]
+ * index.size; // => 2
+ * @example
+ * // Accents folded on both sides, stop words dropped, a filter over the documents
+ * const stopWords = new Set(['de', 'la', 'le']);
+ * const places = createSearchIndex<{ code: string; name: string; country: string }>({
+ * 	id: 'code',
+ * 	fields: ['name'],
+ * 	tokenize: function (text) { return tokenize(text, { ignoreDiacritics: true, stopWords }); }
+ * });
+ * places.addAll([{ code: 'MAD', name: 'Málaga', country: 'ES' }, { code: 'ZRH', name: 'Zürich', country: 'CH' }, { code: 'LEH', name: 'Le Havre', country: 'FR' }]);
+ * places.search('zurich').map(function (r) { return r.id; }); // => ['ZRH']
+ * places.search('le havre').map(function (r) { return r.terms; }); // => [['havre']]
+ * places.search('ma zu', { prefix: true, filter: function (place) { return place.country !== 'CH'; } }).map(function (r) { return r.id; }); // => ['MAD']
+ * places.add({ code: 'ZRH', name: 'Zurich', country: 'CH' }); // throws RangeError
+ */
+export function createSearchIndex<T extends object>(options: SearchIndexOptions<T>): SearchIndex<T> {
+	const caller = 'createSearchIndex';
+	if (typeof options !== 'object' || options === null) throw new TypeError(`${caller}: \`options\` must be an object, got ${typeName(options)}`);
+	const fields: unknown = readOption(options, 'fields');
+	const names: string[] = [];
+	const boosts: number[] = [];
+	if (Array.isArray(fields)) {
+		for (const name of fields as unknown[]) {
+			if (typeof name !== 'string') throw new TypeError(`${caller}: \`options.fields\` must contain field names, got ${typeName(name)}`);
+			names.push(name);
+			boosts.push(1);
+		}
+	} else if (typeof fields === 'object' && fields !== null) {
+		for (const name of Object.keys(fields)) {
+			const boost: unknown = (fields as Record<string, unknown>)[name];
+			assertNumber(caller, `options.fields.${name}`, boost, (boost as number) > 0 && (boost as number) < Infinity, 'a finite number > 0');
+			names.push(name);
+			boosts.push(boost);
+		}
+	} else throw new TypeError(`${caller}: \`options.fields\` must be an array of field names or an object of boosts, got ${typeName(fields)}`);
+	if (names.length === 0) throw new RangeError(`${caller}: \`options.fields\` must name at least one field, got none`);
+	if (new Set(names).size < names.length) throw new RangeError(`${caller}: \`options.fields\` must name each field once, got ${names.join(', ')}`);
+	const idKey = readOption(options, 'id', 'id');
+	assertString(caller, 'options.id', idKey);
+	const extract = readOption(options, 'extract');
+	if (extract !== undefined) assertFunction(caller, 'options.extract', extract);
+	const split = readOption(options, 'tokenize');
+	if (split !== undefined) assertFunction(caller, 'options.tokenize', split);
+	const k1 = readOption(options, 'k1', 1.2);
+	assertNumber(caller, 'options.k1', k1, k1 >= 0 && k1 < Infinity, 'a finite number >= 0');
+	const b = readOption(options, 'b', 0.75);
+	assertNumber(caller, 'options.b', b, b >= 0 && b <= 1, 'a number between 0 and 1');
+
+	const fieldCount = names.length;
+	/** Per field: the number of indexed documents with at least one term in it, and their total number of terms in it. */
+	const docCount: number[] = new Array<number>(fieldCount).fill(0);
+	const totalLength: number[] = new Array<number>(fieldCount).fill(0);
+	// Per slot (documents are numbered in insertion order; a removed document leaves an empty slot until the next vacuum): id, document,
+	// field lengths (`lengths[slot * fieldCount + field]`) and the postings of its distinct terms (in order of first occurrence).
+	const ids: SearchId[] = [];
+	const docs: Array<T | undefined> = [];
+	const lengths: number[] = [];
+	const termsOf: Array<Posting[] | undefined> = [];
+	const slotOf = new Map<SearchId, number>();
+	const postings = new Map<string, Posting>();
+	// The terms in code-unit order (some possibly removed since), and the terms added since it was sorted.
+	let sorted: string[] = [];
+	let fresh: string[] = [];
+	let live = 0;
+	// Incremented by every change, to detect a `filter` that changes the index.
+	let version = 0;
+	// Search scratch space, indexed by slot (no user code runs while it is in use): the total score, the best score for the current
+	// query term, the number of query terms matched, and stamps telling whether those slots were set for the current query / term.
+	let total = new Float64Array(0);
+	let best = total;
+	let docMark = total;
+	let termMark = total;
+	let hits = new Int32Array(0);
+	let clock = 0;
+
+	/**
+	 * Splits a text into terms with the index's tokenizer.
+	 * @param {string} text - The text
+	 * @param {string} method - Name of the public method, for the error messages
+	 * @returns {ReadonlyArray<unknown>} The terms (unvalidated when the tokenizer is the user's)
+	 * @throws {TypeError} when the user's tokenizer does not return an array
+	 */
+	function analyze(text: string, method: string): ReadonlyArray<unknown> {
+		if (split === undefined) return words(text, false, false, 1, undefined, undefined);
+		const terms: unknown = split(text);
+		if (!Array.isArray(terms)) throw new TypeError(`${method}: \`options.tokenize\` must return an array of strings, got ${typeName(terms)}`);
+		return terms;
+	}
+
+	/**
+	 * Removes the document in a slot, updating every statistic, and vacuums when removed documents outnumber the indexed ones.
+	 * @param {number} slot - The slot of an indexed document
+	 * @returns {void}
+	 */
+	function discard(slot: number): void {
+		for (const posting of termsOf[slot] as Posting[]) {
+			const entry = lowerBound(posting.slots, slot);
+			for (let f = 0; f < fieldCount; f++) if (posting.tfs[entry * fieldCount + f] > 0) posting.df[f]--;
+			if (--posting.live === 0) postings.delete(posting.term);
+		}
+		for (let f = 0; f < fieldCount; f++) {
+			const length = lengths[slot * fieldCount + f];
+			if (length > 0) {
+				docCount[f]--;
+				totalLength[f] -= length;
+			}
+		}
+		slotOf.delete(ids[slot]);
+		docs[slot] = undefined;
+		termsOf[slot] = undefined;
+		live--;
+		version++;
+		if (docs.length > 2 * live) vacuum();
+	}
+
+	/**
+	 * Drops the slots of removed documents: renumbers the indexed ones (keeping their order) and compacts every posting list.
+	 * @returns {void}
+	 */
+	function vacuum(): void {
+		const renumbered = new Int32Array(docs.length).fill(-1);
+		let next = 0;
+		for (let slot = 0; slot < docs.length; slot++) {
+			if (docs[slot] === undefined) continue;
+			renumbered[slot] = next;
+			ids[next] = ids[slot];
+			docs[next] = docs[slot];
+			termsOf[next] = termsOf[slot];
+			for (let f = 0; f < fieldCount; f++) lengths[next * fieldCount + f] = lengths[slot * fieldCount + f];
+			slotOf.set(ids[next], next);
+			next++;
+		}
+		ids.length = docs.length = termsOf.length = next;
+		lengths.length = next * fieldCount;
+		for (const posting of postings.values()) {
+			const { slots, tfs } = posting;
+			let kept = 0;
+			for (let entry = 0; entry < slots.length; entry++) {
+				const slot = renumbered[slots[entry]];
+				if (slot < 0) continue;
+				slots[kept] = slot;
+				for (let f = 0; f < fieldCount; f++) tfs[kept * fieldCount + f] = tfs[entry * fieldCount + f];
+				kept++;
+			}
+			slots.length = kept;
+			tfs.length = kept * fieldCount;
+		}
+		// Also forget the removed terms of the prefix lists, which would otherwise grow with every new term while no prefix search merges them.
+		sorted = sorted.filter(isIndexed);
+		fresh = fresh.filter(isIndexed);
+	}
+
+	/**
+	 * Whether a term is in the index.
+	 * @param {string} term - The term
+	 * @returns {boolean} Whether some indexed document contains it
+	 */
+	function isIndexed(term: string): boolean {
+		return postings.has(term);
+	}
+
+	/**
+	 * Indexes a document. Every piece of user code (`extract`, `tokenize`) runs before the index changes, so a throwing one leaves it intact.
+	 * @param {T} document - The document
+	 * @param {string} method - Name of the public method, for the error messages
+	 * @param {boolean} replace - Whether a document with the same id is replaced (otherwise it is an error)
+	 * @returns {boolean} Whether a document was replaced
+	 * @throws {TypeError} when the document is not an object, its id is neither a string nor a number, or a field or term is invalid
+	 * @throws {RangeError} when its id is `NaN`, or already indexed and `replace` is `false`
+	 */
+	function insert(document: T, method: string, replace: boolean): boolean {
+		if (typeof document !== 'object' || document === null) throw new TypeError(`${method}: \`document\` must be an object, got ${typeName(document)}`);
+		const id: unknown = readOption(document as Record<string, unknown>, idKey);
+		if (typeof id !== 'string') assertNumber(method, `document.${idKey}`, id, !Number.isNaN(id), 'a string or a number other than NaN');
+		// The distinct terms (by order of first occurrence) with the index of their counts in `counts` (one per field), and the field lengths.
+		const entries = new Map<string, number>();
+		const counts: number[] = [];
+		const fieldLengths: number[] = new Array<number>(fieldCount).fill(0);
+		for (let f = 0; f < fieldCount; f++) {
+			const name = names[f];
+			const value: unknown = extract === undefined ? readOption(document as Record<string, unknown>, name) : extract(document, name);
+			if (value == null) continue;
+			const texts: unknown = typeof value === 'string' ? [value] : value;
+			if (!Array.isArray(texts)) throw new TypeError(`${method}: \`document.${name}\` must be a string, an array of strings, null or undefined, got ${typeName(value)}`);
+			for (const text of texts as unknown[]) {
+				if (typeof text !== 'string')
+					throw new TypeError(`${method}: \`document.${name}\` must be a string, an array of strings, null or undefined, got an array containing ${typeName(text)}`);
+				for (const term of analyze(text, method)) {
+					assertToken(method, term);
+					if (term === '') continue;
+					let entry = entries.get(term);
+					if (entry === undefined) {
+						entry = entries.size;
+						entries.set(term, entry);
+						for (let g = 0; g < fieldCount; g++) counts.push(0);
+					}
+					counts[entry * fieldCount + f]++;
+					fieldLengths[f]++;
+				}
+			}
+		}
+
+		const existing = slotOf.get(id);
+		if (existing !== undefined) {
+			if (!replace) throw new RangeError(`${method}: a document with the id ${show(id)} is already indexed`);
+			discard(existing);
+		}
+		const slot = docs.length;
+		ids.push(id);
+		docs.push(document);
+		slotOf.set(id, slot);
+		for (let f = 0; f < fieldCount; f++) {
+			lengths.push(fieldLengths[f]);
+			if (fieldLengths[f] > 0) {
+				docCount[f]++;
+				totalLength[f] += fieldLengths[f];
+			}
+		}
+		const list: Posting[] = [];
+		for (const [term, entry] of entries) {
+			let posting = postings.get(term);
+			if (posting === undefined) {
+				posting = { term, slots: [], tfs: [], df: new Array<number>(fieldCount).fill(0), live: 0 };
+				postings.set(term, posting);
+				fresh.push(term);
+			}
+			posting.slots.push(slot);
+			for (let f = 0; f < fieldCount; f++) {
+				const tf = counts[entry * fieldCount + f];
+				posting.tfs.push(tf);
+				if (tf > 0) posting.df[f]++;
+			}
+			posting.live++;
+			list.push(posting);
+		}
+		termsOf.push(list);
+		live++;
+		version++;
+		return existing !== undefined;
+	}
+
+	/**
+	 * The postings of the indexed terms that start with `prefix` (merging the new terms into the sorted list first).
+	 * @param {string} prefix - The prefix
+	 * @returns {Posting[]} Their postings, in code-unit order of the terms
+	 */
+	function complete(prefix: string): Posting[] {
+		if (fresh.length > 0) {
+			fresh.sort();
+			// Merge the two sorted lists, dropping the removed terms and the duplicates (a term removed, then added again).
+			const merged: string[] = [];
+			for (let i = 0, j = 0; i < sorted.length || j < fresh.length;) {
+				const term = j === fresh.length || (i < sorted.length && sorted[i] < fresh[j]) ? sorted[i++] : fresh[j++];
+				if (term !== merged[merged.length - 1] && isIndexed(term)) merged.push(term);
+			}
+			sorted = merged;
+			fresh = [];
+		}
+		const found: Posting[] = [];
+		for (let i = lowerBound(sorted, prefix); i < sorted.length && sorted[i].startsWith(prefix); i++) {
+			const posting = postings.get(sorted[i]);
+			if (posting !== undefined) found.push(posting);
+		}
+		return found;
+	}
+
+	/**
+	 * Unvalidated implementation of `search`'s scoring: accumulates the BM25 score of every document matching the query terms.
+	 * @param {string[]} queryTerms - The distinct query terms
+	 * @param {boolean[]} prefixes - Whether each query term is a prefix
+	 * @param {Map<Posting, number>} matched - Receives the postings of the index terms that matched, numbered in order
+	 * @returns {number[]} The slots of the documents matching at least one query term (their totals and hits are in the scratch space)
+	 */
+	function score(queryTerms: string[], prefixes: boolean[], matched: Map<Posting, number>): number[] {
+		if (total.length < docs.length) {
+			const size = Math.max(docs.length, 2 * total.length);
+			total = new Float64Array(size);
+			best = new Float64Array(size);
+			docMark = new Float64Array(size);
+			termMark = new Float64Array(size);
+			hits = new Int32Array(size);
+		}
+		// `boost · idf · tf · (k1 + 1) / (tf + k1 · (1 − b + b · len / avglen))`, numerator and denominator divided by `k1 + 1`:
+		// `weight · tf / (tf · unit + shift + scale · len)`, whose denominator is always finite and positive, so that even huge boosts
+		// or `k1` can only overflow the score to `Infinity`, never make it `NaN`. (A field no document has gives a `NaN` scale, never used.)
+		const unit = 1 / (k1 + 1);
+		const shift = k1 * (1 - b) * unit;
+		const scales: number[] = [];
+		const weights: number[] = [];
+		for (let f = 0; f < fieldCount; f++) scales.push(k1 * unit * ((b * docCount[f]) / totalLength[f]));
+		const queryStamp = ++clock;
+		const touched: number[] = [];
+		for (let q = 0; q < queryTerms.length; q++) {
+			let matches: Posting[];
+			if (prefixes[q]) matches = complete(queryTerms[q]);
+			else {
+				const posting = postings.get(queryTerms[q]);
+				matches = posting === undefined ? [] : [posting];
+			}
+			const termStamp = ++clock;
+			const termTouched: number[] = [];
+			for (const posting of matches) {
+				if (!matched.has(posting)) matched.set(posting, matched.size);
+				const { slots, tfs, df } = posting;
+				for (let f = 0; f < fieldCount; f++) weights[f] = boosts[f] * Math.log(1 + (docCount[f] - df[f] + 0.5) / (df[f] + 0.5));
+				for (let entry = 0; entry < slots.length; entry++) {
+					const slot = slots[entry];
+					if (docs[slot] === undefined) continue;
+					let value = 0;
+					for (let f = 0; f < fieldCount; f++) {
+						const tf = tfs[entry * fieldCount + f];
+						if (tf > 0) value += (weights[f] * tf) / (tf * unit + shift + scales[f] * lengths[slot * fieldCount + f]);
+					}
+					if (termMark[slot] !== termStamp) {
+						termMark[slot] = termStamp;
+						best[slot] = value;
+						termTouched.push(slot);
+					} else best[slot] = Math.max(best[slot], value);
+				}
+			}
+			for (const slot of termTouched) {
+				if (docMark[slot] !== queryStamp) {
+					docMark[slot] = queryStamp;
+					total[slot] = 0;
+					hits[slot] = 0;
+					touched.push(slot);
+				}
+				total[slot] += best[slot];
+				hits[slot]++;
+			}
+		}
+		return touched;
+	}
+
+	return {
+		get size(): number {
+			return live;
+		},
+		add(document: T): void {
+			insert(document, 'SearchIndex.add', false);
+		},
+		addAll(documents: Iterable<T>): void {
+			if (typeof (documents as Partial<Iterable<T>> | null)?.[Symbol.iterator] !== 'function') {
+				throw new TypeError(`SearchIndex.addAll: \`documents\` must be an iterable, got ${typeName(documents)}`);
+			}
+			for (const document of documents) insert(document, 'SearchIndex.addAll', false);
+		},
+		replace(document: T): boolean {
+			return insert(document, 'SearchIndex.replace', true);
+		},
+		remove(id: SearchId): boolean {
+			const slot = slotOf.get(id);
+			if (slot === undefined) return false;
+			discard(slot);
+			return true;
+		},
+		has(id: SearchId): boolean {
+			return slotOf.has(id);
+		},
+		get(id: SearchId): T | undefined {
+			const slot = slotOf.get(id);
+			return slot === undefined ? undefined : docs[slot];
+		},
+		search(query: string, searchOptions: SearchIndexQueryOptions<T> = {}): Array<SearchIndexResult<T>> {
+			const method = 'SearchIndex.search';
+			assertString(method, 'query', query);
+			const limit = readOption(searchOptions, 'limit', Infinity);
+			assertInteger(method, 'options.limit', limit, 0, true);
+			const prefix: unknown = readOption(searchOptions, 'prefix', false);
+			if (prefix !== true && prefix !== false && prefix !== 'last')
+				throw new TypeError(`${method}: \`options.prefix\` must be a boolean or 'last', got ${show(prefix)}`);
+			const combine: unknown = readOption(searchOptions, 'combine', 'or');
+			if (combine !== 'or' && combine !== 'and') throw new TypeError(`${method}: \`options.combine\` must be 'or' or 'and', got ${show(combine)}`);
+			const filter = readOption(searchOptions, 'filter');
+			if (filter !== undefined) assertFunction(method, 'options.filter', filter);
+
+			// The distinct query terms, in order, each a prefix if any of its occurrences is one.
+			const tokens = analyze(query, method);
+			let last = tokens.length - 1;
+			// Stops at `tokens[-1]`, which is `undefined`.
+			while (tokens[last] === '') last--;
+			const queryTerms: string[] = [];
+			const prefixes: boolean[] = [];
+			const positions = new Map<string, number>();
+			for (let i = 0; i <= last; i++) {
+				const term = tokens[i];
+				assertToken(method, term);
+				if (term === '') continue;
+				const isPrefix = prefix === true || (prefix === 'last' && i === last);
+				const position = positions.get(term);
+				if (position === undefined) {
+					positions.set(term, queryTerms.length);
+					queryTerms.push(term);
+					prefixes.push(isPrefix);
+				} else if (isPrefix) prefixes[position] = true;
+			}
+			if (limit === 0) return [];
+
+			const matched = new Map<Posting, number>();
+			const touched = score(queryTerms, prefixes, matched);
+			const required = combine === 'and' ? queryTerms.length : 1;
+			// Copied out of the scratch space before `filter` runs (it may search the index too).
+			const slots: number[] = [];
+			const scores: number[] = [];
+			for (const slot of touched) {
+				if (hits[slot] >= required) {
+					slots.push(slot);
+					scores.push(total[slot]);
+				}
+			}
+			if (filter !== undefined) {
+				const start = version;
+				let kept = 0;
+				for (let i = 0; i < slots.length; i++) {
+					const keep = filter(docs[slots[i]] as T);
+					if (version !== start) throw new Error(`${method}: \`options.filter\` must not modify the index`);
+					if (keep) {
+						slots[kept] = slots[i];
+						scores[kept++] = scores[i];
+					}
+				}
+				slots.length = scores.length = kept;
+			}
+
+			const results: Array<SearchIndexResult<T>> = [];
+			for (const i of rank(slots, scores, limit)) {
+				const slot = slots[i];
+				results.push({ id: ids[slot], item: docs[slot] as T, score: scores[i], terms: matchedTerms(termsOf[slot] as Posting[], slot, matched) });
+			}
+			return results;
+		}
+	};
 }

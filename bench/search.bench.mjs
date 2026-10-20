@@ -1,5 +1,5 @@
 import Fuse from 'fuse.js';
-import { fuzzyMatch, fuzzySearch, highlight } from 'tinkit/search';
+import { createSearchIndex, fuzzyMatch, fuzzySearch, highlight, tokenize } from 'tinkit/search';
 
 // Deterministic command-palette-like labels: "Category: Verb Noun", dotted command ids and file paths.
 const categories = ['File', 'Edit', 'View', 'Git', 'Terminal', 'Debug', 'Search', 'Editor', 'Workspace', 'Preferences', 'Format', 'Refactor'];
@@ -54,7 +54,204 @@ const fuseCommands = new Fuse(commands, { keys: ['title'], includeScore: true, i
 const longTarget = `${'packages/core/src/'.repeat(12)}components/editor/toggleWordWrap.ts`;
 const matchRanges = fuzzyMatch('ctww', longTarget).ranges;
 
+// A deterministic 10k-document corpus for the BM25 index: a 4,000-word vocabulary of syllable words drawn with a Zipf-like skew,
+// a 4–7-word title and a 30–59-word body per document.
+const syllables = ['ka', 'lo', 'mi', 'ne', 'ru', 'ta', 'shi', 'po', 'den', 'var', 'ix', 'el', 'om', 'tra', 'ber', 'qu'];
+const vocabulary = Array.from({ length: 4000 }, function (_, i) {
+	let word = '';
+	let x = (i * 2654435761) >>> 0;
+	for (let k = 0, n = 2 + (x % 3); k < n; k++) {
+		word += syllables[x % 16];
+		x = Math.floor(x / 16) + k * 7;
+	}
+	return word;
+});
+let state = 12345;
+
+/**
+ * Draws a word, frequent words first (deterministic linear congruential generator).
+ * @returns {string} A word of the vocabulary
+ */
+function drawWord() {
+	state = (state * 1103515245 + 12345) & 0x7fffffff;
+	return vocabulary[Math.floor(vocabulary.length * (state / 0x7fffffff) ** 3)];
+}
+
+/**
+ * Draws a phrase.
+ * @param {number} length - Number of words
+ * @returns {string} The words, separated by spaces
+ */
+function drawPhrase(length) {
+	return Array.from({ length }, drawWord).join(' ');
+}
+
+const documents = Array.from({ length: 10_000 }, function (_, id) {
+	return { id, title: drawPhrase(4 + (id % 4)), body: drawPhrase(30 + (id % 30)) };
+});
+const fields = { title: 2, body: 1 };
+
+/**
+ * Builds the BM25 index of the corpus.
+ * @returns {import('tinkit/search').SearchIndex<{ id: number; title: string; body: string }>} The index
+ */
+function buildIndex() {
+	const built = createSearchIndex({ fields });
+	built.addAll(documents);
+	return built;
+}
+
+const searchIndex = buildIndex();
+const fuseDocuments = new Fuse(documents, {
+	keys: [
+		{ name: 'title', weight: 2 },
+		{ name: 'body', weight: 1 }
+	]
+});
+const tokenized = documents.map(function (document) {
+	return [tokenize(document.title), tokenize(document.body)];
+});
+
+/**
+ * Naive BM25 without an inverted index: scans every pre-tokenized document for every query term (same scores as the index).
+ * @param {string} query - The query
+ * @param {number} limit - Number of results
+ * @returns {Array<{ id: number, score: number }>} The best documents
+ */
+function naiveSearch(query, limit) {
+	const terms = [...new Set(tokenize(query))];
+	const boosts = [fields.title, fields.body];
+	const average = [0, 1].map(function (f) {
+		return (
+			tokenized.reduce(function (sum, document) {
+				return sum + document[f].length;
+			}, 0) / tokenized.length
+		);
+	});
+	const idf = terms.map(function (term) {
+		return [0, 1].map(function (f) {
+			const n = tokenized.filter(function (document) {
+				return document[f].includes(term);
+			}).length;
+			return Math.log(1 + (tokenized.length - n + 0.5) / (n + 0.5));
+		});
+	});
+	const results = [];
+	tokenized.forEach(function (document, id) {
+		let score = 0;
+		terms.forEach(function (term, q) {
+			for (let f = 0; f < 2; f++) {
+				let tf = 0;
+				for (const word of document[f]) if (word === term) tf++;
+				if (tf > 0) score += (boosts[f] * idf[q][f] * tf * 2.2) / (tf + 1.2 * (0.25 + (0.75 * document[f].length) / average[f]));
+			}
+		});
+		if (score > 0) results.push({ id, score });
+	});
+	return results
+		.sort(function (a, b) {
+			return b.score - a.score || a.id - b.id;
+		})
+		.slice(0, limit);
+}
+
+const [common, middle, rare] = [vocabulary[0], vocabulary[40], vocabulary[900]];
+const threeTerms = `${common} ${middle} ${rare}`;
+const body = documents[1].body;
+
 export default [
+	{
+		name: 'createSearchIndex (10k docs, 2 fields, addAll)',
+		fn: buildIndex,
+		competitors: {
+			'fuse.js': function () {
+				return new Fuse(documents, { keys: ['title', 'body'] });
+			}
+		}
+	},
+	{
+		name: 'SearchIndex.search (10k docs, term in 95%, limit 10)',
+		fn: function () {
+			return searchIndex.search(common, { limit: 10 });
+		},
+		baseline: function () {
+			return naiveSearch(common, 10);
+		},
+		competitors: {
+			'fuse.js': function () {
+				return fuseDocuments.search(common, { limit: 10 });
+			}
+		}
+	},
+	{
+		name: 'SearchIndex.search (10k docs, term in 6%, limit 10)',
+		fn: function () {
+			return searchIndex.search(middle, { limit: 10 });
+		},
+		baseline: function () {
+			return naiveSearch(middle, 10);
+		},
+		competitors: {
+			'fuse.js': function () {
+				return fuseDocuments.search(middle, { limit: 10 });
+			}
+		}
+	},
+	{
+		name: 'SearchIndex.search (10k docs, rare term, limit 10)',
+		fn: function () {
+			return searchIndex.search(rare, { limit: 10 });
+		},
+		baseline: function () {
+			return naiveSearch(rare, 10);
+		}
+	},
+	{
+		name: 'SearchIndex.search (10k docs, 3 terms, limit 10)',
+		fn: function () {
+			return searchIndex.search(threeTerms, { limit: 10 });
+		},
+		baseline: function () {
+			return naiveSearch(threeTerms, 10);
+		}
+	},
+	{
+		name: 'SearchIndex.search (10k docs, term in 95%, all)',
+		fn: function () {
+			return searchIndex.search(common);
+		},
+		baseline: function () {
+			return naiveSearch(common, Infinity);
+		}
+	},
+	{
+		name: 'SearchIndex.search (10k docs, and + last prefix)',
+		fn: function () {
+			return searchIndex.search(`${common} ${middle.slice(0, 3)}`, { prefix: 'last', combine: 'and', limit: 10 });
+		}
+	},
+	{
+		name: 'SearchIndex remove + add (10k docs)',
+		fn: function () {
+			searchIndex.remove(5);
+			searchIndex.add(documents[5]);
+		}
+	},
+	{
+		name: 'tokenize (50-word text)',
+		fn: function () {
+			return tokenize(body);
+		},
+		baseline: function () {
+			return body.toLowerCase().split(/[^\p{L}\p{N}]+/u);
+		}
+	},
+	{
+		name: 'tokenize (50-word text, ignoreDiacritics)',
+		fn: function () {
+			return tokenize(body, { ignoreDiacritics: true });
+		}
+	},
 	{
 		name: 'fuzzySearch (1k labels, "delch")',
 		fn: function () {
