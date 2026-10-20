@@ -2920,3 +2920,541 @@ describe('zScore', function () {
 		}).toThrow(new TypeError('zScore: `deviation` must be a number > 0, got string'));
 	});
 });
+
+describe('primeFactors', function () {
+	it('factors small numbers by trial division', function () {
+		expect(helpers.primeFactors(1)).toEqual([]);
+		expect(helpers.primeFactors(2)).toEqual([2]);
+		expect(helpers.primeFactors(360)).toEqual([2, 2, 2, 3, 3, 5]);
+		expect(helpers.primeFactors(97)).toEqual([97]);
+		expect(helpers.primeFactors(1021 * 1019)).toEqual([1019, 1021]);
+		expect(helpers.primeFactors(1021 * 1021 * 7)).toEqual([7, 1021, 1021]);
+		expect(helpers.primeFactors(2 ** 52)).toEqual(new Array(52).fill(2));
+		expect(helpers.primeFactors(3 ** 33)).toEqual(new Array(33).fill(3));
+	});
+
+	it('keeps a large prime cofactor left after trial division', function () {
+		expect(helpers.primeFactors(1031)).toEqual([1031]);
+		expect(helpers.primeFactors(8 * 1_000_003)).toEqual([2, 2, 2, 1_000_003]);
+		expect(helpers.primeFactors(9007199254740881)).toEqual([9007199254740881]);
+	});
+
+	it('splits products of large primes with Pollard rho', function () {
+		expect(helpers.primeFactors(1031 * 1033)).toEqual([1031, 1033]);
+		expect(helpers.primeFactors(9007199254740991)).toEqual([6361, 69431, 20394401]);
+		expect(helpers.primeFactors(94906249 * 94906247)).toEqual([94906247, 94906249]);
+		expect(helpers.primeFactors(1031 ** 5)).toEqual([1031, 1031, 1031, 1031, 1031]);
+		expect(helpers.primeFactors(208057 ** 3)).toEqual([208057, 208057, 208057]);
+		expect(helpers.primeFactors(94906249 ** 2)).toEqual([94906249, 94906249]);
+	});
+
+	it('replays a batch that overshoots, and retries another polynomial when the replay finds the number itself', function () {
+		// Found by search: 1071209 makes the batched gcd reach n, 1260913 makes the replay reach n with c = 1 too.
+		expect(helpers.primeFactors(1071209)).toEqual([1031, 1039]);
+		expect(helpers.primeFactors(1260913)).toEqual([1031, 1223]);
+	});
+
+	it('factors adversarial semiprimes near 2 ** 53 quickly', function () {
+		const start = performance.now();
+		expect(helpers.primeFactors(94906249 * 94906219)).toEqual([94906219, 94906249]);
+		expect(performance.now() - start).toBeLessThan(1000);
+	});
+
+	it('rejects numbers that are not safe integers >= 1', function () {
+		expect(function () {
+			helpers.primeFactors(0);
+		}).toThrow(new RangeError('primeFactors: `n` must be a safe integer >= 1, got 0'));
+		expect(function () {
+			helpers.primeFactors(-6);
+		}).toThrow(new RangeError('primeFactors: `n` must be a safe integer >= 1, got -6'));
+		expect(function () {
+			helpers.primeFactors(1.5);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.primeFactors(2 ** 53);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.primeFactors(NaN);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.primeFactors('12' as never);
+		}).toThrow(new TypeError('primeFactors: `n` must be a safe integer >= 1, got string'));
+	});
+});
+
+describe('divisors', function () {
+	it('lists every divisor in ascending order', function () {
+		expect(helpers.divisors(1)).toEqual([1]);
+		expect(helpers.divisors(12)).toEqual([1, 2, 3, 4, 6, 12]);
+		expect(helpers.divisors(13)).toEqual([1, 13]);
+		expect(helpers.divisors(36)).toEqual([1, 2, 3, 4, 6, 9, 12, 18, 36]);
+		expect(helpers.divisors(2 ** 10)).toEqual([1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]);
+		expect(helpers.divisors(9007199254740991)).toEqual([1, 6361, 69431, 20394401, 441650591, 129728784761, 1416003655831, 9007199254740991]);
+	});
+
+	it('handles highly composite numbers', function () {
+		expect(helpers.divisors(720720)).toHaveLength(240);
+		// 2^4 · 3^2 · 5 · 7 · 11 · 13 · 17 · 19 · 23 · 29 · 31 · 37 · 41 has 15 · 2 ** 11 divisors.
+		const n = 16 * 9 * 5 * 7 * 11 * 13 * 17 * 19 * 23 * 29 * 31 * 37 * 41;
+		const result = helpers.divisors(n);
+		expect(result).toHaveLength(30720);
+		expect(result[result.length - 1]).toBe(n);
+	});
+
+	it('rejects numbers that are not safe integers >= 1', function () {
+		expect(function () {
+			helpers.divisors(-12);
+		}).toThrow(new RangeError('divisors: `n` must be a safe integer >= 1, got -12'));
+		expect(function () {
+			helpers.divisors(null as never);
+		}).toThrow(new TypeError('divisors: `n` must be a safe integer >= 1, got null'));
+	});
+});
+
+describe('primesUpTo', function () {
+	it('lists the primes up to the limit, inclusive', function () {
+		expect(helpers.primesUpTo(30)).toEqual([2, 3, 5, 7, 11, 13, 17, 19, 23, 29]);
+		expect(helpers.primesUpTo(29)).toEqual([2, 3, 5, 7, 11, 13, 17, 19, 23, 29]);
+		expect(helpers.primesUpTo(2)).toEqual([2]);
+		expect(helpers.primesUpTo(3)).toEqual([2, 3]);
+		expect(helpers.primesUpTo(4)).toEqual([2, 3]);
+		expect(helpers.primesUpTo(9)).toEqual([2, 3, 5, 7]);
+		expect(helpers.primesUpTo(25)).toEqual([2, 3, 5, 7, 11, 13, 17, 19, 23]);
+	});
+
+	it('counts the primes below a non-integer limit', function () {
+		expect(helpers.primesUpTo(10.9)).toEqual([2, 3, 5, 7]);
+		expect(helpers.primesUpTo(2.5)).toEqual([2]);
+	});
+
+	it('is empty below 2', function () {
+		expect(helpers.primesUpTo(1)).toEqual([]);
+		expect(helpers.primesUpTo(1.99)).toEqual([]);
+		expect(helpers.primesUpTo(0)).toEqual([]);
+		expect(helpers.primesUpTo(-10)).toEqual([]);
+		expect(helpers.primesUpTo(-Infinity)).toEqual([]);
+	});
+
+	it('matches the prime-counting function', function () {
+		expect(helpers.primesUpTo(1000)).toHaveLength(168);
+		const primes = helpers.primesUpTo(1_000_000);
+		expect(primes).toHaveLength(78498);
+		expect(primes[primes.length - 1]).toBe(999983);
+	});
+
+	it('rejects limits above 10 ** 8 and NaN', function () {
+		expect(function () {
+			helpers.primesUpTo(1e9);
+		}).toThrow(new RangeError('primesUpTo: `limit` must be a number <= 100000000, got 1000000000'));
+		expect(function () {
+			helpers.primesUpTo(Infinity);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.primesUpTo(NaN);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.primesUpTo('10' as never);
+		}).toThrow(new TypeError('primesUpTo: `limit` must be a number <= 100000000, got string'));
+	});
+});
+
+describe('nextPrime', function () {
+	it('finds the smallest prime greater than n', function () {
+		expect(helpers.nextPrime(2)).toBe(3);
+		expect(helpers.nextPrime(3)).toBe(5);
+		expect(helpers.nextPrime(7)).toBe(11);
+		expect(helpers.nextPrime(8)).toBe(11);
+		expect(helpers.nextPrime(10.5)).toBe(11);
+		expect(helpers.nextPrime(113)).toBe(127);
+		expect(helpers.nextPrime(2_147_483_629)).toBe(2_147_483_647);
+		expect(helpers.nextPrime(9007199254740880)).toBe(9007199254740881);
+	});
+
+	it('gives 2 below 2', function () {
+		expect(helpers.nextPrime(1.999)).toBe(2);
+		expect(helpers.nextPrime(0)).toBe(2);
+		expect(helpers.nextPrime(-5)).toBe(2);
+		expect(helpers.nextPrime(-Infinity)).toBe(2);
+	});
+
+	it('rejects n from the largest safe prime on, and NaN', function () {
+		expect(function () {
+			helpers.nextPrime(9007199254740881);
+		}).toThrow(new RangeError('nextPrime: `n` must be a number < 9007199254740881, got 9007199254740881'));
+		expect(function () {
+			helpers.nextPrime(Infinity);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.nextPrime(NaN);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.nextPrime(5n as never);
+		}).toThrow(new TypeError('nextPrime: `n` must be a number < 9007199254740881, got bigint'));
+	});
+});
+
+describe('previousPrime', function () {
+	it('finds the largest prime less than n', function () {
+		expect(helpers.previousPrime(2.5)).toBe(2);
+		expect(helpers.previousPrime(3)).toBe(2);
+		expect(helpers.previousPrime(3.5)).toBe(3);
+		expect(helpers.previousPrime(4)).toBe(3);
+		expect(helpers.previousPrime(11)).toBe(7);
+		expect(helpers.previousPrime(12)).toBe(11);
+		expect(helpers.previousPrime(127)).toBe(113);
+		expect(helpers.previousPrime(2 ** 53)).toBe(9007199254740881);
+	});
+
+	it('rejects n outside (2, 2 ** 53]', function () {
+		expect(function () {
+			helpers.previousPrime(2);
+		}).toThrow(new RangeError('previousPrime: `n` must be a number > 2 and <= 2 ** 53, got 2'));
+		expect(function () {
+			helpers.previousPrime(2 ** 53 + 2);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.previousPrime(NaN);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.previousPrime('9' as never);
+		}).toThrow(new TypeError('previousPrime: `n` must be a number > 2 and <= 2 ** 53, got string'));
+	});
+});
+
+describe('binomial', function () {
+	it('counts the ways to choose k items out of n', function () {
+		expect(helpers.binomial(0, 0)).toBe(1);
+		expect(helpers.binomial(5, 0)).toBe(1);
+		expect(helpers.binomial(5, 5)).toBe(1);
+		expect(helpers.binomial(5, 2)).toBe(10);
+		expect(helpers.binomial(5, 3)).toBe(10);
+		expect(helpers.binomial(52, 5)).toBe(2598960);
+		expect(helpers.binomial(9007199254740991, 1)).toBe(9007199254740991);
+		expect(helpers.binomial(9007199254740991, 9007199254740990)).toBe(9007199254740991);
+	});
+
+	it('is 0 when k is negative or greater than n', function () {
+		expect(helpers.binomial(10, 11)).toBe(0);
+		expect(helpers.binomial(10, -1)).toBe(0);
+		expect(helpers.binomial(0, 1)).toBe(0);
+	});
+
+	it('is exact up to 2 ** 53, where the factorial formula is not', function () {
+		// The largest central binomial coefficient below 2 ** 53.
+		expect(helpers.binomial(56, 28)).toBe(7648690600760440);
+		expect(helpers.binomial(30, 15)).toBe(155117520);
+		expect(helpers.factorial(30) / (helpers.factorial(15) * helpers.factorial(15))).not.toBe(155117520);
+	});
+
+	it('rounds larger results correctly', function () {
+		expect(helpers.binomial(60, 30)).toBe(Number(118264581564861424n));
+		expect(helpers.binomial(100, 50)).toBe(Number(100891344545564193334812497256n));
+		expect(helpers.binomial(1000, 500)).toBe(Number(binomialBig(1000n, 500n)));
+		expect(helpers.binomial(1029, 514)).toBe(Number(binomialBig(1029n, 514n)));
+	});
+
+	it('overflows to Infinity quickly, whatever k', function () {
+		expect(helpers.binomial(2000, 1000)).toBe(Infinity);
+		expect(helpers.binomial(1030, 515)).toBe(Infinity);
+		const start = performance.now();
+		expect(helpers.binomial(9007199254740991, 4503599627370495)).toBe(Infinity);
+		expect(performance.now() - start).toBeLessThan(1000);
+	});
+
+	it('rejects an n that is not a safe integer >= 0 or a k that is not an integer', function () {
+		expect(function () {
+			helpers.binomial(-1, 0);
+		}).toThrow(new RangeError('binomial: `n` must be a safe integer >= 0, got -1'));
+		expect(function () {
+			helpers.binomial(2 ** 53, 1);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.binomial(5, 1.5);
+		}).toThrow(new RangeError('binomial: `k` must be an integer, got 1.5'));
+		expect(function () {
+			helpers.binomial(5, '2' as never);
+		}).toThrow(new TypeError('binomial: `k` must be an integer, got string'));
+	});
+});
+
+describe('extendedGcd', function () {
+	it('gives the gcd and Bézout coefficients', function () {
+		expect(helpers.extendedGcd(240, 46)).toEqual({ gcd: 2, x: -9, y: 47 });
+		expect(helpers.extendedGcd(46, 240)).toEqual({ gcd: 2, x: 47, y: -9 });
+		expect(helpers.extendedGcd(-4, 6)).toEqual({ gcd: 2, x: 1, y: 1 });
+		expect(helpers.extendedGcd(4, -6)).toEqual({ gcd: 2, x: -1, y: -1 });
+		expect(helpers.extendedGcd(7, 7)).toEqual({ gcd: 7, x: 0, y: 1 });
+	});
+
+	it('handles zeros without negative zeros', function () {
+		expect(helpers.extendedGcd(0, 0)).toEqual({ gcd: 0, x: 0, y: 0 });
+		expect(helpers.extendedGcd(0, 5)).toEqual({ gcd: 5, x: 0, y: 1 });
+		expect(helpers.extendedGcd(0, -5)).toEqual({ gcd: 5, x: 0, y: -1 });
+		expect(helpers.extendedGcd(-5, 0)).toEqual({ gcd: 5, x: -1, y: 0 });
+		const { x, y } = helpers.extendedGcd(-5, 0);
+		expect(Object.is(x, -1) && Object.is(y, 0)).toBe(true);
+		expect(Object.is(helpers.extendedGcd(-0, -5).x, 0)).toBe(true);
+	});
+
+	it('is exact for safe integers', function () {
+		const { gcd, x, y } = helpers.extendedGcd(9007199254740991, 9007199254740990);
+		expect(gcd).toBe(1);
+		expect(BigInt(9007199254740991) * BigInt(x) + BigInt(9007199254740990) * BigInt(y)).toBe(1n);
+		// Consecutive Fibonacci numbers (F78 and F77) take the most steps, with the largest quotients times coefficients.
+		const fibonacci = helpers.extendedGcd(8944394323791464, 5527939700884757);
+		expect(fibonacci.gcd).toBe(1);
+		expect(8944394323791464n * BigInt(fibonacci.x) + 5527939700884757n * BigInt(fibonacci.y)).toBe(1n);
+	});
+
+	it('rejects arguments that are not safe integers', function () {
+		expect(function () {
+			helpers.extendedGcd(1.5, 2);
+		}).toThrow(new RangeError('extendedGcd: `a` must be a safe integer, got 1.5'));
+		expect(function () {
+			helpers.extendedGcd(1, 2 ** 53);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.extendedGcd(1, '2' as never);
+		}).toThrow(new TypeError('extendedGcd: `b` must be a safe integer, got string'));
+	});
+});
+
+describe('modInverse', function () {
+	it('inverts numbers coprime to the modulus', function () {
+		expect(helpers.modInverse(3, 11)).toBe(4);
+		expect(helpers.modInverse(-3, 11)).toBe(7);
+		expect(helpers.modInverse(10, 17)).toBe(12);
+		expect(helpers.modInverse(14, 11)).toBe(4);
+		expect(helpers.modInverse(1, 2)).toBe(1);
+		expect(helpers.modInverse(9007199254740990, 9007199254740991)).toBe(9007199254740990);
+	});
+
+	it('is 0 modulo 1', function () {
+		expect(helpers.modInverse(0, 1)).toBe(0);
+		expect(helpers.modInverse(5, 1)).toBe(0);
+		expect(Object.is(helpers.modInverse(-5, 1), 0)).toBe(true);
+	});
+
+	it('throws when there is no inverse', function () {
+		expect(function () {
+			helpers.modInverse(4, 8);
+		}).toThrow(new RangeError('modInverse: `a` must be coprime to `modulus`, got 4 and 8'));
+		expect(function () {
+			helpers.modInverse(0, 7);
+		}).toThrow(new RangeError('modInverse: `a` must be coprime to `modulus`, got 0 and 7'));
+	});
+
+	it('rejects invalid arguments', function () {
+		expect(function () {
+			helpers.modInverse(3, 0);
+		}).toThrow(new RangeError('modInverse: `modulus` must be a safe integer >= 1, got 0'));
+		expect(function () {
+			helpers.modInverse(0.5, 7);
+		}).toThrow(new RangeError('modInverse: `a` must be a safe integer, got 0.5'));
+		expect(function () {
+			helpers.modInverse(3, '7' as never);
+		}).toThrow(new TypeError('modInverse: `modulus` must be a safe integer >= 1, got string'));
+	});
+});
+
+describe('modPow', function () {
+	it('raises to a power modulo a small modulus', function () {
+		expect(helpers.modPow(4, 13, 497)).toBe(445);
+		expect(helpers.modPow(2, 10, 1000)).toBe(24);
+		expect(helpers.modPow(-2, 3, 5)).toBe(2);
+		expect(helpers.modPow(7, 0, 13)).toBe(1);
+		expect(helpers.modPow(0, 0, 13)).toBe(1);
+		expect(helpers.modPow(0, 5, 13)).toBe(0);
+		expect(helpers.modPow(3, 2 ** 53 - 1, 7)).toBe(Number(bigModPow(3n, 2n ** 53n - 1n, 7n)));
+		expect(helpers.modPow(94906264, 2, 94906265)).toBe(1);
+	});
+
+	it('uses BigInt arithmetic for large moduli', function () {
+		expect(helpers.modPow(2, 1e15, 1e15 + 37)).toBe(Number(bigModPow(2n, 10n ** 15n, 10n ** 15n + 37n)));
+		expect(helpers.modPow(94906265, 2, 94906266)).toBe(1);
+		expect(helpers.modPow(-1, 9007199254740991, 9007199254740991)).toBe(9007199254740990);
+		// Fermat: a ** (p - 1) ≡ 1 (mod p).
+		expect(helpers.modPow(123456789, 9007199254740880, 9007199254740881)).toBe(1);
+		expect(helpers.modPow(5, 0, 9007199254740881)).toBe(1);
+	});
+
+	it('is 0 modulo 1', function () {
+		expect(helpers.modPow(5, 3, 1)).toBe(0);
+		expect(helpers.modPow(0, 0, 1)).toBe(0);
+		expect(helpers.modPow(5, -3, 1)).toBe(0);
+	});
+
+	it('raises the inverse to a negative exponent', function () {
+		expect(helpers.modPow(3, -1, 11)).toBe(4);
+		expect(helpers.modPow(3, -2, 11)).toBe(5);
+		expect(helpers.modPow(2, -3, 9007199254740881)).toBe(Number(bigModPow(BigInt(helpers.modInverse(2, 9007199254740881)), 3n, 9007199254740881n)));
+		expect(function () {
+			helpers.modPow(2, -1, 4);
+		}).toThrow(new RangeError('modPow: `base` must be coprime to `modulus` for a negative `exponent`, got 2 and 4'));
+	});
+
+	it('rejects invalid arguments', function () {
+		expect(function () {
+			helpers.modPow(2, 3, 0);
+		}).toThrow(new RangeError('modPow: `modulus` must be a safe integer >= 1, got 0'));
+		expect(function () {
+			helpers.modPow(2, 0.5, 5);
+		}).toThrow(new RangeError('modPow: `exponent` must be a safe integer, got 0.5'));
+		expect(function () {
+			helpers.modPow(2 ** 53, 1, 5);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.modPow('2' as never, 1, 5);
+		}).toThrow(new TypeError('modPow: `base` must be a safe integer, got string'));
+	});
+});
+
+describe('integerSqrt', function () {
+	it('is the floor of the square root of a number', function () {
+		expect(helpers.integerSqrt(0)).toBe(0);
+		expect(helpers.integerSqrt(1)).toBe(1);
+		expect(helpers.integerSqrt(3)).toBe(1);
+		expect(helpers.integerSqrt(4)).toBe(2);
+		expect(helpers.integerSqrt(17)).toBe(4);
+		expect(helpers.integerSqrt(9007199254740991)).toBe(94906265);
+	});
+
+	it('is exact where Math.sqrt rounds up', function () {
+		expect(Math.floor(Math.sqrt(94906265 ** 2 - 1))).toBe(94906265);
+		expect(helpers.integerSqrt(94906265 ** 2 - 1)).toBe(94906264);
+		expect(helpers.integerSqrt(94906265 ** 2)).toBe(94906265);
+	});
+
+	it('handles bigints of any size', function () {
+		expect(helpers.integerSqrt(0n)).toBe(0n);
+		expect(helpers.integerSqrt(1n)).toBe(1n);
+		expect(helpers.integerSqrt(2n)).toBe(1n);
+		expect(helpers.integerSqrt(3n)).toBe(1n);
+		expect(helpers.integerSqrt(4n)).toBe(2n);
+		expect(helpers.integerSqrt(10n ** 40n)).toBe(10n ** 20n);
+		expect(helpers.integerSqrt(10n ** 40n - 1n)).toBe(10n ** 20n - 1n);
+		expect(helpers.integerSqrt(2n ** 64n + 1n)).toBe(2n ** 32n);
+		const big = 3n ** 1001n;
+		const root = helpers.integerSqrt(big);
+		expect(root * root <= big && (root + 1n) * (root + 1n) > big).toBe(true);
+	});
+
+	it('rejects negative numbers, non-integers and other types', function () {
+		expect(function () {
+			helpers.integerSqrt(-1);
+		}).toThrow(new RangeError('integerSqrt: `n` must be a safe integer >= 0 or a bigint >= 0, got -1'));
+		expect(function () {
+			helpers.integerSqrt(-1n);
+		}).toThrow(new RangeError('integerSqrt: `n` must be a safe integer >= 0 or a bigint >= 0, got -1'));
+		expect(function () {
+			helpers.integerSqrt(2.5);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.integerSqrt(2 ** 53);
+		}).toThrow(RangeError);
+		expect(function () {
+			helpers.integerSqrt('4' as never);
+		}).toThrow(new TypeError('integerSqrt: `n` must be a safe integer >= 0 or a bigint >= 0, got string'));
+	});
+});
+
+describe('isPerfectSquare', function () {
+	it('recognizes squares of integers', function () {
+		expect([0, 1, 4, 9, 16, 49, 10000].map(helpers.isPerfectSquare)).toEqual([true, true, true, true, true, true, true]);
+		expect([2, 3, 5, 50, 99].map(helpers.isPerfectSquare)).toEqual([false, false, false, false, false]);
+		expect(helpers.isPerfectSquare(-0)).toBe(true);
+	});
+
+	it('is exact near 2 ** 53, where Math.sqrt rounds', function () {
+		expect(helpers.isPerfectSquare(94906265 ** 2)).toBe(true);
+		expect(helpers.isPerfectSquare(94906265 ** 2 + 1)).toBe(false);
+		expect(helpers.isPerfectSquare(94906265 ** 2 - 1)).toBe(false);
+	});
+
+	it('handles doubles beyond 2 ** 53', function () {
+		expect(helpers.isPerfectSquare(2 ** 100)).toBe(true);
+		expect(helpers.isPerfectSquare(2 ** 101)).toBe(false);
+		expect(helpers.isPerfectSquare((3 * 2 ** 30) ** 2)).toBe(true);
+		// Math.sqrt gives the integer 134217729, whose square (18014398777917441) is not a double.
+		expect(Math.sqrt(18014398777917440)).toBe(134217729);
+		expect(helpers.isPerfectSquare(18014398777917440)).toBe(false);
+		expect(helpers.isPerfectSquare(Number.MAX_VALUE)).toBe(false);
+	});
+
+	it('is false for non-integers, negative numbers and non-finite values', function () {
+		expect([2.25, -4, NaN, Infinity, -Infinity].map(helpers.isPerfectSquare)).toEqual([false, false, false, false, false]);
+	});
+});
+
+describe('isPowerOfTwo', function () {
+	it('recognizes integer powers of two', function () {
+		expect([1, 2, 4, 1024, 2 ** 31, 2 ** 32, 2 ** 53, 2 ** 1023].map(helpers.isPowerOfTwo)).toEqual(new Array(8).fill(true));
+	});
+
+	it('rejects everything else', function () {
+		expect([0, -2, 3, 6, 1000, 2 ** 32 + 2, 2 ** 53 + 2, 0.5, 1.5, NaN, Infinity, -Infinity, Number.MAX_VALUE].map(helpers.isPowerOfTwo)).toEqual(
+			new Array(13).fill(false)
+		);
+	});
+});
+
+describe('nextPowerOfTwo', function () {
+	it('rounds up to a power of two', function () {
+		expect(helpers.nextPowerOfTwo(1000)).toBe(1024);
+		expect(helpers.nextPowerOfTwo(1024)).toBe(1024);
+		expect(helpers.nextPowerOfTwo(1025)).toBe(2048);
+		expect(helpers.nextPowerOfTwo(5.5)).toBe(8);
+		expect(helpers.nextPowerOfTwo(1.0000001)).toBe(2);
+		expect(helpers.nextPowerOfTwo(2 ** 31 + 1)).toBe(2 ** 32);
+		expect(helpers.nextPowerOfTwo(2 ** 40 + 1)).toBe(2 ** 41);
+		expect(helpers.nextPowerOfTwo(2 ** 40 * (1 + 2 ** -52))).toBe(2 ** 41);
+		expect(helpers.nextPowerOfTwo(2 ** 40 * (1 - 2 ** -53))).toBe(2 ** 40);
+		expect(helpers.nextPowerOfTwo(2 ** 1023)).toBe(2 ** 1023);
+	});
+
+	it('gives 1 up to 1', function () {
+		expect([1, 0.3, 0, -0, -5, -Infinity].map(helpers.nextPowerOfTwo)).toEqual([1, 1, 1, 1, 1, 1]);
+	});
+
+	it('does not depend on the rounding of Math.log2', function () {
+		// The specification leaves `Math.log2` implementation-approximated: an estimate one too low or too high is corrected.
+		const low = jest.spyOn(Math, 'log2').mockReturnValue(9.5);
+		expect(helpers.nextPowerOfTwo(3000)).toBe(4096);
+		expect(helpers.isPowerOfTwo(2048)).toBe(true);
+		low.mockReturnValue(12.5);
+		expect(helpers.nextPowerOfTwo(3000)).toBe(4096);
+		expect(helpers.isPowerOfTwo(2048)).toBe(true);
+	});
+
+	it('overflows to Infinity beyond 2 ** 1023', function () {
+		expect(helpers.nextPowerOfTwo(2 ** 1023 * 1.5)).toBe(Infinity);
+		expect(helpers.nextPowerOfTwo(Number.MAX_VALUE)).toBe(Infinity);
+		expect(helpers.nextPowerOfTwo(Infinity)).toBe(Infinity);
+	});
+
+	it('rejects NaN and non-numbers', function () {
+		expect(function () {
+			helpers.nextPowerOfTwo(NaN);
+		}).toThrow(new RangeError('nextPowerOfTwo: `n` must be a number (not NaN), got NaN'));
+		expect(function () {
+			helpers.nextPowerOfTwo('8' as never);
+		}).toThrow(new TypeError('nextPowerOfTwo: `n` must be a number (not NaN), got string'));
+	});
+});
+
+/** `n` choose `k` in BigInt arithmetic. */
+function binomialBig(n: bigint, k: bigint): bigint {
+	let result = 1n;
+	for (let i = 1n; i <= k; i++) result = (result * (n - k + i)) / i;
+	return result;
+}
+
+/** `base ** exponent mod modulus` in BigInt arithmetic, for non-negative arguments. */
+function bigModPow(base: bigint, exponent: bigint, modulus: bigint): bigint {
+	let result = 1n % modulus;
+	let power = base % modulus;
+	for (let rest = exponent; rest > 0n; rest >>= 1n, power = (power * power) % modulus) {
+		if ((rest & 1n) === 1n) result = (result * power) % modulus;
+	}
+	return result;
+}

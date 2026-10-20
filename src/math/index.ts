@@ -2392,3 +2392,582 @@ export function histogram(values: ReadonlyArray<number>, options: HistogramOptio
 		return { x0: edges[index], x1: edges[index + 1], count: binCount };
 	});
 }
+
+/**
+ * Greatest common divisor of two positive safe integers, without validation (see {@link gcd}).
+ * @param {number} a - A positive integer
+ * @param {number} b - A positive integer
+ * @returns {number} Their greatest common divisor
+ */
+function euclid(a: number, b: number): number {
+	while (b !== 0) {
+		const rest = a % b;
+		a = b;
+		b = rest;
+	}
+	return a;
+}
+
+/**
+ * Greatest common divisor of two non-negative bigints (Euclid's algorithm).
+ * @param {bigint} a - A non-negative bigint
+ * @param {bigint} b - A non-negative bigint
+ * @returns {bigint} Their greatest common divisor
+ */
+function euclidBig(a: bigint, b: bigint): bigint {
+	while (b !== 0n) {
+		const rest = a % b;
+		a = b;
+		b = rest;
+	}
+	return a;
+}
+
+/**
+ * Finds a non-trivial factor of an odd composite number by Pollard's rho method, in Brent's variant: Floyd's cycle detection is replaced
+ * by comparing against a saved point at powers of two, and the gcd is taken once per batch of 128 differences multiplied together, then
+ * replayed one step at a time when a batch overshoots to `n` itself. A polynomial `y² + c` that only finds `n` is retried with the next `c`.
+ * In BigInt arithmetic: the products of residues of numbers up to `2 ** 53` need 106 bits.
+ * @param {bigint} n - An odd composite number without small factors
+ * @returns {bigint} A factor `d` of `n` with `1 < d < n`
+ * @example
+ * pollardRho(10403n); // => 101n
+ */
+function pollardRho(n: bigint): bigint {
+	for (let c = 1n; ; c++) {
+		let y = 2n;
+		let x = y;
+		let saved = y;
+		let differences = 1n;
+		let divisor = 1n;
+		for (let length = 1; divisor === 1n; length *= 2) {
+			x = y;
+			for (let i = 0; i < length; i++) y = (y * y + c) % n;
+			for (let done = 0; done < length && divisor === 1n; done += 128) {
+				saved = y;
+				for (let i = Math.min(128, length - done); i > 0; i--) {
+					y = (y * y + c) % n;
+					differences = (differences * (x > y ? x - y : y - x)) % n;
+				}
+				divisor = euclidBig(differences, n);
+			}
+		}
+		// The batch multiplied a difference divisible by `n` (or several whose factors together make `n`): replay it one step at a time.
+		if (divisor === n) {
+			do {
+				saved = (saved * saved + c) % n;
+				divisor = euclidBig(x > saved ? x - saved : saved - x, n);
+			} while (divisor === 1n);
+		}
+		if (divisor !== n) return divisor;
+	}
+}
+
+/**
+ * Pushes the prime factors of a number without prime factors below 1031 (so prime or a product of primes of at least 1031), in no order.
+ * @param {number} n - An odd safe integer, at least 1031, without prime factors below 1031
+ * @param {number[]} factors - Receives the prime factors
+ * @returns {void}
+ */
+function splitLarge(n: number, factors: number[]): void {
+	if (millerRabin(n)) {
+		factors.push(n);
+		return;
+	}
+	const divisor = Number(pollardRho(BigInt(n)));
+	splitLarge(divisor, factors);
+	splitLarge(n / divisor, factors);
+}
+
+/**
+ * The prime factorization of a safe integer `>= 1`, ascending (see {@link primeFactors}).
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {number} n - The number to factor
+ * @returns {number[]} Its prime factors with multiplicity, ascending
+ * @throws {RangeError} when `n` is not a safe integer `>= 1`
+ * @throws {TypeError} when `n` is not a number
+ */
+function factorize(caller: string, n: number): number[] {
+	assertNumber(caller, 'n', n, Number.isSafeInteger(n) && n >= 1, 'a safe integer >= 1');
+	const factors: number[] = [];
+	let rest = n;
+	for (; rest % 2 === 0; rest /= 2) factors.push(2);
+	for (; rest % 3 === 0; rest /= 3) factors.push(3);
+	// 6k ± 1 trial division by the numbers up to about 1000 (as `isPrime` does), which takes out most factors of everyday numbers cheaply.
+	let i = 5;
+	for (; i <= 1024 && i * i <= rest; i += 6) {
+		for (; rest % i === 0; rest /= i) factors.push(i);
+		for (; rest % (i + 2) === 0; rest /= i + 2) factors.push(i + 2);
+	}
+	// What is left has no prime factor below `i`: below `i ** 2`, it is 1 or a prime; otherwise each of its (at most five) prime factors is
+	// at least 1031, which Pollard's rho finds in about `√p` steps, so the cost stays bounded even for adversarial numbers near `2 ** 53`.
+	if (rest > 1) {
+		if (i * i > rest) factors.push(rest);
+		else splitLarge(rest, factors);
+	}
+	return factors.sort(function (a, b) {
+		return a - b;
+	});
+}
+
+/**
+ * Factors a positive integer into primes: the primes whose product is `n`, each repeated as many times as it divides `n`, in ascending
+ * order (`[]` for `1`). Factors below about 1000 are found by trial division; what remains is split by a deterministic Miller–Rabin test
+ * (see {@link isPrime}) and Pollard's rho method, so every safe integer, even a product of two primes near `2 ** 26.5` (the hardest case),
+ * is factored in a few milliseconds at most, where trial division up to `√n` would take seconds.
+ * @param {number} n - A safe integer `>= 1`
+ * @returns {number[]} The prime factors of `n`, with multiplicity, ascending
+ * @throws {RangeError} when `n` is not a safe integer `>= 1`
+ * @throws {TypeError} when `n` is not a number
+ * @example
+ * primeFactors(360); // => [2, 2, 2, 3, 3, 5]
+ * primeFactors(97); // => [97]
+ * primeFactors(1); // => []
+ * primeFactors(9007199254740991); // => [6361, 69431, 20394401]
+ * primeFactors(0); // throws RangeError
+ */
+export function primeFactors(n: number): number[] {
+	return factorize('primeFactors', n);
+}
+
+/**
+ * Lists the positive divisors of a positive integer in ascending order, from `1` to `n` itself, built from its prime factorization (see
+ * {@link primeFactors}), so the cost depends on the number of divisors (at most a few tens of thousands for safe integers) rather than on `√n`.
+ * @param {number} n - A safe integer `>= 1`
+ * @returns {number[]} Every positive divisor of `n`, ascending
+ * @throws {RangeError} when `n` is not a safe integer `>= 1`
+ * @throws {TypeError} when `n` is not a number
+ * @example
+ * divisors(12); // => [1, 2, 3, 4, 6, 12]
+ * divisors(13); // => [1, 13]
+ * divisors(1); // => [1]
+ * divisors(-12); // throws RangeError
+ */
+export function divisors(n: number): number[] {
+	const factors = factorize('divisors', n);
+	const result = [1];
+	for (let i = 0; i < factors.length;) {
+		const prime = factors[i];
+		const count = result.length;
+		// Every divisor found so far, times each power of `prime` that divides `n`.
+		for (let power = prime; factors[i] === prime; i++, power *= prime) {
+			for (let j = 0; j < count; j++) result.push(result[j] * power);
+		}
+	}
+	return result.sort(function (a, b) {
+		return a - b;
+	});
+}
+
+/**
+ * The largest `limit` of {@link primesUpTo}: sieving up to `10 ** 8` takes a 50 MB buffer and returns 5,761,455 primes (about 50 MB more).
+ * An uncapped limit, such as one read from a query string, could make the runtime abort with an out-of-memory error, which cannot be caught.
+ */
+const MAX_SIEVE_LIMIT = 100_000_000;
+
+/**
+ * Lists the primes up to `limit` (inclusive), in ascending order, with the sieve of Eratosthenes over the odd numbers. It is the fast way to
+ * get many primes at once (about a second for the 5.7 million primes below `10 ** 8`); use {@link isPrime} to test a few numbers, and
+ * {@link nextPrime} to walk the primes beyond the limit. A non-integer limit counts the primes below it, and a limit below 2 gives `[]`.
+ * @param {number} limit - The largest number to consider, at most `10 ** 8` (the sieve is allocated in full)
+ * @returns {number[]} The primes `p <= limit`, ascending
+ * @throws {RangeError} when `limit` is `NaN` or greater than `10 ** 8`
+ * @throws {TypeError} when `limit` is not a number
+ * @example
+ * primesUpTo(30); // => [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+ * primesUpTo(2); // => [2]
+ * primesUpTo(1); // => []
+ * primesUpTo(1e9); // throws RangeError
+ */
+export function primesUpTo(limit: number): number[] {
+	assertNumber('primesUpTo', 'limit', limit, limit <= MAX_SIEVE_LIMIT, `a number <= ${MAX_SIEVE_LIMIT}`);
+	const top = Math.floor(limit);
+	if (top < 2) return [];
+	// `composite[i]` stands for the odd number `2i + 3`.
+	const size = (top - 1) >> 1;
+	const composite = new Uint8Array(size);
+	for (let i = 0, prime = 3; prime * prime <= top; i++, prime += 2) {
+		if (composite[i] === 1) continue;
+		// Smaller multiples of `prime` have a smaller prime factor and are already crossed out; even multiples are not in the sieve.
+		for (let j = (prime * prime - 3) >> 1; j < size; j += prime) composite[j] = 1;
+	}
+	const result = [2];
+	for (let i = 0; i < size; i++) if (composite[i] === 0) result.push(2 * i + 3);
+	return result;
+}
+
+/** The largest prime below `2 ** 53`: the primes beyond it are not safe integers. */
+const LARGEST_SAFE_PRIME = 9007199254740881;
+
+/**
+ * Finds the smallest prime greater than `n` (`nextPrime(7)` is `11`; `n` need not be an integer, and every `n < 2` gives `2`). Candidates
+ * are tested with {@link isPrime}, whose cost is bounded, and gaps between primes below `2 ** 53` are at most a few hundred numbers, so the
+ * search is fast for any `n`. There is no safe-integer prime after `9007199254740881`, so larger `n` are rejected.
+ * @param {number} n - The number to start after, less than `9007199254740881` (the largest prime below `2 ** 53`)
+ * @returns {number} The smallest prime `p > n`
+ * @throws {RangeError} when `n` is `NaN` or not less than `9007199254740881`
+ * @throws {TypeError} when `n` is not a number
+ * @example
+ * nextPrime(7); // => 11
+ * nextPrime(10.5); // => 11
+ * nextPrime(-5); // => 2
+ * nextPrime(9007199254740000); // => 9007199254740041
+ * nextPrime(9007199254740881); // throws RangeError
+ */
+export function nextPrime(n: number): number {
+	assertNumber('nextPrime', 'n', n, n < LARGEST_SAFE_PRIME, `a number < ${LARGEST_SAFE_PRIME}`);
+	if (n < 2) return 2;
+	// From here on, only odd numbers can be prime.
+	let candidate = Math.floor(n) + 1;
+	if (candidate % 2 === 0) candidate++;
+	while (!isPrime(candidate)) candidate += 2;
+	return candidate;
+}
+
+/**
+ * Finds the largest prime less than `n` (`previousPrime(11)` is `7`; `n` need not be an integer). There is no prime below `2`, so `n` must
+ * be greater than `2`; and `n` can be at most `2 ** 53`, since the primes just below larger doubles are not safe integers (and could not be
+ * represented exactly). Like {@link nextPrime}, the search is fast for any `n`.
+ * @param {number} n - The number to search below, greater than `2` and at most `2 ** 53`
+ * @returns {number} The largest prime `p < n`
+ * @throws {RangeError} when `n` is not greater than `2` and at most `2 ** 53` (including `NaN`)
+ * @throws {TypeError} when `n` is not a number
+ * @example
+ * previousPrime(11); // => 7
+ * previousPrime(3); // => 2
+ * previousPrime(2 ** 53); // => 9007199254740881
+ * previousPrime(2); // throws RangeError
+ */
+export function previousPrime(n: number): number {
+	assertNumber('previousPrime', 'n', n, n > 2 && n <= 2 ** 53, 'a number > 2 and <= 2 ** 53');
+	if (n <= 3) return 2;
+	// From here on, only odd numbers can be prime.
+	let candidate = Math.ceil(n) - 1;
+	if (candidate % 2 === 0) candidate--;
+	while (!isPrime(candidate)) candidate -= 2;
+	return candidate;
+}
+
+/** `2 ** 1024`: a bigint at least this large converts to `Infinity`. */
+const OVERFLOW = 2n ** 1024n;
+
+/**
+ * Computes the binomial coefficient "`n` choose `k`": the number of ways to choose `k` items out of `n`, `n! / (k! (n - k)!)`, and `0`
+ * when `k < 0` or `k > n` (no way to choose them). The result is exact whenever it is a safe integer, as the multiplicative formula is
+ * evaluated so that every intermediate value is an integer no larger than the result (unlike `factorial(n) / (factorial(k) *
+ * factorial(n - k))`, which is inexact from `n = 23` and `NaN` from `n = 171`); larger results continue in BigInt arithmetic and are
+ * correctly rounded, and results beyond `Number.MAX_VALUE` are `Infinity` (after at most about a thousand steps, whatever `k`).
+ * @param {number} n - The number of items, a safe integer `>= 0`
+ * @param {number} k - The number of items chosen, an integer
+ * @returns {number} `n` choose `k`
+ * @throws {RangeError} when `n` is not a safe integer `>= 0`, or `k` is not an integer
+ * @throws {TypeError} when `n` or `k` is not a number
+ * @example
+ * binomial(5, 2); // => 10
+ * binomial(52, 5); // => 2598960
+ * binomial(10, 11); // => 0
+ * binomial(60, 30); // => 118264581564861424 // exact, although above 2 ** 53
+ * binomial(2000, 1000); // => Infinity
+ */
+export function binomial(n: number, k: number): number {
+	assertNumber('binomial', 'n', n, Number.isSafeInteger(n) && n >= 0, 'a safe integer >= 0');
+	assertNumber('binomial', 'k', k, Number.isInteger(k), 'an integer');
+	if (k < 0 || k > n) return 0;
+	// `C(n, k) = C(n, n - k)`: the fewer factors, the better.
+	const steps = Math.min(k, n - k);
+	const base = n - steps;
+	let result = 1;
+	let i = 1;
+	for (; i <= steps; i++) {
+		// `result` is `C(base + i - 1, i - 1)`, and `result * (base + i) / i` is the integer `C(base + i, i)`. With `g = gcd(result, i)`,
+		// `i / g` divides `base + i`, so both factors below are integers and the product is exact whenever it is safe.
+		const common = euclid(result, i);
+		const next = (result / common) * ((base + i) / (i / common));
+		if (next > Number.MAX_SAFE_INTEGER) break;
+		result = next;
+	}
+	if (i > steps) return result;
+	// `C(base + i, i)` grows with `i` and is at least `2 ** i`, so the exact computation reaches `2 ** 1024` within about 1024 steps.
+	let exact = BigInt(result);
+	for (; i <= steps; i++) {
+		exact = (exact * BigInt(base + i)) / BigInt(i);
+		if (exact >= OVERFLOW) return Infinity;
+	}
+	return Number(exact);
+}
+
+/**
+ * The result of {@link extendedGcd}: the greatest common divisor of `a` and `b`, and Bézout coefficients `x` and `y` with
+ * `a * x + b * y === gcd`.
+ */
+export interface ExtendedGcd {
+	/** The greatest common divisor of `a` and `b`, never negative (`0` only when both are `0`). */
+	readonly gcd: number;
+	/** The coefficient of `a`. */
+	readonly x: number;
+	/** The coefficient of `b`. */
+	readonly y: number;
+}
+
+/**
+ * The extended Euclidean algorithm on the magnitudes of two safe integers (see {@link extendedGcd}).
+ * @param {number} a - A safe integer
+ * @param {number} b - A safe integer
+ * @returns {ExtendedGcd} The gcd and the Bézout coefficients
+ */
+function bezout(a: number, b: number): ExtendedGcd {
+	let previous = Math.abs(a);
+	let current = Math.abs(b);
+	let previousX = 1;
+	let x = 0;
+	let previousY = 0;
+	let y = 1;
+	while (current !== 0) {
+		// The quotient from the exact remainder: `Math.floor(previous / current)` can round up when the true quotient is just below an integer.
+		const rest = previous % current;
+		const quotient = (previous - rest) / current;
+		previous = current;
+		current = rest;
+		// The coefficients alternate in sign and stay below `|a / gcd|` and `|b / gcd|`, so these products and differences are exact.
+		const nextX = previousX - quotient * x;
+		previousX = x;
+		x = nextX;
+		const nextY = previousY - quotient * y;
+		previousY = y;
+		y = nextY;
+	}
+	// `0 * x + 0 * y` is `0` for any coefficients: the algorithm's `x = 1` is as good as any, `0` is the conventional choice.
+	if (previous === 0) return { gcd: 0, x: 0, y: 0 };
+	// `+ 0` turns a `-0` coefficient into `0`.
+	return { gcd: previous, x: (a < 0 ? -previousX : previousX) + 0, y: (b < 0 ? -previousY : previousY) + 0 };
+}
+
+/**
+ * Computes the greatest common divisor of two integers together with Bézout coefficients: integers `x` and `y` such that
+ * `a * x + b * y === gcd(a, b)`, as found by the extended Euclidean algorithm (the smallest ones: `|x| <= |b / gcd|` and
+ * `|y| <= |a / gcd|`). They solve linear Diophantine equations and give modular inverses (see {@link modInverse}). Every intermediate
+ * value is a safe integer, so the result is exact. `extendedGcd(0, 0)` is `{ gcd: 0, x: 0, y: 0 }`.
+ * @param {number} a - A safe integer
+ * @param {number} b - A safe integer
+ * @returns {ExtendedGcd} `{ gcd, x, y }`, with `gcd >= 0` and `a * x + b * y === gcd`
+ * @throws {RangeError} when `a` or `b` is not a safe integer
+ * @throws {TypeError} when `a` or `b` is not a number
+ * @example
+ * extendedGcd(240, 46); // => { gcd: 2, x: -9, y: 47 }
+ * extendedGcd(-4, 6); // => { gcd: 2, x: 1, y: 1 }
+ * extendedGcd(0, 5); // => { gcd: 5, x: 0, y: 1 }
+ */
+export function extendedGcd(a: number, b: number): ExtendedGcd {
+	assertNumber('extendedGcd', 'a', a, Number.isSafeInteger(a), 'a safe integer');
+	assertNumber('extendedGcd', 'b', b, Number.isSafeInteger(b), 'a safe integer');
+	return bezout(a, b);
+}
+
+/**
+ * The inverse of `a` modulo `modulus`, in `[0, modulus)`.
+ * @param {string} message - The start of the error message, naming the caller and the arguments
+ * @param {number} a - A safe integer
+ * @param {number} modulus - A safe integer `>= 1`
+ * @returns {number} The `x` in `[0, modulus)` with `a * x ≡ 1 (mod modulus)`
+ * @throws {RangeError} when `a` and `modulus` are not coprime
+ */
+function inverse(message: string, a: number, modulus: number): number {
+	const { gcd: divisor, x } = bezout(a, modulus);
+	if (divisor !== 1) throw new RangeError(`${message}, got ${a} and ${modulus}`);
+	return modulo(x, modulus);
+}
+
+/**
+ * Computes the modular multiplicative inverse of `a`: the `x` in `[0, modulus)` with `a * x ≡ 1 (mod modulus)`, by the extended Euclidean
+ * algorithm (see {@link extendedGcd}). It exists exactly when `a` and `modulus` are coprime; otherwise a `RangeError` is thrown rather than
+ * a sentinel returned, since a `NaN` or `undefined` would flow silently into the arithmetic it is meant for (check `gcd(a, modulus) === 1`
+ * first when the inputs may not be coprime). Modulo `1`, every number is `0`, so is its inverse.
+ * @param {number} a - The number to invert, a safe integer (negative values are reduced first)
+ * @param {number} modulus - The modulus, a safe integer `>= 1`
+ * @returns {number} The inverse of `a` modulo `modulus`, in `[0, modulus)`
+ * @throws {RangeError} when `a` is not a safe integer, `modulus` is not a safe integer `>= 1`, or `a` and `modulus` are not coprime
+ * @throws {TypeError} when `a` or `modulus` is not a number
+ * @example
+ * modInverse(3, 11); // => 4 // 3 * 4 = 12 ≡ 1 (mod 11)
+ * modInverse(-3, 11); // => 7
+ * modInverse(10, 17); // => 12
+ * modInverse(4, 8); // throws RangeError
+ */
+export function modInverse(a: number, modulus: number): number {
+	assertNumber('modInverse', 'a', a, Number.isSafeInteger(a), 'a safe integer');
+	assertNumber('modInverse', 'modulus', modulus, Number.isSafeInteger(modulus) && modulus >= 1, 'a safe integer >= 1');
+	return inverse('modInverse: `a` must be coprime to `modulus`', a, modulus);
+}
+
+/** The largest modulus whose residues multiply exactly in doubles: `94906265 ** 2` is below `2 ** 53`. */
+const SQRT_SAFE = 94906265;
+
+/**
+ * Computes `base ** exponent` modulo `modulus` (Python's three-argument `pow`) by square-and-multiply, exactly: residues are multiplied in
+ * doubles while their products stay below `2 ** 53` (moduli up to `94906265`), and in BigInt arithmetic beyond, where `(base ** exponent)
+ * % modulus` would overflow or lose every digit. The result is floored (see {@link modulo}), so it lies in `[0, modulus)` even for a
+ * negative base; `0 ** 0` is `1`, and every result modulo `1` is `0`. A negative exponent raises the modular inverse of `base` (see
+ * {@link modInverse}) to `-exponent`, as Python does.
+ * @param {number} base - The base, a safe integer
+ * @param {number} exponent - The exponent, a safe integer (negative only when `base` and `modulus` are coprime)
+ * @param {number} modulus - The modulus, a safe integer `>= 1`
+ * @returns {number} `base ** exponent mod modulus`, in `[0, modulus)`
+ * @throws {RangeError} when an argument is not a safe integer, `modulus` is less than `1`, or `exponent` is negative and `base` is not
+ * coprime to `modulus`
+ * @throws {TypeError} when an argument is not a number
+ * @example
+ * modPow(4, 13, 497); // => 445
+ * modPow(-2, 3, 5); // => 2 // -8 mod 5
+ * modPow(3, -1, 11); // => 4 // the inverse of 3
+ * modPow(2, -1, 4); // throws RangeError
+ */
+export function modPow(base: number, exponent: number, modulus: number): number {
+	assertNumber('modPow', 'base', base, Number.isSafeInteger(base), 'a safe integer');
+	assertNumber('modPow', 'exponent', exponent, Number.isSafeInteger(exponent), 'a safe integer');
+	assertNumber('modPow', 'modulus', modulus, Number.isSafeInteger(modulus) && modulus >= 1, 'a safe integer >= 1');
+	let power = modulo(base, modulus);
+	let rest = exponent;
+	if (exponent < 0) {
+		power = inverse('modPow: `base` must be coprime to `modulus` for a negative `exponent`', base, modulus);
+		rest = -exponent;
+	}
+	if (modulus <= SQRT_SAFE) {
+		let result = 1 % modulus;
+		for (; rest > 0; rest = Math.floor(rest / 2), power = (power * power) % modulus) {
+			if (rest % 2 === 1) result = (result * power) % modulus;
+		}
+		return result;
+	}
+	const big = BigInt(modulus);
+	let result = 1n;
+	let square = BigInt(power);
+	for (let bits = BigInt(rest); bits > 0n; bits >>= 1n, square = (square * square) % big) {
+		if ((bits & 1n) === 1n) result = (result * square) % big;
+	}
+	return Number(result);
+}
+
+/**
+ * Computes the integer square root of a non-negative integer: the largest integer `r` with `r * r <= n` (Python's `math.isqrt`). Unlike
+ * `Math.floor(Math.sqrt(n))`, it is always exact: `Math.sqrt` rounds `√(r² - 1)` up to `r` for large `r`
+ * (`Math.floor(Math.sqrt(94906265 ** 2 - 1))` is `94906265`, one too many). Pass a bigint for numbers of any size: they use Newton's method
+ * in BigInt arithmetic.
+ * @param {number} n - A safe integer `>= 0`
+ * @returns {number} `⌊√n⌋`
+ * @throws {RangeError} when `n` is a number that is not a safe integer `>= 0`, or a negative bigint
+ * @throws {TypeError} when `n` is neither a number nor a bigint
+ * @example
+ * integerSqrt(17); // => 4
+ * integerSqrt(94906265 ** 2 - 1); // => 94906264 // Math.floor(Math.sqrt(...)) gives 94906265
+ * integerSqrt(10n ** 40n); // => 10n ** 20n
+ * integerSqrt(-1); // throws RangeError
+ */
+export function integerSqrt(n: number): number;
+/**
+ * {@link integerSqrt} for a bigint: the largest bigint `r` with `r * r <= n`, by Newton's method.
+ * @param {bigint} n - A bigint `>= 0n`
+ * @returns {bigint} `⌊√n⌋`
+ * @example
+ * integerSqrt(2n ** 64n + 1n); // => 2n ** 32n
+ */
+export function integerSqrt(n: bigint): bigint;
+/**
+ * Computes the integer square root of a non-negative integer, a number or a bigint (see the overloads).
+ * @param {number | bigint} n - A safe integer `>= 0` or a bigint `>= 0n`
+ * @returns {number | bigint} `⌊√n⌋`, of the same type as `n`
+ * @throws {RangeError} when `n` is a number that is not a safe integer `>= 0`, or a negative bigint
+ * @throws {TypeError} when `n` is neither a number nor a bigint
+ * @example
+ * integerSqrt(99); // => 9
+ */
+export function integerSqrt(n: number | bigint): number | bigint {
+	const expected = 'a safe integer >= 0 or a bigint >= 0';
+	if (typeof n === 'bigint') {
+		if (n < 0n) throw new RangeError(`integerSqrt: \`n\` must be ${expected}, got ${n}`);
+		if (n < 2n) return n;
+		// Newton's iteration decreases monotonically to `⌊√n⌋` from any start above it, such as `2 ** ⌈bits / 2⌉`.
+		let root = 1n << BigInt((n.toString(2).length + 1) >> 1);
+		for (let next = (root + n / root) >> 1n; next < root; next = (root + n / root) >> 1n) root = next;
+		return root;
+	}
+	assertNumber('integerSqrt', 'n', n, Number.isSafeInteger(n) && n >= 0, expected);
+	// `Math.sqrt` is correctly rounded: it never rounds below the integer root (an exact double), but can round up to `r + 1` when `n` is
+	// just below `(r + 1) ** 2`. Such squares are below `2 ** 53`, so the product is exact.
+	const root = Math.floor(Math.sqrt(n));
+	return root * root > n ? root - 1 : root;
+}
+
+/**
+ * Checks whether a number is the square of an integer (`0`, `1`, `4`, `9`, …), exactly: `Math.sqrt` alone cannot tell large squares from
+ * their neighbours, so the candidate root is squared back (in BigInt arithmetic above `2 ** 53`, where every double is an integer).
+ * Non-integers, negative numbers, `NaN` and `±Infinity` are not perfect squares.
+ * @param {number} n - The number to test
+ * @returns {boolean} `true` when `n` is the square of an integer
+ * @example
+ * isPerfectSquare(49); // => true
+ * isPerfectSquare(50); // => false
+ * isPerfectSquare(94906265 ** 2 + 1); // => false // Math.sqrt gives exactly 94906265
+ * isPerfectSquare(2.25); // => false // 1.5 is not an integer
+ * isPerfectSquare(2 ** 100); // => true
+ */
+export function isPerfectSquare(n: number): boolean {
+	if (!Number.isInteger(n) || n < 0) return false;
+	// A double that is a square has an exactly representable root, which `Math.sqrt` (correctly rounded) returns.
+	const root = Math.sqrt(n);
+	if (!Number.isInteger(root)) return false;
+	return n <= Number.MAX_SAFE_INTEGER ? root * root === n : BigInt(root) ** 2n === BigInt(n);
+}
+
+/**
+ * The largest power of two `<= n`, for a finite `n >= 1`: `Math.log2` is approximate, so its estimate is corrected with exact comparisons.
+ * @param {number} n - A finite number `>= 1`
+ * @returns {number} `2 ** ⌊log2(n)⌋`
+ */
+function floorPowerOfTwo(n: number): number {
+	// `Math.log2` of the largest doubles rounds to 1024, and `2 ** 1024` is `Infinity`, which halving never brings back.
+	let power = 2 ** Math.min(Math.floor(Math.log2(n)), 1023);
+	while (power > n) power /= 2;
+	// Past `2 ** 1023`, `power * 2` is `Infinity`, never `<= n`.
+	while (power * 2 <= n) power *= 2;
+	return power;
+}
+
+/**
+ * Checks whether a number is an integer power of two (`1`, `2`, `4`, …, up to `2 ** 1023`), for buffer, texture and hash-table sizes.
+ * Fractions (`0.5` is `2 ** -1`), zero, negative numbers, `NaN` and `±Infinity` are not. The test is exact (no `Math.log2` rounding, and
+ * no 32-bit `n & (n - 1)`, which is wrong from `2 ** 32`).
+ * @param {number} n - The number to test
+ * @returns {boolean} `true` when `n` is `2 ** k` for an integer `k >= 0`
+ * @example
+ * isPowerOfTwo(1024); // => true
+ * isPowerOfTwo(1000); // => false
+ * isPowerOfTwo(2 ** 40); // => true
+ * isPowerOfTwo(0.5); // => false
+ */
+export function isPowerOfTwo(n: number): boolean {
+	return Number.isInteger(n) && n >= 1 && floorPowerOfTwo(n) === n;
+}
+
+/**
+ * Finds the smallest integer power of two greater than or equal to a number (`nextPowerOfTwo(1000)` is `1024`), for growing buffers, texture
+ * and hash-table sizes. A power of two is returned as is, and any number up to `1` (fractions, zero and negative numbers included) gives
+ * `1` (`2 ** 0`). Numbers beyond `2 ** 1023` give `Infinity`, since `2 ** 1024` exceeds the doubles. Exact for every number, unlike
+ * `2 ** Math.ceil(Math.log2(n))` (which depends on the rounding of `Math.log2`) and 32-bit tricks (wrong from `2 ** 31`).
+ * @param {number} n - The number to round up (`NaN` is rejected)
+ * @returns {number} The smallest `2 ** k >= n` with `k >= 0`
+ * @throws {RangeError} when `n` is `NaN`
+ * @throws {TypeError} when `n` is not a number
+ * @example
+ * nextPowerOfTwo(1000); // => 1024
+ * nextPowerOfTwo(1024); // => 1024
+ * nextPowerOfTwo(5.5); // => 8
+ * nextPowerOfTwo(0.3); // => 1
+ * nextPowerOfTwo(2 ** 40 + 1); // => 2 ** 41
+ */
+export function nextPowerOfTwo(n: number): number {
+	assertNumber('nextPowerOfTwo', 'n', n, n === n, 'a number (not NaN)');
+	if (n <= 1) return 1;
+	if (n === Infinity) return n;
+	const power = floorPowerOfTwo(n);
+	return power === n ? n : power * 2;
+}

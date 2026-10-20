@@ -1604,4 +1604,273 @@ describe('New math helpers (property-based)', function () {
 			);
 		});
 	});
+
+	describe('primeFactors', function () {
+		const safe = fc.integer({ min: 1, max: Number.MAX_SAFE_INTEGER });
+
+		it('should give ascending primes whose product is n', function () {
+			fc.assert(
+				fc.property(safe, function (n) {
+					const factors = helpers.primeFactors(n);
+					expect(
+						factors.every(function (factor, index) {
+							return helpers.isPrime(factor) && (index === 0 || factors[index - 1] <= factor);
+						})
+					).toBe(true);
+					expect(
+						factors.reduce(function (product, factor) {
+							return product * BigInt(factor);
+						}, 1n)
+					).toBe(BigInt(n));
+				})
+			);
+		});
+
+		it('should split products of two large primes', function () {
+			const large = fc.integer({ min: 1031, max: 94_906_000 }).map(helpers.nextPrime);
+			fc.assert(
+				fc.property(large, large, function (p, q) {
+					fc.pre(p * q <= Number.MAX_SAFE_INTEGER);
+					expect(helpers.primeFactors(p * q)).toEqual([Math.min(p, q), Math.max(p, q)]);
+				})
+			);
+		});
+	});
+
+	describe('divisors', function () {
+		it('should equal the naive list of divisors', function () {
+			fc.assert(
+				fc.property(fc.integer({ min: 1, max: 100_000 }), function (n) {
+					const naive: number[] = [];
+					for (let d = 1; d <= n; d++) if (n % d === 0) naive.push(d);
+					expect(helpers.divisors(n)).toEqual(naive);
+				})
+			);
+		});
+
+		it('should be symmetric: d divides n exactly when n / d does', function () {
+			fc.assert(
+				fc.property(fc.integer({ min: 1, max: Number.MAX_SAFE_INTEGER }), function (n) {
+					const result = helpers.divisors(n);
+					expect(result[0]).toBe(1);
+					expect(result[result.length - 1]).toBe(n);
+					result.forEach(function (d, index) {
+						expect(n % d).toBe(0);
+						expect(result[result.length - 1 - index]).toBe(n / d);
+					});
+				})
+			);
+		});
+	});
+
+	describe('primesUpTo', function () {
+		it('should list exactly the numbers isPrime accepts', function () {
+			fc.assert(
+				fc.property(fc.double({ min: -10, max: 5000, noNaN: true }), function (limit) {
+					const expected: number[] = [];
+					for (let n = 2; n <= limit; n++) if (helpers.isPrime(n)) expected.push(n);
+					expect(helpers.primesUpTo(limit)).toEqual(expected);
+				})
+			);
+		});
+	});
+
+	describe('nextPrime and previousPrime', function () {
+		it('should find the nearest prime, with no prime in between', function () {
+			fc.assert(
+				fc.property(fc.double({ min: -100, max: 1e7, noNaN: true }), function (n) {
+					const next = helpers.nextPrime(n);
+					expect(next > n && helpers.isPrime(next)).toBe(true);
+					for (let m = Math.max(2, Math.floor(n) + 1); m < next; m++) expect(helpers.isPrime(m)).toBe(false);
+					fc.pre(n > 2);
+					const previous = helpers.previousPrime(n);
+					expect(previous < n && helpers.isPrime(previous)).toBe(true);
+					for (let m = previous + 1; m < n; m++) expect(helpers.isPrime(m)).toBe(false);
+				})
+			);
+		});
+
+		it('should be inverse walks over the primes', function () {
+			fc.assert(
+				fc.property(fc.integer({ min: 3, max: Number.MAX_SAFE_INTEGER - 1000 }), function (n) {
+					const prime = helpers.nextPrime(n);
+					expect(helpers.previousPrime(helpers.nextPrime(prime))).toBe(prime);
+					expect(helpers.nextPrime(helpers.previousPrime(prime))).toBe(prime);
+				})
+			);
+		});
+	});
+
+	describe('binomial', function () {
+		it('should equal the correctly rounded BigInt value', function () {
+			fc.assert(
+				fc.property(fc.integer({ min: 0, max: 1200 }), fc.integer({ min: -5, max: 1205 }), function (n, k) {
+					let exact = 0n;
+					if (k >= 0 && k <= n) {
+						exact = 1n;
+						for (let i = 1; i <= k; i++) exact = (exact * BigInt(n - k + i)) / BigInt(i);
+					}
+					expect(helpers.binomial(n, k)).toBe(Number(exact));
+				})
+			);
+		});
+
+		it("should satisfy Pascal's rule and the symmetry exactly below 2 ** 53", function () {
+			fc.assert(
+				fc.property(fc.integer({ min: 1, max: 10_000 }), fc.integer({ min: 1, max: 10_000 }), function (n, k) {
+					const value = helpers.binomial(n, k);
+					fc.pre(value <= Number.MAX_SAFE_INTEGER);
+					expect(helpers.binomial(n - 1, k - 1) + helpers.binomial(n - 1, k)).toBe(value);
+					expect(helpers.binomial(n, n - k)).toBe(value);
+				})
+			);
+		});
+	});
+
+	describe('extendedGcd', function () {
+		const safeInteger = fc.integer({ min: -Number.MAX_SAFE_INTEGER, max: Number.MAX_SAFE_INTEGER });
+
+		it('should give the gcd and small Bézout coefficients', function () {
+			fc.assert(
+				fc.property(safeInteger, safeInteger, function (a, b) {
+					const { gcd, x, y } = helpers.extendedGcd(a, b);
+					expect(gcd).toBe(helpers.gcd(a, b));
+					expect(BigInt(a) * BigInt(x) + BigInt(b) * BigInt(y)).toBe(BigInt(gcd));
+					if (gcd > 0) {
+						expect(Math.abs(x)).toBeLessThanOrEqual(Math.max(1, Math.abs(b) / gcd));
+						expect(Math.abs(y)).toBeLessThanOrEqual(Math.max(1, Math.abs(a) / gcd));
+					}
+				})
+			);
+		});
+	});
+
+	describe('modInverse', function () {
+		it('should give the x in [0, m) with a * x ≡ 1 (mod m)', function () {
+			fc.assert(
+				fc.property(
+					fc.integer({ min: -Number.MAX_SAFE_INTEGER, max: Number.MAX_SAFE_INTEGER }),
+					fc.integer({ min: 2, max: Number.MAX_SAFE_INTEGER }),
+					function (a, modulus) {
+						if (helpers.gcd(a, modulus) !== 1) {
+							expect(function () {
+								helpers.modInverse(a, modulus);
+							}).toThrow(RangeError);
+							return;
+						}
+						const inverse = helpers.modInverse(a, modulus);
+						expect(inverse >= 0 && inverse < modulus).toBe(true);
+						expect((((BigInt(a) * BigInt(inverse)) % BigInt(modulus)) + BigInt(modulus)) % BigInt(modulus)).toBe(1n);
+					}
+				)
+			);
+		});
+	});
+
+	describe('modPow', function () {
+		/** `base ** exponent mod modulus` (floored) in BigInt arithmetic, for a non-negative exponent. */
+		function reference(base: number, exponent: number, modulus: number): number {
+			const m = BigInt(modulus);
+			let result = 1n % m;
+			let power = ((BigInt(base) % m) + m) % m;
+			for (let rest = BigInt(exponent); rest > 0n; rest >>= 1n, power = (power * power) % m) {
+				if ((rest & 1n) === 1n) result = (result * power) % m;
+			}
+			return Number(result);
+		}
+		const base = fc.integer({ min: -Number.MAX_SAFE_INTEGER, max: Number.MAX_SAFE_INTEGER });
+		const exponent = fc.integer({ min: 0, max: Number.MAX_SAFE_INTEGER });
+
+		it('should equal the BigInt reference, for small and large moduli', function () {
+			fc.assert(
+				fc.property(base, exponent, fc.oneof(fc.integer({ min: 1, max: 94_906_265 }), fc.integer({ min: 1, max: Number.MAX_SAFE_INTEGER })), function (b, e, m) {
+					expect(helpers.modPow(b, e, m)).toBe(reference(b, e, m));
+				})
+			);
+		});
+
+		it('should raise the inverse for negative exponents', function () {
+			fc.assert(
+				fc.property(base, fc.integer({ min: 1, max: 1000 }), fc.integer({ min: 2, max: Number.MAX_SAFE_INTEGER }), function (b, e, m) {
+					fc.pre(helpers.gcd(b, m) === 1);
+					const result = helpers.modPow(b, -e, m);
+					// `b ** -e * b ** e ≡ 1`.
+					expect((BigInt(result) * BigInt(helpers.modPow(b, e, m))) % BigInt(m)).toBe(1n);
+				})
+			);
+		});
+	});
+
+	describe('integerSqrt', function () {
+		it('should give the r with r * r <= n < (r + 1) ** 2, for numbers and bigints alike', function () {
+			fc.assert(
+				fc.property(
+					fc.oneof(
+						fc.integer({ min: 0, max: Number.MAX_SAFE_INTEGER }),
+						fc.integer({ min: 94_000_000, max: 94_906_265 }).map(function (r) {
+							return r * r - 1;
+						})
+					),
+					function (n) {
+						const root = helpers.integerSqrt(n);
+						const big = BigInt(root);
+						expect(big * big <= BigInt(n) && (big + 1n) * (big + 1n) > BigInt(n)).toBe(true);
+						expect(helpers.integerSqrt(BigInt(n))).toBe(big);
+					}
+				)
+			);
+		});
+
+		it('should handle bigints of any size', function () {
+			fc.assert(
+				fc.property(fc.bigInt({ min: 0n, max: 2n ** 2000n }), function (n) {
+					const root = helpers.integerSqrt(n);
+					expect(root * root <= n && (root + 1n) * (root + 1n) > n).toBe(true);
+				})
+			);
+		});
+	});
+
+	describe('isPerfectSquare', function () {
+		it('should accept squares and reject their neighbours', function () {
+			fc.assert(
+				fc.property(fc.integer({ min: 1, max: 94_906_265 }), function (r) {
+					expect(helpers.isPerfectSquare(r * r)).toBe(true);
+					expect(helpers.isPerfectSquare(r * r + 1)).toBe(false);
+					expect(helpers.isPerfectSquare(r * r - 1)).toBe(r === 1);
+				})
+			);
+		});
+
+		it('should agree with integerSqrt on safe integers', function () {
+			fc.assert(
+				fc.property(fc.integer({ min: 0, max: Number.MAX_SAFE_INTEGER }), function (n) {
+					const root = helpers.integerSqrt(n);
+					expect(helpers.isPerfectSquare(n)).toBe(root * root === n);
+				})
+			);
+		});
+	});
+
+	describe('isPowerOfTwo and nextPowerOfTwo', function () {
+		it('should recognize every power of two', function () {
+			fc.assert(
+				fc.property(fc.integer({ min: 0, max: 1023 }), function (k) {
+					expect(helpers.isPowerOfTwo(2 ** k)).toBe(true);
+					expect(helpers.nextPowerOfTwo(2 ** k)).toBe(2 ** k);
+					if (k > 1) expect(helpers.isPowerOfTwo(2 ** k + 2 ** (k - 1))).toBe(false);
+				})
+			);
+		});
+
+		it('should round up to the smallest power of two above', function () {
+			fc.assert(
+				fc.property(fc.double({ min: 1, max: 2 ** 1023, noNaN: true }), function (n) {
+					const power = helpers.nextPowerOfTwo(n);
+					expect(helpers.isPowerOfTwo(power)).toBe(true);
+					expect(power >= n && (power === 1 || power / 2 < n)).toBe(true);
+				})
+			);
+		});
+	});
 });
