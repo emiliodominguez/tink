@@ -802,6 +802,10 @@ describe('URL helpers (hostile inputs)', function () {
 			}).toThrow(new RangeError('matchPath: `pattern` must start with \'/\', got ""'));
 			expect(helpers.matchPath('/*', '?x')).toBeNull();
 			expect(helpers.normalizeUrl('http://x/%41')).toBe('http://x/A');
+			expect(helpers.joinUrl('', '?x')).toBe('?x');
+			// A base made only of slashes is no base: nothing is mounted under it (`//evil.example` would be protocol-relative).
+			expect(helpers.withBase('evil.example/x', '//')).toBe('evil.example/x');
+			expect(helpers.withoutBase('//evil.example', '//')).toBe('//evil.example');
 		} finally {
 			delete proto['-1'];
 			delete proto[0];
@@ -1725,6 +1729,25 @@ describe('normalizeUrl', function () {
 		expect(helpers.normalizeUrl('http://x/?utm_source=a#h', { removeQueryParams })).toBe('http://x/#h');
 		expect(helpers.normalizeUrl('http://x/?q=a%20b', { removeQueryParams: ['z'] })).toBe('http://x/?q=a%20b');
 		expect(helpers.normalizeUrl('http://x/?q=1', { removeQueryParams: [vm.runInNewContext('/q/') as RegExp] })).toBe('http://x/');
+	});
+
+	it('writes the query once however many parameters are removed', function () {
+		// Deleting them one by one re-serialized the whole query each time: 10,000 distinct `utm_` keys took half a minute.
+		const deletes = jest.spyOn(URLSearchParams.prototype, 'delete');
+		const writes = jest.spyOn(URL.prototype, 'search', 'set');
+		try {
+			const query = Array.from({ length: 100 }, function (_: unknown, i: number): string {
+				return `utm_${i}=x&k${i}=y`;
+			}).join('&');
+			const kept = Array.from({ length: 100 }, function (_: unknown, i: number): string {
+				return `k${i}=y`;
+			}).join('&');
+			expect(helpers.normalizeUrl(`http://x/?${query}#h`, { removeQueryParams: [/^utm_/] })).toBe(`http://x/?${kept}#h`);
+			expect(deletes.mock.calls.length + writes.mock.calls.length).toBeLessThanOrEqual(1);
+		} finally {
+			deletes.mockRestore();
+			writes.mockRestore();
+		}
 	});
 
 	it('should be idempotent', function () {

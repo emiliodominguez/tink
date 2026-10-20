@@ -455,8 +455,9 @@ export function joinUrl(...parts: string[]): string {
 function joinPaths(paths: ReadonlyArray<string>, base: boolean): string {
 	const first = paths[0];
 	// The first argument is the base: a scheme with its slashes, else `//` before a host, else a single `/` (or nothing: the last
-	// alternative always matches). Any other first part only contributes a single leading `/`.
-	let prefix = base ? (/^[a-z][a-z\d+.-]*:\/*|^\/\/(?=[^/])|^\/?/i.exec(first) as RegExpExecArray)[0] : first[0] === '/' ? '/' : '';
+	// alternative always matches). Any other first part only contributes a single leading `/` (`charAt`: the part is empty when it
+	// was only a query or fragment, and `''[0]` would be read from a polluted `Object.prototype`).
+	let prefix = base ? (/^[a-z][a-z\d+.-]*:\/*|^\/\/(?=[^/])|^\/?/i.exec(first) as RegExpExecArray)[0] : first.charAt(0) === '/' ? '/' : '';
 	// The non-empty slash-free segments, separated by exactly one `/`: each part without its leading and trailing slashes, and the runs
 	// of slashes inside a part (rare) collapsed afterwards.
 	let body = '';
@@ -799,7 +800,8 @@ export function cleanDoubleSlashes(url: string): string {
 function trimBase(base: string): string {
 	let end = base.length;
 
-	while (base[end - 1] === '/') end--;
+	// `charAt`, not an index: past the start, `base[-1]` would be read from a polluted `Object.prototype`.
+	while (base.charAt(end - 1) === '/') end--;
 
 	return base.slice(0, end);
 }
@@ -2092,18 +2094,16 @@ export function normalizeUrl(url: string | UrlObject, options: NormalizeUrlOptio
 	if (stripWww && parsed.hostname.startsWith('www.') && rest.includes('.') && !rest.startsWith('www.')) parsed.hostname = rest;
 
 	if (removed.length > 0) {
-		const params = parsed.searchParams;
+		const pairs = [...parsed.searchParams];
+		const kept = pairs.filter(function ([key]: [string, string]): boolean {
+			return !removed.some(function (pattern: string | RegExp): boolean {
+				// `search` ignores (and keeps) the `lastIndex` of a global or sticky expression.
+				return typeof pattern === 'string' ? pattern === key : key.search(pattern) !== -1;
+			});
+		});
 
-		for (const key of new Set(params.keys())) {
-			if (
-				removed.some(function (pattern: string | RegExp): boolean {
-					// `search` ignores (and keeps) the `lastIndex` of a global or sticky expression.
-					return typeof pattern === 'string' ? pattern === key : key.search(pattern) !== -1;
-				})
-			) {
-				params.delete(key);
-			}
-		}
+		// The query is written once: each `searchParams.delete` re-serializes it, which is quadratic in the number of removed keys.
+		if (kept.length < pairs.length) parsed.search = String(new URLSearchParams(kept));
 	}
 
 	if (sortQuery) parsed.searchParams.sort();
