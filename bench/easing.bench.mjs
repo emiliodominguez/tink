@@ -1,5 +1,5 @@
 import bezier from 'bezier-easing';
-import { cubicBezier, easeInOutCubic, easeInOutElastic, easeOutBounce, interpolate, spring, steps } from 'tinkit/easing';
+import { bounce, cssLinear, cubicBezier, easeInOutCubic, easeInOutElastic, easeOut, easeOutBounce, interpolate, spring, steps, toCssLinear } from 'tinkit/easing';
 
 // One animation's worth of frames: 1000 progress values in [0, 1].
 const frames = Array.from({ length: 1000 }, function (_, i) {
@@ -14,6 +14,16 @@ const oursBack = cubicBezier(0.68, -0.6, 0.32, 1.6);
 const theirsBack = bezier(0.68, -0.6, 0.32, 1.6);
 const stepper = steps(12, 'jump-both');
 const bouncy = spring({ stiffness: 170, damping: 12 });
+const springLinear = cssLinear(
+	toCssLinear(bouncy.easing)
+		.slice('linear('.length, -1)
+		.split(', ')
+		.map(function (stop) {
+			const [output, input] = stop.split(' ');
+			return input === undefined ? Number(output) : [Number(output), Number(input.slice(0, -1)) / 100];
+		})
+);
+const livelyBounce = easeOut(bounce(5, 0.6));
 
 /**
  * Sums `easing` over every frame.
@@ -127,6 +137,30 @@ export default [
 		name: 'spring easing (1000 frames)',
 		fn: function () {
 			return sweep(bouncy.easing);
+		}
+	},
+	{
+		name: 'spring velocity (1000 frames)',
+		fn: function () {
+			return sweep(bouncy.velocity);
+		}
+	},
+	{
+		name: 'toCssLinear(spring easing)',
+		fn: function () {
+			return toCssLinear(bouncy.easing);
+		}
+	},
+	{
+		name: 'cssLinear spring stops (1000 frames)',
+		fn: function () {
+			return sweep(springLinear);
+		}
+	},
+	{
+		name: 'easeOut(bounce(5, 0.6)) (1000 frames)',
+		fn: function () {
+			return sweep(livelyBounce);
 		}
 	},
 	{

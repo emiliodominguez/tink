@@ -6,7 +6,21 @@ const named: Array<[string, helpers.EasingFunction]> = [
 	['cssEase', helpers.cssEase],
 	['cssEaseIn', helpers.cssEaseIn],
 	['cssEaseOut', helpers.cssEaseOut],
-	['cssEaseInOut', helpers.cssEaseInOut]
+	['cssEaseInOut', helpers.cssEaseInOut],
+	['smoothstep', helpers.smoothstep],
+	['smootherstep', helpers.smootherstep],
+	['power(2.5)', helpers.power(2.5)],
+	['power(3)', helpers.power(3)],
+	['back()', helpers.back()],
+	['back(0)', helpers.back(0)],
+	['elastic()', helpers.elastic()],
+	['elastic(1.5, 0.45)', helpers.elastic(1.5, 0.45)],
+	['bounce()', helpers.bounce()],
+	['bounce(1, 0.9)', helpers.bounce(1, 0.9)],
+	['bounce(7, 0.3)', helpers.bounce(7, 0.3)],
+	['easeOut(bounce(5, 0.6))', helpers.easeOut(helpers.bounce(5, 0.6))],
+	['easeOutIn(easeInCubic)', helpers.easeOutIn(helpers.easeInCubic)],
+	['easeOutIn(easeInExpo)', helpers.easeOutIn(helpers.easeInExpo)]
 ];
 for (const family of families) {
 	for (const kind of ['easeIn', 'easeOut', 'easeInOut']) {
@@ -106,7 +120,228 @@ describe('Easing helpers', function () {
 		});
 	});
 
+	describe('smoothstep / smootherstep', function () {
+		it('should be the Hermite polynomials, symmetric around 1/2', function () {
+			for (const t of [0.1, 0.25, 0.3, 0.5, 0.7, 0.9]) {
+				expect(helpers.smoothstep(t)).toBeCloseTo(3 * t * t - 2 * t ** 3, 15);
+				expect(helpers.smootherstep(t)).toBeCloseTo(6 * t ** 5 - 15 * t ** 4 + 10 * t ** 3, 14);
+				expect(helpers.smoothstep(1 - t)).toBeCloseTo(1 - helpers.smoothstep(t), 15);
+				expect(helpers.smootherstep(1 - t)).toBeCloseTo(1 - helpers.smootherstep(t), 15);
+			}
+			expect(helpers.smoothstep(0.5)).toBe(0.5);
+			expect(helpers.smootherstep(0.5)).toBe(0.5);
+			// Not clamped, like the other formula easings.
+			expect(helpers.smoothstep(2)).toBe(-4);
+			expect(helpers.smootherstep(-1)).toBe(-31);
+		});
+	});
+
+	describe('easeOutIn', function () {
+		it('should run the reflection, then the ease-in, each at double speed', function () {
+			const g = helpers.easeOutIn(helpers.easeInQuad);
+			expect([0, 0.25, 0.5, 0.75, 1].map(g)).toEqual([0, 0.375, 0.5, 0.625, 1]);
+			for (const t of [0.1, 0.3, 0.45]) {
+				expect(g(t)).toBeCloseTo(helpers.easeOutQuad(2 * t) / 2, 15);
+				expect(g(1 - t)).toBeCloseTo(1 - g(t), 15);
+			}
+			expect(g(NaN)).toBeNaN();
+		});
+
+		it('should throw a TypeError for non-functions', function () {
+			expect(function () {
+				helpers.easeOutIn('linear' as any);
+			}).toThrow(new TypeError('easeOutIn: `easing` must be a function, got string'));
+		});
+	});
+
+	describe('power', function () {
+		it('should raise t to any positive exponent', function () {
+			const square = helpers.power(2);
+			const cube = helpers.power(3);
+			for (const t of [0.1, 0.3, 0.5, 0.9]) {
+				expect(square(t)).toBeCloseTo(helpers.easeInQuad(t), 15);
+				expect(cube(t)).toBeCloseTo(helpers.easeInCubic(t), 15);
+			}
+			expect(helpers.power(2.5)(0.25)).toBe(0.03125);
+			expect(helpers.power(0.5)(0.25)).toBe(0.5);
+			expect(helpers.power(2)(-3)).toBe(9);
+			expect(helpers.power(0.5)(-1)).toBeNaN();
+			expect(Object.is(helpers.power(3)(-0), 0)).toBe(true);
+		});
+
+		it('should validate the exponent', function () {
+			for (const invalid of [0, -1, Infinity, NaN]) {
+				expect(function () {
+					helpers.power(invalid);
+				}).toThrow(new RangeError(`power: \`exponent\` must be a finite number > 0, got ${invalid}`));
+			}
+			expect(function () {
+				helpers.power('2' as any);
+			}).toThrow(new TypeError('power: `exponent` must be a finite number > 0, got string'));
+		});
+	});
+
+	describe('back', function () {
+		it('should default to easeInBack and give the cubic for overshoot 0', function () {
+			const custom = helpers.back();
+			for (let k = 0; k <= 64; k++) expect(custom(k / 64)).toBe(helpers.easeInBack(k / 64));
+			expect(helpers.back(0)(0.5)).toBe(0.125);
+		});
+
+		it('should pull back further with a larger overshoot', function () {
+			// The minimum of t²·((c + 1)t - c) is at t = 2c / (3(c + 1)).
+			function dip(c: number): number {
+				return helpers.back(c)((2 * c) / (3 * (c + 1)));
+			}
+			expect(dip(1.70158)).toBeCloseTo(-0.1, 2);
+			expect(dip(2.5949)).toBeCloseTo(-0.2, 2);
+			expect(dip(4)).toBeLessThan(dip(2));
+		});
+
+		it('should validate the overshoot', function () {
+			expect(function () {
+				helpers.back(-1);
+			}).toThrow(new RangeError('back: `overshoot` must be a finite number >= 0, got -1'));
+			expect(function () {
+				helpers.back(Infinity);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.back(null as any);
+			}).toThrow(new TypeError('back: `overshoot` must be a finite number >= 0, got null'));
+		});
+	});
+
+	describe('elastic', function () {
+		it('should default to easeInElastic', function () {
+			const custom = helpers.elastic();
+			for (let k = 0; k <= 1000; k++) expect(custom(k / 1000)).toBeCloseTo(helpers.easeInElastic(k / 1000), 14);
+		});
+
+		it('should follow the GSAP formula for a custom amplitude and period', function () {
+			const amplitude = 1.5;
+			const period = 0.45;
+			const custom = helpers.elastic(amplitude, period);
+			const shift = (period / (2 * Math.PI)) * Math.asin(1 / amplitude);
+			for (const t of [0.1, 0.5, 0.8, 0.95]) {
+				expect(custom(t)).toBeCloseTo(-(amplitude * 2 ** (10 * (t - 1)) * Math.sin(((t - 1 - shift) * (2 * Math.PI)) / period)), 14);
+			}
+		});
+
+		it('should swing further with a larger amplitude and oscillate more often with a shorter period', function () {
+			function overshoot(easing: helpers.EasingFunction): number {
+				let max = 0;
+				for (let k = 0; k <= 1000; k++) max = Math.max(max, easing(k / 1000) - 1);
+				return max;
+			}
+			function crossings(easing: helpers.EasingFunction): number {
+				let count = 0;
+				for (let k = 1; k < 1000; k++) if (Math.sign(easing(k / 1000) - 1) !== Math.sign(easing((k - 1) / 1000) - 1)) count++;
+				return count;
+			}
+			expect(overshoot(helpers.easeOut(helpers.elastic(2)))).toBeGreaterThan(overshoot(helpers.easeOut(helpers.elastic(1))));
+			expect(crossings(helpers.easeOut(helpers.elastic(1, 0.1)))).toBeGreaterThan(crossings(helpers.easeOut(helpers.elastic(1, 0.3))));
+		});
+
+		it('should validate its arguments', function () {
+			expect(function () {
+				helpers.elastic(0.5);
+			}).toThrow(new RangeError('elastic: `amplitude` must be a finite number >= 1, got 0.5'));
+			expect(function () {
+				helpers.elastic(1, 0);
+			}).toThrow(new RangeError('elastic: `period` must be a finite number > 0, got 0'));
+			expect(function () {
+				helpers.elastic(1, Infinity);
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.elastic('1' as any);
+			}).toThrow(new TypeError('elastic: `amplitude` must be a finite number >= 1, got string'));
+		});
+	});
+
+	describe('bounce', function () {
+		it("should default to Penner's bounce (3 bounces, restitution 0.5)", function () {
+			const custom = helpers.bounce();
+			const out = helpers.easeOut(custom);
+			for (let k = 0; k <= 1000; k++) {
+				expect(custom(k / 1000)).toBeCloseTo(helpers.easeInBounce(k / 1000), 15);
+				expect(out(k / 1000)).toBeCloseTo(helpers.easeOutBounce(k / 1000), 15);
+			}
+		});
+
+		it('should follow a ball rebounding with the given restitution', function () {
+			const restitution = 0.6;
+			const out = helpers.easeOut(helpers.bounce(4, restitution));
+			// The first fall takes 1 unit and rebound k takes 2·e^k, rising e^2k: the arcs touch 1 at their ends and dip to 1 - e^2k.
+			let total = 1;
+			for (let k = 1; k <= 4; k++) total += 2 * restitution ** k;
+			let end = 1;
+			expect(out(0.5 / total)).toBeCloseTo(0.25, 14);
+			expect(out(end / total)).toBeCloseTo(1, 14);
+			for (let k = 1; k <= 4; k++) {
+				const halfWidth = restitution ** k;
+				expect(out((end + halfWidth) / total)).toBeCloseTo(1 - halfWidth * halfWidth, 14);
+				end += 2 * halfWidth;
+				expect(out(end / total)).toBeCloseTo(1, 14);
+			}
+		});
+
+		it('should extrapolate its last arc before the start and propagate NaN', function () {
+			// One rebound with restitution 0.5: total 2, the ease-in at t is 0.25 - (2(1 - t) - 1.5)².
+			const single = helpers.bounce(1, 0.5);
+			expect(single(0.25)).toBe(0.25);
+			expect(single(-0.25)).toBe(0.25 - 1);
+			expect(helpers.bounce()(NaN)).toBeNaN();
+		});
+
+		it('should validate its arguments', function () {
+			expect(function () {
+				helpers.bounce(0);
+			}).toThrow(new RangeError('bounce: `bounces` must be an integer >= 1, got 0'));
+			expect(function () {
+				helpers.bounce(2.5);
+			}).toThrow(RangeError);
+			for (const invalid of [0, 1, -0.5, NaN]) {
+				expect(function () {
+					helpers.bounce(3, invalid);
+				}).toThrow(new RangeError(`bounce: \`restitution\` must be a number between 0 and 1 (exclusive), got ${invalid}`));
+			}
+			expect(function () {
+				helpers.bounce(3, '0.5' as any);
+			}).toThrow(new TypeError('bounce: `restitution` must be a number between 0 and 1 (exclusive), got string'));
+		});
+	});
+
 	describe('cubicBezier', function () {
+		it('should solve steep, overshooting and flat-ended curves to the precision of doubles', function () {
+			const curves = [
+				[0.9, 0, 0.1, 1],
+				[0.68, -0.6, 0.32, 1.6],
+				[0.05, 0.7, 0.1, 1],
+				[0.7, 0, 0.84, 0],
+				[0.42, 0, 1, 1]
+			];
+			for (const [x1, y1, x2, y2] of curves) {
+				const easing = helpers.cubicBezier(x1, y1, x2, y2);
+				for (let k = 1; k < 1000; k++) {
+					// Reference: 200 bisection steps of the Bernstein form.
+					const t = k / 1000;
+					let low = 0;
+					let high = 1;
+					for (let i = 0; i < 200; i++) {
+						const middle = (low + high) / 2;
+						if (3 * (1 - middle) ** 2 * middle * x1 + 3 * (1 - middle) * middle ** 2 * x2 + middle ** 3 < t) low = middle;
+						else high = middle;
+					}
+					const s = (low + high) / 2;
+					const slope = 3 * (1 - s) ** 2 * x1 + 6 * (1 - s) * s * (x2 - x1) + 3 * s * s * (1 - x2);
+					const ySlope = 3 * (1 - s) ** 2 * y1 + 6 * (1 - s) * s * (y2 - y1) + 3 * s * s * (1 - y2);
+					// x(s) is solved to a few ulps of t; y moves by y'(s) / x'(s) times that.
+					const tolerance = 1e-15 * (1 + Math.abs(ySlope / slope));
+					expect(Math.abs(easing(t) - (3 * (1 - s) ** 2 * s * y1 + 3 * (1 - s) * s * s * y2 + s ** 3))).toBeLessThanOrEqual(tolerance);
+				}
+			}
+		});
+
 		it('should stay finite for huge but finite y control points', function () {
 			expect(helpers.cubicBezier(0.5, 6e307, 0.5, 0)(0.5)).toBeCloseTo(2.25e307, -295);
 			expect(Number.isFinite(helpers.cubicBezier(0.5, -1e308, 0.5, 1e308)(0.25))).toBe(true);
@@ -270,6 +505,153 @@ describe('Easing helpers', function () {
 			expect(function () {
 				helpers.cubicBezier('0' as any, 0, 1, 1);
 			}).toThrow(new TypeError('cubicBezier: `x1` must be a number between 0 and 1, got string'));
+		});
+	});
+
+	describe('cssLinear', function () {
+		it('should place missing inputs like CSS linear()', function () {
+			// linear(0, 0.25, 1): the middle stop sits at 50%.
+			const easing = helpers.cssLinear([0, 0.25, 1]);
+			expect([0, 0.25, 0.5, 0.75, 1].map(easing)).toEqual([0, 0.125, 0.25, 0.625, 1]);
+			// linear(0, 0.1, 0.2 40%, 0.3, 0.9, 1): 0.1 at 20%, 0.3 at 60% and 0.9 at 80%.
+			const spread = helpers.cssLinear([0, 0.1, [0.2, 0.4], 0.3, 0.9, 1]);
+			expect(spread(0.2)).toBe(0.1);
+			expect(spread(0.6)).toBeCloseTo(0.3, 15);
+			expect(spread(0.8)).toBeCloseTo(0.9, 15);
+			expect(spread(0.9)).toBeCloseTo(0.95, 15);
+			// A last stop without input goes to 1, or to the largest input before it (here a jump from 0.5 to 1 at 150%).
+			expect(helpers.cssLinear([0, [0.5, 1.5], 1])(0.75)).toBe(0.25);
+			expect(helpers.cssLinear([0, [0.5, 1.5], 1])(1.5)).toBe(1);
+			expect(helpers.cssLinear([0, [0.5, 1.5], 1])(2)).toBe(1);
+		});
+
+		it('should raise inputs smaller than an earlier one (making a jump) and hold two-input stops', function () {
+			// linear(0, 0.5 80%, 0.7 30%, 1): 0.7 is raised to 80%, a jump from 0.5 to 0.7.
+			const jump = helpers.cssLinear([0, [0.5, 0.8], [0.7, 0.3], 1]);
+			expect(jump(0.4)).toBe(0.25);
+			expect(jump(0.8 - 1e-9)).toBeCloseTo(0.5, 8);
+			expect(jump(0.8)).toBe(0.7);
+			expect(jump(0.9)).toBeCloseTo(0.85, 15);
+			const hold = helpers.cssLinear([0, [0.5, 0.25, 0.75], 1]);
+			expect([0.125, 0.25, 0.5, 0.75, 0.875].map(hold)).toEqual([0.25, 0.5, 0.5, 0.5, 0.75]);
+			// Steps written as linear(): linear(0 0% 50%, 1 50% 100%).
+			const step = helpers.cssLinear([
+				[0, 0, 0.5],
+				[1, 0.5, 1]
+			]);
+			expect([0, 0.25, 0.4999, 0.5, 0.75, 1].map(step)).toEqual([0, 0, 0, 1, 1, 1]);
+		});
+
+		it('should extrapolate the first and last segments, follow the spec on equal inputs and propagate NaN', function () {
+			const easing = helpers.cssLinear([0, [0.6, 0.5], 1]);
+			expect(easing(-1)).toBeCloseTo(-1.2, 15);
+			expect(easing(2)).toBeCloseTo(1.8, 15);
+			// Starting after 0: linear(0.2 50%, 1) extrapolates to 0.2 - 0.8 at t = 0.
+			expect(helpers.cssLinear([[0.2, 0.5], 1])(0)).toBeCloseTo(-0.6, 15);
+			// Equal inputs on both sides: the output of the second point.
+			expect(
+				helpers.cssLinear([
+					[0, 0.5],
+					[1, 0.5]
+				])(0.2)
+			).toBe(1);
+			expect(helpers.cssLinear([0, [1, 1], [0.5, 1]])(2)).toBe(0.5);
+			expect(easing(NaN)).toBeNaN();
+			expect(helpers.cssLinear([[0.5, 0.25, 0.75], 1])(NaN)).toBeNaN();
+			// A flat segment stays flat where the progress overflows.
+			expect(helpers.cssLinear([0, [0, 5e-324]])(-1)).toBe(0);
+			expect(helpers.cssLinear([0, [0.5, 0.5], [0.5, 1]])(Infinity)).toBe(0.5);
+		});
+
+		it('should give the same results in any call order (the cached segment is only a shortcut)', function () {
+			const stops: helpers.LinearStop[] = [0, 0.3, [0.2, 0.3], 0.8, [0.9, 0.7], [1, 0.7], 1];
+			const sequential = helpers.cssLinear(stops);
+			const forward: number[] = [];
+			for (let k = -10; k <= 110; k++) forward.push(sequential(k / 100));
+			const shuffled = helpers.cssLinear(stops);
+			for (let k = 110; k >= -10; k -= 7) expect(shuffled(k / 100)).toBe(forward[k + 10]);
+			for (let k = -10; k <= 110; k += 3) expect(shuffled(k / 100)).toBe(forward[k + 10]);
+		});
+
+		it('should validate the stops', function () {
+			expect(function () {
+				helpers.cssLinear('0, 1' as any);
+			}).toThrow(new TypeError('cssLinear: `stops` must be an array of linear stops, got string'));
+			expect(function () {
+				helpers.cssLinear([0]);
+			}).toThrow(new RangeError('cssLinear: `stops` must hold at least 2 stops, got 1'));
+			for (const invalid of ['1', [1], [1, 2, 3, 4], ['a', 1], [0, '50%'], null]) {
+				expect(function () {
+					helpers.cssLinear([0, invalid as any, 1]);
+				}).toThrow(TypeError);
+			}
+			expect(function () {
+				helpers.cssLinear([0, null as any]);
+			}).toThrow(new TypeError('cssLinear: `stops[1]` must be a number or an array [output, input] or [output, start, end], got null'));
+			expect(function () {
+				helpers.cssLinear([0, NaN]);
+			}).toThrow(new RangeError('cssLinear: `stops[1]` must hold finite numbers, got NaN'));
+			expect(function () {
+				helpers.cssLinear([0, [1, Infinity]]);
+			}).toThrow(new RangeError('cssLinear: `stops[1]` must hold finite numbers, got 1,Infinity'));
+		});
+	});
+
+	describe('toCssLinear', function () {
+		/** Parses a `linear()` string back into stops. */
+		function parse(css: string): helpers.LinearStop[] {
+			return css
+				.slice('linear('.length, -1)
+				.split(', ')
+				.map(function (stop): helpers.LinearStop {
+					const [output, input] = stop.split(' ');
+					return input === undefined ? Number(output) : [Number(output), Number(input.slice(0, -1)) / 100];
+				});
+		}
+
+		it('should keep only the stops needed, and print short numbers', function () {
+			expect(helpers.toCssLinear(helpers.linear)).toBe('linear(0, 1)');
+			expect(helpers.toCssLinear(helpers.cssLinear([0, [1, 0.3], [0.5, 0.6], 1]))).toBe('linear(0, 1 30%, 0.5 60%, 1)');
+			expect(helpers.toCssLinear(helpers.easeInQuad, { tolerance: 0.1 })).toBe('linear(0, 0.25 50%, 1)');
+			expect(helpers.toCssLinear(helpers.steps(2), { samples: 4 })).toBe('linear(0, 0 25%, 0.5 50%, 0.5 75%, 1)');
+			expect(helpers.toCssLinear(helpers.easeInQuad, { tolerance: 0.1, samples: 3 })).toBe('linear(0, 0.11 33.33%, 0.44 66.67%, 1)');
+		});
+
+		it('should stay within the tolerance of every sample, rounding included', function () {
+			const bouncy = helpers.spring({ stiffness: 170, damping: 12 });
+			for (const easing of [bouncy.easing, helpers.easeOutBounce, helpers.easeOutElastic, helpers.easeInOutBack, helpers.cssEase]) {
+				for (const tolerance of [0.05, 0.001, 1e-5]) {
+					const approximation = helpers.cssLinear(parse(helpers.toCssLinear(easing, { tolerance })));
+					for (let k = 0; k <= 1000; k++) expect(Math.abs(approximation(k / 1000) - easing(k / 1000))).toBeLessThanOrEqual(tolerance * (1 + 1e-9));
+				}
+			}
+			// Fewer stops for a looser tolerance.
+			expect(helpers.toCssLinear(bouncy.easing, { tolerance: 0.01 }).length).toBeLessThan(helpers.toCssLinear(bouncy.easing).length);
+		});
+
+		it('should validate its arguments', function () {
+			expect(function () {
+				helpers.toCssLinear(null as any);
+			}).toThrow(new TypeError('toCssLinear: `easing` must be a function, got null'));
+			for (const tolerance of [0, 1, -0.1, NaN]) {
+				expect(function () {
+					helpers.toCssLinear(helpers.linear, { tolerance });
+				}).toThrow(new RangeError(`toCssLinear: \`tolerance\` must be a number between 0 and 1 (exclusive), got ${tolerance}`));
+			}
+			expect(function () {
+				helpers.toCssLinear(helpers.linear, { samples: 1 });
+			}).toThrow(new RangeError('toCssLinear: `samples` must be an integer >= 2, got 1'));
+			expect(function () {
+				helpers.toCssLinear(helpers.linear, { samples: 10.5 });
+			}).toThrow(RangeError);
+			expect(function () {
+				helpers.toCssLinear(
+					function (t) {
+						return 1 / (t - 0.5);
+					},
+					{ samples: 4 }
+				);
+			}).toThrow(new RangeError('toCssLinear: `easing` must return finite numbers, got Infinity at t = 0.5'));
 		});
 	});
 
@@ -503,6 +885,31 @@ describe('Easing helpers', function () {
 			} finally {
 				for (const key of Object.keys(planted)) delete proto[key];
 			}
+		});
+	});
+
+	describe('spring velocity', function () {
+		it('should be the derivative of the position', function () {
+			for (const options of [{}, { damping: 20 }, { damping: 50, velocity: 4 }, { stiffness: 300, damping: 8, mass: 2, velocity: -6 }]) {
+				const { position, velocity } = helpers.spring(options);
+				for (const time of [0.01, 0.1, 0.3, 0.8]) {
+					const h = 1e-6;
+					expect(velocity(time)).toBeCloseTo((position(time + h) - position(time - h)) / (2 * h), 5);
+				}
+			}
+		});
+
+		it('should start at the initial velocity, be 0 before release and once settled for good', function () {
+			const { velocity, duration } = helpers.spring({ velocity: 7 });
+			expect(velocity(0)).toBe(7);
+			expect(velocity(1e-9)).toBeCloseTo(7, 5);
+			expect(velocity(-1)).toBe(0);
+			expect(velocity(Infinity)).toBe(0);
+			expect(velocity(NaN)).toBeNaN();
+			expect(helpers.spring().velocity(0)).toBe(0);
+			// Settled: the energy bound limits the speed to restDelta·ω (ω = 10 for the defaults).
+			expect(Math.abs(velocity(duration))).toBeLessThanOrEqual(0.001 * 10 * (1 + 1e-9));
+			expect(helpers.spring({ damping: 20 }).velocity(1e6)).toBe(0);
 		});
 	});
 

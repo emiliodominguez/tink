@@ -11,6 +11,7 @@
 	},
 	"files": [
 		"consumer.ts",
+		"easing.ts",
 		"async-validate.ts",
 		"date.ts",
 		"errors.ts",

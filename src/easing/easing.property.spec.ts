@@ -72,6 +72,147 @@ describe('Easing helpers (property-based)', function () {
 		});
 	});
 
+	describe('custom curves', function () {
+		const exponent = fc.double({ min: 0.05, max: 20, noNaN: true });
+		const custom = fc.oneof(
+			exponent.map(helpers.power),
+			fc.double({ min: 0, max: 10, noNaN: true }).map(helpers.back),
+			fc.tuple(fc.double({ min: 1, max: 5, noNaN: true }), fc.double({ min: 0.05, max: 2, noNaN: true })).map(function ([amplitude, period]) {
+				return helpers.elastic(amplitude, period);
+			}),
+			fc.tuple(fc.integer({ min: 1, max: 12 }), fc.double({ min: 0.01, max: 0.99, noNaN: true })).map(function ([bounces, restitution]) {
+				return helpers.bounce(bounces, restitution);
+			})
+		);
+
+		it('should go exactly from 0 to 1, and keep easeOut / easeInOut / easeOutIn exact at the ends and the middle', function () {
+			fc.assert(
+				fc.property(custom, function (easing) {
+					expect(easing(0)).toBe(0);
+					expect(Object.is(easing(-0), -0)).toBe(false);
+					expect(easing(1)).toBe(1);
+					for (const variant of [helpers.easeOut(easing), helpers.easeInOut(easing), helpers.easeOutIn(easing)]) {
+						expect(variant(0)).toBe(0);
+						expect(variant(1)).toBe(1);
+					}
+					expect(helpers.easeInOut(easing)(0.5)).toBe(0.5);
+					expect(helpers.easeOutIn(easing)(0.5)).toBe(0.5);
+				})
+			);
+		});
+
+		it('should make power monotonic and keep bounce within [0, 1]', function () {
+			fc.assert(
+				fc.property(exponent, unit, unit, function (p, a, b) {
+					const f = helpers.power(p);
+					expect(f(Math.min(a, b))).toBeLessThanOrEqual(f(Math.max(a, b)));
+				})
+			);
+			fc.assert(
+				fc.property(fc.integer({ min: 1, max: 12 }), fc.double({ min: 0.01, max: 0.99, noNaN: true }), unit, function (bounces, restitution, t) {
+					const value = helpers.bounce(bounces, restitution)(t);
+					expect(value).toBeGreaterThanOrEqual(0);
+					expect(value).toBeLessThanOrEqual(1);
+				})
+			);
+		});
+	});
+
+	describe('cssLinear', function () {
+		const stopOutput = fc.double({ min: -2, max: 2, noNaN: true });
+		// Inputs on a 0.1% grid, like CSS percentages (a subnormal segment width overflows the progress of any formula).
+		const stopInput = fc.integer({ min: -500, max: 1500 }).map(function (k) {
+			return k / 1000;
+		});
+		const stop = fc.oneof(stopOutput, fc.tuple(stopOutput, stopInput), fc.tuple(stopOutput, stopInput, stopInput));
+
+		/**
+		 * The CSS Easing Level 2 algorithm, written as plainly as the spec: canonicalize the stops, then pick the segment by linear search.
+		 */
+		function reference(stops: readonly helpers.LinearStop[], t: number): number {
+			const points: Array<{ output: number; input: number | null }> = [];
+			let largest = -Infinity;
+			stops.forEach(function (entry, index) {
+				const [output, ...inputs] = typeof entry === 'number' ? [entry] : entry;
+				if (inputs.length === 0) {
+					if (index === 0) points.push({ output, input: (largest = 0) });
+					else if (index === stops.length - 1) points.push({ output, input: Math.max(1, largest) });
+					else points.push({ output, input: null });
+				}
+				for (const input of inputs) points.push({ output, input: (largest = Math.max(input, largest)) });
+			});
+			for (let i = 0; i < points.length; i++) {
+				if (points[i].input !== null) continue;
+				let next = i;
+				while (points[next].input === null) next++;
+				const before = points[i - 1].input as number;
+				const after = points[next].input as number;
+				for (let k = i; k < next; k++) points[k].input = before + ((after - before) * (k - i + 1)) / (next - i + 1);
+			}
+			let a = 0;
+			for (let i = 0; i < points.length; i++) if ((points[i].input as number) <= t) a = i;
+			if (a === points.length - 1) a--;
+			const [pointA, pointB] = [points[a], points[a + 1]];
+			if (pointA.input === pointB.input) return pointB.output;
+			return pointA.output + ((t - (pointA.input as number)) / ((pointB.input as number) - (pointA.input as number))) * (pointB.output - pointA.output);
+		}
+
+		it('should agree with the CSS algorithm in any call order', function () {
+			fc.assert(
+				fc.property(
+					fc.array(stop, { minLength: 2, maxLength: 12 }),
+					fc.array(fc.double({ min: -1, max: 2, noNaN: true }), { minLength: 1, maxLength: 20 }),
+					function (stops, ts) {
+						const easing = helpers.cssLinear(stops);
+						for (const t of ts) {
+							// Both interpolate the same segment; they only round differently (relative to the size of an extrapolated value).
+							const expected = reference(stops, t);
+							expect(Math.abs(easing(t) - expected)).toBeLessThanOrEqual(1e-9 * (1 + Math.abs(expected)));
+						}
+					}
+				)
+			);
+		});
+	});
+
+	describe('toCssLinear', function () {
+		it('should stay within the tolerance of every sample of any cubic-bezier or spring', function () {
+			const curve = fc.oneof(
+				fc.tuple(control, overshoot, control, overshoot).map(function ([x1, y1, x2, y2]) {
+					return helpers.cubicBezier(x1, y1, x2, y2);
+				}),
+				fc
+					.record({
+						stiffness: fc.double({ min: 10, max: 1000, noNaN: true }),
+						damping: fc.double({ min: 1, max: 100, noNaN: true }),
+						mass: fc.double({ min: 0.1, max: 10, noNaN: true })
+					})
+					.map(function (options) {
+						return helpers.spring(options).easing;
+					})
+			);
+			fc.assert(
+				fc.property(curve, fc.double({ min: 1e-6, max: 0.2, noNaN: true }), fc.integer({ min: 2, max: 400 }), function (easing, tolerance, samples) {
+					const stops = helpers
+						.toCssLinear(easing, { tolerance, samples })
+						.slice('linear('.length, -1)
+						.split(', ')
+						.map(function (entry): helpers.LinearStop {
+							const [output, input] = entry.split(' ');
+							return input === undefined ? Number(output) : [Number(output), Number(input.slice(0, -1)) / 100];
+						});
+					const approximation = helpers.cssLinear(stops);
+					for (let i = 0; i <= samples; i++) {
+						const t = i / samples;
+						// The printed inputs are rounded too: allow for the slope of the stop's segment over that rounding.
+						expect(Math.abs(approximation(t) - easing(t))).toBeLessThanOrEqual(tolerance * (1 + 1e-6) + 1e-12);
+					}
+				}),
+				{ numRuns: 60 }
+			);
+		});
+	});
+
 	describe('cubicBezier', function () {
 		it('should be the identity (to 1e-9) for control points on the diagonal, i.e. solve x(s) = t accurately', function () {
 			fc.assert(
