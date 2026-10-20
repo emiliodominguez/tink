@@ -9,5 +9,17 @@
 		"skipLibCheck": false,
 		"types": []
 	},
-	"files": ["consumer.ts", "async-validate.ts", "date.ts", "errors.ts", "match.ts", "random-encoding.ts", "math.ts", "store-color.ts", "strings-math.ts", "url-objects.ts", "utils.ts"]
+	"files": [
+		"consumer.ts",
+		"async-validate.ts",
+		"date.ts",
+		"errors.ts",
+		"match.ts",
+		"random-encoding.ts",
+		"math.ts",
+		"store-color.ts",
+		"strings-math.ts",
+		"url-objects.ts",
+		"utils.ts"
+	]
 }

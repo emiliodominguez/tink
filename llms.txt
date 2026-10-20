@@ -1,6 +1,6 @@
 # tink (tinkit)
 
-> Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities (22 modules, 748 exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, encoding, error serialization, fuzzy search, caches, emitters and stores. Property-tested and mutation-tested.
+> Strictly-typed, zero-dependency, tree-shakeable TypeScript utilities (22 modules, 795 exports): arrays, objects, strings, math, functions, async, dates, type guards and Standard Schema validators, colors, easing, encoding, error serialization, fuzzy search, caches, emitters and stores. Property-tested and mutation-tested.
 
 Key facts for code generation:
 - ESM only, zero dependencies, Node >= 20.19 or any modern browser/runtime. TypeScript types ship in the package.
@@ -18,7 +18,7 @@ Key facts for code generation:
 - [guards](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#guards): Runtime type predicates that narrow `unknown` values, composable into path-aware, Standard Schema-compatible validators, plus runtime detection. Import from `tinkit/guards`.
 - [strings](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#strings): Unicode-aware transformations, case conversion, escaping, templating, natural sorting, terminal text width, ANSI/HTML stripping and safe file names. Import from `tinkit/strings`.
 - [url](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#url): Typed route patterns (match and build), query-string building and parsing, URL joining, normalization and cookies. Import from `tinkit/url`.
-- [math](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#math): Precise arithmetic (exact sums, lossless allocation), statistics, regression, histograms, number theory and random numbers. Import from `tinkit/math`.
+- [math](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#math): Precise arithmetic and rounding (exact sums, half-even rounding, lossless allocation, fractions), statistics, regression, histograms, number theory (factorization, modular arithmetic), interpolation, axis ticks, vectors, root finding and random numbers. Import from `tinkit/math`.
 - [functions](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#functions): Function composition, currying, memoization and rate limiting. Import from `tinkit/functions`.
 - [async](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#async): Promise utilities: retries, timeouts, polling, limiters, semaphores and mutexes, request batching, event waiting, keyed Promise.all and async debounce. Import from `tinkit/async`.
 - [color](https://github.com/emiliodominguez/tinkit/blob/main/docs/API.md#color): Hex/RGB/HSL/HSV and OKLab/OKLCH conversion with CSS gamut mapping, perceptual mixing and scales, opt-in named colours and WCAG contrast checks. Import from `tinkit/color`.

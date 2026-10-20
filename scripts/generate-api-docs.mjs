@@ -10,7 +10,10 @@ const MODULES = [
 	['guards', 'Runtime type predicates that narrow `unknown` values, composable into path-aware, Standard Schema-compatible validators, plus runtime detection.'],
 	['strings', 'Unicode-aware transformations, case conversion, escaping, templating, natural sorting, terminal text width, ANSI/HTML stripping and safe file names.'],
 	['url', 'Typed route patterns (match and build), query-string building and parsing, URL joining, normalization and cookies.'],
-	['math', 'Precise arithmetic (exact sums, lossless allocation), statistics, regression, histograms, number theory and random numbers.'],
+	[
+		'math',
+		'Precise arithmetic and rounding (exact sums, half-even rounding, lossless allocation, fractions), statistics, regression, histograms, number theory (factorization, modular arithmetic), interpolation, axis ticks, vectors, root finding and random numbers.'
+	],
 	['functions', 'Function composition, currying, memoization and rate limiting.'],
 	['async', 'Promise utilities: retries, timeouts, polling, limiters, semaphores and mutexes, request batching, event waiting, keyed Promise.all and async debounce.'],
 	['color', 'Hex/RGB/HSL/HSV and OKLab/OKLCH conversion with CSS gamut mapping, perceptual mixing and scales, opt-in named colours and WCAG contrast checks.'],
