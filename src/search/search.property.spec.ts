@@ -1,8 +1,9 @@
 import fc from 'fast-check';
 import * as helpers from '.';
 
-// Small alphabets so that matches (and ties) are frequent; separators and case changes exercise the word-start bonuses.
-const alphabet = fc.constantFrom('a', 'b', 'c', 'A', 'B', ' ', '-', '_', '.', 'é', '😀');
+// Small alphabets so that matches (and ties) are frequent; separators and case changes exercise the word-start bonuses (and the sigmas,
+// whose final form folds like the others).
+const alphabet = fc.constantFrom('a', 'b', 'c', 'A', 'B', ' ', '-', '_', '.', 'é', '😀', 'Σ', 'σ', 'ς');
 const shortText = fc.array(alphabet, { maxLength: 9 }).map(function (chars) {
 	return chars.join('');
 });
@@ -14,7 +15,14 @@ const lowerWord = fc.array(fc.constantFrom('a', 'b', 'c'), { minLength: 1, maxLe
 });
 
 function fold(char: string, caseSensitive: boolean): string {
-	return caseSensitive ? char : char.toLowerCase();
+	return caseSensitive ? char : char.toLowerCase().replace('ς', 'σ');
+}
+
+/** Folds a text code point by code point, case-insensitively. */
+function foldText(text: string): string {
+	return Array.from(text, function (char) {
+		return fold(char, false);
+	}).join('');
 }
 
 function isWord(c: string | undefined): boolean {
@@ -115,7 +123,7 @@ describe('Search helpers (property-based)', function () {
 							return target.slice(start, end);
 						})
 						.join('');
-					expect(spelled.toLowerCase()).toBe(query.toLowerCase());
+					expect(foldText(spelled)).toBe(foldText(query));
 					if (query !== '') expect(referenceScore(Array.from(query), Array.from(target), positionsOf(target, ranges))).toBe(score);
 				})
 			);
@@ -407,7 +415,6 @@ function naiveTokenize(text: string, caseSensitive = false): string[] {
 	let prepared = text.replace(/\p{Cf}/gu, function (char) {
 		return char === '​' ? ' ' : '';
 	});
-	if (!caseSensitive) prepared = prepared.toLowerCase();
 	prepared = prepared.normalize('NFC');
 	const tokens: string[] = [];
 	let current = '';
@@ -419,7 +426,12 @@ function naiveTokenize(text: string, caseSensitive = false): string[] {
 		}
 	}
 	if (current !== '') tokens.push(current);
-	return tokens;
+	// Each word is lower-cased on its own (a capital sigma at its end is final whatever follows it).
+	return caseSensitive
+		? tokens
+		: tokens.map(function (token) {
+				return token.toLowerCase().normalize('NFC');
+			});
 }
 
 /** Folds one code point at a time (no length cap, unlike `foldChars`): compatibility decomposition, diacritics removed, spelled letters. */
@@ -472,7 +484,14 @@ const tokenChars = fc.constantFrom(
 	'J',
 	'\u030c',
 	'\u03aa',
-	'\u0345'
+	'\u0345',
+	// Case-ignorable or cased characters between words, across which a capital sigma could lower-case differently (whole text vs word).
+	'\u0391',
+	'\u2019',
+	':',
+	'\u02bc',
+	'^',
+	'\u24b6'
 );
 const tokenText = fc.array(tokenChars, { maxLength: 16 }).map(function (chars) {
 	return chars.join('');

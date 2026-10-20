@@ -115,6 +115,17 @@ function assertString(caller: string, name: string, value: unknown): asserts val
 	if (typeof value !== 'string') throw new TypeError(`${caller}: \`${name}\` must be a string, got ${typeName(value)}`);
 }
 
+/**
+ * Reads an element of a user array: a hole is `undefined`, never a value planted on a polluted `Object.prototype` (which a `for...of`
+ * loop or an index read would find through the hole).
+ * @param {ArrayLike<V>} array - The array
+ * @param {number} index - The index
+ * @returns {V | undefined} The element, or `undefined` for a hole
+ */
+function elementAt<V>(array: ArrayLike<V>, index: number): V | undefined {
+	return Object.hasOwn(array, index) ? array[index] : undefined;
+}
+
 /** Character class flag: a letter or a digit. */
 const WORD_CHAR = 1;
 /** Character class flag: a character that has an upper-case form (i.e. a lower-case letter). */
@@ -193,7 +204,8 @@ function allocate(length: number, cells: number): Workspace {
 
 /**
  * Folds a code point for comparison: its lower case (as `String.prototype.toLowerCase` gives it for the lone character) unless
- * `caseSensitive`. A character whose lower case is several code points (only `'İ'`) folds to itself, which no other character folds to.
+ * `caseSensitive`, with the final sigma `'ς'` read as `'σ'`, as Unicode case folding does (`'Σ'` lower-cases to either, so `'κοσμος'`
+ * matches `'ΚΟΣΜΟΣ'`). A character whose lower case is several code points (only `'İ'`) folds to itself, which no other character folds to.
  * @param {number} code - A code point
  * @param {boolean} caseSensitive - Whether case must match exactly
  * @returns {number} The folded code point
@@ -201,6 +213,7 @@ function allocate(length: number, cells: number): Workspace {
 function fold(code: number, caseSensitive: boolean): number {
 	if (caseSensitive) return code;
 	if (code < 128) return code >= 65 && code <= 90 ? code + 32 : code;
+	if (code === 0x3c2) return 0x3c3;
 	const lower = String.fromCodePoint(code).toLowerCase();
 	const folded = lower.codePointAt(0) as number;
 	return String.fromCodePoint(folded) === lower ? folded : code;
@@ -208,15 +221,16 @@ function fold(code: number, caseSensitive: boolean): number {
 
 /**
  * Lower-cases a target at once, which is much faster than folding its code points one by one (see {@link fold}) and gives the same code
- * points, at the same offsets, unless the target holds a capital sigma (which may become a final sigma) or an `'İ'` (whose lower case is
- * two code points, so the target gets longer).
+ * points, at the same offsets (with the final sigma, which a capital sigma may lower-case to, read as `'σ'`), unless the target holds an
+ * `'İ'` (whose lower case is two code points, so the target gets longer).
  * @param {string} target - The text searched
  * @returns {string | false} The lower-cased target, or `false` when its code points must be folded one by one (not `null`, which `??=`
  * would take as not computed yet, lower-casing the whole target again for each of its code points)
  */
 function lowerTarget(target: string): string | false {
 	const lower = target.toLowerCase();
-	return lower.length === target.length && !target.includes('\u03a3') ? lower : false;
+	if (lower.length !== target.length) return false;
+	return lower.includes('\u03c2') ? lower.replace(/\u03c2/g, '\u03c3') : lower;
 }
 
 /** The foldings computed by {@link expand}, by code point (at most 4096, then started afresh). */
@@ -517,10 +531,10 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean, cal
  * So an exact prefix always scores at least as much as the same query scattered over word starts, and shorter, tighter, earlier matches rank higher.
  * Among equally-scored alignments the one ending first is chosen, preferring consecutive matches, then the shortest gaps.
  *
- * Characters are compared per Unicode code point after `toLowerCase()` (locale-independent; skipped when `caseSensitive`), so the
- * ranges never split a surrogate pair. By default there is no normalization and no grapheme segmentation: a precomposed `'é'` does not
- * match `'e'` + combining accent, characters whose lower case expands (`'İ'`) only match themselves, and ranges may split
- * multi-code-point graphemes (flags, ZWJ emoji).
+ * Characters are compared per Unicode code point after `toLowerCase()` (locale-independent, with the final sigma `'ς'` read as `'σ'`, so
+ * `'κοσμος'` matches `'ΚΟΣΜΟΣ'`; skipped when `caseSensitive`), so the ranges never split a surrogate pair. By default there is no
+ * normalization and no grapheme segmentation: a precomposed `'é'` does not match `'e'` + combining accent, characters whose lower case
+ * expands (`'İ'`) only match themselves, and ranges may split multi-code-point graphemes (flags, ZWJ emoji).
  *
  * With `ignoreDiacritics` (default `false`, as in fuse.js), both strings are folded per code point the way `toSlug` folds letters, before
  * case folding: compatibility decomposition (NFKD), combining diacritical marks (U+0300–036F, U+1AB0–1AFF, U+1DC0–1DFF, U+20D0–20FF,
@@ -556,6 +570,7 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean, cal
  * // Word starts and consecutive runs beat scattered matches:
  * fuzzyMatch('gc', 'git commit').score > fuzzyMatch('gc', 'magic').score; // => true
  * fuzzyMatch('ab', 'Ab', { caseSensitive: true }); // => undefined
+ * fuzzyMatch('κοσμος', 'Ο ΚΟΣΜΟΣ')?.ranges; // => [[2, 8]]
  * @example
  * fuzzyMatch('cafe', 'Café'); // => undefined
  * fuzzyMatch('cafe', 'Café', { ignoreDiacritics: true })?.ranges; // => [[0, 4]]
@@ -610,12 +625,18 @@ export function fuzzySearch<T>(items: Iterable<T>, query: string, options: Fuzzy
 	const prepared = prepare(query, caseSensitive, readOption(options, 'ignoreDiacritics') === true);
 	const name = key === undefined ? 'item' : 'key(item)';
 	const results: Array<FuzzySearchResult<T>> = [];
-	for (const item of items) {
+	/**
+	 * Matches an item, keeping it in the results when it matches well enough.
+	 * @param {T} item - The item
+	 * @returns {void}
+	 */
+	function visit(item: T): void {
 		const texts: unknown = key === undefined ? item : key(item);
 		let best: FuzzySearchResult<T> | undefined;
 		// Several texts per item only come from `key`: without it, an array item is rejected like any other non-string.
 		if (key !== undefined && Array.isArray(texts)) {
-			for (const text of texts as unknown[]) {
+			for (let t = 0; t < texts.length; t++) {
+				const text = elementAt(texts, t);
 				assertString('fuzzySearch', name, text);
 				const result = match(prepared, text, caseSensitive, 'fuzzySearch');
 				if (result !== undefined && (best === undefined || result.score > best.score)) best = { item, key: text, score: result.score, ranges: result.ranges };
@@ -627,6 +648,9 @@ export function fuzzySearch<T>(items: Iterable<T>, query: string, options: Fuzzy
 		}
 		if (best !== undefined && best.score >= threshold) results.push(best);
 	}
+	// An array is read by index, so that a hole is `undefined` (see `elementAt`).
+	if (Array.isArray(items)) for (let i = 0; i < items.length; i++) visit(elementAt(items as T[], i) as T);
+	else for (const item of items) visit(item);
 
 	return results
 		.sort(function (a, b) {
@@ -742,6 +766,25 @@ function unformat(char: string): string {
 	return char === '​' ? ' ' : '';
 }
 
+/**
+ * A capital sigma whose lower case may depend on the text outside its word: `toLowerCase` makes it final (`'ς'`) when a cased letter comes
+ * before it and none after it, looking across case-ignorable characters, which include punctuation between words (`.`, `'`, `’`, `:`),
+ * so the same word would give different tokens (`'ΟΔΟΣ.Α'` lower-cases to `'οδοσ.α'`). The text is then lower-cased word by word. Matched
+ * when the sigma is followed or preceded, across case-ignorable characters only, by one that is outside words and cased or case-ignorable.
+ * Linear: each alternative scans the case-ignorable characters next to one sigma.
+ */
+const SIGMA_CONTEXT =
+	/\u03a3\p{Case_Ignorable}*(?![\p{L}\p{M}\p{N}])[\p{Case_Ignorable}\p{Cased}]|(?<=(?![\p{L}\p{M}\p{N}])[\p{Case_Ignorable}\p{Cased}]\p{Case_Ignorable}*)\u03a3/u;
+
+/**
+ * Lower-cases a word (a callback for `replace`).
+ * @param {string} word - The word
+ * @returns {string} The lower-cased word
+ */
+function toLowerCase(word: string): string {
+	return word.toLowerCase();
+}
+
 /** More than 30 consecutive combining marks (or halfwidth kana voiced sound marks, which decompose to combining marks). */
 const LONG_MARK_RUN = /[\p{M}\uff9e\uff9f]{31}/u;
 /** 30 marks followed by another one: where {@link normalize} cuts a long run of marks. Global: only used from `lastIndex` 0. */
@@ -853,7 +896,8 @@ function words(
 		prepared = segments.join(' ');
 	}
 	if (diacritics && nonAscii) prepared = transliterate(normalize(prepared, 'NFKD').replace(DIACRITICS, ''));
-	if (!caseSensitive) prepared = prepared.toLowerCase();
+	// Word by word when a capital sigma touches the text between words (see `SIGMA_CONTEXT`).
+	if (!caseSensitive) prepared = nonAscii && SIGMA_CONTEXT.test(prepared) ? prepared.replace(WORDS, toLowerCase) : prepared.toLowerCase();
 	// Composed last, so that tokens are always in NFC: folding decomposes the text, and lower-casing can make characters composable
 	// (`'J'` + caron, which has no precomposed form, gives `'ǰ'`).
 	if (nonAscii) prepared = normalize(prepared, 'NFC');
@@ -877,7 +921,8 @@ function words(
  * Before splitting, format characters are ignored as in Unicode word segmentation (UAX #29): a soft hyphen, zero-width joiner or
  * non-joiner, word joiner, bidirectional mark or BOM inside a word does not split it, and a zero-width space separates words. The text
  * is lower-cased with `toLowerCase()` (locale-independent: `'I'` gives `'i'` even in Turkish, `'İ'` gives `'i̇'` with a combining
- * dot, and a word-final capital sigma becomes `'ς'`), unless `caseSensitive`, then normalized to NFC: tokens are always in NFC, so a
+ * dot, and a capital sigma becomes `'ς'` at the end of a word, whatever follows it: `'ΟΔΟΣ'`, `'ΟΔΟΣ.'` and `"ΟΔΟΣ'Α"` all give
+ * `'οδος'`, as the lower-case `'οδος'` does), unless `caseSensitive`, then normalized to NFC: tokens are always in NFC, so a
  * precomposed `'é'` and `'e'` + combining accent give the same token, and so do `'ǰ'` and `'J'` + caron.
  *
  * With `ignoreDiacritics`, the text is folded before splitting with the rules of {@link fuzzyMatch}'s `ignoreDiacritics` (compatibility
@@ -898,6 +943,7 @@ function words(
  * tokenize('Hello, World! Ünïcode-aware: 42 × π'); // => ['hello', 'world', 'ünïcode', 'aware', '42', 'π']
  * tokenize('Crème brûlée à Zürich', { ignoreDiacritics: true }); // => ['creme', 'brulee', 'a', 'zurich']
  * tokenize('The cat and a hat', { stopWords: new Set(['the', 'and']), minLength: 2 }); // => ['cat', 'hat']
+ * tokenize("Η ΟΔΟΣ. ΟΔΟΣ'Α"); // => ['η', 'οδος', 'οδος', 'α']
  * @example
  * tokenize('東京都に住む'); // => ['東京都に住む']
  * tokenize('東京都に住む', { segmenter: new Intl.Segmenter('ja', { granularity: 'word' }) }).length > 1; // => true
@@ -1225,7 +1271,8 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 	const names: string[] = [];
 	const boosts: number[] = [];
 	if (Array.isArray(fields)) {
-		for (const name of fields as unknown[]) {
+		for (let i = 0; i < fields.length; i++) {
+			const name = elementAt(fields as unknown[], i);
 			if (typeof name !== 'string') throw new TypeError(`${caller}: \`options.fields\` must contain field names, got ${typeName(name)}`);
 			names.push(name);
 			boosts.push(1);
@@ -1408,10 +1455,14 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 			if (value == null) continue;
 			const texts: unknown = typeof value === 'string' ? [value] : value;
 			if (!Array.isArray(texts)) throw new TypeError(`${method}: \`document.${name}\` must be a string, an array of strings, null or undefined, got ${typeName(value)}`);
-			for (const text of texts as unknown[]) {
+			// Holes are read as `undefined` (see `elementAt`), here and in the terms.
+			for (let t = 0; t < texts.length; t++) {
+				const text = elementAt(texts as unknown[], t);
 				if (typeof text !== 'string')
 					throw new TypeError(`${method}: \`document.${name}\` must be a string, an array of strings, null or undefined, got an array containing ${typeName(text)}`);
-				for (const term of analyze(text, method)) {
+				const terms = analyze(text, method);
+				for (let k = 0; k < terms.length; k++) {
+					const term = elementAt(terms, k);
 					assertToken(method, term);
 					if (term === '') continue;
 					let entry = entries.get(term);
@@ -1617,13 +1668,13 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 			// The distinct query terms, in order, each a prefix if any of its occurrences is one.
 			const tokens = analyze(query, method);
 			let last = tokens.length - 1;
-			// Not past the start: `tokens[-1]` would read a polluted `Object.prototype['-1']`.
-			while (last >= 0 && tokens[last] === '') last--;
+			// Not past the start: `tokens[-1]` would read a polluted `Object.prototype['-1']` (as a hole would: see `elementAt`).
+			while (last >= 0 && elementAt(tokens, last) === '') last--;
 			const queryTerms: string[] = [];
 			const prefixes: boolean[] = [];
 			const positions = new Map<string, number>();
 			for (let i = 0; i <= last; i++) {
-				const term = tokens[i];
+				const term = elementAt(tokens, i);
 				assertToken(method, term);
 				if (term === '') continue;
 				const isPrefix = prefix === true || (prefix === 'last' && i === last);

@@ -28,6 +28,23 @@ describe('Search helpers', function () {
 			}
 		});
 
+		it('matches Greek words across cases, whatever their final sigma (regression: lower-case queries missed upper-case targets)', function () {
+			for (const options of [{}, { ignoreDiacritics: true }]) {
+				expect(helpers.fuzzyMatch('κοσμος', 'Ο ΚΟΣΜΟΣ', options)!.ranges).toEqual([[2, 8]]);
+				expect(helpers.fuzzyMatch('ΚΟΣΜΟΣ', 'ο κοσμος', options)!.ranges).toEqual([[2, 8]]);
+				expect(helpers.fuzzyMatch('οδος', 'ΟΔΟΣ.Α', options)!.ranges).toEqual([[0, 4]]);
+				expect(helpers.fuzzyMatch('Οδος', 'οδοσ', options)).toBeDefined();
+			}
+			// With an 'İ' (folded per code point) and without.
+			expect(helpers.fuzzyMatch('ς', 'İΣ')!.ranges).toEqual([[1, 2]]);
+			expect(helpers.fuzzyMatch('ας', 'xας')!.ranges).toEqual([[1, 3]]);
+			expect(
+				helpers.fuzzySearch(['ΚΟΣΜΟΣ', 'κόσμος', 'ΚΟΣΜΗΜΑ'], 'κοσμος').map(function (r) {
+					return r.item;
+				})
+			).toEqual(['ΚΟΣΜΟΣ']);
+		});
+
 		it('lower-cases a target with a capital sigma or an İ once, not once per code point (regression: quadratic time)', function () {
 			const toLowerCase = jest.spyOn(String.prototype, 'toLowerCase');
 			try {
@@ -174,7 +191,9 @@ describe('Search helpers', function () {
 			expect(helpers.fuzzyMatch('{', '[')).toBeUndefined();
 			expect(helpers.fuzzyMatch('@', ' ')).toBeUndefined();
 			expect(helpers.fuzzyMatch('σ', 'ΑΣ')!.ranges).toEqual([[1, 2]]);
-			expect(helpers.fuzzyMatch('σ', 'ς')).toBeUndefined(); // no final-sigma folding
+			// The final sigma is case-folded to 'σ' (a capital sigma lower-cases to either), but kept apart when case matters.
+			expect(helpers.fuzzyMatch('σ', 'ς')!.ranges).toEqual([[0, 1]]);
+			expect(helpers.fuzzyMatch('ς', 'σ', { caseSensitive: true })).toBeUndefined();
 			// The Kelvin sign's lower case is 'k'.
 			expect(helpers.fuzzyMatch('k', '\u212A')).toEqual({ score: 24, ranges: [[0, 1]] });
 			expect(helpers.fuzzyMatch('ok', 'O\u212A')!.ranges).toEqual([[0, 2]]);
@@ -700,6 +719,25 @@ describe('tokenize', function () {
 		expect(helpers.tokenize('ΟΔΟΣ İstanbul I')).toEqual(['οδος', 'i̇stanbul', 'i']);
 		expect(helpers.tokenize('Hello WORLD', { caseSensitive: true })).toEqual(['Hello', 'WORLD']);
 		expect(helpers.tokenize('Hello', { caseSensitive: false })).toEqual(['hello']);
+	});
+
+	it('lower-cases a capital sigma by its word only (regression: punctuation after a word made its final sigma σ)', function () {
+		for (const text of ['ΟΔΟΣ.Α', "ΟΔΟΣ'Α", 'ΟΔΟΣ’Α', 'ΟΔΟΣ:Α', 'ΟΔΟΣ Α', 'οδος α']) expect(helpers.tokenize(text)).toEqual(['οδος', 'α']);
+		expect(helpers.tokenize('Α.Σ ΣΑ ΑΣΑ ΑΣ́.Β')).toEqual(['α', 'σ', 'σα', 'ασα', 'ας́', 'β']);
+		expect(helpers.tokenize("ΟΔΟΣ'Α", { ignoreDiacritics: true })).toEqual(['οδος', 'α']);
+		expect(helpers.tokenize('ΟΔΌΣ.Α', { ignoreDiacritics: true })).toEqual(['οδος', 'α']);
+		expect(helpers.tokenize("ΟΔΟΣ'Α", { caseSensitive: true })).toEqual(['ΟΔΟΣ', 'Α']);
+		const index = helpers.createSearchIndex<{ id: number; text: string }>({ fields: ['text'] });
+		index.addAll([
+			{ id: 1, text: 'ΟΔΟΣ.Α' },
+			{ id: 2, text: "ΟΔΟΣ'ΚΑΙ" },
+			{ id: 3, text: 'οδος' }
+		]);
+		expect(
+			index.search('ΟΔΟΣ').map(function (r) {
+				return r.id;
+			})
+		).toEqual([3, 1, 2]);
 	});
 
 	it('folds diacritics and compatibility characters with ignoreDiacritics', function () {
@@ -1248,6 +1286,54 @@ describe('createSearchIndex', function () {
 			delete proto.limit;
 			delete proto.combine;
 		}
+	});
+
+	it('reads the holes of user arrays as undefined, never through a polluted Object.prototype (regression)', function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		proto[1] = 'planted';
+		try {
+			const sparse = ['a', 'hole', 'b'];
+			delete sparse[1];
+			expect(function () {
+				helpers.createSearchIndex<Book>({ fields: sparse as string[] });
+			}).toThrow(new TypeError('createSearchIndex: `options.fields` must contain field names, got undefined'));
+			expect(function () {
+				helpers.createSearchIndex<{ id: number; tags: string[] }>({ fields: ['tags'] }).add({ id: 1, tags: sparse as string[] });
+			}).toThrow(TypeError);
+			const index = helpers.createSearchIndex<Book>({
+				fields: ['title'],
+				tokenize: function (text) {
+					const terms = text.split(' ');
+					delete terms[1];
+					return terms;
+				}
+			});
+			expect(function () {
+				index.add({ id: 1, title: 'x y z' });
+			}).toThrow(new TypeError('SearchIndex.add: `options.tokenize` must return an array of strings, got an array containing undefined'));
+			expect(index.size).toBe(0);
+			expect(function () {
+				index.search('x y z');
+			}).toThrow(TypeError);
+			expect(function () {
+				helpers.fuzzySearch(sparse as string[], 'plant');
+			}).toThrow(new TypeError('fuzzySearch: `item` must be a string, got undefined'));
+			expect(function () {
+				helpers.fuzzySearch([sparse], 'plant', {
+					key: function (item) {
+						return item as string[];
+					}
+				});
+			}).toThrow(new TypeError('fuzzySearch: `key(item)` must be a string, got undefined'));
+		} finally {
+			delete proto[1];
+		}
+		// Dense arrays and other iterables are read as before.
+		expect(
+			helpers.fuzzySearch(new Set(['alpha', 'beta']), 'a').map(function (r) {
+				return r.item;
+			})
+		).toEqual(['alpha', 'beta']);
 	});
 
 	it('uses a custom tokenizer for fields and queries, ignoring empty terms', function () {
