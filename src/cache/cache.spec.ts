@@ -1,7 +1,26 @@
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import { memoize, type MemoizeCache } from '../functions/index.js';
-import { createDeque, createLRUCache, createPriorityQueue, type Deque, type LRUCache, type LRUEvictionReason, type PriorityQueue } from '.';
+import {
+	createBiMap,
+	createBloomFilter,
+	createDefaultMap,
+	createDeque,
+	createLRUCache,
+	createMultiMap,
+	createPriorityQueue,
+	createRingBuffer,
+	createTrie,
+	type BiMap,
+	type DefaultMap,
+	type Deque,
+	type LRUCache,
+	type LRUEvictionReason,
+	type MultiMap,
+	type PriorityQueue,
+	type RingBuffer,
+	type Trie
+} from '.';
 
 function fakeClock(start = 0) {
 	const clock = {
@@ -1094,5 +1113,1053 @@ describe('createDeque', function () {
 		expect(Object.getOwnPropertyDescriptor(deque, 'size')).toEqual(Object.getOwnPropertyDescriptor(createLRUCache({ max: 1 }), 'size'));
 		expect(Object.getOwnPropertyDescriptor(deque, 'size')?.configurable).toBe(true);
 		expect({ ...deque }.size).toBe(2);
+	});
+});
+
+/** Collects the values a callback releases, after a garbage collection. */
+async function collectGarbage(): Promise<void> {
+	setFlagsFromString('--expose-gc');
+	const gc = runInNewContext('gc') as () => void;
+	await new Promise(function (resolve) {
+		setTimeout(resolve, 0);
+	});
+	gc();
+}
+
+describe('createRingBuffer', function () {
+	it('pushes, shifts, peeks and indexes across wraps', function () {
+		const buffer: RingBuffer<number> = createRingBuffer<number>(3);
+		expect([buffer.size, buffer.capacity, buffer.full]).toEqual([0, 3, false]);
+		expect([buffer.shift(), buffer.peekFirst(), buffer.peekLast(), buffer.at(0), buffer.at(-1)]).toEqual([undefined, undefined, undefined, undefined, undefined]);
+		expect(buffer.push(1)).toBe(1);
+		expect(buffer.push(2)).toBe(2);
+		expect([buffer.peekFirst(), buffer.peekLast(), buffer.full]).toEqual([1, 2, false]);
+		expect(buffer.push(3)).toBe(3);
+		expect(buffer.full).toBe(true);
+		expect(buffer.push(4)).toBe(3);
+		expect(buffer.push(5)).toBe(3);
+		expect(buffer.toArray()).toEqual([3, 4, 5]);
+		expect([buffer.at(0), buffer.at(1), buffer.at(2), buffer.at(3), buffer.at(-1), buffer.at(-3), buffer.at(-4)]).toEqual([3, 4, 5, undefined, 5, 3, undefined]);
+		expect([buffer.peekFirst(), buffer.peekLast()]).toEqual([3, 5]);
+		expect(buffer.shift()).toBe(3);
+		expect(buffer.full).toBe(false);
+		expect(buffer.push(6)).toBe(3);
+		expect(buffer.toArray()).toEqual([4, 5, 6]);
+		expect([buffer.shift(), buffer.shift(), buffer.shift(), buffer.shift()]).toEqual([4, 5, 6, undefined]);
+		expect(buffer.size).toBe(0);
+		buffer.push(7);
+		expect([...buffer]).toEqual([7]);
+	});
+
+	it('wraps every slot of the storage in turn (the newest value lands where the storage index wraps)', function () {
+		const buffer = createRingBuffer<number>(4);
+		const model: number[] = [];
+		for (let i = 0; i < 40; i++) {
+			buffer.push(i);
+			model.push(i);
+			if (model.length > 4) model.shift();
+			if (i % 3 === 0) expect(buffer.shift()).toBe(model.shift());
+			expect(buffer.toArray()).toEqual(model);
+			expect(buffer.peekLast()).toBe(model[model.length - 1]);
+			for (let index = -5; index < 5; index++) expect(buffer.at(index)).toBe(model.at(index));
+		}
+	});
+
+	it('reports overwritten values to onEvict, after the push, and only those', function () {
+		const seen: Array<[string, string[]]> = [];
+		const buffer = createRingBuffer<string>(2, {
+			onEvict: function (value) {
+				seen.push([value, buffer.toArray()]);
+			}
+		});
+		buffer.push('a');
+		buffer.push('b');
+		buffer.shift();
+		buffer.push('c');
+		expect(seen).toEqual([]);
+		buffer.push('d');
+		buffer.push('e');
+		buffer.clear();
+		expect(seen).toEqual([
+			['b', ['c', 'd']],
+			['c', ['d', 'e']]
+		]);
+	});
+
+	it('stays consistent when onEvict throws', function () {
+		const buffer = createRingBuffer<number>(1, {
+			onEvict: function () {
+				throw new Error('boom');
+			}
+		});
+		buffer.push(1);
+		expect(function () {
+			buffer.push(2);
+		}).toThrow('boom');
+		expect([buffer.toArray(), buffer.size]).toEqual([[2], 1]);
+	});
+
+	it('iterates over a snapshot, and clear releases the storage', function () {
+		const buffer = createRingBuffer<number>(5);
+		for (const value of [1, 2, 3]) buffer.push(value);
+		const seen: number[] = [];
+		for (const value of buffer) {
+			seen.push(value);
+			buffer.push(value * 10);
+		}
+		expect(seen).toEqual([1, 2, 3]);
+		expect(buffer.toArray()).toEqual([2, 3, 10, 20, 30]);
+		const copy = buffer.toArray();
+		copy.push(99);
+		expect(buffer.size).toBe(5);
+		buffer.clear();
+		expect([buffer.size, buffer.full, buffer.toArray(), buffer.peekFirst()]).toEqual([0, false, [], undefined]);
+		buffer.push(8);
+		expect(buffer.toArray()).toEqual([8]);
+	});
+
+	it('allocates storage lazily: a huge capacity costs nothing until used', function () {
+		const buffer = createRingBuffer<number>(2 ** 32 - 1);
+		buffer.push(1);
+		expect([buffer.capacity, buffer.size, buffer.at(0), buffer.full]).toEqual([2 ** 32 - 1, 1, 1, false]);
+	});
+
+	it('releases shifted, overwritten and cleared values', async function () {
+		const refs: Array<WeakRef<object>> = [];
+		const kept = createRingBuffer<object>(2);
+		const cleared = createRingBuffer<object>(3);
+		(function () {
+			const values = [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }];
+			refs.push(
+				...values.map(function (value) {
+					return new WeakRef(value);
+				})
+			);
+			kept.push(values[0]);
+			kept.push(values[1]);
+			// Overwrites 0, then shifts 1 and 2 away: only 3 stays.
+			kept.push(values[2]);
+			kept.push(values[3]);
+			kept.shift();
+			kept.shift();
+			kept.push(values[3]);
+			cleared.push(values[4]);
+			cleared.clear();
+		})();
+		await collectGarbage();
+		expect(
+			refs.map(function (ref) {
+				return ref.deref() !== undefined;
+			})
+		).toEqual([false, false, false, true, false]);
+		expect(kept.size).toBe(1);
+	});
+
+	it('never reads a polluted Array.prototype', function () {
+		const proto = Array.prototype as unknown as Record<number, unknown>;
+		proto[0] = 'polluted';
+		proto[1] = 'polluted';
+		proto[2] = 'polluted';
+		try {
+			const buffer = createRingBuffer<number>(3);
+			expect([buffer.peekFirst(), buffer.peekLast(), buffer.shift(), buffer.at(0)]).toEqual([undefined, undefined, undefined, undefined]);
+			buffer.push(1);
+			buffer.push(2);
+			buffer.shift();
+			buffer.shift();
+			// The oldest slot is now past the end of the (still growing) storage.
+			expect([buffer.peekFirst(), buffer.peekLast(), buffer.shift(), buffer.at(0), buffer.at(-1)]).toEqual([undefined, undefined, undefined, undefined, undefined]);
+		} finally {
+			delete proto[0];
+			delete proto[1];
+			delete proto[2];
+		}
+	});
+
+	it('validates its arguments, ignoring a polluted Object.prototype', function () {
+		expect(function () {
+			createRingBuffer(0);
+		}).toThrow(new RangeError('createRingBuffer: `capacity` must be an integer between 1 and 4294967295, got 0'));
+		for (const capacity of [1.5, -1, Infinity, NaN, 2 ** 32]) {
+			expect(function () {
+				createRingBuffer(capacity);
+			}).toThrow(RangeError);
+		}
+		expect(function () {
+			createRingBuffer('3' as never);
+		}).toThrow(new TypeError('createRingBuffer: `capacity` must be an integer between 1 and 4294967295, got string'));
+		expect(function () {
+			createRingBuffer(1, { onEvict: 'no' as never });
+		}).toThrow(new TypeError('createRingBuffer: `options.onEvict` must be a function, got string'));
+		const buffer = createRingBuffer<number>(2);
+		expect(function () {
+			buffer.at(0.5);
+		}).toThrow(new RangeError('RingBuffer.at: `index` must be an integer, got 0.5'));
+		expect(function () {
+			buffer.at('0' as never);
+		}).toThrow(new TypeError('RingBuffer.at: `index` must be an integer, got string'));
+		const proto = Object.prototype as Record<string, unknown>;
+		proto.onEvict = function (): void {
+			throw new Error('polluted');
+		};
+		try {
+			const polluted = createRingBuffer<number>(1);
+			polluted.push(1);
+			expect(polluted.push(2)).toBe(1);
+		} finally {
+			delete proto.onEvict;
+		}
+	});
+
+	it('shares the size and full getters between buffers', function () {
+		const a = createRingBuffer<number>(1);
+		const b = createRingBuffer<number>(2);
+		expect(Object.getOwnPropertyDescriptor(a, 'size')).toEqual(Object.getOwnPropertyDescriptor(createDeque(), 'size'));
+		expect(Object.getOwnPropertyDescriptor(a, 'full')).toEqual(Object.getOwnPropertyDescriptor(b, 'full'));
+		expect(Object.getOwnPropertyDescriptor(a, 'full')?.configurable).toBe(true);
+		expect(Object.getOwnPropertyDescriptor(a, 'full')?.enumerable).toBe(true);
+		a.push(1);
+		expect({ ...a }.full).toBe(true);
+		expect({ ...b }.size).toBe(0);
+	});
+});
+
+describe('createDefaultMap', function () {
+	it('creates, stores and returns the value of a missing key, once', function () {
+		const keys: string[] = [];
+		const map: DefaultMap<string, string[]> = createDefaultMap(function (key: string): string[] {
+			keys.push(key);
+			return [key];
+		});
+		const a = map.get('a');
+		expect(a).toEqual(['a']);
+		expect(map.get('a')).toBe(a);
+		expect(keys).toEqual(['a']);
+		expect([map.peek('b'), map.has('b'), map.size]).toEqual([undefined, false, 1]);
+		expect(map.set('b', ['x'])).toBe(map);
+		expect(map.get('b')).toEqual(['x']);
+		expect(map.delete('b')).toBe(true);
+		expect(map.delete('b')).toBe(false);
+		expect([...map.keys(), ...map.values(), ...map.entries()]).toEqual(['a', ['a'], ['a', ['a']]]);
+		map.clear();
+		expect(map.size).toBe(0);
+	});
+
+	it('treats a stored undefined as a hit, and -0 and NaN keys as a Map does', function () {
+		let calls = 0;
+		const map = createDefaultMap<number, number | undefined>(
+			function (key) {
+				calls++;
+				return key * 2;
+			},
+			[[1, undefined]]
+		);
+		expect(map.get(1)).toBeUndefined();
+		expect(map.get(-0)).toBe(0);
+		expect(map.get(0)).toBe(0);
+		expect([...map.keys()]).toEqual([1, 0]);
+		expect(map.get(NaN)).toBeNaN();
+		expect(map.get(NaN)).toBeNaN();
+		expect(calls).toBe(2);
+	});
+
+	it('passes the factory the key as the map stores it (-0 as 0), as Map.prototype.getOrInsertComputed does', function () {
+		const keys: number[] = [];
+		const map = createDefaultMap(function (key: number): string {
+			keys.push(key);
+			return Object.is(key, -0) ? 'minus zero' : 'zero';
+		});
+		expect(map.get(-0)).toBe('zero');
+		expect(Object.is(keys[0], 0)).toBe(true);
+	});
+
+	it('stores nothing when the factory throws, and keeps the factory result over what the factory stored', function () {
+		const map = createDefaultMap<string, number>(function (key) {
+			if (key === 'bad') throw new Error('nope');
+			map.set(key, -1);
+			return 1;
+		});
+		expect(function () {
+			map.get('bad');
+		}).toThrow('nope');
+		expect(map.has('bad')).toBe(false);
+		expect(map.get('x')).toBe(1);
+		expect(map.peek('x')).toBe(1);
+		expect(map.size).toBe(1);
+	});
+
+	it('iterates live, as a Map', function () {
+		const map = createDefaultMap<number, number>(
+			function (key) {
+				return key;
+			},
+			[[1, 1]]
+		);
+		const seen: number[] = [];
+		for (const [key] of map) {
+			seen.push(key);
+			if (key < 3) map.get(key + 1);
+		}
+		expect(seen).toEqual([1, 2, 3]);
+		expect([...map]).toEqual([
+			...new Map([
+				[1, 1],
+				[2, 2],
+				[3, 3]
+			])
+		]);
+	});
+
+	it('validates its arguments', function () {
+		expect(function () {
+			createDefaultMap('x' as never);
+		}).toThrow(new TypeError('createDefaultMap: `factory` must be a function, got string'));
+		expect(function () {
+			createDefaultMap(String, 5 as never);
+		}).toThrow(new TypeError('createDefaultMap: `entries` must be an iterable, got number'));
+		expect(createDefaultMap(String, null).size).toBe(0);
+		expect(Object.getOwnPropertyDescriptor(createDefaultMap(String), 'size')).toEqual(Object.getOwnPropertyDescriptor(createDeque(), 'size'));
+	});
+});
+
+describe('createBiMap', function () {
+	it('looks up both ways and keeps the pairs one-to-one', function () {
+		const map: BiMap<string, number> = createBiMap<string, number>();
+		expect(map.set('a', 1)).toBe(map);
+		map.set('b', 2);
+		expect([map.get('a'), map.getKey(2), map.has('b'), map.hasValue(1), map.hasValue(3), map.get('z'), map.getKey(9)]).toEqual([
+			1,
+			'b',
+			true,
+			true,
+			false,
+			undefined,
+			undefined
+		]);
+		// 'a' takes 2: its old pair (a, 1) and the pair of 2 (b, 2) both go.
+		map.set('a', 2);
+		expect([...map]).toEqual([['a', 2]]);
+		expect([map.size, map.hasValue(1), map.has('b')]).toEqual([1, false, false]);
+		// The same pair again changes nothing.
+		map.set('c', 3);
+		map.set('a', 2);
+		expect([...map]).toEqual([
+			['a', 2],
+			['c', 3]
+		]);
+		expect([map.delete('a'), map.delete('a'), map.deleteValue(3), map.deleteValue(3)]).toEqual([true, false, true, false]);
+		expect(map.size).toBe(0);
+	});
+
+	it('keeps the place of the side that stays, in each direction', function () {
+		const map = createBiMap([
+			['a', 1],
+			['b', 2],
+			['c', 3]
+		]);
+		map.set('a', 4);
+		expect([...map.keys()]).toEqual(['a', 'b', 'c']);
+		expect([...map.inverse.keys()]).toEqual([2, 3, 4]);
+		map.set('d', 2);
+		expect([...map.entries()]).toEqual([
+			['a', 4],
+			['c', 3],
+			['d', 2]
+		]);
+		expect([...map.inverse]).toEqual([
+			[2, 'd'],
+			[3, 'c'],
+			[4, 'a']
+		]);
+		expect([...map.values()]).toEqual([4, 3, 2]);
+	});
+
+	it('exposes an inverse view over the same storage', function () {
+		const map = createBiMap<string, number>([['x', 1]]);
+		const inverse: BiMap<number, string> = map.inverse;
+		expect(inverse.inverse).toBe(map);
+		expect(map.inverse).toBe(inverse);
+		inverse.set(2, 'y');
+		expect(map.get('y')).toBe(2);
+		expect(inverse.size).toBe(2);
+		inverse.delete(1);
+		expect(map.has('x')).toBe(false);
+		map.clear();
+		expect([map.size, inverse.size]).toEqual([0, 0]);
+		expect(Object.getOwnPropertyDescriptor(map, 'size')).toEqual(Object.getOwnPropertyDescriptor(inverse, 'size'));
+		expect(Object.getOwnPropertyDescriptor(map, 'inverse')?.writable).toBe(false);
+		// Not enumerable: spreading and serializing do not walk into the cycle.
+		map.set('z', 26);
+		expect(Object.keys(map)).toEqual(expect.not.arrayContaining(['inverse']));
+		expect(JSON.stringify(map)).toBe('{"size":1}');
+		expect(JSON.stringify(inverse)).toBe('{"size":1}');
+		expect({ ...inverse }.size).toBe(1);
+	});
+
+	it('compares with SameValueZero and stores -0 as 0 on both sides', function () {
+		const map = createBiMap<number, number>();
+		map.set(-0, -0);
+		expect([...map]).toEqual([[0, 0]]);
+		expect([...map.inverse]).toEqual([[0, 0]]);
+		map.set(NaN, NaN);
+		map.set(NaN, NaN);
+		expect([map.get(NaN), map.getKey(NaN), map.size]).toEqual([NaN, NaN, 2]);
+		map.set(0, NaN);
+		expect([...map]).toEqual([[0, NaN]]);
+	});
+
+	it('validates its entries', function () {
+		expect(function () {
+			createBiMap(1 as never);
+		}).toThrow(new TypeError('createBiMap: `entries` must be an iterable, got number'));
+		expect(createBiMap(undefined).size).toBe(0);
+	});
+});
+
+describe('createMultiMap', function () {
+	it('groups values per key, counting values and keys', function () {
+		const map: MultiMap<string, number> = createMultiMap<string, number>();
+		expect([map.add('a', 1), map.add('a', 1), map.add('b', 2), map.add('a', 3)]).toEqual([true, true, true, true]);
+		expect([map.size, map.keyCount, map.count('a'), map.count('z')]).toEqual([4, 2, 3, 0]);
+		expect(map.get('a')).toEqual([1, 1, 3]);
+		expect(map.get('z')).toEqual([]);
+		expect([map.has('a'), map.has('z'), map.has('a', 3), map.has('a', 2), map.has('z', 1)]).toEqual([true, false, true, false, false]);
+		expect(map.delete('a', 1)).toBe(true);
+		expect(map.get('a')).toEqual([1, 3]);
+		expect([map.delete('a', 7), map.delete('z', 1), map.delete('z')]).toEqual([false, false, false]);
+		expect(map.delete('a')).toBe(true);
+		expect([map.size, map.keyCount, [...map]]).toEqual([1, 1, [['b', 2]]]);
+		expect(map.delete('b', 2)).toBe(true);
+		expect([map.size, map.keyCount, map.has('b')]).toEqual([0, 0, false]);
+	});
+
+	it('distinguishes an undefined value from no value, and finds NaN', function () {
+		const map = createMultiMap<string, number | undefined>([
+			['a', undefined],
+			['a', NaN],
+			['a', 1]
+		]);
+		expect([map.has('a', undefined), map.has('a', NaN), map.has('a', 2)]).toEqual([true, true, false]);
+		expect(map.delete('a', undefined)).toBe(true);
+		expect(map.delete('a', NaN)).toBe(true);
+		expect(map.delete('a', NaN)).toBe(false);
+		expect([...map]).toEqual([['a', 1]]);
+		// Never reads past the end of a group.
+		const proto = Array.prototype as unknown as Record<number, unknown>;
+		proto[1] = NaN;
+		try {
+			expect([map.has('a', NaN), map.delete('a', NaN), map.get('a')]).toEqual([false, false, [1]]);
+		} finally {
+			delete proto[1];
+		}
+	});
+
+	it('keeps each value once per key with `unique`', function () {
+		const map = createMultiMap<string, number>(null, { unique: true });
+		expect([map.add('a', 1), map.add('a', 1), map.add('a', -0), map.add('a', 0), map.add('a', NaN), map.add('a', NaN)]).toEqual([true, false, true, false, true, false]);
+		expect(map.get('a')).toEqual([1, 0, NaN]);
+		expect([map.size, map.count('a'), map.has('a', 0), map.has('a', 2)]).toEqual([3, 3, true, false]);
+		expect([map.delete('a', 2), map.delete('a', 0), map.delete('a', 1), map.delete('a', NaN)]).toEqual([false, true, true, true]);
+		expect([map.size, map.keyCount]).toEqual([0, 0]);
+		map.add('b', 1);
+		map.add('b', 2);
+		expect(map.delete('b')).toBe(true);
+		expect(map.size).toBe(0);
+	});
+
+	it('returns copies and iterates over snapshots', function () {
+		const map = createMultiMap([
+			['a', 1],
+			['b', 2]
+		]);
+		const values = map.get('a');
+		values.push(99);
+		map.add('a', 3);
+		expect(values).toEqual([1, 99]);
+		expect(map.get('a')).toEqual([1, 3]);
+		const seen: Array<[string, number]> = [];
+		for (const pair of map) {
+			seen.push(pair);
+			map.delete(pair[0]);
+			map.add('c', 0);
+		}
+		expect(seen).toEqual([
+			['a', 1],
+			['a', 3],
+			['b', 2]
+		]);
+		expect([...map.keys()]).toEqual(['c']);
+		expect([...map.values()]).toEqual([0, 0, 0]);
+		map.clear();
+		expect([map.size, map.keyCount, [...map.entries()]]).toEqual([0, 0, []]);
+	});
+
+	it('validates its arguments, ignoring a polluted Object.prototype', function () {
+		expect(function () {
+			createMultiMap(1 as never);
+		}).toThrow(new TypeError('createMultiMap: `entries` must be an iterable, got number'));
+		const proto = Object.prototype as Record<string, unknown>;
+		proto.unique = true;
+		try {
+			const map = createMultiMap<string, number>();
+			map.add('a', 1);
+			expect(map.add('a', 1)).toBe(true);
+		} finally {
+			delete proto.unique;
+		}
+		const map = createMultiMap();
+		expect(Object.getOwnPropertyDescriptor(map, 'size')).toEqual(Object.getOwnPropertyDescriptor(createDeque(), 'size'));
+		expect(Object.getOwnPropertyDescriptor(map, 'keyCount')).toEqual(Object.getOwnPropertyDescriptor(createMultiMap(), 'keyCount'));
+		expect(Object.getOwnPropertyDescriptor(map, 'keyCount')?.configurable).toBe(true);
+		expect({ ...map }.keyCount).toBe(0);
+	});
+});
+
+describe('createTrie', function () {
+	it('stores, finds and removes keys, splitting and merging edges', function () {
+		const trie: Trie<number> = createTrie<number>();
+		expect(trie.set('romane', 1)).toBe(trie);
+		trie.set('romanus', 2).set('romulus', 3).set('rubens', 4).set('ruber', 5).set('rubicon', 6).set('rubicundus', 7);
+		expect(trie.size).toBe(7);
+		expect([trie.get('romanus'), trie.get('roman'), trie.get('r'), trie.get('rubiconx'), trie.get(''), trie.get('x')]).toEqual([
+			2,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined
+		]);
+		expect([trie.has('ruber'), trie.has('rube'), trie.has('rubers')]).toEqual([true, false, false]);
+		expect([...trie.keys()]).toEqual(['romane', 'romanus', 'romulus', 'rubens', 'ruber', 'rubicon', 'rubicundus']);
+		// A key ending at a branch point, then on an edge.
+		trie.set('rub', 8).set('rom', 9);
+		expect(trie.keysWithPrefix('rub')).toEqual(['rub', 'rubens', 'ruber', 'rubicon', 'rubicundus']);
+		expect(trie.set('rub', 10).size).toBe(9);
+		expect([trie.delete('ru'), trie.delete('rubx'), trie.delete('rubicundu')]).toEqual([false, false, false]);
+		expect(trie.delete('rub')).toBe(true);
+		expect(trie.delete('rub')).toBe(false);
+		expect(trie.delete('rubicon')).toBe(true);
+		expect(trie.delete('rubicundus')).toBe(true);
+		expect(trie.keysWithPrefix('rub')).toEqual(['rubens', 'ruber']);
+		expect(trie.delete('romane')).toBe(true);
+		expect(trie.delete('rom')).toBe(true);
+		expect([...trie]).toEqual([
+			['romanus', 2],
+			['romulus', 3],
+			['rubens', 4],
+			['ruber', 5]
+		]);
+		for (const key of ['romanus', 'romulus', 'rubens', 'ruber']) expect(trie.delete(key)).toBe(true);
+		expect([trie.size, [...trie], trie.hasPrefix(''), trie.hasPrefix('r')]).toEqual([0, [], false, false]);
+	});
+
+	it('answers prefix queries, including prefixes that end inside an edge', function () {
+		const trie = createTrie([
+			['apple', 1],
+			['application', 2],
+			['apply', 3],
+			['banana', 4]
+		]);
+		expect(trie.keysWithPrefix('appl')).toEqual(['apple', 'application', 'apply']);
+		expect(trie.keysWithPrefix('applic')).toEqual(['application']);
+		expect(trie.keysWithPrefix('applix')).toEqual([]);
+		expect(trie.keysWithPrefix('bananas')).toEqual([]);
+		expect(trie.keysWithPrefix('c')).toEqual([]);
+		expect(trie.keysWithPrefix('')).toEqual(['apple', 'application', 'apply', 'banana']);
+		expect(trie.entriesWithPrefix('app', { limit: 2 })).toEqual([
+			['apple', 1],
+			['application', 2]
+		]);
+		expect(trie.keysWithPrefix('app', { limit: 0 })).toEqual([]);
+		expect(trie.keysWithPrefix('app', { limit: 1 })).toEqual(['apple']);
+		expect(trie.keysWithPrefix('', { limit: Infinity })).toHaveLength(4);
+		expect([trie.hasPrefix('ban'), trie.hasPrefix('banana'), trie.hasPrefix('bananas'), trie.hasPrefix('bx'), trie.hasPrefix('')]).toEqual([
+			true,
+			true,
+			false,
+			false,
+			true
+		]);
+		expect([...trie.values()]).toEqual([1, 2, 3, 4]);
+	});
+
+	it('finds the longest stored prefix of a text', function () {
+		const trie = createTrie([
+			['a', 1],
+			['abc', 2],
+			['abcde', 3]
+		]);
+		expect([trie.longestPrefixOf('abcd'), trie.longestPrefixOf('abcdef'), trie.longestPrefixOf('ab'), trie.longestPrefixOf('b'), trie.longestPrefixOf('')]).toEqual([
+			'abc',
+			'abcde',
+			'a',
+			undefined,
+			undefined
+		]);
+		trie.set('', 0);
+		expect([trie.longestPrefixOf('b'), trie.longestPrefixOf(''), trie.get(''), trie.size]).toEqual(['', '', 0, 4]);
+		expect(trie.keysWithPrefix('')[0]).toBe('');
+		expect(trie.delete('')).toBe(true);
+		expect(trie.longestPrefixOf('x')).toBeUndefined();
+	});
+
+	it('stores undefined values and prototype-like keys safely', function () {
+		const trie = createTrie<number | undefined>();
+		trie.set('__proto__', undefined).set('constructor', 1).set('toString', 2).set('hasOwnProperty', 3);
+		expect([trie.has('__proto__'), trie.get('__proto__'), trie.size]).toEqual([true, undefined, 4]);
+		expect(trie.keysWithPrefix('_')).toEqual(['__proto__']);
+		expect([trie.get('valueOf'), trie.has('__defineGetter__'), trie.longestPrefixOf('constructors')]).toEqual([undefined, false, 'constructor']);
+		expect(({} as Record<string, unknown>).constructor).toBe(Object);
+	});
+
+	it('orders keys by UTF-16 code units, like Array.prototype.sort', function () {
+		const keys = ['\u{1F600}', '\uFFFF', '\u00E9', 'e\u0301', 'Z', 'a', '\uD83D', '\u{1F600}x', 'ab', 'a\u0000', ''];
+		const trie = createTrie(
+			keys.map(function (key): [string, string] {
+				return [key, key];
+			})
+		);
+		expect([...trie.keys()]).toEqual([...keys].sort());
+		expect(trie.keysWithPrefix('\uD83D')).toEqual(['\uD83D', '\u{1F600}', '\u{1F600}x']);
+		expect(trie.size).toBe(keys.length);
+	});
+
+	it('handles very long keys and very deep tries without recursion', function () {
+		const trie = createTrie<number>();
+		const depth = 4000;
+		for (let i = 1; i <= depth; i++) trie.set('a'.repeat(i), i);
+		expect(trie.size).toBe(depth);
+		const keys = [...trie.keys()];
+		expect(keys).toHaveLength(depth);
+		expect(keys[depth - 1]).toBe('a'.repeat(depth));
+		expect(trie.longestPrefixOf('a'.repeat(depth + 5))).toBe('a'.repeat(depth));
+		expect(trie.keysWithPrefix('a'.repeat(depth - 1))).toEqual(['a'.repeat(depth - 1), 'a'.repeat(depth)]);
+		const long = 'x'.repeat(1_000_000);
+		trie.set(long, -1);
+		expect([trie.get(long), trie.has(long.slice(1)), trie.hasPrefix(long.slice(0, 500_000))]).toEqual([-1, false, true]);
+	});
+
+	it('keeps listing in key order after every kind of change below a node it already listed', function () {
+		const trie = createTrie([
+			['ab', 1],
+			['ac', 2],
+			['b', 3]
+		]);
+		/** Lists every key, then the keys under `a`, so that both nodes have been listed before the next change. */
+		function listed(): string[] {
+			expect(trie.keysWithPrefix('a')).toEqual(
+				[...trie.keys()].filter(function (key) {
+					return key.startsWith('a');
+				})
+			);
+			return [...trie.keys()];
+		}
+		expect(listed()).toEqual(['ab', 'ac', 'b']);
+		trie.set('aa', 0); // a new leaf under a listed node
+		expect(listed()).toEqual(['aa', 'ab', 'ac', 'b']);
+		trie.set('bz', 4); // a new leaf under a listed leaf
+		trie.set('bb', 5);
+		expect(listed()).toEqual(['aa', 'ab', 'ac', 'b', 'bb', 'bz']);
+		trie.set('abcd', 6);
+		expect(listed()).toEqual(['aa', 'ab', 'abcd', 'ac', 'b', 'bb', 'bz']);
+		trie.set('abce', 7); // splits the listed edge 'cd'
+		trie.set('abd', 8);
+		trie.set('abc', 9);
+		expect(listed()).toEqual(['aa', 'ab', 'abc', 'abcd', 'abce', 'abd', 'ac', 'b', 'bb', 'bz']);
+		trie.set('0', -1); // a new leaf under the listed root
+		trie.set('ba', 10);
+		expect(listed()).toEqual(['0', 'aa', 'ab', 'abc', 'abcd', 'abce', 'abd', 'ac', 'b', 'ba', 'bb', 'bz']);
+		trie.delete('aa'); // removes a leaf of a listed node
+		expect(listed()).toEqual(['0', 'ab', 'abc', 'abcd', 'abce', 'abd', 'ac', 'b', 'ba', 'bb', 'bz']);
+		trie.delete('abc'); // a node with two children loses its value
+		trie.delete('abd'); // its parent is merged with its only child
+		expect(listed()).toEqual(['0', 'ab', 'abcd', 'abce', 'ac', 'b', 'ba', 'bb', 'bz']);
+		trie.delete('ab');
+		trie.delete('ac'); // the node of 'a' is left with one child and no value: merged into its parent, the root
+		expect(listed()).toEqual(['0', 'abcd', 'abce', 'b', 'ba', 'bb', 'bz']);
+		trie.delete('b'); // a valued node with three children loses its value
+		trie.delete('ba');
+		trie.delete('bb'); // leaves the node of 'b' without value and with one child: merged
+		expect(listed()).toEqual(['0', 'abcd', 'abce', 'bz']);
+		trie.clear();
+		expect(listed()).toEqual([]);
+		trie.set('q', 1);
+		expect(listed()).toEqual(['q']);
+	});
+
+	it('keeps no reference to a string longer than its keys need (a deleted long key, or a key sliced from a long text)', async function () {
+		const tries: Array<Trie<number>> = [];
+		await collectGarbage();
+		const before = process.memoryUsage().heapUsed;
+		for (let i = 0; i < 20; i++) {
+			const trie = createTrie<number>();
+			const prefix = `a shared prefix ${i} `;
+			// One megabyte that the trie no longer needs once the key is deleted: the edge of the prefix outlives it.
+			const long = prefix + 'x'.repeat(1_000_000) + i;
+			trie.set(long, 0);
+			trie.set(prefix + 'a', 1);
+			trie.set(prefix + 'b', 2);
+			trie.delete(long);
+			// A short key cut from a megabyte of text.
+			const text = 'y'.repeat(1_000_000) + i;
+			trie.set(text.slice(1000, 1040), 3);
+			tries.push(trie);
+		}
+		await collectGarbage();
+		// 40 MB if the labels kept views of the long strings.
+		expect(process.memoryUsage().heapUsed - before).toBeLessThan(8_000_000);
+		expect(
+			tries[7].keysWithPrefix('a shared prefix 7 ').concat(
+				tries[7].keysWithPrefix('y').map(function (key) {
+					return String(key.length);
+				})
+			)
+		).toEqual(['a shared prefix 7 a', 'a shared prefix 7 b', '40']);
+	});
+
+	it('returns snapshots and clears', function () {
+		const trie = createTrie([
+			['a', 1],
+			['b', 2]
+		]);
+		const keys = trie.keysWithPrefix('');
+		const iterator = trie.entries();
+		trie.set('c', 3);
+		trie.delete('a');
+		expect(keys).toEqual(['a', 'b']);
+		expect([...iterator]).toEqual([
+			['a', 1],
+			['b', 2]
+		]);
+		const seen: string[] = [];
+		for (const [key] of trie) {
+			seen.push(key);
+			trie.set(key + key, 0);
+		}
+		expect(seen).toEqual(['b', 'c']);
+		trie.clear();
+		expect([trie.size, [...trie], trie.get('b')]).toEqual([0, [], undefined]);
+		trie.set('b', 9);
+		expect([...trie]).toEqual([['b', 9]]);
+	});
+
+	it('validates its arguments', function () {
+		const trie = createTrie<number>();
+		const calls: Array<[string, () => unknown]> = [
+			[
+				'Trie.get: `key`',
+				function () {
+					return trie.get(1 as never);
+				}
+			],
+			[
+				'Trie.has: `key`',
+				function () {
+					return trie.has(null as never);
+				}
+			],
+			[
+				'Trie.set: `key`',
+				function () {
+					return trie.set(undefined as never, 1);
+				}
+			],
+			[
+				'Trie.delete: `key`',
+				function () {
+					return trie.delete({} as never);
+				}
+			],
+			[
+				'Trie.hasPrefix: `prefix`',
+				function () {
+					return trie.hasPrefix(1 as never);
+				}
+			],
+			[
+				'Trie.keysWithPrefix: `prefix`',
+				function () {
+					return trie.keysWithPrefix(1 as never);
+				}
+			],
+			[
+				'Trie.entriesWithPrefix: `prefix`',
+				function () {
+					return trie.entriesWithPrefix(1 as never);
+				}
+			],
+			[
+				'Trie.longestPrefixOf: `text`',
+				function () {
+					return trie.longestPrefixOf(1 as never);
+				}
+			]
+		];
+		for (const [message, call] of calls)
+			expect(call).toThrow(
+				new TypeError(
+					`${message} must be a string, got ${message.includes('has:') ? 'null' : message.includes('set:') ? 'undefined' : message.includes('delete') ? 'object' : 'number'}`
+				)
+			);
+		expect(function () {
+			trie.keysWithPrefix('', { limit: -1 });
+		}).toThrow(new RangeError('Trie.keysWithPrefix: `options.limit` must be an integer >= 0 or Infinity, got -1'));
+		expect(function () {
+			trie.entriesWithPrefix('', { limit: 1.5 });
+		}).toThrow(new RangeError('Trie.entriesWithPrefix: `options.limit` must be an integer >= 0 or Infinity, got 1.5'));
+		expect(function () {
+			createTrie(1 as never);
+		}).toThrow(new TypeError('createTrie: `entries` must be an iterable, got number'));
+		expect(trie.size).toBe(0);
+		const proto = Object.prototype as Record<string, unknown>;
+		proto.limit = 0;
+		try {
+			expect(createTrie([['a', 1]]).keysWithPrefix('')).toEqual(['a']);
+		} finally {
+			delete proto.limit;
+		}
+		expect(Object.getOwnPropertyDescriptor(trie, 'size')).toEqual(Object.getOwnPropertyDescriptor(createDeque(), 'size'));
+	});
+});
+
+describe('createBloomFilter', function () {
+	/** Reference MurmurHash3 x86_32 over bytes, written from the reference C code (SMHasher). */
+	function murmur3(bytes: Uint8Array, seed: number): number {
+		function rotl(x: number, r: number): number {
+			return (x << r) | (x >>> (32 - r));
+		}
+		function scramble(k: number): number {
+			return Math.imul(rotl(Math.imul(k, 0xcc9e2d51), 15), 0x1b873593);
+		}
+		let h = seed | 0;
+		const blocks = bytes.length >> 2;
+		for (let b = 0; b < blocks; b++) {
+			const i = b * 4;
+			h ^= scramble(bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16) | (bytes[i + 3] << 24));
+			h = (Math.imul(rotl(h, 13), 5) + 0xe6546b64) | 0;
+		}
+		const tail = blocks * 4;
+		const rest = bytes.length & 3;
+		let k = 0;
+		if (rest >= 3) k ^= bytes[tail + 2] << 16;
+		if (rest >= 2) k ^= bytes[tail + 1] << 8;
+		if (rest >= 1) h ^= scramble(k ^ bytes[tail]);
+		h ^= bytes.length;
+		h = Math.imul(h ^ (h >>> 16), 0x85ebca6b);
+		h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+		return (h ^ (h >>> 16)) >>> 0;
+	}
+
+	/** The bit positions of `item` by the documented scheme, from the reference hash. */
+	function positions(item: string, bits: number, hashes: number): number[] {
+		const bytes = new Uint8Array(Buffer.from(item, 'utf16le'));
+		let x = (murmur3(bytes, 0) >>> 1) % bits;
+		let y = (murmur3(bytes, 0x9747b28c) >>> 1) % bits;
+		const result: number[] = [];
+		for (let i = 1; i <= hashes; i++) {
+			result.push(x);
+			x = (x + y) % bits;
+			y = (y + i) % bits;
+		}
+		return result;
+	}
+
+	it('has a correct reference MurmurHash3 (published test vectors)', function () {
+		const vectors: Array<[number[] | string, number, number]> = [
+			[[], 0, 0],
+			[[], 1, 0x514e28b7],
+			[[], 0xffffffff, 0x81f16f39],
+			[[0, 0, 0, 0], 0, 0x2362f9de],
+			[[0xff, 0xff, 0xff, 0xff], 0, 0x76293b50],
+			[[0x21, 0x43, 0x65, 0x87], 0, 0xf55b516b],
+			[[0x21, 0x43, 0x65, 0x87], 0x5082edee, 0x2362f9de],
+			[[0x21, 0x43, 0x65], 0, 0x7e4a8634],
+			[[0x21, 0x43], 0, 0xa0f7b07a],
+			[[0x21], 0, 0x72661cf4],
+			['Hello, world!', 1234, 0xfaf6cdb3],
+			['The quick brown fox jumps over the lazy dog', 0x9747b28c, 0x2fa826cd]
+		];
+		for (const [input, seed, expected] of vectors) {
+			const bytes = typeof input === 'string' ? new Uint8Array(Buffer.from(input, 'latin1')) : new Uint8Array(input);
+			expect(murmur3(bytes, seed)).toBe(expected);
+		}
+	});
+
+	it('sets exactly the bits of the documented scheme (MurmurHash3 of the UTF-16LE code units, top 31 bits, enhanced double hashing)', function () {
+		const items = ['', 'a', 'ab', 'abc', '\u00E9', '\u{1F600}', '\uD83D', 'hello world', 'x'.repeat(33), '\uFFFF\u0000\u8000'];
+		for (const [bits, hashes] of [
+			[32, 1],
+			[64, 3],
+			[1000, 7],
+			[96, 40]
+		]) {
+			for (const item of items) {
+				const filter = createBloomFilter({ bits, hashes });
+				filter.add(item);
+				const expected = new Uint8Array(filter.bits / 8);
+				for (const position of positions(item, filter.bits, hashes)) expected[position >> 3] |= 1 << (position & 7);
+				expect(filter.toBytes()).toEqual(expected);
+			}
+		}
+	});
+
+	it('sizes itself with the optimal formulas', function () {
+		const cases: Array<[number, number, number, number]> = [
+			[1000, 0.01, 9600, 7],
+			[1_000_000, 0.001, 14_377_600, 10],
+			[1, 0.5, 32, 22],
+			[100, 0.1, 480, 3],
+			[10_000, 1e-9, 431_328, 30]
+		];
+		for (const [expectedItems, falsePositiveRate, bits, hashes] of cases) {
+			const filter = createBloomFilter({ expectedItems, falsePositiveRate });
+			expect([filter.bits, filter.hashes]).toEqual([bits, hashes]);
+		}
+		expect(createBloomFilter({ expectedItems: 1000 }).bits).toBe(9600);
+		// The optimal number of hashes passes 256 only for absurd rates.
+		expect(createBloomFilter({ expectedItems: 1, falsePositiveRate: 1e-300 }).hashes).toBe(256);
+		const explicit = createBloomFilter({ bits: 33, hashes: 2 });
+		expect([explicit.bits, explicit.hashes, explicit.toBytes().length]).toEqual([64, 2, 8]);
+	});
+
+	it('meets its false-positive rate on structured keys, which a single 32-bit hash could not', function () {
+		const items = 100_000;
+		const filter = createBloomFilter({ expectedItems: items, falsePositiveRate: 1e-6 });
+		for (let i = 0; i < items; i++) filter.add(`user:${i}`);
+		let positives = 0;
+		for (let i = items; i < items + 400_000; i++) if (filter.has(`user:${i}`)) positives++;
+		// About 0.4 expected; with one 32-bit hash, each query would collide with an added item with probability 100,000 / 2³², about 9
+		// false positives whatever the size.
+		expect(positives).toBeLessThan(4);
+		const percent = createBloomFilter({ expectedItems: 10_000, falsePositiveRate: 0.01 });
+		for (let i = 0; i < 10_000; i++) percent.add(String(i));
+		let hits = 0;
+		for (let i = 10_000; i < 110_000; i++) if (percent.has(String(i))) hits++;
+		expect(hits / 100_000).toBeGreaterThan(0.0085);
+		expect(hits / 100_000).toBeLessThan(0.0115);
+	});
+
+	it('estimates its fill, its rate and its number of items', function () {
+		const filter = createBloomFilter({ bits: 32, hashes: 1 });
+		expect([filter.estimatedFalsePositiveRate(), filter.estimatedSize()]).toEqual([0, 0]);
+		expect(Object.is(filter.estimatedSize(), 0)).toBe(true);
+		let added = 0;
+		for (let i = 0; added < 32; i++) if (filter.add(String(i))) added++;
+		expect([filter.estimatedFalsePositiveRate(), filter.estimatedSize()]).toEqual([1, Infinity]);
+		expect(filter.toBytes()).toEqual(new Uint8Array(4).fill(255));
+		filter.clear();
+		expect([filter.estimatedFalsePositiveRate(), filter.estimatedSize(), filter.has('0')]).toEqual([0, 0, false]);
+		const big = createBloomFilter({ expectedItems: 5000, falsePositiveRate: 0.02 });
+		for (let i = 0; i < 2500; i++) big.add(`k${i}`);
+		expect(Math.abs(big.estimatedSize() - 2500)).toBeLessThan(75);
+	});
+
+	it('reads the bytes of `data` themselves, whatever own properties shadow its view', function () {
+		const filter = createBloomFilter({ bits: 64, hashes: 3 });
+		filter.add('a');
+		const backing = new Uint8Array(24);
+		backing.set(filter.toBytes(), 8);
+		const data = backing.subarray(8, 16);
+		Object.defineProperties(data, { buffer: { value: new ArrayBuffer(8) }, byteOffset: { value: 16 }, byteLength: { value: 8 }, length: { value: 8 } });
+		expect(createBloomFilter({ bits: 64, hashes: 3, data }).toBytes()).toEqual(filter.toBytes());
+		const short = backing.subarray(0, 4);
+		Object.defineProperties(short, { byteLength: { value: 8 }, length: { value: 8 } });
+		expect(function () {
+			createBloomFilter({ bits: 64, hashes: 3, data: short });
+		}).toThrow(new RangeError('createBloomFilter: `data` must hold 8 bytes (bits / 8), got 4'));
+	});
+
+	it('restores from bytes of any realm, and copies them', function () {
+		const filter = createBloomFilter({ bits: 64, hashes: 3 });
+		filter.add('a');
+		const bytes = filter.toBytes();
+		const restored = createBloomFilter({ bits: 64, hashes: 3, data: bytes });
+		bytes.fill(0);
+		expect(restored.has('a')).toBe(true);
+		expect(createBloomFilter({ bits: 64, hashes: 3, data: Buffer.from(filter.toBytes()) }).has('a')).toBe(true);
+		const foreign = runInNewContext('new Uint8Array(8)') as Uint8Array;
+		foreign.set(filter.toBytes());
+		const fromForeign = createBloomFilter({ bits: 64, hashes: 3, data: foreign });
+		expect([fromForeign.has('a'), fromForeign.estimatedSize()]).toEqual([true, filter.estimatedSize()]);
+		// Every bit of every byte maps back.
+		const full = createBloomFilter({ bits: 32, hashes: 1, data: new Uint8Array([1, 2, 128, 255]) });
+		expect(full.toBytes()).toEqual(new Uint8Array([1, 2, 128, 255]));
+		expect(full.estimatedFalsePositiveRate()).toBe(11 / 32);
+	});
+
+	it('validates its options, ignoring a polluted Object.prototype', function () {
+		const errors: Array<[unknown, Error | typeof TypeError | typeof RangeError]> = [
+			[null, new TypeError('createBloomFilter: `options` must be an object, got null')],
+			['x', new TypeError('createBloomFilter: `options` must be an object, got string')],
+			[{}, new TypeError('createBloomFilter: `expectedItems` must be an integer >= 1, got undefined')],
+			[{ expectedItems: 0 }, new RangeError('createBloomFilter: `expectedItems` must be an integer >= 1, got 0')],
+			[{ expectedItems: 1.5 }, new RangeError('createBloomFilter: `expectedItems` must be an integer >= 1, got 1.5')],
+			[{ expectedItems: 10, falsePositiveRate: 0 }, new RangeError('createBloomFilter: `falsePositiveRate` must be a number between 0 and 1 (exclusive), got 0')],
+			[{ expectedItems: 10, falsePositiveRate: 1 }, new RangeError('createBloomFilter: `falsePositiveRate` must be a number between 0 and 1 (exclusive), got 1')],
+			[{ expectedItems: 10, falsePositiveRate: NaN }, new RangeError('createBloomFilter: `falsePositiveRate` must be a number between 0 and 1 (exclusive), got NaN')],
+			[
+				{ expectedItems: 10, falsePositiveRate: '0.1' },
+				new TypeError('createBloomFilter: `falsePositiveRate` must be a number between 0 and 1 (exclusive), got string')
+			],
+			[
+				{ expectedItems: 1e9, falsePositiveRate: 0.01 },
+				new RangeError('createBloomFilter: 1000000000 items at a false-positive rate of 0.01 need 9585058400 bits, more than 2147483648')
+			],
+			[
+				{ expectedItems: 10, hashes: 2 },
+				new TypeError('createBloomFilter: pass either `expectedItems` (and `falsePositiveRate`) or `bits` and `hashes` (and `data`), not both')
+			],
+			[{ expectedItems: 10, data: new Uint8Array(4) }, TypeError],
+			[{ bits: 64, hashes: 2, expectedItems: 10 }, TypeError],
+			[{ bits: 64, hashes: 2, falsePositiveRate: 0.1 }, TypeError],
+			[{ bits: 0, hashes: 1 }, new RangeError('createBloomFilter: `bits` must be an integer between 1 and 2147483648, got 0')],
+			[{ bits: 2 ** 31 + 1, hashes: 1 }, RangeError],
+			[{ bits: 64.5, hashes: 1 }, RangeError],
+			[{ bits: '64', hashes: 1 }, new TypeError('createBloomFilter: `bits` must be an integer between 1 and 2147483648, got string')],
+			[{ bits: 64 }, new TypeError('createBloomFilter: `hashes` must be an integer between 1 and 256, got undefined')],
+			[{ bits: 64, hashes: 0 }, new RangeError('createBloomFilter: `hashes` must be an integer between 1 and 256, got 0')],
+			[{ bits: 64, hashes: 257 }, RangeError],
+			[{ bits: 64, hashes: 1.5 }, RangeError],
+			[{ bits: 64, hashes: 1, data: [0, 0, 0, 0, 0, 0, 0, 0] }, new TypeError('createBloomFilter: `data` must be a Uint8Array, got object')],
+			[{ bits: 64, hashes: 1, data: new Uint16Array(4) }, TypeError],
+			[{ bits: 64, hashes: 1, data: { [Symbol.toStringTag]: 'Uint8Array', length: 8 } }, TypeError],
+			[{ bits: 64, hashes: 1, data: new Uint8Array(4) }, new RangeError('createBloomFilter: `data` must hold 8 bytes (bits / 8), got 4')],
+			[{ bits: 40, hashes: 1, data: new Uint8Array(5) }, new RangeError('createBloomFilter: `data` must hold 8 bytes (bits / 8), got 5')]
+		];
+		for (const [options, error] of errors) {
+			expect(function () {
+				createBloomFilter(options as never);
+			}).toThrow(error);
+		}
+		// The bounds themselves are accepted.
+		expect([
+			createBloomFilter({ bits: 1, hashes: 1 }).bits,
+			createBloomFilter({ bits: 2 ** 31 - 31, hashes: 1 }).bits,
+			createBloomFilter({ bits: 2 ** 31, hashes: 1 }).bits
+		]).toEqual([32, 2 ** 31, 2 ** 31]);
+		expect(createBloomFilter({ bits: 64, hashes: 256 }).hashes).toBe(256);
+		expect(createBloomFilter({ expectedItems: 1_488_522_235, falsePositiveRate: 0.5 }).bits).toBe(2 ** 31);
+		expect(function () {
+			createBloomFilter({ expectedItems: 1_488_522_236, falsePositiveRate: 0.5 });
+		}).toThrow(new RangeError('createBloomFilter: 1488522236 items at a false-positive rate of 0.5 need 2147483680 bits, more than 2147483648'));
+		const filter = createBloomFilter({ bits: 64, hashes: 2 });
+		expect(function () {
+			filter.add(1 as never);
+		}).toThrow(new TypeError('BloomFilter.add: `item` must be a string, got number'));
+		expect(function () {
+			filter.has(undefined as never);
+		}).toThrow(new TypeError('BloomFilter.has: `item` must be a string, got undefined'));
+		const proto = Object.prototype as Record<string, unknown>;
+		proto.bits = 64;
+		proto.hashes = 1;
+		proto.data = new Uint8Array(1);
+		try {
+			expect(createBloomFilter({ expectedItems: 1000 }).bits).toBe(9600);
+			expect(createBloomFilter({ bits: 32, hashes: 2 }).toBytes()).toEqual(new Uint8Array(4));
+		} finally {
+			delete proto.bits;
+			delete proto.hashes;
+			delete proto.data;
+		}
 	});
 });

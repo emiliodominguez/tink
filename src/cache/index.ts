@@ -915,3 +915,1383 @@ export function createDeque<T>(values?: Iterable<T> | null, options: DequeOption
 
 	return deque;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// createRingBuffer
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Options accepted by {@link createRingBuffer}.
+ * @template T - The value type
+ */
+export interface RingBufferOptions<T> {
+	/**
+	 * Called with each value that a `push` to a full buffer overwrites, after the buffer holds the new value (so the callback may use it).
+	 * Not called by `shift` or `clear`. An exception it throws propagates to the caller of `push`; the buffer is already consistent.
+	 */
+	onEvict?: (value: T) => void;
+}
+
+/**
+ * A fixed-capacity circular buffer, as returned by {@link createRingBuffer}.
+ * @template T - The value type
+ */
+export interface RingBuffer<T> extends Iterable<T> {
+	/** Number of values. */
+	readonly size: number;
+	/** The maximum number of values. */
+	readonly capacity: number;
+	/** Whether `size === capacity`, i.e. the next `push` overwrites the oldest value. */
+	readonly full: boolean;
+	/** Adds a value as the newest one, overwriting (and reporting to `onEvict`) the oldest value when the buffer is full; returns the new size. */
+	push(value: T): number;
+	/** Removes and returns the oldest value; `undefined` when empty. */
+	shift(): T | undefined;
+	/** Returns the oldest value without removing it; `undefined` when empty. */
+	peekFirst(): T | undefined;
+	/** Returns the newest value without removing it; `undefined` when empty. */
+	peekLast(): T | undefined;
+	/** Returns the value at `index` from the oldest (`0`; a negative index counts from the newest: `-1` is the newest); `undefined` when out of range. */
+	at(index: number): T | undefined;
+	/** The values from oldest to newest, as a new array. */
+	toArray(): T[];
+	/** Removes every value (without calling `onEvict`) and releases the storage. */
+	clear(): void;
+	/** The values from oldest to newest (a snapshot taken when called). */
+	[Symbol.iterator](): IterableIterator<T>;
+}
+
+/** Largest array length, and so the largest capacity of a ring buffer. */
+const MAX_LENGTH = 2 ** 32 - 1;
+
+/**
+ * The `full` getter of every ring buffer (shared, like {@link getSize}, so that the buffers share one shape).
+ * @returns {boolean} Whether the buffer it is read on is full
+ */
+function getFull(this: { [SIZE](): number; capacity: number }): boolean {
+	return this[SIZE]() === this.capacity;
+}
+
+/**
+ * Creates a ring buffer: a circular buffer of at most `capacity` values where pushing to a full buffer overwrites the oldest value, so it
+ * always holds the most recent values (the last N log lines, samples, frames or events). `push`, `shift`, `at` and the peeks are O(1)
+ * and never allocate once the buffer has filled up: its storage grows with the first `capacity` pushes (an empty buffer of capacity
+ * 10⁶ costs nothing) and is then reused in place, never resized.
+ *
+ * Compared with {@link createDeque} with a `capacity` (which also drops the value at the other end when full): a ring buffer is
+ * single-ended (push newest, shift oldest), reports overwritten values to `onEvict`, has `full`, and never grows or shrinks its storage
+ * once full. Use a deque for an unbounded queue or to add and remove at both ends.
+ * - A shifted or cleared value is released at once (its slot is cleared), so the buffer never keeps a reference to a value it no
+ *   longer holds.
+ * - Iteration goes from oldest to newest over a snapshot: changing the buffer while iterating is safe and does not affect the loop.
+ * @template T - The value type
+ * @param {number} capacity - The maximum number of values (an integer between 1 and 2³² - 1)
+ * @param {RingBufferOptions<T>} [options={}] - `onEvict`, called with each overwritten value
+ * @returns {RingBuffer<T>} A new, empty buffer
+ * @throws {TypeError} when `capacity` is not a number, or `onEvict` is provided but not a function
+ * @throws {RangeError} when `capacity` is not an integer between 1 and 2³² - 1 (`Infinity` included: use a deque), or (from `at`) the
+ * index is not an integer
+ * @example
+ * const recent = createRingBuffer<number>(3);
+ * for (const sample of [1, 2, 3, 4, 5]) recent.push(sample);
+ * recent.toArray(); // => [3, 4, 5]
+ * recent.full; // => true
+ * recent.peekFirst(); // => 3
+ * recent.at(-1); // => 5
+ * recent.shift(); // => 3
+ * [...recent]; // => [4, 5]
+ * @example
+ * // Dispose of what falls out of the window
+ * const dropped: string[] = [];
+ * const lines = createRingBuffer<string>(2, { onEvict: function (line) { dropped.push(line); } });
+ * lines.push('a');
+ * lines.push('b');
+ * lines.push('c'); // => 2
+ * dropped; // => ['a']
+ * createRingBuffer(0); // throws RangeError
+ */
+export function createRingBuffer<T>(capacity: number, options: RingBufferOptions<T> = {}): RingBuffer<T> {
+	if (!(Number.isInteger(capacity) && capacity >= 1 && capacity <= MAX_LENGTH)) {
+		assertNumber('createRingBuffer', 'capacity', capacity, false, `an integer between 1 and ${MAX_LENGTH}`);
+	}
+	const onEvict = readOption(options, 'onEvict');
+	if (onEvict !== undefined) assertFunction('createRingBuffer', 'options.onEvict', onEvict);
+
+	// The storage grows by `push` until it holds `capacity` slots (it stays packed: no hole, so no read reaches `Array.prototype`), then
+	// wraps. The next free slot is `(head + length) % capacity`, which equals `ring.length` exactly while the storage is still growing.
+	let ring: Array<T | undefined> = [];
+	let head = 0;
+	let length = 0;
+
+	/**
+	 * The storage index of the value at `offset` from the oldest.
+	 * @param {number} offset - An offset in `[0, length]`
+	 * @returns {number} The storage index
+	 */
+	function slot(offset: number): number {
+		const index = head + offset;
+		return index >= capacity ? index - capacity : index;
+	}
+
+	const buffer = {
+		capacity,
+		push(value: T): number {
+			if (length === capacity) {
+				// Full: the oldest value's slot becomes the newest one's.
+				const evicted = ring[head] as T;
+				ring[head] = value;
+				head = slot(1);
+				if (onEvict) onEvict(evicted);
+				return length;
+			}
+			const tail = slot(length);
+			if (tail === ring.length) ring.push(value);
+			else ring[tail] = value;
+			return ++length;
+		},
+		shift(): T | undefined {
+			if (length === 0) return undefined;
+			const value = ring[head];
+			ring[head] = undefined;
+			head = slot(1);
+			length--;
+			return value;
+		},
+		peekFirst(): T | undefined {
+			return length === 0 ? undefined : ring[head];
+		},
+		peekLast(): T | undefined {
+			return length === 0 ? undefined : ring[slot(length - 1)];
+		},
+		at(index: number): T | undefined {
+			if (!Number.isInteger(index)) assertNumber('RingBuffer.at', 'index', index, false, 'an integer');
+			const offset = index < 0 ? index + length : index;
+			return offset >= 0 && offset < length ? ring[slot(offset)] : undefined;
+		},
+		toArray(): T[] {
+			const values: T[] = [];
+			for (let i = 0; i < length; i++) values.push(ring[slot(i)] as T);
+			return values;
+		},
+		clear(): void {
+			ring = [];
+			head = 0;
+			length = 0;
+		},
+		[Symbol.iterator](): IterableIterator<T> {
+			return buffer.toArray().values();
+		}
+	} as RingBuffer<T>;
+
+	Object.defineProperties(buffer, {
+		[SIZE]: {
+			value: function (): number {
+				return length;
+			}
+		},
+		size: { get: getSize, enumerable: true, configurable: true },
+		full: { get: getFull, enumerable: true, configurable: true }
+	});
+
+	return buffer;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// createDefaultMap
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * A `Map` whose `get` creates missing values, as returned by {@link createDefaultMap}.
+ * @template K - The key type
+ * @template V - The value type
+ */
+export interface DefaultMap<K, V> extends Iterable<[K, V]> {
+	/** Number of entries. */
+	readonly size: number;
+	/** Returns the value stored under `key`; when there is none, stores `factory(key)` and returns it. */
+	get(key: K): V;
+	/** Returns the value stored under `key`, or `undefined`, without creating it. */
+	peek(key: K): V | undefined;
+	/** Whether a value is stored under `key` (never creates one). */
+	has(key: K): boolean;
+	/** Stores `value` under `key` and returns the map. */
+	set(key: K, value: V): DefaultMap<K, V>;
+	/** Removes `key`; returns whether it was present. */
+	delete(key: K): boolean;
+	/** Removes every entry. */
+	clear(): void;
+	/** The keys in insertion order (a live iterator, as `Map`'s). */
+	keys(): IterableIterator<K>;
+	/** The values in insertion order (a live iterator, as `Map`'s). */
+	values(): IterableIterator<V>;
+	/** The `[key, value]` pairs in insertion order (a live iterator, as `Map`'s). */
+	entries(): IterableIterator<[K, V]>;
+	/** Same as `entries()`. */
+	[Symbol.iterator](): IterableIterator<[K, V]>;
+}
+
+/**
+ * Checks the initial entries of a structure: an iterable, or `null`/`undefined` for none.
+ * @template E - The entry type
+ * @param {string} caller - Name of the public function, used in the error message
+ * @param {Iterable<E> | null | undefined} entries - The entries
+ * @returns {Iterable<E> | undefined} The entries (`undefined` for none)
+ * @throws {TypeError} when `entries` is neither iterable nor `null`/`undefined`
+ */
+function readEntries<E>(caller: string, entries: Iterable<E> | null | undefined): Iterable<E> | undefined {
+	if (entries == null) return undefined;
+	if (typeof (entries as Partial<Iterable<E>>)[Symbol.iterator] !== 'function') throw new TypeError(`${caller}: \`entries\` must be an iterable, got ${describe(entries)}`);
+	return entries;
+}
+
+/**
+ * Creates a `Map` whose `get` never misses: a missing key gets the value `factory(key)`, which is stored and returned (Python's
+ * `defaultdict`, or `Map.prototype.getOrInsertComputed` on every `get`). It turns grouping, counting and memo tables into one-liners
+ * without `if (!map.has(key)) map.set(key, [])`. `peek` and `has` look without creating.
+ *
+ * - Keys compare with SameValueZero, as in a `Map`; iteration is in insertion order, with `Map`'s live iterators.
+ * - `factory` is only called on a miss, with the key as the map stores it (`-0` as `0`), and a stored `undefined` is a hit. When it
+ *   throws, nothing is stored. Its result replaces anything `factory` itself stored under `key`.
+ * @template K - The key type
+ * @template V - The value type
+ * @param {(key: K) => V} factory - Creates the value of a missing key
+ * @param {Iterable<readonly [K, V]> | null} [entries] - Initial `[key, value]` pairs
+ * @returns {DefaultMap<K, V>} A new map
+ * @throws {TypeError} when `factory` is not a function, or `entries` is neither iterable nor `null`/`undefined`
+ * @example
+ * const byLength = createDefaultMap(function (): string[] { return []; });
+ * for (const word of ['a', 'bb', 'cc', 'd']) byLength.get(word.length).push(word);
+ * byLength.get(2); // => ['bb', 'cc']
+ * byLength.peek(3); // => undefined
+ * byLength.size; // => 2
+ * @example
+ * // Counting
+ * const counts = createDefaultMap<string, number>(function () { return 0; });
+ * for (const letter of 'banana') counts.set(letter, counts.get(letter) + 1);
+ * [...counts]; // => [['b', 1], ['a', 3], ['n', 2]]
+ */
+export function createDefaultMap<K, V>(factory: (key: K) => V, entries?: Iterable<readonly [K, V]> | null): DefaultMap<K, V> {
+	assertFunction('createDefaultMap', 'factory', factory);
+	const map = new Map<K, V>(readEntries('createDefaultMap', entries));
+
+	const defaults = {
+		get(key: K): V {
+			const stored = map.get(key);
+			if (stored !== undefined || map.has(key)) return stored as V;
+			// The key as the map stores it (`-0` as `0`), as `getOrInsertComputed` passes it.
+			const value = factory(key === 0 ? (0 as K) : key);
+			map.set(key, value);
+			return value;
+		},
+		peek(key: K): V | undefined {
+			return map.get(key);
+		},
+		has(key: K): boolean {
+			return map.has(key);
+		},
+		set(key: K, value: V): DefaultMap<K, V> {
+			map.set(key, value);
+			return defaults;
+		},
+		delete(key: K): boolean {
+			return map.delete(key);
+		},
+		clear(): void {
+			map.clear();
+		},
+		keys(): IterableIterator<K> {
+			return map.keys();
+		},
+		values(): IterableIterator<V> {
+			return map.values();
+		},
+		entries(): IterableIterator<[K, V]> {
+			return map.entries();
+		},
+		[Symbol.iterator](): IterableIterator<[K, V]> {
+			return map.entries();
+		}
+	} as DefaultMap<K, V>;
+
+	Object.defineProperties(defaults, {
+		[SIZE]: {
+			value: function (): number {
+				return map.size;
+			}
+		},
+		size: { get: getSize, enumerable: true, configurable: true }
+	});
+
+	return defaults;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// createBiMap
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * A bidirectional one-to-one map, as returned by {@link createBiMap}.
+ * @template K - The key type
+ * @template V - The value type
+ */
+export interface BiMap<K, V> extends Iterable<[K, V]> {
+	/** Number of pairs. */
+	readonly size: number;
+	/** The same pairs seen from the other side (values as keys), backed by the same storage: changes through either view show in both. */
+	readonly inverse: BiMap<V, K>;
+	/** Returns the value paired with `key`, or `undefined`. */
+	get(key: K): V | undefined;
+	/** Returns the key paired with `value`, or `undefined`. */
+	getKey(value: V): K | undefined;
+	/** Whether `key` is paired. */
+	has(key: K): boolean;
+	/** Whether `value` is paired. */
+	hasValue(value: V): boolean;
+	/** Pairs `key` with `value`, first removing the pairs either of them was part of; returns the map. */
+	set(key: K, value: V): BiMap<K, V>;
+	/** Removes the pair of `key`; returns whether there was one. */
+	delete(key: K): boolean;
+	/** Removes the pair of `value`; returns whether there was one. */
+	deleteValue(value: V): boolean;
+	/** Removes every pair. */
+	clear(): void;
+	/** The keys (a live iterator, in the order of a `Map` of keys to values). */
+	keys(): IterableIterator<K>;
+	/** The values, in the order of `keys()` (a live iterator). */
+	values(): IterableIterator<V>;
+	/** The `[key, value]` pairs, in the order of `keys()` (a live iterator). */
+	entries(): IterableIterator<[K, V]>;
+	/** Same as `entries()`. */
+	[Symbol.iterator](): IterableIterator<[K, V]>;
+}
+
+/**
+ * Creates one side of a bidirectional map over two `Map`s kept as exact mirrors.
+ * @template K - The key type of this side
+ * @template V - The value type of this side
+ * @param {Map<K, V>} forward - Keys to values
+ * @param {Map<V, K>} backward - Values to keys
+ * @returns {BiMap<K, V>} The view (its `size` and `inverse` are defined by the caller)
+ */
+function biMapView<K, V>(forward: Map<K, V>, backward: Map<V, K>): BiMap<K, V> {
+	const view = {
+		get(key: K): V | undefined {
+			return forward.get(key);
+		},
+		getKey(value: V): K | undefined {
+			return backward.get(value);
+		},
+		has(key: K): boolean {
+			return forward.has(key);
+		},
+		hasValue(value: V): boolean {
+			return backward.has(value);
+		},
+		set(key: K, value: V): BiMap<K, V> {
+			// Both sides are keys of one of the maps, so both are stored as those maps store keys (`-0` as `0`): each side then reads the
+			// same in both directions.
+			const left = Object.is(key, -0) ? (0 as K) : key;
+			const right = Object.is(value, -0) ? (0 as V) : value;
+
+			if (forward.has(left)) {
+				const previous = forward.get(left) as V;
+				// The pair is already there (SameValueZero, like the maps).
+				if (previous === right || (previous !== previous && right !== right)) return view;
+				backward.delete(previous);
+			}
+			if (backward.has(right)) forward.delete(backward.get(right) as K);
+			forward.set(left, right);
+			backward.set(right, left);
+			return view;
+		},
+		delete(key: K): boolean {
+			if (!forward.has(key)) return false;
+			backward.delete(forward.get(key) as V);
+			return forward.delete(key);
+		},
+		deleteValue(value: V): boolean {
+			if (!backward.has(value)) return false;
+			forward.delete(backward.get(value) as K);
+			return backward.delete(value);
+		},
+		clear(): void {
+			forward.clear();
+			backward.clear();
+		},
+		keys(): IterableIterator<K> {
+			return forward.keys();
+		},
+		values(): IterableIterator<V> {
+			return forward.values();
+		},
+		entries(): IterableIterator<[K, V]> {
+			return forward.entries();
+		},
+		[Symbol.iterator](): IterableIterator<[K, V]> {
+			return forward.entries();
+		}
+	} as BiMap<K, V>;
+
+	Object.defineProperty(view, SIZE, {
+		value: function (): number {
+			return forward.size;
+		}
+	});
+
+	return view;
+}
+
+/**
+ * Creates a bidirectional map: a one-to-one map that looks up values by key (`get`) and keys by value (`getKey`) in O(1), backed by two
+ * `Map`s kept as exact mirrors. Every value belongs to one key at most, so `set(key, value)` first removes the pairs `key` and `value`
+ * were part of (Guava's `forcePut`): the map can never hold a stale or duplicated pair. `inverse` is the same map seen from the other
+ * side, with no copy.
+ *
+ * - Keys and values compare with SameValueZero (both are `Map` keys); a `-0` key or value is stored as `0`.
+ * - Order: `keys()`, `values()` and `entries()` follow the order a `Map` of keys to values would have after the same changes (changing
+ *   the value of a key keeps the key's place); `inverse` follows the order of a `Map` of values to keys (changing the key of a value
+ *   keeps the value's place). Iterators are live, as `Map`'s.
+ * @template K - The key type
+ * @template V - The value type
+ * @param {Iterable<readonly [K, V]> | null} [entries] - Initial `[key, value]` pairs, set in order (a later pair replaces the earlier
+ * pairs that share its key or its value)
+ * @returns {BiMap<K, V>} A new map
+ * @throws {TypeError} when `entries` is neither iterable nor `null`/`undefined`
+ * @example
+ * const codes = createBiMap([['en', 'English'], ['fr', 'French']]);
+ * codes.get('fr'); // => 'French'
+ * codes.getKey('English'); // => 'en'
+ * codes.inverse.get('French'); // => 'fr'
+ * codes.set('gb', 'English'); // 'en' loses its value, so its pair is removed
+ * codes.has('en'); // => false
+ * [...codes]; // => [['fr', 'French'], ['gb', 'English']]
+ * codes.inverse.inverse === codes; // => true
+ */
+export function createBiMap<K, V>(entries?: Iterable<readonly [K, V]> | null): BiMap<K, V> {
+	const pairs = readEntries('createBiMap', entries);
+	const forward = new Map<K, V>();
+	const backward = new Map<V, K>();
+	const map = biMapView(forward, backward);
+	const inverse = biMapView(backward, forward);
+
+	// `inverse` is not enumerable, so that spreading or serializing a map does not walk into the cycle.
+	Object.defineProperties(map, { size: { get: getSize, enumerable: true, configurable: true }, inverse: { value: inverse } });
+	Object.defineProperties(inverse, { size: { get: getSize, enumerable: true, configurable: true }, inverse: { value: map } });
+	if (pairs !== undefined) for (const [key, value] of pairs) map.set(key, value);
+
+	return map;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// createMultiMap
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Options accepted by {@link createMultiMap}.
+ */
+export interface MultiMapOptions {
+	/**
+	 * When `true`, a key holds each value at most once (a set of values per key, SameValueZero): adding a value already there does
+	 * nothing. When `false`, a key holds a list, duplicates included.
+	 * @default false
+	 */
+	unique?: boolean;
+}
+
+/**
+ * A map from keys to several values, as returned by {@link createMultiMap}.
+ * @template K - The key type
+ * @template V - The value type
+ */
+export interface MultiMap<K, V> extends Iterable<[K, V]> {
+	/** Total number of values, over every key. */
+	readonly size: number;
+	/** Number of keys that hold at least one value. */
+	readonly keyCount: number;
+	/** Adds `value` under `key`; returns whether it was added (`false` only when `unique` and the key already holds it). */
+	add(key: K, value: V): boolean;
+	/** The values of `key` in insertion order, as a new array (empty when the key holds none). */
+	get(key: K): V[];
+	/** Number of values `key` holds, in O(1). */
+	count(key: K): number;
+	/** Whether `key` holds at least one value. */
+	has(key: K): boolean;
+	/** Whether `key` holds `value` (SameValueZero). */
+	has(key: K, value: V): boolean;
+	/** Removes `key` and all its values; returns whether it held any. */
+	delete(key: K): boolean;
+	/** Removes one occurrence of `value` (the oldest) from `key`, and the key once it holds nothing; returns whether one was found. */
+	delete(key: K, value: V): boolean;
+	/** Removes everything. */
+	clear(): void;
+	/** The keys, in the order they were first added (a snapshot taken when called). */
+	keys(): IterableIterator<K>;
+	/** Every value, key by key in the order of `keys()` (a snapshot taken when called). */
+	values(): IterableIterator<V>;
+	/** Every `[key, value]` pair, key by key in the order of `keys()` (a snapshot taken when called). */
+	entries(): IterableIterator<[K, V]>;
+	/** Same as `entries()`. */
+	[Symbol.iterator](): IterableIterator<[K, V]>;
+}
+
+/**
+ * Key of each multimap's (non-enumerable) function returning its number of keys, called by the shared `keyCount` getter.
+ */
+const KEY_COUNT = Symbol();
+
+/**
+ * The `keyCount` getter of every multimap (shared, like {@link getSize}).
+ * @returns {number} The number of keys of the multimap it is read on
+ */
+function getKeyCount(this: { [KEY_COUNT](): number }): number {
+	return this[KEY_COUNT]();
+}
+
+/**
+ * Finds the first occurrence of `value` in a list, with SameValueZero (so `NaN` is found, unlike with `indexOf`).
+ * @template T - The element type
+ * @param {T[]} list - The list
+ * @param {T} value - The value to find
+ * @returns {number} Its index, or `-1`
+ */
+function indexOfValue<T>(list: T[], value: T): number {
+	if (value === value) return list.indexOf(value);
+	for (let i = 0; i < list.length; i++) if (list[i] !== list[i]) return i;
+	return -1;
+}
+
+/**
+ * Builds a `[key, value]` pair.
+ * @template K - The key type
+ * @template V - The value type
+ * @param {K} key - The key
+ * @param {V} value - The value
+ * @returns {[K, V]} The pair
+ */
+function pairOf<K, V>(key: K, value: V): [K, V] {
+	return [key, value];
+}
+
+/**
+ * Creates a multimap: a map from each key to several values, a list per key (or a set, with `unique: true`). Missing keys read as empty:
+ * `get` returns `[]`, so there is no `map.get(key) ?? []` dance, and a key disappears as soon as its last value is removed, so `has`,
+ * `keyCount` and iteration never see empty groups. `add`, `count` and `has(key)` are O(1); `has(key, value)` and `delete(key, value)` are
+ * O(1) with `unique` and linear in the key's values otherwise. `size` counts values, `keyCount` keys.
+ *
+ * - Keys and values compare with SameValueZero (keys are `Map` keys; with `unique`, values are `Set` values, which store `-0` as `0`).
+ * - `get` returns a new array (O(values of the key)): changing the multimap later never changes an array it returned, and changing the
+ *   array never changes the multimap.
+ * - Iteration (`keys`, `values`, `entries`) is over a snapshot: changing the multimap while iterating is safe and does not affect the loop.
+ * @template K - The key type
+ * @template V - The value type
+ * @param {Iterable<readonly [K, V]> | null} [entries] - Initial `[key, value]` pairs, added in order
+ * @param {MultiMapOptions} [options={}] - `unique` (default `false`)
+ * @returns {MultiMap<K, V>} A new multimap
+ * @throws {TypeError} when `entries` is neither iterable nor `null`/`undefined`
+ * @example
+ * const tags = createMultiMap<string, string>();
+ * tags.add('post-1', 'js');
+ * tags.add('post-1', 'ts');
+ * tags.add('post-2', 'js');
+ * tags.get('post-1'); // => ['js', 'ts']
+ * tags.get('post-3'); // => []
+ * [tags.size, tags.keyCount]; // => [3, 2]
+ * tags.delete('post-1', 'js'); // => true
+ * [...tags]; // => [['post-1', 'ts'], ['post-2', 'js']]
+ * @example
+ * // A set of values per key
+ * const followers = createMultiMap([['ada', 'bob'], ['ada', 'bob'], ['ada', 'eve']], { unique: true });
+ * followers.get('ada'); // => ['bob', 'eve']
+ * followers.add('ada', 'eve'); // => false
+ * followers.has('ada', 'bob'); // => true
+ */
+export function createMultiMap<K, V>(entries?: Iterable<readonly [K, V]> | null, options: MultiMapOptions = {}): MultiMap<K, V> {
+	const pairs = readEntries('createMultiMap', entries);
+	const unique = readOption(options, 'unique', false);
+	// A list of values per key, or a set with `unique`. Keys without values are never stored.
+	const groups = new Map<K, V[] | Set<V>>();
+	let total = 0;
+
+	/**
+	 * Snapshots something of every value of every key, key by key.
+	 * @template T - The snapshot element type
+	 * @param {(key: K, value: V) => T} pick - Extracts what to collect from a pair
+	 * @returns {IterableIterator<T>} An iterator over the snapshot
+	 */
+	function collect<T>(pick: (key: K, value: V) => T): IterableIterator<T> {
+		const result: T[] = [];
+		for (const [key, group] of groups) for (const value of group) result.push(pick(key, value));
+		return result.values();
+	}
+
+	/**
+	 * Number of values in a group.
+	 * @param {V[] | Set<V>} group - A group
+	 * @returns {number} Its size
+	 */
+	function countOf(group: V[] | Set<V>): number {
+		return unique ? (group as Set<V>).size : (group as V[]).length;
+	}
+
+	const multimap = {
+		add(key: K, value: V): boolean {
+			const group = groups.get(key);
+			if (group === undefined) groups.set(key, unique ? new Set([value]) : [value]);
+			else if (!unique) (group as V[]).push(value);
+			else if ((group as Set<V>).has(value)) return false;
+			else (group as Set<V>).add(value);
+			total++;
+			return true;
+		},
+		get(key: K): V[] {
+			const group = groups.get(key);
+			return group === undefined ? [] : Array.from(group);
+		},
+		count(key: K): number {
+			const group = groups.get(key);
+			return group === undefined ? 0 : countOf(group);
+		},
+		has(key: K, ...value: [] | [V]): boolean {
+			const group = groups.get(key);
+			if (group === undefined) return false;
+			if (value.length === 0) return true;
+			return unique ? (group as Set<V>).has(value[0]) : indexOfValue(group as V[], value[0]) >= 0;
+		},
+		delete(key: K, ...value: [] | [V]): boolean {
+			const group = groups.get(key);
+			if (group === undefined) return false;
+			if (value.length === 0) {
+				total -= countOf(group);
+				return groups.delete(key);
+			}
+			if (unique) {
+				if (!(group as Set<V>).delete(value[0])) return false;
+			} else {
+				const index = indexOfValue(group as V[], value[0]);
+				if (index < 0) return false;
+				(group as V[]).splice(index, 1);
+			}
+			total--;
+			if (countOf(group) === 0) groups.delete(key);
+			return true;
+		},
+		clear(): void {
+			groups.clear();
+			total = 0;
+		},
+		keys(): IterableIterator<K> {
+			return Array.from(groups.keys()).values();
+		},
+		values(): IterableIterator<V> {
+			return collect(function (_, value): V {
+				return value;
+			});
+		},
+		entries(): IterableIterator<[K, V]> {
+			return collect<[K, V]>(pairOf);
+		},
+		[Symbol.iterator](): IterableIterator<[K, V]> {
+			return collect<[K, V]>(pairOf);
+		}
+	} as MultiMap<K, V>;
+
+	Object.defineProperties(multimap, {
+		[SIZE]: {
+			value: function (): number {
+				return total;
+			}
+		},
+		[KEY_COUNT]: {
+			value: function (): number {
+				return groups.size;
+			}
+		},
+		size: { get: getSize, enumerable: true, configurable: true },
+		keyCount: { get: getKeyCount, enumerable: true, configurable: true }
+	});
+
+	if (pairs !== undefined) for (const [key, value] of pairs) multimap.add(key, value);
+
+	return multimap;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// createTrie
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Options accepted by {@link Trie.keysWithPrefix} and {@link Trie.entriesWithPrefix}.
+ */
+export interface TrieQueryOptions {
+	/**
+	 * The maximum number of results (an integer `>= 0`, or `Infinity`): the first ones in key order. The search stops as soon as it has
+	 * them, so a small limit is fast even when many keys match.
+	 * @default Infinity
+	 */
+	limit?: number;
+}
+
+/**
+ * A map from strings to values with prefix queries, as returned by {@link createTrie}. Keys are ordered by UTF-16 code units, as
+ * `Array.prototype.sort()` and `<` order strings.
+ * @template V - The value type
+ */
+export interface Trie<V> extends Iterable<[string, V]> {
+	/** Number of keys. */
+	readonly size: number;
+	/** Returns the value stored under `key`, or `undefined`. */
+	get(key: string): V | undefined;
+	/** Whether `key` is stored (a stored `undefined` included). */
+	has(key: string): boolean;
+	/** Stores `value` under `key` and returns the trie. */
+	set(key: string, value: V): Trie<V>;
+	/** Removes `key`; returns whether it was stored. */
+	delete(key: string): boolean;
+	/** Removes every key. */
+	clear(): void;
+	/** Whether at least one stored key starts with `prefix` (with `''`: whether the trie holds any key). */
+	hasPrefix(prefix: string): boolean;
+	/** The stored keys that start with `prefix` (`prefix` itself included), in key order. */
+	keysWithPrefix(prefix: string, options?: TrieQueryOptions): string[];
+	/** The `[key, value]` pairs whose key starts with `prefix` (`prefix` itself included), in key order. */
+	entriesWithPrefix(prefix: string, options?: TrieQueryOptions): Array<[string, V]>;
+	/** The longest stored key that is a prefix of `text` (`text` itself included; possibly `''`); `undefined` when there is none. */
+	longestPrefixOf(text: string): string | undefined;
+	/** The keys in key order (a snapshot taken when called). */
+	keys(): IterableIterator<string>;
+	/** The values, in key order (a snapshot taken when called). */
+	values(): IterableIterator<V>;
+	/** The `[key, value]` pairs in key order (a snapshot taken when called). */
+	entries(): IterableIterator<[string, V]>;
+	/** Same as `entries()`. */
+	[Symbol.iterator](): IterableIterator<[string, V]>;
+}
+
+/**
+ * A node of a radix tree: the label of the edge that leads to it, the value of the key that ends there ({@link NO_VALUE} when none
+ * does), its children by the first code unit of their label (`undefined` for a leaf, so that leaves cost no `Map`), and those children
+ * sorted by first code unit, descending: built by the first listing that walks the node and dropped by any change to `children`, so
+ * that repeated listings do not sort again.
+ */
+interface TrieNode {
+	label: string;
+	value: unknown;
+	children: Map<number, TrieNode> | undefined;
+	sorted: TrieNode[] | undefined;
+}
+
+/** The value of a node that no key ends at (a stored `undefined` is a value). */
+const NO_VALUE = Symbol();
+
+/**
+ * Throws a `TypeError` unless `value` is a string.
+ * @param {string} caller - Name of the method, used in the error message
+ * @param {string} name - Name of the validated parameter
+ * @param {unknown} value - The value to validate
+ * @returns {void}
+ * @throws {TypeError} when `value` is not a string
+ */
+function assertString(caller: string, name: string, value: unknown): asserts value is string {
+	if (typeof value !== 'string') throw new TypeError(`${caller}: \`${name}\` must be a string, got ${describe(value)}`);
+}
+
+/**
+ * Length of the common prefix of `label` and of `text` from `offset`, whose first code units are known to be equal. Past the end of
+ * either string `charCodeAt` returns `NaN`, which equals nothing, so the loop needs no bound.
+ * @param {string} label - An edge label
+ * @param {string} text - The text being matched
+ * @param {number} offset - Where the label is matched in `text`
+ * @returns {number} The common length, at least 1
+ */
+function commonLength(label: string, text: string, offset: number): number {
+	let length = 1;
+	while (label.charCodeAt(length) === text.charCodeAt(offset + length)) length++;
+	return length;
+}
+
+/**
+ * Copies a label so that it keeps no longer string alive. V8 makes a substring of 13 code units or more a view of the string it was
+ * cut from, so a label sliced from a key would keep the whole key (or the whole text the key was sliced from) in memory after that key
+ * is deleted; concatenating flattens the view into new memory, and the slice is then a view of that copy only.
+ * @param {string} label - A label
+ * @returns {string} The same code units, backed by memory of their own
+ */
+function detach(label: string): string {
+	return label.length < 13 ? label : (label + ' ').slice(0, -1);
+}
+
+/**
+ * Orders trie nodes by the first code unit of their label, descending (siblings never share it).
+ * @param {TrieNode} a - A node
+ * @param {TrieNode} b - Another node
+ * @returns {number} Negative when `a` comes first
+ */
+function byLabelDescending(a: TrieNode, b: TrieNode): number {
+	return b.label.charCodeAt(0) - a.label.charCodeAt(0);
+}
+
+/**
+ * Creates a trie (prefix tree): a map from strings to values that also answers prefix queries: autocomplete (`keysWithPrefix`, which
+ * stops at `limit` results), `hasPrefix`, and `longestPrefixOf(text)` for routing tables, tokenizers and dictionaries.
+ *
+ * It is a radix tree (each edge holds a whole run of code units, so chains without branches are a single node): `get`, `has`, `set` and
+ * `delete` are O(key length) whatever the number of keys, `longestPrefixOf` is O(text length) at most, and a prefix query costs the
+ * prefix length plus the size of the results (a node sorts its children the first time a query or an iteration lists them, and keeps
+ * that order until they change). Memory stays close to the number of keys, not of characters: there are at most two nodes per key, a
+ * node is four fields, and only nodes with children allocate a `Map` (keyed by code unit, so no key, `'__proto__'` included, is ever a
+ * property name) and, once listed, an array of them. Labels hold their own copy of the code units, never a view of a longer string,
+ * so the trie never keeps a deleted key, or the text a key was sliced from, in memory. `delete` prunes the nodes it leaves without keys
+ * and merges the chains it creates, so a trie that shrank is as small as one built with the remaining keys. Nothing is recursive: keys
+ * of any length work.
+ *
+ * - Keys are compared and ordered by UTF-16 code units, as `===`, `startsWith`, `Array.prototype.sort()` and `<` do: iteration and
+ *   prefix queries list keys in the order `[...keys].sort()` would. A prefix may end in the middle of a surrogate pair, and strings are
+ *   not normalized (`'é'` precomposed and decomposed are different keys).
+ * - Iteration and prefix queries return snapshots: changing the trie afterwards does not affect them.
+ * @template V - The value type
+ * @param {Iterable<readonly [string, V]> | null} [entries] - Initial `[key, value]` pairs, set in order
+ * @returns {Trie<V>} A new trie
+ * @throws {TypeError} when `entries` is neither iterable nor `null`/`undefined`, or a key, prefix or text is not a string
+ * @throws {RangeError} when `limit` is not an integer `>= 0` or `Infinity`
+ * @example
+ * const words = createTrie([['car', 1], ['cart', 2], ['care', 3], ['dog', 4]]);
+ * words.keysWithPrefix('car'); // => ['car', 'care', 'cart']
+ * words.keysWithPrefix('ca', { limit: 2 }); // => ['car', 'care']
+ * words.hasPrefix('do'); // => true
+ * words.longestPrefixOf('carton'); // => 'cart'
+ * words.longestPrefixOf('cat'); // => undefined
+ * words.delete('car'); // => true
+ * [...words.keys()]; // => ['care', 'cart', 'dog']
+ * @example
+ * // Longest-prefix routing
+ * const routes = createTrie<string>().set('/api', 'api').set('/api/users', 'users').set('/', 'home');
+ * routes.get(routes.longestPrefixOf('/api/users/42') ?? '/'); // => 'users'
+ * routes.get(routes.longestPrefixOf('/about') ?? '/'); // => 'home'
+ */
+export function createTrie<V>(entries?: Iterable<readonly [string, V]> | null): Trie<V> {
+	const pairs = readEntries('createTrie', entries);
+	// The root is the node of the empty key; its label is always ''.
+	const root: TrieNode = { label: '', value: NO_VALUE, children: undefined, sorted: undefined };
+	let count = 0;
+	// The full key of the node `locate` last returned.
+	let locatedKey: string;
+
+	/**
+	 * Finds the node where `key` ends, if the trie has one (it may hold no value).
+	 * @param {string} key - The key
+	 * @returns {TrieNode | undefined} The node, or `undefined`
+	 */
+	function find(key: string): TrieNode | undefined {
+		let node = root;
+		for (let i = 0; i < key.length;) {
+			const child = node.children?.get(key.charCodeAt(i));
+			if (child === undefined || !key.startsWith(child.label, i)) return undefined;
+			i += child.label.length;
+			node = child;
+		}
+		return node;
+	}
+
+	/**
+	 * Finds the highest node whose key starts with `prefix` (its subtree holds exactly the keys that do) and stores its key in
+	 * `locatedKey` (longer than `prefix` when the prefix ends inside an edge).
+	 * @param {string} prefix - The prefix
+	 * @returns {TrieNode | undefined} The node, or `undefined` when no key starts with `prefix`
+	 */
+	function locate(prefix: string): TrieNode | undefined {
+		let node = root;
+		for (let i = 0; i < prefix.length;) {
+			const child = node.children?.get(prefix.charCodeAt(i));
+			if (child === undefined) return undefined;
+			const label = child.label;
+			const rest = prefix.length - i;
+			if (rest < label.length) {
+				if (commonLength(label, prefix, i) < rest) return undefined;
+				locatedKey = prefix.slice(0, i) + label;
+				return child;
+			}
+			if (!prefix.startsWith(label, i)) return undefined;
+			i += label.length;
+			node = child;
+		}
+		locatedKey = prefix;
+		return node;
+	}
+
+	/**
+	 * Lists something of every key of a subtree in key order (an iterative pre-order walk, children by first code unit), stopping at
+	 * `limit` results.
+	 * @template T - The result element type
+	 * @param {TrieNode | undefined} start - The subtree root (`undefined` for none)
+	 * @param {string} startKey - Its key
+	 * @param {number} limit - The maximum number of results
+	 * @param {(key: string, value: V) => T} pick - Extracts what to collect from a key and its value
+	 * @returns {T[]} The results
+	 */
+	function collect<T>(start: TrieNode | undefined, startKey: string, limit: number, pick: (key: string, value: V) => T): T[] {
+		const result: T[] = [];
+		if (start === undefined || limit === 0) return result;
+		const nodes = [start];
+		const keys = [startKey];
+		while (nodes.length > 0) {
+			const node = nodes.pop() as TrieNode;
+			const key = keys.pop() as string;
+			if (node.value !== NO_VALUE && result.push(pick(key, node.value as V)) === limit) break;
+			if (node.children !== undefined) {
+				// Pushed in descending order, so that the smallest child is visited next.
+				for (const child of (node.sorted ??= Array.from(node.children.values()).sort(byLabelDescending))) {
+					nodes.push(child);
+					keys.push(key + child.label);
+				}
+			}
+		}
+		return result;
+	}
+
+	/**
+	 * Replaces a node without value that has a single child by that child (whose label absorbs the node's), keeping the tree compressed.
+	 * @param {TrieNode} parent - The node's parent
+	 * @param {TrieNode} node - The node
+	 * @returns {void}
+	 */
+	function merge(parent: TrieNode, node: TrieNode): void {
+		const child = (node.children as Map<number, TrieNode>).values().next().value as TrieNode;
+		child.label = node.label + child.label;
+		(parent.children as Map<number, TrieNode>).set(node.label.charCodeAt(0), child);
+		parent.sorted = undefined;
+	}
+
+	/**
+	 * Reads the `limit` of a prefix query.
+	 * @param {string} caller - Name of the method, used in the error message
+	 * @param {TrieQueryOptions} options - The query options
+	 * @returns {number} The limit
+	 * @throws {RangeError} when it is not an integer `>= 0` or `Infinity`
+	 */
+	function readLimit(caller: string, options: TrieQueryOptions): number {
+		const limit = readOption(options, 'limit', Infinity);
+		assertInteger(caller, 'options.limit', limit, 0, true);
+		return limit;
+	}
+
+	/**
+	 * Returns a key itself.
+	 * @param {string} key - The key
+	 * @returns {string} The key
+	 */
+	function keyOf(key: string): string {
+		return key;
+	}
+
+	const trie = {
+		get(key: string): V | undefined {
+			assertString('Trie.get', 'key', key);
+			const value = find(key)?.value;
+			return value === NO_VALUE ? undefined : (value as V | undefined);
+		},
+		has(key: string): boolean {
+			assertString('Trie.has', 'key', key);
+			const node = find(key);
+			return node !== undefined && node.value !== NO_VALUE;
+		},
+		set(key: string, value: V): Trie<V> {
+			assertString('Trie.set', 'key', key);
+			let node = root;
+			for (let i = 0; i < key.length;) {
+				const code = key.charCodeAt(i);
+				let child = node.children?.get(code);
+				if (child === undefined) {
+					// A new leaf holds the rest of the key.
+					child = { label: detach(key.slice(i)), value: NO_VALUE, children: undefined, sorted: undefined };
+					(node.children ??= new Map()).set(code, child);
+					node.sorted = undefined;
+					node = child;
+					break;
+				}
+				const label = child.label;
+				const common = commonLength(label, key, i);
+				if (common < label.length) {
+					// The key leaves (or ends inside) the edge: split it at the divergence.
+					const middle: TrieNode = { label: detach(label.slice(0, common)), value: NO_VALUE, children: new Map(), sorted: undefined };
+					child.label = detach(label.slice(common));
+					(middle.children as Map<number, TrieNode>).set(child.label.charCodeAt(0), child);
+					(node.children as Map<number, TrieNode>).set(code, middle);
+					node.sorted = undefined;
+					child = middle;
+				}
+				i += common;
+				node = child;
+			}
+			if (node.value === NO_VALUE) count++;
+			node.value = value;
+			return trie;
+		},
+		delete(key: string): boolean {
+			assertString('Trie.delete', 'key', key);
+			let grandparent: TrieNode | undefined;
+			let parent: TrieNode | undefined;
+			let node = root;
+			for (let i = 0; i < key.length;) {
+				const child = node.children?.get(key.charCodeAt(i));
+				if (child === undefined || !key.startsWith(child.label, i)) return false;
+				i += child.label.length;
+				grandparent = parent;
+				parent = node;
+				node = child;
+			}
+			if (node.value === NO_VALUE) return false;
+			node.value = NO_VALUE;
+			count--;
+			// Every node but the root holds a value or has two children or more; restore that.
+			if (parent !== undefined) {
+				const children = node.children;
+				if (children === undefined) {
+					const siblings = parent.children as Map<number, TrieNode>;
+					siblings.delete(node.label.charCodeAt(0));
+					parent.sorted = undefined;
+					// A parent left without children holds a value (or is the root): it becomes a leaf.
+					if (siblings.size === 0) parent.children = undefined;
+					else if (grandparent !== undefined && parent.value === NO_VALUE && siblings.size === 1) merge(grandparent, parent);
+				} else if (children.size === 1) merge(parent, node);
+			}
+			return true;
+		},
+		clear(): void {
+			root.value = NO_VALUE;
+			root.children = undefined;
+			root.sorted = undefined;
+			count = 0;
+		},
+		hasPrefix(prefix: string): boolean {
+			assertString('Trie.hasPrefix', 'prefix', prefix);
+			// Every node below the root leads to a key; only the root can be empty.
+			return count > 0 && locate(prefix) !== undefined;
+		},
+		keysWithPrefix(prefix: string, options: TrieQueryOptions = {}): string[] {
+			assertString('Trie.keysWithPrefix', 'prefix', prefix);
+			const limit = readLimit('Trie.keysWithPrefix', options);
+			const start = locate(prefix);
+			return collect(start, locatedKey, limit, keyOf);
+		},
+		entriesWithPrefix(prefix: string, options: TrieQueryOptions = {}): Array<[string, V]> {
+			assertString('Trie.entriesWithPrefix', 'prefix', prefix);
+			const limit = readLimit('Trie.entriesWithPrefix', options);
+			const start = locate(prefix);
+			return collect<[string, V]>(start, locatedKey, limit, pairOf);
+		},
+		longestPrefixOf(text: string): string | undefined {
+			assertString('Trie.longestPrefixOf', 'text', text);
+			let node = root;
+			let longest = root.value === NO_VALUE ? -1 : 0;
+			for (let i = 0; i < text.length;) {
+				const child = node.children?.get(text.charCodeAt(i));
+				if (child === undefined || !text.startsWith(child.label, i)) break;
+				i += child.label.length;
+				node = child;
+				if (node.value !== NO_VALUE) longest = i;
+			}
+			return longest < 0 ? undefined : text.slice(0, longest);
+		},
+		keys(): IterableIterator<string> {
+			return collect(root, '', Infinity, keyOf).values();
+		},
+		values(): IterableIterator<V> {
+			return collect(root, '', Infinity, function (_, value: V): V {
+				return value;
+			}).values();
+		},
+		entries(): IterableIterator<[string, V]> {
+			return collect<[string, V]>(root, '', Infinity, pairOf).values();
+		},
+		[Symbol.iterator](): IterableIterator<[string, V]> {
+			return collect<[string, V]>(root, '', Infinity, pairOf).values();
+		}
+	} as Trie<V>;
+
+	Object.defineProperties(trie, {
+		[SIZE]: {
+			value: function (): number {
+				return count;
+			}
+		},
+		size: { get: getSize, enumerable: true, configurable: true }
+	});
+
+	if (pairs !== undefined) for (const [key, value] of pairs) trie.set(key, value);
+
+	return trie;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// createBloomFilter
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Options of {@link createBloomFilter} that size the filter from the number of items it should hold.
+ */
+export interface BloomFilterSizingOptions {
+	/** How many distinct items the filter should hold at the target false-positive rate (an integer `>= 1`). */
+	expectedItems: number;
+	/**
+	 * The false-positive rate to reach with `expectedItems` items (a number in `(0, 1)`). Each halving costs about 1.44 bits per item.
+	 * @default 0.01
+	 */
+	falsePositiveRate?: number;
+	bits?: never;
+	hashes?: never;
+	data?: never;
+}
+
+/**
+ * Options of {@link createBloomFilter} that give the filter's geometry explicitly, optionally with its content (from `toBytes()`).
+ */
+export interface BloomFilterGeometryOptions {
+	/** The number of bits (an integer between 1 and 2³¹, rounded up to a multiple of 32). */
+	bits: number;
+	/** The number of bit positions per item (an integer between 1 and 256). */
+	hashes: number;
+	/** The filter's bits, as returned by `toBytes()` of a filter with the same `bits` and `hashes` (`bits / 8` bytes). Copied. */
+	data?: Uint8Array;
+	expectedItems?: never;
+	falsePositiveRate?: never;
+}
+
+/**
+ * Options accepted by {@link createBloomFilter}: either the sizing (`expectedItems`, `falsePositiveRate`) or the geometry (`bits`,
+ * `hashes`, and optionally `data`).
+ */
+export type BloomFilterOptions = BloomFilterSizingOptions | BloomFilterGeometryOptions;
+
+/**
+ * A Bloom filter over strings, as returned by {@link createBloomFilter}.
+ */
+export interface BloomFilter {
+	/** The number of bits (a multiple of 32). */
+	readonly bits: number;
+	/** The number of bit positions per item. */
+	readonly hashes: number;
+	/** Adds an item; returns `true` when it set at least one bit, which proves the item had never been added (a `false` means "probably"). */
+	add(item: string): boolean;
+	/** Whether the item may have been added: `false` is certain, `true` is wrong with a probability of about `estimatedFalsePositiveRate()`. */
+	has(item: string): boolean;
+	/** The probability that `has` answers `true` for an item never added, from the current fill: `(set bits / bits) ** hashes`. O(1). */
+	estimatedFalsePositiveRate(): number;
+	/** An estimate of the number of distinct items added, from the current fill (Swamidass & Baldi); `Infinity` once every bit is set. O(1). */
+	estimatedSize(): number;
+	/** The bits as `bits / 8` bytes (bit `i` is bit `i % 8` of byte `i >> 3`, whatever the platform's endianness), to persist or send. */
+	toBytes(): Uint8Array;
+	/** Removes every item. */
+	clear(): void;
+}
+
+/** Largest number of bits of a Bloom filter (256 MiB): positions come from 31-bit hashes. */
+const MAX_BITS = 2 ** 31;
+
+/** Largest number of hashes of a Bloom filter (the optimal number only reaches it for false-positive rates below about 1e-77). */
+const MAX_HASHES = 256;
+
+/** The second hash returned by the last {@link murmurPair} call. */
+let murmurSecond = 0;
+
+/**
+ * The MurmurHash3 (x86, 32-bit) finalizer, which makes every input bit affect every output bit, keeping the top 31 bits: a
+ * non-negative 32-bit integer keeps the `%` that maps it to a bit position on the fast integer path (a hash above 2³¹ would be a double).
+ * @param {number} hash - The state
+ * @returns {number} The top 31 bits of the final hash
+ */
+function fmix31(hash: number): number {
+	hash = Math.imul(hash ^ (hash >>> 16), 0x85ebca6b);
+	hash = Math.imul(hash ^ (hash >>> 13), 0xc2b2ae35);
+	return (hash ^ (hash >>> 16)) >>> 1;
+}
+
+/**
+ * Two independent hashes of a string in one pass: the top 31 bits of MurmurHash3 x86_32 of its UTF-16LE bytes (two code units per
+ * block) with the seeds `0` and `0x9747b28c`. The second is left in {@link murmurSecond}.
+ * @param {string} text - The string
+ * @returns {number} The first hash, in `[0, 2³¹)`
+ */
+function murmurPair(text: string): number {
+	const length = text.length;
+	let first = 0;
+	let second = 0x9747b28c;
+	let i = 0;
+	for (; i + 1 < length; i += 2) {
+		let block = Math.imul(text.charCodeAt(i) | (text.charCodeAt(i + 1) << 16), 0xcc9e2d51);
+		block = Math.imul((block << 15) | (block >>> 17), 0x1b873593);
+		first ^= block;
+		first = (Math.imul((first << 13) | (first >>> 19), 5) + 0xe6546b64) | 0;
+		second ^= block;
+		second = (Math.imul((second << 13) | (second >>> 19), 5) + 0xe6546b64) | 0;
+	}
+	// The last two bytes, for an odd number of code units (otherwise `charCodeAt` returns `NaN`, the block is 0 and changes nothing).
+	let block = Math.imul(text.charCodeAt(i), 0xcc9e2d51);
+	block = Math.imul((block << 15) | (block >>> 17), 0x1b873593);
+	first ^= block;
+	second ^= block;
+	murmurSecond = fmix31(second ^ (length * 2));
+	return fmix31(first ^ (length * 2));
+}
+
+/**
+ * Number of set bits of a 32-bit integer.
+ * @param {number} word - The integer
+ * @returns {number} Its population count
+ */
+function popcount(word: number): number {
+	word -= (word >>> 1) & 0x55555555;
+	word = (word & 0x33333333) + ((word >>> 2) & 0x33333333);
+	return Math.imul((word + (word >>> 4)) & 0x0f0f0f0f, 0x01010101) >>> 24;
+}
+
+/**
+ * Creates a Bloom filter: a set of strings in a fixed, small amount of memory (about 9.6 bits per item at 1% false positives, whatever
+ * the length of the strings) that answers "definitely not added" or "probably added". It suits caches of negative lookups, "seen
+ * before?" checks over large streams, or deciding whether a slow lookup is worth making. Items cannot be removed, and the filter never
+ * holds the items themselves.
+ *
+ * - Sizing: with `{ expectedItems: n, falsePositiveRate: p }` the filter takes the optimal `m = ⌈-n ln p / (ln 2)²⌉` bits (rounded up
+ *   to a multiple of 32) and `k = round(m / n · ln 2)` hashes, so that after `n` distinct items about a fraction `p` of the items never
+ *   added test positive; beyond `n` the rate climbs (see `estimatedFalsePositiveRate()`). `{ bits, hashes }` sets them directly.
+ * - Hashing: the `k` bit positions come from two MurmurHash3 x86_32 hashes of the UTF-16LE code units (seeds `0` and `0x9747b28c`, top
+ *   31 bits of each, reduced modulo `m`), combined by enhanced double hashing (Kirsch & Mitzenmacher; Dillinger & Manolios: positions
+ *   `x`, `x + y`, `x + 2y + 1`, `x + 3y + 4`… mod `m`), so an `add` or `has` costs one pass over the string plus `k` bit operations,
+ *   and allocates nothing. Two independent hashes matter: with a single 32-bit hash, each item would collide with one of a few
+ *   billion values, a floor of `n / 2³²` false positives that no size can lower. Strings are not normalized (`'é'`
+ *   precomposed and decomposed are different items). The hash is fixed: it is part of the format of `toBytes()`.
+ * - Not for adversarial input: anyone who knows the hash can craft items that test positive, or that fill the filter.
+ * - `toBytes()` and `createBloomFilter({ bits, hashes, data })` save and restore a filter (or send it to another process).
+ * @param {BloomFilterOptions} options - `{ expectedItems, falsePositiveRate }` (default rate `0.01`), or `{ bits, hashes, data }`
+ * @returns {BloomFilter} A new filter
+ * @throws {TypeError} when `options` is not an object, mixes both forms, an option has the wrong type, `data` is not a `Uint8Array`, or
+ * (from `add`/`has`) the item is not a string
+ * @throws {RangeError} when `expectedItems` is not an integer `>= 1`, `falsePositiveRate` is not in `(0, 1)`, the sizing needs more than
+ * 2³¹ bits (256 MiB), `bits` is not an integer between 1 and 2³¹, `hashes` is not an integer between 1 and 256, or `data` does not hold
+ * `bits / 8` bytes
+ * @example
+ * const seen = createBloomFilter({ expectedItems: 1000, falsePositiveRate: 0.01 });
+ * [seen.bits, seen.hashes]; // => [9600, 7]
+ * seen.add('alice'); // => true // a bit changed: 'alice' was certainly new
+ * seen.add('alice'); // => false
+ * seen.has('alice'); // => true
+ * seen.has('bob'); // => false // certain
+ * seen.estimatedSize(); // => 1
+ * @example
+ * // Save and restore
+ * import { toBase64, fromBase64 } from 'tinkit/encoding';
+ * const filter = createBloomFilter({ bits: 1024, hashes: 4 });
+ * filter.add('x');
+ * const saved = { bits: filter.bits, hashes: filter.hashes, data: toBase64(filter.toBytes()) };
+ * const restored = createBloomFilter({ bits: saved.bits, hashes: saved.hashes, data: fromBase64(saved.data) });
+ * restored.has('x'); // => true
+ * createBloomFilter({ expectedItems: 100, falsePositiveRate: 1 }); // throws RangeError
+ */
+export function createBloomFilter(options: BloomFilterOptions): BloomFilter {
+	if (typeof options !== 'object' || options === null) throw new TypeError(`createBloomFilter: \`options\` must be an object, got ${describe(options)}`);
+	const settings = options as { bits?: number; hashes?: number; data?: Uint8Array; expectedItems?: number; falsePositiveRate?: number };
+	// Each option is read once.
+	const geometry = readOption(settings, 'bits');
+	const items = readOption(settings, 'expectedItems') as number;
+	const rate = readOption(settings, 'falsePositiveRate');
+	let hashes = readOption(settings, 'hashes') as number;
+	const data = readOption(settings, 'data');
+	let bits: number;
+
+	if (geometry === undefined) {
+		if (hashes !== undefined || data !== undefined) throwMixed();
+		const target = rate === undefined ? 0.01 : rate;
+		assertInteger('createBloomFilter', 'expectedItems', items, 1);
+		assertNumber('createBloomFilter', 'falsePositiveRate', target, target > 0 && target < 1, 'a number between 0 and 1 (exclusive)');
+		bits = Math.ceil((-items * Math.log(target)) / (Math.LN2 * Math.LN2) / 32) * 32;
+		if (bits > MAX_BITS) throw new RangeError(`createBloomFilter: ${items} items at a false-positive rate of ${target} need ${bits} bits, more than ${MAX_BITS}`);
+		hashes = Math.min(MAX_HASHES, Math.max(1, Math.round((bits / items) * Math.LN2)));
+	} else {
+		if (items !== undefined || rate !== undefined) throwMixed();
+		assertNumber('createBloomFilter', 'bits', geometry, Number.isInteger(geometry) && geometry >= 1 && geometry <= MAX_BITS, `an integer between 1 and ${MAX_BITS}`);
+		assertNumber('createBloomFilter', 'hashes', hashes, Number.isInteger(hashes) && hashes >= 1 && hashes <= MAX_HASHES, `an integer between 1 and ${MAX_HASHES}`);
+		bits = Math.ceil(geometry / 32) * 32;
+	}
+
+	let words: Uint32Array;
+	let setBits = 0;
+	if (data === undefined) words = new Uint32Array(bits / 32);
+	else {
+		const tag = (Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag) as PropertyDescriptor).get as () => unknown;
+		if (tag.call(data) !== 'Uint8Array') throw new TypeError(`createBloomFilter: \`data\` must be a Uint8Array, got ${describe(data)}`);
+		// Copied through the internal slots of `data` (its length and bytes), never through its properties, which own ones could shadow.
+		const bytes = new Uint8Array(data);
+		if (bytes.length !== bits / 8) throw new RangeError(`createBloomFilter: \`data\` must hold ${bits / 8} bytes (bits / 8), got ${bytes.length}`);
+		// The copy becomes the words: each is decoded from little-endian in place (which changes nothing on a little-endian platform).
+		words = new Uint32Array(bytes.buffer);
+		const view = new DataView(bytes.buffer);
+		for (let word = 0; word < words.length; word++) {
+			words[word] = view.getUint32(word * 4, true);
+			setBits += popcount(words[word]);
+		}
+	}
+
+	return {
+		bits,
+		hashes,
+		add(item: string): boolean {
+			assertString('BloomFilter.add', 'item', item);
+			let position = murmurPair(item) % bits;
+			let step = murmurSecond % bits;
+			let added = false;
+			for (let i = 1; i <= hashes; i++) {
+				const word = position >>> 5;
+				const mask = 1 << (position & 31);
+				if ((words[word] & mask) === 0) {
+					words[word] |= mask;
+					setBits++;
+					added = true;
+				}
+				// Enhanced double hashing: positions h1, h1 + h2, h1 + 2 h2 + 1, … (mod bits).
+				position += step;
+				if (position >= bits) position -= bits;
+				step += i;
+				if (step >= bits) step %= bits;
+			}
+			return added;
+		},
+		has(item: string): boolean {
+			assertString('BloomFilter.has', 'item', item);
+			let position = murmurPair(item) % bits;
+			let step = murmurSecond % bits;
+			for (let i = 1; i <= hashes; i++) {
+				if ((words[position >>> 5] & (1 << (position & 31))) === 0) return false;
+				position += step;
+				if (position >= bits) position -= bits;
+				step += i;
+				if (step >= bits) step %= bits;
+			}
+			return true;
+		},
+		estimatedFalsePositiveRate(): number {
+			return (setBits / bits) ** hashes;
+		},
+		estimatedSize(): number {
+			return Math.round((bits / hashes) * -Math.log1p(-setBits / bits));
+		},
+		toBytes(): Uint8Array {
+			const bytes = new Uint8Array(bits / 8);
+			const view = new DataView(bytes.buffer);
+			// Little-endian words: bit `i` is bit `i % 8` of byte `i >> 3`.
+			for (let word = 0; word < words.length; word++) view.setUint32(word * 4, words[word], true);
+			return bytes;
+		},
+		clear(): void {
+			words.fill(0);
+			setBits = 0;
+		}
+	};
+}
+
+/**
+ * Throws the error of a Bloom filter configured with both forms of options.
+ * @returns {never} Never returns
+ * @throws {TypeError} always
+ */
+function throwMixed(): never {
+	throw new TypeError('createBloomFilter: pass either `expectedItems` (and `falsePositiveRate`) or `bits` and `hashes` (and `data`), not both');
+}

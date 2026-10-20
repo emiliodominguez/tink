@@ -1,6 +1,23 @@
 import fc from 'fast-check';
 import { memoize } from '../functions/index.js';
-import { createDeque, createLRUCache, createPriorityQueue, type LRUCache, type LRUEvictionReason } from '.';
+import {
+	createBiMap,
+	createBloomFilter,
+	createDefaultMap,
+	createDeque,
+	createLRUCache,
+	createMultiMap,
+	createPriorityQueue,
+	createRingBuffer,
+	createTrie,
+	type BiMap,
+	type DefaultMap,
+	type LRUCache,
+	type LRUEvictionReason,
+	type MultiMap,
+	type RingBuffer,
+	type Trie
+} from '.';
 
 type Key = number;
 type Value = number;
@@ -403,6 +420,720 @@ describe('createDeque (properties)', function () {
 					expect([...deque]).toEqual(model);
 				}
 			)
+		);
+	});
+});
+
+/** SameValueZero, the equality of `Map` keys and `Set` values. */
+function sameValueZero(a: unknown, b: unknown): boolean {
+	return a === b || (a !== a && b !== b);
+}
+
+/** A `-0` becomes `0`, as `Map` stores keys. */
+function normalizeZero<T>(value: T): T {
+	return (Object.is(value, -0) ? 0 : value) as T;
+}
+
+/** Builds a model-based-testing command that checks the whole observable state after running. */
+function modelCommand<M extends object, R>(label: string, apply: (model: M, real: R) => void, check: (model: M, real: R) => void): fc.Command<M, R> {
+	return {
+		check: function (): boolean {
+			return true;
+		},
+		run: function (model: M, real: R): void {
+			apply(model, real);
+			check(model, real);
+		},
+		toString: function (): string {
+			return label;
+		}
+	};
+}
+
+describe('createRingBuffer (properties)', function () {
+	interface RingModel {
+		capacity: number;
+		values: number[];
+		evicted: number[];
+	}
+	interface RingReal {
+		buffer: RingBuffer<number>;
+		evicted: number[];
+	}
+
+	function check(model: RingModel, real: RingReal): void {
+		expect(real.buffer.toArray()).toEqual(model.values);
+		expect([...real.buffer]).toEqual(model.values);
+		expect(real.buffer.size).toBe(model.values.length);
+		expect(real.buffer.full).toBe(model.values.length === model.capacity);
+		expect(real.buffer.peekFirst()).toBe(model.values[0]);
+		expect(real.buffer.peekLast()).toBe(model.values[model.values.length - 1]);
+		expect(real.evicted).toEqual(model.evicted);
+	}
+
+	const commands = [
+		fc.integer().map(function (value) {
+			return modelCommand<RingModel, RingReal>(
+				`push(${value})`,
+				function (model, real) {
+					model.values.push(value);
+					if (model.values.length > model.capacity) model.evicted.push(model.values.shift() as number);
+					expect(real.buffer.push(value)).toBe(model.values.length);
+				},
+				check
+			);
+		}),
+		fc.constant(
+			modelCommand<RingModel, RingReal>(
+				'shift()',
+				function (model, real) {
+					expect(real.buffer.shift()).toBe(model.values.shift());
+				},
+				check
+			)
+		),
+		fc.integer({ min: -12, max: 12 }).map(function (index) {
+			return modelCommand<RingModel, RingReal>(
+				`at(${index})`,
+				function (model, real) {
+					expect(real.buffer.at(index)).toBe(model.values.at(index));
+				},
+				check
+			);
+		}),
+		fc.constant(
+			modelCommand<RingModel, RingReal>(
+				'clear()',
+				function (model, real) {
+					model.values = [];
+					real.buffer.clear();
+				},
+				check
+			)
+		)
+	];
+
+	it('behaves like an array trimmed to the capacity from the front, reporting every overwritten value', function () {
+		fc.assert(
+			fc.property(fc.integer({ min: 1, max: 8 }), fc.commands(commands, { size: '+1' }), function (capacity, cmds) {
+				fc.modelRun(function () {
+					const evicted: number[] = [];
+					const buffer = createRingBuffer<number>(capacity, {
+						onEvict: function (value) {
+							evicted.push(value);
+						}
+					});
+					return { model: { capacity, values: [], evicted: [] }, real: { buffer, evicted } };
+				}, cmds);
+			}),
+			{ numRuns: 300 }
+		);
+	});
+
+	it('holds the last `capacity` pushed values, like a deque with the same capacity', function () {
+		fc.assert(
+			fc.property(fc.integer({ min: 1, max: 20 }), fc.array(fc.integer(), { maxLength: 80 }), function (capacity, values) {
+				const buffer = createRingBuffer<number>(capacity);
+				const deque = createDeque<number>(null, { capacity });
+				for (const value of values) {
+					buffer.push(value);
+					deque.pushBack(value);
+				}
+				expect(buffer.toArray()).toEqual(values.slice(Math.max(0, values.length - capacity)));
+				expect(buffer.toArray()).toEqual([...deque]);
+			})
+		);
+	});
+});
+
+describe('createDefaultMap (properties)', function () {
+	interface DefaultModel {
+		map: Map<number, string>;
+		calls: number[];
+	}
+	interface DefaultReal {
+		map: DefaultMap<number, string>;
+		calls: number[];
+	}
+
+	function check(model: DefaultModel, real: DefaultReal): void {
+		expect([...real.map]).toEqual([...model.map]);
+		expect([...real.map.keys()]).toEqual([...model.map.keys()]);
+		expect([...real.map.values()]).toEqual([...model.map.values()]);
+		expect(real.map.size).toBe(model.map.size);
+		expect(real.calls).toEqual(model.calls);
+	}
+
+	const defaultKeyArb = fc.constantFrom(0, -0, 1, 2, 3, NaN);
+	const commands = [
+		defaultKeyArb.map(function (key) {
+			return modelCommand<DefaultModel, DefaultReal>(
+				`get(${key})`,
+				function (model, real) {
+					if (!model.map.has(key)) {
+						// The factory gets the key as the map stores it.
+						model.calls.push(normalizeZero(key));
+						model.map.set(key, `made ${key}`);
+					}
+					expect(real.map.get(key)).toBe(model.map.get(key));
+				},
+				check
+			);
+		}),
+		defaultKeyArb.map(function (key) {
+			return modelCommand<DefaultModel, DefaultReal>(
+				`peek/has(${key})`,
+				function (model, real) {
+					expect(real.map.peek(key)).toBe(model.map.get(key));
+					expect(real.map.has(key)).toBe(model.map.has(key));
+				},
+				check
+			);
+		}),
+		fc.tuple(defaultKeyArb, fc.option(fc.string({ maxLength: 2 }), { nil: undefined })).map(function ([key, value]) {
+			return modelCommand<DefaultModel, DefaultReal>(
+				`set(${key}, ${JSON.stringify(value)})`,
+				function (model, real) {
+					model.map.set(key, value as string);
+					expect(real.map.set(key, value as string)).toBe(real.map);
+				},
+				check
+			);
+		}),
+		defaultKeyArb.map(function (key) {
+			return modelCommand<DefaultModel, DefaultReal>(
+				`delete(${key})`,
+				function (model, real) {
+					expect(real.map.delete(key)).toBe(model.map.delete(key));
+				},
+				check
+			);
+		}),
+		fc.constant(
+			modelCommand<DefaultModel, DefaultReal>(
+				'clear()',
+				function (model, real) {
+					model.map.clear();
+					real.map.clear();
+				},
+				check
+			)
+		)
+	];
+
+	it('behaves like a Map that calls the factory exactly on the misses of `get` (a stored undefined is a hit)', function () {
+		fc.assert(
+			fc.property(fc.commands(commands, { size: '+1' }), function (cmds) {
+				fc.modelRun(function () {
+					const calls: number[] = [];
+					const map = createDefaultMap<number, string>(function (key) {
+						calls.push(key);
+						return `made ${key}`;
+					});
+					return { model: { map: new Map(), calls: [] }, real: { map, calls } };
+				}, cmds);
+			}),
+			{ numRuns: 300 }
+		);
+	});
+});
+
+describe('createBiMap (properties)', function () {
+	type Side = number;
+	/** Naive model: the pairs in the order of each direction, as arrays scanned linearly. */
+	interface BiModel {
+		forward: Array<[Side, Side]>;
+		backward: Array<[Side, Side]>;
+	}
+	interface BiReal {
+		map: BiMap<Side, Side>;
+	}
+
+	/** `set(key, value)` on a naive ordered list of pairs: the pair of `value` leaves, the pair of `key` changes in place (or is appended). */
+	function pairsSet(pairs: Array<[Side, Side]>, key: Side, value: Side): Array<[Side, Side]> {
+		const result = pairs.filter(function ([k, v]) {
+			return sameValueZero(k, key) || !sameValueZero(v, value);
+		});
+		const index = result.findIndex(function ([k]) {
+			return sameValueZero(k, key);
+		});
+		if (index >= 0) result[index] = [result[index][0], normalizeZero(value)];
+		else result.push([normalizeZero(key), normalizeZero(value)]);
+		return result;
+	}
+
+	/** Removes the pair of `key` from both lists of a model. */
+	function modelDelete(model: BiModel, key: Side): boolean {
+		const index = model.forward.findIndex(function ([k]) {
+			return sameValueZero(k, key);
+		});
+		if (index < 0) return false;
+		const [, value] = model.forward[index];
+		model.forward.splice(index, 1);
+		model.backward = model.backward.filter(function ([v]) {
+			return !sameValueZero(v, value);
+		});
+		return true;
+	}
+
+	function check(model: BiModel, real: BiReal): void {
+		expect([...real.map]).toEqual(model.forward);
+		expect([...real.map.keys()]).toEqual(
+			model.forward.map(function ([k]) {
+				return k;
+			})
+		);
+		expect([...real.map.values()]).toEqual(
+			model.forward.map(function ([, v]) {
+				return v;
+			})
+		);
+		expect([...real.map.inverse.entries()]).toEqual(model.backward);
+		expect(real.map.size).toBe(model.forward.length);
+		expect(real.map.inverse.size).toBe(model.forward.length);
+		// A bijection: every pair reads the same in both directions.
+		for (const [key, value] of model.forward) {
+			expect(real.map.get(key)).toBe(value);
+			expect(real.map.getKey(value)).toBe(key);
+			expect(real.map.has(key) && real.map.hasValue(value)).toBe(true);
+		}
+		expect(new Set(model.backward.map(String))).toEqual(
+			new Set(
+				model.forward.map(function ([k, v]) {
+					return String([v, k]);
+				})
+			)
+		);
+	}
+
+	const sideArb = fc.constantFrom(0, -0, 1, 2, 3, NaN);
+	const commands = [
+		fc.tuple(sideArb, sideArb, fc.boolean()).map(function ([key, value, inverse]) {
+			return modelCommand<BiModel, BiReal>(
+				inverse ? `inverse.set(${value}, ${key})` : `set(${key}, ${value})`,
+				function (model, real) {
+					model.forward = pairsSet(model.forward, key, value);
+					model.backward = pairsSet(model.backward, value, key);
+					if (inverse) expect(real.map.inverse.set(value, key)).toBe(real.map.inverse);
+					else expect(real.map.set(key, value)).toBe(real.map);
+				},
+				check
+			);
+		}),
+		fc.tuple(sideArb, fc.boolean()).map(function ([side, byValue]) {
+			return modelCommand<BiModel, BiReal>(
+				byValue ? `deleteValue(${side})` : `delete(${side})`,
+				function (model, real) {
+					if (byValue) {
+						const flipped: BiModel = { forward: model.backward, backward: model.forward };
+						const expected = modelDelete(flipped, side);
+						model.forward = flipped.backward;
+						model.backward = flipped.forward;
+						expect(real.map.deleteValue(side)).toBe(expected);
+					} else expect(real.map.delete(side)).toBe(modelDelete(model, side));
+				},
+				check
+			);
+		}),
+		sideArb.map(function (side) {
+			return modelCommand<BiModel, BiReal>(
+				`lookups(${side})`,
+				function (model, real) {
+					const pair = model.forward.find(function ([k]) {
+						return sameValueZero(k, side);
+					});
+					const inverse = model.backward.find(function ([v]) {
+						return sameValueZero(v, side);
+					});
+					expect(real.map.get(side)).toBe(pair?.[1]);
+					expect(real.map.has(side)).toBe(pair !== undefined);
+					expect(real.map.getKey(side)).toBe(inverse?.[1]);
+					expect(real.map.hasValue(side)).toBe(inverse !== undefined);
+					expect(real.map.inverse.get(side)).toBe(inverse?.[1]);
+					expect(real.map.inverse.getKey(side)).toBe(pair?.[1]);
+				},
+				check
+			);
+		}),
+		fc.constant(
+			modelCommand<BiModel, BiReal>(
+				'clear()',
+				function (model, real) {
+					model.forward = [];
+					model.backward = [];
+					real.map.inverse.clear();
+				},
+				check
+			)
+		)
+	];
+
+	it('stays a bijection that matches naive ordered pair lists in both directions', function () {
+		fc.assert(
+			fc.property(fc.commands(commands, { size: '+1' }), function (cmds) {
+				fc.modelRun(function () {
+					return { model: { forward: [], backward: [] }, real: { map: createBiMap<Side, Side>() } };
+				}, cmds);
+			}),
+			{ numRuns: 300 }
+		);
+	});
+
+	it('built from pairs, equals the pairs set one by one', function () {
+		fc.assert(
+			fc.property(fc.array(fc.tuple(fc.integer({ min: 0, max: 5 }), fc.integer({ min: 0, max: 5 })), { maxLength: 20 }), function (pairs) {
+				const built = createBiMap(pairs);
+				const stepwise = createBiMap<number, number>();
+				for (const [key, value] of pairs) stepwise.set(key, value);
+				expect([...built]).toEqual([...stepwise]);
+				expect([...built.inverse]).toEqual([...stepwise.inverse]);
+				expect(new Set(built.values()).size).toBe(built.size);
+			})
+		);
+	});
+});
+
+describe('createMultiMap (properties)', function () {
+	/** Naive model: groups in key order, as an array of `[key, values]` scanned linearly. */
+	interface MultiModel {
+		unique: boolean;
+		groups: Array<[number, number[]]>;
+	}
+	interface MultiReal {
+		map: MultiMap<number, number>;
+	}
+
+	function groupOf(model: MultiModel, key: number): [number, number[]] | undefined {
+		return model.groups.find(function ([k]) {
+			return sameValueZero(k, key);
+		});
+	}
+
+	function holds(values: number[], value: number): boolean {
+		return values.some(function (v) {
+			return sameValueZero(v, value);
+		});
+	}
+
+	function check(model: MultiModel, real: MultiReal): void {
+		const pairs: Array<[number, number]> = [];
+		for (const [key, values] of model.groups) for (const value of values) pairs.push([key, value]);
+		expect([...real.map]).toEqual(pairs);
+		expect([...real.map.entries()]).toEqual(pairs);
+		expect([...real.map.values()]).toEqual(
+			pairs.map(function ([, v]) {
+				return v;
+			})
+		);
+		expect([...real.map.keys()]).toEqual(
+			model.groups.map(function ([k]) {
+				return k;
+			})
+		);
+		expect(real.map.size).toBe(pairs.length);
+		expect(real.map.keyCount).toBe(model.groups.length);
+		for (const [key, values] of model.groups) {
+			expect(real.map.get(key)).toEqual(values);
+			expect(real.map.count(key)).toBe(values.length);
+		}
+	}
+
+	const groupKeyArb = fc.constantFrom(0, -0, 1, 2, NaN);
+	const groupValueArb = fc.constantFrom(0, -0, 1, 2, NaN);
+	const commands = [
+		fc.tuple(groupKeyArb, groupValueArb).map(function ([key, value]) {
+			return modelCommand<MultiModel, MultiReal>(
+				`add(${key}, ${value})`,
+				function (model, real) {
+					const group = groupOf(model, key);
+					// `Set` stores -0 as 0; a list keeps the value as given.
+					const stored = model.unique ? normalizeZero(value) : value;
+					let added = true;
+					if (group === undefined) model.groups.push([normalizeZero(key), [stored]]);
+					else if (model.unique && holds(group[1], value)) added = false;
+					else group[1].push(stored);
+					expect(real.map.add(key, value)).toBe(added);
+				},
+				check
+			);
+		}),
+		fc.tuple(groupKeyArb, fc.option(groupValueArb, { nil: undefined })).map(function ([key, value]) {
+			return modelCommand<MultiModel, MultiReal>(
+				value === undefined ? `delete(${key})` : `delete(${key}, ${value})`,
+				function (model, real) {
+					const group = groupOf(model, key);
+					let removed = false;
+					if (group !== undefined) {
+						if (value === undefined) removed = true;
+						else {
+							const index = group[1].findIndex(function (v) {
+								return sameValueZero(v, value);
+							});
+							if (index >= 0) {
+								group[1].splice(index, 1);
+								removed = true;
+							}
+						}
+						if (value === undefined || group[1].length === 0) model.groups.splice(model.groups.indexOf(group), 1);
+					}
+					expect(value === undefined ? real.map.delete(key) : real.map.delete(key, value)).toBe(removed);
+				},
+				check
+			);
+		}),
+		fc.tuple(groupKeyArb, groupValueArb).map(function ([key, value]) {
+			return modelCommand<MultiModel, MultiReal>(
+				`has(${key}, ${value})`,
+				function (model, real) {
+					const group = groupOf(model, key);
+					expect(real.map.has(key)).toBe(group !== undefined);
+					expect(real.map.has(key, value)).toBe(group !== undefined && holds(group[1], value));
+					expect(real.map.get(key)).toEqual(group === undefined ? [] : group[1]);
+					expect(real.map.count(key)).toBe(group === undefined ? 0 : group[1].length);
+				},
+				check
+			);
+		}),
+		fc.constant(
+			modelCommand<MultiModel, MultiReal>(
+				'clear()',
+				function (model, real) {
+					model.groups = [];
+					real.map.clear();
+				},
+				check
+			)
+		)
+	];
+
+	it('matches a naive list of groups, with lists or sets of values', function () {
+		fc.assert(
+			fc.property(fc.boolean(), fc.commands(commands, { size: '+1' }), function (unique, cmds) {
+				fc.modelRun(function () {
+					return { model: { unique, groups: [] }, real: { map: createMultiMap<number, number>(null, { unique }) } };
+				}, cmds);
+			}),
+			{ numRuns: 300 }
+		);
+	});
+});
+
+describe('createTrie (properties)', function () {
+	interface TrieModel {
+		map: Map<string, number | undefined>;
+	}
+	interface TrieReal {
+		trie: Trie<number | undefined>;
+	}
+
+	/** Every model key starting with `prefix`, in code-unit order. */
+	function withPrefix(model: TrieModel, prefix: string): string[] {
+		return [...model.map.keys()]
+			.filter(function (key) {
+				return key.startsWith(prefix);
+			})
+			.sort();
+	}
+
+	function check(model: TrieModel, real: TrieReal): void {
+		const keys = [...model.map.keys()].sort();
+		expect([...real.trie.keys()]).toEqual(keys);
+		expect([...real.trie]).toEqual(
+			keys.map(function (key) {
+				return [key, model.map.get(key)];
+			})
+		);
+		expect([...real.trie.values()]).toEqual(
+			keys.map(function (key) {
+				return model.map.get(key);
+			})
+		);
+		expect(real.trie.size).toBe(model.map.size);
+	}
+
+	// A small alphabet makes keys share prefixes (splits and merges); a surrogate pair and its halves split code points.
+	const unit = fc.constantFrom('a', 'b', 'c', '\u{1F600}', '\uD83D', '\uDE00', '_');
+	const trieKeyArb = fc.oneof({ arbitrary: fc.string({ unit, maxLength: 6 }), weight: 5 }, { arbitrary: fc.constantFrom('__proto__', 'constructor', ''), weight: 1 });
+	const textArb = fc.oneof(fc.string({ unit, maxLength: 9 }), fc.constantFrom('__proto__x', 'constructor'));
+	const commands = [
+		fc.tuple(trieKeyArb, fc.option(fc.integer({ min: 0, max: 9 }), { nil: undefined, freq: 8 })).map(function ([key, value]) {
+			return modelCommand<TrieModel, TrieReal>(
+				`set(${JSON.stringify(key)}, ${value})`,
+				function (model, real) {
+					model.map.set(key, value);
+					expect(real.trie.set(key, value)).toBe(real.trie);
+				},
+				check
+			);
+		}),
+		trieKeyArb.map(function (key) {
+			return modelCommand<TrieModel, TrieReal>(
+				`delete(${JSON.stringify(key)})`,
+				function (model, real) {
+					expect(real.trie.delete(key)).toBe(model.map.delete(key));
+				},
+				check
+			);
+		}),
+		fc.tuple(textArb, fc.option(fc.integer({ min: 0, max: 4 }), { nil: undefined })).map(function ([text, limit]) {
+			return modelCommand<TrieModel, TrieReal>(
+				`queries(${JSON.stringify(text)}, limit=${String(limit)})`,
+				function (model, real) {
+					const matching = withPrefix(model, text);
+					const limited = matching.slice(0, limit ?? Infinity);
+					const options = limit === undefined ? undefined : { limit };
+					expect(real.trie.get(text)).toBe(model.map.get(text));
+					expect(real.trie.has(text)).toBe(model.map.has(text));
+					expect(real.trie.hasPrefix(text)).toBe(matching.length > 0);
+					expect(real.trie.keysWithPrefix(text, options)).toEqual(limited);
+					expect(real.trie.entriesWithPrefix(text, options)).toEqual(
+						limited.map(function (key) {
+							return [key, model.map.get(key)];
+						})
+					);
+					const longest = [...model.map.keys()]
+						.filter(function (key) {
+							return text.startsWith(key);
+						})
+						.reduce<string | undefined>(function (best, key) {
+							return best === undefined || key.length > best.length ? key : best;
+						}, undefined);
+					expect(real.trie.longestPrefixOf(text)).toBe(longest);
+				},
+				check
+			);
+		}),
+		fc.constant(
+			modelCommand<TrieModel, TrieReal>(
+				'clear()',
+				function (model, real) {
+					model.map.clear();
+					real.trie.clear();
+				},
+				check
+			)
+		)
+	];
+
+	it('behaves like a Map with sorted, filtered keys, under any sequence of sets, deletes and queries', function () {
+		fc.assert(
+			fc.property(fc.commands(commands, { size: '+1' }), function (cmds) {
+				fc.modelRun(function () {
+					return { model: { map: new Map() }, real: { trie: createTrie<number | undefined>() } };
+				}, cmds);
+			}),
+			{ numRuns: 300 }
+		);
+	});
+
+	it('lists any strings in the order of Array.prototype.sort, and every prefix query is a filter of it', function () {
+		fc.assert(
+			fc.property(fc.array(fc.string({ unit: 'binary', maxLength: 8 }), { maxLength: 40 }), fc.string({ unit: 'binary', maxLength: 3 }), function (keys, prefix) {
+				const trie = createTrie(
+					keys.map(function (key, index): [string, number] {
+						return [key, index];
+					})
+				);
+				const sorted = [...new Set(keys)].sort();
+				expect([...trie.keys()]).toEqual(sorted);
+				expect(trie.keysWithPrefix(prefix)).toEqual(
+					sorted.filter(function (key) {
+						return key.startsWith(prefix);
+					})
+				);
+			})
+		);
+	});
+
+	it('deleting keys gives the same trie as never inserting them', function () {
+		fc.assert(
+			fc.property(fc.uniqueArray(fc.string({ unit, maxLength: 6 }), { maxLength: 30 }), fc.array(fc.boolean(), { minLength: 30, maxLength: 30 }), function (keys, drop) {
+				const shrunk = createTrie<number>();
+				const fresh = createTrie<number>();
+				keys.forEach(function (key, index) {
+					shrunk.set(key, index);
+					if (!drop[index]) fresh.set(key, index);
+				});
+				keys.forEach(function (key, index) {
+					if (drop[index]) expect(shrunk.delete(key)).toBe(true);
+				});
+				expect([...shrunk]).toEqual([...fresh]);
+				for (const key of keys) {
+					for (let end = 0; end <= key.length; end++) {
+						const prefix = key.slice(0, end);
+						expect(shrunk.hasPrefix(prefix)).toBe(fresh.hasPrefix(prefix));
+						expect(shrunk.keysWithPrefix(prefix)).toEqual(fresh.keysWithPrefix(prefix));
+						expect(shrunk.longestPrefixOf(key + 'z')).toBe(fresh.longestPrefixOf(key + 'z'));
+					}
+				}
+			})
+		);
+	});
+});
+
+describe('createBloomFilter (properties)', function () {
+	const geometryArb = fc.oneof(
+		fc.record({ expectedItems: fc.integer({ min: 1, max: 200 }), falsePositiveRate: fc.double({ min: 1e-6, max: 0.5, noNaN: true }) }),
+		fc.record({ bits: fc.integer({ min: 1, max: 300 }), hashes: fc.integer({ min: 1, max: 12 }) })
+	);
+
+	it('never gives a false negative, and `add` is true exactly when `has` was false before it', function () {
+		fc.assert(
+			fc.property(
+				geometryArb,
+				fc.array(fc.oneof(fc.string({ unit: 'binary', maxLength: 12 }), fc.string({ maxLength: 4 })), { maxLength: 120 }),
+				function (options, items) {
+					const filter = createBloomFilter(options);
+					for (const item of items) {
+						const before = filter.has(item);
+						expect(filter.add(item)).toBe(!before);
+						expect(filter.has(item)).toBe(true);
+					}
+					for (const item of items) expect(filter.has(item)).toBe(true);
+					const rate = filter.estimatedFalsePositiveRate();
+					expect(rate >= 0 && rate <= 1).toBe(true);
+					expect(filter.estimatedSize()).toBeGreaterThanOrEqual(0);
+				}
+			)
+		);
+	});
+
+	it('round-trips through toBytes: the restored filter answers and estimates the same', function () {
+		fc.assert(
+			fc.property(
+				geometryArb,
+				fc.array(fc.string({ maxLength: 6 }), { maxLength: 60 }),
+				fc.array(fc.string({ maxLength: 6 }), { maxLength: 30 }),
+				function (options, items, probes) {
+					const filter = createBloomFilter(options);
+					for (const item of items) filter.add(item);
+					const restored = createBloomFilter({ bits: filter.bits, hashes: filter.hashes, data: filter.toBytes() });
+					expect(restored.toBytes()).toEqual(filter.toBytes());
+					expect(restored.estimatedSize()).toBe(filter.estimatedSize());
+					expect(restored.estimatedFalsePositiveRate()).toBe(filter.estimatedFalsePositiveRate());
+					for (const probe of [...items, ...probes]) expect(restored.has(probe)).toBe(filter.has(probe));
+				}
+			)
+		);
+	});
+
+	it('reaches the target false-positive rate (within sampling error) once filled with `expectedItems` items', function () {
+		fc.assert(
+			fc.property(fc.constantFrom(0.1, 0.05, 0.01), fc.string({ maxLength: 4 }), function (rate, salt) {
+				const expectedItems = 3000;
+				const filter = createBloomFilter({ expectedItems, falsePositiveRate: rate });
+				for (let i = 0; i < expectedItems; i++) filter.add(`${salt}in:${i}`);
+				const queries = 30_000;
+				let positives = 0;
+				for (let i = 0; i < queries; i++) if (filter.has(`${salt}out:${i}`)) positives++;
+				// Binomial sampling error: 6 standard deviations around the target (the rounding of the formulas only lowers the rate).
+				const sigma = Math.sqrt(queries * rate * (1 - rate));
+				expect(positives).toBeLessThan(queries * rate + 6 * sigma);
+				expect(positives).toBeGreaterThan(queries * rate * 0.8 - 6 * sigma);
+				expect(Math.abs(filter.estimatedFalsePositiveRate() - rate) / rate).toBeLessThan(0.2);
+				expect(Math.abs(filter.estimatedSize() - expectedItems) / expectedItems).toBeLessThan(0.05);
+			}),
+			{ numRuns: 8 }
 		);
 	});
 });
