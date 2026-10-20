@@ -397,6 +397,9 @@ function errorShell(original: object): object {
  */
 const typedArrayTag = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag)?.get as () => unknown;
 
+/** The built-in `%TypedArray%.prototype.join` (a subclass or a polluted prototype cannot replace it). */
+const typedJoin = (Object.getPrototypeOf(Uint8Array.prototype) as Uint8Array).join as (this: ArrayBufferView, separator: string) => string;
+
 /**
  * The built-in `SharedArrayBuffer.prototype.byteLength` getter (absent where `SharedArrayBuffer` is unavailable); it throws for anything
  * that is not a real `SharedArrayBuffer`.
@@ -405,12 +408,42 @@ const sharedByteLength: (() => unknown) | undefined =
 	typeof SharedArrayBuffer === 'function' ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get : undefined;
 
 /**
- * Copies an `ArrayBuffer`, a typed array or a `DataView` (the underlying bytes are duplicated).
+ * Whether a buffer is detached (transferred to a worker or with `transfer()`, or the old buffer of a grown `WebAssembly.Memory`): it has
+ * no contents left, and creating a view of it, or reading the offset or length of a `DataView` of it, throws.
+ * @param {ArrayBufferLike} buffer - The buffer
+ * @returns {boolean} Whether it is detached
+ */
+function isDetached(buffer: ArrayBufferLike): boolean {
+	// A detached buffer has a length of 0: only an empty buffer needs the (throwing) test.
+	if (buffer.byteLength !== 0) return false;
+	try {
+		new Uint8Array(buffer);
+		return false;
+	} catch {
+		return true;
+	}
+}
+
+/**
+ * The bytes of a buffer, or of a `DataView`, as a `Uint8Array` over them: none for a detached buffer (see {@link isDetached}).
+ * @param {ArrayBufferLike | DataView} value - The buffer or the view
+ * @returns {Uint8Array} The bytes
+ */
+function bytesOf(value: ArrayBufferLike | DataView): Uint8Array {
+	if (!ArrayBuffer.isView(value)) return isDetached(value) ? new Uint8Array(0) : new Uint8Array(value);
+	return isDetached(value.buffer) ? new Uint8Array(0) : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+}
+
+/**
+ * Copies an `ArrayBuffer`, a typed array or a `DataView` (the underlying bytes are duplicated; a detached buffer, which has none, is
+ * copied as an empty one).
  * @param {ArrayBuffer | ArrayBufferView} value - The buffer or view to copy
  * @returns {ArrayBuffer | ArrayBufferView} An independent copy with the same prototype
  */
 function copyBinary(value: ArrayBuffer | ArrayBufferView): ArrayBuffer | ArrayBufferView {
 	if (!ArrayBuffer.isView(value)) {
+		// `slice` throws for a detached buffer.
+		if (isDetached(value)) return adoptPrototype(new ArrayBuffer(0), value);
 		const { resizable, growable, maxByteLength } = value as ArrayBuffer & { resizable?: boolean; growable?: boolean; maxByteLength?: number };
 		// `slice` returns a fixed-length buffer: a resizable (or growable shared) one is rebuilt with its maximum length.
 		if (!resizable && !growable) return adoptPrototype(value.slice(0), value);
@@ -420,7 +453,8 @@ function copyBinary(value: ArrayBuffer | ArrayBufferView): ArrayBuffer | ArrayBu
 		return adoptPrototype(copy, value);
 	}
 
-	const bytes = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+	// A view of a detached buffer has no bytes (and a `DataView` of one throws on reading its offset).
+	const bytes = isDetached(value.buffer) ? new ArrayBuffer(0) : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
 	// The built-in tag getter reads the typed array's internal name, so a subclass overriding `Symbol.toStringTag` can't mislead it;
 	// it returns `undefined` for a `DataView`.
 	const name = (typedArrayTag.call(value) as string | undefined) ?? 'DataView';
@@ -522,6 +556,26 @@ function isBareRecord(value: object): boolean {
 }
 
 /**
+ * Whether a value is a plain object of this realm or of another one: `isPlainObject` (an `Object.prototype` or `null` prototype), or an
+ * object whose prototype is the `Object.prototype` of an iframe or a `vm` context (such as the parsed body of a `fetch` response under
+ * Jest), which `isPlainObject` rejects. The merge, path, diff, patch, key and serialization helpers walk all of them alike (the objects
+ * they build have this realm's `Object.prototype`).
+ * @param {unknown} value - The value to check
+ * @returns {boolean} Whether `value` is a plain object of any realm
+ */
+function isPlainRecord(value: unknown): value is Properties {
+	if (isPlainObject(value)) return true;
+	if (!isObject(value)) return false;
+	try {
+		// Only objects of another realm (and those without `Object.prototype` in their chain) fail `instanceof Object`.
+		return !(value instanceof Object) && isForeignObjectPrototype(Object.getPrototypeOf(value));
+	} catch {
+		// A revoked proxy throws on `instanceof`, like `isPlainObject` on `Object.getPrototypeOf`.
+		return false;
+	}
+}
+
+/**
  * Whether an object that {@link isOrdinary} rejects still has no internal state besides its members, so that the clone and equality
  * functions can skip the brand checks of the other built-ins: an array (of another realm, of a subclass, or with holes or extra keys), or
  * an object of another realm (an iframe, a `vm` context, such as the parsed body of a `fetch` response under Jest) whose prototype is
@@ -590,7 +644,8 @@ export function merge<T extends object, S extends object[]>(target: T, ...source
  * Creates a shallow copy of a value.
  * - Primitives and functions are returned as-is.
  * - Arrays stay arrays (holes preserved); class instances keep their prototype and own enumerable (string and symbol) properties.
- * - `Date`, `RegExp` (incl. `lastIndex`), `Map`, `Set`, `ArrayBuffer`, typed arrays/`DataView` and boxed primitives get a new instance with the same contents.
+ * - `Date`, `RegExp` (incl. `lastIndex`), `Map`, `Set`, `ArrayBuffer`, typed arrays/`DataView` and boxed primitives get a new instance with the
+ *   same contents (a detached buffer, which has none, gives an empty one).
  * - Errors keep `message`, `stack` and other own (even non-enumerable) properties.
  * - `WeakMap`, `WeakSet` and promises (any object with a `then` method) cannot be copied and are returned by reference.
  * - Keys are defined, never assigned: a `'__proto__'` key stays an own data property (no prototype change); `constructor` and
@@ -1100,8 +1155,10 @@ export type OmitAtPath<T, P extends string> =
  * @returns {object} The copy
  */
 function copyContainer(container: object): object {
-	if (Array.isArray(container)) return clone(container);
-	return Object.getPrototypeOf(container) === null ? copyBare(container) : { ...container };
+	const prototype = Object.getPrototypeOf(container);
+	if (prototype === Object.prototype && !Array.isArray(container)) return { ...container };
+	// Arrays, `null`-prototype objects, and the plain objects of another realm (whose prototype `clone` keeps).
+	return prototype === null ? copyBare(container) : clone(container);
 }
 
 /**
@@ -1399,7 +1456,8 @@ function copyWith(value: unknown, seen?: Map<object, unknown>): unknown {
 			const descriptor = Object.getOwnPropertyDescriptor(value, key);
 			// A getter copied earlier may have deleted this property.
 			if (descriptor === undefined) continue;
-			if ('value' in descriptor) descriptor.value = copyChild(descriptor.value, seen);
+			// Own `value` only: an accessor descriptor inherits one from a polluted `Object.prototype`, and given an own one it is invalid.
+			if (hasOwn(descriptor, 'value')) descriptor.value = copyChild(descriptor.value, seen);
 			// V8 defines `stack` as an own accessor reading an internal slot of the original, which the copy lacks: copy its value.
 			else if (key === 'stack') {
 				defineDescriptor(copy, key, { value: (value as Error).stack, writable: true, configurable: true, enumerable: descriptor.enumerable === true });
@@ -1435,6 +1493,8 @@ function copyViewOver(value: ArrayBufferView, seen: Map<object, unknown>): Array
 	const buffer = copyWith(value.buffer, seen) as ArrayBufferLike & { resizable?: boolean; growable?: boolean };
 	const name = (typedArrayTag.call(value) as string | undefined) ?? 'DataView';
 	const View = (globalThis as unknown as Record<string, new (buffer: ArrayBufferLike, byteOffset: number, length?: number) => ArrayBufferView>)[name];
+	// A view of a detached buffer is empty (its buffer was copied as an empty one; a `DataView` of it throws on reading its offset).
+	if (isDetached(value.buffer)) return adoptPrototype(new View(buffer, 0, 0), value);
 	// Whether a view tracks the length of its buffer cannot be read: a view of a resizable (or growable) buffer that reaches its end is
 	// copied as length-tracking, which is how such views are made (`new Uint8Array(buffer)`), so that it grows with the copied buffer.
 	if ((buffer.resizable === true || buffer.growable === true) && value.byteOffset + value.byteLength === buffer.byteLength) {
@@ -1459,7 +1519,8 @@ function copyChild(value: unknown, seen?: Map<object, unknown>): unknown {
  * - Primitives are returned as-is; functions are copied BY REFERENCE.
  * - Arrays, plain objects and class instances are copied recursively (prototype preserved; own enumerable string AND symbol keys copied,
  *   getters are read and stored as data properties).
- * - `Date`, `RegExp` (incl. `lastIndex`), `Map` (keys and values cloned), `Set`, `ArrayBuffer`, typed arrays, `DataView` and boxed primitives get new instances.
+ * - `Date`, `RegExp` (incl. `lastIndex`), `Map` (keys and values cloned), `Set`, `ArrayBuffer`, typed arrays, `DataView` and boxed primitives
+ *   get new instances (a detached buffer, which has no contents, gives an empty one).
  *   Resizable buffers stay resizable, and a view that reaches the end of one tracks its length (whether the original did cannot be read).
  * - Errors keep their prototype and all own properties (`message`, `stack`, `cause`, ...).
  * - `WeakMap`, `WeakSet` and promises (any object with a `then` method) cannot be copied and are returned by reference.
@@ -1598,7 +1659,7 @@ function mergeInto(result: object, source: object, ancestors: object[], settings
 	for (const key of ownEnumerableKeys(source)) {
 		if (UNSAFE_KEYS.has(key)) continue;
 		const incoming = (source as Properties)[key];
-		const plain = settings.deep && isPlainObject(incoming);
+		const plain = settings.deep && isPlainRecord(incoming);
 		let value = incoming;
 
 		if (plain || !simple) {
@@ -1609,7 +1670,7 @@ function mergeInto(result: object, source: object, ancestors: object[], settings
 			if (value === undefined) {
 				// In defaults mode a present value is kept (only plain objects and arrays may still be combined with the incoming one).
 				const kept = fill && current !== undefined && !(settings.nullish && current === null);
-				if (plain && (isPlainObject(current) || !kept)) {
+				if (plain && (isPlainRecord(current) || !kept)) {
 					path.push(key);
 					value = mergeInto(mergeBase(current, incoming as object, ancestors, settings, path), incoming as object, ancestors, settings, path);
 					path.pop();
@@ -1638,10 +1699,10 @@ function mergeInto(result: object, source: object, ancestors: object[], settings
  */
 function mergeBase(current: unknown, incoming: object, ancestors: object[], settings: MergeSettings, path: PropertyKey[]): object {
 	const created = settings.created;
-	if (isPlainObject(current) && (created === undefined || created.has(current))) return current;
-	const base = emptyLike(isPlainObject(current) ? current : incoming);
+	if (isPlainRecord(current) && (created === undefined || created.has(current))) return current;
+	const base = emptyLike(isPlainRecord(current) ? current : incoming);
 	created?.add(base);
-	return isPlainObject(current) ? mergeInto(base, current, ancestors, { ...settings, customizer: undefined }, path) : base;
+	return isPlainRecord(current) ? mergeInto(base, current, ancestors, { ...settings, customizer: undefined }, path) : base;
 }
 
 /**
@@ -1653,7 +1714,7 @@ function mergeBase(current: unknown, incoming: object, ancestors: object[], sett
  * @throws {TypeError} when the target or a source is not a plain object, or an input contains a circular reference
  */
 function mergeAll(settings: MergeSettings, target: object, sources: ReadonlyArray<unknown>): object {
-	if (!isPlainObject(target)) throw new TypeError(`${settings.caller}: \`target\` must be a plain object, got ${describe(target)}`);
+	if (!isPlainRecord(target)) throw new TypeError(`${settings.caller}: \`target\` must be a plain object, got ${describe(target)}`);
 
 	const ancestors: object[] = [];
 	const run: MergeSettings = settings.customizer === undefined ? settings : { ...settings, created: new WeakSet<object>() };
@@ -1666,7 +1727,7 @@ function mergeAll(settings: MergeSettings, target: object, sources: ReadonlyArra
 	for (let index = 0; index < sources.length; index++) {
 		const source = sources[index];
 		if (source == null) continue;
-		if (!isPlainObject(source)) throw new TypeError(`${settings.caller}: \`sources[${index}]\` must be a plain object, got ${describe(source)}`);
+		if (!isPlainRecord(source)) throw new TypeError(`${settings.caller}: \`sources[${index}]\` must be a plain object, got ${describe(source)}`);
 		mergeInto(result, source, ancestors, run, []);
 	}
 
@@ -1702,7 +1763,8 @@ const DEEP_MERGE: MergeSettings = { caller: 'deepMerge', deep: true, fill: false
 
 /**
  * Deeply merges plain objects into a NEW object, left to right (later sources win). Inputs are never mutated.
- * - Only PLAIN objects are merged recursively (every merged plain object in the result is a fresh object).
+ * - Only PLAIN objects are merged recursively (every merged plain object in the result is a fresh object, of this realm). Plain objects
+ *   of another realm (an iframe, a `vm` context, such as the body of a `fetch` response under Jest) are plain objects too.
  * - Arrays, dates, maps, class instances and all other values REPLACE the previous value and are assigned by reference.
  * - A key present in a source always wins, even when its value is `undefined`.
  * - Keys `__proto__`, `constructor` and `prototype` are DROPPED at every level: deepMerge is the classic sink for untrusted
@@ -1998,16 +2060,15 @@ function binaryEqual(a: ArrayBuffer | ArrayBufferView, b: ArrayBuffer | ArrayBuf
 	if (!ArrayBuffer.isView(a)) {
 		// `b` has the tag of `a`: an `ArrayBuffer` and a `SharedArrayBuffer` never pair (a view could, with a forged prototype).
 		if (ArrayBuffer.isView(b)) return false;
-		left = new Uint8Array(a);
-		right = new Uint8Array(b as ArrayBuffer);
+		left = bytesOf(a);
+		right = bytesOf(b as ArrayBuffer);
 	} else {
 		// The built-in tag getter reads the internal name (`undefined` for a `DataView`): a forged tag or prototype cannot pair two kinds.
 		const name = typedArrayTag.call(a);
 		if (!ArrayBuffer.isView(b) || typedArrayTag.call(b) !== name) return false;
 		if (name === undefined) {
-			const view = b as ArrayBufferView;
-			left = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
-			right = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+			left = bytesOf(a as DataView);
+			right = bytesOf(b as DataView);
 		}
 	}
 	const length = left.length;
@@ -2106,14 +2167,13 @@ function sameKind(a: object, b: object): boolean {
 }
 
 /**
- * Whether an object is a JSON object for the `test` operation of {@link applyPatch}: a plain object with an `Object.prototype` or
- * `null` prototype (not a thenable).
+ * Whether an object is a JSON object for the `test` operation of {@link applyPatch}: a plain object with an `Object.prototype` (of any
+ * realm) or `null` prototype (not a thenable).
  * @param {object} value - The object
  * @returns {boolean} Whether it is a plain object
  */
 function isJsonObject(value: object): boolean {
-	const prototype = Object.getPrototypeOf(value);
-	return (prototype === null || prototype === Object.prototype) && isTree(value, prototype);
+	return !Array.isArray(value) && isTree(value, Object.getPrototypeOf(value));
 }
 
 /**
@@ -2180,7 +2240,8 @@ function customEqual(a: unknown, b: unknown, stack: ComparisonStack, key: unknow
 	const path: unknown[] = [];
 	for (let index = 1; index < depth; index++) path.push(pairs[index][2]);
 	if (depth > 0) path.push(key);
-	const parent = pairs[depth - 1] as [object, object] | undefined;
+	// The roots have no parent (`pairs[-1]` would be read from a polluted `Object.prototype`).
+	const parent = depth > 0 ? pairs[depth - 1] : undefined;
 
 	if (objects) pairs.push([a, b, key]);
 	let result: unknown = customizer(a, b, { key, path, parentA: parent?.[0], parentB: parent?.[1], equals: stack.equals as (a: unknown, b: unknown) => boolean });
@@ -2197,7 +2258,8 @@ function customEqual(a: unknown, b: unknown, stack: ComparisonStack, key: unknow
  * - `Date`: same time value (two invalid dates are equal). `RegExp`: same `source` and `flags` (`lastIndex` ignored).
  * - `Map`/`Set`: same size and a one-to-one matching of deeply equal entries/members. Primitive keys/members are matched in O(1);
  *   object keys/members are matched pairwise, which is O(n²) in the worst case.
- * - Typed arrays (element-wise), `DataView`/`ArrayBuffer` (byte-wise), boxed primitives (by value), errors (`name` + `message` + own enumerable props).
+ * - Typed arrays (element-wise), `DataView`/`ArrayBuffer` (byte-wise; a detached buffer has no bytes), boxed primitives (by value), errors
+ *   (`name` + `message` + own enumerable props).
  * - `WeakMap`, `WeakSet` and promises (any object with a `then` method) are only equal to themselves.
  * - Built-ins are recognized by their internal slots, not their prototype or tag: a genuine `Map` never equals a `Proxy` of one (such
  *   as a framework's reactive `Map`, whose entries the slots do not reveal) or an object posing as one, in either order.
@@ -2268,7 +2330,7 @@ export interface IsMatchOptions {
  */
 function matchWith(value: unknown, pattern: unknown, subset: boolean, stack: ComparisonStack): boolean {
 	if (sameValueZero(value, pattern)) return true;
-	const plain = isPlainObject(pattern);
+	const plain = isPlainRecord(pattern);
 	if (!plain && !Array.isArray(pattern)) return isObject(pattern) && equalWith(value, pattern, comparisonStack());
 	if (!(isObject(value) || isFunction(value)) || (!plain && !Array.isArray(value))) return false;
 	if (isComparing(stack, value, pattern)) {
@@ -2385,7 +2447,10 @@ export function shallowEqual(a: unknown, b: unknown): boolean {
 			}
 			for (let index = 0; index < a.length; index++) {
 				const item = a[index];
-				if (!sameValueZero(item, b[index]) || (item === undefined && index in a !== index in b)) return false;
+				if (!sameValueZero(item, b[index])) return false;
+				// A hole reads `undefined`, unless the prototype chain (a polluted `Array.prototype` or `Object.prototype`) has the index:
+				// then a hole reads (and `in` finds) the planted value, and only own elements tell the two sides apart.
+				if (index in prototype ? hasOwn(a, index) !== hasOwn(b, index) : item === undefined && index in a !== index in b) return false;
 			}
 			return true;
 		}
@@ -2651,7 +2716,7 @@ function readSeparator(caller: string, options: FlattenOptions): string {
  * @returns {boolean} Whether the value is an array or a plain object
  */
 function isContainer(value: unknown): value is object {
-	return Array.isArray(value) || isPlainObject(value);
+	return Array.isArray(value) || isPlainRecord(value);
 }
 
 /**
@@ -2869,7 +2934,7 @@ function diffWalk(a: object, b: object, prefix: string, missing: string[], chang
 		const left = (a as Properties)[key];
 		const right = (b as Properties)[key];
 		if (left === right) continue;
-		if ((Array.isArray(left) && Array.isArray(right)) || (isPlainObject(left) && isPlainObject(right))) {
+		if ((Array.isArray(left) && Array.isArray(right)) || (isPlainRecord(left) && isPlainRecord(right))) {
 			diffWalk(left, right, path + '.', missing, changed, state);
 		} else if (changed !== undefined && !isEqual(left, right)) {
 			changed.push(path);
@@ -2900,7 +2965,8 @@ interface DiffState {
 /**
  * Computes the structural differences between two trees of plain objects and arrays, as dot-separated paths
  * (array elements use numeric segments: `'list.0'`).
- * - Recurses wherever BOTH sides are plain objects, or BOTH are arrays (array elements are compared by index; holes count as missing).
+ * - Recurses wherever BOTH sides are plain objects (of any realm), or BOTH are arrays (array elements are compared by index; holes
+ *   count as missing).
  * - Other values (incl. a plain object versus an array) are leaves compared with {@link isEqual}.
  * - Only own enumerable string keys are considered; prototypes of plain objects are not compared.
  * - Identical references (including `a === b`) are equal by definition and are not walked.
@@ -2919,7 +2985,7 @@ interface DiffState {
  * diff({ a: 1, b: { c: 2, d: [1] } }, { b: { c: 3, d: [1, 2] }, e: 0 }); // => { added: ['b.d.1', 'e'], removed: ['a'], changed: ['b.c'] }
  */
 export function diff(a: object, b: object): ObjectDiff {
-	if (!((Array.isArray(a) && Array.isArray(b)) || (isPlainObject(a) && isPlainObject(b)))) {
+	if (!((Array.isArray(a) && Array.isArray(b)) || (isPlainRecord(a) && isPlainRecord(b)))) {
 		throw new TypeError('diff: `a` and `b` must both be plain objects or both be arrays');
 	}
 	const result: ObjectDiff = { added: [], removed: [], changed: [] };
@@ -2934,14 +3000,16 @@ export function diff(a: object, b: object): ObjectDiff {
 
 /**
  * Whether an object is a container that {@link replaceEqualDeep} and {@link createPatch} walk: a plain object (`Object.prototype` or
- * `null` prototype, not a thenable) or a dense array without other own keys.
+ * `null` prototype, not a thenable) or a dense array without other own keys, of this realm or of another one (an iframe, a `vm` context).
  * @param {object} value - The object
  * @param {unknown} prototype - Its prototype
  * @returns {boolean} Whether its members are walked
  */
 function isTree(value: object, prototype: unknown): boolean {
-	if (prototype === null) return !isPromise(value) && getTag(value) === '[object Object]';
-	return isOrdinary(value, prototype) && (!Array.isArray(value) || isSimpleArray(value));
+	if (prototype === Object.prototype || prototype === Array.prototype) return isOrdinary(value, prototype) && (!Array.isArray(value) || isSimpleArray(value));
+	if (prototype === null || isForeignObjectPrototype(prototype)) return !isPromise(value) && getTag(value) === '[object Object]';
+	// Every realm's `Array.prototype` is an array (a subclass's prototype is not one): an array of another realm.
+	return Array.isArray(value) && Array.isArray(prototype) && !isPromise(value) && isSimpleArray(value);
 }
 
 /** The state of one {@link replaceEqualDeep} call. */
@@ -3474,7 +3542,7 @@ function memberOf(state: PatchState, container: unknown, segments: ReadonlyArray
 		// Own elements only: a hole must not read a value from a polluted `Array.prototype`.
 		return hasOwn(container, index) ? container[index] : undefined;
 	}
-	if (!isPlainObject(container)) patchFailure(state, `${pointerTo(segments, position)} is not an object or an array`);
+	if (!isPlainRecord(container)) patchFailure(state, `${pointerTo(segments, position)} is not an object or an array`);
 	// Own members only: `__proto__`, `constructor` or `toString` never reach a prototype.
 	if (!hasOwn(container, segments[position])) patchFailure(state, `${pointerTo(segments, position + 1)} does not exist`);
 	return container[segments[position]];
@@ -3897,7 +3965,8 @@ function sortKeysWith(value: unknown, compare: ((a: string, b: string) => number
  * too (other objects, such as dates, maps and class instances, are kept by reference); array items keep their order.
  * - JavaScript always enumerates INTEGER-LIKE keys (`'0'`, `'42'`, up to 2³² - 2) first, in ascending numeric order, whatever the
  *   insertion order: no comparator can move them after other keys (`sortKeys({ b: 1, 2: 1, a: 1, 10: 1 })` lists `2, 10, a, b`).
- * - Keys are DEFINED, never assigned: a `'__proto__'` key stays a plain own property. Plain objects keep their prototype (`null` too).
+ * - Keys are DEFINED, never assigned: a `'__proto__'` key stays a plain own property. Plain objects keep their prototype (`null` too;
+ *   a copy of a plain object of another realm has this realm's `Object.prototype`).
  * @template T - The object type
  * @param {T} object - The plain object or array to copy
  * @param {SortKeysOptions} [options={}] - `deep` (default `false`) and `compare` (default: UTF-16 code unit order)
@@ -3948,7 +4017,7 @@ function evolveWith(value: object, transforms: object, ancestors: object[]): obj
 	const result = copyContainer(value) as Properties;
 	for (const key of ownEnumerableKeys(transforms)) {
 		const transform = (transforms as Properties)[key];
-		const nested = isPlainObject(transform);
+		const nested = isPlainRecord(transform);
 		if (!nested && typeof transform !== 'function') {
 			throw new TypeError(`evolve: \`transforms.${String(key)}\` must be a function or a plain object, got ${describe(transform)}`);
 		}
@@ -3983,7 +4052,7 @@ function evolveWith(value: object, transforms: object, ancestors: object[]): obj
  */
 export function evolve<T extends object, E extends Evolver<T>>(object: T, transforms: E): Evolved<T, E> {
 	assertContainer('evolve', 'object', object);
-	if (!isPlainObject(transforms)) throw new TypeError(`evolve: \`transforms\` must be a plain object, got ${describe(transforms)}`);
+	if (!isPlainRecord(transforms)) throw new TypeError(`evolve: \`transforms\` must be a plain object, got ${describe(transforms)}`);
 	return evolveWith(object, transforms, []) as Evolved<T, E>;
 }
 
@@ -4339,6 +4408,9 @@ function encodeMembers(object: object, ancestors: object[]): string {
 	return text + '}';
 }
 
+/** Above this many items, {@link encodeItems} joins the encodings a chunk of this many at a time. */
+const JOIN_CHUNK = 4096;
+
 /**
  * Encodes the items of an array-like value (holes of a genuine array are encoded as nothing, like in an array literal).
  * @param {ArrayLike<unknown>} items - The items
@@ -4346,6 +4418,7 @@ function encodeMembers(object: object, ancestors: object[]): string {
  * @returns {string} The `[...]` encoding
  */
 function encodeItems(items: ArrayLike<unknown>, ancestors: object[]): string {
+	if (items.length > JOIN_CHUNK) return encodeLongItems(items, ancestors);
 	let text = '[';
 	for (let index = 0; index < items.length; index++) {
 		if (index > 0) text += ',';
@@ -4355,6 +4428,64 @@ function encodeItems(items: ArrayLike<unknown>, ancestors: object[]): string {
 	// As in array literals, a trailing hole needs one more comma: otherwise `new Array(1)` would encode like `[]`.
 	if (items.length > 0 && !hasOwn(items, items.length - 1)) text += ',';
 	return text + ']';
+}
+
+/**
+ * {@link encodeItems} for more than `JOIN_CHUNK` items. The encodings are joined a chunk at a time: appended to the text one by one,
+ * each took some 70 bytes of memory, so that tens of millions of items (a large typed array) exhausted the memory and aborted the
+ * process before the text reached the engine's maximum string length (where a `RangeError`, which can be caught, is thrown).
+ * @param {ArrayLike<unknown>} items - The items
+ * @param {object[]} ancestors - Objects on the current path (cycle detection)
+ * @returns {string} The `[...]` encoding
+ */
+function encodeLongItems(items: ArrayLike<unknown>, ancestors: object[]): string {
+	const length = items.length;
+	const chunks: string[] = [];
+	let chunk: string[] = [];
+	for (let index = 0; index < length; index++) {
+		if (!hasOwn(items, index)) {
+			// A hole (only arrays have some): the array may be sparse, the rest is encoded from its own elements.
+			if (chunk.length > 0) chunks.push(chunk.join(','));
+			return `[${chunks.join(',')}${index > 0 ? ',' : ''}${encodeSparseItems(items as ReadonlyArray<unknown>, index, ancestors)}`;
+		}
+		chunk.push(encodeValue(items[index], ancestors));
+		if (chunk.length === JOIN_CHUNK) {
+			chunks.push(chunk.join(','));
+			chunk = [];
+		}
+	}
+	if (chunk.length > 0) chunks.push(chunk.join(','));
+	return `[${chunks.join(',')}]`;
+}
+
+/**
+ * The rest of the encoding of a long array from its first hole (see {@link encodeLongItems}): the array may be sparse (a length of
+ * `2 ** 32 - 1` with a few items), so its own elements are visited and each run of holes is written at once. One comma at a time, a few
+ * hundred million holes took seconds and exhausted the memory (aborting the process) before the text reached the engine's maximum
+ * string length, which now throws a `RangeError` at once.
+ * @param {ReadonlyArray<unknown>} items - The array
+ * @param {number} hole - The index of its first hole, after the comma that precedes it
+ * @param {object[]} ancestors - Objects on the current path (cycle detection)
+ * @returns {string} The encoding of the items from `hole` on, and the closing `]`
+ */
+function encodeSparseItems(items: ReadonlyArray<unknown>, hole: number, ancestors: object[]): string {
+	// Each part is the commas before an item, then the item; they are joined a chunk at a time too.
+	const chunks: string[] = [];
+	let chunk: string[] = [];
+	// The commas written so far: one before each index after the first.
+	let commas = hole;
+	for (const index of presentIndexes(items)) {
+		if (index < hole) continue;
+		chunk.push(','.repeat(index - commas) + encodeValue(items[index], ancestors));
+		commas = index;
+		if (chunk.length === JOIN_CHUNK) {
+			chunks.push(chunk.join(''));
+			chunk = [];
+		}
+	}
+	chunks.push(chunk.join(''));
+	// One comma per index after the last item, and one more for a trailing hole.
+	return chunks.join('') + ','.repeat(items.length - 1 - commas + (hasOwn(items, items.length - 1) ? 0 : 1)) + ']';
 }
 
 /**
@@ -4383,11 +4514,13 @@ function encodeSpecial(value: object, ancestors: object[]): string {
 	if (isMap(value)) return `Map(${encodeUnordered(value, ancestors)})`;
 	if (isSet(value)) return `Set(${encodeUnordered(value, ancestors)})`;
 	if (isBinary(value)) {
-		if (!ArrayBuffer.isView(value)) return `${getTag(value).slice(8, -1)}(${encodeItems(new Uint8Array(value), ancestors)})`;
+		if (!ArrayBuffer.isView(value)) return `${getTag(value).slice(8, -1)}([${typedJoin.call(bytesOf(value), ',')}])`;
 		const name = typedArrayTag.call(value) as string | undefined;
-		// A typed array encodes its elements (numbers or bigints), a `DataView` its bytes.
-		const items = name === undefined ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : (value as unknown as ArrayLike<unknown>);
-		return `${name ?? 'DataView'}(${encodeItems(items, ancestors)})`;
+		// A typed array encodes its elements (numbers or bigints), a `DataView` its bytes (none when detached, like an empty one).
+		if (name === undefined) return `DataView([${typedJoin.call(bytesOf(value as DataView), ',')}])`;
+		// The built-in `join` writes integers as `encodeValue` does, faster and in less memory; not `-0` (`'0'`) nor bigints (no `n`).
+		if (!name.startsWith('Float') && !name.startsWith('Big')) return `${name}([${typedJoin.call(value, ',')}])`;
+		return `${name}(${encodeItems(value as unknown as ArrayLike<unknown>, ancestors)})`;
 	}
 	const [isBoxed, primitive] = unbox(value);
 	if (isBoxed) return `${getTag(value).slice(8, -1)}(${encodeValue(primitive, ancestors)})`;
@@ -4427,7 +4560,7 @@ function encodeValue(value: unknown, ancestors: object[]): string {
 	}
 	if (ancestors.includes(value)) throw new TypeError('stableStringify: cannot serialize a circular structure');
 	ancestors.push(value);
-	const text = isPlainObject(value) ? encodeMembers(value, ancestors) : Array.isArray(value) ? encodeItems(value, ancestors) : encodeSpecial(value, ancestors);
+	const text = isPlainRecord(value) ? encodeMembers(value, ancestors) : Array.isArray(value) ? encodeItems(value, ancestors) : encodeSpecial(value, ancestors);
 	ancestors.pop();
 	return text;
 }
@@ -4437,12 +4570,13 @@ function encodeValue(value: unknown, ancestors: object[]): string {
  * insertion order of their keys or `Map`/`Set` entries, which makes the result usable as a cache key, a memoization key or the input
  * of {@link hash}. Encoding version 1 (it only changes in a major release):
  * - JSON values encode exactly like `JSON.stringify` with keys sorted (by UTF-16 code units): `{"a":[1,"x"],"b":null}`. Plain objects
- *   (`Object.prototype` or `null` prototype) encode their own enumerable string keys; symbol keys are ignored. Arrays encode their
- *   items; a hole encodes as nothing (`[1,,3]`), and a trailing one
- *   adds a comma, as in array literals (`[1,,]` for `[1, <hole>]`).
+ *   (`Object.prototype` or `null` prototype; the `Object.prototype` of another realm too, such as the body of a `fetch` response under
+ *   Jest) encode their own enumerable string keys; symbol keys are ignored. Arrays encode their items; a hole encodes as nothing
+ *   (`[1,,3]`), and a trailing one adds a comma, as in array literals (`[1,,]` for `[1, <hole>]`).
  * - Values JSON cannot represent get a distinct encoding: `undefined` (also as an object value: `{"a":undefined}`), `NaN`, `Infinity`,
  *   `-Infinity`, `-0`, bigints (`12n`), `Date(ms)`, `RegExp("/a/g")`, `Map([[k,v],...])` and `Set([...])` (entries sorted by encoding),
- *   typed arrays, `DataView`s and `ArrayBuffer`s (`Uint8Array([1,2])`, bytes for the last two), boxed primitives (`Number(1)`), and other
+ *   typed arrays, `DataView`s and `ArrayBuffer`s (`Uint8Array([1,2])`, bytes for the last two; a detached buffer has none),
+ *   boxed primitives (`Number(1)`), and other
  *   objects (class instances, errors...) as `ClassName{...}` with their own enumerable string keys.
  * - Functions, symbols, `WeakMap`s, `WeakSet`s, promises (any object with a `then` method) and circular references throw a
  *   `TypeError` (shared references are fine).
@@ -4451,7 +4585,8 @@ function encodeValue(value: unknown, ancestors: object[]): string {
  * @param {unknown} value - The value to serialize
  * @returns {string} The deterministic encoding
  * @throws {TypeError} when the value contains a function, a symbol, a `WeakMap`, a `WeakSet`, a promise or a circular reference
- * @throws {RangeError} when the nesting is deeper than the call stack allows
+ * @throws {RangeError} when the nesting is deeper than the call stack allows, or the encoding would be longer than the engine's maximum
+ *   string length (about 2²⁹ characters in V8: an array of a billion items, holes included)
  * @example
  * stableStringify({ b: 1, a: [true, 'x'] }); // => '{"a":[true,"x"],"b":1}'
  * stableStringify({ a: 1, b: 2 }) === stableStringify({ b: 2, a: 1 }); // => true
@@ -4476,6 +4611,7 @@ export function stableStringify(value: unknown): string {
  * @throws {TypeError} when `seed` is not a number
  * @throws {RangeError} when `seed` is not an integer in `[0, 2³² - 1]`
  * @throws {TypeError} when the value contains a function, a symbol, a `WeakMap`, a `WeakSet`, a promise or a circular reference
+ * @throws {RangeError} when the encoding would be longer than the engine's maximum string length (see {@link stableStringify})
  * @example
  * hash({ a: 1, b: [1, 2] }) === hash({ b: [1, 2], a: 1 }); // => true
  * hash({ a: 1 }) === hash({ a: 2 }); // => false

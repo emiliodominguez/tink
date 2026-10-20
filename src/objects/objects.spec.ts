@@ -5101,3 +5101,272 @@ describe('Objects helpers (1.6 audit, pass 2: polluted prototypes)', function ()
 		expect(Object.getOwnPropertyDescriptor(result, '__proto__')?.value).toEqual({ role: 'user' });
 	});
 });
+
+describe('Objects helpers (1.6 audit, pass 3)', function () {
+	/**
+	 * Runs `body` while `Object.prototype` holds `values` (as a vulnerable deep merge of JSON would plant them), then removes them.
+	 * @param {Record<string, unknown>} values - The keys and values to plant
+	 * @param {() => void} body - The checks
+	 * @returns {void}
+	 */
+	function withPollution(values: Record<string, unknown>, body: () => void): void {
+		const prototype = Object.prototype as Record<string, unknown>;
+		for (const key of Object.keys(values)) {
+			Object.defineProperty(prototype, key, { __proto__: null, value: values[key], writable: true, configurable: true, enumerable: true } as PropertyDescriptor);
+		}
+		try {
+			body();
+		} finally {
+			for (const key of Object.keys(values)) delete prototype[key];
+		}
+	}
+
+	/**
+	 * Detaches a buffer, as transferring it to a worker does (`ArrayBuffer.prototype.transfer`, ES2024).
+	 * @param {ArrayBufferLike} buffer - The buffer
+	 * @returns {void}
+	 */
+	function detach(buffer: ArrayBufferLike): void {
+		(buffer as unknown as { transfer: () => ArrayBuffer }).transfer();
+	}
+
+	/**
+	 * @param {number} length - The length of the buffer
+	 * @returns {ArrayBuffer} A detached buffer (its contents were transferred)
+	 */
+	function detached(length: number): ArrayBuffer {
+		const buffer = new ArrayBuffer(length);
+		detach(buffer);
+		return buffer;
+	}
+
+	it('shallowEqual tells a hole from an own item whatever the prototypes hold at its index', function () {
+		withPollution({ 1: 'x' }, function () {
+			// eslint-disable-next-line no-sparse-arrays
+			expect(helpers.shallowEqual([1, , 3], [1, 'x', 3])).toBe(false);
+			// eslint-disable-next-line no-sparse-arrays
+			expect(helpers.shallowEqual([1, 'x', 3], [1, , 3])).toBe(false);
+			// eslint-disable-next-line no-sparse-arrays
+			expect(helpers.shallowEqual([1, , 3], [1, , 3])).toBe(true);
+			expect(helpers.shallowEqual([1, 'x', 3], [1, 'x', 3])).toBe(true);
+		});
+		withPollution({ 1: undefined }, function () {
+			// eslint-disable-next-line no-sparse-arrays
+			expect(helpers.shallowEqual([1, , 3], [1, undefined, 3])).toBe(false);
+		});
+		// Without pollution, a hole still differs from an `undefined` item only.
+		// eslint-disable-next-line no-sparse-arrays
+		expect(helpers.shallowEqual([1, , 3], [1, undefined, 3])).toBe(false);
+		expect(helpers.shallowEqual([1, undefined], [1, undefined])).toBe(true);
+	});
+
+	it('copies an error whatever `value` Object.prototype holds (its `stack` is an accessor in V8)', function () {
+		withPollution({ value: 1 }, function () {
+			const error = new TypeError('boom', { cause: 2 });
+			for (const copy of [helpers.deepClone(error), helpers.clone(error)]) {
+				expect(copy.message).toBe('boom');
+				expect(copy.cause).toBe(2);
+				expect(copy.stack).toBe(error.stack);
+			}
+		});
+	});
+
+	it('isEqualWith gives the roots no parents whatever Object.prototype holds at -1', function () {
+		withPollution({ '-1': [{ planted: 1 }, { planted: 2 }] }, function () {
+			const parents: unknown[] = [];
+			helpers.isEqualWith({ a: 1 }, { a: 1 }, function (_a, _b, context) {
+				parents.push(context.parentA, context.parentB);
+				return undefined;
+			});
+			expect(parents.slice(0, 2)).toEqual([undefined, undefined]);
+		});
+	});
+
+	describe('plain objects of another realm (a `vm` context, the body of a `fetch` response under Jest)', function () {
+		const realm = vm.createContext({});
+		/**
+		 * @param {string} source - An expression
+		 * @returns {T} Its value, evaluated in the other realm
+		 */
+		function foreign<T = Record<string, unknown>>(source: string): T {
+			return vm.runInContext(`(${source})`, realm) as T;
+		}
+
+		it('are merged like local ones (the merge helpers threw)', function () {
+			expect(helpers.deepMerge({ a: { x: 0, y: 0 } }, foreign('{ a: { y: 1 }, list: [1] }'))).toEqual({ a: { x: 0, y: 1 }, list: [1] });
+			const merged = helpers.deepMerge(foreign('{ a: { x: 1 } }'), { a: { y: 2 } });
+			expect(merged).toEqual({ a: { x: 1, y: 2 } });
+			expect(Object.getPrototypeOf(merged)).toBe(Object.prototype);
+			expect(Object.getPrototypeOf(merged.a)).toBe(Object.prototype);
+			expect(helpers.deepMerge({}, foreign('JSON.parse(\'{"__proto__": {"admin": true}, "a": 1}\')'))).toEqual({ a: 1 });
+			expect(helpers.defaults({ a: 1 }, foreign('{ a: 2, b: 2 }'))).toEqual({ a: 1, b: 2 });
+			expect(helpers.defaultsDeep({ a: { x: 1 } }, foreign('{ a: { x: 2, y: 2 } }'))).toEqual({ a: { x: 1, y: 2 } });
+			expect(helpers.defaultsWith({ deep: true }, foreign('{ a: { x: 1 } }'), { a: { y: 2 } })).toEqual({ a: { x: 1, y: 2 } });
+			expect(helpers.deepMergeWith({ arrays: 'concat' }, { a: { l: [1] } }, foreign('{ a: { l: [2] } }'))).toEqual({ a: { l: [1, 2] } }); // Neither is a revoked proxy (stored as it is, as before).
+			const { proxy, revoke } = Proxy.revocable({}, {});
+			revoke();
+			expect(helpers.deepMerge({}, { a: proxy }).a).toBe(proxy);
+		});
+
+		it('are walked by the path, key and diff helpers (which threw, or left their keys unchanged)', function () {
+			expect(helpers.diff(foreign('{ a: { x: 1 }, b: 1 }'), { a: { x: 2 }, c: 1 })).toEqual({ added: ['c'], removed: ['b'], changed: ['a.x'] });
+			expect(helpers.flattenObject(foreign('{ a: { b: 1 }, list: [{ c: 2 }] }'))).toEqual({ 'a.b': 1, 'list.0.c': 2 });
+			expect(Object.keys(helpers.sortKeys(foreign('{ b: 1, a: 2 }')))).toEqual(['a', 'b']);
+			expect(JSON.stringify(helpers.sortKeys({ x: foreign('{ b: 1, a: 2 }') }, { deep: true }))).toBe('{"x":{"a":2,"b":1}}');
+			expect(helpers.toCamelCaseKeys(foreign('{ user_id: 1, home_address: { zip_code: "1" }, list: [{ a_b: 1 }] }'))).toEqual({
+				userId: 1,
+				homeAddress: { zipCode: '1' },
+				list: [{ aB: 1 }]
+			});
+			expect(
+				helpers.transformKeysDeep(foreign('{ a: { b: 1 } }'), function (key) {
+					return key.toUpperCase();
+				})
+			).toEqual({ A: { B: 1 } });
+			const updated = helpers.updatePath(foreign('{ a: { x: 1 }, b: 1 }'), 'a.x', 2);
+			expect(updated).toEqual({ a: { x: 2 }, b: 1 });
+			// The copies on the path keep their prototype, as the other copies do.
+			expect(Object.getPrototypeOf(updated.a)).toBe(Object.getPrototypeOf(foreign('{}')));
+			expect(helpers.omitPath(foreign('{ a: { x: 1, y: 1 } }'), 'a.x')).toEqual({ a: { y: 1 } });
+			expect(helpers.evolve(foreign('{ a: { x: 1 } }'), foreign<{ a: { x: (n: number) => number } }>('{ a: { x: function (n) { return n + 1; } } }') as never)).toEqual({
+				a: { x: 2 }
+			});
+			expect(helpers.isMatch({ a: { x: 1, y: 2 } }, foreign('{ a: { x: 1 } }'))).toBe(true);
+			expect(helpers.isMatch({ a: { x: 2 } }, foreign('{ a: { x: 1 } }'))).toBe(false);
+		});
+
+		it('are encoded like local ones by stableStringify and hash (as `Object{...}` before)', function () {
+			const value = foreign('{ b: [1, { c: 2 }], a: null }');
+			expect(helpers.stableStringify(value)).toBe('{"a":null,"b":[1,{"c":2}]}');
+			expect(helpers.hash(value)).toBe(helpers.hash({ a: null, b: [1, { c: 2 }] }));
+			expect(helpers.stableStringify(foreign('new Date(0)'))).toBe('Date(0)');
+		});
+
+		it('are walked by the structural sharing and JSON Patch helpers', function () {
+			const before = foreign('{ user: { name: "Ada" }, list: [1, 2, 3], meta: { v: 1 } }');
+			const after = foreign('{ user: { name: "Ada" }, list: [0, 1, 2, 3], meta: { v: 2 } }');
+			expect(helpers.createPatch(before, after)).toEqual([
+				{ op: 'add', path: '/list/0', value: 0 },
+				{ op: 'replace', path: '/meta/v', value: 2 }
+			]);
+			expect(helpers.createPatch(before, foreign('{ user: { name: "Ada" }, list: [1, 2, 3], meta: { v: 1, x: undefined } }'))).toEqual([]);
+			const shared = helpers.replaceEqualDeep(before, after) as typeof after;
+			expect(shared.user).toBe(before.user);
+			expect(shared.list).toEqual([0, 1, 2, 3]);
+			expect(shared.meta).toEqual({ v: 2 });
+			expect(helpers.replaceEqualDeep(before, foreign('{ user: { name: "Ada" }, list: [1, 2, 3], meta: { v: 1 } }'))).toBe(before);
+			const patched = helpers.applyPatch(before, [
+				{ op: 'replace', path: '/user/name', value: 'Grace' },
+				{ op: 'test', path: '/meta', value: { v: 1 } }
+			]) as typeof before;
+			expect(patched).toEqual({ user: { name: 'Grace' }, list: [1, 2, 3], meta: { v: 1 } });
+			expect(patched.list).toBe(before.list);
+			expect(before).toEqual({ user: { name: 'Ada' }, list: [1, 2, 3], meta: { v: 1 } });
+		});
+	});
+
+	describe('detached buffers (transferred, or the old buffer of a grown WebAssembly memory)', function () {
+		it('compare as empty ones (isEqual threw)', function () {
+			expect(helpers.isEqual(detached(8), new ArrayBuffer(0))).toBe(true);
+			expect(helpers.isEqual(new ArrayBuffer(0), detached(8))).toBe(true);
+			expect(helpers.isEqual(detached(8), new ArrayBuffer(1))).toBe(false);
+			expect(helpers.isEqual(new DataView(new ArrayBuffer(0)), new DataView(new ArrayBuffer(0)))).toBe(true);
+			const view = new DataView(new ArrayBuffer(4));
+			detach(view.buffer);
+			expect(helpers.isEqual(view, new DataView(new ArrayBuffer(0)))).toBe(true);
+			expect(helpers.isEqual(view, new DataView(new ArrayBuffer(1)))).toBe(false);
+			expect(helpers.replaceEqualDeep({ b: new ArrayBuffer(0) }, { b: detached(2) }).b.byteLength).toBe(0);
+			expect(helpers.createPatch({ b: detached(2) }, { b: new ArrayBuffer(0) })).toEqual([]);
+		});
+
+		it('encode as empty ones (stableStringify and hash threw)', function () {
+			expect(helpers.stableStringify(detached(4))).toBe('ArrayBuffer([])');
+			const view = new DataView(new ArrayBuffer(4));
+			detach(view.buffer);
+			expect(helpers.stableStringify(view)).toBe('DataView([])');
+			expect(helpers.hash({ b: detached(4) })).toBe(helpers.hash({ b: new ArrayBuffer(0) }));
+		});
+
+		it('are copied as empty ones (the clone helpers threw)', function () {
+			for (const copy of [helpers.clone(detached(4)), helpers.deepClone(detached(4))]) {
+				expect(guards.isArrayBuffer(copy)).toBe(true);
+				expect(copy.byteLength).toBe(0);
+			}
+			const typed = new Uint16Array(4);
+			detach(typed.buffer);
+			const view = new DataView(new ArrayBuffer(4));
+			detach(view.buffer);
+			for (const copy of [helpers.clone(typed), helpers.deepClone(typed)]) {
+				expect(copy).toBeInstanceOf(Uint16Array);
+				expect(copy.length).toBe(0);
+			}
+			for (const copy of [helpers.clone(view), helpers.deepClone(view)]) {
+				expect(copy).toBeInstanceOf(DataView);
+				expect(copy.byteLength).toBe(0);
+			}
+			// Views of one detached buffer still share the (empty) copy of it.
+			const buffer = new ArrayBuffer(8);
+			const pair = { a: new Uint8Array(buffer), b: new DataView(buffer) };
+			detach(buffer);
+			const copy = helpers.deepClone(pair);
+			expect(copy.a.buffer).toBe(copy.b.buffer);
+			expect(copy.a.buffer.byteLength).toBe(0);
+		});
+	});
+
+	it('stableStringify writes the holes of a long sparse array in runs (a length of 1e8 exhausted the memory)', function () {
+		const sparse: unknown[] = [];
+		sparse.length = 100_000_000;
+		sparse[2] = 'a';
+		sparse[99_999_990] = { b: 1 };
+		const text = helpers.stableStringify(sparse);
+		expect(text.length).toBe(100_000_000 + 2 + 3 + 7);
+		expect(text.slice(0, 6)).toBe('[,,"a"');
+		expect(text.endsWith(`{"b":1}${','.repeat(10)}]`)).toBe(true);
+		// Too long for any string: a `RangeError` at once.
+		const huge: unknown[] = [];
+		huge.length = 2 ** 32 - 1;
+		huge[1] = 1;
+		expect(function () {
+			helpers.hash(huge);
+		}).toThrow(RangeError);
+		// A long array whose first hole comes late, or with no item at all, or that ends with an item.
+		/**
+		 * @param {unknown[]} items - The array
+		 * @returns {string} Its encoding, written one index at a time
+		 */
+		function reference(items: unknown[]): string {
+			let expected = '[';
+			for (let index = 0; index < items.length; index++) expected += (index > 0 ? ',' : '') + (index in items ? helpers.stableStringify(items[index]) : '');
+			return expected + (items.length > 0 && !(items.length - 1 in items) ? ',' : '') + ']';
+		}
+		const late = new Array<unknown>(70_000).fill(1, 0, 69_000);
+		late[69_500] = 'x';
+		const empty = new Array<unknown>(70_000);
+		const ending = new Array<unknown>(70_000);
+		ending[69_999] = 2;
+		const dense = Array.from({ length: 9000 }, function (_, index) {
+			return index % 3 === 0 ? { index } : index;
+		});
+		const holeFirst = dense.slice();
+		delete holeFirst[0];
+		const holeLast = dense.slice();
+		holeLast.length = 9001;
+		for (const items of [late, empty, ending, dense, holeFirst, holeLast, new Array<unknown>(5000), dense.slice(0, 8192)])
+			expect(helpers.stableStringify(items)).toBe(reference(items));
+	});
+
+	it('stableStringify writes large typed arrays in linear memory (tens of millions of items exhausted the memory)', function () {
+		const bytes = new Uint8Array(20_000_000).fill(200);
+		expect(helpers.stableStringify(bytes).length).toBe('Uint8Array([])'.length + 4 * 20_000_000 - 1);
+		expect(helpers.stableStringify(bytes.buffer).startsWith('ArrayBuffer([200,200,')).toBe(true);
+		expect(helpers.stableStringify(new DataView(bytes.buffer, 1, 2))).toBe('DataView([200,200])');
+		expect(helpers.stableStringify(new Int16Array([-1, 0, 300]))).toBe('Int16Array([-1,0,300])');
+		// Floats keep `-0`, bigints their `n`, at any length.
+		const floats = new Float64Array(5000).fill(1.5);
+		floats[4999] = -0;
+		expect(helpers.stableStringify(floats)).toBe(`Float64Array([${'1.5,'.repeat(4999)}-0])`);
+		expect(helpers.stableStringify(new BigInt64Array(5000).fill(-2n))).toBe(`BigInt64Array([${'-2n,'.repeat(4999)}-2n])`);
+		expect(helpers.stableStringify(new Float32Array([-0, NaN, Infinity]))).toBe('Float32Array([-0,NaN,Infinity])');
+	});
+});
