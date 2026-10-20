@@ -549,6 +549,41 @@ describe('random', function () {
 			expect(helpers.randomId(30)).toMatch(/^[A-Za-z0-9_-]{30}$/);
 		});
 
+		it('should keep working after a TextDecoder constructor throws (regression: every later call threw)', function () {
+			const original = Object.getOwnPropertyDescriptor(globalThis, 'TextDecoder') as PropertyDescriptor;
+			const Native = globalThis.TextDecoder;
+			let fail = true;
+			/** A decoder whose constructor throws until `fail` is cleared. */
+			class Flaky extends Native {
+				/** Throws while `fail` is set. */
+				constructor() {
+					if (fail) throw new Error('unavailable');
+					super();
+				}
+			}
+			let isolated: typeof import('.') | undefined;
+
+			jest.isolateModules(function () {
+				// A fresh copy of the module, which has not created a decoder yet.
+				// eslint-disable-next-line @typescript-eslint/no-require-imports
+				isolated = require('.') as typeof import('.');
+			});
+
+			const { randomId } = isolated as typeof import('.');
+
+			Object.defineProperty(globalThis, 'TextDecoder', { value: Flaky, configurable: true, writable: true });
+			try {
+				expect(function () {
+					randomId(10);
+				}).toThrow('unavailable');
+				fail = false;
+				expect(randomId(30)).toMatch(/^[A-Za-z0-9_-]{30}$/);
+			} finally {
+				Object.defineProperty(globalThis, 'TextDecoder', original);
+			}
+			expect(randomId(30)).toMatch(/^[A-Za-z0-9_-]{30}$/);
+		});
+
 		it('should use the alphabet of each call when alternating alphabets, and keep validating them', function () {
 			for (let i = 0; i < 20; i++) {
 				expect(helpers.randomId(30, 'ab')).toMatch(/^[ab]{30}$/);

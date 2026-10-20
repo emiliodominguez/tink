@@ -854,8 +854,9 @@ function generateId(count: number, characters: string[], crypto: CryptoLike): st
 	}
 	if (ascii) {
 		if (Decoder !== decoderClass) {
-			decoderClass = Decoder;
+			// The class is recorded only once its decoder exists: a constructor that throws must not leave it paired with no decoder.
 			utf8Decoder = new (Decoder as new () => TextDecoderLike)();
+			decoderClass = Decoder;
 		}
 		// Accepted indexes are below `length`, so masking them again is a no-op.
 		for (let i = 0; i < count; i++) indexes[i] = codes[indexes[i] & mask];
