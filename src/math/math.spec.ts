@@ -5092,3 +5092,67 @@ describe('dot, norm, distance and cosineSimilarity', function () {
 		}).toThrow(new RangeError('cosineSimilarity: `xs` and `ys` must have the same length, got 1 and 3'));
 	});
 });
+
+describe('Regressions found by the reference reviews', function () {
+	it('dot falls back to per-product scaling instead of overflowing or flushing small terms', function () {
+		// A factor beyond 2 ** 996 made the exact product splitting overflow, and the whole-vector scaling then overflowed or flushed.
+		expect(helpers.dot([1e308], [0.9])).toBe(1e308 * 0.9);
+		expect(helpers.dot([1e308], [-3e-30])).toBe(1e308 * -3e-30);
+		expect(helpers.dot([0.5, 0.5], [1e308, 1e308])).toBe(1e308);
+		expect(helpers.dot([1e301, 1e-30], [0, 1e30])).toBe(1e-30 * 1e30);
+		expect(helpers.dot([1e301, 1e-300], [1e-301, 1e300])).toBe(2);
+		expect(helpers.dot([1e308, 0, 2], [0.9, 5, 1e-300])).toBe(1e308 * 0.9);
+		expect(helpers.dot([1e308, 0], [0, 1e308])).toBe(0);
+	});
+
+	it('dot lets infinite factors decide without the spurious Infinity - Infinity of overflowing products', function () {
+		expect(helpers.dot([Infinity, 1e300, 1], [1, -1e300, Infinity])).toBe(Infinity);
+		expect(helpers.dot([Infinity, 1], [0, 1])).toBeNaN();
+		expect(helpers.dot([-Infinity, 1e300], [1, 1e300])).toBe(-Infinity);
+	});
+
+	it('pingPong mirrors negative values exactly', function () {
+		expect(helpers.pingPong(-0.1, 3)).toBe(0.1);
+		expect(helpers.pingPong(-1e-20, 3)).toBe(1e-20);
+		expect(helpers.pingPong(-1.67e199, Number.MAX_VALUE)).toBe(1.67e199);
+	});
+
+	it('smoothstep keeps the direction of a reversed pair of subnormal edges for infinite x (via inverseLerp)', function () {
+		expect(helpers.inverseLerp(5e-324, 0, Infinity)).toBe(-Infinity);
+		expect(helpers.inverseLerp(5e-324, 0, -Infinity)).toBe(Infinity);
+		expect(helpers.smoothstep(5e-324, 0, -Infinity)).toBe(1);
+		expect(helpers.smoothstep(5e-324, 0, Infinity)).toBe(0);
+		expect(helpers.smootherstep(5e-324, 0, Infinity)).toBe(0);
+	});
+
+	it('angleDifference keeps tiny differences and their sign, rounding the exact rotation once', function () {
+		expect(helpers.angleDifference(1, 0.9999999999999999)).toBe(0.9999999999999999 - 1);
+		expect(helpers.angleDifference(0.9999999999999999, 1)).toBe(1 - 0.9999999999999999);
+		expect(helpers.angleDifference(1e-20, 0)).toBe(-1e-20);
+		expect(helpers.angleDifference(359.99999999999994, -180)).toBe(-179.99999999999994);
+		// An exact difference just above -180 that rounds onto it is the half turn, +180.
+		expect(helpers.angleDifference(-90, 90 + 2 ** -46)).toBe(180);
+		expect(helpers.angleDifference(90 + 2 ** -46, -90)).toBe(180);
+		// A subnormal period with an odd number of units: its half is not a double, and the half turns are compared exactly.
+		const unit = Number.MIN_VALUE;
+		expect(helpers.angleDifference(0, 15 * unit, 20 * unit)).toBe(-5 * unit);
+		expect(helpers.angleDifference(0, 10 * unit, 21 * unit)).toBe(10 * unit);
+		expect(helpers.angleDifference(0, 11 * unit, 21 * unit)).toBe(-10 * unit);
+	});
+
+	it('variance and standardDeviation keep every digit for data far from zero (Welford lost some)', function () {
+		const offset = [1e15 + 1, 1e15 + 2, 1e15 + 4, 1e15 + 8];
+		expect(helpers.variance(offset)).toBe(7.1875);
+		expect(helpers.variance(offset, { sample: true })).toBe(28.75 / 3);
+		expect(helpers.standardDeviation(offset)).toBe(Math.sqrt(7.1875));
+		expect(helpers.summarize(offset).variance).toBe(7.1875);
+	});
+
+	it('standardize gives unit-variance scores for data far from zero, even when the mean is not a double', function () {
+		expect(helpers.standardize([1e15 + 1, 1e15 + 2, 1e15 + 4, 1e15 + 8])).toEqual([-1.025755289064345, -0.6527533657682196, 0.09325048082403138, 1.5852581740085334]);
+		const scores = helpers.standardize([1e15, 1e15, 1e15 + 0.125]);
+		expect(scores[0]).toBeCloseTo(-Math.SQRT1_2, 15);
+		expect(scores[1]).toBeCloseTo(-Math.SQRT1_2, 15);
+		expect(scores[2]).toBeCloseTo(Math.SQRT2, 15);
+	});
+});

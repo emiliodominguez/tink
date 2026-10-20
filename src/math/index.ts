@@ -2,11 +2,14 @@ import { assertFunction, assertInteger, assertNumber, describe, draw, readOption
 import type { RandomGenerator } from '../utils/index.js';
 
 /**
- * Options accepted by {@link variance} and {@link standardDeviation}.
+ * Options accepted by {@link variance}, {@link standardDeviation}, {@link covariance}, {@link standardize}, {@link skewness} and
+ * {@link kurtosis}.
  */
 export interface VarianceOptions {
 	/**
-	 * When `true`, computes the sample (Bessel-corrected, divides by `n - 1`) statistic instead of the population one (divides by `n`).
+	 * When `true`, computes the sample statistic instead of the population one: Bessel-corrected (divides by `n - 1` instead of `n`) for the
+	 * variance, the standard deviation, the covariance and the scores of `standardize`, and the adjusted Fisher–Pearson `G1` and `G2` (Excel's
+	 * `SKEW` and `KURT`) for the skewness and the kurtosis.
 	 * @default false
 	 */
 	sample?: boolean;
@@ -658,7 +661,8 @@ export function inverseLerp(start: number, end: number, value: number): number {
 	if (start === end) return 0;
 	const span = end - start;
 	const offset = value - start;
-	if (Number.isFinite(span) && Number.isFinite(offset)) return offset / span;
+	// An infinite `value` gives `±Infinity` (or `NaN`) directly: halving a subnormal span would round it to zero and lose its sign.
+	if (Number.isFinite(span) && (Number.isFinite(offset) || !Number.isFinite(value))) return offset / span;
 	// A difference overflowed (`inverseLerp(-1e308, 1e308, 0)`): the halves do not, and their ratio is the same.
 	return (value / 2 - start / 2) / (end / 2 - start / 2);
 }
@@ -771,7 +775,11 @@ export function mode(numbers: ReadonlyArray<number>): number[] {
 }
 
 /**
- * Computes the variance of an array of numbers using Welford's numerically stable online algorithm.
+ * Computes the variance of an array of numbers in two passes: the compensated mean (see {@link average}), then the squared deviations from
+ * it, corrected for the rounding of the mean (Chan, Golub and LeVeque's corrected two-pass algorithm, as in {@link covariance}). That keeps
+ * every digit the data allows for values far from zero, where Welford's one-pass update (whose running mean is rounded at every step) lost
+ * some (`variance([1e15 + 1, 1e15 + 2, 1e15 + 4, 1e15 + 8])` is exactly `7.1875`). The values are scaled by a power of two first
+ * (exactly), so that only a variance that is itself beyond the doubles overflows.
  * By default the population variance (divide by `n`) is returned; pass `{ sample: true }` for the
  * sample variance (divide by `n - 1`). Elements are converted once with unary `+` (numeric strings count as numbers).
  * @param {ReadonlyArray<number>} numbers - The numbers
@@ -781,51 +789,37 @@ export function mode(numbers: ReadonlyArray<number>): number[] {
  * @example
  * variance([2, 4, 4, 4, 5, 5, 7, 9]); // => 4
  * variance([1, 2, 3, 4], { sample: true }); // => 1.6666666666666667
+ * variance([1e15 + 1, 1e15 + 2, 1e15 + 4, 1e15 + 8]); // => 7.1875
  * variance([]); // => NaN
  */
 export function variance(numbers: ReadonlyArray<number>, options: VarianceOptions = {}): number {
-	const sample = readOption(options, 'sample') === true;
-	const [count, squaredDistance, allFinite] = welford(numbers, 1);
-	const divisor = sample ? count - 1 : count;
-	if (divisor <= 0 || !allFinite) return NaN;
-	if (squaredDistance >= 0 && squaredDistance < Infinity) return squaredDistance / divisor;
-	// The running sum of squared deviations (`n` times the variance) overflowed, or Welford's update turned that into `-Infinity` or
-	// `NaN`: redo it on values scaled by 2 ** -600 (exact), then scale the variance back in two exact steps, so that only a variance
-	// that really overflows is `Infinity`.
-	return scaledVariance(numbers, divisor) * 2 ** 600 * 2 ** 600;
+	const divisor = readOption(options, 'sample') === true ? numbers.length - 1 : numbers.length;
+	if (divisor <= 0) return NaN;
+	const [squares, scale] = centredSquares(numbers);
+	// Scaled back in two steps, so that the square of the scale itself never overflows or underflows.
+	return squares / divisor / scale / scale;
 }
 
 /**
- * The variance of `numbers` scaled by `2 ** -1200` (computed on the values scaled by `2 ** -600`, exactly), for variances that overflow.
- * @param {ReadonlyArray<number>} numbers - The numbers
- * @param {number} divisor - `n` or `n - 1`
- * @returns {number} The scaled variance
+ * The sum of the squared deviations of a sample from its mean, on the values scaled by {@link scaledSample}, by the corrected two-pass
+ * algorithm: the deviations from the rounded mean add up to `n` times its rounding error `e` instead of `0`, which adds `n·e²` to the sum of
+ * squares; subtracting `(Σd)² / n` takes it out again. Values are converted with unary `+`.
+ * @param {ReadonlyArray<number>} numbers - A sample of at least one value
+ * @returns {[number, number]} The sum of squares of the scaled values (`NaN` if a value is not finite) and the scale
  */
-function scaledVariance(numbers: ReadonlyArray<number>, divisor: number): number {
-	return welford(numbers, 2 ** -600)[1] / divisor;
-}
-
-/**
- * Welford's online algorithm on `numbers` multiplied by `scale`: the count, the sum of squared deviations from the mean, and whether
- * every element is finite. Elements are converted with unary `+`.
- * @param {ReadonlyArray<number>} numbers - The numbers
- * @param {number} scale - A power of two to multiply them by
- * @returns {[number, number, boolean]} The count, the sum of squared deviations (of the scaled values) and whether all are finite
- */
-function welford(numbers: ReadonlyArray<number>, scale: number): [number, number, boolean] {
-	let count = 0;
-	let mean = 0;
-	let squaredDistance = 0;
-	let allFinite = true;
-	for (const item of numbers) {
-		const value = +item * scale;
-		count++;
-		if (!Number.isFinite(value)) allFinite = false;
-		const delta = value - mean;
-		mean += delta / count;
-		squaredDistance += delta * (value - mean);
+function centredSquares(numbers: ReadonlyArray<number>): [number, number] {
+	const [values, scale] = scaledSample(numbers);
+	const count = values.length;
+	const mean = average(values);
+	let total = 0;
+	let squares = 0;
+	for (let i = 0; i < count; i++) {
+		const deviation = values[i] - mean;
+		total += deviation;
+		squares += deviation * deviation;
 	}
-	return [count, squaredDistance, allFinite];
+	// An infinite value makes the mean infinite and its deviation `NaN`. The correction never exceeds the sum it corrects, except by rounding.
+	return [Math.max(squares - (total * total) / count, 0), scale];
 }
 
 /**
@@ -841,11 +835,11 @@ function welford(numbers: ReadonlyArray<number>, scale: number): [number, number
  * standardDeviation([1], { sample: true }); // => NaN
  */
 export function standardDeviation(numbers: ReadonlyArray<number>, options: VarianceOptions = {}): number {
-	const result = variance(numbers, options);
-	if (result !== Infinity) return Math.sqrt(result);
-	// The variance overflows although every value is finite, but its square root (at most half the range) does not: take the root of
-	// the scaled variance, then scale back by 2 ** 600.
-	return Math.sqrt(scaledVariance(numbers, readOption(options, 'sample') === true ? numbers.length - 1 : numbers.length)) * 2 ** 600;
+	const divisor = readOption(options, 'sample') === true ? numbers.length - 1 : numbers.length;
+	if (divisor <= 0) return NaN;
+	const [squares, scale] = centredSquares(numbers);
+	// The root of the scaled variance, scaled back: it does not overflow even when the variance does.
+	return Math.sqrt(squares / divisor) / scale;
 }
 
 /**
@@ -2999,7 +2993,7 @@ function scaleByPowerOfTwo(value: number, exponent: number): number {
  * multiplicative quantities (Python's `statistics.geometric_mean`, scipy's `gmean`, Excel's `GEOMEAN`). The product is accumulated with
  * its power of two kept apart, so that it neither overflows nor underflows whatever the number of values (`geometricMean([1e300, 1e300])`
  * is `1e300`, where the product is `Infinity`), and its root is taken once, so the result is accurate to a few units in the last place
- * (exact for exact powers: `geometricMean([2, 8])` is `4`, where `exp(mean(log))` gives `4.000000000000001`).
+ * (exact for exact powers: `geometricMean([2, 8])` is `4`, and `geometricMean([81, 1, 1, 1])` is `3`, which `exp(mean(log))` need not give).
  *
  * Values are converted once with unary `+`. The geometric mean is only defined for non-negative values: a negative value or `NaN` gives
  * `NaN`; otherwise a zero gives `0`, and an `Infinity` gives `Infinity` (`NaN` with a zero).
@@ -3321,7 +3315,8 @@ export function medianAbsoluteDeviation(numbers: ReadonlyArray<number>): number 
 
 /**
  * Computes the trimmed (truncated) mean of an array of numbers: the mean of what remains once the `floor(n · proportion)` smallest and as
- * many largest values are cut off, a mean that outliers do not move (scipy's `trim_mean`). `proportion = 0` gives the plain
+ * many largest values are cut off, a mean that outliers do not move (scipy's `trim_mean`). As in scipy, `n · proportion` is a
+ * floating-point product: `100 · 0.29` is `28.999999999999996`, so 28 values are cut from each end, not 29. `proportion = 0` gives the plain
  * {@link average}, and a proportion close to `0.5` tends to the median. The input is not mutated; values are converted once with unary `+`.
  * @param {ReadonlyArray<number>} numbers - The numbers
  * @param {number} proportion - The share cut off at each end, in `[0, 0.5)`
@@ -3422,8 +3417,14 @@ export function standardize(numbers: ReadonlyArray<number>, options: VarianceOpt
 	const [values] = scaledSample(numbers);
 	const mean = average(values);
 	const deviation = standardDeviation(values, options);
-	return values.map(function (value) {
-		return deviation === 0 ? 0 : (value - mean) / deviation;
+	const deviations = values.map(function (value) {
+		return value - mean;
+	});
+	// The mean of data far from zero cannot be held exactly (that of `1e15 + k` values is a multiple of `0.125`): the deviations from the
+	// rounded mean, which are exact for such data, are off by its rounding error, which is their own mean. Subtracting it centres them again.
+	const correction = sum(deviations) / deviations.length;
+	return deviations.map(function (offset) {
+		return deviation === 0 ? 0 : (offset - correction) / deviation;
 	});
 }
 
@@ -3478,7 +3479,8 @@ export function softmax(numbers: ReadonlyArray<number>): number[] {
  * gives the values themselves.
  *
  * A `NaN` value is skipped: its position repeats the previous average (`NaN` before the first number), and the average goes on from there,
- * instead of every later average being `NaN`. An infinite value makes every later average infinite (`NaN` once both infinities were seen).
+ * instead of every later average being `NaN`. An infinite value makes every later average infinite when `alpha < 1` (`NaN` once both
+ * infinities were seen; pandas starts again after such a `NaN`, this function does not).
  * Values are converted once with unary `+`.
  * @param {ReadonlyArray<number>} values - The series
  * @param {number} alpha - The smoothing factor, in `(0, 1]`: the weight of the newest value
@@ -4078,9 +4080,10 @@ function stepPosition(caller: string, edge0: number, edge1: number, x: number): 
  *
  * `lambda` is the decay rate: after `1 / lambda` units of time, about 63% of the distance is covered (`ln(2) / lambda` is the half-life).
  * The result always lies between `current` and `target` and never overshoots. It is exactly `target` when `lambda * deltaTime` is large,
- * and a step too small to change `current` (one below half an ulp, close to the target) moves it by an ulp instead, so repeated steps reach
- * `target` exactly and an animation that waits for `value === target` ends: rounding to nearest alone can leave the value a few ulps short
- * forever.
+ * and a step too small to change `current` (below half an ulp of it, as close to the target, or with a tiny `lambda * deltaTime`) moves it
+ * by an ulp instead, so repeated steps reach `target` exactly and an animation that waits for `value === target` ends: rounding to nearest
+ * alone can leave the value a few ulps short forever. Frame-rate independence holds up to that ulp per step: with steps that small, the value
+ * creeps an ulp at a time instead of stalling.
  * @param {number} current - The current value
  * @param {number} target - The value to approach
  * @param {number} lambda - The decay rate per unit of time, a finite number `>= 0` (`0` never moves)
@@ -4111,8 +4114,9 @@ export function damp(current: number, target: number, lambda: number, deltaTime:
  * period, as Unity's `DeltaAngle` (`angleDifference(350, 10) === 20`, not `-340`). Degrees by default; pass `2 * Math.PI` as the period
  * for radians, or any other period (`24` for hours on a clock). A half turn is `+period / 2`.
  *
- * Both angles are reduced modulo the period first (with the exact `%`), so angles accumulated over many turns lose no precision in the
- * subtraction. A zero difference is `+0`, and `NaN` or `±Infinity` angles give `NaN`.
+ * The result is the exact shortest rotation rounded once: both angles are reduced with the exact `%` and their difference is kept exactly
+ * until the last step, so angles accumulated over many turns lose no precision, and `angleDifference(a, b)` is `-angleDifference(b, a)`
+ * except for a half turn. A zero difference is `+0`, and `NaN` or `±Infinity` angles give `NaN`.
  * @param {number} from - The starting angle
  * @param {number} to - The target angle
  * @param {number} [period=360] - The size of a full turn, a finite number `> 0`
@@ -4142,12 +4146,48 @@ export function angleDifference(from: number, to: number, period = 360): number 
  */
 function shortestRotation(caller: string, from: number, to: number, period: number): number {
 	assertNumber(caller, 'period', period, period > 0 && period < Infinity, 'a finite number > 0');
-	// The remainders are exact and lie in `(-period, period)`, so their difference cannot overflow. Wrapping into `[0, period)` and then
-	// subtracting the period from the upper half (exactly: both are within a factor 2 of each other) gives `(-period / 2, period / 2]`
-	// without `±period / 2` bounds, which a subnormal period would round to 0.
-	const turn = wrap((to % period) - (from % period), 0, period);
-	// `+ 0` turns `-0` into `0`; `NaN` fails the comparison and is returned.
-	return (turn > period / 2 ? turn - period : turn) + 0;
+	// Both angles reduced exactly into `[-period / 2, period / 2]`: `%` is exact, and so is adding or subtracting the period from a
+	// remainder beyond a half turn (Sterbenz).
+	const a = halfTurn(to % period, period);
+	const b = halfTurn(from % period, period);
+	// Their difference, in `[-period, period]`, as the exact `high + low` (Knuth's TwoSum).
+	let high = a - b;
+	const virtual = high - a;
+	const low = a - (high - virtual) - (b + virtual);
+	// Brought into `(-period / 2, period / 2]` by one more exact shift, decided on the exact difference; the only rounding is the last one.
+	const above = beyondHalf(high, period);
+	if (above > 0 || (above === 0 && low > 0)) high -= period;
+	else if (above < 0 || (above === 0 && low <= 0 && high < 0)) high += period;
+	const turn = high + low;
+	// The exact difference is now above `-period / 2`, but can round onto it: the half turn is `+period / 2`. `+ 0` turns `-0` into `0`, and
+	// `NaN` is returned.
+	return (beyondHalf(turn, period) === 0 && turn < 0 ? turn + period : turn) + 0;
+}
+
+/**
+ * Compares a value with half a period, exactly: `2 * value` with `period` below `1` (where halving a subnormal period could round), and
+ * `value` with `period / 2` otherwise (where doubling could overflow).
+ * @param {number} value - A value in `[-2 * period, 2 * period]`
+ * @param {number} period - The period, a finite number `> 0`
+ * @returns {number} `1` when `value > period / 2`, `-1` when `value < -period / 2`, `0` when `|value| === period / 2`, and `NaN` otherwise
+ * (strictly between the half turns, or `NaN`)
+ */
+function beyondHalf(value: number, period: number): number {
+	const magnitude = period < 1 ? 2 * Math.abs(value) : Math.abs(value);
+	const half = period < 1 ? period : period / 2;
+	if (magnitude > half) return value > 0 ? 1 : -1;
+	return magnitude === half ? 0 : NaN;
+}
+
+/**
+ * Brings a remainder of the period into `[-period / 2, period / 2]`, exactly.
+ * @param {number} rest - `angle % period`, in `(-period, period)` (or `NaN`)
+ * @param {number} period - The period
+ * @returns {number} The congruent value within half a turn of `0`
+ */
+function halfTurn(rest: number, period: number): number {
+	const above = beyondHalf(rest, period);
+	return above > 0 ? rest - period : above < 0 ? rest + period : rest;
 }
 
 /**
@@ -4182,8 +4222,8 @@ export function lerpAngle(start: number, end: number, t: number, period = 360): 
  * as `value` goes from `0` to `length`, falls back to `0` at `2 * length`, and so on. For animations driven by a time that only grows
  * (a pulsing glow, a patrolling sprite), or to reflect an index at the ends of a range. Negative values mirror positive ones.
  *
- * The value is reduced with the exact {@link modulo} of `2 * length`, and the falling half is `2 * length` minus the reduced value, which
- * is exact too, so `pingPong(0.1, 3)` is `0.1` (where `length - |value mod 2·length - length|` gives `0.10000000000000009`). `NaN` and
+ * The magnitude of the value is reduced with the exact `%` of `2 * length`, and the falling half is `2 * length` minus the reduced value,
+ * which is exact too, so `pingPong(0.1, 3)` and `pingPong(-0.1, 3)` are `0.1` (where `length - |value mod 2·length - length|` gives `0.10000000000000009`). `NaN` and
  * `±Infinity` give `NaN`.
  * @param {number} value - The ever-changing input (typically a time)
  * @param {number} length - The top of the bounce, a finite number `> 0`
@@ -4204,7 +4244,9 @@ export function pingPong(value: number, length: number): number {
 	// A cycle beyond `Number.MAX_VALUE`: halving the value and the length is exact for such a large length (and for any value that is not
 	// subnormal; a subnormal one is then off by at most the smallest subnormal).
 	if (cycle === Infinity) return 2 * pingPong(value / 2, length / 2);
-	const phase = modulo(value, cycle);
+	// The magnitude: `%` of a non-negative value is exact, where reducing a negative one into `[0, cycle)` rounds (`-0.1` to
+	// `5.9` and back to `0.09999999999999964`), and `pingPong(-v, length)` is `pingPong(v, length)` (the wave is symmetric).
+	const phase = Math.abs(value) % cycle;
 	// `cycle - phase` is exact for `phase` in `[length, cycle)` (Sterbenz), and `NaN` fails the comparison and is returned.
 	return phase > length ? cycle - phase : phase;
 }
@@ -4391,10 +4433,12 @@ export function ticks(start: number, stop: number, count = 10): number[] {
  * repeatedly, until the step no longer changes (at most 10 times), so that an axis over the result starts and ends with a tick
  * (`niceDomain(0.201, 0.996)` is `[0.2, 1]`). The bounds are computed with the same expressions as the ticks, so
  * `ticks(...niceDomain(a, b, n), n)` starts and ends exactly with them, and a domain that is already nice is returned as is (d3 floors the
- * rounded quotients, which can move a bound that is already round out by a step, or in by an ulp).
+ * rounded quotients, which can move a bound that is already round out by a step, or in by an ulp). Both hold whenever the step is coarser
+ * than the precision of the bounds; on a domain only a few dozen ulps wide (a noisy constant series), the step is finer than the doubles
+ * there, and the bounds are kept or moved by an ulp instead.
  *
  * The result always contains the domain and keeps its direction: a decreasing domain stays decreasing. A domain of one value is returned as
- * is, and the bounds never go beyond `±Number.MAX_VALUE`. With a `count` below 2, widening the bounds can double the step every round, as in
+ * is, and the bounds never go beyond `±Number.MAX_VALUE` (a bound clamped there is not a tick). With a `count` below 2, widening the bounds can double the step every round, as in
  * d3: the result is then the bounds of the tenth round, which are not always ticks.
  * @param {number} start - One end of the domain, a finite number
  * @param {number} stop - The other end, a finite number
@@ -4527,9 +4571,11 @@ function assertSameLength(caller: string, xs: ReadonlyArray<number>, ys: Readonl
  * Computes the dot (scalar) product of two vectors, `Σ xs[i] · ys[i]`, as accurately as if it were computed in twice the precision of
  * doubles and then rounded (Ogita, Rump and Oishi's `Dot2`), so that products that cancel do not wipe out the result:
  * `dot([1e16, 1, -1e16], [1, 1, 1])` is `1`, where the plain loop gives `0`. The error is at most about an ulp of the result plus
- * `n² · 2 ** -106` times `Σ |xs[i] · ys[i]|`, for `n` elements. When a product or the sum overflows, or the result is so small (below
- * `2 ** -900`) that the rounding of products below the normal doubles could matter, it is computed again on both vectors scaled by powers of
- * two (exactly), so that only a result beyond the doubles overflows. About five times as slow as the plain loop on long vectors.
+ * `n² · 2 ** -106` times `Σ |xs[i] · ys[i]|`, for `n` elements. When a product or the sum overflows, a value is beyond `2 ** 996` (where
+ * the exact splitting of the products would overflow), or the result is so small (below `2 ** -900`) that the rounding of products below
+ * the normal doubles could matter, it is computed again with each product scaled by a power of two of its own (exactly), so that only a
+ * result beyond the doubles overflows and no element is flushed by a much larger one. About five times as slow as the plain loop on long
+ * vectors.
  *
  * Values are converted once with unary `+`. When one is not finite, the result is the IEEE sum of the products (`Infinity`, `-Infinity` or
  * `NaN`), without the spurious `Infinity - Infinity` of products that overflow.
@@ -4542,6 +4588,7 @@ function assertSameLength(caller: string, xs: ReadonlyArray<number>, ys: Readonl
  * dot([1e16, 1, -1e16], [1, 1, 1]); // => 1 // the plain loop gives 0
  * dot([1e200, 1e200], [1e200, -1e200]); // => 0 // the plain loop gives NaN (Infinity - Infinity)
  * dot([Infinity, 1e200], [1, -1e200]); // => Infinity
+ * dot([1e308], [0.9]); // => 9e307
  * dot([], []); // => 0
  * dot([1, 2], [1]); // throws RangeError
  */
@@ -4553,17 +4600,68 @@ export function dot(xs: ReadonlyArray<number>, ys: ReadonlyArray<number>): numbe
 	// so the products are first taken as they are: an overflow makes the result infinite or `NaN` (`Infinity - Infinity`).
 	const direct = dot2(x, 1, y, 1);
 	if (Math.abs(direct) >= 2 ** -900 && Math.abs(direct) < Infinity) return direct;
-	const scaleX = vectorScale(x);
-	const scaleY = vectorScale(y);
-	const scaled = dot2(x, scaleX, y, scaleY);
-	if (scaled !== scaled) {
-		// A value is not finite (its vector's scale is then 1): the plain sum of the scaled products, where an infinity or a `NaN` decides.
-		let total = 0;
-		for (let i = 0; i < x.length; i++) total += x[i] * scaleX * (y[i] * scaleY);
-		return total;
+	return normalizedDot(x, y);
+}
+
+/**
+ * {@link dot} when the direct `Dot2` cannot be trusted: a product or the sum overflowed, a value is beyond `2 ** 996` (where Veltkamp's
+ * splitting overflows), a value is not finite, or the result is tiny. Each product is taken on the mantissas of its two factors (exactly
+ * split into `high + low`, which can neither overflow nor underflow there) times a power of two of its own, and the terms are added with the
+ * error-free sums of `Dot2` relative to the largest of those powers. Scaling each vector as a whole instead would flush every element far
+ * below its largest one (`dot([1e301, 1e-30], [0, 1e30])` is `1`); here only terms below `2 ** -1000` times the largest product are lost,
+ * far within the error bound of `Dot2`.
+ * @param {Float64Array} x - The first vector
+ * @param {Float64Array} y - The second vector, as long as `x`
+ * @returns {number} The dot product
+ */
+function normalizedDot(x: Float64Array, y: Float64Array): number {
+	const count = x.length;
+	const exponents = new Float64Array(count);
+	const mantissasX = new Float64Array(count);
+	const mantissasY = new Float64Array(count);
+	let largest = -Infinity;
+	// The sum of the products that are not finite (an infinite or `NaN` factor): it decides the result alone, without the spurious
+	// `Infinity - Infinity` of finite products that overflow.
+	let special = 0;
+	let hasSpecial = false;
+	for (let i = 0; i < count; i++) {
+		const a = x[i];
+		const b = y[i];
+		if (!Number.isFinite(a) || !Number.isFinite(b)) {
+			special += a * b;
+			hasSpecial = true;
+		} else if (a !== 0 && b !== 0) {
+			const exponentA = Math.floor(Math.log2(Math.abs(a)));
+			const exponentB = Math.floor(Math.log2(Math.abs(b)));
+			// Mantissas between about 0.5 and 2 (`log2` can be off by one next to a power of two), exact for subnormal factors too.
+			mantissasX[i] = scaleByPowerOfTwo(a, -exponentA);
+			mantissasY[i] = scaleByPowerOfTwo(b, -exponentB);
+			exponents[i] = exponentA + exponentB;
+			largest = Math.max(largest, exponents[i]);
+		}
 	}
-	// Scaled back by the smaller scale first: the intermediate result grows, so it cannot underflow before the final one does.
-	return scaled / Math.min(scaleX, scaleY) / Math.max(scaleX, scaleY);
+	if (hasSpecial) return special;
+	// Every product is zero (or there are none).
+	if (largest === -Infinity) return 0;
+	let high = 0;
+	let low = 0;
+	for (let i = 0; i < count; i++) {
+		const mantissaX = mantissasX[i];
+		if (mantissaX === 0) continue;
+		const mantissaY = mantissasY[i];
+		// Below `2 ** -1022` relative to the largest product, the scaling is no longer exact; below `2 ** -1074`, the term vanishes.
+		const scale = scaleByPowerOfTwo(1, exponents[i] - largest);
+		const productHigh = mantissaX * mantissaY;
+		const productLow = productError(mantissaX, mantissaY);
+		const term = productHigh * scale;
+		// Knuth's TwoSum: `sumHigh + sumLow` is exactly `high + term`.
+		const sumHigh = high + term;
+		const virtual = sumHigh - high;
+		const sumLow = high - (sumHigh - virtual) + (term - virtual);
+		high = sumHigh;
+		low += sumLow + productLow * scale;
+	}
+	return scaleByPowerOfTwo(high + low, largest);
 }
 
 /**

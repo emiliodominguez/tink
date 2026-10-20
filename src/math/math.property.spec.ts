@@ -3021,3 +3021,114 @@ describe('Rounding and floating-point helpers (property-based)', function () {
 		});
 	});
 });
+
+/** The exact value of a finite double times `2 ** 1074`, an integer. */
+function exactScaled(value: number): bigint {
+	let mantissa = Math.abs(value);
+	let shift = 0;
+	for (; !Number.isInteger(mantissa); shift++) mantissa *= 2;
+	const scaled = BigInt(mantissa) << BigInt(1074 - shift);
+	return value < 0 ? -scaled : scaled;
+}
+
+/** The absolute value of a bigint. */
+function bigAbs(value: bigint): bigint {
+	return value < 0n ? -value : value;
+}
+
+/** Whether `result` is a nearest double to the exact value `exact * 2 ** -scaleBits` (no neighbour is closer). */
+function isNearest(result: number, exact: bigint, scaleBits: bigint): boolean {
+	function error(candidate: number): bigint {
+		return bigAbs((exactScaled(candidate) << (scaleBits - 1074n)) - exact);
+	}
+	return error(result) <= error(helpers.nextAfter(result, Infinity)) && error(result) <= error(helpers.nextAfter(result, -Infinity));
+}
+
+describe('Math helpers (property-based, exact references)', function () {
+	const fullDouble = fc.double({ noNaN: true, noDefaultInfinity: true });
+
+	it('dot stays within the Dot2 error bound of the exact dot product over the whole range of doubles', function () {
+		fc.assert(
+			fc.property(
+				fc.integer({ min: 1, max: 6 }).chain(function (length) {
+					return fc.tuple(fc.array(fullDouble, { minLength: length, maxLength: length }), fc.array(fullDouble, { minLength: length, maxLength: length }));
+				}),
+				function ([xs, ys]) {
+					const result = helpers.dot(xs, ys);
+					let exact = 0n;
+					let magnitude = 0n;
+					for (let i = 0; i < xs.length; i++) {
+						const product = exactScaled(xs[i]) * exactScaled(ys[i]);
+						exact += product;
+						magnitude += bigAbs(product);
+					}
+					// Beyond the doubles (or so close that rounding reaches Infinity): only the sign is checked.
+					if (!Number.isFinite(result)) {
+						expect(exact > 0n ? result === Infinity : result === -Infinity).toBe(true);
+						return;
+					}
+					// `n² · 2 ** -106 · Σ|xy|`, plus two ulps of the result, plus the smallest subnormal (products that underflow), all times `2 ** 2148`.
+					const n = BigInt(xs.length);
+					const ulp = exactScaled(helpers.ulp(result)) << 1074n;
+					const bound = ((n * n * magnitude) >> 106n) + 2n * ulp + (1n << 1074n);
+					expect(bigAbs((exactScaled(result) << 1074n) - exact) <= bound).toBe(true);
+				}
+			)
+		);
+	});
+
+	it('angleDifference is the correctly rounded shortest rotation, and antisymmetric', function () {
+		const angle = fc.oneof(fc.double({ min: -1e6, max: 1e6, noNaN: true }), fullDouble);
+		const period = fc.constantFrom(360, 2 * Math.PI, 24, 1, 0.1, 7, 1e-300, 5e-323);
+		fc.assert(
+			fc.property(angle, angle, period, function (from, to, turn) {
+				const result = helpers.angleDifference(from, to, turn);
+				const full = exactScaled(turn);
+				let exact = (exactScaled(to) - exactScaled(from)) % full;
+				if (exact < 0n) exact += full;
+				if (2n * exact > full) exact -= full;
+				// In `(-turn / 2, turn / 2]`, and nearest to the exact rotation (a rotation that rounds onto `-turn / 2` is `+turn / 2`).
+				expect(2n * exactScaled(result) > -full && 2n * exactScaled(result) <= full).toBe(true);
+				if (2n * exactScaled(result) !== full) expect(isNearest(result, exact, 1074n)).toBe(true);
+				const back = helpers.angleDifference(to, from, turn);
+				if (2n * exactScaled(result) !== full && 2n * exactScaled(back) !== full) expect(back).toBe(-result + 0);
+			})
+		);
+	});
+
+	it('variance is within a few ulps of the exact variance, however far the data is from zero', function () {
+		const offsetData = fc
+			.tuple(fc.double({ min: -1e15, max: 1e15, noNaN: true }), fc.array(fc.integer({ min: -1000, max: 1000 }), { minLength: 2, maxLength: 30 }))
+			.map(function ([offset, steps]) {
+				return steps.map(function (step) {
+					return offset + step * 0.125;
+				});
+			});
+		fc.assert(
+			fc.property(offsetData, fc.boolean(), function (values, sample) {
+				const result = helpers.variance(values, { sample });
+				const n = BigInt(values.length);
+				const scaled = values.map(exactScaled);
+				const total = scaled.reduce(function (a, b) {
+					return a + b;
+				}, 0n);
+				// `Σ(n·x - Σx)² / (n² · divisor)`, compared through `n² · divisor · result`, all times `2 ** 2148`.
+				const squares = scaled.reduce(function (a, x) {
+					return a + (n * x - total) ** 2n;
+				}, 0n);
+				const divisor = sample ? n - 1n : n;
+				const fromResult = n * n * divisor * (exactScaled(result) << 1074n);
+				const ulp = n * n * divisor * (exactScaled(helpers.ulp(result)) << 1074n);
+				expect(bigAbs(fromResult - squares) <= 4n * ulp).toBe(true);
+			})
+		);
+	});
+
+	it('pingPong is symmetric: negative values mirror positive ones exactly', function () {
+		fc.assert(
+			fc.property(fullDouble, fc.double({ min: 1e-300, max: 1e300, noNaN: true }), function (value, length) {
+				expect(helpers.pingPong(-value, length)).toBe(helpers.pingPong(value, length));
+			})
+		);
+	});
+});
