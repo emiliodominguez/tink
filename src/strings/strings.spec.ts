@@ -297,6 +297,24 @@ describe('String helpers', function () {
 			expect(helpers.toPascalCase('ǆemal ǉubljana')).toEqual('ǅemalǈubljana');
 			expect(helpers.toCamelCase('foo ǆemal')).toEqual('fooǅemal');
 		});
+
+		it('should use the full Unicode title-case mapping where it differs from the upper case (regression)', function () {
+			// Georgian letters are their own title case: their upper case (Mtavruli) is only for all-caps text. Used to give 'Საქართველო'.
+			expect(helpers.toTitleCase('საქართველო თბილისი')).toBe('საქართველო თბილისი');
+			expect(helpers.toPascalCase('ქართული ენა')).toBe('ქართულიენა');
+			// 'ŉ' title-cases to 'ʼN' (SpecialCasing.txt), not 'ʼn'.
+			expect(helpers.toTitleCase('ŉ')).toBe('\u02bcN');
+			// The Greek letters with ypogegrammeni keep it (as a prosgegrammeni): used to give 'Αι' and 'Ἀι' (a capital then a small iota).
+			expect(helpers.toTitleCase('ᾳ ᾀ ᾗ ῳ')).toBe('\u1fbc \u1f88 \u1f9f \u1ffc');
+			expect(helpers.toTitleCase('ᾲ ᾴ ᾷ ῇ')).toBe('\u1fba\u0345 \u0386\u0345 \u0391\u0342\u0345 \u0397\u0342\u0345');
+			// Their capitals lower-case to them first; the prosgegrammeni alone title-cases to a capital iota.
+			expect(helpers.toTitleCase('ᾼ ᾈ \u1fbe')).toBe('\u1fbc \u1f88 \u0399');
+			expect(helpers.toStartCase('ᾳδη ქალაქი')).toBe('\u1fbcδη ქალაქი');
+			expect(helpers.toTrainCase('ᾳδη ქალაქი')).toBe('\u1fbcδη-ქალაქი');
+			expect(helpers.toSentenceCase('ქალაქი ᾳδη')).toBe('ქალაქი ᾳδη');
+			expect(helpers.toCamelCase('foo ᾳδη')).toBe('foo\u1fbcδη');
+			expect(helpers.toDelimitedCase('ᾳ ŉ', '.', { case: 'capital' })).toBe('\u1fbc.\u02bcN');
+		});
 	});
 
 	describe('toSnakeCase', function () {
@@ -393,6 +411,24 @@ describe('String helpers', function () {
 			expect(helpers.removeDiacritics('')).toEqual('');
 			expect(helpers.removeDiacritics('plain ascii 123')).toEqual('plain ascii 123');
 			expect(helpers.removeDiacritics('한국어 日本語 😀')).toEqual('한국어 日本語 😀');
+		});
+
+		it('should normalize runs of more than 30 combining marks 30 marks at a time, in linear time (regression)', function () {
+			// Runtimes reorder a run of marks with an insertion sort: 100 000 alternating accents used to take about 10 seconds.
+			const started = Date.now();
+			expect(helpers.removeDiacritics('a' + '\u0301\u05b0'.repeat(50_000) + 'b')).toBe('a' + '\u05b0'.repeat(50_000) + 'b');
+			expect(helpers.toSlug('a' + '\u0301\u0345'.repeat(50_000) + 'b')).toBe('ab');
+			expect(Date.now() - started).toBeLessThan('__stryker__' in globalThis ? Infinity : 1000);
+			// Up to 30 marks are reordered and composed as the runtime does it, a longer run 30 marks at a time (the Stream-Safe Text Format).
+			const run = '\u05b1\u05b0'.repeat(15);
+			expect(helpers.removeDiacritics('א' + run)).toBe('א' + '\u05b0'.repeat(15) + '\u05b1'.repeat(15));
+			expect(helpers.removeDiacritics('א' + run + '\u05b1\u05b0'.repeat(5))).toBe(
+				'א' + '\u05b0'.repeat(15) + '\u05b1'.repeat(15) + '\u05b0'.repeat(5) + '\u05b1'.repeat(5)
+			);
+			expect(helpers.removeDiacritics('ж'.repeat(40) + 'e\u0301')).toBe('ж'.repeat(40) + 'e');
+			expect(helpers.removeDiacritics('ж'.repeat(40) + '\u0301'.repeat(40))).toBe('ж'.repeat(40));
+			// Halfwidth voiced sound marks decompose (NFKD) to combining marks too.
+			expect(helpers.toSlug('a' + '\uff9e\u0301'.repeat(20) + 'b')).toBe('a-b');
 		});
 	});
 
@@ -905,6 +941,9 @@ describe('String helpers', function () {
 			// An interpolation ending the text keeps the last line; one starting a line belongs to that line, not the previous one.
 			expect(helpers.dedent`\n    a\n    ${'b'}`).toBe('a\nb');
 			expect(helpers.dedent`\n  a\n${'  '}\n  b\n`).toBe('  a\n  \n  b');
+			// An interpolation inside a `\r\n` belongs to the line before it: the trailing blank line is dropped around it.
+			expect(helpers.dedent`a\r${'X'}\n  `).toBe('aX');
+			expect(helpers.dedent`\n  a\r${'X'}\n  b\r${'Y'}\n  `).toBe('a\rX\nbY');
 		});
 
 		it('should resolve escape sequences in the literal text before dedenting', function () {

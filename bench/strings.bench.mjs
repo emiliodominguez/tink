@@ -24,6 +24,7 @@ import * as lodash from 'lodash-es';
 import * as radash from 'radash';
 import {
 	capitalize,
+	dedent,
 	escapeHtml,
 	escapeRegExp,
 	getWords,
@@ -88,6 +89,17 @@ const otherValues = { id: 42, address: { city: 'Paris' }, date: '2024-01-15' };
 const otherLodashTemplate = 'Order ${id} shipped to ${address.city} on ${date}.';
 const otherCompiledLodash = lodash.template(otherLodashTemplate);
 const otherCompiledEs = esTemplate(otherLodashTemplate);
+const japanese = '東京都に住む人々は毎日電車で通勤しています。日本語のテキストを検索する、「カタカナ」ー'.repeat(4);
+const korean = '대한민국의 수도는 서울특별시이며 한국어를 사용합니다. '.repeat(6);
+const indentedCode = `
+    function example(value) {
+        if (value > 10) {
+            return value * 2;
+        }
+        // A comment line
+        return value;
+    }
+`.repeat(8);
 
 /**
  * Maps a function over a list (the shape every case-conversion case uses).
@@ -446,6 +458,30 @@ export default [
 			lodash: function () {
 				return lodash.words(paragraph);
 			}
+		}
+	},
+	{
+		// Kana, CJK punctuation and Hangul syllables are graphemes on their own: no segmenter is needed.
+		name: 'reverse (Japanese and Korean text, 0.5 KB)',
+		fn: function () {
+			return reverse(japanese) + reverse(korean);
+		},
+		competitors: {
+			'es-toolkit': function () {
+				return reverseString(japanese) + reverseString(korean);
+			}
+		}
+	},
+	{
+		name: 'truncate + padEnd (Japanese and Korean text)',
+		fn: function () {
+			return truncate(japanese, 40) + truncate(korean, 40) + padEnd(japanese, 400) + padEnd(korean, 400);
+		}
+	},
+	{
+		name: 'dedent (1.4 KB, 64 lines)',
+		fn: function () {
+			return dedent(indentedCode);
 		}
 	},
 	{

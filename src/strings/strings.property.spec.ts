@@ -61,13 +61,15 @@ const spacedLowerWords = fc.array(lowerLetterWord, { minLength: 1, maxLength: 6 
 
 /**
  * Text mixing characters that are graphemes on their own (below U+0300, Latin Extended Additional, General Punctuation, CJK
- * ideographs...) with sequences that form multi-code-unit graphemes (CR LF, combining marks, ZWJ, emoji with modifiers, Hangul jamo,
+ * punctuation, kana and ideographs, Hangul syllables...) with sequences that form multi-code-unit graphemes (CR LF, combining marks, ZWJ, emoji with modifiers, Hangul jamo,
  * prepend characters, spacing marks), including the code points on each side of the ranges the implementation treats as plain text.
  */
 const mixedText = fc.string({
 	unit: fc.constantFrom(
 		...['a', 'Z', '0', ' ', '.', 'é', 'ÿ', '\n', '\r', '\r\n', '\u0301', 'e\u0301', '\u200d', '👍🏽', '中', '—', '\u2070', '\u1e01', '\u1dff', '\u4e00'],
-		...['\u9fff', '\u4dff', '\ua000', '\u3099', 'か', '\u200c', '\u206f', '\u20d0', 'Ω', 'ж', '\u0483', '\u1100', '\u1161', '\u11a8', '가', '\u0600', '\u0e33', 'ก']
+		...['\u9fff', '\u4dff', '\ua000', '\u3099', 'か', '\u200c', '\u206f', '\u20d0', 'Ω', 'ж', '\u0483', '\u1100', '\u1161', '\u11a8', '가', '\u0600', '\u0e33', 'ก'],
+		...['\u2fff', '\u3000', '\u3029', '\u302a', '\u302f', '\u3030', '\u3031', '\u303d', '\u309b', 'ア', 'ー', '\u3297', '\u3298', '\u3299', '\u4dc0'],
+		...['\uabff', '\uac00', '각', '\ud7a3', '\ud7a4', '\ud7b0', '\ud7fb', '\u11ff', '\ua960', '\ufe0f', '\u{1F1EF}', '😀']
 	)
 });
 

@@ -59,13 +59,12 @@ function getGraphemeSegmenter(): Intl.Segmenter | null {
  * Matches any code unit that may join a neighbour into a multi-code-unit grapheme cluster: `\r` (of `\r\n`), every surrogate, every BMP
  * code point whose grapheme-break property is Extend, ZWJ, SpacingMark, Prepend or a Hangul L/V/T jamo (combining marks, ZWJ/ZWNJ,
  * variation selectors, Indic vowel signs...), and, to keep the pattern short, the blocks around them. Below U+0300, in Latin Extended
- * Additional, Greek Extended and General Punctuation (U+1E00–U+206F, except ZWNJ and ZWJ) and in the CJK Unified Ideographs (U+4E00–U+9FFF),
- * every other code unit is a grapheme on its own: no grapheme-break rule joins two of them.
+ * Additional, Greek Extended and General Punctuation (U+1E00–U+206F, except ZWNJ and ZWJ), in the CJK blocks from U+3000 to U+9FFF
+ * (punctuation, kana, ideographs...; except the ideographic tone marks U+302A–302F, the kana voicing marks U+3099–309A and the emoji
+ * U+3030, U+303D, U+3297 and U+3299) and among the Hangul syllables (U+AC00–U+D7A3, which only join conjoining jamo), every other code
+ * unit is a grapheme on its own: no grapheme-break rule joins two of them (checked against `Intl.Segmenter` for all of them).
  */
-const COMPLEX_TEXT = /[\u0300-\u1dff\u200c-\u200d\u2070-\u4dff\ua000-\uffff\r]/;
-
-/** The {@link COMPLEX_TEXT} code units, as the body of a character class (a literal: a module-level call would defeat tree-shaking). */
-const COMPLEX = '\\u0300-\\u1dff\\u200c-\\u200d\\u2070-\\u4dff\\ua000-\\uffff\\r';
+const COMPLEX_TEXT = /[\u0300-\u1dff\u200c-\u200d\u2070-\u2fff\u302a-\u3030\u303d\u3099\u309a\u3297\u3299\ua000-\uabff\ud7a4-\uffff\r]/;
 
 /**
  * Tells whether every UTF-16 code unit of a string is a grapheme cluster on its own, so it can be processed without a segmenter.
@@ -91,19 +90,21 @@ function isSimpleCode(code: number): boolean {
  * between them, and the other code unit on each side (which a combining mark, `\n` after `\r`, a prepend character or an emoji ZWJ
  * sequence may join). Two consecutive other code units are always separated by a grapheme boundary (no grapheme-break rule joins them or
  * looks back across them), so the text outside these regions is one grapheme per code unit and every region can be segmented on its own.
+ * (The class of {@link COMPLEX_TEXT} is spelled out in this and the next pattern, as literals: bundlers keep a module-level
+ * `new RegExp(...)` call, and everything it uses, in every bundle that imports any helper of the module.)
  */
-const COMPLEX_REGION = new RegExp(`[^${COMPLEX}]?(?:[${COMPLEX}]+[^${COMPLEX}]?)+`, 'g');
-
-/** An emoji (`Extended_Pictographic`) with an optional skin tone modifier or emoji presentation selector. */
-const PICTOGRAPH = String.raw`\p{Extended_Pictographic}(?:[\u{1F3FB}-\u{1F3FF}]|\ufe0f)?`;
+const COMPLEX_REGION =
+	/[^\u0300-\u1dff\u200c-\u200d\u2070-\u2fff\u302a-\u3030\u303d\u3099\u309a\u3297\u3299\ua000-\uabff\ud7a4-\uffff\r]?(?:[\u0300-\u1dff\u200c-\u200d\u2070-\u2fff\u302a-\u3030\u303d\u3099\u309a\u3297\u3299\ua000-\uabff\ud7a4-\uffff\r]+[^\u0300-\u1dff\u200c-\u200d\u2070-\u2fff\u302a-\u3030\u303d\u3099\u309a\u3297\u3299\ua000-\uabff\ud7a4-\uffff\r]?)+/g;
 
 /**
- * One grapheme cluster of the common shapes that need no segmenter (a sticky match): an emoji ZWJ sequence of {@link PICTOGRAPH}s, a flag
+ * One grapheme cluster of the common shapes that need no segmenter (a sticky match): an emoji ZWJ sequence of pictographs (each an
+ * `Extended_Pictographic` code point with an optional skin tone modifier or emoji presentation selector), a flag
  * (a pair of regional indicators), or a code unit that {@link COMPLEX_TEXT} does not match. Every `Extended_Pictographic` code point has the
  * grapheme-break property Other, so such a cluster ends before any code unit that does not continue it with a modifier, a selector or a
  * zero-width joiner (checked against `Intl.Segmenter` for all of them).
  */
-const EMOJI_GRAPHEME = new RegExp(`${PICTOGRAPH}(?:\u200d${PICTOGRAPH})*|[\u{1F1E6}-\u{1F1FF}]{2}|(?![${COMPLEX}])[\0-\uffff]`, 'uy');
+const EMOJI_GRAPHEME =
+	/\p{Extended_Pictographic}(?:[\u{1F3FB}-\u{1F3FF}]|\ufe0f)?(?:\u200d\p{Extended_Pictographic}(?:[\u{1F3FB}-\u{1F3FF}]|\ufe0f)?)*|[\u{1F1E6}-\u{1F1FF}]{2}|(?![\u0300-\u1dff\u200c-\u200d\u2070-\u2fff\u302a-\u3030\u303d\u3099\u309a\u3297\u3299\ua000-\uabff\ud7a4-\uffff\r])[\0-\uffff]/uy;
 
 /**
  * Splits a region of {@link COMPLEX_REGION} into graphemes without the (slow) segmenter when it only holds the clusters {@link EMOJI_GRAPHEME}
@@ -132,6 +133,9 @@ function pushEmojiGraphemes(region: string, graphemes: string[]): boolean {
 	return true;
 }
 
+/** A code unit above U+00FF. */
+const WIDE_TEXT = /[^\0-\xff]/;
+
 /**
  * Splits a string into grapheme clusters (or code points when `Intl.Segmenter` is unavailable). Only the regions that may hold
  * multi-code-unit clusters (see {@link COMPLEX_REGION}) go through the (slow) segmenter, unless they only hold common emoji shapes (see
@@ -141,7 +145,9 @@ function pushEmojiGraphemes(region: string, graphemes: string[]): boolean {
  * @returns {string[]} The graphemes of `string` (only the first ones, at least `limit + 1`, when it has more than `limit`)
  */
 function splitGraphemes(string: string, limit: number = Infinity): string[] {
-	if (isSimpleText(string)) return string.split('');
+	// One grapheme per code unit (and no surrogate): V8 splits Latin-1 text faster with `split`, and other text (CJK, Cyrillic, curly
+	// quotes...) about 3 times faster with the string iterator.
+	if (isSimpleText(string)) return WIDE_TEXT.test(string) ? [...string] : string.split('');
 
 	const segmenter = getGraphemeSegmenter();
 	const graphemes: string[] = [];
@@ -186,18 +192,36 @@ function firstGrapheme(string: string): string {
 const TITLE_CASE_EXCEPTIONS = /[ǆǉǌǳ]/;
 
 /**
- * Title-cases a single lower-case letter (one code point) for use at the start of a word. Digraphs use their dedicated title-case letter (`'ǆ'` → `'ǅ'`).
- * When the upper-case mapping expands to several code points (`'ß'` → `'SS'`, `'ﬁ'` → `'FI'`) only the first one stays upper-case
- * (`'Ss'`, `'Fi'`), approximating Unicode title case.
+ * Title-cases a single lower-case letter (one code point) for use at the start of a word, with the Unicode title-case mapping
+ * (`SpecialCasing.txt` included). Digraphs use their dedicated title-case letter (`'ǆ'` → `'ǅ'`). When the upper-case mapping expands to
+ * several code points (`'ß'` → `'SS'`, `'ﬁ'` → `'FI'`) only the first one stays upper-case (`'Ss'`, `'Fi'`), except after the apostrophe
+ * of `'ŉ'` (`'ʼN'`). Georgian letters are their own title case (their upper case, Mtavruli, is only used for all-caps text), and the
+ * Greek letters with ypogegrammeni keep it as the prosgegrammeni of their title-case form (`'ᾳ'` → `'ᾼ'`, `'ᾲ'` → `'Ὰ'` + U+0345), where
+ * the upper case spells it as a capital iota (`'ΑΙ'`).
  * @param {string} letter - The letter to convert
  * @returns {string} The title-cased letter
  */
 function titleCaseLetter(letter: string): string {
-	if (letter.charCodeAt(0) < 0x80) return letter.toUpperCase();
+	const code = letter.charCodeAt(0);
 
-	if (TITLE_CASE_EXCEPTIONS.test(letter)) return String.fromCharCode(letter.charCodeAt(0) - 1);
+	if (code < 0x80) return letter.toUpperCase();
+
+	if (TITLE_CASE_EXCEPTIONS.test(letter)) return String.fromCharCode(code - 1);
+
+	if (code >= 0x10d0 && code <= 0x10ff) return letter;
 
 	const upper = letter.toUpperCase();
+
+	if (code === 0x149) return upper;
+
+	if (code >= 0x1f80 && code <= 0x1fff && upper.length > 1 && upper.endsWith('\u0399')) {
+		// `'ᾳ'` → `'ΑΙ'` → `'Α'` + U+0345, which composes to `'ᾼ'`; `'ᾷ'` keeps `'Α'` + U+0342 + U+0345 as it is (no single code point).
+		const title = upper.slice(0, -1) + '\u0345';
+		const composed = title.normalize('NFC');
+
+		return composed.length === 1 ? composed : title;
+	}
+
 	const head = String.fromCodePoint(upper.codePointAt(0) as number);
 
 	return head + upper.slice(head.length).toLowerCase();
@@ -231,21 +255,18 @@ const HAS_LOWER_CASE = /\p{Ll}/u;
 /** An upper-case or title-case letter after the first character: without one, a chunk has no word boundary. */
 const INNER_UPPER = /.[\p{Lu}\p{Lt}]/u;
 
-/** A run of capital units for {@link UNICODE_WORD}: each one after the first is not followed by a lower-case unit. */
-const CAPITALS = String.raw`[\p{Lu}\p{Lt}]\p{M}*(?!\p{M})(?:[\p{Lu}\p{Lt}]\p{M}*(?![\p{M}\p{Ll}]))*`;
-
 /**
  * The words of a chunk that has lower-case letters, as a single match. Characters are grouped into units (a base character and its
  * combining marks; the `(?!\p{M})` guards keep the engine from splitting a unit when it backtracks). A word ends before an upper/title-case
  * unit that follows a lower-case or number unit (`hello|World`, `version2|Beta`), or that follows another capital and precedes a lower-case
  * unit (`XML|Http`). So a word is: a run of capitals (each one after the first not followed by a lower-case unit), a lower-case/number unit,
  * or other letters/orphan marks optionally followed by such a run; then any number of lower-case/number units, or other letters
- * (`Lm`/`Lo`, after which a capital never starts a word) each optionally followed by a run of capitals.
+ * (`Lm`/`Lo`, after which a capital never starts a word) each optionally followed by a run of capitals. The run of capitals, spelled
+ * out three times (a literal: see {@link COMPLEX_REGION}), is `[\p{Lu}\p{Lt}]\p{M}*(?!\p{M})(?:[\p{Lu}\p{Lt}]\p{M}*(?![\p{M}\p{Ll}]))*`:
+ * each capital unit after the first is not followed by a lower-case unit.
  */
-const UNICODE_WORD = new RegExp(
-	String.raw`(?:${CAPITALS}|[\p{Ll}\p{N}]\p{M}*|(?:[\p{Lm}\p{Lo}]\p{M}*|\p{M}+)(?:${CAPITALS})?)(?:[\p{Ll}\p{N}]\p{M}*|[\p{Lm}\p{Lo}]\p{M}*(?:${CAPITALS})?)*`,
-	'gu'
-);
+const UNICODE_WORD =
+	/(?:[\p{Lu}\p{Lt}]\p{M}*(?!\p{M})(?:[\p{Lu}\p{Lt}]\p{M}*(?![\p{M}\p{Ll}]))*|[\p{Ll}\p{N}]\p{M}*|(?:[\p{Lm}\p{Lo}]\p{M}*|\p{M}+)(?:[\p{Lu}\p{Lt}]\p{M}*(?!\p{M})(?:[\p{Lu}\p{Lt}]\p{M}*(?![\p{M}\p{Ll}]))*)?)(?:[\p{Ll}\p{N}]\p{M}*|[\p{Lm}\p{Lo}]\p{M}*(?:[\p{Lu}\p{Lt}]\p{M}*(?!\p{M})(?:[\p{Lu}\p{Lt}]\p{M}*(?![\p{M}\p{Ll}]))*)?)*/gu;
 
 /** The apostrophes removed by the word splitter. */
 const APOSTROPHES = /['’]/g;
@@ -254,9 +275,10 @@ const APOSTROPHES = /['’]/g;
  * The words of ASCII text (without apostrophes), with the same rules as the Unicode path of {@link splitWords}, as a single match:
  * a run of capitals and digits that is a whole run of letters and digits (`HTTP2`, `A0B1`), the capitals before the last one of a run
  * followed by a lower-case letter (`XML` in `XMLHttp`), capitals followed by lower-case letters and digits (`Http`, `version2`), or
- * trailing capitals (`DOG` in `lazyDOG`).
+ * trailing capitals (`DOG` in `lazyDOG`). The first alternative only matches what the fourth would at the same place (no other one
+ * matches a lower-case letter, or a capital before one), and finds the most common words (`quick`, `Fox`) without trying the others.
  */
-const ASCII_WORD = /(?<![A-Za-z0-9])[A-Z0-9]+(?![A-Za-z0-9])|[A-Z]+(?=[A-Z][a-z])|[A-Z]*[a-z0-9]+|[A-Z]+/g;
+const ASCII_WORD = /[A-Z]?[a-z][a-z0-9]*|(?<![A-Za-z0-9])[A-Z0-9]+(?![A-Za-z0-9])|[A-Z]+(?=[A-Z][a-z])|[A-Z]*[a-z0-9]+|[A-Z]+/g;
 
 /**
  * Splits an identifier or free text into words for the case-conversion helpers.
@@ -528,7 +550,8 @@ function toLowerCase(text: string): string {
 /**
  * Converts a string to title case: in every whitespace-separated word the first letter is upper-cased and everything else is lower-cased.
  * Whitespace and punctuation are preserved exactly. Leading punctuation is skipped (`'(hello)'` → `'(Hello)'`),
- * but a word starting with a digit is left lower-case (`'1st'` stays `'1st'`). Works with Unicode letters.
+ * but a word starting with a digit is left lower-case (`'1st'` stays `'1st'`). Works with Unicode letters, with their Unicode title case
+ * (`'ǆ'` → `'ǅ'`, `'ß'` → `'Ss'`, `'ᾳ'` → `'ᾼ'`; Georgian letters are their own title case).
  * @param {string} string - The string to be converted to title case
  * @returns {string} The string in title case
  * @example
@@ -620,9 +643,89 @@ export function toPascalCase(string: string): string {
 	return result;
 }
 
+/** More than 30 consecutive combining marks (or halfwidth kana voiced sound marks, which decompose to combining marks). */
+const LONG_MARK_RUN = /[\p{M}\uff9e\uff9f]{31}/u;
+
+/** 30 marks followed by another one: where {@link normalize} cuts a long run of marks. Global: only used from `lastIndex` 0. */
+const MARK_RUN_PIECE = /[\p{M}\uff9e\uff9f]{30}(?=[\p{M}\uff9e\uff9f])/gu;
+
+/**
+ * Normalizes a string like `String.prototype.normalize`, in linear time. Runtimes put each run of combining marks in canonical order with
+ * an insertion sort, quadratic in its length (100 000 alternating accents take seconds), so a run of more than 30 marks is normalized 30
+ * marks at a time, where the Stream-Safe Text Format of UAX #15 cuts it: its marks are neither reordered nor composed across the cuts.
+ * Text without such a run (all text but absurd text) is normalized exactly as the runtime does it.
+ * @param {string} string - The string
+ * @param {'NFC' | 'NFD' | 'NFKD'} form - The normalization form
+ * @returns {string} The normalized string
+ */
+function normalize(string: string, form: 'NFC' | 'NFD' | 'NFKD'): string {
+	if (!hasLongMarkRun(string)) return string.normalize(form);
+
+	let result = '';
+	let start = 0;
+
+	MARK_RUN_PIECE.lastIndex = 0;
+
+	while (MARK_RUN_PIECE.test(string)) {
+		result += string.slice(start, MARK_RUN_PIECE.lastIndex).normalize(form);
+		start = MARK_RUN_PIECE.lastIndex;
+	}
+
+	return result + string.slice(start).normalize(form);
+}
+
+/**
+ * Whether a string holds more than 30 consecutive combining marks (see {@link LONG_MARK_RUN}), with a skip loop (as in Boyer–Moore) over the
+ * code units that may be marks (see {@link isUnmarked}): such a run holds the code unit 30 after its start, so only that one is read, then
+ * those before it back to the last one that is not a mark, from which the next run may start. The (slow) Unicode regular expression only
+ * runs once 31 consecutive code units may be marks, so most text is only read in part.
+ * @param {string} string - The string
+ * @returns {boolean} Whether {@link LONG_MARK_RUN} matches it
+ */
+function hasLongMarkRun(string: string): boolean {
+	// The code units from `start` to `known` may all be marks.
+	let start = 0;
+	let known = -1;
+
+	while (start + 30 < string.length) {
+		let index = start + 30;
+
+		while (index > known && !isUnmarked(string.charCodeAt(index))) index--;
+
+		if (index === known) return LONG_MARK_RUN.test(string);
+
+		known = start + 30;
+		start = index + 1;
+	}
+
+	return false;
+}
+
+/**
+ * Whether a code unit is certainly not (half of) a combining mark: it is below U+0300, or a Thai, Lao, Myanmar or Khmer consonant, a kana
+ * letter, a CJK ideograph or a Hangul syllable (scripts written without spaces, whose text would otherwise look like a run of marks).
+ * @param {number} code - A UTF-16 code unit
+ * @returns {boolean} `true` when the code unit is none of the marks {@link LONG_MARK_RUN} counts
+ */
+function isUnmarked(code: number): boolean {
+	return (
+		code < 0x300 ||
+		(code >= 0xe01 && code <= 0xe30) ||
+		(code >= 0xe81 && code <= 0xeb0) ||
+		(code >= 0x1000 && code <= 0x102a) ||
+		(code >= 0x1780 && code <= 0x17b3) ||
+		(code >= 0x3041 && code <= 0x3096) ||
+		(code >= 0x30a1 && code <= 0x30fa) ||
+		(code >= 0x3400 && code <= 0x9fff) ||
+		(code >= 0xac00 && code <= 0xd7a3)
+	);
+}
+
 /**
  * Removes diacritical marks (accents, umlauts, cedillas...) from a string: it is decomposed (NFD), the combining diacritical marks are stripped
  * and the result is recomposed (NFC). Only the combining diacritical mark blocks are removed, so scripts that use other combining marks are left intact.
+ * Linear time: a run of more than 30 combining marks (which no text needs, and which runtimes normalize in quadratic time) is normalized
+ * 30 marks at a time, as the Stream-Safe Text Format of UAX #15 cuts it.
  * @param {string} string - The string to clean
  * @returns {string} The string without diacritics
  * @throws {TypeError} when `string` is not a string
@@ -632,7 +735,7 @@ export function toPascalCase(string: string): string {
 export function removeDiacritics(string: string): string {
 	assertString('removeDiacritics', 'string', string);
 	// ASCII text has no decomposition and nothing to recompose.
-	return NON_ASCII.test(string) ? string.normalize('NFD').replace(DIACRITICS, '').normalize('NFC') : string;
+	return NON_ASCII.test(string) ? normalize(normalize(string, 'NFD').replace(DIACRITICS, ''), 'NFC') : string;
 }
 
 /**
@@ -687,7 +790,8 @@ function replaceAllOf(string: string, replacements: unknown): string {
  * words and is dropped). With the default options the result always matches `/^([a-z0-9]+(-[a-z0-9]+)*)?$/`.
  *
  * Options: `separator` (default `'-'`), `lowercase` (default `true`; when `false`, the runs of `[a-zA-Z0-9]` are kept as they are) and
- * `replacements` (texts replaced first, such as `{ '&': ' and ' }`). The cost of `replacements` grows with the number of keys.
+ * `replacements` (texts replaced first, such as `{ '&': ' and ' }`). The cost of `replacements` grows with the number of keys. The cost is
+ * otherwise linear: as in {@link removeDiacritics}, a run of more than 30 combining marks is normalized 30 marks at a time.
  * @param {string} string - The string to be converted to a slug
  * @param {SlugOptions} [options={}] - `separator`, `lowercase` and `replacements`
  * @returns {string} The URL-friendly slug (possibly empty)
@@ -713,7 +817,7 @@ export function toSlug(string: string, options: SlugOptions = {}): string {
 	let folded = text;
 
 	if (NON_ASCII.test(text)) {
-		folded = text.normalize('NFKD').replace(DIACRITICS, '');
+		folded = normalize(text, 'NFKD').replace(DIACRITICS, '');
 		// Lower-cased before transliterating: only the lower-case letters can then be left.
 		if (lowercase) folded = folded.toLowerCase();
 		folded = transliterate(folded);
@@ -1207,9 +1311,9 @@ function dedentParts(parts: ReadonlyArray<string>): string[] {
 	for (let index = 1; index < parts.length; index++) valueOffsets.push((offset += parts[index - 1].length));
 
 	const valueAt = new Set(valueOffsets);
-	const removed = new Uint8Array(joined.length);
-	// The starts of the non-blank lines, whose common indentation is removed once it is known.
-	const indented: number[] = [];
+	// The removed spans of `joined`, in order and disjoint: `[start, end)` pairs, where an end of `-1` stands for the common indentation
+	// of a non-blank line (only known once every line has been seen).
+	const removed: number[] = [];
 	const separator = /\r\n|\r|\n/g;
 	let common: string | undefined;
 	let valueIndex = 0;
@@ -1233,8 +1337,8 @@ function dedentParts(parts: ReadonlyArray<string>): string[] {
 		if (valueIndex === firstValue && indentationEnd === end) {
 			// A blank line is emptied; the first line (the only one starting at 0) is dropped with its line separator, and the last one
 			// with the separator before it (for a single line, that is the whole text either way).
-			if (match === null) removed.fill(1, previousEnd);
-			else removed.fill(1, start, start === 0 ? next : end);
+			if (match === null) removed.push(previousEnd, joined.length);
+			else removed.push(start, start === 0 ? next : end);
 		} else {
 			const indentation = joined.slice(start, indentationEnd);
 			let length = 0;
@@ -1243,7 +1347,7 @@ function dedentParts(parts: ReadonlyArray<string>): string[] {
 			while (common !== undefined && length < common.length && common[length] === indentation[length]) length++;
 
 			common = common === undefined ? indentation : common.slice(0, length);
-			indented.push(start);
+			removed.push(start, -1);
 		}
 
 		if (match === null) break;
@@ -1252,16 +1356,29 @@ function dedentParts(parts: ReadonlyArray<string>): string[] {
 		start = next;
 	}
 
-	for (const lineStart of indented) removed.fill(1, lineStart, lineStart + (common as string).length);
-
+	const indentation = (common as string | undefined)?.length ?? 0;
+	let span = 0;
 	let base = 0;
 
+	// Each part keeps the text between the removed spans, copied by slices (a span may continue into the next parts).
 	return parts.map(function (part: string): string {
+		const partEnd = base + part.length;
 		let text = '';
+		let cursor = base;
 
-		for (let index = 0; index < part.length; index++) if (removed[base + index] === 0) text += part[index];
+		for (; span < removed.length && removed[span] < partEnd; span += 2) {
+			const spanEnd = removed[span + 1] === -1 ? removed[span] + indentation : removed[span + 1];
 
-		base += part.length;
+			if (removed[span] > cursor) text += joined.slice(cursor, removed[span]);
+
+			cursor = Math.max(cursor, spanEnd);
+
+			if (spanEnd > partEnd) break;
+		}
+
+		if (cursor < partEnd) text += joined.slice(cursor, partEnd);
+
+		base = partEnd;
 
 		return text;
 	});
