@@ -1,5 +1,55 @@
 # Changelog
 
+## 1.6.0 (unreleased)
+
+The `store`/`cache` pass of 1.5.0, extended to every other module: each was audited for bugs, safety and speed, against references (Chrome's CSS engine, `node:crypto`, `node:zlib`, `node:net`, `node:path`, node-semver, Python's `str.title()`, exact BigInt arithmetic, `Intl` in 418 time zones) and with differential fuzzing against 1.5.0. Every fix comes with a regression test that fails on 1.5.0; every speed-up was measured against the 1.5.0 build in the same process.
+
+**Safety: options and inputs inherited from a polluted `Object.prototype`.** These helpers read their options (or an optional input field) with plain property access, so a value planted on `Object.prototype` was honoured. They now read own (or deliberately inherited, such as class getters) properties only, as the rest of the library already did; the shared reader also recognises a planted `NaN`.
+
+- **Bypasses:** `isUrl` (a planted `protocols` list accepted `javascript:` URLs) and `parseJson` (a planted `proto: 'ignore'` turned the `__proto__` check off).
+- **Poisoned caches and merged keys:** `memoizeAsync`, `createBatcher`, `memoize` and `@memoize` (a planted `cache`, `resolver` or `key`).
+- **Planted signals, timings and limits:** `sleep`, `retry`, `pollUntil`, `mapWithConcurrency`/`mapSettledWithConcurrency`/`filterWithConcurrency`, `createLimiter`, `createQueue` and `Queue.add`, `createRateLimiter`, `Batcher.load`/`loadMany`, the emitter's `waitFor`, `mapConcurrent`, `throttle`, `debounce`, `@debounced`, `@throttled`, `@retryable` (whose options copy now has no prototype, so an own `__proto__` key from `JSON.parse` stays a key), `diffSequences`/`longestCommonSubsequence` (`maxEdits`), `eachDayOfInterval`, `formatDuration`, `toISOStringLocal`, `spring`, `fuzzyMatch`/`fuzzySearch`.
+- **Output:** every `format*` helper and `pluralRule` (`locale`, `display`, `decimals`, `type`, `style`, `suffixes`, and a missing suffix category read from the prototype), `isHexColor` (`alpha`), `toRgba` and the colour helpers taking `{ r, g, b }` (an inherited `a` made every colour translucent), `getJwtExpiration`/`isJwtExpired` (`exp`), and `toCsv` (a hole written as a value planted on `Array.prototype`).
+- **A `get` or `set` key on `Object.prototype`** made every `Object.defineProperty` throw: `deserializeError` and `toError` broke their never-throw promise, `defineError` classes could not be created, and `safeStringify`/`serializeError` turned objects with a `toString` or `valueOf` key into a `[Throws]` marker. Planted `writable`/`enumerable`/`configurable` also changed the attributes of `defineError` statics.
+
+**Safety: denial of service.**
+
+- `explain` with `isLazy` (guards) and `lazy` parsers (validate) reported an invalid object held in several places once per path: exponential in the depth of the shared objects (20 levels gave a million issues, 40 ran out of memory; YAML aliases build such values). The object is now reported at its first path, with one `Invalid value (same object as reported at another path)` issue at each other path, and a valid shared object is walked once.
+- `removeDiacritics`, `toSlug`, `tokenize` and the default tokenizer of `createSearchIndex` took seconds on long runs of combining marks (the runtime's `normalize` is quadratic in a run): runs longer than 30 marks are normalized 30 at a time (the Stream-Safe Text Format of UAX #15), so 100,000 marks take about 2 ms.
+- `SearchIndex#replace`, or `remove` then `add` of the same id, cost grew with the index (about 170 µs at 10,000 documents): about 1 µs at any size now.
+- `verifyJwt` accepted a token without an `iss`/`aud` claim when `issuer` or `audience` was a sparse array (`[, 'api']`); it now throws a `TypeError`.
+
+**Fixed.**
+
+- **`throttle(fn, wait, { leading: false, trailing: true })`** never invoked `fn` while calls kept coming faster than its timer could fire (during a long synchronous loop): each late call dropped the pending one. The first call after a window now performs the overdue call, once per window, like lodash.
+- **`Queue#add({ signal })`:** a signal that could not drop its listener and aborted after the task had started rejected the task's promise, losing its result.
+- **`createEmitter`** called listeners with its internal registration record as `this` (a listener could reactivate itself); `this` is now `undefined`.
+- **`isEqual`** threw comparing a `Map`, `Set`, `Date`, `RegExp` or `DataView` with a `Proxy` of one (or an object faking its tag), and was order-dependent for the other built-ins; both sides must now be the same kind of built-in. Binary data of different kinds behind a forged prototype no longer compare equal.
+- **`isError`** trusted the `'[object Error]'` tag for objects of other realms or with a `null` prototype, so a fake `Symbol.toStringTag` passed; it now uses `Error.isError` where the runtime has it.
+- **`zip` and `interleave`** read a non-object `next()` result as `{ value: undefined }` and kept going (an endless loop on an infinite iterator); like `for...of`, they now throw a `TypeError`.
+- **Floating point (`math`):** `weightedAverage` is correctly rounded (it was an ulp off in about a third of cases: `weightedAverage([1, 2], [1, 3])` gave `1.7500000000000002`) and no longer overflows to `Infinity` for huge values with a finite mean. `nthRoot` is within an ulp (it was up to 67 off for huge or tiny values) and returns exact roots exactly (it missed about half). `toRadians`, `toDegrees` and `zScore` no longer overflow in an intermediate step; `percentage(1, 3)` is `100 / 3`; `randomIntBetween(-MAX, MAX)` no longer always returns `MAX` (or `NaN`).
+- **`parseDuration`** read decimals through a binary fraction: `'1.001s'` was `1000.9999999999999` ms, now `1001`.
+- **`cubicBezier`** stopped one Newton step early (errors up to about 1.4e-12); it is now within a few ulps, like `bezier-easing`.
+- **Title case:** `toTitleCase`, `toPascalCase`, `toCamelCase`, `toStartCase`, `toTrainCase`, `toSentenceCase` and `toDelimitedCase({ case: 'capital' })` upper-cased 83 letters instead of title-casing them (Georgian words started with a Mtavruli capital, Greek letters with ypogegrammeni became two letters); every lower-case letter now matches Python's `str.title()`.
+- **Standard Schema:** a foreign validator returning a falsy `issues` other than `undefined` (`null`, `false`) crashed `parse`; any falsy `issues` now means success, as the spec says.
+- **`curry(null)`** threw the engine's error reading `fn.length` instead of the library's `TypeError`; **`once`** and **`before`** release `fn` after their last call, so its closure can be collected.
+- **`toCsv`** wrote a row whose only cell is a hole as an empty line (dropped by `skipEmptyLines`); it is now `""`.
+
+**Faster.** Steady-state results are identical to 1.5.0 (checked on random and edge inputs); the most visible changes:
+
+- **`emitter`:** unsubscribing and removing `once` listeners is O(1) amortized, also during an emit (it rebuilt the list, and copied it during an emit): 1,000 `once` listeners and an emit are 75× faster, 1,000 unsubscribes 39×.
+- **`date`:** reading a timestamp no longer allocates a `Date`: `isBefore`, `compareAsc`, `minDate`, the `diffIn*` helpers and the other comparisons are 5–20× faster.
+- **`objects`:** null-prototype records and plain objects of another realm (iframes, `vm` contexts, `fetch` bodies under Jest) went through brand checks that each threw: `isEqual` and `deepClone` of 100 such records are 87–142× faster, `deepFreeze` 10×. `isEqual` on typed arrays is 26× faster (1.3× faster than es-toolkit), on Maps and Sets of primitives about 2×; `isEmpty` on primitives up to 229×; the merge helpers and `pick` 1.2×.
+- **`math`:** `covariance`, `correlation`, `linearRegression`, `rootMeanSquare`, `skewness`, `kurtosis`, `standardize` and `softmax` 5–14× on 10,000 values, `mode` 2.2×, `weightedAverage` 2×.
+- **`strings`/`search`:** kana, CJK punctuation and Hangul skip `Intl.Segmenter` (`reverse`, `truncate`, `stringWidth`, `mask`, `wordWrap` on Japanese or Korean text 2–80×), `dedent` 2×, `fuzzySearch` 1.8–4.2×.
+- **`color`:** the 8-bit to linear-light table is a typed array built on first use (`contrastRatio` 1.6–2.3×, `deltaE` 1.2–1.6×, `toOklch` 1.4×), and `toColorName` looks exact matches up in a reverse map (14×).
+- **`encoding`:** `sha256`/`hmacSha256` compute the message schedule in a 16-word ring (1.3–1.5×), `decodeJwt`/`verifyJwt` skip the `JSON.parse` reviver when no polluting key can be present (1.4–1.8×), `encodeUtf8({ fatal: true })` uses the native `isWellFormed` (3.4×).
+- **Others:** the async iterable helpers on sync sources 1.2–1.4× (one `await` per item instead of two; items now arrive one microtask sooner), `isRecordOf` 1.8–2.3×, `cubicBezier` 1.1–1.3×, `zipObject` with up to 16 keys 1.65–3.2×, `debounce`/`memoize` creation 1.5×.
+
+**Behaviour changes** beyond the fixes above: a `Map`, `Set` or buffer whose prototype was set to `null` is treated as the record it looks like by `clone`, `deepClone`, `isEqual`, `isEmpty` and `deepFreeze`; a run of more than 30 combining marks may normalize differently from the native `normalize` (marks are not reordered across the cuts); `isRecordOf` visits the keys an object had when the check started.
+
+**Package size:** module-level `new RegExp(...)` calls, which esbuild keeps in every bundle, are now literals (the tree-shaking check no longer allows them): most `strings` and `url` helpers shrink by 60–250 B gzipped. The fixes add a few dozen bytes to the helpers that now read options safely; the larger growths are `weightedAverage` (+285 B), `nthRoot` (+223 B), `fuzzyMatch`/`fuzzySearch`/`tokenize`/`createSearchIndex` (+260–320 B) and `createEmitter` (+150 B). The runtime total is 149.2 kB gzipped (was 146.9 kB), within the 154 kB budget.
+
 ## 1.5.0
 
 A completeness, safety and performance pass over `store` and `cache`, driven by a fresh mutation run (every surviving mutant is now killed by a test or documented as equivalent) and by benchmarks:

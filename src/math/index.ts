@@ -555,7 +555,7 @@ export function toRadians(degrees: number): number {
 
 /**
  * Converts radians to degrees: `radians * 180 / Math.PI`, which only overflows when the angle in degrees does (`toDegrees(3e306)` is
- * `1.718873385392471e308`, not `Infinity`).
+ * `1.7188733853924698e308`, not `Infinity`).
  * @param {number} radians - The angle in radians
  * @returns {number} The angle in degrees
  * @example
