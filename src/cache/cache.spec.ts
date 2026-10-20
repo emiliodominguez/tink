@@ -744,6 +744,52 @@ describe('LRUCache size budget and remaining TTL', function () {
 		expect([free.size, free.totalSize]).toEqual([3, 1]);
 	});
 
+	it('keeps the total exact with fractional sizes: an emptied cache totals 0, and a value that fits on its own is kept', function () {
+		const { events, onEvict } = recorder<string, number>();
+		const cache = createLRUCache<string, number>({
+			max: Infinity,
+			maxSize: 0.3,
+			sizeOf: function (size) {
+				return size;
+			},
+			onEvict
+		});
+		// The doubles 0.1 and 0.2 add up to more than the double 0.3: 'a' goes.
+		cache.set('a', 0.1).set('b', 0.2);
+		expect([[...cache], cache.totalSize]).toEqual([[['b', 0.2]], 0.2]);
+		cache.delete('b');
+		expect([cache.size, cache.totalSize]).toEqual([0, 0]);
+		cache.set('c', 0.3);
+		expect([[...cache], cache.totalSize]).toEqual([[['c', 0.3]], 0.3]);
+		cache.set('c', 0.1).set('d', 0.2);
+		expect([[...cache], cache.totalSize]).toEqual([[['d', 0.2]], 0.2]);
+		expect(events).toEqual([
+			['a', 0.1, 'capacity'],
+			['b', 0.2, 'deleted'],
+			['c', 0.3, 'replaced'],
+			['c', 0.1, 'capacity']
+		]);
+		// Sizes of very different magnitudes: the residue itself is rounded, yet an emptied cache still totals exactly 0.
+		const mixed = createLRUCache<string, number>({
+			max: Infinity,
+			sizeOf: function (size) {
+				return size;
+			}
+		});
+		mixed
+			.set('a', 0.1)
+			.set('b', 0.2)
+			.set('c', 2 ** 53);
+		mixed.delete('a');
+		mixed.delete('b');
+		expect(mixed.totalSize).toBe(2 ** 53);
+		mixed.delete('c');
+		expect(mixed.totalSize).toBe(0);
+		// Growing or shrinking an entry: 0.01 - 0.1 rounds, the total must not.
+		mixed.set('d', 0.1).set('d', 0.01);
+		expect(mixed.totalSize).toBe(0.01);
+	});
+
 	it('reports every eviction even when onEvict throws', function () {
 		const seen: string[] = [];
 		const cache = textCache(4, function (key) {

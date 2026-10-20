@@ -66,7 +66,10 @@ export interface LRUCache<K, V> extends Iterable<[K, V]> {
 	 * operation has touched yet; call `prune()` first for an exact live count. Never exceeds `max`.
 	 */
 	readonly size: number;
-	/** Total size of the stored entries, as measured by `sizeOf` (the number of entries without it). Never exceeds `maxSize`. */
+	/**
+	 * Total size of the stored entries, as measured by `sizeOf` (the number of entries without it). Never exceeds `maxSize`. It is the
+	 * sum of the current sizes rounded once, so fractional sizes do not drift as entries come and go (an emptied cache totals `0`).
+	 */
 	readonly totalSize: number;
 	/** Returns the value of a live entry and marks it most-recently used (restarting its TTL with `updateAgeOnGet`); `undefined` otherwise. */
 	get(key: K): V | undefined;
@@ -314,8 +317,11 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	// Both ends of the recency list.
 	let newest: Entry<K, V> | undefined;
 	let oldest: Entry<K, V> | undefined;
-	// The sum of the entries' sizes.
+	// The sum of the entries' sizes, kept as a rounded sum plus the rounding errors of the additions that made it (`total + residue`):
+	// with sizes that are not integers (0.1, 0.2...), plain additions and subtractions drift, so that an emptied cache would total
+	// 5.6e-17 and a value that fits on its own would be evicted on arrival.
 	let total = 0;
+	let residue = 0;
 	// Whether any entry may ever expire (set by the first `set` with a finite TTL). Until then every `expiresAt` is `Infinity`, so the
 	// clock (`Date.now` costs more than a `Map` lookup) is not read at all.
 	let timed = false;
@@ -400,6 +406,18 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	}
 
 	/**
+	 * Adds a size to the total, keeping the exact rounding error of the addition (Knuth's TwoSum) in `residue`.
+	 * @param {number} size - The size to add (negative to subtract)
+	 * @returns {void}
+	 */
+	function account(size: number): void {
+		const sum = total + size;
+		const added = sum - total;
+		residue += total - (sum - added) + (size - added);
+		total = sum;
+	}
+
+	/**
 	 * Removes an entry from the map and the list.
 	 * @param {Entry<K, V>} entry - The entry
 	 * @returns {void}
@@ -407,7 +425,9 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	function remove(entry: Entry<K, V>): void {
 		store.delete(entry.key);
 		unlink(entry);
-		total -= entry.size;
+		account(-entry.size);
+		// An empty cache totals exactly 0, whatever rounding the residue itself went through.
+		if (store.size === 0) total = residue = 0;
 	}
 
 	/**
@@ -415,7 +435,7 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 	 * @returns {boolean} `true` when least-recently-used entries must go
 	 */
 	function overflows(): boolean {
-		return store.size > max || total > maxSize;
+		return store.size > max || total + residue > maxSize;
 	}
 
 	/**
@@ -594,7 +614,9 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 					const expired = time >= entry.expiresAt;
 
 					entry.value = value;
-					total += size - entry.size;
+					// Two additions: `size - entry.size` would be rounded before reaching the total.
+					account(size);
+					account(-entry.size);
 					entry.size = size;
 					entry.ttl = ttl;
 					entry.expiresAt = time + ttl;
@@ -622,7 +644,7 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 
 				store.set(key, added);
 				pushNewest(added);
-				total += size;
+				account(size);
 				fit(time, undefined);
 
 				return cache;
@@ -644,7 +666,7 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 				store.clear();
 				newest = undefined;
 				oldest = undefined;
-				total = 0;
+				total = residue = 0;
 
 				notifyAll(removed);
 			},
@@ -686,7 +708,7 @@ export function createLRUCache<K = unknown, V = unknown>(options: LRUCacheOption
 		}
 	);
 	(cache as unknown as Record<symbol, unknown>)[TOTAL_SIZE] = function (): number {
-		return total;
+		return total + residue;
 	};
 
 	return cache;
