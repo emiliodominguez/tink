@@ -152,11 +152,18 @@ const HEX_COLOR_PATTERN = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
 const OPAQUE_HEX_COLOR_PATTERN = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
 
 /**
- * The official semver.org 2.0.0 regular expression (numbered groups: major, minor, patch, pre-release, build). A literal, not
- * `new RegExp(...)`: bundlers keep a module-level constructor call, even in bundles that never read a version.
+ * The official semver.org 2.0.0 regular expression (numbered groups: major, minor, patch, pre-release, build), with the identifiers
+ * checked apart (see {@link matchSemver}): its repeated group of identifiers overflowed the regular expression backtracking stack on
+ * a few million of them, so that a long string made {@link isSemver} throw. A literal, not `new RegExp(...)`: bundlers keep a
+ * module-level constructor call, even in bundles that never read a version.
  */
-const SEMVER_PATTERN =
-	/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
+const SEMVER_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/;
+
+/** An empty identifier (a leading, trailing or doubled dot), or, with `0\d+` matched, a numeric pre-release identifier with a leading zero. */
+const BAD_IDENTIFIER = /(?:^|\.)(?:0\d+)?(?:\.|$)/;
+
+/** An empty identifier: a leading, trailing or doubled dot. */
+const EMPTY_IDENTIFIER = /(?:^|\.)(?:\.|$)/;
 
 /** A string of ASCII digits. */
 const DIGITS_PATTERN = /^[0-9]+$/;
@@ -176,8 +183,11 @@ const BASE64_PATTERN = /^[A-Za-z0-9+/]*={0,2}$/;
 /** Base64url (RFC 4648 §5) body and padding. */
 const BASE64_URL_PATTERN = /^[A-Za-z0-9_-]*={0,2}$/;
 
-/** A lowercase ASCII slug, as produced by `toSlug` from the strings module. */
-const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+/**
+ * A lowercase ASCII slug, as produced by `toSlug` from the strings module: no leading, trailing or doubled hyphen. Without a repeated
+ * group (`[a-z0-9]+(?:-[a-z0-9]+)*`), which overflowed the regular expression backtracking stack on a few million hyphens.
+ */
+const SLUG_PATTERN = /^(?!-)(?!.*--)[a-z0-9-]+(?<!-)$/;
 
 /** Decimal number syntax: optional sign, digits with an optional fraction (or a bare fraction), optional exponent. */
 const NUMERIC_PATTERN = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/;
@@ -621,12 +631,14 @@ export function isHexColor(value: unknown, options?: IsHexColorOptions): value i
 }
 
 /**
- * Matches a value against the official semver regular expression.
+ * Matches a value against the official semver regular expression (see {@link SEMVER_PATTERN}).
  * @param {unknown} value - The value
  * @returns {RegExpExecArray | null} The match, or `null` when `value` is not a string holding a semantic version
  */
 function matchSemver(value: unknown): RegExpExecArray | null {
-	return typeof value === 'string' ? SEMVER_PATTERN.exec(value) : null;
+	const match = typeof value === 'string' ? SEMVER_PATTERN.exec(value) : null;
+
+	return match === null || (match[4] !== undefined && BAD_IDENTIFIER.test(match[4])) || (match[5] !== undefined && EMPTY_IDENTIFIER.test(match[5])) ? null : match;
 }
 
 /**
@@ -644,7 +656,7 @@ function matchSemver(value: unknown): RegExpExecArray | null {
  * isSemver('01.2.3'); // => false
  */
 export function isSemver(value: unknown): value is string {
-	return typeof value === 'string' && SEMVER_PATTERN.test(value);
+	return matchSemver(value) !== null;
 }
 
 /**
@@ -1851,7 +1863,9 @@ export function luhnCheck(digits: string): boolean {
  * isCreditCardNumber('0000 0000 0000 0000'); // => false
  */
 export function isCreditCardNumber(value: unknown): value is string {
-	if (typeof value !== 'string' || !CARD_PATTERN.test(value)) return false;
+	// At most 19 digits with a separator between each two: longer strings (up to millions of characters, which overflowed the pattern's
+	// backtracking stack) are rejected first.
+	if (typeof value !== 'string' || value.length > 37 || !CARD_PATTERN.test(value)) return false;
 	const digits = value.replace(/[ -]/g, '');
 	return digits.length >= 12 && digits.length <= 19 && /[1-9]/.test(digits) && luhnCheck(digits);
 }
@@ -2566,7 +2580,8 @@ function standardNode(schema: StandardSchemaLike): Node {
 			const own = moved.get(found) === true;
 
 			for (const issue of found as ReadonlyArray<{ readonly message: string; readonly path?: ReadonlyArray<PropertyKey | { readonly key: PropertyKey }> }>) {
-				const segments = (issue.path ?? []).map(function (segment: PropertyKey | { readonly key: PropertyKey }): PropertyKey {
+				// An issue at the root may have no `path`: a polluted `Object.prototype.path` is not read (a string there threw).
+				const segments = readOption(issue, 'path', []).map(function (segment: PropertyKey | { readonly key: PropertyKey }): PropertyKey {
 					return typeof segment === 'object' ? segment.key : segment;
 				});
 				const copy = { message: issue.message, path: [...path, ...segments] };
@@ -2847,11 +2862,15 @@ function execute(fast: Fast, run: Run, value: unknown, issues: SchemaIssue[]): u
 function report(run: Run, value: unknown, issues: SchemaIssue[], root: boolean): unknown {
 	const outer = rootIssues;
 
-	if (scope.depth++ === 0 || root) rootIssues = issues;
+	// Nothing that can throw (near the stack limit, any call can overflow) runs between a change of the scope and the `try` that undoes
+	// it, nor before the undoing in `finally`: a depth left above 0 would keep every memo, and its stale outputs, for every later parse.
+	// The outermost parse starts from empty memos, in case the `release` of an earlier one overflowed.
+	if (scope.depth === 0) release();
 	if (root) {
 		moved.set(issues, true);
 		outers.add(outer);
 	}
+	if (scope.depth++ === 0 || root) rootIssues = issues;
 	try {
 		return run(value, [], issues);
 	} catch (error) {
@@ -2862,9 +2881,10 @@ function report(run: Run, value: unknown, issues: SchemaIssue[], root: boolean):
 
 		return undefined;
 	} finally {
-		if (root) outers.delete(outer);
 		rootIssues = outer;
-		if (--scope.depth === 0) release();
+		scope.depth--;
+		if (root) outers.delete(outer);
+		if (scope.depth === 0) release();
 	}
 }
 
@@ -3987,8 +4007,8 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 	const memo = new Map<object, unknown>();
 	const reported = new Map<object, unknown>();
 	// The values being scored: a union that reaches this parser again on the same value (`lazy(() => union(a, nullable(self)))`) would
-	// score it forever.
-	const scoring = new Set<unknown>();
+	// score it forever. Held like the memos, so that a `delete` that overflowed cannot leave a value scored as 1 for good.
+	const scoring = new Set<object>();
 
 	/**
 	 * Returns the compiled schema, calling `getter` on first use.
@@ -4022,6 +4042,8 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 		const node = resolve();
 
 		if (typeof value !== 'object' || value === null) return node.fast(value);
+		// An outermost parse finding outputs in its own memo follows one whose `release` overflowed: they may be stale (see `report`).
+		if (scope.depth === 0 && memo.size !== 0) release();
 
 		const known = memo.get(value);
 
@@ -4068,6 +4090,7 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 			const node = resolve();
 
 			if (typeof value !== 'object' || value === null) return node.run(value, path, issues);
+			if (scope.depth === 0) release();
 
 			let state = reported.get(value) as LazyReport | undefined;
 
@@ -4116,13 +4139,12 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 				}
 				throw error;
 			} finally {
+				// The scope first: the map calls below can overflow (see `report`).
+				if (--scope.checks === 0) scope.checkRoot = undefined;
+				if (--scope.depth === 0) rootIssues = undefined;
 				if (failed) reported.set(value, { index: before, first: issues[before], list: issues });
 				else reported.delete(value);
-				if (--scope.checks === 0) scope.checkRoot = undefined;
-				if (--scope.depth === 0) {
-					rootIssues = undefined;
-					release();
-				}
+				if (scope.depth === 0) release();
 			}
 		},
 		guard: undefined,
@@ -4135,12 +4157,12 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 			return handlesMissing(resolve());
 		},
 		score: function scoreLazy(value: unknown): number {
-			if (scoring.has(value)) return 1;
-			scoring.add(value);
+			if (scoring.has(value as object)) return 1;
+			hold(scoring).add(value as object);
 			try {
 				return scoreOf(resolve(), value);
 			} finally {
-				scoring.delete(value);
+				scoring.delete(value as object);
 			}
 		}
 	});

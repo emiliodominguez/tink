@@ -947,4 +947,137 @@ describe('recursive unions told apart deep inside', function () {
 		// Quadratic, four times the depth took about sixteen times as many calls (800 levels: 964,000).
 		expect(count(800)).toBeLessThan(count(200) * 6);
 	});
+
+	describe('state left by a throw', function () {
+		const Item: Parser<unknown> = lazy(function () {
+			return { qty: asInteger };
+		});
+		const Chain: Parser<unknown> = lazy(function () {
+			return { n: asInteger, next: optional(Chain) };
+		});
+		const adapted: Schema = {
+			'~standard': {
+				version: 1,
+				vendor: 'adapter',
+				validate: function validate(value: unknown) {
+					return Chain['~standard'].validate(value);
+				}
+			}
+		};
+		const Other: Parser<unknown> = lazy(function () {
+			return { z: asInteger };
+		});
+		const scenarios: ReadonlyArray<[string, Schema, unknown]> = [
+			['an invalid parse', Chain, { n: 1, next: { n: 'x' } }],
+			['a valid parse', Chain, { n: 1, next: { n: 2 } }],
+			['a report through an adapter', { a: adapted }, { a: { n: 1, next: { n: 'x' } } }],
+			['a union report', union(Chain, Other), { n: 'x', z: 'y' }]
+		];
+		const builtins: ReadonlyArray<[string, Record<string, unknown>, string]> = [
+			['WeakMap#set', WeakMap.prototype as unknown as Record<string, unknown>, 'set'],
+			['Map#set', Map.prototype as unknown as Record<string, unknown>, 'set'],
+			['Map#delete', Map.prototype as unknown as Record<string, unknown>, 'delete'],
+			['Map#clear', Map.prototype as unknown as Record<string, unknown>, 'clear'],
+			['Set#add', Set.prototype as unknown as Record<string, unknown>, 'add'],
+			['Set#delete', Set.prototype as unknown as Record<string, unknown>, 'delete'],
+			['Array#slice', Array.prototype as unknown as Record<string, unknown>, 'slice']
+		];
+
+		/**
+		 * Whether a parse accepts an object that it parsed before and that became invalid since: what a memo kept from an earlier parse gives.
+		 * @returns {boolean} `true` when the stale output is returned
+		 */
+		function acceptsStale(): boolean {
+			const order = { qty: 1 as unknown };
+
+			parse(Item, order);
+			order.qty = 'x';
+
+			return safeParse(Item, order)[0] === undefined;
+		}
+
+		// Near the stack limit, any call there (the builtins included) can overflow, even in a `finally`: each one throws here in turn.
+		it('should leave no memo or nesting behind when a call between a counter update and its restore throws', function () {
+			const stale: string[] = [];
+
+			for (const [name, schema, value] of scenarios) {
+				for (const [method, prototype, key] of builtins) {
+					const original = prototype[key] as (...args: unknown[]) => unknown;
+					let fired = true;
+
+					for (let at = 1; fired; at++) {
+						let made = 0;
+
+						fired = false;
+						prototype[key] = function (this: unknown, ...args: unknown[]): unknown {
+							if (++made === at) {
+								fired = true;
+								throw new RangeError('Maximum call stack size exceeded');
+							}
+
+							return original.apply(this, args);
+						};
+						try {
+							safeParse(schema, value);
+						} catch {
+							// The parse may fail with the error: only what the next ones see matters.
+						} finally {
+							prototype[key] = original;
+						}
+						// Two parses: the first may still clean up after the throw, every later one must be right.
+						acceptsStale();
+						if (acceptsStale()) stale.push(`${name}, ${method} call ${at}`);
+					}
+				}
+			}
+			expect(stale).toEqual([]);
+		});
+
+		it('should not give the output an overflowed release kept to the next parse of the same object', function () {
+			const order = { qty: 1 as unknown };
+			const original = Map.prototype.clear;
+			let thrown = false;
+
+			Map.prototype.clear = function (this: Map<unknown, unknown>): void {
+				if (thrown) return original.call(this);
+				thrown = true;
+				throw new RangeError('Maximum call stack size exceeded');
+			};
+			try {
+				parse(Item, order);
+			} catch {
+				// The parse itself may fail: the memo it kept matters.
+			} finally {
+				Map.prototype.clear = original;
+			}
+			order.qty = 'x';
+			expect(issuesOf(Item, order)).toEqual([{ message: 'Expected an integer or an integer string (got string)', path: ['qty'] }]);
+		});
+
+		it('should score a union member again after a delete of its scoring set threw', function () {
+			const Close: Parser<unknown> = lazy(function () {
+				return { a: asInteger, b: asInteger, c: asInteger };
+			});
+			const schema = union(
+				Close,
+				lazy(function () {
+					return { z: asInteger };
+				})
+			);
+			const value = { a: 1, b: 2, c: 'x' };
+			const original = Set.prototype.delete;
+
+			Set.prototype.delete = function (): boolean {
+				throw new RangeError('Maximum call stack size exceeded');
+			};
+			try {
+				safeParse(schema, value);
+			} catch {
+				// Only the next report matters.
+			} finally {
+				Set.prototype.delete = original;
+			}
+			expect(issuesOf(schema, value)).toEqual([{ message: 'Expected an integer or an integer string (got string)', path: ['c'] }]);
+		});
+	});
 });

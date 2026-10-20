@@ -19,14 +19,19 @@ import {
 	asJson,
 	blankAsUndefined,
 	chain,
+	compareSemver,
 	discriminatedUnion,
 	incrementSemver,
+	isCreditCardNumber,
+	isSemver,
+	isSlug,
 	lazy,
 	nullable,
 	optional,
 	recordOf,
 	parse,
 	parseJson,
+	parseSemver,
 	safeParse,
 	transform,
 	tuple,
@@ -444,6 +449,25 @@ describe('compiled schemas under prototype pollution', function () {
 
 		expect(results).toEqual([[undefined, { a: 4 }], [{ message: 'Not a number', path: ['a'] }]]);
 	});
+
+	it('should not read the path of a foreign issue from Object.prototype', function () {
+		const foreign: Schema = {
+			'~standard': {
+				version: 1,
+				vendor: 'foreign',
+				validate: function validate() {
+					return { issues: [{ message: 'Not a number' }] };
+				}
+			}
+		};
+
+		// The planted string was mapped as the path of an issue at the root: every report threw a `TypeError`.
+		expect(
+			polluted(Object.prototype, 'path', 'planted', function () {
+				return issuesOf({ a: foreign }, { a: 'x' });
+			})
+		).toEqual([{ message: 'Not a number', path: ['a'] }]);
+	});
 });
 
 describe('semver under prototype pollution', function () {
@@ -454,5 +478,26 @@ describe('semver under prototype pollution', function () {
 		});
 
 		expect(result).toBe('1.2.4-beta.0.0');
+	});
+});
+
+describe('string validators on strings of millions of characters', function () {
+	// The patterns repeated a group per identifier, hyphen or digit, and overflowed the backtracking stack around 5 million characters.
+	it('should check versions with millions of identifiers without throwing', function () {
+		const prerelease = 'a.'.repeat(5e6);
+
+		expect(isSemver(`1.2.3-${prerelease}a`)).toBe(true);
+		expect(isSemver(`1.2.3-${prerelease}!`)).toBe(false);
+		expect(isSemver(`1.2.3-${prerelease}01`)).toBe(false);
+		expect(isSemver(`1.2.3-${prerelease}`)).toBe(false);
+		expect(isSemver(`1.2.3+${prerelease}01`)).toBe(true);
+		expect(parseSemver(`1.0.0-a+${prerelease}b`)?.build).toHaveLength(5e6 + 1);
+		expect(compareSemver(`1.2.3-${prerelease}a`, '1.2.3')).toBe(-1);
+	});
+
+	it('should check slugs and card numbers of millions of characters without throwing', function () {
+		expect(isSlug(`${'a-'.repeat(1e7)}a`)).toBe(true);
+		expect(isSlug('a-'.repeat(1e7))).toBe(false);
+		expect(isCreditCardNumber(`${'1 '.repeat(1e7)}1`)).toBe(false);
 	});
 });
