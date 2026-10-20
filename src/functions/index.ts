@@ -40,7 +40,10 @@ const KEY_VISIT_BUDGET = 65536;
 /** See {@link KEY_VISIT_BUDGET} (2^24 characters). */
 const KEY_LENGTH_BUDGET = 16777216;
 
-/** From this index on, {@link serializeKey} writes each run of holes of an array at once (see {@link ownIndexes}). */
+/**
+ * From this index on, a loop over the elements of an array (in {@link serializeKey}, {@link shallowEqualArgs} and {@link cons}) skips from a
+ * hole to the next own element (see {@link isLongHole}).
+ */
 const SPARSE_KEY_SCAN = 65536;
 
 /** Thrown by {@link serializeKey} when a key expanded in full exceeds its budget (see {@link KEY_VISIT_BUDGET}). */
@@ -90,7 +93,8 @@ const hasOwn = Object.prototype.hasOwnProperty;
  * @throws {RangeError} when `value` is `NaN`, infinite or negative
  */
 function assertWait(caller: string, name: string, value: number): void {
-	assertNumber(caller, name, value, value >= 0 && value < Infinity, 'a finite number >= 0');
+	// `typeof` first: comparing an object converts it (calling its `valueOf`, or joining a long array, for seconds) before it is rejected.
+	assertNumber(caller, name, value, typeof value === 'number' && value >= 0 && value < Infinity, 'a finite number >= 0');
 }
 
 /**
@@ -558,7 +562,8 @@ export type Memoized<F extends AnyFunction, C extends MemoizeCache<unknown, unkn
  *
  * Limitations: plain objects and arrays are compared structurally by their own enumerable string keys (key order matters; symbol keys
  * and non-enumerable properties are ignored; getters are invoked), holes in arrays count as `undefined`, and circular plain structures
- * throw. Two class instances with the same fields are different keys. Supply a custom `resolver` for anything else.
+ * throw. Two class instances with the same fields are different keys. A key is as long as the serialised arguments (and building it
+ * takes several times that memory): for arguments holding millions of elements, or anything else, supply a custom `resolver`.
  * @param {...unknown} args - The call arguments
  * @returns {unknown} The cache key
  * @throws {TypeError} when the arguments contain a circular structure of plain objects or arrays
@@ -674,6 +679,29 @@ function ownIndexes(array: unknown[]): number[] {
 }
 
 /**
+ * The array index a property key stands for.
+ * @param {string} key - An own key of an array
+ * @returns {number} The index, or `-1` for another key (`'label'`, `'01'`, `'1e5'`…)
+ */
+function indexOfKey(key: string): number {
+	const index = Number(key) >>> 0;
+
+	return String(index) === key ? index : -1;
+}
+
+/**
+ * Whether a loop over the elements of an array reached a hole past {@link SPARSE_KEY_SCAN} elements, and should go on with the own elements
+ * only: one at a time, the holes of a long sparse array (a length of `2 ** 32 - 1` for a few elements, after
+ * `array[index] = value`) take minutes.
+ * @param {ReadonlyArray<unknown>} array - The array
+ * @param {number} index - The index reached
+ * @returns {boolean} `true` at such a hole
+ */
+function isLongHole(array: ReadonlyArray<unknown>, index: number): boolean {
+	return index >= SPARSE_KEY_SCAN && !hasOwn.call(array, index);
+}
+
+/**
  * Compares two numbers, for an ascending sort.
  * @param {number} a - A number
  * @param {number} b - Another number
@@ -776,9 +804,8 @@ function serializeKey(value: unknown, state: KeyState): string {
 
 					if (element !== undefined || i < SPARSE_KEY_SCAN || hasOwn.call(value, i)) key += (i === 0 ? '' : ',') + serializeKey(element, state);
 					else {
-						// A run of holes is written at once: one at a time, those of a sparse array (a length of `2 ** 32 - 1` for a few elements,
-						// after `array[index] = value`) took seconds and gigabytes of memory, aborting the process, before the key reached the
-						// engine's maximum string length (where `repeat` throws a `RangeError` at once).
+						// A run of holes is written at once: one at a time, those of a long sparse array took seconds and gigabytes of memory,
+						// aborting the process, before the key reached the engine's maximum string length (where `repeat` throws a `RangeError` at once).
 						indexes ??= ownIndexes(value);
 						while (indexes[next] <= i) next++;
 						const end = Math.min(indexes[next], value.length);
@@ -2006,6 +2033,25 @@ export function shallowEqualArgs(next: ReadonlyArray<unknown>, previous: Readonl
 
 	for (let i = 0; i < next.length; i++) {
 		if (!sameValueZero(next[i], previous[i])) return false;
+		// From a hole of both on, only the own elements are compared: the holes of either read the same in both.
+		if (isLongHole(next, i) && isLongHole(previous, i)) return sameElementsFrom(next, previous, i) && sameElementsFrom(previous, next, i);
+	}
+
+	return true;
+}
+
+/**
+ * Whether the own elements of `next` after index `start` equal the elements of `previous` at the same indexes (see {@link shallowEqualArgs}).
+ * @param {ReadonlyArray<unknown>} next - An argument list
+ * @param {ReadonlyArray<unknown>} previous - The other one
+ * @param {number} start - The index after which elements are compared
+ * @returns {boolean} `true` when they are equal
+ */
+function sameElementsFrom(next: ReadonlyArray<unknown>, previous: ReadonlyArray<unknown>, start: number): boolean {
+	for (const key of Object.keys(next)) {
+		const index = indexOfKey(key);
+
+		if (index > start && index < next.length && !sameValueZero(next[index], previous[index])) return false;
 	}
 
 	return true;
@@ -2108,7 +2154,8 @@ export type MatchResult<H> = { [P in keyof H]-?: H[P] extends (...args: never[])
  * Exhaustive pattern matching on a discriminated union: calls the handler named after `value[key]` (the "tag") with `value`, and returns
  * its result. Each handler's argument is narrowed to the matching union member, the result is the union of the handlers' return types,
  * and leaving out a tag is a compile error unless a `_` handler catches the remaining ones (a tag literally named `'_'` is handled by `_`).
- * Boolean, number, `null` and `undefined` tags are matched by their string form (`true`, `404`, `null`).
+ * Boolean, number, `null` and `undefined` tags are matched by their string form (`true`, `404`, `null`); an object or function is no tag
+ * (only `_` handles it).
  *
  * At runtime only own properties of `handlers` count (a tag such as `'toString'` or `'__proto__'` never reaches `Object.prototype`). A
  * tag without a handler and no `_` (data that does not match its type, e.g. from an API) throws an `AssertionError` naming the key and
@@ -2142,13 +2189,16 @@ export function match<T extends object, K extends keyof T, H extends MatchHandle
 	// Functions too: `T extends object` accepts callable members (a function with a `kind` property).
 	if ((typeof value !== 'object' && typeof value !== 'function') || value === null) throw new TypeError(`match: \`value\` must be an object, got ${describe(value)}`);
 
-	const tag = String(value[key]);
+	const raw: unknown = value[key];
+	// An object is no tag (data that does not match its type): its string form would be (`['circle']` reads as 'circle', and a long array
+	// takes seconds to join).
+	const tag = (typeof raw === 'object' && raw !== null) || typeof raw === 'function' ? undefined : String(raw);
 	// A key present with an `undefined` value (allowed by the `Partial` handler types) counts as absent, so `_` handles that member.
-	const own = (Object.hasOwn(handlers, tag) ? handlers[tag as keyof H] : undefined) as unknown;
+	const own = (tag !== undefined && Object.hasOwn(handlers, tag) ? handlers[tag as keyof H] : undefined) as unknown;
 	const handler = own === undefined && Object.hasOwn(handlers, '_') ? (handlers['_' as keyof H] as unknown) : own;
 
 	// The tag may come from untrusted data: quote at most 100 characters of it, so that the message stays safe to log.
-	if (handler === undefined) throw new AssertionError(`match: no handler for \`${String(key)}\` ${JSON.stringify(tag.slice(0, 100))}`);
+	if (handler === undefined) throw new AssertionError(`match: no handler for \`${String(key)}\` ${tag === undefined ? describe(raw) : JSON.stringify(tag.slice(0, 100))}`);
 	// A tag without its own handler fell back to `_` (and may be untrusted): name the handler actually used.
 	assertFunction('match', `handlers.${own === undefined ? '_' : tag}`, handler);
 
@@ -2319,7 +2369,7 @@ function register(caller: string, record: PatternRecord): AnyFunction {
 	 * @returns {boolean} Whether it matches
 	 */
 	function pattern(value: unknown): boolean {
-		return testHelper(caller, record, value, undefined, 0);
+		return testRoot(caller, pattern, value, undefined);
 	}
 
 	(pattern as { [HELPER]?: PatternRecord })[HELPER] = record;
@@ -2334,8 +2384,99 @@ function register(caller: string, record: PatternRecord): AnyFunction {
 const CYCLE_CHECK_DEPTH = 64;
 
 /**
+ * How many parts of a pattern {@link testRoot} tests before it remembers the outcome of each object, array and helper for each value (see
+ * {@link recall}): a pattern holding a part twice, which holds another one twice, and so on (or an `anyOf` of the same alternative twice,
+ * nested), tested against values sharing their objects the same way, would test the innermost part once per path, exponentially often.
+ */
+const TEST_BUDGET = 65536;
+
+/** How many more parts the current {@link testRoot} tests before it remembers outcomes. */
+let testsLeft = TEST_BUDGET;
+
+/**
+ * The outcomes remembered by the current {@link testRoot}, by part of the pattern and value: `false`, `true`, or what the match captured.
+ */
+let outcomes: Map<object, Map<unknown, boolean | unknown[]>> | undefined;
+
+/**
+ * Tests a value against a whole pattern (see {@link test}), remembering outcomes once past {@link TEST_BUDGET}.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {unknown} pattern - The pattern
+ * @param {unknown} value - The value
+ * @param {unknown[] | undefined} log - Receives the captures, or `undefined` to bind nothing
+ * @returns {boolean} Whether `value` matches
+ * @throws {TypeError} when the test follows a cycle of the pattern
+ */
+function testRoot(caller: string, pattern: unknown, value: unknown, log: unknown[] | undefined): boolean {
+	// Restored afterwards: a guard of the pattern may run another match meanwhile, and nothing may outlive the test.
+	const left = testsLeft;
+	const known = outcomes;
+
+	testsLeft = TEST_BUDGET;
+	outcomes = undefined;
+	try {
+		return test(caller, pattern, value, log, 0);
+	} finally {
+		testsLeft = left;
+		outcomes = known;
+	}
+}
+
+/**
+ * Tests a value against an object, array or helper of a pattern (see {@link test}), or, past {@link TEST_BUDGET}, gives the outcome of an
+ * earlier test of the same part against the same value (a match captures what it captured then).
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {object} pattern - The part of the pattern
+ * @param {unknown} value - The value
+ * @param {unknown[] | undefined} log - The captures so far, or `undefined` to bind nothing
+ * @param {number} depth - How many objects and arrays of the pattern enclose this one
+ * @param {PatternRecord | undefined} record - The helper, or `undefined` for an object or array (already checked to be one `value` may match)
+ * @returns {boolean} Whether `value` matches
+ */
+function recall(caller: string, pattern: object, value: unknown, log: unknown[] | undefined, depth: number, record: PatternRecord | undefined): boolean {
+	let byValue: Map<unknown, boolean | unknown[]> | undefined;
+
+	// `-0` is never remembered: a `Map` takes it for `0`, which a guard may tell apart.
+	if (--testsLeft < 0 && !Object.is(value, -0)) {
+		outcomes ??= new Map();
+		byValue = outcomes.get(pattern);
+		if (byValue === undefined) outcomes.set(pattern, (byValue = new Map()));
+
+		const known = byValue.get(value);
+
+		if (known !== undefined) {
+			if (typeof known !== 'boolean') recapture(log as unknown[], known);
+			return known !== false;
+		}
+	}
+
+	const start = log?.length as number;
+	const matched = record === undefined ? testStructure(caller, pattern, value, log, depth) : testHelper(caller, record, value, log, depth);
+
+	byValue?.set(value, matched && log !== undefined && log.length > start ? log.slice(start) : matched);
+
+	return matched;
+}
+
+/**
+ * Appends to `log` what a part of a pattern captured when it was met before (see {@link recall} and {@link scan}). When `log` already holds
+ * the part's first name (or, for an anonymous capture, another anonymous one), the part is met again on a path that captures it twice,
+ * which {@link select} rejects: that name is then appended once, where all the part's captures would double the log at each level of a
+ * pattern holding the part twice, which holds it twice, and so on.
+ * @param {unknown[]} log - The captures so far
+ * @param {ReadonlyArray<unknown>} entries - What the part captured, as pairs of a name and a value
+ * @returns {void}
+ */
+function recapture(log: unknown[], entries: ReadonlyArray<unknown>): void {
+	let count = entries.length;
+
+	for (let index = 0; index < log.length && count > 2; index += 2) if (log[index] === entries[0]) count = 2;
+	for (let index = 0; index < count; index++) log.push(entries[index]);
+}
+
+/**
  * Tests a value against a pattern, with the semantics of {@link isMatching} but without compiling it (see {@link matchWith}), and records
- * what its helpers capture in `log`.
+ * what its helpers capture in `log`. Called by {@link testRoot}, or for a part of the pattern.
  * @param {string} caller - Name of the public function, used in error messages
  * @param {unknown} pattern - The pattern
  * @param {unknown} value - The value
@@ -2348,7 +2489,7 @@ function test(caller: string, pattern: unknown, value: unknown, log: unknown[] |
 	if (typeof pattern === 'function') {
 		const record = helperOf(pattern);
 
-		return record === undefined ? Boolean(pattern(value)) : testHelper(caller, record, value, log, depth);
+		return record === undefined ? Boolean(pattern(value)) : recall(caller, pattern, value, log, depth, record);
 	}
 	if (typeof pattern !== 'object' || pattern === null) return sameValueZero(value, pattern);
 
@@ -2366,8 +2507,23 @@ function test(caller: string, pattern: unknown, value: unknown, log: unknown[] |
 		}
 	}
 	if (array ? !Array.isArray(value) || value.length !== pattern.length : typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+
+	return recall(caller, pattern, value, log, depth, undefined);
+}
+
+/**
+ * Tests a value against an object or array pattern, once {@link test} checked that the value may match it.
+ * @param {string} caller - Name of the public function, used in error messages
+ * @param {object} pattern - The object or array pattern
+ * @param {unknown} value - The value: an array of the same length, or an object that is not an array
+ * @param {unknown[] | undefined} log - The captures so far, or `undefined` to bind nothing
+ * @param {number} depth - How many objects and arrays of the pattern enclose this one
+ * @returns {boolean} Whether `value` matches
+ * @throws {TypeError} when the test follows a cycle of the pattern
+ */
+function testStructure(caller: string, pattern: object, value: unknown, log: unknown[] | undefined, depth: number): boolean {
 	if (depth === CYCLE_CHECK_DEPTH) scan(caller, pattern, [], [], new Map());
-	if (array) {
+	if (Array.isArray(pattern)) {
 		// A hole reads `undefined`, in the pattern (as `isMatching` compiles it) and in the value.
 		const direct = !isArrayPrototypePolluted();
 
@@ -2447,10 +2603,21 @@ function testHelper(caller: string, record: PatternRecord, value: unknown, log: 
 		if (!test(caller, patterns[0], elementOf(value, 0, direct), log, depth)) return false;
 		if (patterns[1] === _) return true;
 
-		// A new dense array, as a pattern of `isMatching` reads the elements.
+		// A new array, whose holes read `undefined` (as a pattern of `isMatching` reads the elements).
 		const tail = new Array<unknown>(value.length - 1);
 
-		for (let index = 1; index < value.length; index++) tail[index - 1] = elementOf(value, index, direct);
+		for (let index = 1; index < value.length; index++) {
+			if (isLongHole(value, index)) {
+				// The own elements after the hole, in any order.
+				for (const key of Object.keys(value)) {
+					const own = indexOfKey(key);
+
+					if (own > index && own < value.length) tail[own - 1] = elementOf(value, own, direct);
+				}
+				break;
+			}
+			tail[index - 1] = elementOf(value, index, direct);
+		}
 
 		return test(caller, patterns[1], tail, log, depth);
 	}
@@ -2487,7 +2654,7 @@ function scan(caller: string, pattern: unknown, log: unknown[], ancestors: unkno
 
 	if (known !== undefined) {
 		if (known === false) return false;
-		for (let index = 0; index < known.length; index++) log.push(known[index]);
+		recapture(log, known);
 
 		return true;
 	}
@@ -2726,7 +2893,7 @@ export function anyOf<const P extends readonly unknown[]>(...patterns: P): AnyOf
 /**
  * Creates a list pattern, F#'s `head :: tail`: it matches non-empty arrays whose first element matches `head` and whose other elements,
  * as a new array, match `tail` (anything, by default). Combine with `[]` (the empty array) for exhaustive recursion over arrays. The tail
- * is a copy, so matching it costs O(n): for long arrays, prefer index loops.
+ * is a copy, so matching it costs O(n): for long arrays, prefer index loops. (Past 65,536 elements, the holes of a sparse array stay holes in it.)
  * @template H - The pattern of the first element
  * @template T - The pattern of the other elements
  * @param {H} head - The pattern of the first element
@@ -3317,7 +3484,7 @@ class MatchState {
 		// Only truncated when needed: setting `length` costs more than the rest of a simple test.
 		if (log.length !== 0) log.length = 0;
 
-		const matched = test('matchWith', pattern, this.value, log, 0);
+		const matched = testRoot('matchWith', pattern, this.value, log);
 
 		this.log = log;
 		if (!matched) return this;
@@ -3382,8 +3549,10 @@ class MatchState {
  * never matches a key pattern, and a class instance used as a pattern is compared by identity (while its type is structural): match
  * classes with `isInstanceOf(Class)` instead. Proxies are trusted: `matchWith` checks that a property is own before reading it, while
  * compiled patterns ({@link isMatching}, and the parts of {@link matcher} patterns without helpers) may read it first, so a proxy whose
- * traps disagree (`get` without `getOwnPropertyDescriptor`) may match differently in each. Captures: mixing anonymous and named captures is
- * a compile error; several anonymous captures, or a name captured twice, only throw (see {@link capture}).
+ * traps disagree (`get` without `getOwnPropertyDescriptor`) may match differently in each. Once a test went through 65,536 objects, arrays
+ * and helpers of a pattern, a part held in several places is tested once per value (its guards run once), so that shared parts cost linear
+ * time. Captures: mixing anonymous and named captures is a compile error; several anonymous captures, or a name captured twice, only
+ * throw (see {@link capture}).
  * @template T - The type of the value
  * @param {T} value - The value to match
  * @returns {MatchBuilder<T, never>} The builder
@@ -3551,7 +3720,7 @@ function matching(cases: ReadonlyArray<MatcherCase>, fallback: UnknownFunction |
 			const current = cases[index];
 			const log = current.captures ? [] : undefined;
 
-			if (current.guard === undefined ? test('matcher', current.pattern, value, log, 0) : current.guard(value)) {
+			if (current.guard === undefined ? testRoot('matcher', current.pattern, value, log) : current.guard(value)) {
 				const selection = log === undefined ? NO_SELECTION : select('matcher', log);
 
 				if (current.when === undefined || callCase(current.when, selection, value)) return callCase(current.handler, selection, value);

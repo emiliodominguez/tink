@@ -4740,6 +4740,237 @@ describe('Functions helpers (pass 3 regressions)', function () {
 	});
 });
 
+describe('Functions helpers (pass 5 regressions)', function () {
+	/**
+	 * Builds `depth` levels of plain objects, each holding the next one twice.
+	 * @param {number} depth - The number of levels
+	 * @param {unknown} leaf - The innermost value
+	 * @returns {unknown} The outermost object
+	 */
+	function nest(depth: number, leaf: unknown): unknown {
+		let value = leaf;
+		for (let level = 0; level < depth; level++) value = { l: value, r: value };
+		return value;
+	}
+
+	/**
+	 * Counts the calls of `Array.prototype.push` made while `run` runs.
+	 * @param {() => void} run - The code to watch
+	 * @returns {number} The number of calls
+	 */
+	function countPushes(run: () => void): number {
+		const push = Array.prototype.push;
+		let calls = 0;
+		Array.prototype.push = function (this: unknown[], ...items: unknown[]): number {
+			calls++;
+			return push.apply(this, items);
+		};
+		try {
+			run();
+		} finally {
+			Array.prototype.push = push;
+		}
+		return calls;
+	}
+
+	it('should reject a wait that is not a number without converting it (regression: a long sparse array was joined, for minutes)', function () {
+		let conversions = 0;
+		const wait = {
+			valueOf(): number {
+				conversions++;
+				return 10;
+			}
+		} as unknown as number;
+		expect(function () {
+			helpers.debounce(helpers.noop, wait);
+		}).toThrow(new TypeError('debounce: `wait` must be a finite number >= 0, got object'));
+		expect(function () {
+			helpers.debounce(helpers.noop, 10, { maxWait: wait });
+		}).toThrow(TypeError);
+		expect(function () {
+			helpers.throttle(helpers.noop, wait);
+		}).toThrow(TypeError);
+		// Previously converted twice per call (a sparse array of length 2 ** 32 - 1 is joined into a string of 4 billion commas).
+		expect(conversions).toBe(0);
+	});
+
+	/**
+	 * A sparse array of length `2 ** 20 + 2` (one past 2 ** 20 holes), behind a proxy counting the reads of its elements.
+	 * @param {Record<number, unknown>} elements - The own elements
+	 * @returns {{ array: unknown[]; reads: () => number }} The proxy, and the number of reads so far
+	 */
+	function countedSparse(elements: Record<number, unknown>): { array: unknown[]; reads: () => number } {
+		const target: unknown[] = [];
+		target.length = 2 ** 20 + 2;
+		// A key that is no index, ignored.
+		Object.assign(target, elements, { label: elements[0] });
+		let reads = 0;
+		const array = new Proxy(target, {
+			get(object, key, receiver): unknown {
+				if (key !== 'length') reads++;
+				return Reflect.get(object, key, receiver) as unknown;
+			}
+		});
+		return {
+			array,
+			reads(): number {
+				return reads;
+			}
+		};
+	}
+
+	it('should compare long sparse argument lists by their own elements (regression: every hole, minutes for 2 ** 32 - 1)', function () {
+		const next = countedSparse({ 0: 1, 70000: NaN, [2 ** 20]: 'x' });
+		const previous = countedSparse({ 0: 1, 70000: NaN, [2 ** 20]: 'x' });
+		expect(helpers.shallowEqualArgs(next.array, previous.array)).toBe(true);
+		// Previously over a million reads of each.
+		expect(next.reads()).toBeLessThan(70000);
+		expect(helpers.shallowEqualArgs(next.array, countedSparse({ 0: 1, 70000: NaN, [2 ** 20]: 'y' }).array)).toBe(false);
+		expect(helpers.shallowEqualArgs(next.array, countedSparse({ 0: 1, 70000: NaN }).array)).toBe(false);
+		expect(helpers.shallowEqualArgs(countedSparse({ 0: 1, 70000: NaN }).array, next.array)).toBe(false);
+		// A hole equals an own `undefined`, as before.
+		expect(helpers.shallowEqualArgs(countedSparse({ 70001: undefined }).array, countedSparse({}).array)).toBe(true);
+		const huge: unknown[] = [];
+		huge[2 ** 32 - 2] = 1;
+		const copy: unknown[] = [];
+		copy[2 ** 32 - 2] = 1;
+		expect(helpers.shallowEqualArgs(huge, copy)).toBe(true);
+		copy[2 ** 32 - 2] = 2;
+		expect(helpers.shallowEqualArgs(huge, copy)).toBe(false);
+	});
+
+	it('should copy the tail of a long sparse array for cons by its own elements (regression: every hole, out of memory)', function () {
+		const list = countedSparse({ 0: 'head', 1: 'second', [2 ** 20 + 1]: 'last' });
+		const tail = matchWith(list.array).with(cons('head', capture()), helpers.identity).otherwise(helpers.constant([])) as unknown[];
+		expect(list.reads()).toBeLessThan(70000);
+		expect(tail.length).toBe(2 ** 20 + 1);
+		expect([tail[0], tail[1], tail[2 ** 20]]).toEqual(['second', undefined, 'last']);
+		expect(Object.keys(tail).length).toBe(65536);
+		const huge: unknown[] = ['head'];
+		huge[2 ** 32 - 2] = 'last';
+		expect(
+			matchWith(huge)
+				.with(cons('head', cons(undefined)), helpers.constant('matched'))
+				.otherwise(helpers.constant('other'))
+		).toBe('matched');
+	});
+
+	it("should not take an object for the tag of match (regression: its string form, so `['circle']` matched `circle`)", function () {
+		let conversions = 0;
+		const tag = {
+			toString(): string {
+				conversions++;
+				return 'circle';
+			}
+		};
+		const handlers = { circle: helpers.constant('circle'), _: helpers.constant('other') };
+		// Data that does not match its type.
+		const loose = match as unknown as (value: object, key: string, handlers: object) => unknown;
+		expect(loose({ kind: ['circle'] }, 'kind', handlers)).toBe('other');
+		expect(loose({ kind: tag }, 'kind', handlers)).toBe('other');
+		expect(loose({ kind: helpers.noop }, 'kind', handlers)).toBe('other');
+		expect(conversions).toBe(0);
+		expect(function () {
+			loose({ kind: ['circle'] }, 'kind', { circle: helpers.constant('circle') });
+		}).toThrow(new AssertionError('match: no handler for `kind` object'));
+		expect(loose({ kind: Symbol.for('circle') }, 'kind', { 'Symbol(circle)': helpers.constant('symbol') })).toBe('symbol');
+	});
+
+	describe('a pattern holding a part twice, level after level, against values sharing their objects the same way', function () {
+		it('should test each part once per value past the budget (regression: once per path, 2 ** levels times)', function () {
+			let calls = 0;
+			/**
+			 * A guard counting its calls.
+			 * @param {unknown} value - The value
+			 * @returns {boolean} Whether it is 1
+			 */
+			function isOne(value: unknown): boolean {
+				calls++;
+				return value === 1;
+			}
+			// Previously 2 ** 20 calls (30 levels: a billion, minutes).
+			expect(matchWith(nest(20, 1)).with(nest(20, isOne), helpers.constant('matched')).otherwise(helpers.constant('other'))).toBe('matched');
+			expect(calls).toBeLessThan(70000);
+			calls = 0;
+			expect(matchWith(nest(20, 2)).with(nest(20, isOne), helpers.constant('matched')).otherwise(helpers.constant('other'))).toBe('other');
+			// Fails at the first leaf.
+			expect(calls).toBe(1);
+			calls = 0;
+			const shared = nest(20, isOne);
+			expect(matcher().with({ x: capture(), shared }, helpers.identity).otherwise(helpers.constant('other'))({ x: 'x', shared: nest(20, 1) })).toBe('x');
+			calls = 0;
+			let alternative: unknown = isOne;
+			for (let level = 0; level < 20; level++) alternative = anyOf(alternative, alternative);
+			const pattern = alternative as (value: unknown) => boolean;
+			expect(matchWith(2).with(pattern, helpers.constant('matched')).otherwise(helpers.constant('other'))).toBe('other');
+			expect(calls).toBeLessThan(70000);
+			calls = 0;
+			expect(matcher().with([pattern], helpers.constant('matched')).otherwise(helpers.constant('other'))([2])).toBe('other');
+			expect(calls).toBeLessThan(70000);
+			calls = 0;
+			expect(pattern(2)).toBe(false);
+			expect(calls).toBeLessThan(70000);
+		});
+
+		it('should still capture what a remembered part captured, tell -0 from 0, and remember nothing after a test', function () {
+			// Enough parts to spend the budget first.
+			const spend = new Array(70000).fill(anyOf(_));
+			const ones = new Array(70000).fill(1);
+			// The same part tried again after the alternative holding it failed: captured again.
+			const point = { x: captureAs('x'), y: captureAs('y') };
+			const pattern = { spend, at: anyOf({ point, kind: 'a' }, { point, kind: 'b' }) };
+			const value = { spend: ones, at: { point: { x: 1, y: 2 }, kind: 'b' } };
+			const expected = Object.assign(Object.create(null), { x: 1, y: 2 });
+			expect(matchWith(value).with(pattern, helpers.identity).otherwise(helpers.constant('other'))).toEqual(expected);
+			expect(matcher().with(pattern, helpers.identity).otherwise(helpers.constant('other'))(value)).toEqual(expected);
+			const notNegativeZero = anyOf(function (part: unknown): boolean {
+				return !Object.is(part, -0);
+			});
+			const zeros = matcher()
+				.with([...spend, notNegativeZero, notNegativeZero], helpers.constant('no -0'))
+				.otherwise(helpers.constant('-0'));
+			expect(zeros([...ones, 0, 0])).toBe('no -0');
+			expect(zeros([...ones, 0, -0])).toBe('-0');
+			const box = { v: 1 };
+			const isOneBox = matcher()
+				.with(new Array(70000).fill(anyOf({ v: 1 })), helpers.constant(true))
+				.otherwise(helpers.constant(false));
+			const boxes = new Array(70000).fill(box);
+			expect(isOneBox(boxes)).toBe(true);
+			box.v = 2;
+			expect(isOneBox(boxes)).toBe(false);
+		});
+
+		it('should reject a part captured twice without doubling its captures at each level (regression: out of memory)', function () {
+			for (const leaf of [capture(), captureAs('a')]) {
+				const message = /several|twice/;
+				// Previously 2 ** 21 captures listed (26 levels: out of memory) before the error.
+				const pushes = countPushes(function () {
+					expect(function () {
+						matcher().with(nest(20, leaf), helpers.identity);
+					}).toThrow(message);
+					expect(function () {
+						matchWith(nest(20, 1)).with(nest(20, leaf), helpers.identity);
+					}).toThrow(message);
+					helpers.anyOf(nest(20, leaf));
+				});
+				expect(pushes).toBeLessThan(100000);
+			}
+			// The same error as before for a small pattern: the first name captured twice.
+			const pair = { a: captureAs('a'), b: captureAs('b') };
+			expect(function () {
+				matcher().with({ x: pair, y: pair }, helpers.identity);
+			}).toThrow(new TypeError('matcher: `pattern` must capture each name once, got "a" twice'));
+			expect(function () {
+				matcher().with({ z: captureAs('z'), x: pair, y: pair }, helpers.identity);
+			}).toThrow(new TypeError('matcher: `pattern` must capture each name once, got "a" twice'));
+			expect(function () {
+				matcher().with({ x: { p: capture(), q: captureAs('q') }, y: { p: capture(), q: captureAs('q') } } as unknown, helpers.identity);
+			}).toThrow(new TypeError('matcher: `pattern` must capture either one anonymous value or named values, got both'));
+		});
+	});
+});
+
 /** Runs a garbage collection, once the values a test released are no longer referenced by its stack. */
 async function collectGarbage(): Promise<void> {
 	setFlagsFromString('--expose-gc');
