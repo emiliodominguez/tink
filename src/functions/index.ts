@@ -2445,7 +2445,7 @@ function recall(caller: string, pattern: object, value: unknown, log: unknown[] 
 		const known = byValue.get(value);
 
 		if (known !== undefined) {
-			if (typeof known !== 'boolean') recapture(log as unknown[], known);
+			if (typeof known !== 'boolean') for (let index = 0; index < known.length; index++) (log as unknown[]).push(known[index]);
 			return known !== false;
 		}
 	}
@@ -2453,25 +2453,42 @@ function recall(caller: string, pattern: object, value: unknown, log: unknown[] 
 	const start = log?.length as number;
 	const matched = record === undefined ? testStructure(caller, pattern, value, log, depth) : testHelper(caller, record, value, log, depth);
 
-	byValue?.set(value, matched && log !== undefined && log.length > start ? log.slice(start) : matched);
+	byValue?.set(value, matched && log !== undefined && log.length > start ? capturesFrom(log, start) : matched);
 
 	return matched;
 }
 
 /**
- * Appends to `log` what a part of a pattern captured when it was met before (see {@link recall} and {@link scan}). When `log` already holds
- * the part's first name (or, for an anonymous capture, another anonymous one), the part is met again on a path that captures it twice,
- * which {@link select} rejects: that name is then appended once, where all the part's captures would double the log at each level of a
- * pattern holding the part twice, which holds it twice, and so on.
- * @param {unknown[]} log - The captures so far
- * @param {ReadonlyArray<unknown>} entries - What the part captured, as pairs of a name and a value
- * @returns {void}
+ * Keeps, of the captures a part of a pattern added to `log` from `start` on, those that decide anything, and returns them for {@link recall}
+ * and {@link scan} to remember: in order, those up to the first one repeating a name (or, for an anonymous capture, another anonymous one),
+ * then only those naming something new. The rest decides nothing ({@link select} rejects the captures at that repeat whatever comes before
+ * and after it, and {@link anyOf} compares the names captured, and whether one is repeated), while a part captured twice, which is captured
+ * twice, and so on, would double the captures at each level. (Keeping fewer, depending on the captures before the part, made what is
+ * remembered of it wrong where it is met again.)
+ * @param {unknown[]} log - The captures, as pairs of a name and a value
+ * @param {number} start - Where the part's captures begin
+ * @returns {unknown[]} The captures kept
  */
-function recapture(log: unknown[], entries: ReadonlyArray<unknown>): void {
-	let count = entries.length;
+function capturesFrom(log: unknown[], start: number): unknown[] {
+	// One capture repeats nothing.
+	if (log.length - start <= 2) return log.slice(start);
 
-	for (let index = 0; index < log.length && count > 2; index += 2) if (log[index] === entries[0]) count = 2;
-	for (let index = 0; index < count; index++) log.push(entries[index]);
+	const names = new Set<unknown>();
+	let end = start;
+	let repeated = false;
+
+	for (let index = start; index < log.length; index += 2) {
+		const known = names.has(log[index]);
+
+		if (known && repeated) continue;
+		repeated ||= known;
+		names.add(log[index]);
+		log[end++] = log[index];
+		log[end++] = log[index + 1];
+	}
+	if (end < log.length) log.length = end;
+
+	return log.slice(start);
 }
 
 /**
@@ -2654,7 +2671,7 @@ function scan(caller: string, pattern: unknown, log: unknown[], ancestors: unkno
 
 	if (known !== undefined) {
 		if (known === false) return false;
-		recapture(log, known);
+		for (let index = 0; index < known.length; index++) log.push(known[index]);
 
 		return true;
 	}
@@ -2679,7 +2696,7 @@ function scan(caller: string, pattern: unknown, log: unknown[], ancestors: unkno
 		} else for (const key of patternKeys(pattern as object)) found = scan(caller, (pattern as Record<PropertyKey, unknown>)[key], log, ancestors, memo) || found;
 		ancestors.pop();
 	}
-	memo.set(pattern, found && log.slice(start));
+	memo.set(pattern, found && capturesFrom(log, start));
 
 	return found;
 }
@@ -2854,7 +2871,8 @@ export function active<A, R>(extract: (value: A) => R): ActivePattern<A, R> {
 /**
  * Creates an or-pattern, F#'s `| A | B ->`: it matches what any of `patterns` matches, trying them in order, and narrows to the union of
  * their types. Like F#, every alternative must capture the same names (or all one anonymous value, or nothing): the alternative that
- * matched binds them. Named after JSON Schema's `anyOf`; unlike `isOneOf` (a set of values) and `isUnion` (guards), it takes any patterns.
+ * matched binds them. (Alternatives that capture a name more than once, which throws when they bind, only need the same names, each
+ * repeating one.) Named after JSON Schema's `anyOf`; unlike `isOneOf` (a set of values) and `isUnion` (guards), it takes any patterns.
  * @template P - The alternative patterns
  * @param {...P} patterns - The alternatives (at least one)
  * @returns {AnyOfPattern<P>} The pattern
@@ -2881,7 +2899,15 @@ export function anyOf<const P extends readonly unknown[]>(...patterns: P): AnyOf
 
 		for (let entry = 0; entry < log.length; entry += 2) names.push(log[entry] === undefined ? 'an anonymous value' : JSON.stringify(log[entry]));
 
-		const captured = names.length === 0 ? 'nothing' : names.sort().join(', ');
+		// Each name once, and whether one is repeated: how often it is depends on which parts were met before (see {@link capturesFrom}).
+		let captured = names.length === 0 ? 'nothing' : names.sort()[0];
+		let repeated = false;
+
+		for (let entry = 1; entry < names.length; entry++) {
+			if (names[entry] !== names[entry - 1]) captured += `, ${names[entry]}`;
+			else repeated = true;
+		}
+		if (repeated) captured += ', one of them more than once';
 
 		if (index === 0) expected = captured;
 		else if (captured !== expected) throw new TypeError(`anyOf: \`patterns[${index}]\` must capture what \`patterns[0]\` captures (${expected}), got ${captured}`);

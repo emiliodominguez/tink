@@ -3248,7 +3248,7 @@ describe('matchWith / matcher', function () {
 			}).toThrow(new TypeError('matcher: `pattern` must capture each name once, got "x" twice'));
 			expect(function () {
 				anyOf([shared, 1], [1, shared], [shared, shared]);
-			}).toThrow(new TypeError('anyOf: `patterns[2]` must capture what `patterns[0]` captures ("x"), got "x", "x"'));
+			}).toThrow(new TypeError('anyOf: `patterns[2]` must capture what `patterns[0]` captures ("x"), got "x", one of them more than once'));
 		});
 
 		it('requires a string name', function () {
@@ -4967,6 +4967,36 @@ describe('Functions helpers (pass 5 regressions)', function () {
 			expect(function () {
 				matcher().with({ x: { p: capture(), q: captureAs('q') }, y: { p: capture(), q: captureAs('q') } } as unknown, helpers.identity);
 			}).toThrow(new TypeError('matcher: `pattern` must capture either one anonymous value or named values, got both'));
+		});
+
+		it('should remember what a part captures whatever was captured before it (regression: anyOf rejected equal alternatives)', function () {
+			const pair = [captureAs('n'), captureAs('m')];
+			const outer = [pair];
+			// Previously `outer` was remembered as capturing "n" only, having been met after another "n": the second alternative lacked "m".
+			expect(anyOf([pair, captureAs('n'), outer], [outer, captureAs('n'), pair])([[1, 2], 3, [[1, 2]]])).toBe(true);
+			// Both repeat a name: the same names suffice, however often (they throw when they bind).
+			expect(anyOf([pair, pair], [pair, captureAs('m'), captureAs('m')])([[1, 2], 1, 1])).toBe(true);
+			expect(function () {
+				anyOf([pair, pair], [pair]);
+			}).toThrow(new TypeError('anyOf: `patterns[1]` must capture what `patterns[0]` captures ("m", "n", one of them more than once), got "m", "n"'));
+			// Many captures (looked up in a set) are kept the same way.
+			const many: Record<string, unknown> = {};
+			for (let index = 0; index < 20; index++) many[`k${index}`] = captureAs(`k${index}`);
+			expect(anyOf([many, many, captureAs('z')], [captureAs('z'), many, many])).toBeInstanceOf(Function);
+			expect(function () {
+				matcher().with({ x: many, y: { many }, z: many }, helpers.identity);
+			}).toThrow(new TypeError('matcher: `pattern` must capture each name once, got "k0" twice'));
+			// The same error whichever parts were remembered, past the budget too.
+			for (const spent of [0, 70000]) {
+				const pattern = { spend: new Array(spent).fill(anyOf(_)), at: [pair, [captureAs('z'), outer], outer] };
+				const value = { spend: new Array(spent).fill(0), at: [[1, 2], [3, [[1, 2]]], [[1, 2]]] };
+				expect(function () {
+					matchWith(value).with(pattern, helpers.identity);
+				}).toThrow(new TypeError('matchWith: `pattern` must capture each name once, got "n" twice'));
+				expect(function () {
+					matcher().with(pattern, helpers.identity);
+				}).toThrow(new TypeError('matcher: `pattern` must capture each name once, got "n" twice'));
+			}
 		});
 	});
 });
