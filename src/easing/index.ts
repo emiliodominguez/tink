@@ -1,5 +1,5 @@
 import { lerp } from '../math/index.js';
-import { assertFunction, assertInteger, assertNumber, describe as typeName } from '../utils/assert.js';
+import { assertFunction, assertInteger, assertNumber, readOption, describe as typeName } from '../utils/assert.js';
 
 /**
  * An easing function: maps animation progress `t` (`0` at the start, `1` at the end) to eased progress.
@@ -67,7 +67,15 @@ export interface Spring {
 
 /** Overshoot constant of the "back" easings (overshoots by about 10%). */
 const BACK = 1.70158;
-/** Precision of the curve parameter `s` solving `x(s) = t` in {@link cubicBezier}. */
+/**
+ * Newton step below which {@link cubicBezier} applies it and stops solving `x(s) = t`: the next step would be of the order of its
+ * square (times `x'' / 2x'`), below double precision.
+ */
+const BEZIER_STEP = 1e-8;
+/**
+ * The same for the safeguarded solver, which also meets the roots where Newton–Raphson only converges linearly (next to a vertical
+ * tangent, `x' = 0`), so that the step it stops on is not the error left: it stops on a smaller one.
+ */
 const BEZIER_EPSILON = 1e-12;
 /** Value of a `steps()` position: `[added to the current step, added to the number of steps to get the number of jumps]`. */
 const STEP_POSITIONS: Record<StepPosition, readonly [number, number]> = {
@@ -480,9 +488,10 @@ export function easeInOutBounce(t: number): number {
 /**
  * Solves `x(s) = t` for `s` in `[0, 1]`, where `x(s) = ((a·s + b)·s + c)·s` is increasing with `x(0) = 0` and `x(1) = 1`.
  *
- * Newton–Raphson from `s = t`, safeguarded by the bracket `[low, high]` of the root: a step that leaves it (or is infinite, where x
- * is flat) bisects instead. Stops once the step is below `BEZIER_EPSILON`, or is NaN (0 / 0: exact root where x is flat). Takes
- * about 5 steps for usual curves; the bound only matters for t < ~1e-19 at a vertical tangent.
+ * Plain Newton–Raphson from `s = t`, which takes 3 to 5 steps for usual curves. Once a step is below `BEZIER_STEP` it is applied
+ * and the result returned: Newton converges quadratically, so what that last step leaves is of the order of its square, at the limit
+ * of double precision (|x(s) - t| of a few ulps). A step that leaves `(0, 1)` (or is infinite or NaN, where x is flat), or no
+ * convergence within 8 steps, hands over to {@link solveBezierSafely}.
  * @param {number} a - Cubic coefficient
  * @param {number} b - Quadratic coefficient
  * @param {number} c - Linear coefficient
@@ -491,12 +500,39 @@ export function easeInOutBounce(t: number): number {
  */
 function solveBezier(a: number, b: number, c: number, t: number): number {
 	let s = t;
+	for (let i = 0; i < 8; i++) {
+		const step = (((a * s + b) * s + c) * s - t) / ((3 * a * s + 2 * b) * s + c);
+		const next = s - step;
+		if (!(next > 0 && next < 1)) break;
+		if (!(Math.abs(step) >= BEZIER_STEP)) return next;
+		s = next;
+	}
+	return solveBezierSafely(a, b, c, t);
+}
+
+/**
+ * Solves `x(s) = t` like {@link solveBezier}, for the curves where plain Newton–Raphson leaves `(0, 1)` or converges slowly.
+ *
+ * Newton–Raphson from `s = t`, safeguarded by the bracket `[low, high]` of the root: a step that leaves it (or is infinite, where x
+ * is flat) bisects instead. Stops once the step is below `BEZIER_EPSILON` (applying it when it stays in the bracket), or is NaN
+ * (0 / 0: exact root where x is flat). The bound only matters for t < ~1e-19 at a vertical tangent.
+ * @param {number} a - Cubic coefficient
+ * @param {number} b - Quadratic coefficient
+ * @param {number} c - Linear coefficient
+ * @param {number} t - Target value, in `(0, 1)`
+ * @returns {number} The curve parameter `s`
+ */
+function solveBezierSafely(a: number, b: number, c: number, t: number): number {
+	let s = t;
 	let low = 0;
 	let high = 1;
 	for (let i = 0; i < 64; i++) {
 		const error = ((a * s + b) * s + c) * s - t;
 		const step = error / ((3 * a * s + 2 * b) * s + c);
-		if (!(Math.abs(step) >= BEZIER_EPSILON)) break;
+		if (!(Math.abs(step) >= BEZIER_EPSILON)) {
+			const next = s - step;
+			return next > low && next < high ? next : s;
+		}
 		if (error < 0) low = s;
 		else high = s;
 		s -= step;
@@ -507,9 +543,9 @@ function solveBezier(a: number, b: number, c: number, t: number): number {
 
 /**
  * Creates an easing function equivalent to CSS `cubic-bezier(x1, y1, x2, y2)`: the curve from `(0, 0)` to `(1, 1)` with control
- * points `(x1, y1)` and `(x2, y2)`, evaluated by solving `x(s) = t` for the curve parameter `s` to ~1e-12 (Newton–Raphson, safeguarded
- * by bisection, which always converges because `x` is monotonic when `x1, x2 ∈ [0, 1]`; for `t > 0.5` on the mirrored curve, so that
- * both ends are equally precise), then returning `y(s)`.
+ * points `(x1, y1)` and `(x2, y2)`, evaluated by solving `x(s) = t` for the curve parameter `s` to the precision of doubles (`x(s)`
+ * within a few ulps of `t`; Newton–Raphson, safeguarded by bisection, which always converges because `x` is monotonic when
+ * `x1, x2 ∈ [0, 1]`; for `t > 0.5` on the mirrored curve, so that both ends are equally precise), then returning `y(s)`.
  *
  * Like browsers, inputs outside `[0, 1]` are extrapolated linearly along the tangent at the nearest end point.
  * @param {number} x1 - x of the first control point, in `[0, 1]`
@@ -668,7 +704,12 @@ export function steps(count: number, position: StepPosition = 'jump-end'): Easin
  * spring({ damping: 0 }); // throws RangeError
  */
 export function spring(options: SpringOptions = {}): Spring {
-	const { stiffness = 100, damping = 10, mass = 1, velocity = 0, restDelta = 0.001 } = options;
+	// An option inherited from a polluted `Object.prototype` is ignored (see `readOption`): it must not change the physics.
+	const stiffness = readOption(options, 'stiffness', 100);
+	const damping = readOption(options, 'damping', 10);
+	const mass = readOption(options, 'mass', 1);
+	const velocity = readOption(options, 'velocity', 0);
+	const restDelta = readOption(options, 'restDelta', 0.001);
 	assertNumber('spring', 'stiffness', stiffness, stiffness > 0 && stiffness < Infinity, 'a finite number > 0');
 	assertNumber('spring', 'damping', damping, damping > 0 && damping < Infinity, 'a finite number > 0');
 	assertNumber('spring', 'mass', mass, mass > 0 && mass < Infinity, 'a finite number > 0');

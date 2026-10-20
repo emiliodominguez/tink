@@ -9,6 +9,9 @@ const ours = cubicBezier(0.25, 0.1, 0.25, 1);
 const theirs = bezier(0.25, 0.1, 0.25, 1);
 const oursSteep = cubicBezier(0.9, 0, 0.1, 1);
 const theirsSteep = bezier(0.9, 0, 0.1, 1);
+// Overshooting y control points (easings.net's `easeInOutBack`).
+const oursBack = cubicBezier(0.68, -0.6, 0.32, 1.6);
+const theirsBack = bezier(0.68, -0.6, 0.32, 1.6);
 const stepper = steps(12, 'jump-both');
 const bouncy = spring({ stiffness: 170, damping: 12 });
 
@@ -71,6 +74,17 @@ export default [
 		competitors: {
 			'bezier-easing': function () {
 				return sweep(theirsSteep);
+			}
+		}
+	},
+	{
+		name: 'cubicBezier (0.68, -0.6, 0.32, 1.6) (1000 frames)',
+		fn: function () {
+			return sweep(oursBack);
+		},
+		competitors: {
+			'bezier-easing': function () {
+				return sweep(theirsBack);
 			}
 		}
 	},

@@ -161,6 +161,32 @@ describe('Easing helpers', function () {
 			}
 		});
 
+		it('should solve x(s) = t to a few ulps, applying the last Newton step', function () {
+			// Diagonal control points give the identity, so the result is x(s) itself: it used to stop up to ~1e-12 away from t.
+			const grid: number[] = [];
+			for (let k = 0; k <= 20; k++) grid.push(k / 20);
+			for (const a of grid) {
+				for (const b of grid) {
+					const identity = helpers.cubicBezier(a, a, b, b);
+					for (let k = 1; k < 128; k++) expect(Math.abs(identity(k / 128) - k / 128)).toBeLessThanOrEqual(2e-15);
+				}
+			}
+			// CSS `ease` against its value solved with 200 bisection steps of the Bernstein form.
+			const ease = helpers.cubicBezier(0.25, 0.1, 0.25, 1);
+			for (let k = 1; k < 1000; k++) {
+				const t = k / 1000;
+				let low = 0;
+				let high = 1;
+				for (let i = 0; i < 200; i++) {
+					const middle = (low + high) / 2;
+					if (3 * (1 - middle) ** 2 * middle * 0.25 + 3 * (1 - middle) * middle ** 2 * 0.25 + middle ** 3 < t) low = middle;
+					else high = middle;
+				}
+				const s = (low + high) / 2;
+				expect(Math.abs(ease(t) - (3 * (1 - s) ** 2 * s * 0.1 + 3 * (1 - s) * s * s + s ** 3))).toBeLessThanOrEqual(2e-15);
+			}
+		});
+
 		it('should fall back to bisection where a Newton step leaves the bracket of the root (nearly flat middle)', function () {
 			const identity = helpers.cubicBezier(0.95, 0.95, 0, 0);
 			for (let k = 1; k < 1000; k++) expect(Math.abs(identity(k / 1000) - k / 1000)).toBeLessThanOrEqual(1e-11);
@@ -460,6 +486,23 @@ describe('Easing helpers', function () {
 			expect(function () {
 				helpers.spring({ stiffness: 1e-300, mass: 1e300, damping: 1e-300 });
 			}).toThrow(/does not settle/);
+		});
+
+		it('should ignore options inherited from a polluted Object.prototype', function () {
+			const reference = helpers.spring();
+			const proto = Object.prototype as Record<string, unknown>;
+			const planted = { stiffness: 1e6, damping: 1, mass: 50, velocity: 50, restDelta: 0.5 };
+			Object.assign(proto, planted);
+			try {
+				const polluted = helpers.spring();
+				expect(polluted.duration).toBe(reference.duration);
+				expect(polluted.position(0.1)).toBe(reference.position(0.1));
+				// Own options still apply, and so do options inherited from another prototype.
+				expect(helpers.spring({ damping: 20 }).position(0.1)).toBe(helpers.spring(Object.create({ damping: 20 })).position(0.1));
+				expect(helpers.spring({ damping: 20 }).position(0.1)).not.toBe(reference.position(0.1));
+			} finally {
+				for (const key of Object.keys(planted)) delete proto[key];
+			}
 		});
 	});
 
