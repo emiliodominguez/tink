@@ -68,7 +68,8 @@ export function contains<T>(array: ReadonlyArray<T>, value: T): boolean {
  * first([]); // => undefined
  */
 export function first<T>(array: ReadonlyArray<T>): T | undefined {
-	return array[0];
+	// The length is checked first: `[][0]` would be looked up on `Object.prototype`, where pollution can plant a `0`.
+	return array.length === 0 ? undefined : array[0];
 }
 
 /**
@@ -81,7 +82,8 @@ export function first<T>(array: ReadonlyArray<T>): T | undefined {
  * last([]); // => undefined
  */
 export function last<T>(array: ReadonlyArray<T>): T | undefined {
-	return array[array.length - 1];
+	// The length is checked first: `[][-1]` would be looked up on `Object.prototype`, where pollution can plant a `-1`.
+	return array.length === 0 ? undefined : array[array.length - 1];
 }
 
 /**
@@ -1866,7 +1868,8 @@ export function orderBy<T>(
 	for (let k = 0; k < count; k++) {
 		// The parameter names are only formatted on failure.
 		if (typeof selectors[k] !== 'function') assertFunction('orderBy', `selectors[${k}]`, selectors[k]);
-		directions.push(single ? shared : toDirection('orderBy', 'orders', orders[k] ?? 'asc', k));
+		// Missing trailing directions are not read: past the end, an index would be looked up on a polluted `Object.prototype`.
+		directions.push(single ? shared : toDirection('orderBy', 'orders', k < orders.length ? (orders[k] ?? 'asc') : 'asc', k));
 	}
 	if (count === 1) return sortBy(array, selectors[0], directions[0] === 1 ? 'asc' : 'desc');
 	const length = array.length;
@@ -2396,16 +2399,18 @@ export function zipObject<const K extends PropertyKey, V>(keys: ReadonlyArray<K>
 	// times faster than `Object.defineProperty`; the usual prototype is attached afterwards. For few keys (the usual case, e.g. a CSV
 	// header), attaching it costs more than the keys themselves: they are assigned to a plain object as long as `Object.prototype`
 	// holds none of them (`__proto__`, `toString`, a polluted setter or read-only property) and none is an object (whose conversion to a
-	// property key could run code twice). The first such key moves the keys assigned so far to a null-prototype object.
+	// property key could run code twice). The first such key moves the keys assigned so far to a null-prototype object. The value is read
+	// before the check: a getter reading it must not plant a setter or read-only property between the check and the assignment.
 	let plain = keys.length <= 16;
 	let result = (plain ? {} : nullObject()) as Record<K, V>;
 	for (let i = 0; i < keys.length; i++) {
 		const key = keys[i];
+		const value = values[i];
 		if (plain && (typeof key === 'object' || typeof key === 'function' || key in Object.prototype)) {
 			plain = false;
 			result = Object.assign(nullObject(), result) as Record<K, V>;
 		}
-		result[key] = values[i];
+		result[key] = value;
 	}
 	return plain ? result : (Object.setPrototypeOf(result, Object.prototype) as Record<K, V>);
 }
@@ -2961,7 +2966,12 @@ export function flattenTree<N extends object>(roots: ReadonlyArray<N>, options: 
 		}
 		const node = list[index++];
 		if (order === 'depth-first') result.push(node);
-		else (levels[lists.length] ??= []).push(node);
+		else {
+			// A level is reached from the one above it, so it is created right after it: `levels` has no holes, whose reads would fall
+			// through to a polluted `Object.prototype[depth]`.
+			if (lists.length === levels.length) levels.push([]);
+			levels[lists.length].push(node);
+		}
 		const nodeChildren: unknown = readOption(node, childrenKey as keyof N & string);
 		if (nodeChildren === null || nodeChildren === undefined) continue;
 		if (!Array.isArray(nodeChildren)) throw new TypeError(`flattenTree: \`${childrenKey}\` must be an array, got ${describe(nodeChildren)}`);

@@ -93,6 +93,19 @@ describe('Arrays helpers', function () {
 			expect(helpers.last([1, 2, 3])).toBe(3);
 		});
 
+		it('should return undefined for an empty array, also when Object.prototype holds index keys', function () {
+			const proto = Object.prototype as Record<string, unknown>;
+			proto[0] = 'planted';
+			proto[-1] = 'planted';
+			try {
+				expect(helpers.first([])).toBeUndefined();
+				expect(helpers.last([])).toBeUndefined();
+			} finally {
+				delete proto[0];
+				delete proto[-1];
+			}
+		});
+
 		it('should return undefined for an empty array', function () {
 			const result: string | undefined = helpers.last<string>([]);
 			expect(result).toBeUndefined();
@@ -1939,6 +1952,31 @@ describe('Arrays helpers (ordering, slicing, set algebra, combinatorics)', funct
 			{ name: 'al', age: 40 }
 		];
 
+		it('should read missing trailing directions as asc, not from a polluted Object.prototype', function () {
+			const proto = Object.prototype as Record<string, unknown>;
+			proto[1] = 'desc';
+			try {
+				expect(
+					helpers.orderBy(
+						users,
+						[
+							function (user) {
+								return user.age;
+							},
+							function (user) {
+								return user.name;
+							}
+						],
+						['desc']
+					)
+				).toStrictEqual([users[3], users[2], users[0], users[1]]);
+				// An explicit `undefined` direction is `'asc'` too.
+				expect(helpers.orderBy(users, [name, name], ['desc', undefined as never])).toStrictEqual([users[0], users[2], users[1], users[3]]);
+			} finally {
+				delete proto[1];
+			}
+		});
+
 		/** Name selector. */
 		function name(user: { name: string }): string {
 			return user.name;
@@ -2419,6 +2457,30 @@ describe('Arrays helpers (ordering, slicing, set algebra, combinatorics)', funct
 				['c', 4]
 			]);
 			expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+		});
+
+		it('defines a key whose setter or read-only property is planted on Object.prototype while its value is read', function () {
+			const set = jest.fn();
+			for (const descriptor of [
+				{ set, configurable: true },
+				{ value: 'planted', writable: false, configurable: true }
+			]) {
+				const values = ['v0', 'v1'];
+				Object.defineProperty(values, 1, {
+					get: function () {
+						Object.defineProperty(Object.prototype, 'late', descriptor);
+						return 'v1';
+					}
+				});
+				try {
+					const result = helpers.zipObject(['k', 'late'], values);
+					expect(Object.getOwnPropertyDescriptor(result, 'late')).toStrictEqual({ value: 'v1', writable: true, enumerable: true, configurable: true });
+					expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+				} finally {
+					delete (Object.prototype as Record<string, unknown>).late;
+				}
+			}
+			expect(set).not.toHaveBeenCalled();
 		});
 
 		it('rejects arrays of different lengths instead of dropping keys or values', function () {
@@ -3298,6 +3360,21 @@ describe('Arrays helpers (comparators, trees, updates and paging)', function () 
 
 	describe('flattenTree', function () {
 		type Node = { id: number; children?: Node[] | null };
+
+		it('should list the levels of a breadth-first walk without reading a polluted Object.prototype', function () {
+			const planted: unknown[] = ['planted'];
+			const proto = Object.prototype as Record<string, unknown>;
+			proto[0] = planted;
+			proto[1] = planted;
+			try {
+				const tree: Node[] = [{ id: 1, children: [{ id: 2 }] }, { id: 3 }];
+				expect(helpers.flattenTree(tree, { order: 'breadth-first' })).toStrictEqual([tree[0], tree[1], (tree[0].children as Node[])[0]]);
+				expect(planted).toStrictEqual(['planted']);
+			} finally {
+				delete proto[0];
+				delete proto[1];
+			}
+		});
 		const forest: Node[] = [
 			{
 				id: 1,
