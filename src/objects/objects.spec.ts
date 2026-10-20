@@ -4524,18 +4524,93 @@ describe('safeStringify', function () {
 		for (let level = 0; level < 16; level++) shared = { l: shared, r: shared };
 		const expected = JSON.stringify(shared, undefined, 1);
 		const stringify = jest.spyOn(JSON, 'stringify');
+		let calls: unknown[][];
 		try {
 			expect(helpers.safeStringify(shared, { space: 1 })).toBe(expected);
-			// Strings and primitives only: the shared tree itself is not handed to `JSON.stringify`, which would write it once per path.
-			expect(
-				stringify.mock.calls.every(function ([value]) {
-					return typeof value !== 'object' || value === null;
-				})
-			).toBe(true);
 		} finally {
+			calls = stringify.mock.calls;
 			stringify.mockRestore();
 		}
+		// Only small parts that share nothing are handed to `JSON.stringify`, never the shared tree, which it would write once per path.
+		const parts = calls.filter(function ([value]) {
+			return typeof value === 'object' && value !== null;
+		});
+		expect(parts.length).toBeLessThan(10);
+		for (const [part] of parts) expect(JSON.stringify(part).length).toBeLessThan(512);
 		for (let level = 16; level < 30; level++) shared = { l: shared, r: shared };
+		expect(function () {
+			helpers.safeStringify(shared);
+		}).toThrow(RangeError);
+	});
+
+	it('writes the parts of a value that share nothing with JSON.stringify (regression: a rope ten times the size of the text)', function () {
+		const settings = { retry: { times: 2, delays: [1, 2] } };
+		const rows = Array.from({ length: 1000 }, function (_, index) {
+			return { id: index, name: `row ${index}`, tags: ['a', 'b'] };
+		});
+		const value = { rows, first: settings, second: { nested: [settings, 'x'] }, third: settings };
+		for (const space of [undefined, 2, '\t']) {
+			const stringify = jest.spyOn(JSON, 'stringify');
+			let text: string | undefined;
+			let calls: number;
+			try {
+				text = helpers.safeStringify(value, { space });
+			} finally {
+				calls = stringify.mock.calls.length;
+				stringify.mockRestore();
+			}
+			expect(text).toBe(JSON.stringify(value, undefined, space));
+			// One call for the rows, one per place of the settings, one per key of the nodes holding them: not one per row and string.
+			expect(calls).toBeLessThan(20);
+		}
+	});
+
+	it('keeps the state of its conversion own (regression: read from a polluted Object.prototype)', function () {
+		const proto = Object.prototype as Record<string, unknown>;
+		let reads = 0;
+		const leaf = new Proxy(
+			Array.from({ length: 100 }, function (_, index) {
+				return index;
+			}),
+			{
+				get(target, key, receiver): unknown {
+					if (typeof key === 'string' && /^\d+$/.test(key)) reads++;
+					return Reflect.get(target, key, receiver) as unknown;
+				}
+			}
+		);
+		const keyed: Record<string, unknown> = {};
+		for (let index = 0; index < 50; index++) keyed[`k${index}`] = leaf;
+		proto.converted = {};
+		proto.values = 'P';
+		try {
+			expect(helpers.safeStringify({ a: { b: [1] } })).toBe('{"a":{"b":[1]}}');
+			// The large leaf is still converted once, not once per key.
+			expect(helpers.safeStringify(keyed)).toBe(JSON.stringify(keyed));
+			expect(reads).toBe(100 + 50 * 100);
+		} finally {
+			delete proto.converted;
+			delete proto.values;
+		}
+	});
+
+	it('walks the value again, shallower, when telling a stack overflow apart itself fails (the stack ran out there)', function () {
+		let shared: object = { v: 1 };
+		for (let level = 0; level < 30; level++) shared = { l: shared, r: shared };
+		// Too long a text, and a check that throws in its place: as when the check runs out of stack.
+		Object.defineProperty(RangeError, Symbol.hasInstance, {
+			configurable: true,
+			value(): boolean {
+				throw new RangeError('Maximum call stack size exceeded');
+			}
+		});
+		let text: string | undefined;
+		try {
+			text = helpers.safeStringify(shared);
+		} finally {
+			delete (RangeError as { [Symbol.hasInstance]?: unknown })[Symbol.hasInstance];
+		}
+		expect(text).toContain('"[Object]"');
 		expect(function () {
 			helpers.safeStringify(shared);
 		}).toThrow(RangeError);

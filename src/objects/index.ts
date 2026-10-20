@@ -4732,6 +4732,29 @@ interface JsonLayout {
 	readonly sort: boolean;
 	/** The texts longer than `REMEMBERED_TEXT` written so far, by node of the tree. */
 	readonly texts: Map<object, string>;
+	/**
+	 * When the keys are written in the tree's order: the nodes holding a node reached through several paths ({@link holdersOfShared}).
+	 * The others are written flat by `JSON.stringify`.
+	 */
+	readonly holders?: Set<object>;
+}
+
+/**
+ * The nodes of a tree that hold a node reached through several paths (the converter shares the JSON of a value held in several places).
+ * Below the others, every node is met once (or was first met there), so `JSON.stringify` writes them in the time of their text.
+ * @param {JsonValue} node - The tree
+ * @param {Set<object>} seen - The nodes met so far
+ * @param {Set<object>} holders - Receives the holders
+ * @returns {boolean} Whether the node was met before or holds such a node
+ */
+function holdersOfShared(node: JsonValue, seen: Set<object>, holders: Set<object>): boolean {
+	if (typeof node !== 'object' || node === null) return false;
+	if (seen.has(node)) return true;
+	seen.add(node);
+	let holds = false;
+	for (const child of Array.isArray(node) ? node : Object.values(node)) if (holdersOfShared(child, seen, holders)) holds = true;
+	if (holds) holders.add(node);
+	return holds;
 }
 
 /**
@@ -4753,17 +4776,23 @@ function writeJson(value: JsonValue, indent: string, layout: JsonLayout): string
 	const gap = layout.gap;
 	const inner = indent + gap;
 	let text = '';
-	if (isArray) {
-		for (let index = 0; index < value.length; index++) text += (index === 0 ? '' : ',') + (gap === '' ? '' : '\n' + inner) + writeJson(value[index], inner, layout);
+	if (layout.holders !== undefined && !layout.holders.has(value)) {
+		// Flat, as fast as `JSON.stringify` alone: written piece by piece, a large text took ten times its size as a rope of small strings.
+		// (A JSON text has a line break only between lines.)
+		text = JSON.stringify(value, undefined, gap).replaceAll('\n', '\n' + indent);
 	} else {
-		const keys = layout.keys ?? (layout.sort ? Object.keys(value).sort() : Object.keys(value));
-		for (const key of keys) {
-			if (!hasOwn(value, key)) continue;
-			text += (text === '' ? '' : ',') + (gap === '' ? '' : '\n' + inner) + JSON.stringify(key) + (gap === '' ? ':' : ': ') + writeJson(value[key], inner, layout);
+		if (isArray) {
+			for (let index = 0; index < value.length; index++) text += (index === 0 ? '' : ',') + (gap === '' ? '' : '\n' + inner) + writeJson(value[index], inner, layout);
+		} else {
+			const keys = layout.keys ?? (layout.sort ? Object.keys(value).sort() : Object.keys(value));
+			for (const key of keys) {
+				if (!hasOwn(value, key)) continue;
+				text += (text === '' ? '' : ',') + (gap === '' ? '' : '\n' + inner) + JSON.stringify(key) + (gap === '' ? ':' : ': ') + writeJson(value[key], inner, layout);
+			}
 		}
+		if (text === '') return isArray ? '[]' : '{}';
+		text = (isArray ? '[' : '{') + text + (gap === '' ? '' : '\n' + indent) + (isArray ? ']' : '}');
 	}
-	if (text === '') return isArray ? '[]' : '{}';
-	text = (isArray ? '[' : '{') + text + (gap === '' ? '' : '\n' + indent) + (isArray ? ']' : '}');
 	if (text.length > REMEMBERED_TEXT) layout.texts.set(value, text);
 	return text;
 }
@@ -4833,20 +4862,43 @@ export function safeStringify(value: unknown, options: SafeStringifyOptions = {}
 	const gap = typeof space === 'number' ? ' '.repeat(Math.min(10, Math.max(0, Math.trunc(space) || 0))) : (space ?? '').slice(0, 10);
 	let depth = Math.min(maxDepth, MAX_JSON_DEPTH);
 	for (;;) {
-		const walk: JsonWalk = { replacer: typeof replacer === 'function' ? replacer : undefined, keys, stack: true, maxDepth: depth, ancestors: [], onPath: new Set() };
+		// Every field is own: a polluted `Object.prototype.converted` (or `values`, `count`…) would otherwise be read as the state of the walk.
+		const walk: JsonWalk = {
+			replacer: typeof replacer === 'function' ? replacer : undefined,
+			keys,
+			stack: true,
+			maxDepth: depth,
+			ancestors: [],
+			onPath: new Set(),
+			converted: undefined,
+			dependent: false,
+			count: 0,
+			values: 0,
+			shared: false
+		};
 		const tree = toJsonValue({ '': value }, '', walk);
 		if (tree === undefined) return undefined;
 		try {
 			// The tree holds plain objects and arrays only: `JSON.stringify` writes it faster, unless a `toJSON` was planted on their
 			// prototypes, the keys must be written in another order than the tree's, or the tree shares nodes (a value sharing objects),
-			// which `JSON.stringify` would write once per path: in exponential time before refusing too long a text.
-			return keys === undefined && !sort && walk.shared !== true && !('toJSON' in Array.prototype)
-				? JSON.stringify(tree, undefined, gap)
-				: writeJson(tree, '', { gap, keys, sort, texts: new Map() });
+			// which `JSON.stringify` would write once per path: in exponential time before refusing too long a text. Then only the nodes
+			// holding a shared one are written piece by piece when the keys keep the tree's order.
+			const plain = keys === undefined && !sort && !('toJSON' in Array.prototype);
+			if (plain && walk.shared !== true) return JSON.stringify(tree, undefined, gap);
+			const holders = plain ? new Set<object>() : undefined;
+			if (holders !== undefined) holdersOfShared(tree, new Set(), holders);
+			return writeJson(tree, '', { gap, keys, sort, texts: new Map(), holders });
 		} catch (error) {
 			// Called with little stack left, writing a deep tree can overflow it: the value is walked again, half as deep. Any other failure
-			// (a text longer than the engine's maximum string length) is thrown, as documented.
-			if (depth === 0 || !isStackOverflow(error)) throw error;
+			// (a text longer than the engine's maximum string length) is thrown, as documented. The check can itself run out of stack (its
+			// regular expression needs some): the stack is then what failed.
+			let overflow: boolean;
+			try {
+				overflow = isStackOverflow(error);
+			} catch {
+				overflow = true;
+			}
+			if (depth === 0 || !overflow) throw error;
 			depth >>= 1;
 		}
 	}
