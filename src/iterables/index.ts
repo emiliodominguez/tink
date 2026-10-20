@@ -1190,8 +1190,11 @@ async function* mappedConcurrently(
 ): AsyncGenerator<unknown, void, undefined> {
 	// Sync iterables always get the wrapper, which closes them on early exit and awaits their items.
 	const source = (isAsyncIterable(iterable) ? iterable : awaitedItems(iterable))[Symbol.asyncIterator]();
-	// Pulled items not yet yielded: in source order when `ordered`, otherwise in the order they settled.
-	const slots: MappedSlot[] = [];
+	// Pulled items not yet yielded, from `slots[head]`: in source order when `ordered`, otherwise in the order they settled. The first one
+	// is taken by moving `head` (`shift()` copies the whole array, which made a large read-ahead quadratic), and the array is compacted
+	// once half of it is taken.
+	const slots: Array<MappedSlot | undefined> = [];
+	let head = 0;
 	let buffered = 0;
 	let index = 0;
 	let pulling = false;
@@ -1235,53 +1238,58 @@ async function* mappedConcurrently(
 		if (pulling || exhausted || stopped || buffered >= concurrency) return;
 		pulling = true;
 
-		let pull: Promise<IteratorResult<unknown>>;
+		let pull: unknown;
 
 		// A hand-written source may throw from `next()` or return a plain result: treated like `for await` does.
 		try {
-			pull = Promise.resolve(source.next());
+			pull = source.next();
 		} catch (error) {
 			pull = Promise.reject(error);
 		}
-		pull.then(function (step) {
-			let done: unknown;
-			let item: unknown;
+		whenSettled(
+			pull,
+			function (step: IteratorResult<unknown>) {
+				let done: unknown;
+				let item: unknown;
 
-			// The result is read like `for await` reads it: a non-object, or a `done` / `value` getter that throws, is the source failing.
-			try {
-				if (typeof step !== 'object' || step === null) throw new TypeError(`mapConcurrent: iterator result ${describe(step)} is not an object`);
-				done = step.done;
-				if (!done) item = step.value;
-			} catch (error) {
-				failSource(error);
-				return;
-			}
-			pulling = false;
-			if (done) {
-				exhausted = true;
-			} else if (!stopped) {
-				const slot: MappedSlot = { settled: false, ok: false, result: undefined };
-				let outcome: unknown;
-
-				buffered++;
-				if (ordered) slots.push(slot);
+				// The result is read like `for await` reads it: a non-object, or a `done` / `value` getter that throws, is the source failing.
 				try {
-					outcome = fn(item, index++, signal);
+					if (typeof step !== 'object' || step === null) throw new TypeError(`mapConcurrent: iterator result ${describe(step)} is not an object`);
+					done = step.done;
+					if (!done) item = step.value;
 				} catch (error) {
-					outcome = Promise.reject(error);
+					failSource(error);
+					return;
 				}
-				Promise.resolve(outcome).then(
-					function (value) {
-						settle(slot, true, value);
-					},
-					function (error: unknown) {
-						settle(slot, false, error);
+				pulling = false;
+				if (done) {
+					exhausted = true;
+				} else if (!stopped) {
+					const slot: MappedSlot = { settled: false, ok: false, result: undefined };
+					let outcome: unknown;
+
+					buffered++;
+					if (ordered) slots.push(slot);
+					try {
+						outcome = fn(item, index++, signal);
+					} catch (error) {
+						outcome = Promise.reject(error);
 					}
-				);
-				fill();
-			}
-			notify();
-		}, failSource);
+					whenSettled(
+						outcome,
+						function (value: unknown) {
+							settle(slot, true, value);
+						},
+						function (error: unknown) {
+							settle(slot, false, error);
+						}
+					);
+					fill();
+				}
+				notify();
+			},
+			failSource
+		);
 	}
 
 	/**
@@ -1317,10 +1325,15 @@ async function* mappedConcurrently(
 			if (signal?.aborted) throw abortReason(signal);
 			fill();
 
-			const slot = slots[0];
+			// An own slot only: past the end, `slots[head]` would read a polluted `Object.prototype[0]` as a settled mapping.
+			const slot = head < slots.length ? slots[head] : undefined;
 
 			if (slot?.settled) {
-				slots.shift();
+				slots[head++] = undefined;
+				if (head * 2 >= slots.length) {
+					slots.splice(0, head);
+					head = 0;
+				}
 				buffered--;
 				// A failed mapping ends the iteration: throw before `fill` would pull another item.
 				if (!slot.ok) throw slot.result;
@@ -1373,9 +1386,29 @@ async function closeQuietly(source: AsyncIterator<unknown>): Promise<void> {
  */
 function closeLater(source: AsyncIterator<unknown>): void {
 	try {
-		Promise.resolve(source.return?.()).then(undefined, ignore);
+		whenSettled(source.return?.(), ignore, ignore);
 	} catch {
 		// A synchronously throwing `return()`: nothing is waiting for it either.
+	}
+}
+
+/**
+ * Calls `onFulfilled` or `onRejected` (exactly one of them, once) when `value` settles, reading it as `await` does: a native promise is
+ * followed with the built-in `then` (an own `then` property is ignored), and when `Promise.resolve` or `then` throws (a `constructor` getter
+ * that throws), `onRejected` gets the error, asynchronously too (the callers wait for a wake-up after starting a pull). A bare `.then()` call
+ * would throw instead, out of the callback that made it: the rejection went unhandled and the consumer waiting for that settlement hung.
+ * @template T
+ * @param {unknown} value - A value, a promise or a thenable
+ * @param {(value: T) => void} onFulfilled - Called with the value
+ * @param {(error: unknown) => void} onRejected - Called with the error
+ * @returns {void}
+ */
+function whenSettled<T>(value: unknown, onFulfilled: (value: T) => void, onRejected: (error: unknown) => void): void {
+	try {
+		Promise.prototype.then.call(Promise.resolve(value), onFulfilled as (value: unknown) => void, onRejected);
+	} catch (error) {
+		// Thrown before the callbacks were registered: neither will be called.
+		Promise.reject(error).then(undefined, onRejected);
 	}
 }
 
@@ -1644,13 +1677,13 @@ export type MergedValue<T extends ReadonlyArray<AwaitableIterable<unknown>>> = T
 			: never
 	: never;
 
-/** {@link mergeAsync}: a `next()` of the source is pending (a source with no state yet, or whose value was handed out, is idle). */
+/** {@link mergeAsync}: a `next()` of the source is pending (a source not pulled yet, or whose value was handed out, is idle). */
 const PULLING = 1;
 /** {@link mergeAsync}: the source delivered a value that is waiting to be yielded. */
 const BUFFERED = 2;
 /** {@link mergeAsync}: the source ended or failed on its own (it is not closed). */
 const FINISHED = 3;
-/** {@link mergeAsync}: the last value of the source was handed out, and it was not pulled again yet. */
+/** {@link mergeAsync}: the source is idle: not pulled yet, or its last value was handed out and it was not pulled again yet. */
 const HANDED_OUT = 0;
 
 /**
@@ -1707,16 +1740,17 @@ async function* merged(sources: ReadonlyArray<AwaitableIterable<unknown>>): Asyn
 	function pull(index: number): void {
 		states[index] = PULLING;
 
-		let step: Promise<IteratorResult<unknown>>;
+		let step: unknown;
 
 		// A hand-written source may throw from `next()` or return a plain result: treated like `for await` does.
 		try {
-			step = Promise.resolve(iterators[index].next());
+			step = iterators[index].next();
 		} catch (error) {
 			step = Promise.reject(error);
 		}
-		step.then(
-			function (result) {
+		whenSettled(
+			step,
+			function (result: IteratorResult<unknown>) {
 				let done: unknown;
 				let value: unknown;
 
@@ -1749,6 +1783,8 @@ async function* merged(sources: ReadonlyArray<AwaitableIterable<unknown>>): Asyn
 		for (const source of sources) {
 			// Sync iterables get the wrapper, which awaits their items and closes them on early exit.
 			iterators.push((isAsyncIterable(source) ? source : awaitedItems(source))[Symbol.asyncIterator]());
+			// Its own state at once: when opening a later source throws, `states[index]` must not read a polluted `Object.prototype`.
+			states.push(HANDED_OUT);
 			running++;
 		}
 		for (let index = 0; index < iterators.length; index++) pull(index);
@@ -1929,38 +1965,42 @@ async function* batchedByTime(
 	function pull(): void {
 		pulling = true;
 
-		let step: Promise<IteratorResult<unknown>>;
+		let step: unknown;
 
 		try {
-			step = Promise.resolve(source.next());
+			step = source.next();
 		} catch (error) {
 			step = Promise.reject(error);
 		}
-		step.then(function (result) {
-			let done: unknown;
-			let value: unknown;
+		whenSettled(
+			step,
+			function (result: IteratorResult<unknown>) {
+				let done: unknown;
+				let value: unknown;
 
-			try {
-				if (typeof result !== 'object' || result === null) throw new TypeError(`bufferTime: iterator result ${describe(result)} is not an object`);
-				done = result.done;
-				if (!done) value = result.value;
-			} catch (error) {
-				failSource(error);
-				return;
-			}
-			if (stopped) return;
-			pulling = false;
-			if (done) {
-				exhausted = true;
-				flush();
-			} else {
-				batch.push(value);
-				if (batch.length >= maxSize) flush();
-				// The window of a batch opens with its first item.
-				else if (batch.length === 1 && ms !== Infinity) timer = setTimeout(onTimer, ms);
-			}
-			notify();
-		}, failSource);
+				try {
+					if (typeof result !== 'object' || result === null) throw new TypeError(`bufferTime: iterator result ${describe(result)} is not an object`);
+					done = result.done;
+					if (!done) value = result.value;
+				} catch (error) {
+					failSource(error);
+					return;
+				}
+				if (stopped) return;
+				pulling = false;
+				if (done) {
+					exhausted = true;
+					flush();
+				} else {
+					batch.push(value);
+					if (batch.length >= maxSize) flush();
+					// The window of a batch opens with its first item.
+					else if (batch.length === 1 && ms !== Infinity) timer = setTimeout(onTimer, ms);
+				}
+				notify();
+			},
+			failSource
+		);
 	}
 
 	/**
@@ -2214,7 +2254,7 @@ function chunkReader(caller: string, source: unknown, whole: boolean, signal: Ab
 		}
 		// Cancelling settles a pending read, so the lock can be released at once.
 		try {
-			Promise.resolve(reader.cancel(reason)).then(undefined, ignore);
+			whenSettled(reader.cancel(reason), ignore, ignore);
 		} catch {
 			// A synchronously throwing `cancel()`: nobody is waiting for it.
 		}
@@ -2238,7 +2278,7 @@ function chunkReader(caller: string, source: unknown, whole: boolean, signal: Ab
 	function interruptible(pull: unknown): Promise<unknown> {
 		return new Promise(function (resolve, reject) {
 			interrupt = reject;
-			Promise.resolve(pull).then(resolve, reject);
+			whenSettled(pull, resolve, reject);
 		});
 	}
 

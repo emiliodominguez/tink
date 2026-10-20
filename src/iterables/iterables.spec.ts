@@ -4520,3 +4520,148 @@ describe('stream readers and combinators: edge cases', function () {
 		expect(text.stats.reason).toBeInstanceOf(RangeError);
 	});
 });
+
+describe('async combinators: hostile promises, large read-aheads and a polluted Object.prototype (regressions)', function () {
+	/** A native promise of `value` whose `constructor` getter throws (so `Promise.resolve` throws on it). */
+	function throwingConstructor<T>(value: T): Promise<T> {
+		return Object.defineProperty(Promise.resolve(value), 'constructor', {
+			get() {
+				throw new Error('constructor getter');
+			}
+		});
+	}
+
+	/** A native promise of `value` with an own `then` that throws (`await` ignores it: it uses the built-in `then`). */
+	function throwingThen<T>(value: T): Promise<T> {
+		return Object.assign(Promise.resolve(value), {
+			then() {
+				throw new Error('own then');
+			}
+		});
+	}
+
+	/** An async iterable of `0, 1` whose `next()` results are made by `wrap`. */
+	function wrappedSource(wrap: (result: IteratorResult<number>) => unknown): AsyncIterable<number> {
+		return {
+			[Symbol.asyncIterator]() {
+				let pull = 0;
+				return {
+					next() {
+						const result = pull < 2 ? { done: false, value: pull++ } : { done: true, value: undefined };
+						return wrap(result as IteratorResult<number>);
+					}
+				} as AsyncIterator<number>;
+			}
+		};
+	}
+
+	/** Records the unhandled rejections while `run` runs (and a few ticks after). */
+	async function unhandledDuring(run: () => Promise<unknown>): Promise<unknown[]> {
+		const unhandled: unknown[] = [];
+		function record(reason: unknown): void {
+			unhandled.push(reason);
+		}
+		process.on('unhandledRejection', record);
+		try {
+			await run();
+			await new Promise(function (resolve) {
+				setTimeout(resolve, 20);
+			});
+		} finally {
+			process.off('unhandledRejection', record);
+		}
+		return unhandled;
+	}
+
+	it('mapConcurrent rejects when fn returns a promise whose constructor getter throws (regression: it hung, the error unhandled)', async function () {
+		const unhandled = await unhandledDuring(async function () {
+			for (const ordered of [true, false]) {
+				await expect(helpers.toArrayAsync(helpers.mapConcurrent([1, 2], throwingConstructor, { concurrency: 2, ordered }))).rejects.toThrow('constructor getter');
+			}
+		});
+		expect(unhandled).toEqual([]);
+		// As `await` reads it: `mapAsync` rejects the same way.
+		await expect(helpers.toArrayAsync(helpers.mapAsync([1], throwingConstructor))).rejects.toThrow('constructor getter');
+	});
+
+	it('reads a native promise with an own throwing then as await does: by its value (regression: mapConcurrent hung)', async function () {
+		const unhandled = await unhandledDuring(async function () {
+			expect(await helpers.toArrayAsync(helpers.mapConcurrent([1, 2], throwingThen, 2))).toEqual([1, 2]);
+			// A source whose results come that way: the second pull starts from the callback of the first one.
+			expect(await helpers.toArrayAsync(helpers.mapConcurrent(wrappedSource(throwingThen), double, 2))).toEqual([0, 2]);
+			expect(await helpers.toArrayAsync(helpers.mergeAsync(wrappedSource(throwingThen)))).toEqual([0, 1]);
+			expect(await helpers.toArrayAsync(helpers.bufferTime(wrappedSource(throwingThen), 1000))).toEqual([[0, 1]]);
+			expect(await helpers.streamToArray(wrappedSource(throwingThen), { signal: new AbortController().signal })).toEqual([0, 1]);
+			const awaited: number[] = [];
+			for await (const value of wrappedSource(throwingThen)) awaited.push(value);
+			expect(awaited).toEqual([0, 1]);
+		});
+		expect(unhandled).toEqual([]);
+	});
+
+	it('rejects with the error of a source whose results throw on Promise.resolve, from the first pull or a later one', async function () {
+		/** Wraps the second result only. */
+		function second(result: IteratorResult<number>): unknown {
+			return result.value === 1 ? throwingConstructor(result) : Promise.resolve(result);
+		}
+		const unhandled = await unhandledDuring(async function () {
+			await expect(helpers.toArrayAsync(helpers.mapConcurrent(wrappedSource(second), double, 2))).rejects.toThrow('constructor getter');
+			await expect(helpers.toArrayAsync(helpers.mapConcurrent(wrappedSource(throwingConstructor), double, 1))).rejects.toThrow('constructor getter');
+			await expect(helpers.toArrayAsync(helpers.mergeAsync(wrappedSource(second)))).rejects.toThrow('constructor getter');
+			await expect(helpers.toArrayAsync(helpers.bufferTime(wrappedSource(second), 1000))).rejects.toThrow('constructor getter');
+		});
+		expect(unhandled).toEqual([]);
+	});
+
+	it('mapConcurrent stays linear with a large read-ahead held up by a slow first item (regression: quadratic shift)', async function () {
+		const items = Array.from({ length: 150_000 }, function (_, index) {
+			return index;
+		});
+		/** The first item takes a while, so that every other one is mapped and waits behind it. */
+		function slowFirst(value: number): number | Promise<number> {
+			return value === 0
+				? new Promise(function (resolve) {
+						setTimeout(resolve, 50, 0);
+					})
+				: value;
+		}
+		const start = Date.now();
+		const result = await helpers.toArrayAsync(helpers.mapConcurrent(items, slowFirst, Infinity));
+		expect(Date.now() - start).toBeLessThan(3000);
+		expect(result).toEqual(items);
+	});
+
+	it('ignores a polluted Object.prototype[0] (regression: read as a settled mapping, or as the state of a source)', async function () {
+		const proto = Object.prototype as Record<number, unknown>;
+		const log: string[] = [];
+		const first: AsyncIterable<number> = {
+			[Symbol.asyncIterator]() {
+				return {
+					next: async function () {
+						return { done: true, value: undefined };
+					},
+					return: async function () {
+						log.push('closed');
+						return { done: true, value: undefined };
+					}
+				};
+			}
+		};
+		const unopenable = {
+			[Symbol.asyncIterator]() {
+				throw new Error('cannot open');
+			}
+		} as unknown as AsyncIterable<number>;
+		proto[0] = { settled: true, ok: true, result: 'planted' };
+		try {
+			expect(await helpers.toArrayAsync(helpers.mapConcurrent([1, 2], double, 1))).toEqual([2, 4]);
+			expect(await helpers.toArrayAsync(helpers.mapConcurrent([1, 2], double, { concurrency: 2, ordered: false }))).toEqual([2, 4]);
+			// 3 is the state of a source that finished: the source opened before the failing one must still be closed.
+			proto[0] = 3;
+			await expect(helpers.toArrayAsync(helpers.mergeAsync(first, unopenable))).rejects.toThrow('cannot open');
+			expect(log).toEqual(['closed']);
+		} finally {
+			delete proto[0];
+		}
+	});
+});
