@@ -2148,9 +2148,17 @@ const FAIL = Symbol.for('tinkit.parse.fail');
 
 /**
  * The issue list of the outermost report running (see {@link report}), `undefined` between parses: the list of the parse the caller
- * sees, as opposed to the lists of parses nested in a guard, a `check` predicate or a transform (see {@link lazy}).
+ * sees, as opposed to the lists of parses nested in a guard, a `check` predicate or a transform (see {@link lazy}). A parse whose
+ * issues are added to the report around it (see {@link surfaced}) holds it while it reports.
  */
 let rootIssues: SchemaIssue[] | undefined;
+
+/**
+ * Set while a foreign Standard Schema validator reports (see {@link standardNode}), until a parse starts (see {@link execute}): a
+ * parser of this module handed over as a plain Standard Schema reports there to a list whose issues the report around it takes, so
+ * that list must hold the issues its pointers refer to, like the report the caller sees.
+ */
+let surfaced = false;
 
 /** Where a {@link lazy} parser reported an invalid object: its first issue, at `index` in the list it went to. */
 interface LazyReport {
@@ -2268,7 +2276,7 @@ interface CompiledParser<T> extends StandardSchemaV1<unknown, T> {
 	readonly '~tink.1': Node;
 }
 
-/** Guards, foreign Standard Schema validators and object schemas, compiled on first use. */
+/** Guards, foreign Standard Schema validators and object schemas, compiled on first use, and the `~standard` props of parsers. */
 const compiled = new WeakMap<object, Node>();
 
 /**
@@ -2389,7 +2397,7 @@ function compile(caller: string, name: string, schema: unknown, ancestors: objec
 
 	if (node !== undefined) return node;
 	// Standard Schema first: some validators are callable (ArkType's types), and calling them as guards would accept anything.
-	if (isStandardSchema(schema)) node = standardNode(schema);
+	if (isStandardSchema(schema)) node = compiled.get(schema['~standard']) ?? standardNode(schema);
 	else if (typeof schema === 'function') node = guardNode(schema as Guard<unknown>);
 	else if (isPlainObject(schema)) node = objectNode(caller, name, schema as ObjectSchema, ancestors);
 	else throw invalidSchema(caller, name, schema);
@@ -2496,8 +2504,14 @@ function standardNode(schema: StandardSchemaLike): Node {
 			return result.issues ? FAIL : result.value;
 		},
 		run: function runStandard(value: unknown, path: PropertyKey[], issues: SchemaIssue[]): unknown {
+			// Its issues join this report: a parser of this module reporting through it must not point at issues it does not hold (a
+			// validator that throws leaves the flag set, which only makes the next parse report in full).
+			surfaced = true;
+
 			const result = callValidator(value);
 			const found = result.issues;
+
+			surfaced = false;
 
 			if (!found) return result.value;
 			if (found.length === 0) issues.push({ message: `Invalid value (got ${describe(value)})`, path: path.slice() });
@@ -2753,10 +2767,14 @@ function rerun(node: Node, value: unknown, path: PropertyKey[], issues: SchemaIs
  */
 function execute(fast: Fast, run: Run, value: unknown, issues: SchemaIssue[]): unknown {
 	// The fast parse needs no scope of its own: each outermost lazy parser keeps its memo (see `utils/memo.ts`) for its own call, and
-	// fails a value too deep to parse.
+	// fails a value too deep to parse. Read first: a parse nested in the fast parse must not take the flag.
+	const root = surfaced;
+
+	surfaced = false;
+
 	const output = fast(value);
 
-	return output === FAIL ? report(run, value, issues) : output;
+	return output === FAIL ? report(run, value, issues, root) : output;
 }
 
 /**
@@ -2765,10 +2783,13 @@ function execute(fast: Fast, run: Run, value: unknown, issues: SchemaIssue[]): u
  * @param {Run} run - The reporting parse
  * @param {unknown} value - The value to parse
  * @param {SchemaIssue[]} issues - Where issues are pushed
+ * @param {boolean} root - Whether the report around this one takes its issues (see {@link surfaced})
  * @returns {unknown} The output (meaningless when issues were added)
  */
-function report(run: Run, value: unknown, issues: SchemaIssue[]): unknown {
-	if (scope.depth++ === 0) rootIssues = issues;
+function report(run: Run, value: unknown, issues: SchemaIssue[], root: boolean): unknown {
+	const outer = rootIssues;
+
+	if (scope.depth++ === 0 || root) rootIssues = issues;
 	try {
 		return run(value, [], issues);
 	} catch (error) {
@@ -2779,10 +2800,8 @@ function report(run: Run, value: unknown, issues: SchemaIssue[]): unknown {
 
 		return undefined;
 	} finally {
-		if (--scope.depth === 0) {
-			rootIssues = undefined;
-			release();
-		}
+		rootIssues = outer;
+		if (--scope.depth === 0) release();
 	}
 }
 
@@ -2807,16 +2826,18 @@ function validateWith(fast: Fast, run: Run, value: unknown): StandardSchemaResul
  * @returns {Parser<T>} The parser
  */
 function toCompiledParser<T>(node: Node): Parser<T> {
-	return {
-		'~tink.1': node,
-		'~standard': {
-			version: 1,
-			vendor: 'tink',
-			validate: function validate(value: unknown): StandardSchemaResult<T> {
-				return validateWith(node.fast, node.run, value) as StandardSchemaResult<T>;
-			}
+	const props = {
+		version: 1,
+		vendor: 'tink',
+		validate: function validate(value: unknown): StandardSchemaResult<T> {
+			return validateWith(node.fast, node.run, value) as StandardSchemaResult<T>;
 		}
-	} as CompiledParser<T>;
+	};
+
+	// Its props handed over alone (`{ '~standard': parser['~standard'] }`) compile to the node itself (see `compile`).
+	compiled.set(props, node);
+
+	return { '~tink.1': node, '~standard': props } as CompiledParser<T>;
 }
 
 /**

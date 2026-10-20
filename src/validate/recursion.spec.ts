@@ -679,6 +679,45 @@ describe('recursive unions told apart deep inside', function () {
 		]);
 	});
 
+	it('should report the issues of a parser handed over as a plain Standard Schema, not a pointer to nothing', function () {
+		type Tree = { id: number; kids: Tree[] };
+		const idIssue = { message: 'Expected an integer or an integer string (got string)', path: ['kids', 0, 'kids', 0, 'id'] };
+		const tree: Parser<Tree> = lazy(function () {
+			return { id: asInteger, kids: arrayOf(wrapped) };
+		});
+		// Its props alone (they compile to the parser itself), and an adapter whose `validate` calls the parser's.
+		const wrapped: Schema = { '~standard': tree['~standard'] };
+		let adapterCalls = 0;
+		const adapted: Parser<Tree> = lazy(function () {
+			return { id: asInteger, kids: arrayOf(adapter) };
+		});
+		const adapter: Schema = {
+			'~standard': {
+				version: 1,
+				vendor: 'adapter',
+				validate: function validate(value: unknown) {
+					adapterCalls++;
+
+					return adapted['~standard'].validate(value);
+				}
+			}
+		};
+		const value = { id: 1, kids: [{ id: 2, kids: [{ id: 'x', kids: [] }] }] };
+
+		// The parse of the adapter's first call (the fast parse of `kids`) marked the objects as reported: its second call (the reporting
+		// parse) used to give only `Invalid value (same object as reported at another path)` at `kids.0`.
+		expect(issuesOf(tree, value)).toEqual([idIssue]);
+		expect(issuesOf(adapted, value)).toEqual([idIssue]);
+		expect(adapterCalls).toBeLessThan(20);
+		expect(issuesOf(arrayOf(wrapped), [{ id: 'x', kids: [] }])).toEqual([{ message: 'Expected an integer or an integer string (got string)', path: [0, 'id'] }]);
+
+		// The props alone report like the parser: an object held twice is reported once (an adapter reports it at every path).
+		let shared: unknown = { id: 'x', kids: [] };
+
+		for (let level = 0; level < 16; level++) shared = { id: level, kids: [shared, shared] };
+		expect(issuesOf(tree, shared)).toHaveLength(17);
+	});
+
 	it('should report again an object held twice whose first report found nothing', function () {
 		let lateCalls = 0;
 		/**
