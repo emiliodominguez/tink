@@ -28,6 +28,25 @@ describe('Search helpers', function () {
 			}
 		});
 
+		it('lower-cases a target with a capital sigma or an İ once, not once per code point (regression: quadratic time)', function () {
+			const toLowerCase = jest.spyOn(String.prototype, 'toLowerCase');
+			try {
+				for (const target of ['Σ' + 'é'.repeat(1000) + 'a', 'İ' + 'é'.repeat(1000) + 'a']) {
+					toLowerCase.mockClear();
+					expect(helpers.fuzzyMatch('a', target)?.ranges).toEqual([[1001, 1002]]);
+					expect(helpers.fuzzyMatch('éa', target)?.ranges).toEqual([[1000, 1002]]);
+					// Each code point is folded on its own (about one call each), but the whole target is lower-cased once per match.
+					expect(
+						toLowerCase.mock.contexts.filter(function (context) {
+							return String(context) === target;
+						})
+					).toHaveLength(2);
+				}
+			} finally {
+				toLowerCase.mockRestore();
+			}
+		});
+
 		it('throws a RangeError instead of allocating a back-pointer matrix of more than 2 ** 28 cells', function () {
 			const long = 'a'.repeat(20_000);
 			expect(function () {
@@ -433,6 +452,28 @@ describe('Search helpers', function () {
 			const long = `${'é'.repeat(300)}😀`;
 			expect(helpers.fuzzyMatch('é😀', long)?.ranges).toEqual([[299, 302]]);
 			expect(helpers.fuzzyMatch('éé', 'é'.repeat(40))?.ranges).toEqual([[0, 2]]);
+		});
+
+		it('builds the ranges without reading or writing a polluted Object.prototype["-1"] (regression)', function () {
+			const polluted = Object.prototype as Record<string, unknown>;
+			const planted = [0, 0];
+			polluted['-1'] = planted;
+			try {
+				expect(helpers.fuzzyMatch('fb', 'fooBar')).toEqual({
+					score: 45,
+					ranges: [
+						[0, 1],
+						[3, 4]
+					]
+				});
+				expect(helpers.fuzzySearch(['fooBar'], 'fb')[0].ranges).toEqual([
+					[0, 1],
+					[3, 4]
+				]);
+				expect(planted).toEqual([0, 0]);
+			} finally {
+				delete polluted['-1'];
+			}
 		});
 	});
 });

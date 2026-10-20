@@ -211,11 +211,12 @@ function fold(code: number, caseSensitive: boolean): number {
  * points, at the same offsets, unless the target holds a capital sigma (which may become a final sigma) or an `'İ'` (whose lower case is
  * two code points, so the target gets longer).
  * @param {string} target - The text searched
- * @returns {string | null} The lower-cased target, or `null` when its code points must be folded one by one
+ * @returns {string | false} The lower-cased target, or `false` when its code points must be folded one by one (not `null`, which `??=`
+ * would take as not computed yet, lower-casing the whole target again for each of its code points)
  */
-function lowerTarget(target: string): string | null {
+function lowerTarget(target: string): string | false {
 	const lower = target.toLowerCase();
-	return lower.length === target.length && !target.includes('\u03a3') ? lower : null;
+	return lower.length === target.length && !target.includes('\u03a3') ? lower : false;
 }
 
 /** The foldings computed by {@link expand}, by code point (at most 4096, then started afresh). */
@@ -393,7 +394,7 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean, cal
 	// The number of characters of the target: its length bounds them, except with `ignoreDiacritics`, where they are counted first.
 	let capacity = diacritics ? 0 : length;
 	// The target lower-cased at once, to fold its non-ASCII code points (see `lowerTarget`), once the first one is met.
-	let lower: string | null | undefined;
+	let lower: string | false | undefined;
 	if (!filtered) {
 		// Greedy subsequence check (the alignment only exists if it passes, and the buffers are only filled then), unless `contains` did it.
 		let matched = 0;
@@ -403,7 +404,7 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean, cal
 				const chars = caseSensitive ? expand(code) : expandFolded(code);
 				for (let c = 0; c < chars.length; c++) if (chars[c] === q[matched]) matched++;
 				capacity += chars.length;
-			} else if ((code < 128 || caseSensitive || (lower ??= lowerTarget(target)) === null ? fold(code, caseSensitive) : lower.codePointAt(k)) === q[matched]) matched++;
+			} else if ((code < 128 || caseSensitive || (lower ??= lowerTarget(target)) === false ? fold(code, caseSensitive) : lower.codePointAt(k)) === q[matched]) matched++;
 			k += code > 0xffff ? 2 : 1;
 		}
 		if (matched < m) return undefined;
@@ -435,7 +436,7 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean, cal
 			starts[n] = start;
 			ends[n] = k;
 			raw[n] = code;
-			codes[n++] = code < 128 || caseSensitive || (lower ??= lowerTarget(target)) === null ? fold(code, caseSensitive) : (lower.codePointAt(start) as number);
+			codes[n++] = code < 128 || caseSensitive || (lower ??= lowerTarget(target)) === false ? fold(code, caseSensitive) : (lower.codePointAt(start) as number);
 		}
 	}
 	const cells = m * n;
@@ -489,7 +490,8 @@ function match(query: PreparedQuery, target: string, caseSensitive: boolean, cal
 	// Walk the back pointers from the last matched character, building the ranges from right to left.
 	const ranges: Array<[number, number]> = [];
 	for (let i = m - 1; i >= 0; i--) {
-		const last = ranges[ranges.length - 1];
+		// Not `ranges[-1]` when there is none yet: that would read a polluted `Object.prototype['-1']` (and write to it).
+		const last = ranges.length === 0 ? undefined : ranges[ranges.length - 1];
 		// Characters folded from the same code point share its range: they merge, like adjacent ones.
 		if (last !== undefined && last[0] <= ends[end]) last[0] = starts[end];
 		else ranges.push([starts[end], ends[end]]);
@@ -1615,8 +1617,8 @@ export function createSearchIndex<T extends object>(options: SearchIndexOptions<
 			// The distinct query terms, in order, each a prefix if any of its occurrences is one.
 			const tokens = analyze(query, method);
 			let last = tokens.length - 1;
-			// Stops at `tokens[-1]`, which is `undefined`.
-			while (tokens[last] === '') last--;
+			// Not past the start: `tokens[-1]` would read a polluted `Object.prototype['-1']`.
+			while (last >= 0 && tokens[last] === '') last--;
 			const queryTerms: string[] = [];
 			const prefixes: boolean[] = [];
 			const positions = new Map<string, number>();
