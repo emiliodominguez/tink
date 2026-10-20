@@ -799,6 +799,18 @@ function skippedBusinessDays(calendar: BusinessCalendar, earlier: Date, later: D
 }
 
 /**
+ * Reads an element of a user array: a hole is `undefined`, never a value planted on a polluted `Object.prototype` (which a `for...of`
+ * loop or an index read would find through the hole).
+ * @template T - The type of the elements
+ * @param {ArrayLike<T>} array - The array
+ * @param {number} index - The index
+ * @returns {T | undefined} The element, or `undefined` for a hole
+ */
+function elementAt<T>(array: ArrayLike<T>, index: number): T | undefined {
+	return Object.hasOwn(array, index) ? array[index] : undefined;
+}
+
+/**
  * Validates {@link BusinessDayOptions} and builds their calendar. O(h log h) for `h` holidays; without them, O(1) and allocation-free.
  * @param {string} caller - Name of the public function, used in the error messages
  * @param {BusinessDayOptions | undefined} options - The options
@@ -821,10 +833,10 @@ function businessCalendar(caller: string, options: BusinessDayOptions | undefine
 	if (weekendDays !== undefined) {
 		if (!Array.isArray(weekendDays)) throw new TypeError(`${caller}: \`weekend\` must be an array of weekday indices, got ${describe(weekendDays)}`);
 		weekend = 0;
-		// An index loop, unlike `forEach`, also visits the holes of a sparse array.
+		// An index loop, unlike `forEach`, also visits the holes of a sparse array (which read `undefined`, see `elementAt`).
 		for (let i = 0; i < weekendDays.length; i++) {
 			// Read once: the day that is validated is the day that is used, even behind a getter.
-			const weekday: unknown = weekendDays[i];
+			const weekday: unknown = elementAt(weekendDays, i);
 
 			assertWeekday(caller, weekday as number, `weekend[${i}]`);
 			weekend |= 1 << (weekday as number);
@@ -840,12 +852,21 @@ function businessCalendar(caller: string, options: BusinessDayOptions | undefine
 
 		const days = new Set<number>();
 
-		for (const holiday of holidayDates) {
+		/**
+		 * Adds the epoch day of a holiday, unless it is a weekend day: a holiday on a weekend day changes nothing, so only the others are
+		 * kept and every kept one removes a business day.
+		 * @param {DateInput} holiday - The holiday
+		 * @returns {void}
+		 */
+		function add(holiday: DateInput): void {
 			const day = epochDay(toValidDate(holiday));
 
-			// A holiday on a weekend day changes nothing: only keep the others, so that every kept one removes a business day.
 			if (((weekend >> mod(day + 4, DAYS_PER_WEEK)) & 1) === 0) days.add(day);
 		}
+
+		// An array is read by index, so that a hole is `undefined` (see `elementAt`).
+		if (Array.isArray(holidayDates)) for (let i = 0; i < holidayDates.length; i++) add(elementAt(holidayDates as DateInput[], i) as DateInput);
+		else for (const holiday of holidayDates) add(holiday);
 		holidays = Float64Array.from(days).sort();
 	}
 
@@ -1652,7 +1673,9 @@ export function compareDesc(a: DateInput, b: DateInput): -1 | 0 | 1 {
 export function minDate(dates: Iterable<DateInput>): Date | undefined {
 	let result = Infinity;
 
-	for (const date of dates) result = Math.min(result, timeOf(date));
+	// An array is read by index, so that a hole is `undefined` (see `elementAt`).
+	if (Array.isArray(dates)) for (let i = 0; i < dates.length; i++) result = Math.min(result, timeOf(elementAt(dates, i) as DateInput));
+	else for (const date of dates) result = Math.min(result, timeOf(date));
 
 	// Valid timestamps are finite, so `Infinity` means that `dates` was empty.
 	return result === Infinity ? undefined : new Date(result);
@@ -1671,7 +1694,9 @@ export function minDate(dates: Iterable<DateInput>): Date | undefined {
 export function maxDate(dates: Iterable<DateInput>): Date | undefined {
 	let result = -Infinity;
 
-	for (const date of dates) result = Math.max(result, timeOf(date));
+	// An array is read by index, so that a hole is `undefined` (see `elementAt`).
+	if (Array.isArray(dates)) for (let i = 0; i < dates.length; i++) result = Math.max(result, timeOf(elementAt(dates, i) as DateInput));
+	else for (const date of dates) result = Math.max(result, timeOf(date));
 
 	// Valid timestamps are finite, so `-Infinity` means that `dates` was empty.
 	return result === -Infinity ? undefined : new Date(result);
@@ -1694,7 +1719,12 @@ export function closestTo(target: DateInput, dates: Iterable<DateInput>): Date |
 	let closest = NaN;
 	let distance = Infinity;
 
-	for (const date of dates) {
+	/**
+	 * Keeps `date` when it is closer than the closest so far.
+	 * @param {DateInput} date - A candidate
+	 * @returns {void}
+	 */
+	function visit(date: DateInput): void {
 		const candidate = timeOf(date);
 
 		if (Math.abs(candidate - time) < distance) {
@@ -1702,6 +1732,10 @@ export function closestTo(target: DateInput, dates: Iterable<DateInput>): Date |
 			distance = Math.abs(candidate - time);
 		}
 	}
+
+	// An array is read by index, so that a hole is `undefined` (see `elementAt`).
+	if (Array.isArray(dates)) for (let i = 0; i < dates.length; i++) visit(elementAt(dates, i) as DateInput);
+	else for (const date of dates) visit(date);
 
 	return distance === Infinity ? undefined : new Date(closest);
 }
@@ -1977,8 +2011,11 @@ function tokenize(
 	end: number
 ): number {
 	for (const match of pattern.slice(start, stop).matchAll(regex)) {
-		// Own keys only: every token of `regex` is an own key of `formatters` or of `FORMATTERS` (never one of a polluted prototype).
-		parts.push(pattern.slice(end, start + match.index), match[1] ?? (Object.hasOwn(formatters, match[0]) ? formatters : FORMATTERS)[match[0]]);
+		// Own keys only: every token of `regex` is an own key of `formatters` or of `FORMATTERS` (never one of a polluted prototype). A
+		// match of a regex without the `[...]` group has no index 1, which a polluted `Object.prototype` would answer.
+		const literal = match.length > 1 ? match[1] : undefined;
+
+		parts.push(pattern.slice(end, start + match.index), literal ?? (Object.hasOwn(formatters, match[0]) ? formatters : FORMATTERS)[match[0]]);
 		end = start + match.index + match[0].length;
 	}
 
@@ -2446,11 +2483,12 @@ export function formatDuration(ms: number, options: FormatDurationOptions = {}):
 	if (!Array.isArray(units)) throw new TypeError(`formatDuration: \`units\` must be an array of duration units, got ${describe(units)}`);
 
 	// The units seen, as bits of their indices in `DURATION_UNITS`: each element is read once, so the units that are validated are the
-	// units that are used, even behind a getter. An index loop, unlike `forEach`, also visits the holes of a sparse array.
+	// units that are used, even behind a getter. An index loop, unlike `forEach`, also visits the holes of a sparse array (which read
+	// `undefined`, see `elementAt`).
 	let seen = 0;
 
 	for (let i = 0; i < units.length; i++) {
-		const unit: unknown = units[i];
+		const unit: unknown = elementAt(units, i);
 		const index = DURATION_UNITS.indexOf(unit as DurationUnit);
 
 		if (index < 0)
@@ -3245,11 +3283,20 @@ function sortedBounds(caller: string, name: string, intervals: Iterable<Interval
 	const bounds: Array<[number, number]> = [];
 	let index = 0;
 
-	for (const interval of intervals) {
+	/**
+	 * Validates the next interval and keeps its bounds, unless it is empty and empty ones are dropped.
+	 * @param {Interval} interval - The interval
+	 * @returns {void}
+	 */
+	function add(interval: Interval): void {
 		const pair = intervalBounds(caller, `${name}[${index++}]`, interval);
 
 		if (keepEmpty || pair[0] < pair[1]) bounds.push(pair);
 	}
+
+	// An array is read by index, so that a hole is `undefined` (see `elementAt`).
+	if (Array.isArray(intervals)) for (let i = 0; i < intervals.length; i++) add(elementAt(intervals as Interval[], i) as Interval);
+	else for (const interval of intervals) add(interval);
 
 	return bounds.sort(function (a: [number, number], b: [number, number]): number {
 		return a[0] - b[0];

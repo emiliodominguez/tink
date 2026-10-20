@@ -3505,6 +3505,68 @@ describe('Date helpers under prototype pollution', function () {
 		});
 	});
 
+	it('formats every token, never a literal read from an inherited "1"', function () {
+		const date = new Date(2024, 0, 5, 9, 7, 3, 4);
+
+		polluted('1', 'polluted', function () {
+			expect(helpers.formatDate(date, 'YYYY-MM-DD')).toBe('2024-01-05');
+			expect(helpers.formatDate(date, '[at] HH:mm')).toBe('at 09:07');
+			expect(helpers.toISODateString(date)).toBe('2024-01-05');
+			expect(helpers.toISOStringLocal(date)).toMatch(/^2024-01-05T09:07:03\.004/);
+			expect(helpers.formatInTimeZone(Date.UTC(2024, 0, 5), 'UTC', 'YYYY-MM-DD Z')).toBe('2024-01-05 +00:00');
+			expect(helpers.parseDate('2024-01-05', 'YYYY-MM-DD')?.getTime()).toBe(new Date(2024, 0, 5).getTime());
+		});
+	});
+
+	it('reads a hole of an array as undefined, never as a value planted on Object.prototype', function () {
+		/**
+		 * A sparse array: `items`, with a hole at `index`.
+		 */
+		function holed<T>(items: T[], index: number): T[] {
+			const array = items.slice();
+
+			delete array[index];
+
+			return array;
+		}
+
+		polluted('1', 'd', function () {
+			expect(function () {
+				helpers.formatDuration(93_784_005, { units: holed(['h', 'h'], 1) as helpers.DurationUnit[] });
+			}).toThrow(new RangeError('formatDuration: `units` must only contain d, h, m, s, ms, got undefined'));
+		});
+		polluted('1', 3, function () {
+			expect(function () {
+				helpers.isBusinessDay(new Date(2024, 0, 3), { weekend: holed([0, 0, 6], 1) as helpers.WeekdayIndex[] });
+			}).toThrow(new TypeError('isBusinessDay: `weekend[1]` must be an integer between 0 and 6, got undefined'));
+		});
+		polluted('0', new Date(2024, 0, 3).getTime(), function () {
+			const hole = holed([0], 0);
+
+			expect(function () {
+				helpers.isBusinessDay(new Date(2024, 0, 3), { holidays: hole });
+			}).toThrow(new TypeError('Expected a Date or a timestamp number'));
+			for (const call of [helpers.minDate, helpers.maxDate, helpers.closestTo.bind(null, 0)] as Array<(dates: number[]) => unknown>) {
+				expect(function () {
+					call(holed([5, 6], 0));
+				}).toThrow(new TypeError('Expected a Date or a timestamp number'));
+			}
+		});
+		polluted('0', { start: 0, end: 8.64e15 }, function () {
+			const busy = holed([{ start: 10, end: 20 }], 0);
+
+			expect(function () {
+				helpers.findGaps({ start: 0, end: 100 }, busy);
+			}).toThrow(new TypeError('findGaps: `busy[0]` must be an interval object, got undefined'));
+			expect(function () {
+				helpers.mergeIntervals(busy);
+			}).toThrow(new TypeError('mergeIntervals: `intervals[0]` must be an interval object, got undefined'));
+		});
+		// Other iterables are read as they iterate.
+		expect(helpers.minDate(new Set([5, 3]))?.getTime()).toBe(3);
+		expect(helpers.mergeIntervals(new Set([{ start: 1, end: 2 }]))).toEqual([{ start: new Date(1), end: new Date(2) }]);
+	});
+
 	it('time zone clocks and relative time formatters ignore inherited Intl options, and are not cached corrupted', function () {
 		const time = Date.UTC(2024, 0, 15, 12, 30);
 		const base = new Date(2024, 0, 10, 12);
