@@ -584,6 +584,29 @@ describe('random', function () {
 			expect(randomId(30)).toMatch(/^[A-Za-z0-9_-]{30}$/);
 		});
 
+		it('should keep the buffer of each alphabet after a call made from inside getRandomValues (regression: it served another alphabet)', function () {
+			const real = globalThis.crypto;
+			let reenter = false;
+			const crypto = {
+				getRandomValues(array: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> {
+					if (reenter) {
+						reenter = false;
+						helpers.randomId(4, 'xyz');
+					}
+					return real.getRandomValues(array);
+				}
+			};
+
+			withCrypto(crypto, function () {
+				helpers.randomId(8, '0123456789');
+				// The refill of the digits calls randomId with another alphabet.
+				reenter = true;
+				expect(helpers.randomId(8, '0123456789')).toMatch(/^\d{8}$/);
+				for (let i = 0; i < 20; i++) expect(helpers.randomId(8, 'xyz')).toMatch(/^[xyz]{8}$/);
+				expect(helpers.randomId(8, '0123456789')).toMatch(/^\d{8}$/);
+			});
+		});
+
 		it('should use the alphabet of each call when alternating alphabets, and keep validating them', function () {
 			for (let i = 0; i < 20; i++) {
 				expect(helpers.randomId(30, 'ab')).toMatch(/^[ab]{30}$/);

@@ -724,17 +724,16 @@ export function randomId(size: number = 21, alphabet: string = URL_ALPHABET): st
 	// Astral characters take two UTF-16 units, so a buffer could not be sliced by position: generate them directly.
 	if (characters.length !== alphabet.length) return generateId(size, characters, crypto);
 
-	if (alphabet !== poolAlphabet || crypto !== poolSource) {
+	const same = alphabet === poolAlphabet && crypto === poolSource;
+	if (!same || poolOffset + size > pool.length) {
+		// Grow the batch geometrically while the same alphabet keeps being used (alternating alphabets stay cheap).
+		const target = same ? Math.max(poolNext, size) : size;
+		const batch = generateId(target, characters, crypto);
+		// Committed only once generated: a call made from inside `getRandomValues` may have refilled the pool for another alphabet meanwhile.
+		pool = batch;
 		poolAlphabet = alphabet;
 		poolSource = crypto;
-		pool = '';
-		poolNext = 0;
-	}
-	if (poolOffset + size > pool.length) {
-		// Grow the batch geometrically while the same alphabet keeps being used (alternating alphabets stay cheap).
-		const target = Math.max(poolNext, size);
 		poolNext = Math.min(target * 16, MAX_POOL_SIZE);
-		pool = generateId(target, characters, crypto);
 		poolOffset = 0;
 	}
 	poolOffset += size;
