@@ -2391,6 +2391,14 @@ describe('mapConcurrent', function () {
 		expect(stats.produced).toBe(0);
 	});
 
+	it('rejects at once when the source aborts the signal while it is pulled, then idles', async function () {
+		const signal = new FakeSignal();
+		const { iterator, stats } = abortingSource<number>(signal, 'stopped');
+		expect(await outcomeNow(helpers.mapConcurrent(iterator, double, { concurrency: 1, signal }).next())).toBe('stopped');
+		expect(stats).toEqual({ pulled: 1, closed: 1 });
+		expect(signal.listeners.size).toBe(0);
+	});
+
 	it('validates its arguments eagerly', function () {
 		expect(function () {
 			helpers.mapConcurrent(5 as any, double, 1);
@@ -2481,6 +2489,46 @@ class TestSignal {
 		this.reason = reason;
 		for (const listener of [...this.listeners]) listener();
 	}
+}
+
+/**
+ * An idle async source whose `next()` aborts `signal` first (as code in an async generator's body may, before its first `await`),
+ * counting its `next()` and `return()` calls.
+ */
+function abortingSource<T>(signal: { abort(reason?: unknown): void }, reason: unknown) {
+	const stats = { pulled: 0, closed: 0 };
+	const iterator: AsyncIterableIterator<T> = {
+		[Symbol.asyncIterator]() {
+			return iterator;
+		},
+		next() {
+			stats.pulled++;
+			signal.abort(reason);
+			return new Promise<IteratorResult<T>>(function () {});
+		},
+		return() {
+			stats.closed++;
+			return Promise.resolve({ done: true, value: undefined });
+		}
+	};
+	return { iterator, stats };
+}
+
+/**
+ * How a promise has settled once the microtask queue is drained: its rejection reason, `{ value }`, or `'pending'`.
+ */
+async function outcomeNow(promise: Promise<unknown>): Promise<unknown> {
+	let outcome: unknown = 'pending';
+	promise.then(
+		function (value) {
+			outcome = { value };
+		},
+		function (error) {
+			outcome = error;
+		}
+	);
+	await settle();
+	return outcome;
 }
 
 /**
@@ -4392,6 +4440,39 @@ describe('stream readers and combinators: edge cases', function () {
 		gate.resolve(1);
 		await settle();
 		expect(finalized).toBe(1);
+	});
+
+	it('rejects at once when the source aborts the signal while it is read, then idles', async function () {
+		const readers: Array<(source: AsyncIterable<never>, signal: TestSignal) => Promise<unknown>> = [
+			function (source, signal) {
+				return helpers.bufferTime(source, 10, { signal }).next();
+			},
+			function (source, signal) {
+				return helpers.readLines(source, { signal }).next();
+			},
+			function (source, signal) {
+				return helpers.parseSSE(source, { signal }).next();
+			},
+			function (source, signal) {
+				return helpers.parseNdjson(source, { signal }).next();
+			},
+			function (source, signal) {
+				return helpers.streamToText(source, { signal });
+			},
+			function (source, signal) {
+				return helpers.streamToBytes(source, { signal });
+			},
+			function (source, signal) {
+				return helpers.streamToArray(source, { signal });
+			}
+		];
+		for (const read of readers) {
+			const signal = new TestSignal();
+			const { iterator, stats } = abortingSource<never>(signal, 'stopped');
+			expect(await outcomeNow(read(iterator, signal))).toBe('stopped');
+			expect(stats).toEqual({ pulled: 1, closed: 1 });
+			expect(signal.listeners.size).toBe(0);
+		}
 	});
 
 	it('does not cancel a stream that ended, even when aborted while its last lines are read', async function () {

@@ -1341,7 +1341,8 @@ async function* mappedConcurrently(
 			} else if (exhausted && buffered === 0) {
 				if (sourceError) throw sourceError.error;
 				return;
-			} else {
+			} else if (!stopped) {
+				// Skipped once aborted by code that `fill` ran (the source's `next()`): no wake-up would come, the loop throws at once instead.
 				await new Promise<void>(function (resolve) {
 					wakeUp = resolve;
 				});
@@ -2058,9 +2059,12 @@ async function* batchedByTime(
 				return;
 			} else {
 				if (!pulling) pull();
-				await new Promise<void>(function (resolve) {
-					wakeUp = resolve;
-				});
+				// Skipped once aborted by code that `pull` ran (the source's `next()`): no wake-up would come, the loop throws at once instead.
+				if (abortedWith === undefined) {
+					await new Promise<void>(function (resolve) {
+						wakeUp = resolve;
+					});
+				}
 			}
 		}
 	} catch (error) {
@@ -2307,6 +2311,8 @@ function chunkReader(caller: string, source: unknown, whole: boolean, signal: Ab
 	function interruptible(pull: unknown): Promise<[unknown]> {
 		return new Promise(function (resolve, reject) {
 			interrupt = reject;
+			// Aborted by code that requesting the read ran (an async generator's body, a stream's `pull`): interrupted at once too.
+			if (abortedWith !== undefined) reject(abortedWith.reason);
 			whenSettled(
 				pull,
 				function (step: unknown) {
