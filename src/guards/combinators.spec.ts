@@ -1711,3 +1711,33 @@ describe('guards (pass 6 regressions)', function () {
 		expect(explain(isTree, tree)).toEqual([{ message: 'Invalid value (got string)', path: ['c', 0, 'a'] }]);
 	});
 });
+
+describe('guards (pass 7 regressions)', function () {
+	it('reports a cycle where it closes after a guard explained the object during its check', function () {
+		type Node = { k: 'a'; v: number; c?: Node } | { k: 'b'; list: Node[] };
+		let reentrant: (() => unknown) | undefined;
+		// A refinement that explains a value once, as a guard may: here, on the loop's `v`, the loop itself, while the union checks it.
+		const isLeaf = refine(isFiniteNumber, function (n: number): boolean {
+			const action = reentrant;
+
+			if (n === 1 && action !== undefined) {
+				reentrant = undefined;
+				action();
+			}
+			return true;
+		});
+		const isNode: Guard<Node> = isLazy(function (): Guard<Node> {
+			return isDiscriminatedUnion('k', { a: isShape({ v: isLeaf, c: isOptional(isNode) }), b: isShape({ list: isArrayOf(isNode) }) });
+		});
+		const loop: Record<string, unknown> = { k: 'a', v: 1 };
+		loop.c = loop;
+		const root = { k: 'b', list: [{ k: 'a', v: 0, c: loop }] };
+
+		expect(explain(isNode, root)).toEqual([{ message: 'Circular reference', path: ['list', 0, 'c', 'c'] }]);
+		reentrant = function (): unknown {
+			return explain(isNode, loop);
+		};
+		// That explanation is recorded in the union's context of the loop, which the outer call enters when the cycle closes.
+		expect(explain(isNode, root)).toEqual([{ message: 'Circular reference', path: ['list', 0, 'c', 'c'] }]);
+	});
+});

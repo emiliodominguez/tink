@@ -2766,8 +2766,9 @@ export function isLazy<T>(getter: () => Guard<T>): (value: unknown) => value is 
 			const state = reported.get(value);
 
 			if (state === true) return true;
-			// A cycle is reported where it closes, whatever the discriminant context it started in.
-			if (state === PENDING || (state === undefined && discriminatedReports.size !== 0 && isPending(value, plainReported, discriminatedReports))) {
+			// A cycle is reported where it closes, whatever the discriminant context it started in, and whatever this context recorded for the
+			// object before (an `explain` called by a guard during the check of the object, which had entered this context).
+			if (state === PENDING || (discriminatedReports.size !== 0 && isPending(value, plainReported, discriminatedReports))) {
 				issues.push({ message: 'Circular reference', path: path.slice() });
 
 				return false;
