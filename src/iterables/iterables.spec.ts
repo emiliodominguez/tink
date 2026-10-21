@@ -3778,6 +3778,19 @@ describe('bufferTime', function () {
 		expect(jest.getTimerCount()).toBe(0);
 	});
 
+	it('yields a batch whose timer the source fired from its own next() (regression: the read hung)', async function () {
+		const source = (async function* () {
+			yield 1;
+			// A test's generator moving the fake clock on before it idles: the batch's time is up while bufferTime pulls.
+			jest.advanceTimersByTime(100);
+			await new Promise(function () {});
+		})();
+		const batches = helpers.bufferTime(source, 50);
+		expect(await outcomeNow(batches.next())).toEqual({ value: { done: false, value: [1] } });
+		expect(jest.getTimerCount()).toBe(0);
+		await expect(batches.return!(undefined)).resolves.toEqual({ done: true, value: undefined });
+	});
+
 	it('flushes a batch `ms` after its first item, and never yields an empty batch', async function () {
 		const source = controlled<number>();
 		const batches = helpers.bufferTime(source.iterator, 100);
@@ -4521,6 +4534,46 @@ describe('stream readers and combinators: edge cases', function () {
 		controller.abort('quit');
 		expect(web.stream.locked).toBe(false);
 		await expect(lines.next()).rejects.toBe('quit');
+	});
+
+	it('does not cancel the source again when a listener the signal kept fires after the reader closed it (regression)', async function () {
+		// The signal dispatches to a copy of its listeners: one added before the reader's stops it during the dispatch.
+		const signal = new TestSignal();
+		const { stream, stats } = fakeStream({
+			read: async function () {
+				return { done: false, value: 'a\nb\n' };
+			}
+		});
+		const lines = helpers.readLines(stream as any, { signal });
+		signal.addEventListener('abort', function () {
+			void lines.throw!('stopped').catch(function () {});
+		});
+		await expect(lines.next()).resolves.toEqual({ done: false, value: 'a' });
+		signal.abort('late');
+		await settle();
+		expect(stats).toEqual({ released: 1, cancelled: 1 });
+		// A signal whose removeEventListener throws keeps the listener: an abort after the end must not close the source again.
+		const sticky = new TestSignal();
+		sticky.removeEventListener = function () {
+			throw new Error('cannot remove');
+		};
+		let returns = 0;
+		const chunks: AsyncIterableIterator<string> = {
+			[Symbol.asyncIterator]() {
+				return this;
+			},
+			async next() {
+				return { done: false, value: 'xxxx' };
+			},
+			async return() {
+				returns++;
+				return { done: true, value: undefined };
+			}
+		};
+		await expect(helpers.streamToText(chunks, { signal: sticky, maxLength: 2 })).rejects.toThrow(RangeError);
+		sticky.abort('late');
+		await settle();
+		expect(returns).toBe(1);
 	});
 
 	it('drops a chunk that arrives while the signal is being aborted, before processing it', async function () {

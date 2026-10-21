@@ -2059,8 +2059,9 @@ async function* batchedByTime(
 				return;
 			} else {
 				if (!pulling) pull();
-				// Skipped once aborted by code that `pull` ran (the source's `next()`): no wake-up would come, the loop throws at once instead.
-				if (abortedWith === undefined) {
+				// Skipped once code that `pull` ran (the source's `next()`) aborted, or fired the batch timer (fake timers): their wake-up was
+				// given before the wait, the loop throws or yields the batch at once instead.
+				if (abortedWith === undefined && ready.length === 0) {
 					await new Promise<void>(function (resolve) {
 						wakeUp = resolve;
 					});
@@ -2358,8 +2359,12 @@ function chunkReader(caller: string, source: unknown, whole: boolean, signal: Ab
 		check,
 		async close(failure: { error: unknown } | undefined): Promise<void> {
 			detach(signal, onAbort);
+			const open = !settled;
+			// Settled first: a listener the signal kept (its `removeEventListener` threw, or it dispatches to a copy of its listeners) must not
+			// cancel the source a second time on a later abort.
+			settled = true;
 			try {
-				if (!settled) await (reader !== undefined ? reader.cancel(failure?.error) : iterator?.return?.());
+				if (open) await (reader !== undefined ? reader.cancel(failure?.error) : iterator?.return?.());
 			} catch (error) {
 				// When the reading failed, that error is the one reported (like `for await`).
 				if (failure === undefined) throw error;
