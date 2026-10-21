@@ -4703,8 +4703,8 @@ export function hash(value: unknown, seed: number = 0): number {
 export interface SafeStringifyOptions {
 	/**
 	 * As `JSON.stringify`'s: a function called as `replacer.call(holder, key, value)` for every value (after its `toJSON`, before any
-	 * conversion, so it sees bigints, maps and errors as they are), or the list of the keys to write for objects (strings and numbers;
-	 * own properties only).
+	 * conversion, so it sees bigints, maps and errors as they are), or the list of the keys to write for objects (strings and numbers,
+	 * boxed ones too; own properties only).
 	 */
 	replacer?: ((this: unknown, key: string, value: unknown) => unknown) | ReadonlyArray<string | number>;
 	/** As `JSON.stringify`'s: the number of spaces to indent with (capped at 10), or the indentation string (its first 10 characters). */
@@ -4798,6 +4798,24 @@ function writeJson(value: JsonValue, indent: string, layout: JsonLayout): string
 }
 
 /**
+ * Whether an item of a replacer list names a key, as in `JSON.stringify`: a string or a number, boxed ones too (then named by their own
+ * `toString`). The brand checks of `valueOf` tell them apart.
+ * @param {unknown} item - The item
+ * @returns {boolean} Whether it names a key
+ */
+function isKeyItem(item: unknown): boolean {
+	for (const valueOf of [String.prototype.valueOf, Number.prototype.valueOf] as Array<(this: unknown) => unknown>) {
+		try {
+			valueOf.call(item);
+			return true;
+		} catch {
+			// Not of this kind.
+		}
+	}
+	return false;
+}
+
+/**
  * `JSON.stringify` that never throws on the value: it gives the same text for everything `JSON.stringify` handles (same `toJSON`,
  * replacer and `space` semantics), and a useful one where `JSON.stringify` throws or loses data:
  * - A circular reference becomes `"[Circular]"`; only true ancestors count, so an object referenced twice (siblings, a DAG) is written
@@ -4855,7 +4873,7 @@ export function safeStringify(value: unknown, options: SafeStringifyOptions = {}
 	let keys: string[] | undefined;
 	if (Array.isArray(replacer)) {
 		const listed = new Set<string>();
-		for (const key of replacer as ReadonlyArray<unknown>) if (typeof key === 'string' || typeof key === 'number') listed.add(String(key));
+		for (const key of replacer as ReadonlyArray<unknown>) if (isKeyItem(key)) listed.add(String(key));
 		keys = sort ? [...listed].sort() : [...listed];
 	}
 	// As `JSON.stringify`: at most 10 spaces (none for 0, a negative number or `NaN`), or the first 10 characters of a string.

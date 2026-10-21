@@ -4835,6 +4835,18 @@ describe('safeStringify', function () {
 		expect(helpers.safeStringify(value, { replacer: list, sortKeys: true })).toBe('{"1":"one","a":{"a":2,"c":3},"c":[{"a":4}]}');
 	});
 
+	it('reads boxed strings and numbers of a replacer list as JSON.stringify does (regression: left out)', function () {
+		const value = { a: 1, 1: 'one', b: 2, c: 3 };
+		const named = Object.assign(new String('x'), {
+			toString() {
+				return 'c';
+			}
+		});
+		const list = [new String('a'), new Number(1), named, new Boolean(true), Object(Symbol('b'))] as unknown as string[];
+		expect(helpers.safeStringify(value, { replacer: list })).toBe(JSON.stringify(value, list));
+		expect(helpers.safeStringify(value, { replacer: list })).toBe('{"a":1,"1":"one","c":3}');
+	});
+
 	it('sorts keys with sortKeys', function () {
 		expect(helpers.safeStringify({ b: 1, a: { d: 1, c: 2 }, 10: 0, 2: 0 }, { sortKeys: true })).toBe('{"10":0,"2":0,"a":{"c":2,"d":1},"b":1}');
 		const value = { b: [{ y: 1, x: 2 }], a: new Map([['k', { d: 1, c: 2 }]]) };
