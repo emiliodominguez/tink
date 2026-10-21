@@ -1465,6 +1465,41 @@ describe('Time-ordered ids (re-entrant callbacks)', function () {
 			expect(ids).toEqual(order);
 		}
 	});
+
+	it('should give a uuidv7 its own random bits when the random source calls the generator (regression: it took those of the inner id)', function () {
+		const base = helpers.createRandom('own bits');
+		const drawn: number[] = [];
+		let inner = '';
+		let nested = false;
+		const next: () => string = helpers.createUuidv7({
+			now: function () {
+				return 1700000000000;
+			},
+			random: function () {
+				const value = Math.floor(base() * 256);
+				if (!nested) {
+					drawn.push(value);
+					// The ninth byte (byte 14 of the UUID) calls the generator, which draws all of its own bytes.
+					if (drawn.length === 9) {
+						nested = true;
+						inner = next();
+						nested = false;
+					}
+				}
+				return value / 256;
+			}
+		});
+
+		const outer = next();
+		const tail = drawn
+			.slice(6)
+			.map(function (byte) {
+				return byte.toString(16).padStart(2, '0');
+			})
+			.join('');
+		expect(outer.slice(-8)).toBe(tail);
+		expect(inner < outer).toBe(true);
+	});
 });
 
 describe('Time-ordered ids (polluted Object.prototype)', function () {

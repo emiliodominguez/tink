@@ -478,12 +478,13 @@ export function createUuidv7(options?: TimeIdOptions): () => string {
 function uuidv7Generator(now: (() => number) | undefined, random: RandomGenerator | undefined): () => string {
 	let last = -1;
 	let counter = 0;
-	// Scratch space: every byte that is read is written by the same call first (a re-entrant call from `now` or `random` may overwrite
-	// some of them, but the state is read only after those callbacks, so ids stay strictly increasing).
-	const bytes = new Uint8Array(16);
+	// Scratch space for the CSPRNG, whose bytes are copied in after any callback has run. An injected `random` gets a buffer per call: a
+	// call made from inside it would overwrite the bytes drawn so far, giving this id the random bits of that one. The state is read only
+	// after the callbacks, so ids stay strictly increasing.
+	const scratch = new Uint8Array(16);
 	return function nextUuidv7(): string {
 		const time = readTime('uuidv7', now);
-		randomInto('uuidv7', bytes, 6, random);
+		const bytes = randomInto('uuidv7', random === undefined ? scratch : new Uint8Array(16), 6, random);
 		let stamp = last;
 		let count = counter + 1;
 		if (time > last || count > COUNTER_MAX) {
