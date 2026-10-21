@@ -32,8 +32,13 @@ export const scope = {
 /** The nesting of lazy schemas from which a stack overflow is blamed on the value, not on the code (a guard or transform recursing). */
 const TOO_DEEP = 100;
 
-/** The memos (and sets of objects being explained) holding entries. */
-const held: Array<Map<object, unknown> | Set<object>> = [];
+/**
+ * The memos (and sets of objects being explained) holding entries. Not empty while no check runs (`scope.depth` is 0) only when the
+ * `release` of the outermost check that ended last overflowed the stack: the next outermost check or parse then releases them first,
+ * since their entries answer for objects that may have changed since (a `PENDING` reading as a cycle).
+ * @internal
+ */
+export const held: Array<Map<object, unknown> | Set<object>> = [];
 
 /**
  * Registers `collection` for clearing when the outermost check (or parse) ends; call it before adding an entry.

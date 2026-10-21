@@ -1,5 +1,5 @@
 import * as vm from 'vm';
-import { safeParse } from '../validate/index.js';
+import { lazy, safeParse } from '../validate/index.js';
 import {
 	explain,
 	ensure,
@@ -1667,6 +1667,20 @@ describe('guards (pass 6 regressions)', function () {
 		});
 		(tree.c as Tree[])[0].a = 'x';
 		expect(explain(isTree, tree)).toEqual([{ message: 'Invalid value (got string)', path: ['c', 0, 'a'] }]);
+	});
+
+	it('a check does not read the verdicts left by a parse that could not release its memos', function () {
+		const tree: Tree = { a: 1, c: [{ a: 1 }] };
+		// A lazy parser around the guard: the guard's check is nested in the parse, which releases the memos of both.
+		const schema = lazy(function () {
+			return { tree: isTree };
+		});
+
+		withoutRelease(function (): unknown {
+			return safeParse(schema, { tree });
+		});
+		(tree.c as Tree[])[0].a = 'x';
+		expect(isTree(tree)).toBe(false);
 	});
 
 	it('a lazy guard explained when recording its verdict overflows leaves the check depth right', function () {

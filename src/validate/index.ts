@@ -14,7 +14,7 @@ import {
 import { describe, readOption, show } from '../utils/assert.js';
 import type { AnyFunction } from '../utils/index.js';
 import { generate } from '../utils/jit.js';
-import { hold, isTooDeep, PENDING, release, scope } from '../utils/memo.js';
+import { held, hold, isTooDeep, PENDING, release, scope } from '../utils/memo.js';
 import { guardScore } from '../utils/score.js';
 
 /**
@@ -2864,7 +2864,8 @@ function report(run: Run, value: unknown, issues: SchemaIssue[], root: boolean):
 
 	// Nothing that can throw (near the stack limit, any call can overflow) runs between a change of the scope and the `try` that undoes
 	// it, nor before the undoing in `finally`: a depth left above 0 would keep every memo, and its stale outputs, for every later parse.
-	// The outermost parse starts from empty memos, in case the `release` of an earlier one overflowed.
+	// The outermost parse starts from empty memos, in case the `release` of an earlier one overflowed (see `held`; a report is rare
+	// enough to release unconditionally).
 	if (scope.depth === 0) release();
 	if (root) {
 		moved.set(issues, true);
@@ -4042,8 +4043,8 @@ export function lazy<T>(getter: () => Schema): Parser<T> {
 		const node = resolve();
 
 		if (typeof value !== 'object' || value === null) return node.fast(value);
-		// An outermost parse finding outputs in its own memo follows one whose `release` overflowed: they may be stale (see `report`).
-		if (scope.depth === 0 && memo.size !== 0) release();
+		// An outermost parse starts from empty memos, in case the `release` of an earlier one overflowed (see `held`).
+		if (scope.depth === 0 && held.length !== 0) release();
 
 		const known = memo.get(value);
 
