@@ -3517,8 +3517,9 @@ describe('integerSqrt', function () {
 			elapsed = Math.min(elapsed, performance.now() - start);
 			expect(root).toBe(slow);
 		}
-		// About three divisions of the full number (and smaller ones), against seventeen.
-		expect(elapsed).toBeLessThan(reference / 3);
+		// About three divisions of the full number (and smaller ones), against seventeen: about a fifth of the time, bounded loosely (the
+		// old iteration takes as long as the reference), since a loaded machine (the parallel time-zone runs) narrows the ratio to a half.
+		expect(elapsed).toBeLessThan(reference / 1.5);
 	});
 
 	it('bounds the Bézout coefficients only when both inputs are non-zero, as documented', function () {
