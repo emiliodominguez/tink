@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.6.0 (unreleased)
+## 1.6.0
 
 The `store`/`cache` pass of 1.5.0, extended to every module and repeated until each came back clean: every module was audited for safety (prototype pollution, hostile input sizes), for state left inconsistent after a throw or a re-entrant call, for bugs and for speed, against references (Chrome's CSS engine, parse5, `node:crypto`, `node:zlib`, `node:net`, `node:path`, node-semver, Python's `str.title()`, exact BigInt arithmetic, `Intl` in 418 time zones) and with differential fuzzing against 1.5.0. Every fix comes with a regression test that fails on 1.5.0; every speed-up was measured against the 1.5.0 build in the same process.
 
