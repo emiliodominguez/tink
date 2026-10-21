@@ -2058,6 +2058,65 @@ describe('createHistory', function () {
 			counter.setState(6);
 			expect(history.getState().undoCount).toBe(0);
 		});
+
+		it('moves the steps once when a listener redoes an undo and another listener throws', function () {
+			const store = createStore(0);
+			const history = createHistory(store, { limit: 2 });
+			store.setState(1);
+			store.setState(2);
+			let redo = true;
+			store.subscribe(function () {
+				if (redo && store.getState() === 1) {
+					redo = false;
+					history.redo();
+				}
+			});
+			let fail = true;
+			store.subscribe(function () {
+				if (fail) {
+					fail = false;
+					throw new Error('listener');
+				}
+			});
+			// Back on the state before the undo, which a store refusing the state would leave too: the redo has moved the steps back.
+			expect(function () {
+				history.undo();
+			}).toThrow('listener');
+			expect(store.getState()).toBe(2);
+			expect(history.getState()).toEqual({ canUndo: true, canRedo: false, undoCount: 2, redoCount: 0 });
+			const states: number[] = [];
+			while (history.undo()) states.push(store.getState());
+			expect(states).toEqual([1, 0]);
+		});
+
+		it("publishes the move of the steps when the store's getState throws as the restoration ends", function () {
+			const inner = createStore(0);
+			let fail = false;
+			const store: HistorySource<number> = {
+				getState(): number {
+					if (fail) {
+						fail = false;
+						throw new Error('getState');
+					}
+					return inner.getState();
+				},
+				setState: inner.setState,
+				subscribe: inner.subscribe
+			};
+			const history = createHistory(store);
+			inner.setState(1);
+			// Subscribed after the history: the next read of the state, the end of the restoration, throws.
+			inner.subscribe(function () {
+				fail = true;
+			});
+			expect(function () {
+				history.undo();
+			}).toThrow('getState');
+			expect(inner.getState()).toBe(0);
+			expect(history.getState()).toEqual({ canUndo: false, canRedo: true, undoCount: 0, redoCount: 1 });
+			inner.setState(2);
+			expect(history.getState()).toEqual({ canUndo: true, canRedo: false, undoCount: 1, redoCount: 0 });
+		});
 	});
 
 	describe('stores that notify later', function () {
@@ -3182,6 +3241,45 @@ describe('computed', function () {
 			delete proto.equals;
 		}
 	});
+
+	it('notifies a subscriber that read a value no notification announced, after a notification threw', function () {
+		const list = createStore({ items: ['a'] });
+		const filter = createStore('');
+		// Throws on an empty list (a pure function of the state).
+		const first = list.select(function (state) {
+			if (state.items.length === 0) throw new Error('no items');
+			return state.items[0];
+		});
+		const label = computed([filter, first], function (f, i) {
+			return `${f}:${i}`;
+		});
+		label.subscribe(function () {});
+		expect(function () {
+			list.setState({ items: [] });
+		}).toThrow('no items');
+		// Reading `first` throws, so `label` is not told of the filter.
+		expect(function () {
+			filter.setState('x');
+		}).toThrow('no items');
+		// `first` is 'a' again: nothing notifies `label`, whose next read finds the filter.
+		list.setState({ items: ['a', 'b'] });
+		let shown = label.getState();
+		expect(shown).toBe('x:a');
+		label.subscribe(function () {
+			shown = label.getState();
+		});
+		// Back to the value of the last notification: still a change for whoever read 'x:a'.
+		filter.setState('');
+		expect(shown).toBe(':a');
+		// And then only on changes again.
+		const listener = jest.fn();
+		label.subscribe(listener);
+		filter.setState('');
+		list.setState({ items: ['a', 'c'] });
+		expect(listener).not.toHaveBeenCalled();
+		filter.setState('y');
+		expect(listener).toHaveBeenCalledTimes(1);
+	});
 });
 
 /**
@@ -3299,6 +3397,26 @@ describe('persistStore', function () {
 		store.setState({ token: 'b', remember: false });
 		expect(storage.data.has('auth')).toBe(false);
 		expect(storage.calls).toEqual(['get auth', 'set auth', 'remove auth']);
+	});
+
+	it('removes the key when not persisting after the first read threw', function () {
+		const storage = memoryStorage({ auth: '{"state":{"token":"old"},"version":0}' });
+		const getItem = jest.fn(function (): string | null {
+			throw new Error('getItem');
+		});
+		const store = createStore({ token: '', remember: true });
+		const onError = jest.fn();
+		persistStore(store, {
+			key: 'auth',
+			storage: { getItem, setItem: storage.setItem, removeItem: storage.removeItem },
+			partialize(state) {
+				return state.remember ? { token: state.token } : undefined;
+			},
+			onError
+		});
+		expect(onError).toHaveBeenCalledWith(new Error('getItem'));
+		store.setState({ token: '', remember: false });
+		expect(storage.data.has('auth')).toBe(false);
 	});
 
 	it('writes back the migrated state itself, whatever the store does with setState', function () {
@@ -3882,6 +4000,65 @@ describe('persistStore', function () {
 					delete scope.removeEventListener;
 				}
 			}
+		});
+
+		it('writes back what listeners change in reaction even when another listener throws', function () {
+			withEvents(function (dispatch) {
+				const storage = memoryStorage();
+				const store = createStore({ items: [] as string[], count: 0 });
+				store.subscribe(function () {
+					const state = store.getState();
+					if (state.count !== state.items.length) store.setState({ ...state, count: state.items.length });
+				});
+				const onError = jest.fn();
+				persistStore(store, { key: 'cart', storage, sync: true, onError });
+				let fail = true;
+				store.subscribe(function () {
+					if (fail) {
+						fail = false;
+						throw new Error('listener');
+					}
+				});
+				storage.data.set('cart', '{"state":{"items":["a","b"],"count":0},"version":0}');
+				dispatch({ key: 'cart', newValue: null, storageArea: storage });
+				expect(onError).toHaveBeenCalledWith(new Error('listener'));
+				expect(store.getState()).toEqual({ items: ['a', 'b'], count: 2 });
+				expect(storage.data.get('cart')).toBe('{"state":{"items":["a","b"],"count":2},"version":0}');
+			});
+		});
+
+		it('removes the key after reading what another tab wrote threw', function () {
+			withEvents(function (dispatch) {
+				const storage = memoryStorage();
+				let fail = false;
+				const flaky: PersistStorage = {
+					getItem(key: string): string | null | undefined {
+						if (fail) throw new Error('getItem');
+						return storage.getItem(key);
+					},
+					setItem: storage.setItem,
+					removeItem: storage.removeItem
+				};
+				const store = createStore({ token: '', remember: false });
+				const onError = jest.fn();
+				persistStore(store, {
+					key: 'auth',
+					storage: flaky,
+					sync: true,
+					partialize(state) {
+						return state.remember ? { token: state.token } : undefined;
+					},
+					onError
+				});
+				storage.data.set('auth', '{"state":{"token":"secret"},"version":0}');
+				fail = true;
+				dispatch({ key: 'auth', newValue: null, storageArea: flaky });
+				fail = false;
+				expect(onError).toHaveBeenCalledWith(new Error('getItem'));
+				// The storage may hold a text: not persisting removes it.
+				store.setState({ token: '', remember: false });
+				expect(storage.data.has('auth')).toBe(false);
+			});
 		});
 	});
 

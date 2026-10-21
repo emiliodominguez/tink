@@ -312,6 +312,9 @@ function derive<S, T>(source: Pick<ReadonlyStore<S>, 'getState' | 'subscribe'>, 
 	let version = 0;
 	let notifiedVersion = 0;
 	let notifiedValue: T;
+	// Whether a notification of the source threw before the listeners were told of its value: since then, a `getState` call may have
+	// returned a value no notification announced, so the next change notifies even back to `notifiedValue`.
+	let behind = false;
 	let detach: Unsubscribe | undefined;
 
 	/**
@@ -338,15 +341,23 @@ function derive<S, T>(source: Pick<ReadonlyStore<S>, 'getState' | 'subscribe'>, 
 
 	/**
 	 * Source listener: notifies the derived subscribers when the selected value differs from the one of the last notification (comparing
-	 * versions rather than recomputing, so a `getState` call made by another listener earlier in the same round cannot hide the change).
+	 * versions rather than recomputing, so a `getState` call made by another listener earlier in the same round cannot hide the change),
+	 * or when it changed after a notification that threw.
 	 * @returns {void}
 	 */
 	function onSourceChange(): void {
+		const was = behind;
+		// Until the listeners are told: if `getState` (a selector, `equals`, a source) throws, they are left behind.
+		behind = true;
 		const current = getState();
-		if (version === notifiedVersion) return;
+		if (version === notifiedVersion) {
+			behind = was;
+			return;
+		}
 		// The value may have changed and changed back within the round (A, then B read by another listener, then A again). Compared
-		// before the version is marked as notified: when `equals` throws, the next notification of the source compares again.
-		const unchanged = equals(notifiedValue, current);
+		// before the version is marked as notified: when `equals` throws, the next notification of the source notifies.
+		const unchanged = !was && equals(notifiedValue, current);
+		behind = false;
 		notifiedVersion = version;
 		if (unchanged) return;
 		notifiedValue = current;
@@ -488,7 +499,8 @@ function assertStore(name: string, value: unknown): asserts value is ReadonlySto
  * - `useSyncExternalStore` friendly: `getState` returns the same reference until the result changes, and methods can be passed
  *   unbound: `useSyncExternalStore(total.subscribe, total.getState)`.
  * - `compute` and `equals` must be pure: they may run for a `getState` call, not only on changes. Errors they throw propagate to
- *   the caller (`getState`, or the source's `setState` through the notification), and the next read recomputes.
+ *   the caller (`getState`, or the source's `setState` through the notification), and the next read recomputes (after a notification
+ *   that threw, the next change notifies, even back to the last notified value).
  * @template S - The source state type (single store)
  * @template T - The computed type
  * @param {ReadonlyStore<S> | ReadonlyArray<ReadonlyStore<unknown>>} stores - A store, or an array of stores (whose states are passed to
@@ -1415,10 +1427,11 @@ export function createHistory<S>(store: HistorySource<S>, options: HistoryOption
 		try {
 			record();
 		} finally {
-			// Even when `record` throws (a stack overflow): left set, the flag would merge every later change into the restored step.
+			// Even when `record` throws (a stack overflow, the store's `getState`): left set, the flag would merge every later change into
+			// the restored step, and the move of the steps would go unpublished.
 			restoring = false;
+			publish();
 		}
-		publish();
 	}
 
 	/**
@@ -1440,8 +1453,9 @@ export function createHistory<S>(store: HistorySource<S>, options: HistoryOption
 				return state;
 			});
 		} catch (error) {
-			// The store's `setState` (or `equals`) threw before changing the state: the step stays where it was.
-			if (Object.is(getState.call(store), before)) {
+			// The store's `setState` (or `equals`) threw before changing the state: the step stays where it was. Unless a listener called
+			// `undo` or `redo` meanwhile (back to `before`, and listeners threw): that restoration has ended, and has moved the steps itself.
+			if (restoring && Object.is(getState.call(store), before)) {
 				rollback();
 				present = before;
 			}
@@ -1807,8 +1821,9 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 	// Nowhere to persist: nothing to read, write or stop.
 	if (storage === undefined) return identity as Unsubscribe;
 
-	// The text the storage is known to hold under `key` (`null`: none), so that writing it again is skipped.
-	let stored: string | null = null;
+	// The text the storage is known to hold under `key` (`null`: none, `undefined`: unknown, its read threw), so that writing it again,
+	// or removing a key that is not there, is skipped.
+	let stored: string | null | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let active = true;
 	// Whether a `storage` event is being hydrated (the store's notification then writes nothing), the state it set, and whether the
@@ -1829,12 +1844,17 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 	/**
 	 * Reads, migrates and merges a stored state into the store. Never throws: errors go to `onError`.
 	 * @param {() => unknown} read - Returns the stored text (`null` or `undefined` for none)
-	 * @returns {boolean} Whether a state was set on the store
+	 * @returns {void}
 	 */
-	function hydrate(read: () => unknown): boolean {
+	function hydrate(read: () => unknown): void {
 		try {
+			// Unknown until read: a storage whose `getItem` throws may still hold a text, which a removal must not skip.
+			stored = undefined;
 			const text = read();
-			if (text === null || text === undefined) return false;
+			if (text === null || text === undefined) {
+				stored = null;
+				return;
+			}
 			if (typeof text !== 'string') throw new TypeError(`persistStore: \`storage.getItem\` must return a string or null, got ${describe(text)}`);
 			stored = text;
 			const persisted = deserialize(text);
@@ -1858,10 +1878,8 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 			setState.call(store, function (): S {
 				return next;
 			});
-			return true;
 		} catch (error) {
 			report(error);
-			return false;
 		}
 	}
 
@@ -1882,22 +1900,20 @@ export function persistStore<S, P = S>(store: Pick<Store<S>, 'getState' | 'setSt
 		const { key: changed, storageArea } = event as { key?: unknown; storageArea?: unknown };
 		// `key` is `null` when another tab cleared the whole storage.
 		if (storageArea !== storage || (changed !== key && changed !== null)) return;
-		// The storage no longer holds what this tab wrote (`hydrate` records what it holds now, when it is a string).
-		stored = null;
+		// The storage no longer holds what this tab wrote: `hydrate` records what it holds now.
 		syncing = true;
 		notified = false;
-		let set: boolean;
 		try {
 			// What the storage holds now, rather than the event's `newValue`: events arrive late, and the text of an event older than a
 			// write of this tab would replace this tab's state with a stale one (while the other tab takes this tab's).
-			set = hydrate(readStorage);
+			hydrate(readStorage);
 		} finally {
 			syncing = false;
 		}
 		// What this tab's listeners changed in reaction is a change of its own, written as usual (even back to the state before the
 		// event); a state the store did not take (its `equals` deemed it equal to the current one: no notification) is not, or two tabs
-		// whose states only differ in key order would echo each other.
-		if (set && notified && !Object.is(getState.call(store), synced)) onChange();
+		// whose states only differ in key order would echo each other. Even when a listener threw: the store took the state.
+		if (notified && !Object.is(getState.call(store), synced)) onChange();
 	}
 
 	/**
