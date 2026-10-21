@@ -4094,3 +4094,165 @@ describe('persistStore', function () {
 		}
 	});
 });
+
+describe('state after a stack overflow', function () {
+	// Near the stack limit, any call can overflow, builtins included, even in a `catch` or `finally` block: each builtin call below
+	// throws in turn (a `RangeError` like V8's), and the next, unrelated calls must still work.
+	type Builtin = [string, Record<string, unknown>, string];
+	const builtins: Builtin[] = [
+		['Array.prototype.push', Array.prototype as unknown as Record<string, unknown>, 'push'],
+		['Object.is', Object as unknown as Record<string, unknown>, 'is'],
+		['Set.prototype.add', Set.prototype as unknown as Record<string, unknown>, 'add']
+	];
+
+	/**
+	 * Runs `fn` with the `at`-th call of a builtin throwing a stack overflow `RangeError`.
+	 * @param {Builtin} builtin - The builtin to break
+	 * @param {number} at - Which call throws
+	 * @param {() => void} fn - The function to run
+	 * @returns {boolean} Whether the builtin threw
+	 */
+	function overflowAt([, owner, key]: Builtin, at: number, fn: () => void): boolean {
+		const original = owner[key] as (...args: unknown[]) => unknown;
+		let made = 0;
+		owner[key] = function (this: unknown, ...args: unknown[]): unknown {
+			if (++made === at) throw new RangeError('Maximum call stack size exceeded');
+			return original.apply(this, args);
+		};
+		try {
+			fn();
+		} catch {
+			// The call may fail with the error: only what the next calls see matters.
+		} finally {
+			owner[key] = original;
+		}
+		return made >= at;
+	}
+
+	it('should keep notifying after collecting a listener error overflowed', function () {
+		const store = createStore(0);
+		let calls = 0;
+		store.subscribe(function () {
+			calls++;
+		});
+		store.subscribe(function () {
+			throw new Error('listener');
+		});
+
+		expect(
+			overflowAt(builtins[0], 1, function () {
+				store.setState(1);
+			})
+		).toBe(true);
+		expect(function () {
+			store.setState(2);
+		}).toThrow('listener');
+		expect(calls).toBe(2);
+	});
+
+	it('should keep notifying in batches after holding a notification back overflowed', function () {
+		const store = createStore(0);
+		let calls = 0;
+		store.subscribe(function () {
+			calls++;
+		});
+
+		expect(
+			overflowAt(builtins[0], 1, function () {
+				batch(function () {
+					store.setState(1);
+				});
+			})
+		).toBe(true);
+		batch(function () {
+			store.setState(2);
+		});
+		expect(calls).toBe(1);
+	});
+
+	it('should leave no history restoring or batching after any builtin call of a command overflowed', function () {
+		type Doubled = { v: number; d?: number };
+		const stuck: string[] = [];
+		const commands: Array<[string, (store: Store<Doubled>, history: StoreHistory) => void]> = [
+			[
+				'setState',
+				function (store) {
+					store.setState({ v: 3 });
+				}
+			],
+			[
+				'undo',
+				function (_, history) {
+					history.undo();
+				}
+			],
+			[
+				'redo',
+				function (_, history) {
+					history.undo();
+					history.redo();
+				}
+			],
+			[
+				'history.batch',
+				function (store, history) {
+					history.batch(function () {
+						store.setState({ v: 3 });
+						store.setState({ v: 4 });
+					});
+				}
+			],
+			[
+				'undo in a batch',
+				function (_, history) {
+					batch(function () {
+						history.undo();
+					});
+				}
+			],
+			[
+				'undo by a listener',
+				function (store) {
+					store.setState({ v: -1 });
+				}
+			]
+		];
+
+		for (const [name, command] of commands) {
+			for (const builtin of builtins) {
+				let fired = true;
+				for (let at = 1; fired; at++) {
+					const store = createStore<Doubled>({ v: 0 });
+					// A listener keeping a derived field, and one undoing a forbidden state.
+					store.subscribe(function () {
+						const state = store.getState();
+						if (state.d !== state.v * 2) store.setState({ ...state, d: state.v * 2 });
+					});
+					const history = createHistory(store);
+					store.subscribe(function () {
+						if (store.getState().v < 0) history.undo();
+					});
+					store.setState({ v: 1 });
+					store.setState({ v: 2 });
+
+					fired = overflowAt(builtin, at, function () {
+						command(store, history);
+					});
+					// A first change publishes what the interrupted command may have left unpublished; the next ones are checked.
+					store.setState({ v: 10 });
+					const steps = history.getState().undoCount;
+					const before = store.getState();
+					store.setState({ v: 20 });
+					const after = store.getState();
+					batch(function () {
+						store.setState({ v: 30 });
+					});
+					const recorded = after.d === 40 && history.getState().undoCount === steps + 2;
+					const undone = recorded && history.undo() && store.getState() === after && history.undo() && store.getState() === before;
+					if (!undone) stuck.push(`${name}, ${builtin[0]} call ${at}`);
+				}
+			}
+		}
+		expect(stuck).toEqual([]);
+	});
+});

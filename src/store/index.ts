@@ -116,12 +116,11 @@ function createNotifier(): Notifier {
 	}
 
 	/**
-	 * Ends a notification: compacts the list, then runs the deferred callbacks.
+	 * Ends a notification (once `notifying` is reset): compacts the list, then runs the deferred callbacks.
 	 * @param {unknown[] | undefined} errors - The errors collected so far
 	 * @returns {unknown[] | undefined} `errors`, plus those of the callbacks
 	 */
 	function settle(errors: unknown[] | undefined): unknown[] | undefined {
-		notifying = false;
 		compact();
 		// Most notifications defer nothing: no set is allocated for them.
 		if (deferred === undefined) return errors;
@@ -157,43 +156,47 @@ function createNotifier(): Notifier {
 		let rounds = 0;
 
 		notifying = true;
+		try {
+			while (pending) {
+				pending = false;
+				if (++rounds > MAX_ROUNDS) break;
 
-		while (pending) {
-			pending = false;
+				const length = subscriptions.length;
+				let roundErrors: unknown[] | undefined;
 
-			if (++rounds > MAX_ROUNDS) {
-				errors = settle(errors);
-				const message = `store: listeners changed the state during ${MAX_ROUNDS} consecutive notification rounds`;
-				// The errors of the rounds run so far are kept as the cause, rather than lost.
-				if (errors === undefined) throw new RangeError(message);
-				throw new RangeError(message, {
-					cause: errors.length === 1 ? errors[0] : new AggregateError(errors, `store: ${errors.length} notification rounds threw`)
-				});
-			}
+				for (let i = 0; i < length; i++) {
+					const listener = subscriptions[i].listener;
+					if (listener === undefined) continue;
 
-			const length = subscriptions.length;
-			let roundErrors: unknown[] | undefined;
+					try {
+						listener();
+					} catch (error) {
+						roundErrors = roundErrors ?? [];
+						roundErrors.push(error);
+					}
+				}
 
-			for (let i = 0; i < length; i++) {
-				const listener = subscriptions[i].listener;
-				if (listener === undefined) continue;
-
-				try {
-					listener();
-				} catch (error) {
-					roundErrors = roundErrors ?? [];
-					roundErrors.push(error);
+				if (roundErrors !== undefined) {
+					errors = errors ?? [];
+					errors.push(roundErrors.length === 1 ? roundErrors[0] : new AggregateError(roundErrors, `store: ${roundErrors.length} listeners threw`));
 				}
 			}
-
-			if (roundErrors !== undefined) {
-				errors = errors ?? [];
-				errors.push(roundErrors.length === 1 ? roundErrors[0] : new AggregateError(roundErrors, `store: ${roundErrors.length} listeners threw`));
-			}
+		} finally {
+			// Reset however the rounds end: near the stack limit, collecting an error can itself overflow the stack, and a notifier left
+			// `notifying` would never notify again (every later round only marks itself pending).
+			notifying = false;
 		}
 
 		errors = settle(errors);
 
+		if (rounds > MAX_ROUNDS) {
+			const message = `store: listeners changed the state during ${MAX_ROUNDS} consecutive notification rounds`;
+			// The errors of the rounds run so far are kept as the cause, rather than lost.
+			if (errors === undefined) throw new RangeError(message);
+			throw new RangeError(message, {
+				cause: errors.length === 1 ? errors[0] : new AggregateError(errors, `store: ${errors.length} notification rounds threw`)
+			});
+		}
 		if (errors === undefined) return;
 		if (errors.length === 1) throw errors[0];
 		throw new AggregateError(errors, `store: ${errors.length} notification rounds threw`);
@@ -218,8 +221,9 @@ function createNotifier(): Notifier {
 			if (batchDepth > 0) {
 				// Held back until the outermost batch ends, once however many changes the batch makes.
 				if (!held) {
-					held = true;
+					// Queued first: a `push` that throws (at the stack limit) must not leave the notifier held without being queued.
 					heldBack.push(run);
+					held = true;
 				}
 				return;
 			}
@@ -1408,8 +1412,12 @@ export function createHistory<S>(store: HistorySource<S>, options: HistoryOption
 	 * @returns {void}
 	 */
 	function settle(): void {
-		record();
-		restoring = false;
+		try {
+			record();
+		} finally {
+			// Even when `record` throws (a stack overflow): left set, the flag would merge every later change into the restored step.
+			restoring = false;
+		}
 		publish();
 	}
 
@@ -1439,7 +1447,14 @@ export function createHistory<S>(store: HistorySource<S>, options: HistoryOption
 			}
 			throw error;
 		} finally {
-			later(settle);
+			let ended = false;
+			try {
+				later(settle);
+				ended = true;
+			} finally {
+				// Neither run nor scheduled (a stack overflow): the restoration ends here rather than never.
+				if (!ended) restoring = false;
+			}
 		}
 		return true;
 	}
@@ -1498,9 +1513,13 @@ export function createHistory<S>(store: HistorySource<S>, options: HistoryOption
 			try {
 				result = fn();
 			} finally {
-				record();
-				// A change right after the batch starts a new step.
-				if (--depth === 0) lastChange = -Infinity;
+				try {
+					record();
+				} finally {
+					// Even when `record` throws (a stack overflow): a depth left above 0 would merge every later change into one step. A change
+					// right after the batch starts a new step.
+					if (--depth === 0) lastChange = -Infinity;
+				}
 			}
 			if (isThenable(result)) throw new TypeError('batch: `fn` must be synchronous, got a function returning a thenable');
 			return result;
