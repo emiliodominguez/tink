@@ -1570,15 +1570,25 @@ function biMapView<K, V>(forward: Map<K, V>, backward: Map<V, K>): BiMap<K, V> {
 				const left = Object.is(key, -0) ? (0 as K) : key;
 				const right = Object.is(value, -0) ? (0 as V) : value;
 
-				if (forward.has(left)) {
-					const previous = forward.get(left) as V;
-					// The pair is already there (SameValueZero, like the maps).
-					if (previous === right || (previous !== previous && right !== right)) return view;
-					backward.delete(previous);
+				try {
+					if (forward.has(left)) {
+						const previous = forward.get(left) as V;
+						// The pair is already there (SameValueZero, like the maps).
+						if (previous === right || (previous !== previous && right !== right)) return view;
+						backward.delete(previous);
+					}
+					if (backward.has(right)) forward.delete(backward.get(right) as K);
+					forward.set(left, right);
+					backward.set(right, left);
+				} catch (error) {
+					// Interrupted (adding a key can overflow the stack): every pair of `left` or `right` goes, so that no half pair stays.
+					// Inlined: a function call made here, as deep as the call that overflowed, would overflow too.
+					if (forward.has(left)) backward.delete(forward.get(left) as V);
+					forward.delete(left);
+					if (backward.has(right)) forward.delete(backward.get(right) as K);
+					backward.delete(right);
+					throw error;
 				}
-				if (backward.has(right)) forward.delete(backward.get(right) as K);
-				forward.set(left, right);
-				backward.set(right, left);
 				return view;
 			},
 			delete(key: K): boolean {
@@ -2130,15 +2140,17 @@ export function createTrie<V>(entries?: Iterable<readonly [string, V]> | null): 
 	}
 
 	/**
-	 * Replaces a node without value that has a single child by that child (whose label absorbs the node's), keeping the tree compressed.
+	 * Replaces a node without value by its only (remaining) child, whose label absorbs the node's, keeping the tree compressed.
 	 * @param {TrieNode} parent - The node's parent
 	 * @param {TrieNode} node - The node
+	 * @param {TrieNode} child - The child that replaces it
 	 * @returns {void}
 	 */
-	function merge(parent: TrieNode, node: TrieNode): void {
-		const child = (node.children as Map<number, TrieNode>).values().next().value as TrieNode;
-		child.label = node.label + child.label;
+	function merge(parent: TrieNode, node: TrieNode, child: TrieNode): void {
+		const label = node.label + child.label;
+		// The one change that can throw (at the stack limit) comes first, so that a throw leaves the trie as it was.
 		(parent.children as Map<number, TrieNode>).set(node.label.charCodeAt(0), child);
+		child.label = label;
 		parent.sorted = undefined;
 	}
 
@@ -2183,10 +2195,14 @@ export function createTrie<V>(entries?: Iterable<readonly [string, V]> | null): 
 				for (let i = 0; i < key.length;) {
 					const code = key.charCodeAt(i);
 					let child = node.children?.get(code);
+					// Each change below is made by one `Map` call that may throw (at the stack limit), made last, once the new nodes are
+					// ready: a throw leaves the trie as it was.
 					if (child === undefined) {
 						// A new leaf holds the rest of the key.
 						child = { label: detach(key.slice(i)), value: NO_VALUE, children: undefined, sorted: undefined };
-						(node.children ??= new Map()).set(code, child);
+						const children = node.children ?? new Map<number, TrieNode>();
+						children.set(code, child);
+						node.children = children;
 						node.sorted = undefined;
 						node = child;
 						break;
@@ -2194,13 +2210,20 @@ export function createTrie<V>(entries?: Iterable<readonly [string, V]> | null): 
 					const label = child.label;
 					const common = commonLength(label, key, i);
 					if (common < label.length) {
-						// The key leaves (or ends inside) the edge: split it at the divergence.
+						// The key leaves (or ends inside) the edge: split it at the divergence, the new leaf (if any) beside the old child.
+						const rest = detach(label.slice(common));
 						const middle: TrieNode = { label: detach(label.slice(0, common)), value: NO_VALUE, children: new Map(), sorted: undefined };
-						child.label = detach(label.slice(common));
-						(middle.children as Map<number, TrieNode>).set(child.label.charCodeAt(0), child);
+						(middle.children as Map<number, TrieNode>).set(rest.charCodeAt(0), child);
+						let target = middle;
+						if (i + common < key.length) {
+							target = { label: detach(key.slice(i + common)), value: NO_VALUE, children: undefined, sorted: undefined };
+							(middle.children as Map<number, TrieNode>).set(key.charCodeAt(i + common), target);
+						}
 						(node.children as Map<number, TrieNode>).set(code, middle);
+						child.label = rest;
 						node.sorted = undefined;
-						child = middle;
+						node = target;
+						break;
 					}
 					i += common;
 					node = child;
@@ -2223,20 +2246,26 @@ export function createTrie<V>(entries?: Iterable<readonly [string, V]> | null): 
 					node = child;
 				}
 				if (node.value === NO_VALUE) return false;
-				node.value = NO_VALUE;
-				count--;
-				// Every node but the root holds a value or has two children or more; restore that.
+				// Every node but the root holds a value or has two children or more; restore that, with one `Map` call that may throw (at
+				// the stack limit) before anything else changes, so that a throw leaves the trie as it was.
 				if (parent !== undefined) {
 					const children = node.children;
 					if (children === undefined) {
 						const siblings = parent.children as Map<number, TrieNode>;
-						siblings.delete(node.label.charCodeAt(0));
-						parent.sorted = undefined;
-						// A parent left without children holds a value (or is the root): it becomes a leaf.
-						if (siblings.size === 0) parent.children = undefined;
-						else if (grandparent !== undefined && parent.value === NO_VALUE && siblings.size === 1) merge(grandparent, parent);
-					} else if (children.size === 1) merge(parent, node);
+						if (grandparent !== undefined && parent.value === NO_VALUE && siblings.size === 2) {
+							// The parent keeps a single child, which replaces it (removing the node with it).
+							for (const sibling of siblings.values()) if (sibling !== node) merge(grandparent, parent, sibling);
+						} else {
+							// A parent left without children holds a value (or is the root): it becomes a leaf.
+							const last = siblings.size === 1;
+							siblings.delete(node.label.charCodeAt(0));
+							parent.sorted = undefined;
+							if (last) parent.children = undefined;
+						}
+					} else if (children.size === 1) merge(parent, node, children.values().next().value as TrieNode);
 				}
+				node.value = NO_VALUE;
+				count--;
 				return true;
 			},
 			clear(): void {

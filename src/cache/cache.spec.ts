@@ -2667,3 +2667,118 @@ describe('createBloomFilter', function () {
 		}
 	});
 });
+
+describe('structures after a stack overflow', function () {
+	// Near the stack limit, any builtin call can overflow (a `Map` adding a key grows its table): each `Map` call below throws in turn (a
+	// `RangeError` like V8's), and the structure must stay consistent.
+	const methods = ['set', 'delete'] as const;
+
+	/**
+	 * Runs `fn` with the `at`-th call of a `Map` method throwing a stack overflow `RangeError`.
+	 * @param {'set' | 'delete'} method - The method to break
+	 * @param {number} at - Which call throws
+	 * @param {() => void} fn - The function to run
+	 * @returns {boolean} Whether the method threw
+	 */
+	function overflowAt(method: (typeof methods)[number], at: number, fn: () => void): boolean {
+		const prototype = Map.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
+		const original = prototype[method];
+		let made = 0;
+		prototype[method] = function (this: unknown, ...args: unknown[]): unknown {
+			if (++made === at) throw new RangeError('Maximum call stack size exceeded');
+			return original.apply(this, args);
+		};
+		try {
+			fn();
+		} catch {
+			// The call fails with the error: only the state it leaves matters.
+		} finally {
+			prototype[method] = original;
+		}
+		return made >= at;
+	}
+
+	it('should keep both sides of a bimap mirrored when a set overflows', function () {
+		const broken: string[] = [];
+		const changes: Array<[string, number]> = [
+			['a', 2],
+			['d', 3],
+			['a', 4],
+			['e', 5]
+		];
+
+		for (const method of methods) {
+			for (const [key, value] of changes) {
+				let fired = true;
+				for (let at = 1; fired; at++) {
+					const map = createBiMap([
+						['a', 1],
+						['b', 2],
+						['c', 3]
+					]);
+					fired = overflowAt(method, at, function () {
+						map.set(key, value);
+					});
+					const mirrored =
+						map.size === map.inverse.size &&
+						[...map].every(function ([k, v]) {
+							return map.getKey(v) === k;
+						});
+					if (!mirrored) broken.push(`set(${key}, ${value}), ${method} call ${at}`);
+				}
+			}
+		}
+		expect(broken).toEqual([]);
+	});
+
+	it('should leave a trie as it was when a set or delete overflows', function () {
+		const broken: string[] = [];
+		const words = ['car', 'cart', 'care', 'cartography', 'do', 'dog'];
+		const changes: Array<[string, (trie: Trie<number>) => unknown]> = [
+			...['carton', 'cab', 'c', 'dot', 'x', 'cartographer'].map(function (word): [string, (trie: Trie<number>) => unknown] {
+				return [
+					`set(${word})`,
+					function (trie) {
+						return trie.set(word, 0);
+					}
+				];
+			}),
+			...words.map(function (word): [string, (trie: Trie<number>) => unknown] {
+				return [
+					`delete(${word})`,
+					function (trie) {
+						return trie.delete(word);
+					}
+				];
+			})
+		];
+
+		for (const method of methods) {
+			for (const [name, change] of changes) {
+				let fired = true;
+				for (let at = 1; fired; at++) {
+					const trie = createTrie(
+						words.map(function (word, i): [string, number] {
+							return [word, i];
+						})
+					);
+					fired = overflowAt(method, at, function () {
+						change(trie);
+					});
+					const keys = [...trie.keys()];
+					const consistent =
+						keys.join() === [...words].sort().join() &&
+						trie.size === keys.length &&
+						['', 'c', 'ca', 'car', 'cart', 'carto', 'd', 'do', 'x'].every(function (prefix) {
+							const expected = keys.filter(function (key) {
+								return key.startsWith(prefix);
+							});
+							return trie.hasPrefix(prefix) === expected.length > 0 && trie.keysWithPrefix(prefix).join() === expected.join();
+						});
+					if (fired && !consistent) broken.push(`${name}, ${method} call ${at}: ${keys.join()}`);
+				}
+			}
+		}
+		expect(broken).toEqual([]);
+	});
+});
