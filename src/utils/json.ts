@@ -40,17 +40,18 @@ export interface JsonWalk {
 	/**
 	 * The JSON of the containers converted so far that hold other containers or more than 64 values, by depth: a container shared by
 	 * several paths (YAML aliases build such values) is converted once per depth instead of once per path, which is exponential in the
-	 * depth of the sharing.
+	 * depth of the sharing. This field and the next ones are required, so that every walk sets them as its own: read through a polluted
+	 * `Object.prototype`, they would corrupt the conversion.
 	 */
-	converted?: Map<object, [depth: number, json: JsonValue] | Map<number, JsonValue>>;
+	converted: Map<object, [depth: number, json: JsonValue] | Map<number, JsonValue>> | undefined;
 	/** Whether the conversion under way depends on its path (it wrote `'[Circular]'`, a truncation or a thrown error): not remembered. */
-	dependent?: boolean;
+	dependent: boolean;
 	/** The number of containers converted so far. */
-	count?: number;
+	count: number;
 	/** The number of items and members converted so far. */
-	values?: number;
+	values: number;
 	/** Whether the JSON of a container converted earlier was used again: the tree then shares it between several places. */
-	shared?: boolean;
+	shared: boolean;
 }
 
 /**
@@ -275,8 +276,8 @@ function toJsonObject(value: object, walk: JsonWalk): JsonValue {
 		return known;
 	}
 	const outer = walk.dependent;
-	const before = (walk.count = (walk.count ?? 0) + 1);
-	const values = walk.values ?? 0;
+	const before = ++walk.count;
+	const values = walk.values;
 	walk.dependent = false;
 	ancestors.push(value);
 	onPath.add(value);
@@ -289,7 +290,7 @@ function toJsonObject(value: object, walk: JsonWalk): JsonValue {
 	onPath.delete(value);
 	// Remembered when it holds other containers or more than a few values (a leaf of a million items shared by thousands of paths cost
 	// a conversion per path), and does not depend on its path.
-	if (!walk.dependent && (walk.count > before || (walk.values as number) > values + 64) && walk.replacer === undefined) {
+	if (!walk.dependent && (walk.count > before || walk.values > values + 64) && walk.replacer === undefined) {
 		const converted = (walk.converted ??= new Map());
 		if (entry === undefined) converted.set(value, [depth, json]);
 		else if (Array.isArray(entry)) converted.set(value, new Map([entry, [depth, json]]));
@@ -307,7 +308,7 @@ function toJsonObject(value: object, walk: JsonWalk): JsonValue {
  */
 function toJsonItems(items: ReadonlyArray<unknown>, walk: JsonWalk): JsonValue[] {
 	if (items.length >= MAX_JSON_ITEMS) throw new RangeError('Invalid string length');
-	walk.values = (walk.values ?? 0) + items.length;
+	walk.values += items.length;
 	const json: JsonValue[] = [];
 	for (let index = 0; index < items.length; index++) json.push(toJsonValue(items, index, walk) ?? null);
 	return json;
@@ -323,7 +324,7 @@ function toJsonItems(items: ReadonlyArray<unknown>, walk: JsonWalk): JsonValue[]
 export function toJsonMembers(object: object, walk: JsonWalk): Record<string, JsonValue> {
 	const listed = walk.keys;
 	const keys = listed ?? Object.keys(object);
-	walk.values = (walk.values ?? 0) + keys.length;
+	walk.values += keys.length;
 	const json: Record<string, JsonValue> = {};
 	for (const key of keys) {
 		const member = toJsonValue(object, key, walk, listed === undefined);
