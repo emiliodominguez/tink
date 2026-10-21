@@ -1135,11 +1135,13 @@ export function createQueue<S extends AbortSignalLike = never>(options: QueueOpt
 
 				/**
 				 * Abort listener of a waiting task (unregistered once it starts or is dropped): removes it from the queue and rejects its
-				 * promise.
+				 * promise. It does nothing once the task has left the queue: a signal whose `addEventListener` started or dropped it (by
+				 * re-entering the queue) only gets the listener registered afterwards.
 				 * @param {unknown} reason - The abort reason
 				 * @returns {void}
 				 */
 				function onAbort(reason: unknown): void {
+					if (entry.done) return;
 					entry.done = true;
 					// Once the aborted tasks are half of the heap, the waiting ones are popped and pushed back in order (both orders kept): the
 					// heap stays within twice the waiting tasks, at O(log n) amortized per abort.
@@ -1158,16 +1160,17 @@ export function createQueue<S extends AbortSignalLike = never>(options: QueueOpt
 				if (!paused && running < concurrency && queued() === 0) {
 					run();
 				} else {
-					// The listeners first (the queue's, idempotent, then the task's): when adding one throws, the task is not queued (its
-					// promise rejects).
+					// The queue's listener first (idempotent): when adding it throws, the task is not queued (its promise rejects). The task is
+					// queued before its own listener is added, so that a signal calling it while it is being added finds the task counted (it
+					// would otherwise count as waiting no more, and the queue stop listening to its signal while tasks wait); when adding it
+					// throws, the task leaves the queue as if aborted, with that error.
 					watchSignal(queueSignal, drop);
+					waiting.push(entry);
 					try {
 						watchSignal(signal, onAbort);
 					} catch (error) {
-						notify();
-						throw error;
+						onAbort(error);
 					}
-					waiting.push(entry);
 					// A queue signal that aborted as its listener was added (and ran it before this task was queued) drops this task too.
 					if (queueSignal?.aborted) drop(abortReason(queueSignal));
 				}
@@ -1687,13 +1690,14 @@ function semaphore(name: string, permits: number, onIdle: () => void = noop): Se
 			}
 
 			/**
-			 * Abort listener, unregistered once the request leaves the queue: a late abort (from a signal whose `removeEventListener`
-			 * throws) would otherwise `dispatch` again and report the semaphore idle, making a keyed mutex forget a key held again.
+			 * Abort listener, unregistered once the request leaves the queue, and doing nothing once it has: a late abort would otherwise
+			 * `dispatch` again and report the semaphore idle, making a keyed mutex forget a key held again. (A signal whose
+			 * `addEventListener` granted the request, by re-entering the semaphore, only gets the listener registered afterwards.)
 			 * @param {unknown} reason - The abort reason
 			 * @returns {void}
 			 */
 			function onAbort(reason: unknown): void {
-				fail(reason);
+				if (waiter.queued) fail(reason);
 			}
 
 			// Queued first, so that a listener called while being added finds the request; when adding it throws, the request leaves the
@@ -1874,7 +1878,9 @@ export function createKeyedMutex<K = unknown>(): KeyedMutex<K> {
 	}
 
 	/**
-	 * Forgets a lock left free by a request that failed at once (invalid options, aborted signal), and returns the request's promise.
+	 * Forgets a lock left free by a request that failed at once (invalid options, aborted signal), and returns the request's promise. A
+	 * lock taken after it was forgotten is recorded again: reading the options runs user code, which may have released the lock (it was
+	 * then idle, and forgotten) before the request took it.
 	 * @template T - The resolved value type
 	 * @param {K} key - The key
 	 * @param {Semaphore} lock - Its lock
@@ -1883,6 +1889,7 @@ export function createKeyedMutex<K = unknown>(): KeyedMutex<K> {
 	 */
 	function tidy<T>(key: K, lock: Semaphore, request: Promise<T>): Promise<T> {
 		if (lock.available === 1) locks.delete(key);
+		else if (!locks.has(key)) locks.set(key, lock);
 		return request;
 	}
 
@@ -4065,6 +4072,9 @@ export function createCircuitBreaker<F extends AnyFunction>(fn: F, options: Circ
 			if (!failed) consecutiveFailures = 0;
 			else if (++consecutiveFailures >= failureThreshold) enter('open');
 		} else if (failed) {
+			// The trial is over: when the clock throws (the circuit stays half-open), the next call may be a trial again, or the circuit
+			// would reject every call for good.
+			trials--;
 			enter('open');
 		} else if (++passed >= halfOpenMaxCalls) {
 			enter('closed');

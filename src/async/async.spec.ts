@@ -7851,3 +7851,143 @@ describe('abort listener kept by a signal whose addEventListener throws', functi
 		releaseC();
 	});
 });
+
+/**
+ * A signal-like whose `addEventListener` keeps the listener and runs `onAdd` (code re-entering the helper, or aborting the signal at once).
+ * @param {(signal: { aborted: boolean; reason: unknown }, listener: () => void) => void} onAdd - Runs as the listener is added
+ * @returns {{ signal: { aborted: boolean; reason: unknown; addEventListener: (type: string, listener: () => void) => void; removeEventListener: (type: string, listener: () => void) => void }; abort: (reason: unknown) => void }} The signal and its abort
+ */
+function reentrantSignal(onAdd: (signal: { aborted: boolean; reason: unknown }, listener: () => void) => void) {
+	const listeners = new Set<() => void>();
+	const signal = {
+		aborted: false,
+		reason: undefined as unknown,
+		addEventListener(_type: string, listener: () => void): void {
+			listeners.add(listener);
+			onAdd(signal, listener);
+		},
+		removeEventListener(_type: string, listener: () => void): void {
+			listeners.delete(listener);
+		}
+	};
+	return {
+		signal,
+		abort(reason: unknown): void {
+			signal.aborted = true;
+			signal.reason = reason;
+			for (const listener of [...listeners]) listener();
+		}
+	};
+}
+
+describe('instance state after a signal or option that runs user code while a request is queued', function () {
+	it('keeps the queue listening to its signal after a task signal aborted as its listener was added (regression: the waiting tasks missed the abort)', async function () {
+		const controller = new AbortController();
+		const queue = createQueue({ concurrency: 1, signal: controller.signal });
+		let release!: () => void;
+		void queue.add(function () {
+			return new Promise<void>(function (resolve) {
+				release = resolve;
+			});
+		});
+		const waiting = queue.add(function () {
+			return 'ran';
+		});
+		const empty = jest.fn();
+		void queue.onEmpty().then(empty);
+		const eager = reentrantSignal(function (signal, listener) {
+			signal.aborted = true;
+			signal.reason = 'eager';
+			listener();
+		});
+		await expect(queue.add(function () {}, { signal: eager.signal })).rejects.toBe('eager');
+		expect(queue.size).toBe(1);
+		expect(empty).not.toHaveBeenCalled();
+		controller.abort('stop');
+		expect(queue.size).toBe(0);
+		await expect(waiting).rejects.toBe('stop');
+		release();
+	});
+
+	it('ignores a late abort of a task that left the queue while its listener was being added (the next task must not wait forever)', async function () {
+		const queue = createQueue({ concurrency: 1 });
+		let release!: () => void;
+		void queue.add(function () {
+			return new Promise<void>(function (resolve) {
+				release = resolve;
+			});
+		});
+		const clearing = reentrantSignal(function () {
+			queue.clear();
+		});
+		await expect(queue.add(function () {}, { signal: clearing.signal })).rejects.toThrow(AbortError);
+		clearing.abort('late');
+		const next = queue.add(function () {
+			return 'next';
+		});
+		expect(queue.size).toBe(1);
+		release();
+		await expect(next).resolves.toBe('next');
+	});
+
+	it('ignores a late abort of a keyed mutex request granted while its listener was being added (regression: two holders)', async function () {
+		const mutex = createKeyedMutex<string>();
+		const first = await mutex.acquire('doc');
+		const releasing = reentrantSignal(function () {
+			first();
+		});
+		const second = await mutex.acquire('doc', { signal: releasing.signal });
+		second();
+		const third = await mutex.acquire('doc');
+		releasing.abort('late');
+		expect(mutex.isLocked('doc')).toBe(true);
+		expect(mutex.tryAcquire('doc')).toBeUndefined();
+		third();
+		expect(mutex.size).toBe(0);
+	});
+
+	it('records a key whose lock an option getter released before the request took it (regression: two holders)', async function () {
+		const mutex = createKeyedMutex<string>();
+		const first = await mutex.acquire('doc');
+		const second = await mutex.acquire('doc', {
+			get timeout() {
+				first();
+				return Infinity;
+			}
+		});
+		expect(mutex.isLocked('doc')).toBe(true);
+		expect(mutex.tryAcquire('doc')).toBeUndefined();
+		second();
+		expect(mutex.size).toBe(0);
+	});
+
+	it('lets a new trial through when the clock throws as a failed trial reopens the circuit (regression: it rejected every call for good)', async function () {
+		let clock = 0;
+		let clockThrows = false;
+		let healthy = false;
+		const breaker = createCircuitBreaker(
+			async function () {
+				if (!healthy) throw new Error('down');
+				return 'ok';
+			},
+			{
+				failureThreshold: 1,
+				resetTimeout: 100,
+				now: function () {
+					if (clockThrows) throw new Error('clock');
+					return clock;
+				}
+			}
+		);
+		await expect(breaker()).rejects.toThrow('down');
+		clock = 100;
+		const trial = breaker();
+		clockThrows = true;
+		await expect(trial).rejects.toThrow('clock');
+		clockThrows = false;
+		expect(breaker.state).toBe('half-open');
+		healthy = true;
+		await expect(breaker()).resolves.toBe('ok');
+		expect(breaker.state).toBe('closed');
+	});
+});
