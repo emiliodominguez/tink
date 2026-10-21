@@ -4376,7 +4376,8 @@ function shortestRotation(caller: string, from: number, to: number, period: numb
 	const low = a - (high - virtual) - (b + virtual);
 	// Brought into `(-period / 2, period / 2]` by one more exact shift, decided on the exact difference; the only rounding is the last one.
 	const above = beyondHalf(high, period);
-	if (above > 0 || (above === 0 && low > 0)) high -= period;
+	// On a half turn, the low part decides: past `+period / 2` (`high > 0`, `low > 0`), or at or past `-period / 2` (`high < 0`, `low <= 0`).
+	if (above > 0 || (above === 0 && high > 0 && low > 0)) high -= period;
 	else if (above < 0 || (above === 0 && low <= 0 && high < 0)) high += period;
 	const turn = high + low;
 	// The exact difference is now above `-period / 2`, but can round onto it: the half turn is `+period / 2`. `+ 0` turns `-0` into `0`, and

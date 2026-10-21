@@ -4852,6 +4852,14 @@ describe('damp', function () {
 });
 
 describe('angleDifference and lerpAngle', function () {
+	it('keeps a rotation just past a half turn below zero within the range (regression: a full turn off)', function () {
+		// `from` reduces to exactly a half turn and `to` is a subnormal above 0: the rotation is just above `-12`, not `-36`.
+		expect(helpers.angleDifference(9678326661783996, 5e-324, 24)).toBe(12);
+		expect(helpers.angleDifference(5e-324, 9678326661783996, 24)).toBe(12);
+		expect(helpers.angleDifference(180, 5e-324)).toBe(180);
+		expect(helpers.angleDifference(-180, -5e-324)).toBe(180);
+	});
+
 	it('gives the shortest signed rotation', function () {
 		expect(helpers.angleDifference(350, 10)).toBe(20);
 		expect(helpers.angleDifference(10, 350)).toBe(-20);
