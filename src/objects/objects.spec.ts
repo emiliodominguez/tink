@@ -4565,6 +4565,17 @@ describe('safeStringify', function () {
 		}
 	});
 
+	it('indents a value sharing objects with a gap holding a line break as JSON.stringify does (regression: its breaks indented too)', function () {
+		const settings = {
+			retry: { times: 2, delays: [1, 2] },
+			rows: Array.from({ length: 70 }, function (_, index) {
+				return index;
+			})
+		};
+		const value = { first: settings, second: settings, other: { nested: [1, { deep: 2 }] } };
+		for (const space of ['\n', ' \n', '\r\n']) expect(helpers.safeStringify(value, { space })).toBe(JSON.stringify(value, undefined, space));
+	});
+
 	it('keeps the state of its conversion own (regression: read from a polluted Object.prototype)', function () {
 		const proto = Object.prototype as Record<string, unknown>;
 		let reads = 0;

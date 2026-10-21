@@ -4778,7 +4778,7 @@ function writeJson(value: JsonValue, indent: string, layout: JsonLayout): string
 	let text = '';
 	if (layout.holders !== undefined && !layout.holders.has(value)) {
 		// Flat, as fast as `JSON.stringify` alone: written piece by piece, a large text took ten times its size as a rope of small strings.
-		// (A JSON text has a line break only between lines.)
+		// (A JSON text has a line break only between lines, when the gap holds none.)
 		text = JSON.stringify(value, undefined, gap).replaceAll('\n', '\n' + indent);
 	} else {
 		if (isArray) {
@@ -4882,10 +4882,11 @@ export function safeStringify(value: unknown, options: SafeStringifyOptions = {}
 			// The tree holds plain objects and arrays only: `JSON.stringify` writes it faster, unless a `toJSON` was planted on their
 			// prototypes, the keys must be written in another order than the tree's, or the tree shares nodes (a value sharing objects),
 			// which `JSON.stringify` would write once per path: in exponential time before refusing too long a text. Then only the nodes
-			// holding a shared one are written piece by piece when the keys keep the tree's order.
+			// holding a shared one are written piece by piece when the keys keep the tree's order (and the gap holds no line break, which
+			// the flat parts could not tell from theirs when indenting them).
 			const plain = keys === undefined && !sort && !('toJSON' in Array.prototype);
 			if (plain && walk.shared !== true) return JSON.stringify(tree, undefined, gap);
-			const holders = plain ? new Set<object>() : undefined;
+			const holders = plain && !gap.includes('\n') ? new Set<object>() : undefined;
 			if (holders !== undefined) holdersOfShared(tree, new Set(), holders);
 			return writeJson(tree, '', { gap, keys, sort, texts: new Map(), holders });
 		} catch (error) {
