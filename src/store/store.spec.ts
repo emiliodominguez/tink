@@ -553,6 +553,53 @@ describe('createStore', function () {
 			expect(seen).toBe(false);
 		});
 
+		it('notifies a subscriber of several stores that read a value while another of them notified it', function () {
+			const tab = createStore('home');
+			const unread = createStore(0);
+			// Before the selection's own listener: one bumps another store, the other refuses the admin tab.
+			tab.subscribe(function () {
+				if (tab.getState() === 'admin') unread.setState(1);
+			});
+			tab.subscribe(function () {
+				if (tab.getState() === 'admin') tab.setState('settings');
+			});
+			const selected = tab.select(function (t) {
+				return t;
+			});
+			let shown = '';
+			// A view of both stores, told by either: it reads 'admin' while `unread` notifies it.
+			function render(): void {
+				shown = `${unread.getState()} ${selected.getState()}`;
+			}
+			unread.subscribe(render);
+			selected.subscribe(render);
+			tab.setState('settings');
+			tab.setState('admin');
+			expect(selected.getState()).toBe('settings');
+			expect(shown).toBe('1 settings');
+		});
+
+		it('notifies a subscriber that a listener of the source called directly before the selection was told', function () {
+			const tab = createStore('home');
+			const selected = tab.select(function (t) {
+				return t;
+			});
+			let shown = '';
+			function render(): void {
+				shown = selected.getState();
+			}
+			tab.subscribe(function () {
+				if (tab.getState() === 'admin') render();
+			});
+			tab.subscribe(function () {
+				if (tab.getState() === 'admin') tab.setState('settings');
+			});
+			selected.subscribe(render);
+			tab.setState('settings');
+			tab.setState('admin');
+			expect(shown).toBe('settings');
+		});
+
 		it('returns the selected value and only notifies when it changes', function () {
 			const store = createStore(initial());
 			const count = store.select(function (s) {
@@ -3379,6 +3426,67 @@ describe('computed', function () {
 		});
 		filter.setState('');
 		expect(shown).toBe(':A');
+	});
+
+	it('notifies when another source told it of a change while a source of it held a value no notification announced', function () {
+		const base = createStore(0);
+		const offset = createStore(0);
+		// Before the selection's own listener: one moves the offset, the other refuses 1.
+		base.subscribe(function () {
+			if (base.getState() === 1) offset.setState(-1);
+		});
+		base.subscribe(function () {
+			if (base.getState() === 1) base.setState(0);
+		});
+		const selected = base.select(function (n) {
+			return n;
+		});
+		// Told by `offset` while `selected` holds 1: -1 + 1 is the value it notified last, 0.
+		const sum = computed([offset, selected], function (o, s) {
+			return o + s;
+		});
+		let seen = sum.getState();
+		sum.subscribe(function () {
+			seen = sum.getState();
+		});
+		base.setState(1);
+		expect(sum.getState()).toBe(-1);
+		expect(seen).toBe(-1);
+	});
+
+	it('notifies the listener of a foreign store combining it with another, which read a value while the other notified it', function () {
+		const tab = createStore('home');
+		const unread = createStore(0);
+		tab.subscribe(function () {
+			if (tab.getState() === 'admin') unread.setState(1);
+		});
+		tab.subscribe(function () {
+			if (tab.getState() === 'admin') tab.setState('settings');
+		});
+		const selected = computed(tab, function (t) {
+			return t;
+		});
+		// Hand-written, or another library's: subscribing subscribes to both, and the state reads both.
+		const both = {
+			getState(): string {
+				return `${unread.getState()} ${selected.getState()}`;
+			},
+			subscribe(listener: () => void): Unsubscribe {
+				const fromUnread = unread.subscribe(listener);
+				const fromSelected = selected.subscribe(listener);
+				return function (): void {
+					fromUnread();
+					fromSelected();
+				};
+			}
+		};
+		let shown = '';
+		both.subscribe(function () {
+			shown = both.getState();
+		});
+		tab.setState('settings');
+		tab.setState('admin');
+		expect(shown).toBe('1 settings');
 	});
 });
 

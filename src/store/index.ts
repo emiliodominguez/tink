@@ -485,7 +485,9 @@ function assertStore(name: string, value: unknown): asserts value is ReadonlySto
  * - `compute` and `equals` must be pure: they may run for a `getState` call, not only on changes. Errors they throw propagate to
  *   the caller (`getState`, or the source's `setState` through the notification), and the next read recomputes.
  * - A value that changes and changes back between two notifications (A, B, A again, within one notification or after one threw)
- *   notifies when B was read meanwhile: whoever read it, a subscriber maybe, must not be left with B.
+ *   notifies when B was read meanwhile: whoever read it, a subscriber maybe (even outside its own notification), must not be left
+ *   with B. A subscriber may thus be told of the value it saw last, which is not a change: a listener asking for a value again on such
+ *   a call, while another listener refuses it, loops until the round limit (`RangeError`).
  * @template S - The source state type (single store)
  * @template T - The computed type
  * @param {ReadonlyStore<S> | ReadonlyArray<ReadonlyStore<unknown>>} stores - A store, or an array of stores (whose states are passed to
