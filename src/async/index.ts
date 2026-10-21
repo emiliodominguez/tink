@@ -1706,7 +1706,9 @@ function semaphore(name: string, permits: number, onIdle: () => void = noop): Se
 			try {
 				watchSignal(signal, onAbort);
 			} catch (error) {
+				// The requests behind it may fit now (it was the head of the queue, too heavy for the permits left).
 				unlink(waiter);
+				dispatch();
 				throw error;
 			}
 			// A listener called while being added has failed the request already: no timer.

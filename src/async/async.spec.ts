@@ -4282,6 +4282,28 @@ describe('Async helpers (locks, events, reduceAsync, minDelay)', function () {
 			expect(createSemaphore(Infinity).available).toBe(Infinity);
 		});
 
+		it('grants the requests behind a head request whose signal threw while adding its listener (regression: left queued)', async function () {
+			const semaphore = createSemaphore(2);
+			const first = semaphore.tryAcquire(1) as () => void;
+			let light: Promise<() => void> | undefined;
+			const signal = {
+				aborted: false,
+				addEventListener(): void {
+					// Queued behind the heavy request, then the heavy one fails.
+					light = semaphore.acquire({ weight: 1 });
+					throw new Error('add');
+				},
+				removeEventListener(): void {}
+			};
+			await expect(semaphore.acquire({ weight: 2, signal })).rejects.toThrow('add');
+			const release = await (light as Promise<() => void>);
+			expect(semaphore.available).toBe(0);
+			expect(semaphore.pending).toBe(0);
+			release();
+			first();
+			expect(semaphore.available).toBe(2);
+		});
+
 		it('grants available permits at once and counts them', async function () {
 			const semaphore = createSemaphore(3);
 			expect(semaphore.available).toBe(3);
