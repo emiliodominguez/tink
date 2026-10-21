@@ -1864,12 +1864,15 @@ export function createKeyedMutex<K = unknown>(): KeyedMutex<K> {
 	const entering = new Map<K, number>();
 
 	/**
-	 * Forgets the lock of `key`, once idle, unless a request of the key is still to take it.
+	 * Forgets `lock`, the idle lock of `key`, unless a request of the key is still to take it, or the key has another lock: a request
+	 * leaving the queue runs its signal's `removeEventListener` before reporting the lock idle, and that may have released the key (which
+	 * forgot it) and taken it again.
 	 * @param {K} key - The key
+	 * @param {Semaphore} lock - The idle lock
 	 * @returns {void}
 	 */
-	function forget(key: K): void {
-		if (!entering.has(key)) locks.delete(key);
+	function forget(key: K, lock: Semaphore): void {
+		if (!entering.has(key) && locks.get(key) === lock) locks.delete(key);
 	}
 
 	/**
@@ -1881,9 +1884,11 @@ export function createKeyedMutex<K = unknown>(): KeyedMutex<K> {
 		let lock = locks.get(key);
 
 		if (lock === undefined) {
-			lock = semaphore('KeyedMutex', 1, function () {
-				forget(key);
+			const created = semaphore('KeyedMutex', 1, function () {
+				forget(key, created);
 			});
+
+			lock = created;
 			locks.set(key, lock);
 		}
 
@@ -1908,7 +1913,7 @@ export function createKeyedMutex<K = unknown>(): KeyedMutex<K> {
 		} finally {
 			if (count > 0) entering.set(key, count);
 			else entering.delete(key);
-			if (lock.available === 1) forget(key);
+			if (lock.available === 1) forget(key, lock);
 		}
 	}
 

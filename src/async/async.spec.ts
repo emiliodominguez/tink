@@ -8013,6 +8013,28 @@ describe('instance state after a signal or option that runs user code while a re
 		expect(mutex.size).toBe(0);
 	});
 
+	it('keeps the lock of a key released and taken again by the signal of a request leaving the queue (regression: two holders)', async function () {
+		const mutex = createKeyedMutex<string>();
+		const first = await mutex.acquire('doc');
+		let other: (() => void) | undefined;
+		const signal = {
+			aborted: false,
+			addEventListener(): void {},
+			removeEventListener(): void {
+				// Run as the timed-out request leaves the queue, before its lock reports being idle.
+				first();
+				other = mutex.tryAcquire('doc');
+			}
+		};
+		await expect(mutex.acquire('doc', { signal, timeout: 1 })).rejects.toThrow(TimeoutError);
+		expect(other).toBeInstanceOf(Function);
+		expect(mutex.isLocked('doc')).toBe(true);
+		expect(mutex.size).toBe(1);
+		expect(mutex.tryAcquire('doc')).toBeUndefined();
+		(other as () => void)();
+		expect(mutex.size).toBe(0);
+	});
+
 	it('lets a new trial through when the clock throws as a failed trial reopens the circuit (regression: it rejected every call for good)', async function () {
 		let clock = 0;
 		let clockThrows = false;
