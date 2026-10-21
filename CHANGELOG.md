@@ -40,6 +40,7 @@ The `store`/`cache` pass of 1.5.0, extended to every module and repeated until e
 
 **Fixed.**
 
+- **`angleDifference`** (and `lerpAngle`) gave a rotation a full period off, outside `(-period / 2, period / 2]`, when the angles differed by exactly a half turn below zero plus a subnormal: `angleDifference(9678326661783996, 5e-324, 24)` was `-36`, now `12`.
 - **`throttle(fn, wait, { leading: false, trailing: true })`** never invoked `fn` while calls kept coming faster than its timer could fire (during a long synchronous loop): each late call dropped the pending one. The first call after a window now performs the overdue call, once per window, like lodash. **`debounce`** with `maxWait` could run `fn` up to `2 * wait - maxWait` late after a `flush()`.
 - **`createEmitter`** called listeners with its internal registration record as `this` (a listener could reactivate itself); `this` is now `undefined`.
 - **`isEqual`** threw comparing a `Map`, `Set`, `Date`, `RegExp` or `DataView` with a `Proxy` of one (or an object faking its tag), and was order-dependent for the other built-ins; both sides must now be the same kind of built-in. Binary data of different kinds behind a forged prototype no longer compare equal. Plain objects of another realm are plain for the other `objects` helpers too, and detached buffers act as empty ones.
