@@ -202,7 +202,7 @@ export function toJsonValue(holder: object, key: string | number, walk: JsonWalk
 	const depth = walk.ancestors.length;
 	try {
 		let value = own || hasOwn.call(holder, key) ? (holder as Record<string | number, unknown>)[key] : undefined;
-		if ((typeof value === 'object' && value !== null) || typeof value === 'bigint') {
+		if ((typeof value === 'object' && value !== null) || typeof value === 'bigint' || typeof value === 'function') {
 			// A `toJSON` that a pollution put on `Object.prototype` is ignored (own and other inherited ones, such as `Date`'s, are honoured).
 			const toJSON = readOption(value as { toJSON?: unknown }, 'toJSON');
 			if (typeof toJSON === 'function') value = toJSON.call(value, String(key));

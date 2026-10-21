@@ -4847,6 +4847,22 @@ describe('safeStringify', function () {
 		expect(helpers.safeStringify(value, { replacer: list })).toBe('{"a":1,"1":"one","c":3}');
 	});
 
+	it('calls the toJSON of a function as JSON.stringify does (regression: dropped)', function () {
+		const named = Object.assign(
+			function (): void {
+				// A function holding a `toJSON`.
+			},
+			{
+				toJSON(key: string): string {
+					return `F${key}`;
+				}
+			}
+		);
+		const value = { a: named, list: [named], plain: function (): void {} };
+		expect(helpers.safeStringify(value)).toBe(JSON.stringify(value));
+		expect(helpers.safeStringify(value)).toBe('{"a":"Fa","list":["F0"]}');
+	});
+
 	it('sorts keys with sortKeys', function () {
 		expect(helpers.safeStringify({ b: 1, a: { d: 1, c: 2 }, 10: 0, 2: 0 }, { sortKeys: true })).toBe('{"10":0,"2":0,"a":{"c":2,"d":1},"b":1}');
 		const value = { b: [{ y: 1, x: 2 }], a: new Map([['k', { d: 1, c: 2 }]]) };
