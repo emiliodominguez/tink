@@ -463,7 +463,25 @@ describe('createStore', function () {
 	});
 
 	describe('select', function () {
-		it('does not notify when the value changed and changed back within one notification, even if it was read in between', function () {
+		it('does not notify when the value changed and changed back within one notification unread', function () {
+			const store = createStore({ v: 0 });
+			store.subscribe(function () {
+				if (store.getState().v === 1) store.setState({ v: 0 });
+			});
+			const selected = store.select(function (state) {
+				return state.v;
+			});
+			const seen: number[] = [];
+			selected.subscribe(function () {
+				seen.push(selected.getState());
+			});
+			store.setState({ v: 1 });
+			expect(seen).toEqual([]);
+			store.setState({ v: 2 });
+			expect(seen).toEqual([2]);
+		});
+
+		it('notifies when the value changed and changed back within one notification after it was read in between', function () {
 			const store = createStore({ v: 0 });
 			const derived: { current?: ReadonlyStore<number> } = {};
 			store.subscribe(function () {
@@ -478,10 +496,61 @@ describe('createStore', function () {
 			selected.subscribe(function () {
 				seen.push(selected.getState());
 			});
+			// Whoever read 1 may be a subscriber: it is told of 0.
 			store.setState({ v: 1 });
-			expect(seen).toEqual([]);
+			expect(seen).toEqual([0]);
 			store.setState({ v: 2 });
-			expect(seen).toEqual([2]);
+			expect(seen).toEqual([0, 2]);
+		});
+
+		it('notifies a subscriber that read a value of its own notification which a later listener took back', function () {
+			const store = createStore(0);
+			const selected = store.select(function (n) {
+				return n;
+			});
+			let once = true;
+			selected.subscribe(function () {
+				if (once && selected.getState() === 1) {
+					once = false;
+					store.setState(2);
+				}
+			});
+			let seen: number | undefined;
+			selected.subscribe(function () {
+				seen = selected.getState();
+			});
+			// Refuses 2: back to 1, the value the selection last notified.
+			store.subscribe(function () {
+				if (store.getState() === 2) store.setState(1);
+			});
+			store.setState(1);
+			expect(store.getState()).toBe(1);
+			expect(seen).toBe(1);
+		});
+
+		it('notifies a subscriber that subscribed and read during a notification, before the selection was told', function () {
+			const store = createStore(0);
+			const positive = store.select(function (n) {
+				return n > 0;
+			});
+			let seen: boolean | undefined;
+			let mounted = false;
+			// Before the selection's own listener: one mounts a subscriber, the other refuses positive states.
+			store.subscribe(function () {
+				if (mounted) return;
+				mounted = true;
+				positive.subscribe(function () {
+					seen = positive.getState();
+				});
+				seen = positive.getState();
+			});
+			store.subscribe(function () {
+				if (store.getState() > 0) store.setState(0);
+			});
+			positive.subscribe(function () {});
+			store.setState(1);
+			expect(store.getState()).toBe(0);
+			expect(seen).toBe(false);
 		});
 
 		it('returns the selected value and only notifies when it changes', function () {
@@ -716,8 +785,8 @@ describe('createStore', function () {
 				seen.push(view.getState());
 			});
 
-			// The recomputation compares once (10 vs 20), the notification once more (the last notified 10 vs 20): that one throws.
-			failAt = calls + 2;
+			// The recomputation of the notification compares 10 and 20: it throws.
+			failAt = calls + 1;
 			expect(function () {
 				store.setState(2);
 			}).toThrow('equals');
@@ -3279,6 +3348,37 @@ describe('computed', function () {
 		expect(listener).not.toHaveBeenCalled();
 		filter.setState('y');
 		expect(listener).toHaveBeenCalledTimes(1);
+	});
+
+	it('notifies a subscriber of a store derived from it that read a value no notification announced, after a notification threw', function () {
+		const list = createStore({ items: ['a'] });
+		const filter = createStore('');
+		const first = list.select(function (state) {
+			if (state.items.length === 0) throw new Error('no items');
+			return state.items[0];
+		});
+		const label = computed([filter, first], function (f, i) {
+			return `${f}:${i}`;
+		});
+		// One level further down.
+		const upper = label.select(function (l) {
+			return l.toUpperCase();
+		});
+		upper.subscribe(function () {});
+		expect(function () {
+			list.setState({ items: [] });
+		}).toThrow('no items');
+		expect(function () {
+			filter.setState('x');
+		}).toThrow('no items');
+		list.setState({ items: ['a', 'b'] });
+		let shown = upper.getState();
+		expect(shown).toBe('X:A');
+		upper.subscribe(function () {
+			shown = upper.getState();
+		});
+		filter.setState('');
+		expect(shown).toBe(':A');
 	});
 });
 

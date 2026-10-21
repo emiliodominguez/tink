@@ -311,10 +311,6 @@ function derive<S, T>(source: Pick<ReadonlyStore<S>, 'getState' | 'subscribe'>, 
 	let value: T;
 	let version = 0;
 	let notifiedVersion = 0;
-	let notifiedValue: T;
-	// Whether a notification of the source threw before the listeners were told of its value: since then, a `getState` call may have
-	// returned a value no notification announced, so the next change notifies even back to `notifiedValue`.
-	let behind = false;
 	let detach: Unsubscribe | undefined;
 
 	/**
@@ -340,27 +336,16 @@ function derive<S, T>(source: Pick<ReadonlyStore<S>, 'getState' | 'subscribe'>, 
 	}
 
 	/**
-	 * Source listener: notifies the derived subscribers when the selected value differs from the one of the last notification (comparing
-	 * versions rather than recomputing, so a `getState` call made by another listener earlier in the same round cannot hide the change),
-	 * or when it changed after a notification that threw.
+	 * Source listener: notifies the derived subscribers when the selected value changed since the last notification (comparing versions
+	 * rather than recomputing, so a `getState` call made by another listener earlier in the same round cannot hide the change). A value
+	 * that changed and changed back (A, then B, then A again) notifies when B was read meanwhile: by whom is unknown, possibly a
+	 * subscriber (within this round, outside any, or after a notification of the source threw), who would be left with B.
 	 * @returns {void}
 	 */
 	function onSourceChange(): void {
-		const was = behind;
-		// Until the listeners are told: if `getState` (a selector, `equals`, a source) throws, they are left behind.
-		behind = true;
-		const current = getState();
-		if (version === notifiedVersion) {
-			behind = was;
-			return;
-		}
-		// The value may have changed and changed back within the round (A, then B read by another listener, then A again). Compared
-		// before the version is marked as notified: when `equals` throws, the next notification of the source notifies.
-		const unchanged = !was && equals(notifiedValue, current);
-		behind = false;
+		getState();
+		if (version === notifiedVersion) return;
 		notifiedVersion = version;
-		if (unchanged) return;
-		notifiedValue = current;
 		notifier.notify();
 	}
 
@@ -371,11 +356,10 @@ function derive<S, T>(source: Pick<ReadonlyStore<S>, 'getState' | 'subscribe'>, 
 			assertFunction('subscribe', 'listener', listener);
 
 			if (!detach) {
-				const initial = getState();
+				getState();
 
 				// The selector may have subscribed to this store itself (directly, or through a listener of the source): attach once.
 				if (!detach) {
-					notifiedValue = initial;
 					notifiedVersion = version;
 					detach = attach(source, onSourceChange);
 				}
@@ -499,8 +483,9 @@ function assertStore(name: string, value: unknown): asserts value is ReadonlySto
  * - `useSyncExternalStore` friendly: `getState` returns the same reference until the result changes, and methods can be passed
  *   unbound: `useSyncExternalStore(total.subscribe, total.getState)`.
  * - `compute` and `equals` must be pure: they may run for a `getState` call, not only on changes. Errors they throw propagate to
- *   the caller (`getState`, or the source's `setState` through the notification), and the next read recomputes (after a notification
- *   that threw, the next change notifies, even back to the last notified value).
+ *   the caller (`getState`, or the source's `setState` through the notification), and the next read recomputes.
+ * - A value that changes and changes back between two notifications (A, B, A again, within one notification or after one threw)
+ *   notifies when B was read meanwhile: whoever read it, a subscriber maybe, must not be left with B.
  * @template S - The source state type (single store)
  * @template T - The computed type
  * @param {ReadonlyStore<S> | ReadonlyArray<ReadonlyStore<unknown>>} stores - A store, or an array of stores (whose states are passed to
