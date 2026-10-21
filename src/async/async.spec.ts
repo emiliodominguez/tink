@@ -7961,6 +7961,58 @@ describe('instance state after a signal or option that runs user code while a re
 		expect(mutex.size).toBe(0);
 	});
 
+	it('keeps the lock of a key whose option getter releases it and takes it again before the request takes it (regression: two holders)', async function () {
+		const mutex = createKeyedMutex<string>();
+		const first = await mutex.acquire('doc');
+		let other: (() => void) | undefined;
+		const second = mutex.acquire('doc', {
+			get timeout() {
+				first();
+				other = mutex.tryAcquire('doc');
+				return Infinity;
+			}
+		});
+		expect(other).toBeInstanceOf(Function);
+		const granted = jest.fn();
+		void second.then(granted);
+		await Promise.resolve();
+		expect(granted).not.toHaveBeenCalled();
+		expect(mutex.isLocked('doc')).toBe(true);
+		(other as () => void)();
+		const release = await second;
+		expect(mutex.tryAcquire('doc')).toBeUndefined();
+		release();
+		expect(mutex.size).toBe(0);
+	});
+
+	it('keeps the lock of a key released and taken again by its signal, or by a nested request failing at once (regression: two holders)', async function () {
+		const mutex = createKeyedMutex<string>();
+		const first = await mutex.acquire('doc');
+		let other: (() => void) | undefined;
+		const signal = {
+			get aborted() {
+				if (other === undefined) {
+					first();
+					// A nested request of the key that fails at once must not forget the lock either.
+					void mutex.run('doc', 'not a function' as never).catch(function () {});
+					other = mutex.tryAcquire('doc');
+				}
+				return false;
+			},
+			addEventListener(): void {},
+			removeEventListener(): void {}
+		};
+		const ran = jest.fn();
+		const work = mutex.run('doc', ran, { signal });
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(ran).not.toHaveBeenCalled();
+		(other as () => void)();
+		await work;
+		expect(ran).toHaveBeenCalledTimes(1);
+		expect(mutex.size).toBe(0);
+	});
+
 	it('lets a new trial through when the clock throws as a failed trial reopens the circuit (regression: it rejected every call for good)', async function () {
 		let clock = 0;
 		let clockThrows = false;

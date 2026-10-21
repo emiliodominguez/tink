@@ -1858,9 +1858,22 @@ export function createMutex(): Mutex {
  */
 export function createKeyedMutex<K = unknown>(): KeyedMutex<K> {
 	const locks = new Map<K, Semaphore>();
+	// The number of requests of each key still to take its lock: reading their options (and signal) runs user code, which may release the
+	// lock and take it again. Their key keeps its lock meanwhile, or a new lock would be created and taken, and the request then take the
+	// old one: two holders.
+	const entering = new Map<K, number>();
 
 	/**
-	 * The lock of `key`, created on first use; it deletes itself once idle.
+	 * Forgets the lock of `key`, once idle, unless a request of the key is still to take it.
+	 * @param {K} key - The key
+	 * @returns {void}
+	 */
+	function forget(key: K): void {
+		if (!entering.has(key)) locks.delete(key);
+	}
+
+	/**
+	 * The lock of `key`, created on first use; it is forgotten once idle (see {@link forget}).
 	 * @param {K} key - The key
 	 * @returns {Semaphore} The lock
 	 */
@@ -1869,7 +1882,7 @@ export function createKeyedMutex<K = unknown>(): KeyedMutex<K> {
 
 		if (lock === undefined) {
 			lock = semaphore('KeyedMutex', 1, function () {
-				locks.delete(key);
+				forget(key);
 			});
 			locks.set(key, lock);
 		}
@@ -1878,36 +1891,45 @@ export function createKeyedMutex<K = unknown>(): KeyedMutex<K> {
 	}
 
 	/**
-	 * Forgets a lock left free by a request that failed at once (invalid options, aborted signal), and returns the request's promise. A
-	 * lock taken after it was forgotten is recorded again: reading the options runs user code, which may have released the lock (it was
-	 * then idle, and forgotten) before the request took it.
+	 * Makes a request for the lock of `key`, keeping the lock until the request has taken it or is queued, then forgets the lock if the
+	 * request failed at once (invalid options, aborted signal) and nobody else holds it.
 	 * @template T - The resolved value type
 	 * @param {K} key - The key
-	 * @param {Semaphore} lock - Its lock
-	 * @param {Promise<T>} request - The promise to return
-	 * @returns {Promise<T>} `request`
+	 * @param {(lock: Semaphore) => Promise<T>} take - Makes the request
+	 * @returns {Promise<T>} The request's promise
 	 */
-	function tidy<T>(key: K, lock: Semaphore, request: Promise<T>): Promise<T> {
-		if (lock.available === 1) locks.delete(key);
-		else if (!locks.has(key)) locks.set(key, lock);
-		return request;
+	function request<T>(key: K, take: (lock: Semaphore) => Promise<T>): Promise<T> {
+		const lock = lockOf(key);
+		const count = entering.get(key) ?? 0;
+
+		entering.set(key, count + 1);
+		try {
+			return take(lock);
+		} finally {
+			if (count > 0) entering.set(key, count);
+			else entering.delete(key);
+			if (lock.available === 1) forget(key);
+		}
 	}
 
 	return {
 		acquire(key: K, options?: MutexAcquireOptions): Promise<Release> {
-			const lock = lockOf(key);
-			return tidy(key, lock, lock.acquire(options));
+			return request(key, function (lock) {
+				return lock.acquire(options);
+			});
 		},
 		tryAcquire(key: K): Release | undefined {
-			// A free key gets a lock and takes it, a held one keeps its lock: nothing to tidy.
+			// A free key gets a lock and takes it, a held one keeps its lock: nothing to forget.
 			return lockOf(key).tryAcquire();
 		},
 		run<T>(key: K, fn: () => PromiseLike<T> | T, options?: MutexAcquireOptions): Promise<T> {
-			const lock = lockOf(key);
-			return tidy(key, lock, lock.run(fn, options));
+			return request(key, function (lock) {
+				return lock.run(fn, options);
+			});
 		},
 		isLocked(key: K): boolean {
-			return locks.has(key);
+			// A key may keep an idle lock while its requests read their options.
+			return locks.get(key)?.available === 0;
 		},
 		get size(): number {
 			return locks.size;
